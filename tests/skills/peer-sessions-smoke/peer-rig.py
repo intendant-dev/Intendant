@@ -16,6 +16,7 @@ Native daemon-lane children emit no per-session usage/limits (the known
   python3 peer-rig.py            # API-only proof (short sleep step)
   python3 peer-rig.py --browser  # + headless-Chrome Station probe
 """
+import glob
 import json
 import os
 import re
@@ -42,11 +43,27 @@ SCRATCH = os.environ.get("PEER_RIG_SCRATCH") or tempfile.mkdtemp(prefix="peer-ri
 CDP_PORT = int(os.environ.get("PEER_RIG_CDP_PORT", "9333"))
 BROWSER = "--browser" in sys.argv
 SLEEP_STEP = 30 if BROWSER else 6
+# Deadline for the child's 'done' fold. Overridable so the timeout path
+# (and its forensics dump below) can be exercised deliberately, e.g.
+# PEER_RIG_DONE_TIMEOUT=1; unset, it is the historical SLEEP_STEP + 60.
+DONE_TIMEOUT = int(os.environ.get("PEER_RIG_DONE_TIMEOUT") or (SLEEP_STEP + 60))
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CDP = os.path.expanduser("~/projects/smoke-agent-unification/cdp.py")
 
 procs = []
 T0 = time.time()
+
+# Forensics state: a wait timeout used to print ONLY "TIMEOUT", discarding
+# every artifact that could decide worker-stall vs lane-drop vs fold-freeze
+# (observed twice on 2026-07-16: a child folded 'working' in 0.7s, then
+# never folded 'done' within the deadline, and nothing else was captured).
+# spawn_daemon() registers every daemon here; child_of() keeps the newest
+# child fold; dump_forensics() prints it all before the SystemExit.
+DAEMONS = []  # [{"name", "home", "log", "port"}] in spawn order
+OBSERVER = {}  # {"port", "home"} — daemon B, whose /api/peers fold we assert on
+LAST_OBSERVED = {"child": None}  # newest child-session fold seen by child_of()
+DAEMON_LOG_TAIL = 60
+PEERS_JSONL_TAIL = 40
 
 
 def log(msg):
@@ -82,6 +99,58 @@ def ws_action(port, payload):
         time.sleep(0.5)
 
 
+def tail_lines(path, n):
+    try:
+        with open(path, errors="replace") as f:
+            lines = f.readlines()
+    except OSError as e:
+        return [f"<unreadable {path}: {e}>\n"]
+    return lines[-n:] or ["<empty>\n"]
+
+
+def dump_forensics(desc):
+    """Print everything the box still holds when a wait times out.
+
+    Each section is independently best-effort: a dead daemon or missing
+    file prints a marker instead of masking the remaining sections.
+    """
+    print(f"\n========== TIMEOUT FORENSICS: {desc} ==========", flush=True)
+
+    print("---------- (a) last-observed child session fold ----------")
+    child = LAST_OBSERVED["child"]
+    print(json.dumps(child, indent=1) if child is not None
+          else "<no child session ever folded>")
+
+    print("---------- (b) final /api/peers on the observer (incl. connection_state) ----------")
+    if OBSERVER.get("port"):
+        try:
+            peers = http("GET", f"http://127.0.0.1:{OBSERVER['port']}/api/peers")
+            print(json.dumps(peers, indent=1))
+        except Exception as e:  # noqa: BLE001
+            print(f"<GET /api/peers failed: {e}>")
+    else:
+        print("<observer daemon not spawned yet>")
+
+    for d in DAEMONS:
+        print(f"---------- (c) daemon.log tail ({d['name']}, last {DAEMON_LOG_TAIL} lines) ----------")
+        sys.stdout.writelines(tail_lines(d["log"], DAEMON_LOG_TAIL))
+
+    jsonls = []
+    if OBSERVER.get("home"):
+        # The peer log writer appends under the daemon's log dir; glob both
+        # the flat legacy spot and the per-session layout.
+        pattern = os.path.join(OBSERVER["home"], ".intendant", "logs", "**", "peers.jsonl")
+        jsonls = sorted(glob.glob(pattern, recursive=True))
+    if not jsonls:
+        print("---------- (d) observer peers.jsonl ----------")
+        print("<no peers.jsonl found under the observer home>")
+    for path in jsonls:
+        print(f"---------- (d) observer peers.jsonl tail ({path}, last {PEERS_JSONL_TAIL} lines) ----------")
+        sys.stdout.writelines(tail_lines(path, PEERS_JSONL_TAIL))
+
+    print("========== END FORENSICS ==========", flush=True)
+
+
 def wait_for(desc, fn, timeout=45, interval=0.25):
     deadline = time.time() + timeout
     last = None
@@ -93,6 +162,10 @@ def wait_for(desc, fn, timeout=45, interval=0.25):
         except Exception as e:  # noqa: BLE001
             last = e
         time.sleep(interval)
+    try:
+        dump_forensics(desc)
+    except Exception as e:  # noqa: BLE001
+        print(f"<forensics dump itself failed: {e}>", flush=True)
     raise SystemExit(f"TIMEOUT waiting for {desc} (last error: {last})")
 
 
@@ -128,6 +201,7 @@ def spawn_daemon(name, home, script, cwd):
         return int(m.group(1)) if m else None
 
     port = wait_for(f"{name} bound port", parse_port, timeout=30)
+    DAEMONS.append({"name": name, "home": home, "log": log_path, "port": port})
     log(f"daemon {name} pid {p.pid} port {port} home {home}")
     wait_for(f"{name} agent card",
              lambda: http("GET", f"http://127.0.0.1:{port}/.well-known/agent-card.json"))
@@ -186,6 +260,7 @@ try:
     _, a_port = spawn_daemon("A(peer)", os.path.join(SCRATCH, "home-a"), script_a, proj_a)
     _, b_port = spawn_daemon("B(primary)", os.path.join(SCRATCH, "home-b"), script_b,
                              os.path.join(SCRATCH, "proj-b"))
+    OBSERVER.update(port=b_port, home=os.path.join(SCRATCH, "home-b"))
 
     add = http("POST", f"http://127.0.0.1:{b_port}/api/peers",
                {"card_url": f"http://127.0.0.1:{a_port}/.well-known/agent-card.json",
@@ -214,7 +289,10 @@ try:
 
     def child_of(sessions):
         live = [s for s in sessions if not s.get("is_primary")]
-        return live[0] if live else None
+        child = live[0] if live else None
+        if child is not None:
+            LAST_OBSERVED["child"] = child  # retained for dump_forensics
+        return child
 
     child = wait_for("a folded child session on B",
                      lambda: child_of(peer_sessions()), timeout=60)
@@ -273,7 +351,7 @@ try:
 
     done = wait_for("child phase 'done' after completion",
                     lambda: (lambda c: c if c and c.get("phase") == "done" else None)(
-                        child_of(peer_sessions())), timeout=SLEEP_STEP + 60)
+                        child_of(peer_sessions())), timeout=DONE_TIMEOUT)
     check(done.get("phase") == "done", "phase folded to 'done' from TaskComplete")
 
     time.sleep(3)

@@ -856,17 +856,15 @@ pub(crate) fn set_api_keys_result(env_path: Option<&Path>, body: &str) -> String
 //    `write_api_response`; the tunnel twins frame them through the
 //    dispatch adapters.
 
-/// JSON under the bare wildcard-CORS tail (`Access-Control-Allow-Origin:
-/// *` + `Connection: close`, NO `Cache-Control`) — the historical
-/// framing of the api-keys POST and the diagnostics sink.
-pub(crate) fn bare_wildcard_json_response(status: u16, body: String) -> ApiResponse {
+/// JSON under the bare tail (`Connection: close` only, NO
+/// `Cache-Control`) — the historical framing of the api-keys POST and
+/// the diagnostics sink, minus the wildcard ACAO those shapes once
+/// baked in (CORS is the row posture's decision, not a response's).
+pub(crate) fn bare_json_response(status: u16, body: String) -> ApiResponse {
     ApiResponse::Json {
         status,
         body: JsonBody::PreSerialized(body),
-        headers: vec![
-            ("Access-Control-Allow-Origin", "*".to_string()),
-            ("Connection", "close".to_string()),
-        ],
+        headers: vec![("Connection", "close".to_string())],
     }
 }
 
@@ -894,10 +892,10 @@ pub(crate) fn settings_post_api_response(
 
 /// POST /api/api-keys + the tunnel's `api_api_keys_save`: always 200 —
 /// the historical lane reports failures in the body — under the bare
-/// wildcard tail. `env_path` arrives from the transport edge
+/// tail. `env_path` arrives from the transport edge
 /// ([`api_keys_env_path`]).
 pub(crate) fn api_keys_save_api_response(env_path: Option<&Path>, body_text: &str) -> ApiResponse {
-    bare_wildcard_json_response(200, set_api_keys_result(env_path, body_text))
+    bare_json_response(200, set_api_keys_result(env_path, body_text))
 }
 
 /// GET /api/api-key-status + the tunnel's `api_key_status`.
@@ -1434,12 +1432,13 @@ mod tests {
         )
     }
 
-    /// The bare wildcard-CORS JSON framing (`Access-Control-Allow-Origin:
-    /// *` + `Connection` tail, NO `Cache-Control`): the api-keys POST
-    /// shape, spelled out literally.
-    fn golden_settings_bare_wildcard_json_transcript(status_line: &str, body: &str) -> String {
+    /// The bare JSON framing (`Connection` tail only, NO
+    /// `Cache-Control`): the api-keys POST shape, spelled out literally
+    /// (its historical wildcard ACAO is retired — the own-origin row
+    /// posture emits no CORS header).
+    fn golden_settings_bare_json_transcript(status_line: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
     }
@@ -1621,7 +1620,7 @@ mod tests {
         let cors = settings_route_cors("POST", "/api/api-keys");
         // Unknown key: rejected before any config-dir resolution — and
         // still 200 OK (the historical always-200 POST lane) under the
-        // bare wildcard tail.
+        // bare tail.
         let response = collect_settings_handler_response(|stream| {
             handle_api_keys_post(
                 stream,
@@ -1633,7 +1632,7 @@ mod tests {
         .await;
         assert_eq!(
             golden_settings_transcript(&response),
-            golden_settings_bare_wildcard_json_transcript(
+            golden_settings_bare_json_transcript(
                 "200 OK",
                 r#"{"error":"Unknown key: NOT_A_KNOWN_KEY"}"#
             )
@@ -1654,7 +1653,7 @@ mod tests {
         .await;
         assert_eq!(
             golden_settings_transcript(&response),
-            golden_settings_bare_wildcard_json_transcript("200 OK", &expected_body)
+            golden_settings_bare_json_transcript("200 OK", &expected_body)
         );
     }
 

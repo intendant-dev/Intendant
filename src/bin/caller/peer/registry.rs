@@ -8,7 +8,7 @@
 //! ## Log sink dependency injection
 //!
 //! The registry receives a pre-constructed
-//! `mpsc::Sender<TaggedPeerEvent>` via its constructor and threads
+//! `mpsc::Sender<EnqueuedPeerEvent>` via its constructor and threads
 //! it through to every peer actor's `spawn_peer` call. The writer
 //! task on the receiver side is the caller's responsibility
 //! (typically `main.rs` when it wires up the gateway) — keeping
@@ -32,9 +32,10 @@
 //! cleanly with `PeerError::CardFetch`.
 
 use crate::peer::card::{AgentCard, TransportSpec};
-use crate::peer::event::{PeerEvent, TaggedPeerEvent};
+use crate::peer::event::PeerEvent;
 use crate::peer::handle::{spawn_peer, PeerHandle, PeerSnapshot};
 use crate::peer::id::PeerId;
+use crate::peer::log_writer::EnqueuedPeerEvent;
 use crate::peer::transport::tls_client::{self, ClientIdentityPaths};
 use crate::peer::transport::IntendantWsTransport;
 use crate::peer::PeerError;
@@ -111,12 +112,12 @@ pub struct PeerRegistry {
 
 struct PeerRegistryInner {
     peers: RwLock<HashMap<PeerId, PeerHandle>>,
-    log_sink: mpsc::Sender<TaggedPeerEvent>,
+    log_sink: mpsc::Sender<EnqueuedPeerEvent>,
     events: broadcast::Sender<RegistryEvent>,
 }
 
 impl PeerRegistry {
-    pub fn new(log_sink: mpsc::Sender<TaggedPeerEvent>) -> Self {
+    pub fn new(log_sink: mpsc::Sender<EnqueuedPeerEvent>) -> Self {
         let (events, _) = broadcast::channel(REGISTRY_BROADCAST_CAPACITY);
         Self {
             inner: Arc::new(PeerRegistryInner {
@@ -589,8 +590,9 @@ fn spawn_state_observer(handle: PeerHandle, events: broadcast::Sender<RegistryEv
 /// chatty peer (e.g. streaming model deltas), the per-peer broadcast's
 /// `Lagged` error is logged at debug and the forwarder skips ahead.
 /// This is intentional — durable per-peer events land on the session
-/// log via the registry's [`TaggedPeerEvent`] log sink, so the dashboard
-/// can drop intermediate frames safely.
+/// log via the registry's
+/// [`TaggedPeerEvent`](crate::peer::event::TaggedPeerEvent) log sink, so
+/// the dashboard can drop intermediate frames safely.
 ///
 /// Exits cleanly when the per-peer actor's broadcast sender drops
 /// (`RecvError::Closed`), same lifetime model as `spawn_state_observer`.
@@ -841,7 +843,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_registry_is_empty() {
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(16);
         let reg = PeerRegistry::new(log_tx);
         assert_eq!(reg.len(), 0);
         assert!(reg.is_empty());
@@ -857,7 +859,7 @@ mod tests {
     #[tokio::test]
     async fn add_peer_fetches_card_and_registers() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
 
         let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
@@ -878,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn add_peer_rejects_duplicates() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
 
         // Use the pre-fetched card path so both add_peer calls
@@ -906,7 +908,7 @@ mod tests {
     /// time, not silently attach to nothing.
     #[tokio::test]
     async fn add_peer_rejects_card_with_no_supported_transports() {
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(16);
         let reg = PeerRegistry::new(log_tx);
 
         let card = AgentCard {
@@ -935,7 +937,7 @@ mod tests {
     #[tokio::test]
     async fn list_returns_cloneable_handles() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
 
         let ws_url = format!("ws://127.0.0.1:{port}/ws");
@@ -956,7 +958,7 @@ mod tests {
     /// `remove_peer` on an unknown id returns NotFound.
     #[tokio::test]
     async fn remove_unknown_peer_errors() {
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(16);
         let reg = PeerRegistry::new(log_tx);
 
         let unknown = PeerId::new(PeerKind::Intendant, "ghost");
@@ -979,7 +981,7 @@ mod tests {
     #[tokio::test]
     async fn add_peer_emits_peer_added_event() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
         let mut events = reg.subscribe();
 
@@ -1013,7 +1015,7 @@ mod tests {
     #[tokio::test]
     async fn remove_peer_emits_peer_removed_event() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
 
         let ws_url = format!("ws://127.0.0.1:{port}/ws");
@@ -1048,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn peer_state_changes_emit_push_events() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
         let mut events = reg.subscribe();
 
@@ -1093,7 +1095,7 @@ mod tests {
     #[tokio::test]
     async fn peer_events_are_forwarded() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
         let mut events = reg.subscribe();
 
@@ -1144,7 +1146,7 @@ mod tests {
     #[tokio::test]
     async fn event_forwarder_releases_handle_after_remove() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
 
         let ws_url = format!("ws://127.0.0.1:{port}/ws");
@@ -1191,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn multiple_subscribers_receive_same_events() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
         let mut sub_a = reg.subscribe();
         let mut sub_b = reg.subscribe();
@@ -1235,7 +1237,7 @@ mod tests {
     #[tokio::test]
     async fn add_peer_with_via_persists_across_initial_card_refresh() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
 
         // Reach the test gateway via localhost, but declare a via URL
@@ -1310,7 +1312,7 @@ mod tests {
     #[tokio::test]
     async fn add_peer_with_via_replaces_card_transports() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
 
         let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
@@ -1349,7 +1351,7 @@ mod tests {
     #[tokio::test]
     async fn add_peer_with_via_empty_preserves_card_transports() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
 
         let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
@@ -1384,7 +1386,7 @@ mod tests {
     #[tokio::test]
     async fn add_peer_with_via_multiple_urls_preserve_order() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
 
         let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
@@ -1424,7 +1426,7 @@ mod tests {
     async fn add_peer_with_credentials_pinned_override_replaces_card_auth() {
         use crate::peer::card::TransportAuth;
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
 
         let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
@@ -1465,7 +1467,7 @@ mod tests {
     #[tokio::test]
     async fn add_peer_with_credentials_empty_override_preserves_card_auth() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
 
         let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
@@ -1495,7 +1497,7 @@ mod tests {
     #[tokio::test]
     async fn add_peer_with_credentials_rejects_malformed_override() {
         let (port, gateway) = spawn_test_peer().await;
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
 
         let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
@@ -1576,7 +1578,7 @@ mod tests {
     #[tokio::test]
     async fn add_peer_with_pinned_card_rejects_malformed_fingerprint() {
         use crate::peer::card::{AuthRequirements, TransportAuth};
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
         let mut card = fake_card("bad-pin", "ws://x/ws");
         card.auth = AuthRequirements {
@@ -1609,7 +1611,7 @@ mod tests {
     #[tokio::test]
     async fn add_peer_with_pinned_card_accepts_valid_fingerprint() {
         use crate::peer::card::{AuthRequirements, TransportAuth};
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let reg = PeerRegistry::new(log_tx);
         let mut card = fake_card("good-pin", "ws://x/ws");
         card.auth = AuthRequirements {

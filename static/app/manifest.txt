@@ -109,6 +109,7 @@ ui2-settings.js
 55b-session-launch.js
 56-debug-sessions.js
 57a-sessions-list.js
+57b-session-fork.js
 57-sessions-replay.js
 57-sessions-message-search.js
 57-attention-notifications.js

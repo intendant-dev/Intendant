@@ -117,12 +117,14 @@ pub use event::{
 };
 pub use handle::{ConnectionState, PeerHandle, PeerSnapshot};
 pub use id::PeerId;
-// LOG_CHANNEL_CAPACITY has cfg(test) consumers only (the mcp_http and
-// mcp tools_peer rigs) — a plain build's unused-import lint can't see
-// them, so the allow keeps a cleanup pass from stripping it again.
+// LOG_CHANNEL_CAPACITY and EnqueuedPeerEvent have cfg(test) consumers only
+// (the mcp_http / mcp tools_peer / gateway peer rigs build their log sinks
+// by hand; production code inside `peer` names the log_writer path
+// directly) — a plain build's unused-import lint can't see them, so the
+// allow keeps a cleanup pass from stripping them again.
 pub use log_writer::spawn_peer_log_writer;
 #[cfg_attr(not(test), allow(unused_imports))]
-pub use log_writer::LOG_CHANNEL_CAPACITY;
+pub use log_writer::{EnqueuedPeerEvent, LOG_CHANNEL_CAPACITY};
 pub use registry::{PeerRegistry, RegistryEvent};
 pub use traits::PeerTask;
 

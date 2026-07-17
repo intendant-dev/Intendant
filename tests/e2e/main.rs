@@ -199,27 +199,25 @@ fn tail(contents: &str, max: usize) -> String {
     contents[start..].to_string()
 }
 
-/// One free loopback port, same caveats as [`two_free_loopback_ports`].
-fn free_loopback_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("ephemeral port addr")
-        .port()
-}
-
-/// Two distinct free loopback ports, grabbed while both listeners are
-/// alive so the kernel cannot hand out the same port twice. The listeners
-/// are dropped on return and the daemons re-bind moments later; if a port
-/// is stolen in that window the daemon walks to the next free port and the
-/// test fails loudly on its readiness poll — a flake, never a false pass.
-fn two_free_loopback_ports() -> (u16, u16) {
-    let first = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
-    let second = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
-    (
-        first.local_addr().expect("ephemeral port addr").port(),
-        second.local_addr().expect("ephemeral port addr").port(),
-    )
+/// The port from a daemon's `Dashboard: http(s)://127.0.0.1:<port>`
+/// startup line, if `log` contains it yet. The daemon prints that line
+/// only after its listener is bound, reporting the port it actually
+/// holds — under `--web 0` (kernel-assigned port) the line is the one
+/// truthful source for where it landed. Same contract the CI
+/// dashboard-boot step consumes from the same log with sed
+/// (`.github/workflows/windows.yml`).
+fn dashboard_port(log: &str) -> Option<u16> {
+    log.lines().find_map(|line| {
+        let (_, rest) = line.split_once("Dashboard: ")?;
+        let rest = rest
+            .strip_prefix("https://")
+            .or_else(|| rest.strip_prefix("http://"))?;
+        let rest = rest.strip_prefix("127.0.0.1:")?;
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        rest[..end].parse().ok()
+    })
 }
 
 /// A persistent-daemon variant of [`TestRig`]: the same isolated binary
@@ -231,6 +229,8 @@ struct DaemonRig {
     /// a still-running process holds open log handles on Windows.
     child: tokio::process::Child,
     rig: TestRig,
+    /// The port the daemon actually bound (parsed from its `Dashboard:`
+    /// startup line; the daemon picks it itself under `--web 0`).
     port: u16,
 }
 
@@ -242,9 +242,8 @@ impl DaemonRig {
         tail(&contents, 4000)
     }
 
-    /// Tail of the daemon's durable federated peer-event record
-    /// (`peers.jsonl`; see `peer::spawn_peer_log_writer`), for failure
-    /// context AND for the delivery-receipt assertion: connection
+    /// The daemon's durable federated peer-event record (`peers.jsonl`;
+    /// see `peer::spawn_peer_log_writer`), in full: connection
     /// transitions and delegation-time activity live here, on the
     /// *sending* daemon, where a lost cross-daemon message leaves its
     /// only trace. The file lives in the daemon's *session* log dir —
@@ -255,7 +254,14 @@ impl DaemonRig {
     /// `.intendant/logs/peers.jsonl` that nothing writes, so the
     /// forensics rail dumped empty; the receipt assertion made that
     /// visible.)
-    fn peer_log_tail(&self) -> String {
+    ///
+    /// Wait probes must search this full record, never
+    /// [`Self::peer_log_tail`]'s bounded window: the record only ever
+    /// grows, so a line that landed early is pushed further above any
+    /// fixed-size tail by every later event — a probe reading the tail
+    /// can permanently miss what it waits for (the 2026-07-16
+    /// `task_receipt` merge-queue ejections).
+    fn peer_log(&self) -> String {
         let logs_dir = self.rig.home.path().join(".intendant").join("logs");
         let mut combined = String::new();
         if let Ok(entries) = std::fs::read_dir(&logs_dir) {
@@ -266,19 +272,24 @@ impl DaemonRig {
                 }
             }
         }
-        tail(&combined, 4000)
+        combined
+    }
+
+    /// Bounded tail of [`Self::peer_log`], for failure-dump context only
+    /// — dumps ride inside panic messages and must stay
+    /// panic-message-sized.
+    fn peer_log_tail(&self) -> String {
+        tail(&self.peer_log(), 4000)
     }
 }
 
-/// Spawn an idle daemon (no task) with the given mock script and wait until
-/// its gateway serves the agent card — the same flags and readiness probe as
-/// the peer-sessions smoke rig (`tests/skills/peer-sessions-smoke`).
-async fn spawn_daemon(
-    client: &reqwest::Client,
-    script: &serde_json::Value,
-    port: u16,
-) -> DaemonRig {
-    spawn_daemon_on_rig(client, TestRig::new(), script, port, false).await
+/// Spawn an idle daemon (no task) with the given mock script on a
+/// kernel-assigned port and wait until its gateway serves the agent card —
+/// the same readiness probe as the peer-sessions smoke rig
+/// (`tests/skills/peer-sessions-smoke`). The bound port is on the returned
+/// rig (`DaemonRig::port`).
+async fn spawn_daemon(client: &reqwest::Client, script: &serde_json::Value) -> DaemonRig {
+    spawn_daemon_on_rig(client, TestRig::new(), script, false).await
 }
 
 /// [`spawn_daemon`] against a caller-prepared rig — used when the rig's
@@ -290,7 +301,6 @@ async fn spawn_daemon_on_rig(
     client: &reqwest::Client,
     rig: TestRig,
     script: &serde_json::Value,
-    port: u16,
     tls: bool,
 ) -> DaemonRig {
     // These rigs model a *rooted* daemon: an idle --web daemon launched
@@ -311,22 +321,54 @@ async fn spawn_daemon_on_rig(
         // to a file instead.
         .stdout(log.try_clone().expect("clone daemon log"))
         .stderr(log);
-    cmd.arg("--web").arg(port.to_string()).args([
-        "--bind",
-        "127.0.0.1",
-        "--no-tui",
-        "--autonomy",
-        "full",
-    ]);
-    let (ws_scheme, http_scheme) = if tls {
-        ("wss", "https")
+    // `--web 0`: the daemon binds a kernel-assigned port and reports it
+    // in its `Dashboard:` startup line — the race-free way to boot a
+    // suite's worth of daemons in parallel. (Handing each daemon a
+    // pre-picked free port left a window between releasing the probe
+    // listener and the daemon's own bind; under concurrent test boots —
+    // and macOS's sequential ephemeral-port allocator — the number got
+    // re-taken, the daemon truthfully walked to the next free port, and
+    // the readiness poll below burned its whole deadline probing the
+    // stale one.) No `--advertise-url` either: with a specific loopback
+    // bind the daemon auto-advertises exactly
+    // `ws(s)://127.0.0.1:<bound port>/ws` (the specific-bind rule in
+    // web_gateway/agent_card.rs), the same URL the flag used to spell
+    // out, now guaranteed to match the real port.
+    cmd.arg("--web")
+        .arg("0")
+        .args(["--bind", "127.0.0.1", "--no-tui", "--autonomy", "full"]);
+    let http_scheme = if tls {
+        "https"
     } else {
         cmd.arg("--no-tls");
-        ("ws", "http")
+        "http"
     };
-    cmd.arg("--advertise-url")
-        .arg(format!("{ws_scheme}://127.0.0.1:{port}/ws"));
-    let child = cmd.spawn().expect("spawn intendant daemon");
+    let mut child = cmd.spawn().expect("spawn intendant daemon");
+
+    // Phase one of boot: the daemon's actual port, from its startup
+    // line (teed into daemon.log). One deadline spans both boot phases —
+    // this wait and the gateway readiness poll below.
+    let log_path = rig.home.path().join("daemon.log");
+    let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
+    let port = loop {
+        let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if let Some(port) = dashboard_port(&contents) {
+            break port;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "daemon exited during startup ({status}):\n{}",
+                tail(&contents, 4000)
+            );
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon did not print its Dashboard startup line within \
+             {DAEMON_START_TIMEOUT:?}:\n{}",
+            tail(&contents, 4000)
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
     let mut daemon = DaemonRig { child, rig, port };
 
     // Readiness. Plain rigs poll the agent card as before. TLS rigs
@@ -341,7 +383,6 @@ async fn spawn_daemon_on_rig(
     } else {
         format!("{http_scheme}://127.0.0.1:{port}/.well-known/agent-card.json")
     };
-    let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
     loop {
         let ready = if tls {
             client.get(&probe_url).send().await.is_ok()
@@ -1017,7 +1058,7 @@ async fn create_session_with_worktree_runs_inside_the_worktree() {
     });
 
     let client = reqwest::Client::new();
-    let mut daemon = spawn_daemon_on_rig(&client, rig, &script, free_loopback_port(), false).await;
+    let mut daemon = spawn_daemon_on_rig(&client, rig, &script, false).await;
     let (mut ws, _) =
         tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", daemon.port))
             .await
@@ -1205,8 +1246,8 @@ async fn ctl_session_note_posts_a_display_only_note_with_image() {
         .no_proxy()
         .build()
         .expect("http client");
-    let port = free_loopback_port();
-    let daemon = spawn_daemon(&client, &idle_script, port).await;
+    let daemon = spawn_daemon(&client, &idle_script).await;
+    let port = daemon.port;
 
     let image_path = daemon.rig.project.path().join("note-image.png");
     std::fs::write(&image_path, IMAGE_BYTES).expect("write note image");
@@ -1339,8 +1380,8 @@ async fn transfer_jobs_round_trip_over_direct_http() {
         .no_proxy()
         .build()
         .expect("http client");
-    let port = free_loopback_port();
-    let daemon = spawn_daemon(&client, &idle_script, port).await;
+    let daemon = spawn_daemon(&client, &idle_script).await;
+    let port = daemon.port;
     let base = format!("http://127.0.0.1:{port}");
 
     // Two uneven chunks force a mid-file resume boundary.
@@ -1550,8 +1591,8 @@ async fn sessions_stream_serves_ndjson_over_direct_http() {
         .no_proxy()
         .build()
         .expect("http client");
-    let port = free_loopback_port();
-    let daemon = spawn_daemon(&client, &idle_script, port).await;
+    let daemon = spawn_daemon(&client, &idle_script).await;
+    let port = daemon.port;
 
     let response = client
         .get(format!(
@@ -1648,8 +1689,8 @@ async fn display_request_rail_round_trips_over_ws() {
         .no_proxy()
         .build()
         .expect("http client");
-    let port = free_loopback_port();
-    let daemon = spawn_daemon(&client, &idle_script, port).await;
+    let daemon = spawn_daemon(&client, &idle_script).await;
+    let port = daemon.port;
 
     // Subscribe before requesting so the broadcast cannot race the assert.
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
@@ -1918,8 +1959,8 @@ async fn cu_actions_broadcast_display_scoped_events_over_ws() {
         .no_proxy()
         .build()
         .expect("http client");
-    let port = free_loopback_port();
-    let daemon = spawn_daemon(&client, &idle_script, port).await;
+    let daemon = spawn_daemon(&client, &idle_script).await;
+    let port = daemon.port;
 
     // Subscribe before acting so the broadcast cannot race the assert.
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
@@ -2034,8 +2075,7 @@ async fn cu_observe_modes_choose_ax_pixels_or_nothing() {
         .no_proxy()
         .build()
         .expect("http client");
-    let port = free_loopback_port();
-    let daemon = spawn_daemon(&client, &idle_script, port).await;
+    let daemon = spawn_daemon(&client, &idle_script).await;
 
     // user_session CU requires the display grant (the synthetic backend
     // serves the capture session it registers).
@@ -2188,8 +2228,8 @@ async fn ctl_ask_blocks_until_the_dashboard_answers() {
         .no_proxy()
         .build()
         .expect("http client");
-    let port = free_loopback_port();
-    let daemon = spawn_daemon(&client, &idle_script, port).await;
+    let daemon = spawn_daemon(&client, &idle_script).await;
+    let port = daemon.port;
 
     // Subscribe before asking so the broadcast cannot race the assert.
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
@@ -2316,8 +2356,8 @@ async fn ctl_notify_broadcasts_and_persists() {
         .no_proxy()
         .build()
         .expect("http client");
-    let port = free_loopback_port();
-    let daemon = spawn_daemon(&client, &idle_script, port).await;
+    let daemon = spawn_daemon(&client, &idle_script).await;
+    let port = daemon.port;
 
     // Subscribe before notifying so the broadcast cannot race the assert.
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
@@ -2439,9 +2479,9 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
         .no_proxy()
         .build()
         .expect("http client");
-    let (port_a, port_b) = two_free_loopback_ports();
-    let mut a = spawn_daemon(&client, &idle_script, port_a).await;
-    let mut b = spawn_daemon(&client, &peer_script, port_b).await;
+    let mut a = spawn_daemon(&client, &idle_script).await;
+    let mut b = spawn_daemon(&client, &peer_script).await;
+    let (port_a, port_b) = (a.port, b.port);
 
     // Failure forensics shared by every cross-daemon wait below. Always
     // dump BOTH sides: the narrative of a delegation lost in flight lives
@@ -2607,20 +2647,26 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
         dump_daemons()
     );
     // And the receipt leaves a durable trace on A's federated peer-event
-    // record (`peers.jsonl`, the forensics rail dump_daemons reads). The
-    // actor writes it via the async log sink, so it may trail the ctl
-    // response — on a loaded CI box by far more than a beat (a 30s
-    // deadline here ejected two otherwise-green merge-queue entries on
-    // 2026-07-16). PEER_WAIT_TIMEOUT like the test's other cross-daemon
+    // record (`peers.jsonl`). The actor writes it durable-first — the
+    // log-sink send is awaited, under a monotonic seq, before the event
+    // is broadcast — so it is in the file promptly; what it does NOT do
+    // is stay inside a bounded tail window. This wait once probed
+    // peer_log_tail()'s last 4000 chars, and on a fast box the scripted
+    // run's completion flood (a dozen-plus peer events behind the
+    // receipt) had scrolled the receipt above that window before the
+    // first 250 ms poll — the 2026-07-16 merge-queue ejections, misread
+    // at the time as the write trailing the ctl response on a loaded
+    // box. The record only grows, so that miss was permanent: probe the
+    // FULL record. PEER_WAIT_TIMEOUT like the test's other cross-daemon
     // waits: the deadline only bounds failing runs, never green ones.
     poll_until(
         "the task_receipt landing in daemon A's peers.jsonl",
         PEER_WAIT_TIMEOUT,
         || {
-            let tail = a.peer_log_tail();
+            let log = a.peer_log();
             let delegation_id = delegation_id.clone();
             async move {
-                (tail.contains("task_receipt") && tail.contains(&delegation_id)).then_some(())
+                (log.contains("task_receipt") && log.contains(&delegation_id)).then_some(())
             }
         },
         &dump_daemons,
@@ -2711,8 +2757,10 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
     // Side B: provision an isolated access store under the rig's state
     // root, then boot the daemon on its default TLS+mTLS path (no
     // `--no-tls` ⇒ it auto-loads the store's server cert and verifies
-    // client certs against the store's CA).
-    let port_b = free_loopback_port();
+    // client certs against the store's CA). No `--port`: the daemon
+    // picks its own port at spawn below, and setup's `--port` only
+    // shapes the dashboard URL it *prints* — nothing in the store
+    // (certs are SAN-bound to hosts/IPs, never ports) depends on it.
     let rig_b = TestRig::new();
     std::fs::write(rig_b.project.path().join("intendant.toml"), "")
         .expect("mark side B's project root");
@@ -2727,8 +2775,6 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
             "localhost",
             "--name",
             "peer-e2e-b",
-            "--port",
-            &port_b.to_string(),
             "--no-serve-certs",
             "--force",
         ]);
@@ -2749,8 +2795,8 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
             ]
         }]
     });
-    let mut daemon_b =
-        spawn_daemon_on_rig(&insecure_probe, rig_b, &idle_script, port_b, true).await;
+    let mut daemon_b = spawn_daemon_on_rig(&insecure_probe, rig_b, &idle_script, true).await;
+    let port_b = daemon_b.port;
 
     // Side A: a bare project, nothing else.
     let rig_a = TestRig::new();
@@ -4242,7 +4288,7 @@ async fn native_session_forks_at_a_round_boundary() {
         }]
     });
     let client = reqwest::Client::new();
-    let mut daemon = spawn_daemon(&client, &script, free_loopback_port()).await;
+    let mut daemon = spawn_daemon(&client, &script).await;
     let port = daemon.port;
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
         .await

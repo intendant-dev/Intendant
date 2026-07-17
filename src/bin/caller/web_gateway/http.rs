@@ -658,6 +658,16 @@ impl HttpResponse {
         }
     }
 
+    /// Own-origin CORS posture: strip any `Access-Control-Allow-Origin`
+    /// a legacy response shape baked in. Same-origin readers never need
+    /// the header, and emitting one on an own-origin row would re-open
+    /// exactly the cross-origin readability the posture exists to deny.
+    pub(crate) fn own_origin_cors(mut self) -> Self {
+        self.headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case("access-control-allow-origin"));
+        self
+    }
+
     /// Fleet-allowlist CORS posture: strip any wildcard, echo the origin
     /// only when it passed the allowlist, and mark `Vary: Origin`. The
     /// one fleet renderer (its string-form ancestor retired with the S6

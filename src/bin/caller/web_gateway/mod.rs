@@ -412,7 +412,7 @@ pub(crate) fn diagnostics_visual_freshness_api_response(
         }
         Err(e) => (500, serde_json::json!({"error": e.to_string()}).to_string()),
     };
-    bare_wildcard_json_response(status, body)
+    bare_json_response(status, body)
 }
 
 async fn handle_diagnostics_visual_freshness(
@@ -531,12 +531,13 @@ mod tests {
         response
     }
 
-    /// The sink's bare wildcard-CORS JSON framing (`Access-Control-
-    /// Allow-Origin: *` + `Connection` tail, NO `Cache-Control`),
-    /// spelled out literally.
+    /// The sink's bare JSON framing (`Connection` tail only, NO
+    /// `Cache-Control`), spelled out literally — the shape's historical
+    /// wildcard ACAO is retired (the own-origin row posture emits no
+    /// CORS header).
     fn golden_diagnostics_transcript(status_line: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
     }
@@ -2045,6 +2046,112 @@ mod tests {
         handle.abort();
     }
 
+    /// The session-data CORS lane (`CorsPosture::FleetOrLoopback`)
+    /// through the real gateway: arbitrary web origins are refused at
+    /// the gate, while a sibling loopback dashboard's preflight gets the
+    /// exact-origin echo (the responses themselves carry no wildcard —
+    /// pinned by the golden transcripts). The 403 leg doubles as proof
+    /// the handler (which scans session stores) never runs for foreign
+    /// pages, so this test stays hermetic.
+    #[tokio::test]
+    async fn test_sessions_cors_lane_refuses_foreign_and_echoes_loopback() {
+        let (port, handle) = spawn_test_gateway_with_registry(None).await;
+        // Foreign page origin on the session list: refused pre-dispatch,
+        // and the refusal itself is not cross-origin readable.
+        let resp = http_request(
+            port,
+            "GET /api/sessions HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "foreign origin should be refused on the session list: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        assert!(
+            !resp.contains("Access-Control-Allow-Origin"),
+            "the refusal must carry no ACAO header: {resp}"
+        );
+        // A sibling daemon's dashboard on another loopback port (the
+        // multi-instance Stats topology; this connection arrives over
+        // loopback): the preflight echoes the origin exactly.
+        let resp = http_request(
+            port,
+            "OPTIONS /api/sessions HTTP/1.1\r\nHost: localhost\r\nOrigin: http://127.0.0.1:9321\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "preflight should answer 204: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        assert!(
+            resp.contains("Access-Control-Allow-Origin: http://127.0.0.1:9321\r\n"),
+            "loopback sibling origin should be echoed exactly: {resp}"
+        );
+        assert!(
+            !resp.contains("Access-Control-Allow-Origin: *"),
+            "the session preflight must never answer wildcard: {resp}"
+        );
+        assert!(
+            resp.contains("Vary: Origin\r\n"),
+            "the echo must be cache-partitioned by origin: {resp}"
+        );
+        // A foreign origin's preflight on the same path: no echo at all.
+        let resp = http_request(
+            port,
+            "OPTIONS /api/sessions HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "got: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        assert!(
+            !resp.contains("Access-Control-Allow-Origin"),
+            "foreign preflight must get no ACAO header: {resp}"
+        );
+        // No Origin header (curl, same-origin navigation): no ACAO.
+        let resp = http_request(
+            port,
+            "OPTIONS /api/sessions HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "got: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        assert!(
+            !resp.contains("Access-Control-Allow-Origin"),
+            "origin-less preflight must get no ACAO header: {resp}"
+        );
+        // An admitted sibling origin sending an undeclared method gets
+        // the structured 405 WITH the echo (the row's posture applies to
+        // the dispatch-level error too), instead of an opaque CORS
+        // failure. Pre-handler, so still hermetic.
+        let resp = http_request(
+            port,
+            "POST /api/sessions HTTP/1.1\r\nHost: localhost\r\nOrigin: http://127.0.0.1:9321\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+            "undeclared method should answer 405: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        assert!(
+            resp.contains("Access-Control-Allow-Origin: http://127.0.0.1:9321\r\n"),
+            "the 405 must stay readable to the admitted origin: {resp}"
+        );
+        assert!(
+            resp.contains("Vary: Origin\r\n") && resp.contains("Allow: "),
+            "the 405 keeps its Allow header and origin-varies: {resp}"
+        );
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_api_access_overview_lists_current_browser_root_grant() {
         let (port, handle) = spawn_test_gateway_with_registry(None).await;
@@ -3493,8 +3600,7 @@ mod tests {
     /// `{"peers":[]}`. Baseline for the list endpoint shape.
     #[tokio::test]
     async fn test_api_peers_list_empty_registry() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
         let resp = http_request(port, "GET /api/peers HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
@@ -3518,8 +3624,7 @@ mod tests {
         let (target_port, target_handle) = spawn_test_gateway_with_registry(None).await;
 
         // Gateway B: the dashboard, with its own peer registry.
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(64);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (dash_port, dash_handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -3605,8 +3710,7 @@ mod tests {
     /// diagnostic error message.
     #[tokio::test]
     async fn test_api_peers_post_invalid_body() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -3624,8 +3728,7 @@ mod tests {
     /// `DELETE /api/peers` for an unknown peer id returns 404.
     #[tokio::test]
     async fn test_api_peers_delete_unknown_returns_404() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -3683,8 +3786,7 @@ mod tests {
         let (target_port, target_handle) = spawn_test_gateway_with_registry(None).await;
 
         // Gateway B: the dashboard, with its own peer registry.
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(64);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let registry_for_wait = registry.clone();
         let (dash_port, dash_handle) = spawn_test_gateway_with_registry(Some(registry)).await;
@@ -3850,8 +3952,7 @@ mod tests {
     /// peer lookup path before any transport interaction.
     #[tokio::test]
     async fn test_api_peers_op_unknown_peer_returns_404() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -3874,8 +3975,7 @@ mod tests {
     /// `POST /api/peers/{id}/message` with malformed JSON returns 400.
     #[tokio::test]
     async fn test_api_peers_send_message_invalid_body_returns_400() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -3895,8 +3995,7 @@ mod tests {
     /// rejects empty bodies before the peer lookup runs.
     #[tokio::test]
     async fn test_api_peers_send_message_requires_text_or_content() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -3921,8 +4020,7 @@ mod tests {
     /// "supported op" from "unrecognized verb".
     #[tokio::test]
     async fn test_api_peers_unknown_op_returns_404() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -3964,8 +4062,7 @@ mod tests {
     /// hint that at least one is required.
     #[tokio::test]
     async fn test_api_peers_eligible_requires_capability_param() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -3989,8 +4086,7 @@ mod tests {
     /// peers).
     #[tokio::test]
     async fn test_api_peers_eligible_rejects_unknown_capability() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -4049,8 +4145,7 @@ mod tests {
     /// Bad JSON body returns 400.
     #[tokio::test]
     async fn test_api_coordinator_route_invalid_body_returns_400() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -4070,8 +4165,7 @@ mod tests {
     /// which is almost never what the caller meant.
     #[tokio::test]
     async fn test_api_coordinator_route_rejects_empty_capabilities() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -4098,8 +4192,7 @@ mod tests {
     /// GET on the route endpoint returns 405 — only POST is allowed.
     #[tokio::test]
     async fn test_api_coordinator_route_get_returns_405() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 

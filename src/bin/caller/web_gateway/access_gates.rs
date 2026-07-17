@@ -235,7 +235,7 @@ fn direct_loopback_dashboard_request(peer_addr: std::net::SocketAddr, header_tex
     }
 }
 
-fn has_reverse_proxy_provenance(header_text: &str) -> bool {
+pub(crate) fn has_reverse_proxy_provenance(header_text: &str) -> bool {
     header_text.lines().skip(1).any(|line| {
         let Some((name, _)) = line.split_once(':') else {
             return false;
