@@ -3020,6 +3020,7 @@ pub(crate) async fn run_round_loop(
                     round,
                     turns_in_round,
                     native_message_count,
+                    project_root: Some(project.root.clone()),
                 });
 
                 // Parked-steer pickup, half 1 (see claim_steer_injections):
