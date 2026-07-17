@@ -390,7 +390,11 @@ fn cache_vitals_from_usage(
     if sample_total == 0 {
         return None;
     }
-    let hit_pct = ((read * 100 + sample_total / 2) / sample_total).min(100) as u8;
+    // Floor, never round: 100 must mean the entire sample was served from
+    // the cache (read == sample_total exactly). Rounding displayed a
+    // 99.5%+ hit as a lying "100%" — a fraction of a percent of fresh
+    // input is still fresh input, and the number should say so.
+    let hit_pct = ((read * 100) / sample_total).min(100) as u8;
     let ttl_seconds = main
         .cache_ttl_seconds
         .or(previous_ttl)
@@ -948,6 +952,8 @@ mod tests {
         assert_eq!(vitals.ttl_seconds, Some(3600));
 
         // Read-only response: no flavor statement — sticky TTL survives.
+        // 100% is honest here: creation + uncached == 0, so the whole
+        // sample really was served from cache.
         let sticky = cache_vitals_from_usage(
             &usage_with_sample("anthropic", 100, 0, 0, None),
             Some(3600),
@@ -976,6 +982,36 @@ mod tests {
             cache_vitals_from_usage(&usage_with_sample("anthropic", 0, 0, 0, None), None, 46)
                 .is_none()
         );
+    }
+
+    /// The hit percentage floors — it never rounds a near-miss up to a
+    /// dishonest 100 (or any x.5+ up to the next integer). 100 appears
+    /// only when creation + uncached == 0, i.e. read == sample_total.
+    #[test]
+    fn cache_hit_pct_floors_never_rounds() {
+        // 999 cached / 1 fresh = 99.9% — rounding displayed 100 (the
+        // observed live lie); floor says 99.
+        let near_miss =
+            cache_vitals_from_usage(&usage_with_sample("anthropic", 999, 0, 1, None), None, 47)
+                .expect("sample present");
+        assert_eq!(near_miss.hit_pct, Some(99));
+
+        // Same fraction with the fresh tokens split across creation and
+        // uncached input — both count against the hit.
+        let split =
+            cache_vitals_from_usage(&usage_with_sample("anthropic", 1998, 1, 1, None), None, 48)
+                .expect("sample present");
+        assert_eq!(split.hit_pct, Some(99));
+
+        // Mid-range: 2/3 = 66.7% floors to 66, never rounds to 67.
+        let mid = cache_vitals_from_usage(&usage_with_sample("openai", 2, 0, 1, None), None, 49)
+            .expect("sample present");
+        assert_eq!(mid.hit_pct, Some(66));
+
+        // Exactly everything cached is the one honest 100.
+        let full = cache_vitals_from_usage(&usage_with_sample("openai", 7, 0, 0, None), None, 50)
+            .expect("sample present");
+        assert_eq!(full.hit_pct, Some(100));
     }
 
     #[tokio::test]
