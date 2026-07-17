@@ -42,6 +42,8 @@ pub(crate) use relay::*;
 const PROTOCOL: &str = "intendant-connect-rendezvous-v1";
 const REGISTER_PROOF_PROTOCOL: &str = "intendant-connect-register-proof-v1";
 const HOSTED_CONTROL_CAPABILITY_PROTOCOL: &str = "intendant-connect-hosted-control-capability-v1";
+const FLEET_CERTIFICATE_LEDGER_PROTOCOL: &str = "intendant-fleet-certificate-ledger-v1";
+const FLEET_CERTIFICATE_LEDGER_SERIALS_CAP: usize = 256;
 const CLAIM_PROTOCOL: &str = "intendant-connect-claim-v1";
 /// v2 claim proofs bind the claiming account (user id + handle at claim
 /// time) into the payload the daemon signs, so the account↔daemon binding
@@ -1126,6 +1128,32 @@ struct AttestationRecord {
     proof: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FleetCertificateLedgerRecord {
+    protocol: String,
+    daemon_id: String,
+    daemon_public_key: String,
+    fleet_origin: String,
+    serials: Vec<String>,
+    issued_unix_ms: u64,
+    signature: String,
+}
+
+impl FleetCertificateLedgerRecord {
+    fn unsigned_payload(&self) -> String {
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            self.protocol,
+            self.daemon_id,
+            self.daemon_public_key,
+            self.fleet_origin,
+            self.serials.join(","),
+            self.issued_unix_ms,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonRecord {
     daemon_id: String,
@@ -1137,6 +1165,10 @@ struct DaemonRecord {
     /// and may refuse the route.
     #[serde(default)]
     hosted_control_enabled: bool,
+    /// Daemon-signed expected certificate serials for the exact fleet origin.
+    /// Connect stores and projects this document without becoming its signer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fleet_certificate_ledger: Option<FleetCertificateLedgerRecord>,
     /// Connect account association for discovery/routing. The legacy
     /// field name is retained for store compatibility; it is not a daemon
     /// IAM owner and carries no daemon authority.
@@ -1779,6 +1811,7 @@ fn daemon_view(daemon: &DaemonRecord, hosted_control_url: Option<&str>) -> serde
         // This is navigation metadata; opening it still begins at the
         // daemon's public doorbell with no authority.
         "hosted_control_url": hosted_control_url,
+        "fleet_certificate_ledger": daemon.fleet_certificate_ledger,
     })
 }
 
@@ -1809,6 +1842,7 @@ fn daemon_fleet_target_view(config: &ServiceConfig, daemon: &DaemonRecord) -> se
         "online": online,
         "claimed_daemon": true,
         "daemon_public_key": daemon.daemon_public_key,
+        "fleet_certificate_ledger": daemon.fleet_certificate_ledger,
         // Route/account metadata is deliberately not an openable control
         // target in the default hosted build.
         "url": "",
@@ -1957,6 +1991,7 @@ mod tests {
             label: None,
             daemon_public_key: "daemon-key".to_string(),
             hosted_control_enabled: false,
+            fleet_certificate_ledger: None,
             owner_user_id: None,
             claim_code_hash: None,
             claim_code_created_unix_ms: None,
@@ -2107,6 +2142,7 @@ mod tests {
                 label: None,
                 daemon_public_key: "key".to_string(),
                 hosted_control_enabled: false,
+                fleet_certificate_ledger: None,
                 owner_user_id: None,
                 claim_code_hash: None,
                 claim_code_created_unix_ms: None,
@@ -2187,6 +2223,7 @@ mod tests {
                 label: None,
                 daemon_public_key: "key".to_string(),
                 hosted_control_enabled: false,
+                fleet_certificate_ledger: None,
                 owner_user_id: None,
                 claim_code_hash: None,
                 claim_code_created_unix_ms: None,

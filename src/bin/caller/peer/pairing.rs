@@ -742,6 +742,7 @@ pub(crate) fn join_peer_invite(
                 client_key: Some(key_path.to_string_lossy().into_owned()),
                 pinned_fingerprints: pins,
                 browser_tcp_via_url: None,
+                certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
             });
         }
     }
@@ -1134,6 +1135,7 @@ mod tests {
                     client_key: None,
                     pinned_fingerprints: Vec::new(),
                     browser_tcp_via_url: Some("ws://browser-via/ws".into()),
+                    certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
                 }],
                 ..ProjectConfig::default()
             },

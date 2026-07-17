@@ -7,7 +7,17 @@ pub(crate) fn is_public_hosted_control_path(method: &str, path: &str) -> bool {
             | ("POST", "/api/hosted-control/requests")
             | ("POST", "/api/hosted-control/requests/poll")
             | ("POST", "/api/hosted-control/anchor-decisions")
+            | ("GET", "/api/hosted-control/certificate-ledger")
+            | ("POST", "/api/hosted-control/witness-reports")
     )
+}
+
+pub(crate) fn is_fleet_only_hosted_control_path(method: &str, path: &str) -> bool {
+    is_public_hosted_control_path(method, path)
+        && !matches!(
+            (method, path),
+            ("GET", "/api/hosted-control/certificate-ledger")
+        )
 }
 
 fn json_value<T: serde::Serialize>(value: T) -> ApiResponse {
@@ -144,6 +154,52 @@ pub(crate) async fn handle_hosted_control_anchor_decision(
     write_api_response(stream, response, cors, None).await;
 }
 
+pub(crate) async fn handle_hosted_control_certificate_ledger(
+    stream: DemuxStream,
+    runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
+    cors: crate::gateway_routes::CorsPosture,
+) {
+    let response = match runtime.certificate_ledger() {
+        Ok(ledger) => json_value(ledger),
+        Err(error) if !runtime.configured() => ApiResponse::json_error(404, error),
+        Err(error) if !runtime.enabled() => ApiResponse::json_error(503, error),
+        Err(error) => ApiResponse::json_error(503, error),
+    };
+    write_api_response(stream, response, cors, None).await;
+}
+
+pub(crate) async fn handle_hosted_control_witness_report(
+    stream: DemuxStream,
+    body: String,
+    runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
+    header_text: &str,
+    is_tls: bool,
+    cors: crate::gateway_routes::CorsPosture,
+) {
+    let response = match serde_json::from_str::<
+        crate::access::hosted_control::HostedCertificateWitnessReport,
+    >(&body)
+    .map_err(|error| format!("invalid certificate witness report: {error}"))
+    .and_then(|report| {
+        let request_origin = fleet_origin_from_request(header_text, is_tls)?;
+        if report.fleet_origin != request_origin {
+            return Err("certificate witness fleet origin does not match the request".to_string());
+        }
+        runtime.receive_signed_app_witness(report)
+    }) {
+        Ok(guard) => json_value(crate::access::hosted_control::HostedPublicLaneGuard {
+            status: guard.status,
+        }),
+        Err(error) if !runtime.configured() => ApiResponse::json_error(404, error),
+        Err(error) if !runtime.enabled() => ApiResponse::json_error(503, error),
+        Err(error) if error.contains("no qualifying signed application distribution") => {
+            ApiResponse::json_error(503, error)
+        }
+        Err(error) => ApiResponse::json_error(403, error),
+    };
+    write_api_response(stream, response, cors, None).await;
+}
+
 pub(crate) async fn handle_hosted_control_ws_ticket(
     stream: DemuxStream,
     runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
@@ -184,6 +240,18 @@ struct HostedPolicyInput {
 struct HostedEligibilityInput {
     session_id: String,
     eligible: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostedWitnessConfirmInput {
+    serial_hex: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostedWitnessOverrideInput {
+    evidence_sha256: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -285,6 +353,35 @@ pub(crate) async fn handle_hosted_control_management(
                 Err(error) => ApiResponse::json_error(400, error),
             }
         }
+        ("POST", "/api/access/hosted-control/witnesses/confirm") => {
+            match serde_json::from_str::<HostedWitnessConfirmInput>(&body)
+                .map_err(|error| format!("invalid certificate confirmation: {error}"))
+                .and_then(|input| {
+                    runtime
+                        .confirm_witness_serial(&input.serial_hex, actor)
+                        .map_err(|error| error.to_string())
+                }) {
+                Ok(guard) => json_value(guard),
+                Err(error) => ApiResponse::json_error(400, error),
+            }
+        }
+        ("POST", "/api/access/hosted-control/witnesses/override") => {
+            match serde_json::from_str::<HostedWitnessOverrideInput>(&body)
+                .map_err(|error| format!("invalid certificate override: {error}"))
+                .and_then(|input| {
+                    runtime
+                        .override_witness_guard(&input.evidence_sha256, actor)
+                        .map_err(|error| error.to_string())
+                }) {
+                Ok(guard) => json_value(guard),
+                Err(error)
+                    if error == crate::access::hosted_control::WITNESS_EVIDENCE_CHANGED_ERROR =>
+                {
+                    ApiResponse::json_error(409, error)
+                }
+                Err(error) => ApiResponse::json_error(400, error),
+            }
+        }
         ("POST", "/api/access/hosted-control/anchors") => {
             match serde_json::from_str::<crate::access::hosted_control::SignedAppAnchor>(&body)
                 .map_err(|error| format!("invalid signed-app anchor enrollment: {error}"))
@@ -313,9 +410,19 @@ mod tests {
             ("POST", "/api/hosted-control/requests"),
             ("POST", "/api/hosted-control/requests/poll"),
             ("POST", "/api/hosted-control/anchor-decisions"),
+            ("GET", "/api/hosted-control/certificate-ledger"),
+            ("POST", "/api/hosted-control/witness-reports"),
         ] {
             assert!(is_public_hosted_control_path(method, path));
         }
+        assert!(!is_fleet_only_hosted_control_path(
+            "GET",
+            "/api/hosted-control/certificate-ledger"
+        ));
+        assert!(is_fleet_only_hosted_control_path(
+            "POST",
+            "/api/hosted-control/requests"
+        ));
         for (method, path) in [
             ("POST", "/api/hosted-control/bootstrap"),
             ("GET", "/api/hosted-control/requests"),
