@@ -30,9 +30,13 @@
   let peekBoundLog = null;
   let peekRendered = []; // [{ source, clone }] in list order
   let peekFollow = true;
-  // Explicit close suppresses auto-open until the working streak ends or
-  // the target changes — otherwise the next phase mutation would fight
-  // the user's dismissal.
+  // Explicit close is real state, not a render artifact: every automatic
+  // open stays suppressed until a deliberate trigger clears it — the
+  // working streak ending (so a NEW turn may auto-open), the prompt
+  // target changing, or the user re-entering the dock from outside via a
+  // gesture off the peek (the focusin entry in peekWire). Renders and
+  // live events for the target must never resurrect a dismissed peek —
+  // otherwise the next phase mutation would fight the user's dismissal.
   let peekDismissed = false;
   let peekLastTarget = '';
   let peekLastPhaseCat = null;
@@ -335,6 +339,19 @@
     peekOpen();
   }
 
+  // Every explicit dismissal — the ✕, Esc, outside-click, the QA hook —
+  // funnels through here so the surfaces cannot drift apart again: latch
+  // plus close, plus the ✕'s keep-typing refocus when asked. That refocus
+  // is safe against the open-on-focus entry rule only because of the
+  // gesture guard in peekWire's focusin handler — add dismissal
+  // side-effects here, never at the call sites.
+  function peekDismiss(refocus) {
+    peekClose(true);
+    if (!refocus) return;
+    const input = document.getElementById('activity-task-input');
+    if (input) input.focus({ preventScroll: true });
+  }
+
   function peekBuild(root) {
     const icon = (name, size) => (typeof ui2Icon === 'function' ? ui2Icon(name, size) : '');
     root.setAttribute('role', 'region');
@@ -400,9 +417,7 @@
     });
     closeBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      peekClose(true);
-      const input = document.getElementById('activity-task-input');
-      if (input) input.focus({ preventScroll: true });
+      peekDismiss(true);
     });
     peekList.addEventListener('scroll', () => {
       peekFollow = peekList.scrollTop + peekList.clientHeight >= peekList.scrollHeight - 24;
@@ -414,6 +429,11 @@
   // content on every load of a dashboard with history is a surprise, not
   // an affordance. Focus counts as intent only after a real gesture.
   let peekSawUserGesture = false;
+  // Target of the most recent pointerdown/keydown: gesture state the
+  // focus-entry rule can trust when focus-event bookkeeping cannot be —
+  // WebKit never mouse-focuses buttons, so a focusin caused by clicking
+  // the peek's own chrome arrives with a null/outside relatedTarget.
+  let peekGestureTarget = null;
 
   const peekWire = () => {
     const root = document.getElementById('ui2-composer-peek');
@@ -423,16 +443,28 @@
     peekBarEl = bar;
     peekBuild(root);
 
-    document.addEventListener('pointerdown', () => { peekSawUserGesture = true; }, { capture: true, passive: true });
-    document.addEventListener('keydown', () => { peekSawUserGesture = true; }, { capture: true });
+    const noteGesture = (e) => {
+      peekSawUserGesture = true;
+      peekGestureTarget = e.target instanceof Node ? e.target : null;
+    };
+    document.addEventListener('pointerdown', noteGesture, { capture: true, passive: true });
+    document.addEventListener('keydown', noteGesture, { capture: true });
 
     bar.addEventListener('focusin', (e) => {
       if (!peekSawUserGesture) return;
       if (peekIsOpen() || peekComposerPill()) return;
-      // Focus moving WITHIN the dock (input → Send, the close button's
-      // refocus) is not an entry — reopening there would undo an Esc/×
-      // dismissal the user just made.
+      // Focus moving WITHIN the dock (Tab from input to Send, engines
+      // that focus buttons on click) is not an entry — reopening there
+      // would undo an Esc/× dismissal the user just made.
       if (e.relatedTarget instanceof Node && bar.contains(e.relatedTarget)) return;
+      // relatedTarget alone cannot carry that rule on WebKit: Safari
+      // never mouse-focuses buttons, so the ✕ handler's keep-typing
+      // refocus of the input lands here with a null/body relatedTarget —
+      // and used to reopen the sheet in the very click that dismissed it.
+      // Gesture state instead of focus-event timing: a focus produced by
+      // interacting with the peek itself is peek interaction, never an
+      // entry into the composer.
+      if (peekGestureTarget && peekRoot.contains(peekGestureTarget)) return;
       // Focus landing on the target-switch chrome is retargeting intent,
       // not composition — opening the peek under that popover just stacks
       // two overlays (and made Esc close the hidden one first).
@@ -459,16 +491,16 @@
       if (e.target instanceof Node && peekBarEl.contains(e.target)) {
         e.preventDefault();
         e.stopImmediatePropagation();
-        peekClose(true);
+        peekDismiss(false);
         return;
       }
-      peekClose(true);
+      peekDismiss(false);
     }, true);
 
     document.addEventListener('pointerdown', (e) => {
       if (!peekIsOpen()) return;
       if (e.target instanceof Node && peekBarEl.contains(e.target)) return;
-      peekClose(true);
+      peekDismiss(false);
     }, true);
 
     window.addEventListener('ui2:composer-state', (e) => {
@@ -500,7 +532,7 @@
     window.__ui2Peek = {
       isOpen: peekIsOpen,
       open: peekOpen,
-      close: () => peekClose(true),
+      close: () => peekDismiss(false),
       sessionId: () => peekBoundSid,
     };
   };
