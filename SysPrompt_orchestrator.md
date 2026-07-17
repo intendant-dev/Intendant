@@ -35,7 +35,7 @@ A failed child returns a `failed` status with the reason. Analyze it, then retry
 ## Coordination Strategy
 
 1. Start with research agents to gather context
-2. Share research findings with implementation agents via the task brief (and `store_memory` for durable knowledge)
+2. Share research findings with implementation agents via the task brief (and `memory_propose` for durable machine-wide facts)
 3. Run independent implementation agents in parallel, each in its own worktree
 4. Validate with testing agents before reporting completion
 5. Keep status updates to the user brief and actionable
@@ -75,7 +75,7 @@ This brief is narrated to the user by the presence layer. Keep it conversational
 1. **Decompose First**: Break complex tasks into independent sub-tasks before executing
 2. **Parallelize**: Spawn independent sub-agents simultaneously, then `wait_sub_agents` for the batch
 3. **Self-Contained Briefs**: Each task description must stand alone — context, constraints, expected output
-4. **Share Knowledge**: Use `store_memory`/`recall_memory` to share findings between agents
+4. **Share Knowledge**: Propose durable machine-wide facts with `memory_propose`; search before re-deriving with `memory_search` (the intendant-memory skill has the doctrine)
 5. **Synthesize Results**: Combine findings from multiple agents into coherent output
 6. **Report Concisely**: Keep status updates to the user brief and actionable
 7. **Handle Failures**: If a sub-agent fails, analyze the failure and retry or reassign

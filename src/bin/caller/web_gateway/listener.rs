@@ -3170,11 +3170,6 @@ mod tests {
             "card should advertise ComputerUse capability: {:?}",
             card.capabilities
         );
-        assert!(
-            card.capabilities.contains(&Capability::Knowledge),
-            "card should advertise Knowledge capability: {:?}",
-            card.capabilities
-        );
 
         // Auth defaults to None in phase 1 (trust the network layer).
         assert!(
@@ -3335,7 +3330,6 @@ mod tests {
             agent_state,
             project_root: PathBuf::from("/tmp"),
             log_dir: PathBuf::from("/tmp"),
-            knowledge_path: PathBuf::from("/tmp/knowledge.json"),
             presence_session: None,
             context_injection: None,
         });
@@ -3527,7 +3521,6 @@ mod tests {
             agent_state,
             project_root: PathBuf::from("/tmp"),
             log_dir: PathBuf::from("/tmp"),
-            knowledge_path: PathBuf::from("/tmp/knowledge.json"),
             presence_session: None,
             context_injection: None,
         });
@@ -3590,7 +3583,6 @@ mod tests {
             agent_state,
             project_root: PathBuf::from("/tmp"),
             log_dir: PathBuf::from("/tmp"),
-            knowledge_path: PathBuf::from("/tmp/knowledge.json"),
             presence_session: None,
             context_injection: None,
         });

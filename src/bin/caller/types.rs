@@ -1166,20 +1166,6 @@ pub fn format_model_summary(content: &str) -> String {
                     let q = cmd.get("question").and_then(|q| q.as_str()).unwrap_or("?");
                     format!("ask: {}", truncate_str(q, 100))
                 }
-                "storeMemory" => {
-                    let key = cmd
-                        .get("memory_key")
-                        .and_then(|k| k.as_str())
-                        .unwrap_or("?");
-                    format!("store: {}", key)
-                }
-                "recallMemory" => {
-                    let q = cmd
-                        .get("memory_query")
-                        .and_then(|q| q.as_str())
-                        .unwrap_or("?");
-                    format!("recall: {}", q)
-                }
                 "execPty" => {
                     let command = cmd.get("command").and_then(|c| c.as_str()).unwrap_or("?");
                     format!("pty: {}", truncate_str(command, 120))

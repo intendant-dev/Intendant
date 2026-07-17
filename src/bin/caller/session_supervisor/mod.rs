@@ -182,7 +182,6 @@ pub struct SubAgentSpawnParams {
     /// project's HEAD.
     pub worktree: bool,
     /// Inject the project knowledge store into the child's conversation.
-    pub inherit_memory: bool,
     pub name: Option<String>,
 }
 
@@ -252,7 +251,6 @@ pub(crate) struct SubAgentWiring {
     child_name: String,
     role: sub_agent::SubAgentRole,
     system_prompt: Option<String>,
-    inherit_memory: bool,
     /// The child's delegation depth (parent depth + 1).
     depth: usize,
 }

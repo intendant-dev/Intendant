@@ -462,8 +462,8 @@ pub fn classify_command(cmd: &serde_json::Value) -> Vec<ActionCategory> {
         .is_some_and(|id| id <= 0);
 
     match function {
-        "inspectPath" | "recallMemory" => vec![ActionCategory::FileRead],
-        "writeFile" | "editFile" | "storeMemory" => vec![ActionCategory::FileWrite],
+        "inspectPath" => vec![ActionCategory::FileRead],
+        "writeFile" | "editFile" => vec![ActionCategory::FileWrite],
         "captureScreen" => {
             let mut cats = vec![ActionCategory::FileRead];
             if targets_user_display {

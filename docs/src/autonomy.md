@@ -99,8 +99,8 @@ Commands are classified into categories by inspecting the command JSON
 
 | Category | Examples |
 |----------|----------|
-| FileRead | `inspectPath`, `recallMemory` |
-| FileWrite | `editFile`, `writeFile`, `storeMemory` |
+| FileRead | `inspectPath` |
+| FileWrite | `editFile`, `writeFile` |
 | FileDelete | shell commands with `rm`, `rmdir` |
 | CommandExec | `execAsAgent`, `execPty` |
 | NetworkRequest | shell commands with `curl`, `wget`, `ssh`, `git` |

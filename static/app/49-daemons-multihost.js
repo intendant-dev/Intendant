@@ -2440,7 +2440,7 @@ window.intendantDashboardControl = {
     };
     try {
       dashboardControlServerSender({ t: 'make_active', provider: 'gemini', model: 'debug' });
-      dashboardControlServerSender({ t: 'async_query', id: 'aq_debug', tool: 'recall_memory', args: {} });
+      dashboardControlServerSender({ t: 'async_query', id: 'aq_debug', tool: 'search_transcripts', args: {} });
       dashboardControlServerSender({ action: 'approve', id: 123 });
       await new Promise(resolve => setTimeout(resolve, 0));
     } finally {
