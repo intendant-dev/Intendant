@@ -456,11 +456,14 @@ the agent's click coordinates match the screenshot it receives.
 
 ## Recording
 
-Display recording runs in parallel with WebRTC streaming via ffmpeg
-(`recording.rs`). When a `DisplaySession` exists, frames are subscribed from the
-session, JPEG-encoded, and piped to ffmpeg via `image2pipe`. Without a session,
-the legacy fallback uses `x11grab` on Linux and `screencapture` feeding
-`image2pipe` on macOS. Recordings are segmented into MP4 files (default 60 s)
+Display recording runs in parallel with WebRTC streaming, with ffmpeg strictly
+as the encoder (`recording.rs`). When a `DisplaySession` exists, frames are
+polled from the session, JPEG-encoded, and piped to ffmpeg via `image2pipe`.
+Without a session (`--record-display`, the debug screen), Linux lets ffmpeg
+capture directly via `x11grab`, while macOS captures the requested display
+in-process via ScreenCaptureKit and bridges the frames into the same
+`image2pipe` encoder — so the Intendant process itself must hold the Screen
+Recording permission. Recordings are segmented into MP4 files (default 60 s)
 for efficient seeking; the dashboard provides a player with timeline, seeking,
 and speed control.
 

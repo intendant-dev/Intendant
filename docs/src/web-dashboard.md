@@ -515,6 +515,13 @@ directory is safe to delete; it rebuilds on the next scan.
   writes into the log dir. Child sub-agent sessions are hidden by default;
   enable **Show subagents** to include them. Fork and side sessions stay
   visible with lineage chips that point back to their parent session.
+  Opening a card raises the detail overlay, whose transcript doubles as
+  the lineage explorer: eligible rows grow a hover ⑂ fork affordance
+  (claude-code message anchors, codex turn boundaries — "the child keeps
+  everything above and redoes from here"), abandoned claude-code branches
+  render dimmed with a forkable **branch tip** chip, and the collapsed
+  **Fork points** panel lists the complete catalog (native rounds, codex
+  item anchors, anchors beyond the loaded pages).
   When a peer daemon is connected, a **host strip** appears above the
   toolbar: pick a peer chip to browse that daemon's sessions in place
   (read-only cards; clicking one hands off to the peer's own dashboard,

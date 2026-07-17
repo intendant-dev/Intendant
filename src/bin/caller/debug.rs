@@ -80,7 +80,8 @@ pub async fn setup_debug_screen(web_port: u16) -> Result<DebugScreen, String> {
         .spawn()
         .map_err(|e| format!("Failed to open browser: {}", e))?;
 
-    // display_id 0 = main screen (used by avfoundation for recording)
+    // display_id 0 = kCGNullDirectDisplay, which the in-process
+    // ScreenCaptureKit recording path maps to the main display.
     Ok(DebugScreen {
         xvfb_guard: None,
         firefox: browser,
@@ -155,10 +156,11 @@ pub async fn setup_debug_screen(_web_port: u16) -> Result<DebugScreen, String> {
 pub async fn start_debug_recording(
     display_id: u32,
     config: &RecordingConfig,
+    bus: &EventBus,
 ) -> Result<recording::RecordingGuard, String> {
     let dir = daemon_recordings_dir();
     let _ = std::fs::create_dir_all(&dir);
-    recording::start_display_recording(display_id, 1280, 720, config, &dir).await
+    recording::start_display_recording(display_id, 1280, 720, config, &dir, bus).await
 }
 
 /// Spawn a background task that handles debug screen control messages.
@@ -214,7 +216,7 @@ pub fn spawn_debug_screen_handler(
                             eprintln!("[debug] Already recording");
                             continue;
                         }
-                        match start_debug_recording(s.display_id, &recording_config).await {
+                        match start_debug_recording(s.display_id, &recording_config, &bus).await {
                             Ok(guard) => {
                                 let stream = guard.stream_name().to_string();
                                 rec_guard = Some(guard);

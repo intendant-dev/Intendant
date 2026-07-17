@@ -62,6 +62,12 @@ pub(crate) struct ForkPoint {
     /// history through (the chain-slice anchor).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_uuid: Option<String>,
+    /// Claude Code only: the transcript message uuid whose rendered row
+    /// this point belongs on. `message` anchors cut at a user turn's
+    /// *parent* (`message_uuid`) but read as "fork from before this user
+    /// turn", so the display row is the user turn itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_message_uuid: Option<String>,
     /// Claude Code only: the anchor sits on history replaced by the
     /// newest compact boundary. Informational — the chain-slice fork
     /// omits the boundary and keeps full pre-compaction history.
