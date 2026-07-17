@@ -470,6 +470,7 @@ pub(crate) struct WsInboundCtx {
     pub(crate) dashboard_control_grant: crate::dashboard_control::DashboardControlGrant,
     pub(crate) peer_file_transfer_registry:
         Arc<crate::peer_file_transfer::PeerFileTransferRegistry>,
+    pub(crate) hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
     pub(crate) peer_identity: Option<PeerConnectionIdentity>,
     pub(crate) browser_host_ip: Option<std::net::IpAddr>,
     pub(crate) ice_config: crate::display::IceConfig,
@@ -513,6 +514,7 @@ pub(crate) async fn ws_inbound_task(
         dashboard_control: dashboard_control_inbound,
         dashboard_control_grant: dashboard_control_grant_inbound,
         peer_file_transfer_registry: peer_file_transfer_registry_inbound,
+        hosted_control: hosted_control_inbound,
         peer_identity: peer_identity_inbound,
         browser_host_ip,
         ice_config,
@@ -2173,6 +2175,36 @@ pub(crate) async fn ws_inbound_task(
                                     &bus_inbound,
                                 )
                                 .await;
+                            }
+                            Ok(ControlMsg::HostedCertificateWitness { report }) => {
+                                let Some(identity) = peer_identity_inbound.as_ref() else {
+                                    continue;
+                                };
+                                match hosted_control_inbound.receive_peer_witness(
+                                    report,
+                                    &identity.fingerprint,
+                                    &identity.label,
+                                ) {
+                                    Ok(guard) => {
+                                        bus_inbound.send(AppEvent::PresenceLog {
+                                            message: format!(
+                                                "[hosted-control] peer certificate witness recorded; lane guard={}",
+                                                guard.status.as_str(),
+                                            ),
+                                            level: Some(LogLevel::Info),
+                                            turn: None,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        bus_inbound.send(AppEvent::PresenceLog {
+                                            message: format!(
+                                                "[hosted-control] rejected peer certificate witness: {error}"
+                                            ),
+                                            level: Some(LogLevel::Warn),
+                                            turn: None,
+                                        });
+                                    }
+                                }
                             }
                             Ok(ControlMsg::RequestDisplayInputAuthority { display_id }) => {
                                 // Phase 5a.1: handler body lives in

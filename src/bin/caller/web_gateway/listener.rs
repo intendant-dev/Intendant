@@ -543,6 +543,12 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
         hosted_control_daemon_label,
         display_media_relay_configured,
     ));
+    if let Some(registry) = peer_registry.clone() {
+        crate::peer::certificate_witness::spawn_certificate_witness_loop(
+            Arc::clone(&hosted_control),
+            registry,
+        );
+    }
     // Cache the most recent worktree inventory scan. Scanning can walk
     // large worktree directories for disk-size accounting, so the
     // dashboard explicitly triggers refreshes instead of doing it on
@@ -993,6 +999,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
         config.connect.clone(),
         dashboard_control.clone(),
         tcp_advertised_port,
+        Arc::clone(&hosted_control),
     );
     // Reachability relay tunnel: hold a control channel to Connect and splice
     // relayed browser connections into the dedicated loopback-only ingress
@@ -2468,6 +2475,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         dashboard_control: Arc::clone(&dashboard_control),
                         dashboard_control_grant: dashboard_control_grant_for_ws.clone(),
                         peer_file_transfer_registry: Arc::clone(&peer_file_transfer_registry),
+                        hosted_control: Arc::clone(&hosted_control),
                         peer_identity: peer_identity_for_ws.clone(),
                         browser_host_ip,
                         ice_config: ice_config.clone(),

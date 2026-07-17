@@ -729,6 +729,29 @@ impl PeerHandle {
         }
     }
 
+    /// Submit this daemon's signed observation of the peer's hosted fleet
+    /// certificate over the already-authenticated peer transport.
+    pub async fn submit_certificate_witness(
+        &self,
+        report: crate::access::hosted_control::HostedCertificateWitnessReport,
+    ) -> Result<(), PeerError> {
+        if !self.features().certificate_witness {
+            return Err(PeerError::UnsupportedCapability(
+                "hosted_certificate_witness".into(),
+            ));
+        }
+        match self
+            .exec(PeerOp::HostedCertificateWitness { report })
+            .await?
+        {
+            PeerOpAck::Ok => Ok(()),
+            other => Err(PeerError::Transport(format!(
+                "expected Ok ack, got {}",
+                other.name()
+            ))),
+        }
+    }
+
     /// Request explicit disconnect. Awaits until the actor has
     /// transitioned to [`ConnectionState::Disconnected`] so callers
     /// know the transport is actually torn down when this returns.

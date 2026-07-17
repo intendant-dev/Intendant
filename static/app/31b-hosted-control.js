@@ -92,6 +92,7 @@ function hostedControlEnsureGate() {
              aria-labelledby="hosted-control-title">
       <h1 id="hosted-control-title">Borrow control of this daemon</h1>
       <p id="hosted-control-summary"></p>
+      <div class="hosted-control-guard" id="hosted-control-guard" hidden></div>
       <div class="hosted-control-fingerprint" id="hosted-control-daemon"></div>
       <div class="hosted-control-grid">
         <label>Ceiling preset<select id="hosted-control-preset"></select></label>
@@ -224,7 +225,9 @@ function hostedControlPathNeedsProof(url) {
       || path === '/api/hosted-control/bootstrap'
       || path === '/api/hosted-control/requests'
       || path === '/api/hosted-control/requests/poll'
-      || path === '/api/hosted-control/anchor-decisions') {
+      || path === '/api/hosted-control/anchor-decisions'
+      || path === '/api/hosted-control/certificate-ledger'
+      || path === '/api/hosted-control/witness-reports') {
     return false;
   }
   return true;
@@ -300,10 +303,32 @@ async function hostedControlPrepare() {
   );
   const gate = hostedControlEnsureGate();
   gate.hidden = false;
+  const guard = body.lane_guard || { status: 'clear', unexpected_serials: [] };
+  const guardBox = document.getElementById('hosted-control-guard');
+  const guardStatus = String(guard.status || 'clear');
+  if (guardStatus !== 'clear') {
+    guardBox.hidden = false;
+    guardBox.className = `hosted-control-guard ${guardStatus}`;
+    guardBox.textContent = guardStatus === 'suspended'
+      ? 'Hosted leases are suspended because certificate evidence was confirmed.'
+      : guardStatus === 'alert'
+        ? 'A certificate witness reported a serial outside this daemon’s signed ledger.'
+        : 'The owner kept the lane available for the currently displayed certificate evidence.';
+  }
   document.getElementById('hosted-control-summary').textContent =
-    `${body.daemon_label || body.daemon_id} will mint only the preset you request, bounded by its ${body.ceiling} ceiling.`;
+    `Certificate witnesses shorten the detection window. The lease ceiling and immutable floor bound what the hosted lane can do. ${body.daemon_label || body.daemon_id} will mint only the preset you request, up to ${body.ceiling}.`;
   document.getElementById('hosted-control-daemon').textContent =
     `daemon ${body.daemon_id}\nidentity ${body.daemon_public_key}`;
+  if (guardStatus === 'suspended') {
+    const button = document.getElementById('hosted-control-request');
+    button.disabled = true;
+    button.hidden = true;
+    hostedControlSetGateStatus(
+      'This lane is suspended. Review the certificate evidence from a direct-mTLS dashboard or local console.',
+      true,
+    );
+    await new Promise(() => {});
+  }
   const label = document.getElementById('hosted-control-label');
   label.value = `${navigator.platform || 'Browser'} browser`;
   const presetSelect = document.getElementById('hosted-control-preset');
@@ -518,13 +543,74 @@ function hostedControlRenderManagementCard() {
     }).join('') || '<p>No active leases.</p>';
     const eligible = (state.policy.eligible_session_ids || [])
       .map(id => `<span class="acc-chip">${hostedControlEscape(id)}</span>`).join(' ') || 'None';
+    const guard = state.lane_guard || {
+      status: 'clear',
+      unexpected_serials: [],
+      corroborated_serials: [],
+      ct_serials: [],
+      owner_confirmed_serials: [],
+      reports: [],
+    };
+    const guardStatus = String(guard.status || 'clear');
+    const ledger = state.certificate_ledger || null;
+    const expected = (ledger?.serials || [])
+      .map(serial => `<span class="acc-chip hosted-control-serial">${hostedControlEscape(serial)}</span>`)
+      .join(' ') || 'Unavailable';
+    const unexpected = (guard.unexpected_serials || [])
+      .map(serial => `<span class="acc-chip hosted-control-serial">${hostedControlEscape(serial)}</span>`)
+      .join(' ') || 'None';
+    const evidenceSources = [
+      ['Observer quorum', guard.corroborated_serials || []],
+      ['Transparency log', guard.ct_serials || []],
+      ['Owner confirmed', guard.owner_confirmed_serials || []],
+    ].filter(([, serials]) => serials.length).map(([label, serials]) =>
+      `<div><strong>${hostedControlEscape(label)}:</strong> ${serials
+        .map(serial => `<span class="acc-chip hosted-control-serial">${hostedControlEscape(serial)}</span>`)
+        .join(' ')}</div>`).join('')
+      || '<div><strong>Confirmed sources:</strong> None</div>';
+    const confirmed = new Set(guard.owner_confirmed_serials || []);
+    const confirmActions = ['alert', 'overridden'].includes(guardStatus)
+      ? (guard.unexpected_serials || [])
+        .filter(serial => guardStatus === 'overridden' || !confirmed.has(serial))
+        .map(serial => `<button data-hosted-confirm-serial="${hostedControlEscape(serial)}">
+          ${guardStatus === 'overridden' ? 'Suspend for' : 'Confirm'}
+          ${hostedControlEscape(serial)}</button>`).join('')
+      : '';
+    const overrideAction = ['alert', 'suspended'].includes(guardStatus)
+      ? '<button data-hosted-guard-override>Keep lane available for this evidence</button>'
+      : '';
+    const witnessRows = (guard.reports || []).slice(-12).reverse().map(record => {
+      const report = record.report || {};
+      return `<div class="hosted-control-witness-row">
+        <span><strong>${hostedControlEscape(record.observer_label || report.observer_id)}</strong>
+        · ${hostedControlEscape(report.observer_kind)} · ${hostedControlEscape(report.vantage)}</span>
+        <span class="hosted-control-serial">${hostedControlEscape(report.observed_serial_hex)}</span>
+        <time>${hostedControlEscape(new Date(Number(record.received_unix_ms)).toLocaleString())}</time>
+      </div>`;
+    }).join('') || '<p>No witness reports.</p>';
     mount.innerHTML = `<div class="acc-section-head">
       <div class="acc-section-title">Hosted control</div>
       <div class="acc-section-sub">Daemon-minted, browser-key-bound leases. Feature:
       ${state.enabled ? 'enabled' : state.configured ? 'initialization error' : 'dark'}.
-      Signed-app confirmation is unavailable until a qualifying signed distribution ships.</div>
+      Signed-app confirmation and witnessing are unavailable until a qualifying signed distribution ships.</div>
     </div>
     <div class="hosted-control-mgmt">
+      <div class="hosted-control-mgmt-section hosted-control-guard-section ${hostedControlEscape(guardStatus)}">
+        <div class="hosted-control-guard-heading">
+          <strong>Certificate guard</strong>
+          <span class="hosted-control-guard-status">${hostedControlEscape(guardStatus)}</span>
+        </div>
+        <p>Certificate witnesses shorten the detection window. The lease ceiling and immutable floor
+        bound what the hosted lane can do.</p>
+        <div><strong>Signed ledger${ledger?.fleet_origin
+          ? ` · ${hostedControlEscape(ledger.fleet_origin)}` : ''}:</strong> ${expected}</div>
+        <div><strong>Unexpected serials:</strong> ${unexpected}</div>
+        <div class="hosted-control-evidence-sources">${evidenceSources}</div>
+        <div class="hosted-control-mgmt-row">${confirmActions}${overrideAction}</div>
+        <div class="hosted-control-witnesses">${witnessRows}</div>
+        <p>One report alerts. Two distinct observers with at least one outside-network vantage,
+        a transparency-log match, or owner confirmation suspends the lane. Same-LAN reports stay weak.</p>
+      </div>
       <div class="hosted-control-mgmt-section">
         <strong>Daemon ceiling</strong>
         <div class="hosted-control-mgmt-row">
@@ -576,6 +662,21 @@ function hostedControlRenderManagementCard() {
       button.onclick = () => hostedControlManagementPost(
         '/api/access/hosted-control/leases/revoke',
         { lease_id: button.dataset.hostedRevoke },
+      ).then(hostedControlRenderManagementCard)
+        .catch(error => showControlToast?.('error', error.message));
+    }
+    for (const button of mount.querySelectorAll('[data-hosted-confirm-serial]')) {
+      button.onclick = () => hostedControlManagementPost(
+        '/api/access/hosted-control/witnesses/confirm',
+        { serial_hex: button.dataset.hostedConfirmSerial },
+      ).then(hostedControlRenderManagementCard)
+        .catch(error => showControlToast?.('error', error.message));
+    }
+    const override = mount.querySelector('[data-hosted-guard-override]');
+    if (override) {
+      override.onclick = () => hostedControlManagementPost(
+        '/api/access/hosted-control/witnesses/override',
+        {},
       ).then(hostedControlRenderManagementCard)
         .catch(error => showControlToast?.('error', error.message));
     }

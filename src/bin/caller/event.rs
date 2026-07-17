@@ -2002,6 +2002,12 @@ pub enum ControlMsg {
         session_id: String,
         signal: crate::peer::WebRtcSignal,
     },
+    /// An authenticated peer's certificate observation for this daemon's
+    /// hosted fleet name. The gateway consumes this at the peer transport
+    /// edge; it is never forwarded into the general control plane.
+    HostedCertificateWitness {
+        report: crate::access::hosted_control::HostedCertificateWitnessReport,
+    },
     CreateBrowserWorkspace {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,

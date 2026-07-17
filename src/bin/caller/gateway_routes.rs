@@ -293,6 +293,8 @@ pub(crate) enum RouteHandlerId {
     HostedControlRequestCreate,
     HostedControlRequestPoll,
     HostedControlAnchorDecision,
+    HostedControlCertificateLedger,
+    HostedControlWitnessReport,
     HostedControlWsTicket,
     HostedControlManagement,
     /// Shared by the user-client-grants / grants-update pair (one legacy
@@ -1538,6 +1540,22 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::HostedControlAnchorDecision,
         "Present a signed application-anchor decision document",
     ),
+    public_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/hosted-control/certificate-ledger"),
+        BodyPolicy::None,
+        RouteHandlerId::HostedControlCertificateLedger,
+        "Read the daemon-signed fleet-certificate ledger (no authority)",
+    ),
+    public_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/witness-reports"),
+        BodyPolicy::Capped(
+            crate::access::hosted_control::HOSTED_WITNESS_REPORT_BODY_CAP_BYTES,
+        ),
+        RouteHandlerId::HostedControlWitnessReport,
+        "Present a certificate observation signed by an enrolled application witness",
+    ),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/hosted-control/ws-ticket"),
@@ -1725,7 +1743,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AccessManage,
         BodyPolicy::None,
         RouteHandlerId::HostedControlManagement,
-        "Hosted-control policy, pending request, active lease, and signed-app anchor state",
+        "Hosted-control policy, lease, signed-app anchor, and certificate-guard state",
     ),
     op_route(
         RouteMethod::Post,
@@ -1733,7 +1751,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AccessManage,
         BodyPolicy::Default,
         RouteHandlerId::HostedControlManagement,
-        "Decide requests, revoke leases, change policy, or mark hosted-eligible sessions",
+        "Decide requests, revoke leases, change policy, mark hosted-eligible sessions, or act on certificate evidence",
     ),
     // ── Connect rendezvous administration. Status is inspect-grade but
     //    never carries the one-time claim code; revealing the code is its own
@@ -2674,6 +2692,10 @@ mod tests {
         assert_eq!(
             policy("POST", "/api/access/org-grants/renew"),
             BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/hosted-control/witness-reports"),
+            BodyPolicy::Capped(crate::access::hosted_control::HOSTED_WITNESS_REPORT_BODY_CAP_BYTES,)
         );
         // Handler-owned streams: uploads spool to a tempfile; the doorbell's
         // cap is runtime config the table cannot carry.

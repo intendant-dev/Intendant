@@ -1562,6 +1562,11 @@ pub(crate) async fn handle_control_command_mcp(
             // has no path to the registry from this dispatcher; no-op.
             None
         }
+        ControlMsg::HostedCertificateWitness { .. } => {
+            // Accepted only on an authenticated peer WebSocket and consumed
+            // at that transport edge. MCP cannot supply the peer binding.
+            None
+        }
     }
 }
 

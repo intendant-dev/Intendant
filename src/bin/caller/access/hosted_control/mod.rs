@@ -8,7 +8,9 @@
 mod model;
 mod policy;
 mod runtime;
+mod witness;
 
 pub use model::*;
 pub use policy::*;
 pub use runtime::*;
+pub use witness::*;

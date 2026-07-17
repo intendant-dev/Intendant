@@ -261,6 +261,8 @@ pub(crate) struct DaemonRegisterRequest {
     hosted_control_enabled: Option<bool>,
     #[serde(default)]
     hosted_control_signature: Option<String>,
+    #[serde(default)]
+    fleet_certificate_ledger: Option<FleetCertificateLedgerRecord>,
 }
 
 const MAX_DAEMON_ID_BYTES: usize = 128;
@@ -346,6 +348,90 @@ fn validate_daemon_register_shape(
                 "hosted-control capability and signature must be supplied together",
             ));
         }
+    }
+    Ok(())
+}
+
+fn normalize_certificate_serial(serial: &str) -> Option<String> {
+    if serial.is_empty()
+        || serial.len() > 128
+        || !serial.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let lower = serial.to_ascii_lowercase();
+    let trimmed = lower.trim_start_matches('0');
+    Some(if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    })
+}
+
+fn verify_fleet_certificate_ledger(
+    body: &DaemonRegisterRequest,
+    ledger: &FleetCertificateLedgerRecord,
+) -> ApiResult<()> {
+    if body.hosted_control_enabled != Some(true) {
+        return Err(ApiError::bad_request(
+            "fleet certificate ledger requires hosted control to be enabled",
+        ));
+    }
+    if ledger.protocol != FLEET_CERTIFICATE_LEDGER_PROTOCOL
+        || ledger.daemon_id != body.daemon_id
+        || ledger.daemon_public_key != body.daemon_public_key
+        || ledger.issued_unix_ms == 0
+        || ledger.issued_unix_ms
+            > body
+                .issued_at_unix_ms
+                .saturating_add(REGISTER_PROOF_MAX_SKEW_MS)
+    {
+        return Err(ApiError::bad_request(
+            "fleet certificate ledger binding is invalid",
+        ));
+    }
+    let origin = Url::parse(&ledger.fleet_origin)
+        .map_err(|_| ApiError::bad_request("fleet certificate ledger origin is invalid"))?;
+    if origin.scheme() != "https"
+        || origin.host_str().is_none()
+        || origin.username() != ""
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+        || origin.origin().ascii_serialization() != ledger.fleet_origin
+    {
+        return Err(ApiError::bad_request(
+            "fleet certificate ledger origin must be an exact HTTPS origin",
+        ));
+    }
+    if ledger.serials.is_empty() || ledger.serials.len() > FLEET_CERTIFICATE_LEDGER_SERIALS_CAP {
+        return Err(ApiError::bad_request(
+            "fleet certificate ledger serial count is invalid",
+        ));
+    }
+    let normalized = ledger
+        .serials
+        .iter()
+        .map(|serial| normalize_certificate_serial(serial))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| ApiError::bad_request("fleet certificate ledger serial is invalid"))?;
+    let mut canonical = normalized.clone();
+    canonical.sort();
+    canonical.dedup();
+    if ledger.serials != normalized || canonical != normalized {
+        return Err(ApiError::bad_request(
+            "fleet certificate ledger serials are not canonical",
+        ));
+    }
+    if !verify_ed25519_b64u(
+        &ledger.daemon_public_key,
+        ledger.unsigned_payload().as_bytes(),
+        &ledger.signature,
+    ) {
+        return Err(ApiError::bad_request(
+            "fleet certificate ledger signature is invalid",
+        ));
     }
     Ok(())
 }
@@ -487,6 +573,9 @@ fn verify_registration_proof(body: &DaemonRegisterRequest, now: u64) -> ApiResul
             ));
         }
     }
+    if let Some(ledger) = body.fleet_certificate_ledger.as_ref() {
+        verify_fleet_certificate_ledger(body, ledger)?;
+    }
     Ok(())
 }
 
@@ -599,6 +688,7 @@ fn apply_daemon_registration(
             label: None,
             daemon_public_key: daemon_public_key.to_string(),
             hosted_control_enabled: false,
+            fleet_certificate_ledger: None,
             owner_user_id: None,
             claim_code_hash: None,
             claim_code_created_unix_ms: None,
@@ -725,6 +815,10 @@ pub(crate) async fn daemon_register(
                     {
                         if record.hosted_control_enabled != hosted_control_enabled {
                             record.hosted_control_enabled = hosted_control_enabled;
+                            outcome.durable_change = true;
+                        }
+                        if record.fleet_certificate_ledger != body.fleet_certificate_ledger {
+                            record.fleet_certificate_ledger = body.fleet_certificate_ledger.clone();
                             outcome.durable_change = true;
                         }
                     }
@@ -2267,6 +2361,7 @@ mod tests {
             label: None,
             daemon_public_key: format!("{daemon_id}-key"),
             hosted_control_enabled: false,
+            fleet_certificate_ledger: None,
             owner_user_id,
             claim_code_hash: claim_code.map(claim_code_hash),
             claim_code_created_unix_ms,
@@ -2773,6 +2868,7 @@ mod tests {
             signature,
             hosted_control_enabled: None,
             hosted_control_signature: None,
+            fleet_certificate_ledger: None,
         };
         validate_daemon_register_shape(&valid, false).unwrap();
 
@@ -3094,6 +3190,7 @@ mod tests {
             signature,
             hosted_control_enabled: Some(true),
             hosted_control_signature: Some(b64u(key.sign(capability_payload.as_bytes()).as_ref())),
+            fleet_certificate_ledger: None,
         };
         verify_registration_proof(&valid, now).unwrap();
         let mut altered_capability = valid.clone();
@@ -3123,9 +3220,96 @@ mod tests {
             signature: b64u(key.sign(stale_payload.as_bytes()).as_ref()),
             hosted_control_enabled: None,
             hosted_control_signature: None,
+            fleet_certificate_ledger: None,
         };
         let error = verify_registration_proof(&stale, now).unwrap_err();
         assert!(error.message.contains("stale"));
+    }
+
+    #[test]
+    fn registration_accepts_only_an_exact_daemon_signed_certificate_ledger() {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        use ring::signature::KeyPair as _;
+        let daemon_public_key = b64u(key.public_key().as_ref());
+        let now = 1_700_000_000_000;
+        let claim_code_hash = claim_code_hash("abandon-ability-able-about-above-absent-absorb");
+        let registration_payload =
+            registration_signing_payload("daemon-1", &daemon_public_key, &claim_code_hash, now);
+        let capability_payload = hosted_control_capability_signing_payload(
+            "daemon-1",
+            &daemon_public_key,
+            &claim_code_hash,
+            now,
+            true,
+        );
+        let mut ledger = FleetCertificateLedgerRecord {
+            protocol: FLEET_CERTIFICATE_LEDGER_PROTOCOL.to_string(),
+            daemon_id: "daemon-1".to_string(),
+            daemon_public_key: daemon_public_key.clone(),
+            fleet_origin: "https://fleet.example.test".to_string(),
+            serials: vec!["a".to_string(), "b".to_string()],
+            issued_unix_ms: now,
+            signature: String::new(),
+        };
+        ledger.signature = b64u(key.sign(ledger.unsigned_payload().as_bytes()).as_ref());
+        let valid = DaemonRegisterRequest {
+            protocol: PROTOCOL.to_string(),
+            daemon_id: "daemon-1".to_string(),
+            daemon_public_key,
+            claim_code_hash,
+            issued_at_unix_ms: now,
+            signature: b64u(key.sign(registration_payload.as_bytes()).as_ref()),
+            hosted_control_enabled: Some(true),
+            hosted_control_signature: Some(b64u(key.sign(capability_payload.as_bytes()).as_ref())),
+            fleet_certificate_ledger: Some(ledger.clone()),
+        };
+        verify_registration_proof(&valid, now).unwrap();
+
+        let mut stable = valid.clone();
+        let stable_ledger = stable.fleet_certificate_ledger.as_mut().unwrap();
+        stable_ledger.issued_unix_ms = now - 1_000_000;
+        stable_ledger.signature = b64u(
+            key.sign(stable_ledger.unsigned_payload().as_bytes())
+                .as_ref(),
+        );
+        verify_registration_proof(&stable, now).unwrap();
+
+        let mut altered = valid.clone();
+        altered.fleet_certificate_ledger.as_mut().unwrap().serials = vec!["00a".to_string()];
+        assert!(verify_registration_proof(&altered, now)
+            .unwrap_err()
+            .message
+            .contains("canonical"));
+
+        let mut wrong_origin = ledger;
+        wrong_origin.fleet_origin = "https://other.example.test".to_string();
+        let mut altered = valid;
+        altered.fleet_certificate_ledger = Some(wrong_origin);
+        assert!(verify_registration_proof(&altered, now)
+            .unwrap_err()
+            .message
+            .contains("signature"));
+    }
+
+    #[test]
+    fn account_daemon_view_projects_the_signed_certificate_ledger() {
+        let mut daemon = daemon_record("daemon-1", Some(Uuid::new_v4()), None, None);
+        daemon.fleet_certificate_ledger = Some(FleetCertificateLedgerRecord {
+            protocol: FLEET_CERTIFICATE_LEDGER_PROTOCOL.to_string(),
+            daemon_id: "daemon-1".to_string(),
+            daemon_public_key: "key".to_string(),
+            fleet_origin: "https://fleet.example.test".to_string(),
+            serials: vec!["abc".to_string()],
+            issued_unix_ms: 1,
+            signature: "signature".to_string(),
+        });
+        let view = daemon_view(&daemon, Some("https://fleet.example.test/"));
+        assert_eq!(
+            view["fleet_certificate_ledger"]["serials"],
+            serde_json::json!(["abc"])
+        );
     }
 
     #[test]

@@ -494,6 +494,12 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
 
 #[allow(dead_code)]
 pub fn profile_allows_control_msg(profile: &str, ctrl: &ControlMsg) -> bool {
+    if matches!(ctrl, ControlMsg::HostedCertificateWitness { .. }) {
+        // This transport-only verb is admitted from an authenticated peer
+        // certificate at the gateway edge, independent of general peer
+        // control profiles.
+        return false;
+    }
     if matches!(ctrl, ControlMsg::PeerDashboardControlSignal { .. }) {
         return profile_allows_dashboard_control_tunnel(profile);
     }
@@ -896,6 +902,9 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         // through `profile_allows_dashboard_control_tunnel` (the tunnel is
         // multi-capability, so its door is any-of, not this single op).
         ControlMsg::PeerDashboardControlSignal { .. } => PeerOperation::SessionInspect,
+        // Fallback classification only: the gateway admits this exact
+        // transport verb solely from a verified peer identity.
+        ControlMsg::HostedCertificateWitness { .. } => PeerOperation::PresenceRead,
         ControlMsg::PeerFileTransferSignal { .. } => PeerOperation::FilesystemRead,
         ControlMsg::RequestDisplayInputAuthority { .. }
         | ControlMsg::ReleaseDisplayInputAuthority { .. }

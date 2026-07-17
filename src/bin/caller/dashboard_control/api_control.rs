@@ -1830,6 +1830,7 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::WebRtcSignal { .. } => "webrtc_signal",
         ControlMsg::PeerFileTransferSignal { .. } => "peer_file_transfer_signal",
         ControlMsg::PeerDashboardControlSignal { .. } => "peer_dashboard_control_signal",
+        ControlMsg::HostedCertificateWitness { .. } => "hosted_certificate_witness",
         ControlMsg::RequestDisplayInputAuthority { .. } => "request_display_input_authority",
         ControlMsg::ReleaseDisplayInputAuthority { .. } => "release_display_input_authority",
         ControlMsg::SetDiagnosticsVisualMarker { .. } => "set_diagnostics_visual_marker",

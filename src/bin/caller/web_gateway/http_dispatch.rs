@@ -1362,6 +1362,25 @@ pub(crate) async fn serve_http_request(
                 return handle_hosted_control_anchor_decision(stream, hosted_control, route.cors)
                     .await;
             }
+            RouteHandlerId::HostedControlCertificateLedger => {
+                return handle_hosted_control_certificate_ledger(
+                    stream,
+                    hosted_control,
+                    route.cors,
+                )
+                .await;
+            }
+            RouteHandlerId::HostedControlWitnessReport => {
+                return handle_hosted_control_witness_report(
+                    stream,
+                    route_body,
+                    hosted_control,
+                    header_text,
+                    is_tls,
+                    route.cors,
+                )
+                .await;
+            }
             RouteHandlerId::HostedControlWsTicket => {
                 return handle_hosted_control_ws_ticket(
                     stream,

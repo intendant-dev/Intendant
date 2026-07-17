@@ -31,6 +31,7 @@ use std::sync::{Mutex, OnceLock};
 
 const FLEET_ORIGIN_PROVENANCE_FILE: &str = "fleet-origin-provenance.json";
 const FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION: u32 = 1;
+const FLEET_CT_STATUS_FILE: &str = "fleet-cert-ct-status.json";
 
 /// Durable service-controlled-name provenance. Certificates and Connect
 /// registration are both replaceable/optional at startup, but a name once
@@ -126,6 +127,10 @@ fn load_fleet_origin_provenance_in(cert_dir: &Path) -> Result<FleetOriginProvena
     Ok(provenance)
 }
 
+pub(crate) fn current_fleet_name_in(cert_dir: &Path) -> Result<Option<String>, String> {
+    load_fleet_origin_provenance_in(cert_dir).map(|provenance| provenance.name)
+}
+
 fn remember_fleet_origin_in(
     cert_dir: &Path,
     zone: Option<&str>,
@@ -216,6 +221,9 @@ pub struct FleetCertStatus {
     /// The foreign certificates behind an `alert`: "serial · issuer ·
     /// not_before" summaries.
     pub ct_unknown: Vec<String>,
+    /// Normalized serials corresponding to `ct_unknown`. Kept structured so
+    /// hosted-lane admission never parses display strings.
+    pub ct_foreign_serials: Vec<String>,
     pub ct_checked_unix_ms: Option<u64>,
     pub ct_last_error: Option<String>,
 }
@@ -235,6 +243,14 @@ pub fn status_snapshot() -> FleetCertStatus {
     registry()
         .lock()
         .expect("fleet cert status poisoned")
+        .clone()
+}
+
+pub fn ct_foreign_serials() -> Vec<String> {
+    registry()
+        .lock()
+        .expect("fleet cert status poisoned")
+        .ct_foreign_serials
         .clone()
 }
 
@@ -510,6 +526,7 @@ pub(crate) fn refresh_installed_state_in(cert_dir: &Path) {
     if let Some(error) = restored.warning {
         eprintln!("[fleet-cert] restore fleet-origin provenance: {error}");
     }
+    restore_ct_status_in(cert_dir);
     // Offline/Connect-disabled startup restores the last current name so an
     // installed certificate remains usable. A register response observed in
     // this process wins, including an explicit null hint; remembered names
@@ -737,13 +754,17 @@ struct OwnCertRecord {
     issued_unix_ms: u64,
 }
 
+fn serials_path_in(cert_dir: &Path) -> PathBuf {
+    cert_dir.join("fleet-cert-serials.json")
+}
+
 fn serials_path() -> PathBuf {
-    cert_dir().join("fleet-cert-serials.json")
+    serials_path_in(&cert_dir())
 }
 
 /// Lowercase hex with leading zeros trimmed — both our parsed serials
 /// and crt.sh's strings normalize to this before comparison.
-fn normalize_serial_hex(serial: &str) -> String {
+pub(crate) fn normalize_serial_hex(serial: &str) -> String {
     let lower = serial.trim().to_ascii_lowercase();
     let trimmed = lower.trim_start_matches('0');
     if trimmed.is_empty() {
@@ -765,11 +786,51 @@ fn cert_serial_hex(cert_pem: &str) -> Option<String> {
     Some(normalize_serial_hex(&hex))
 }
 
-fn own_serial_records() -> Vec<OwnCertRecord> {
-    std::fs::read_to_string(serials_path())
+fn own_serial_records_in(cert_dir: &Path) -> Vec<OwnCertRecord> {
+    std::fs::read_to_string(serials_path_in(cert_dir))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
+}
+
+fn own_serial_records() -> Vec<OwnCertRecord> {
+    own_serial_records_in(&cert_dir())
+}
+
+#[cfg(test)]
+pub(crate) fn own_serials_for_name_in(cert_dir: &Path, name: &str) -> Vec<String> {
+    own_serial_ledger_for_name_in(cert_dir, name)
+        .map(|(serials, _)| serials)
+        .unwrap_or_default()
+}
+
+pub(crate) fn own_serial_ledger_for_name_in(
+    cert_dir: &Path,
+    name: &str,
+) -> Option<(Vec<String>, u64)> {
+    let name = normalized_dns_name(name)?;
+    let mut records: Vec<(String, u64)> = own_serial_records_in(cert_dir)
+        .into_iter()
+        .filter(|record| normalized_dns_name(&record.name).as_deref() == Some(name.as_str()))
+        .filter_map(|record| {
+            let serial = normalize_serial_hex(&record.serial_hex);
+            (record.issued_unix_ms > 0
+                && !serial.is_empty()
+                && serial.len() <= 128
+                && serial.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then_some((serial, record.issued_unix_ms))
+        })
+        .collect();
+    records.sort_by(|(serial_a, issued_a), (serial_b, issued_b)| {
+        issued_b.cmp(issued_a).then_with(|| serial_a.cmp(serial_b))
+    });
+    let mut seen = std::collections::BTreeSet::new();
+    records.retain(|(serial, _)| seen.insert(serial.clone()));
+    records.truncate(crate::access::hosted_control::HOSTED_CERTIFICATE_LEDGER_SERIALS_CAP);
+    let issued_unix_ms = records.iter().map(|(_, issued)| *issued).max()?;
+    let mut serials: Vec<String> = records.into_iter().map(|(serial, _)| serial).collect();
+    serials.sort();
+    Some((serials, issued_unix_ms))
 }
 
 /// Record a certificate this daemon obtained — BEFORE install, so a
@@ -799,6 +860,63 @@ struct CtEntry {
     serial_hex: String,
     issuer: String,
     not_before: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct DurableCtStatus {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    foreign_serials: Vec<String>,
+    #[serde(default)]
+    unknown_summaries: Vec<String>,
+    #[serde(default)]
+    checked_unix_ms: Option<u64>,
+}
+
+fn ct_status_path_in(cert_dir: &Path) -> PathBuf {
+    cert_dir.join(FLEET_CT_STATUS_FILE)
+}
+
+fn persist_ct_status_in(cert_dir: &Path, status: &FleetCertStatus) -> Result<(), String> {
+    let durable = DurableCtStatus {
+        state: status.ct_state.clone(),
+        foreign_serials: status.ct_foreign_serials.clone(),
+        unknown_summaries: status.ct_unknown.clone(),
+        checked_unix_ms: status.ct_checked_unix_ms,
+    };
+    let serialized = serde_json::to_string_pretty(&durable)
+        .map_err(|error| format!("serialize durable CT status: {error}"))?;
+    write_private(&ct_status_path_in(cert_dir), serialized.as_bytes())
+}
+
+fn load_ct_status_in(cert_dir: &Path) -> Option<DurableCtStatus> {
+    let mut durable = std::fs::read_to_string(ct_status_path_in(cert_dir))
+        .ok()
+        .and_then(|text| serde_json::from_str::<DurableCtStatus>(&text).ok())?;
+    durable.foreign_serials = durable
+        .foreign_serials
+        .into_iter()
+        .map(|serial| normalize_serial_hex(&serial))
+        .collect();
+    durable.foreign_serials.sort();
+    durable.foreign_serials.dedup();
+    if !matches!(durable.state.as_str(), "ok" | "alert") {
+        return None;
+    }
+    Some(durable)
+}
+
+fn restore_ct_status_in(cert_dir: &Path) {
+    let Some(durable) = load_ct_status_in(cert_dir) else {
+        return;
+    };
+    with_status(|status| {
+        status.ct_state = durable.state;
+        status.ct_foreign_serials = durable.foreign_serials;
+        status.ct_unknown = durable.unknown_summaries;
+        status.ct_checked_unix_ms = durable.checked_unix_ms;
+    });
 }
 
 /// Parse a crt.sh `output=json` response, deduplicating the
@@ -881,8 +999,13 @@ pub async fn ct_check_once() {
                 if foreign.is_empty() {
                     status.ct_state = "ok".to_string();
                     status.ct_unknown = Vec::new();
+                    status.ct_foreign_serials = Vec::new();
                 } else {
                     status.ct_state = "alert".to_string();
+                    status.ct_foreign_serials = foreign
+                        .iter()
+                        .map(|entry| entry.serial_hex.clone())
+                        .collect();
                     status.ct_unknown = foreign
                         .iter()
                         .map(|entry| {
@@ -895,6 +1018,9 @@ pub async fn ct_check_once() {
                 }
             });
             let status = status_snapshot();
+            if let Err(error) = persist_ct_status_in(&cert_dir(), &status) {
+                eprintln!("[fleet-cert] persist durable CT status: {error}");
+            }
             if status.ct_state == "alert" {
                 eprintln!(
                     "[fleet-cert] CT ALERT: {} certificate(s) for {name} in the public CT logs \
@@ -1150,6 +1276,104 @@ mod tests {
         assert_eq!(normalize_serial_hex("038ABc"), "38abc");
         assert_eq!(normalize_serial_hex("0000"), "0");
         assert_eq!(normalize_serial_hex(" 03f2 "), "3f2");
+    }
+
+    #[test]
+    fn own_serial_ledger_is_exact_name_canonical_and_deduplicated() {
+        let temp = tempfile::tempdir().unwrap();
+        let records = vec![
+            OwnCertRecord {
+                serial_hex: "000b".to_string(),
+                name: "One.Fleet.Example.Test.".to_string(),
+                directory: "test".to_string(),
+                issued_unix_ms: 1,
+            },
+            OwnCertRecord {
+                serial_hex: "0A".to_string(),
+                name: "one.fleet.example.test".to_string(),
+                directory: "test".to_string(),
+                issued_unix_ms: 2,
+            },
+            OwnCertRecord {
+                serial_hex: "000b".to_string(),
+                name: "one.fleet.example.test".to_string(),
+                directory: "test".to_string(),
+                issued_unix_ms: 3,
+            },
+            OwnCertRecord {
+                serial_hex: "ff".to_string(),
+                name: "two.fleet.example.test".to_string(),
+                directory: "test".to_string(),
+                issued_unix_ms: 4,
+            },
+        ];
+        std::fs::write(
+            serials_path_in(temp.path()),
+            serde_json::to_vec(&records).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            own_serials_for_name_in(temp.path(), "ONE.fleet.example.test"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            own_serial_ledger_for_name_in(temp.path(), "ONE.fleet.example.test"),
+            Some((vec!["a".to_string(), "b".to_string()], 3))
+        );
+    }
+
+    #[test]
+    fn own_serial_ledger_is_stably_bounded_to_the_newest_issuances() {
+        let temp = tempfile::tempdir().unwrap();
+        let count = crate::access::hosted_control::HOSTED_CERTIFICATE_LEDGER_SERIALS_CAP + 3;
+        let records: Vec<OwnCertRecord> = (0..count)
+            .map(|index| OwnCertRecord {
+                serial_hex: format!("{:x}", index + 1),
+                name: "one.fleet.example.test".to_string(),
+                directory: "test".to_string(),
+                issued_unix_ms: (index + 1) as u64,
+            })
+            .collect();
+        std::fs::write(
+            serials_path_in(temp.path()),
+            serde_json::to_vec(&records).unwrap(),
+        )
+        .unwrap();
+
+        let (serials, issued_unix_ms) =
+            own_serial_ledger_for_name_in(temp.path(), "one.fleet.example.test").unwrap();
+        assert_eq!(
+            serials.len(),
+            crate::access::hosted_control::HOSTED_CERTIFICATE_LEDGER_SERIALS_CAP
+        );
+        assert_eq!(issued_unix_ms, count as u64);
+        assert!(!serials.contains(&"1".to_string()));
+        assert!(!serials.contains(&"2".to_string()));
+        assert!(!serials.contains(&"3".to_string()));
+    }
+
+    #[test]
+    fn successful_ct_verdict_round_trips_through_the_durable_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let status = FleetCertStatus {
+            ct_state: "alert".to_string(),
+            ct_unknown: vec!["b · issuer · time".to_string()],
+            ct_foreign_serials: vec!["000b".to_string(), "0A".to_string()],
+            ct_checked_unix_ms: Some(42),
+            ..Default::default()
+        };
+        persist_ct_status_in(temp.path(), &status).unwrap();
+
+        assert_eq!(
+            load_ct_status_in(temp.path()),
+            Some(DurableCtStatus {
+                state: "alert".to_string(),
+                foreign_serials: vec!["a".to_string(), "b".to_string()],
+                unknown_summaries: vec!["b · issuer · time".to_string()],
+                checked_unix_ms: Some(42),
+            })
+        );
     }
 
     #[test]

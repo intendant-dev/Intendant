@@ -191,8 +191,10 @@ remain the authority bounds throughout that interval.
 
 Each enabled daemon publishes a signed fleet-certificate ledger containing its
 exact fleet origin and the certificate serials it obtained for that name. The
-record is signed by the daemon identity. Hosted metadata may relay the record,
-but cannot change its contents without invalidating the signature.
+canonical serial set is bounded to the newest issuances, and the signed record
+stays byte-stable until the name or set changes. Hosted metadata may relay the
+record, but cannot change its contents without invalidating the daemon-identity
+signature.
 
 Configured peer daemons periodically fetch that record through their existing
 authenticated peer route, dial the fleet name from their own network path with
@@ -222,14 +224,20 @@ visible.
 An owner can override the exact current unexpected-serial set from a trusted
 surface. The alert remains visible. Further reports about the same serial do
 not churn the override, while any newly observed serial changes the evidence
-set and suspends the lane again.
+set and suspends the lane again. Confirming an observation later clears the
+override and suspends the lane.
+
+The public bootstrap projects only the guard status needed to stop or warn a
+hosted browser. Serial evidence, observer labels, reports, and owner
+attribution remain on the trusted management snapshot.
 
 The witness protocol has no general peer-control capability. A peer report is
 accepted only on an authenticated peer connection and is keyed to that
 connection's verified certificate identity. A signed-application report must
-verify against an active enrolled anchor. The target also rechecks every
-reported serial against its current local ledger, so a report based on a stale
-pre-renewal ledger cannot classify a locally recorded renewal as unexpected.
+verify against an active enrolled anchor. The target also requires the current
+ledger digest and rechecks every reported serial against that ledger, so a
+report based on a stale pre-renewal document cannot classify a locally
+recorded renewal as unexpected.
 
 ## Capability bounds
 
@@ -266,7 +274,9 @@ pre-renewal ledger cannot classify a locally recorded renewal as unexpected.
 | Hosted policy/state cannot be loaded | Admission and live authorization fail closed. |
 
 Every request creation, decision, lease issue/revoke/expiry observation,
-ceiling change, and eligibility change produces a bounded IAM audit record.
+ceiling change, eligibility change, accepted certificate report, owner
+confirmation, and exact-evidence override produces a bounded IAM audit record.
 A policy update that revokes several leases also emits one record for each
-revoked lease. Audit records contain ids, actor, preset, and lifetime—not task
-text, file content, signaling payloads, or private key material.
+revoked lease. Audit records contain ids, actor, preset, lifetime, and
+certificate evidence identifiers—not task text, file content, signaling
+payloads, or private key material.

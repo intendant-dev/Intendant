@@ -93,6 +93,7 @@ pub use crate::access::access_policy;
 pub mod access_request;
 mod actor;
 pub mod card;
+pub mod certificate_witness;
 pub mod coordinator;
 pub mod event;
 pub mod handle;
