@@ -1091,6 +1091,33 @@ pub(crate) fn limit_park_log_line(
 pub(crate) const LIMIT_PARK_QUEUED_MESSAGE_LOG: &str =
     "Message queued — delivers when the limit resets";
 
+/// Deferral for an out-of-band `/compact` requested while a rate-limit
+/// park is armed: dispatching it would burn against the very limit the
+/// park is waiting out (observed live 2026-07-17 — repeated compaction
+/// attempts into a #388 park each answered "You've hit your session
+/// limit"). Both idle lanes (the supervised external-mode loop and the
+/// persistent daemon lane) skip the dispatch and answer with this calm
+/// line instead; the requester re-runs `/compact` after the reset.
+/// Returns `None` when the action may dispatch (not a compact, or no
+/// park armed). Pure — clock injected for tests.
+pub(crate) fn compact_deferred_by_limit_park(
+    action: &str,
+    limit_park: &Option<LimitParkState>,
+    now: tokio::time::Instant,
+    now_epoch: u64,
+) -> Option<String> {
+    if action != "compact" {
+        return None;
+    }
+    let park = limit_park.as_ref()?;
+    let resets_at_epoch =
+        now_epoch.saturating_add(park.resume_at.saturating_duration_since(now).as_secs());
+    Some(format!(
+        "Compaction deferred — rate-limited; {}; request it again after the limit resets",
+        external_agent::limit_reset_phrase(Some(resets_at_epoch), now_epoch)
+    ))
+}
+
 /// Pop the next still-deliverable message off a rate-limit park queue,
 /// dropping entries cancelled while they waited. FIFO — the pending
 /// re-send sits at the front, user messages queued during the park
@@ -1185,6 +1212,37 @@ mod tests {
         assert!(event_rx.is_none());
         // A disabled receiver stays disabled.
         assert!(try_buffered_idle_agent_event(&mut event_rx).is_none());
+    }
+
+    /// A `/compact` arriving while a rate-limit park is armed defers with
+    /// the calm reset-time line; anything else — other ops, or no park —
+    /// dispatches normally. Clock injected: no sleeps, no wall time.
+    #[tokio::test]
+    async fn compact_thread_action_defers_while_limit_parked() {
+        let now = tokio::time::Instant::now();
+        let parked = Some(LimitParkState {
+            resume_at: now + Duration::from_secs(10 * 60),
+            pending: None,
+        });
+
+        let deferral = compact_deferred_by_limit_park("compact", &parked, now, 1_000)
+            .expect("parked compact must defer");
+        assert!(
+            deferral.starts_with("Compaction deferred — rate-limited"),
+            "deferral: {deferral}"
+        );
+        assert!(deferral.contains("in ~10m"), "deferral: {deferral}");
+
+        // Not a compact: the park does not block other thread actions here.
+        assert_eq!(
+            compact_deferred_by_limit_park("fork", &parked, now, 1_000),
+            None
+        );
+        // No park armed: compact dispatches.
+        assert_eq!(
+            compact_deferred_by_limit_park("compact", &None, now, 1_000),
+            None
+        );
     }
 
     #[test]

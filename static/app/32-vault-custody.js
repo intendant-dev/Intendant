@@ -1549,8 +1549,9 @@ const claudeSigninState = {
   busy: false,
   lastError: '',
   pollTimer: null,
-  sessions: [], // running claude-code sessions for the reload panel
+  sessions: [], // live claude-code sessions for the reload panel
   sessionsFetchedAt: 0,
+  lastPhase: '', // transition detector: entering success forces a fresh fetch
   reloadRequested: new Set(),
 };
 
@@ -1583,7 +1584,15 @@ async function claudeSigninRefresh({ force = false } = {}) {
   }
   claudeSigninEnsurePoll();
   renderClaudeSigninSection();
-  if (claudeSigninPhase() === 'success') claudeSigninRefreshSessions().catch(() => {});
+  const phaseNow = claudeSigninPhase();
+  const phaseChanged = phaseNow !== claudeSigninState.lastPhase;
+  claudeSigninState.lastPhase = phaseNow;
+  // Entering success forces the fetch past the freshness window: the
+  // reload chips must reflect live sessions at the exact moment the user
+  // needs them (a cached pre-success list here hid a parked session).
+  if (phaseNow === 'success') {
+    claudeSigninRefreshSessions({ force: phaseChanged }).catch(() => {});
+  }
 }
 
 /* 2s poll while a ceremony is in flight and the page is looking at it;
@@ -1665,20 +1674,85 @@ async function claudeSigninCancel() {
   renderClaudeSigninSection();
 }
 
+/* Catalog statuses that mean a session row has ENDED — a mirror of the
+   daemon's session-catalog terminal vocabulary (SESSION_ENDED_STATUSES
+   plus the bare-dir "abandoned" classification). A daemon-side parity
+   test pins this set to the source
+   (claude_signin_terminal_status_mirror_matches_catalog_vocabulary), so
+   keep the one-status-per-quote shape scrapable. */
+const CLAUDE_SIGNIN_TERMINAL_STATUSES = new Set([
+  'completed', 'failed', 'interrupted', 'abandoned',
+]);
+
+/* Reload candidates are ALIVE supervised claude-code sessions: wrapper
+   evidence (a supervised session always has an Intendant wrapper row —
+   merged rows carry intendant_status / intendant_session_id, unmerged
+   wrapper rows have source "intendant") and a non-terminal status. The
+   old `status === 'running'` filter excluded exactly the sessions whose
+   reload matters most — limit-parked and between-turn sessions read
+   idle/external on the row, never running (live incident 2026-07-17).
+   Raw transcript rows with no wrapper are history, not reload targets. */
+function claudeSigninSessionIsReloadCandidate(row) {
+  const backend = String(row?.backend_source || row?.source || '').toLowerCase();
+  if (!backend.includes('claude')) return false;
+  const wrapperStatus = String(row?.intendant_status || '').trim();
+  const supervised =
+    String(row?.source || '') === 'intendant' ||
+    !!wrapperStatus ||
+    !!String(row?.intendant_session_id || '').trim();
+  if (!supervised) return false;
+  const effective = (wrapperStatus || String(row?.status || '').trim()).toLowerCase();
+  return !CLAUDE_SIGNIN_TERMINAL_STATUSES.has(effective);
+}
+
+/* Chip copy for a reload candidate: live phase (open session windows,
+   recent status events) beats the catalog row's disk-derived status — a
+   limit-parked session reads idle on disk but waiting_rate_limit live.
+   Lookups are guarded: the live maps are declared in later fragments. */
+function claudeSigninSessionStateChip(row) {
+  const ids = [row?.session_id, row?.backend_session_id, row?.intendant_session_id]
+    .map(v => String(v || '').trim())
+    .filter(Boolean);
+  let phase = '';
+  try {
+    for (const id of ids) {
+      if (typeof sessionWindows !== 'undefined' && sessionWindows.get(id)?.phase) {
+        phase = String(sessionWindows.get(id).phase);
+      }
+      if (!phase && typeof recentSessionStatusPhase === 'function') {
+        phase = String(recentSessionStatusPhase(id) || '');
+      }
+      if (phase) break;
+    }
+  } catch (_) {
+    /* live maps unavailable: fall back to the row's status below */
+  }
+  const key = phase.toLowerCase().replace(/-/g, '_');
+  if (key === 'waiting_rate_limit') return { label: 'rate-limited', cls: 'warn' };
+  if (key === 'interrupting' || key.startsWith('waiting')) return { label: 'waiting', cls: 'warn' };
+  if (key.startsWith('running') || key === 'thinking' || key === 'orchestrating') {
+    return { label: 'running', cls: 'ok' };
+  }
+  if (key === 'idle') return { label: 'parked', cls: '' };
+  const status = String(row?.intendant_status || row?.status || '').trim().toLowerCase();
+  if (status === 'running' || status === 'in_progress') return { label: 'running', cls: 'ok' };
+  if (status === 'idle' || status === 'external') return { label: 'parked', cls: '' };
+  return { label: status || 'live', cls: '' };
+}
+
 /* The reload panel's corpus: live claude-code sessions on this daemon.
    The daemon is the authority on reloadability — this list only decides
    which chips to offer. */
 async function claudeSigninRefreshSessions({ force = false } = {}) {
-  if (!force && Date.now() - claudeSigninState.sessionsFetchedAt < 10000) return;
+  /* 2.5s freshness (was 10s): right after sign-in success a stale empty
+     list is the worst answer; the ceremony/render cadence bounds the
+     request rate while the pane is watched. */
+  if (!force && Date.now() - claudeSigninState.sessionsFetchedAt < 2500) return;
   claudeSigninState.sessionsFetchedAt = Date.now();
   try {
     const resp = await daemonApi.request('api_sessions', { limit: 100 });
     if (!resp.ok || !Array.isArray(resp.body)) return;
-    claudeSigninState.sessions = resp.body.filter(row => {
-      if (String(row?.status || '') !== 'running') return false;
-      const backend = String(row?.backend_source || row?.source || '').toLowerCase();
-      return backend.includes('claude');
-    });
+    claudeSigninState.sessions = resp.body.filter(claudeSigninSessionIsReloadCandidate);
     renderClaudeSigninSection();
   } catch (_) {
     /* the next poll or manual refresh recovers */
@@ -1912,22 +1986,24 @@ function renderClaudeSigninSection() {
       note('Signed in (the CLI did not report account details).');
     }
 
-    // The value half: running Claude Code sessions keep the OLD account
-    // until their backend process restarts — offer the per-session
-    // reload (graceful in-place respawn, resume-attached).
+    // The value half: LIVE Claude Code sessions — running, parked between
+    // turns, or rate-limit-parked — keep the OLD account until their
+    // backend process restarts. Offer the per-session reload (graceful
+    // in-place respawn, resume-attached); parked sessions are the ones
+    // pinned to the old account longest, so they matter most here.
     claudeSigninRefreshSessions().catch(() => {});
     const reloadHead = document.createElement('div');
     reloadHead.className = 'vault-status-line';
     const reloadTitle = document.createElement('span');
     reloadTitle.className = 'lbl';
     reloadTitle.style.fontWeight = '600';
-    reloadTitle.textContent = 'Running Claude Code sessions';
+    reloadTitle.textContent = 'Live Claude Code sessions';
     reloadHead.appendChild(reloadTitle);
     card.appendChild(reloadHead);
     if (!claudeSigninState.sessions.length) {
-      note('No running Claude Code sessions — new sessions start on the new account.');
+      note('No live Claude Code sessions — new sessions start on the new account.');
     } else {
-      note('Running sessions keep the old account until reloaded. Reloading restarts the backend on the same conversation; a mid-turn session is interrupted first.');
+      note('Live sessions — including parked and rate-limited ones — keep the old account until reloaded. Reloading restarts the backend on the same conversation; a mid-turn session is interrupted first.');
       const list = document.createElement('div');
       list.className = 'vault-entry-list';
       for (const session of claudeSigninState.sessions) {
@@ -1940,6 +2016,14 @@ function renderClaudeSigninSection() {
         const kindChip = document.createElement('span');
         kindChip.className = 'vault-chip';
         kindChip.textContent = 'claude-code';
+        const state = claudeSigninSessionStateChip(session);
+        const stateChip = document.createElement('span');
+        stateChip.className = 'vault-chip' + (state.cls ? ` ${state.cls}` : '');
+        stateChip.textContent = state.label;
+        stateChip.title =
+          state.label === 'rate-limited'
+            ? 'Rate-limit park — the backend is alive and stays on the old account until reloaded'
+            : 'Session state — alive sessions stay on the old account until reloaded';
         const actions = document.createElement('span');
         actions.className = 'vault-entry-actions';
         if (claudeSigninState.reloadRequested.has(sessionId)) {
@@ -1952,7 +2036,7 @@ function renderClaudeSigninSection() {
             vaultButton('Reload credentials', () => claudeSigninReloadSession(sessionId))
           );
         }
-        row.append(lbl, kindChip, actions);
+        row.append(lbl, kindChip, stateChip, actions);
         list.appendChild(row);
       }
       card.appendChild(list);
