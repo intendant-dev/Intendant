@@ -10,6 +10,55 @@ use tokio::time::{timeout, Duration};
 /// Maximum bytes to read from agent stdout/stderr (64 MB).
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Read up to `cap` bytes from `reader` into `buf`, then, if the cap was
+/// reached, keep reading and DISCARDING the remainder until EOF so the
+/// writer never blocks on a full pipe. Returns how many bytes were
+/// discarded.
+///
+/// The cap bounds what we *buffer*, not what we *consume*: a plain capped
+/// read (`take(cap).read_to_end(..)`) stops consuming at the cap while the
+/// pipe stays open, so a child with more output than the cap blocks forever
+/// on the full pipe buffer and `child.wait()` never resolves. The batch
+/// hard-timeout eventually reaps that — except for askHuman batches, whose
+/// timeout is effectively infinite, where the session hangs permanently.
+///
+/// Output landing exactly at the cap drains zero bytes and reports no
+/// discard.
+async fn read_capped_then_drain<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    cap: u64,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<u64> {
+    let mut limited = reader.take(cap);
+    let read = limited.read_to_end(buf).await? as u64;
+    if read < cap {
+        // EOF arrived under the cap: nothing left in the stream to drain.
+        return Ok(0);
+    }
+    tokio::io::copy(&mut limited.into_inner(), &mut tokio::io::sink()).await
+}
+
+/// Append an honest truncation note for one over-cap stream to the batch's
+/// stderr, so the model knows that stream was cut rather than complete.
+/// Streams that fit (`discarded == 0`, including exactly-at-cap output)
+/// append nothing.
+fn append_over_cap_note(stderr_buf: &mut Vec<u8>, stream: &str, discarded: u64) {
+    if discarded == 0 {
+        return;
+    }
+    if !stderr_buf.is_empty() && !stderr_buf.ends_with(b"\n") {
+        stderr_buf.push(b'\n');
+    }
+    let cap_mib = MAX_OUTPUT_BYTES / (1024 * 1024);
+    stderr_buf.extend_from_slice(
+        format!(
+            "[intendant] {stream} exceeded the {cap_mib} MiB cap; \
+             {discarded} bytes were discarded"
+        )
+        .as_bytes(),
+    );
+}
+
 /// Env var the sandboxed runtime consults to decide whether display 0 (the
 /// user's real session) is a permitted capture/input target (`src/agent.rs`,
 /// `docs/src/runtime-protocol.md`). The controller never sets this on its own
@@ -347,32 +396,39 @@ async fn run_agent_inner(
         let mut stdout = child.stdout.take();
         let mut stderr = child.stderr.take();
 
+        // The reads cap what is buffered but always consume to EOF
+        // (read_capped_then_drain) — an unread pipe would block the child's
+        // writes and park `child.wait()` in this join forever.
         let read_stdout = async {
-            if let Some(ref mut out) = stdout {
-                out.take(MAX_OUTPUT_BYTES as u64)
-                    .read_to_end(&mut stdout_buf)
-                    .await?;
+            match stdout {
+                Some(ref mut out) => {
+                    read_capped_then_drain(out, MAX_OUTPUT_BYTES as u64, &mut stdout_buf).await
+                }
+                None => Ok(0),
             }
-            Ok::<_, std::io::Error>(())
         };
         let read_stderr = async {
-            if let Some(ref mut err) = stderr {
-                err.take(MAX_OUTPUT_BYTES as u64)
-                    .read_to_end(&mut stderr_buf)
-                    .await?;
+            match stderr {
+                Some(ref mut err) => {
+                    read_capped_then_drain(err, MAX_OUTPUT_BYTES as u64, &mut stderr_buf).await
+                }
+                None => Ok(0),
             }
-            Ok::<_, std::io::Error>(())
         };
 
         let (stdout_res, stderr_res, status) = tokio::join!(read_stdout, read_stderr, child.wait());
-        stdout_res?;
-        stderr_res?;
-        Ok::<_, CallerError>(status?)
+        let stdout_discarded = stdout_res?;
+        let stderr_discarded = stderr_res?;
+        Ok::<_, CallerError>((status?, stdout_discarded, stderr_discarded))
     })
     .await;
 
     match result {
-        Ok(Ok(status)) => output_with_exit_status(stdout_buf, stderr_buf, status),
+        Ok(Ok((status, stdout_discarded, stderr_discarded))) => {
+            append_over_cap_note(&mut stderr_buf, "stdout", stdout_discarded);
+            append_over_cap_note(&mut stderr_buf, "stderr", stderr_discarded);
+            output_with_exit_status(stdout_buf, stderr_buf, status)
+        }
         Ok(Err(err)) => Err(err),
         Err(_) => {
             let _ = child.kill().await;
@@ -648,6 +704,102 @@ mod tests {
                 .get_envs()
                 .all(|(k, _)| k != std::ffi::OsStr::new("INTENDANT_USER_DISPLAY_GRANTED")),
             "ungranted state must not set the grant var on the child"
+        );
+    }
+
+    /// A small injected cap for the drain tests — never allocate the real
+    /// 64 MiB in a unit test.
+    const TEST_CAP: u64 = 1024;
+
+    /// Run one writer/reader pair over an in-memory duplex whose internal
+    /// buffer is far smaller than the payload, so an unconsumed reader
+    /// wedges the writer exactly like a full OS pipe. Returns
+    /// (buffered bytes, discarded count). The surrounding timeout turns the
+    /// deadlock regression into a fast failure instead of a hung test.
+    async fn drain_round_trip(total: usize, cap: u64) -> (Vec<u8>, u64) {
+        let (mut reader, mut writer) = tokio::io::duplex(64);
+        let payload = vec![0xAB_u8; total];
+        let write_side = async move {
+            writer.write_all(&payload).await.unwrap();
+            // writer dropped here → EOF
+        };
+        let mut buf = Vec::new();
+        let read_side = read_capped_then_drain(&mut reader, cap, &mut buf);
+        let (_, read_res) = timeout(Duration::from_secs(30), async {
+            tokio::join!(write_side, read_side)
+        })
+        .await
+        .expect("writer or reader deadlocked: over-cap output was not drained");
+        let discarded = read_res.unwrap();
+        (buf, discarded)
+    }
+
+    /// The deadlock regression: a child writing more than the cap must
+    /// still reach EOF (the writer future completes) because the remainder
+    /// is drained, while the buffer holds exactly the cap and the discard
+    /// count is reported for the truncation note.
+    #[tokio::test]
+    async fn over_cap_output_is_drained_so_the_writer_completes() {
+        let total = TEST_CAP as usize * 4 + 37;
+        let (buf, discarded) = drain_round_trip(total, TEST_CAP).await;
+        assert_eq!(buf.len() as u64, TEST_CAP, "buffer must stop at the cap");
+        assert_eq!(discarded, total as u64 - TEST_CAP);
+    }
+
+    /// Output landing exactly at the cap is complete, not truncated: the
+    /// drain finds immediate EOF and no discard is reported (so no
+    /// truncation note is emitted downstream).
+    #[tokio::test]
+    async fn exactly_at_cap_output_reports_no_discard() {
+        let (buf, discarded) = drain_round_trip(TEST_CAP as usize, TEST_CAP).await;
+        assert_eq!(buf.len() as u64, TEST_CAP);
+        assert_eq!(discarded, 0, "exactly-at-cap output must not be flagged");
+        assert!(buf.iter().all(|&b| b == 0xAB));
+    }
+
+    /// Under-cap output reads normally end to end with nothing discarded.
+    #[tokio::test]
+    async fn under_cap_output_reads_fully_with_no_discard() {
+        let total = 100;
+        let (buf, discarded) = drain_round_trip(total, TEST_CAP).await;
+        assert_eq!(buf.len(), total, "under-cap output must arrive intact");
+        assert_eq!(discarded, 0);
+    }
+
+    /// The truncation note is appended only when bytes were discarded, on
+    /// its own line, naming the stream and the count; untouched streams
+    /// (including exactly-at-cap, discarded == 0) add nothing.
+    #[test]
+    fn over_cap_note_appends_only_for_discarded_bytes() {
+        let cap_mib = MAX_OUTPUT_BYTES / (1024 * 1024);
+
+        // discarded == 0 leaves the buffer untouched.
+        let mut stderr_buf = b"child stderr".to_vec();
+        append_over_cap_note(&mut stderr_buf, "stdout", 0);
+        assert_eq!(stderr_buf, b"child stderr");
+
+        // A note on a non-empty buffer lands on its own line.
+        append_over_cap_note(&mut stderr_buf, "stdout", 5);
+        assert_eq!(
+            String::from_utf8(stderr_buf.clone()).unwrap(),
+            format!(
+                "child stderr\n[intendant] stdout exceeded the {cap_mib} MiB cap; \
+                 5 bytes were discarded"
+            )
+        );
+
+        // A second stream's note separates from the first.
+        append_over_cap_note(&mut stderr_buf, "stderr", 7);
+        assert!(String::from_utf8(stderr_buf).unwrap().ends_with(&format!(
+            "\n[intendant] stderr exceeded the {cap_mib} MiB cap; 7 bytes were discarded"
+        )));
+
+        // An empty buffer takes the note without a leading newline.
+        let mut empty = Vec::new();
+        append_over_cap_note(&mut empty, "stdout", 1);
+        assert_eq!(
+            String::from_utf8(empty).unwrap(),
+            format!("[intendant] stdout exceeded the {cap_mib} MiB cap; 1 bytes were discarded")
         );
     }
 }
