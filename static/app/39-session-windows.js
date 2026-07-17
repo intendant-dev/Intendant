@@ -800,6 +800,13 @@ function deriveSessionActivity(activity, nowSec = Date.now() / 1000) {
     hasHeartbeat: threshold > 0,
     effort: String(activity.effort || '').trim(),
     resetsAtEpoch: Number(activity.resetsAtEpoch) || 0,
+    // Short descriptions of wire-announced background tasks still running
+    // (grounds the parked-on-tasks claim; may ride any state). No
+    // threshold accompanies parked, so it never derives to stalled —
+    // waiting on a long task in honest silence is the whole point.
+    backgroundTasks: Array.isArray(activity.backgroundTasks)
+      ? activity.backgroundTasks.map((t) => String(t || '').trim()).filter(Boolean)
+      : [],
   };
 }
 
@@ -816,9 +823,19 @@ const ACTIVITY_STATE_LABELS = {
   responding: 'Responding',
   'tool-running': 'Running tools',
   'awaiting-api': 'Awaiting model',
+  'parked-on-tasks': 'Parked',
   'rate-limited': 'Rate-limited',
   stalled: 'Stalled',
 };
+
+// Status-pill label for a parked session: plain words, with the count the
+// wire vouches for. Shared by the pill upgrade and anything else that
+// needs the one-line parked phrasing.
+function sessionParkedPillLabel(act) {
+  if (!act || act.state !== 'parked-on-tasks') return '';
+  const n = (act.backgroundTasks || []).length || 1;
+  return `Parked · ${n} background task${n === 1 ? '' : 's'}`;
+}
 
 function formatActivityElapsed(seconds) {
   const s = Math.max(0, Math.round(Number(seconds) || 0));
@@ -857,6 +874,7 @@ const VITALS_SYMBOLS = {
       if (v.state === 'responding') return `🗒 Responding · ${v.elapsedText}`;
       if (v.state === 'tool-running') return `🔧 Running tools · ${v.elapsedText}`;
       if (v.state === 'awaiting-api') return `⋯ Awaiting model · ${v.elapsedText}`;
+      if (v.state === 'parked-on-tasks') return `⏸ Parked · ${v.bgCount} background task${v.bgCount === 1 ? '' : 's'} · ${v.elapsedText}`;
       if (v.state === 'stalled') return `⚠ Stalled · quiet ${v.quietText}`;
       if (v.state === 'rate-limited') return `⛔ Rate-limited${v.reset ? ` · resets in ${v.reset}` : ''}`;
       return `${ACTIVITY_STATE_LABELS[v.state] || v.state} · ${v.elapsedText}`;
@@ -882,6 +900,16 @@ const VITALS_SYMBOLS = {
       }
       if (v.state === 'awaiting-api') {
         return [`A request is with the model provider and no reply has arrived yet (${v.elapsedText}).`];
+      }
+      if (v.state === 'parked-on-tasks') {
+        const lines = [
+          v.bgCount === 1
+            ? `The last round finished, but a background task the agent started is still running (parked ${v.elapsedText} ago):`
+            : `The last round finished, but ${v.bgCount} background tasks the agent started are still running (parked ${v.elapsedText} ago):`,
+        ];
+        for (const task of v.bgTasks || []) lines.push(`• ${task}`);
+        lines.push('Nothing is needed from you — the session wakes itself when a task finishes, and it is truly idle only once they are done.');
+        return lines;
       }
       if (v.state === 'stalled') {
         return [
@@ -1127,13 +1155,16 @@ function vitalsChipModels(vitals, meta, sessionId) {
       elapsedText: formatActivityElapsed(act.elapsed),
       quietText: formatActivityElapsed(act.quiet),
       reset: act.resetsAtEpoch ? formatLimitReset(act.resetsAtEpoch) : '',
+      bgTasks: act.backgroundTasks,
+      bgCount: act.backgroundTasks.length,
     }, {
-      // Calm while genuinely working; attention (health dot) only for
+      // Calm while genuinely working (parked included — waiting on its
+      // own background work is normal); attention (health dot) only for
       // stalled and rate-limited — the two states that mean "waiting on
       // something other than the model's own work".
       severity: act.state === 'stalled' || act.state === 'rate-limited' ? 'warn' : '',
       ticking: true,
-      sig: `${act.state}|${act.effort}|${act.hasHeartbeat ? 1 : 0}`,
+      sig: `${act.state}|${act.effort}|${act.hasHeartbeat ? 1 : 0}|${act.backgroundTasks.join(';')}`,
     });
   }
 
@@ -1884,7 +1915,7 @@ function applySessionVitals(raw = {}) {
 function maybeRefreshSessionWindowActivityPill(sid, win, vitals) {
   if (!win || !win.phase || typeof applySessionWindowPhase !== 'function') return;
   const act = deriveSessionActivity(vitals?.activity);
-  const key = act ? `${act.state}|${act.effort}` : '';
+  const key = act ? `${act.state}|${act.effort}|${act.backgroundTasks.length}` : '';
   if (win.activityPillKey === key) return;
   win.activityPillKey = key;
   applySessionWindowPhase(win, sid, win.phase);

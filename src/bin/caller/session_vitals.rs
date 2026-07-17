@@ -1735,7 +1735,7 @@ mod tests {
             last_stream_byte_epoch: 104,
             stalled_after_seconds: Some(20),
             effort: Some("max".into()),
-            resets_at_epoch: None,
+            ..Default::default()
         };
         bus.send(AppEvent::SessionActivity {
             session_id: Some("s9".into()),
@@ -1883,6 +1883,7 @@ mod tests {
             "lastStreamByteEpoch",
             "stalledAfterSeconds",
             "effort",
+            "backgroundTasks",
         ] {
             assert!(
                 catalog.contains(field),
@@ -1896,6 +1897,7 @@ mod tests {
             "responding",
             "tool-running",
             "awaiting-api",
+            "parked-on-tasks",
             "rate-limited",
             "stalled",
         ] {

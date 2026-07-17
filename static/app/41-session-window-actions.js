@@ -439,13 +439,33 @@ function ensureSessionWindow(sessionId, meta = {}) {
 // the truth. Without wire activity the optimistic dispatch guess survives
 // only as the generic "Awaiting model…" (PHASE_LABELS.thinking) until
 // bytes confirm or the session settles.
+// Between rounds the same wire facts beat a bare "Idle": a session whose
+// backend announced still-running background tasks is parked waiting on
+// them (it wakes itself when one finishes), and the pill says so — but
+// only for live sessions; an ended session's stale vitals claim nothing.
 function sessionWindowPhaseDisplayLabel(sessionId, phase) {
   const p = normalizeSessionPhase(phase);
-  if (isAgentActivePhase(p)
-      && typeof deriveSessionActivity === 'function'
-      && typeof sessionWireActivity === 'function') {
+  const canDerive = typeof deriveSessionActivity === 'function'
+    && typeof sessionWireActivity === 'function';
+  if (canDerive && (p === 'idle' || p === 'done')
+      && typeof sessionParkedPillLabel === 'function') {
+    const win = typeof sessionWindows !== 'undefined'
+      ? sessionWindows.get(String(sessionId || '').trim())
+      : null;
+    if (!win?.ended) {
+      const parked = sessionParkedPillLabel(deriveSessionActivity(sessionWireActivity(sessionId)));
+      if (parked) return parked;
+    }
+  }
+  if (isAgentActivePhase(p) && canDerive) {
     const act = deriveSessionActivity(sessionWireActivity(sessionId));
     if (act) {
+      // Phase inference can lag a settle: honor a parked claim (with its
+      // count) even while the phase still reads active.
+      if (typeof sessionParkedPillLabel === 'function') {
+        const parked = sessionParkedPillLabel(act);
+        if (parked) return parked;
+      }
       const label = (typeof ACTIVITY_STATE_LABELS === 'object' && ACTIVITY_STATE_LABELS[act.state])
         || act.state;
       return act.state === 'reasoning' && act.effort ? `${label} (${act.effort})` : label;
