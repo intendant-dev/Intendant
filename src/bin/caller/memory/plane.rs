@@ -377,7 +377,6 @@ impl EphemeralPlane {
         );
         let (root_sk, _) = suite::ed25519::keypair(&root_seed);
         let genesis_op = seal_op(header, body.to_value(), &OpSigner::Ed25519(&root_sk));
-        let ctrl_head = genesis_op.op_hash();
 
         let mut plane = EphemeralPlane {
             plane_id,
@@ -394,11 +393,14 @@ impl EphemeralPlane {
             writer_seq: 0,
             prev_writer_hash: [0; 32],
             ctrl_seq: 1,
-            ctrl_head,
+            ctrl_head: [0; 32], // the genesis op_hash, set on append below
             hlc_last_ms,
         };
         plane.prev_writer_hash = gen_start(&plane.dev.lineage, 1);
-        plane.append(genesis_op)?;
+        // The append's returned hash IS the genesis `op_hash` (the
+        // ctrl chain head) — reuse it instead of encoding the op a
+        // second time for a standalone `op_hash()` call.
+        plane.ctrl_head = plane.append(genesis_op)?;
         Ok((plane, custody))
     }
 
@@ -539,8 +541,13 @@ impl EphemeralPlane {
     /// precedence, D-112) and its named outcome surfaces verbatim.
     fn append(&mut self, op: Signedop) -> Result<[u8; 32], MemoryError> {
         let name = self.next_name();
-        let op_hash = op.op_hash();
-        self.items.insert(name.clone(), op.encode());
+        // Encode ONCE: the canonical triple bytes are both what the
+        // log holds and the `op_hash` preimage (`Signedop::op_hash` is
+        // `H_op` over these same bytes, O2), so hashing the held bytes
+        // skips a second full encode.
+        let bytes = op.encode();
+        let op_hash = h_tag(Tag::Op, &bytes);
+        self.items.insert(name.clone(), bytes);
         match fold_set(&self.items, &BTreeMap::new()) {
             Ok((verdicts, state)) => {
                 let verdict = verdicts
@@ -563,12 +570,11 @@ impl EphemeralPlane {
                     }
                     Verdict::Rejected(outcome, disposition) => {
                         self.items.remove(&name);
-                        // Re-derive without the rejected op so the
-                        // cache never reflects a set we don't hold.
-                        let (verdicts, state) = fold_set(&self.items, &BTreeMap::new())
-                            .map_err(|Unimplemented(why)| MemoryError::Unimplemented(why))?;
-                        self.verdicts = verdicts;
-                        self.state = state;
+                        // The candidate fold was never installed in
+                        // this arm, so after the removal the held
+                        // cache already describes exactly the set we
+                        // hold (the fold is a pure function of the
+                        // item set) — nothing to re-derive.
                         Err(MemoryError::Rejected {
                             outcome,
                             disposition,
