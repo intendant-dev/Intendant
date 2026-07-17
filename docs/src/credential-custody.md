@@ -356,34 +356,61 @@ daemon with no local keys and no lease reports "unfueled" in the
 dashboard rather than erroring opaquely — the same graceful state the
 no-API-key path shows today.
 
-## On-box sign-in: the Claude ceremony
+## On-box sign-in: the guided ceremonies
 
-The deliberate counterpoint to leases: the Vault tab's **Claude
-account** card drives the Claude Code CLI's own `claude auth login` on a
-**daemon-private PTY** (`claude_auth_ceremony.rs`; never registered in
-the agent-visible terminal registry), for owners who keep that
-credential on-box. The dashboard shows the sign-in URL (captured by a
-per-ceremony `PATH` shim that swallows `open`/`xdg-open`, with a PTY
-parse fallback, and validated against the claude.com/anthropic.com
-OAuth shape before display), the owner signs in from their own browser
-and pastes the code back, and the CLI performs the PKCE exchange itself
-— the daemon never sees token material, and ceremony I/O is never
-logged. Four `credentials.manage`-gated routes carry it
-(`/api/claude-auth/{start,status,code,cancel}` + datachannel twins,
-docs table in [Web Dashboard](./web-dashboard.md)); hosted-provenance
-clients are hard-refused at the handlers, one ceremony runs at a time,
-and a 5-minute timeout (or explicit cancel — verified non-destructive)
-reaps the process. **Tier gate:** a daemon whose Claude Code credential
-is custody-managed (active `oauth:claude-code` lease) or whose
-Anthropic provider rides a client-egress relay refuses the ceremony —
-a dashboard login would park a durable credential on disk behind the
-owner's off-box custody choice. After a successful sign-in the card
-lists running Claude Code sessions with per-session **Reload
-credentials** chips: a graceful in-place respawn, resume-attached to
-the same backend session, that re-reads the fresh store (a mid-turn
+The deliberate counterpoint to leases: the Vault tab's **Agent
+accounts** section drives each agent CLI's own login ceremony on a
+**daemon-private PTY** (never registered in the agent-visible terminal
+registry), for owners who keep those credentials on-box. A shared
+provider-parameterized core (`auth_ceremony.rs`) carries the state
+machine, the PTY transport and reaping, the browser-spawn-suppression
+`PATH` shim, and **daemon-wide single-flight** — one credential
+ceremony at a time, across providers — under thin per-provider drivers:
+
+**Claude** (`claude_auth_ceremony.rs`, `claude auth login`): the
+dashboard shows the sign-in URL (captured by the per-ceremony shim that
+swallows `open`/`xdg-open`, with a PTY parse fallback, and validated
+against the claude.com/anthropic.com OAuth shape before display), the
+owner signs in from their own browser and pastes the code back, and the
+CLI performs the PKCE exchange itself — the daemon never sees token
+material, and ceremony I/O is never logged. 5-minute timeout. V1 is the
+claude.ai lane only (`--console` / `--sso` are follow-ups).
+
+**Codex** (`codex_auth_ceremony.rs`, `codex login --device-auth`): the
+ChatGPT device flow inverts the exchange — the dashboard shows the
+verification URL (validated: https on `auth.openai.com` exactly) and
+the **one-time code**, which the owner types into OpenAI's page;
+nothing comes back to the daemon, the CLI polls OpenAI outbound and
+completes server-side. Success detection is a `codex login status` poll
+(exit-code driven, so output-copy drift can't break it) with the CLI's
+own clean exit + status probe as the second lane; a daemon already
+signed in disables the poll lane so a re-login can't read as instant
+success. The one-time code appears in dashboard status payloads (the
+owner must read it) but never in daemon logs. 15-minute timeout — the
+device code's own expiry. V1 is the ChatGPT subscription lane only (the
+`--with-api-key` / `--with-access-token` stdin lanes are a different
+custody class and stay follow-ups).
+
+Seven `credentials.manage`-gated routes carry the two ceremonies
+(`/api/claude-auth/{start,status,code,cancel}` +
+`/api/codex-auth/{start,status,cancel}` — the device flow deliberately
+has no code-submission leaf — with datachannel twins, docs table in
+[Web Dashboard](./web-dashboard.md)); hosted-provenance clients are
+hard-refused at the handlers, and explicit cancel (verified
+non-destructive against both CLIs) or the timeout reaps the process.
+**Tier gate:** a daemon whose backend credential is custody-managed
+(active `oauth:claude-code` / `oauth:codex` lease) or whose provider
+rides a client-egress relay refuses the ceremony — a dashboard login
+would park a durable credential on disk behind the owner's off-box
+custody choice. (The OpenAI egress arm is structurally vacant today —
+`RELAY_KINDS` excludes OpenAI because its API refuses browser CORS —
+but the gate names the kind so it engages if a relay ever lands.) After
+a successful sign-in the card lists that provider's running sessions
+with per-session **Reload credentials** chips: a graceful in-place
+respawn, resume-attached to the same backend session (Codex via its
+thread-resume machinery), that re-reads the fresh store (a mid-turn
 session is interrupted first; a rate-limit park is cancelled with its
-pending re-send preserved). V1 is the claude.ai lane only
-(`--console` / `--sso` are follow-ups) and local-daemon only.
+pending re-send preserved). Both ceremonies are local-daemon only.
 
 ## Egress: whose network path
 

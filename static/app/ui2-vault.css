@@ -596,13 +596,23 @@ html.ui-v2 .ui2-vault-moved-go {
 }
 html.ui-v2 .ui2-vault-moved-go:hover { background: var(--surface-2); border-color: var(--iris); }
 
-/* ── Claude sign-in ceremony card (#claude-signin-section) ──
-   Its own mount between the vault and the custody trail, so it works
-   with the vault locked, absent, or never created. Mirrors the vault
-   section's treatment (card unwrap, eyebrow status lines, pill chips,
-   row cards, control buttons) with the same tokens; everything is
-   tap-first — no hover-only affordances. */
-html.ui-v2 #claude-signin-section .vault-card {
+/* ── Agent sign-in ceremony cards (#agent-signin-section) ──
+   One card per provider (Claude, Codex) in their own mount between the
+   vault and the custody trail, so they work with the vault locked,
+   absent, or never created. Mirrors the vault section's treatment
+   (card unwrap, eyebrow status lines, pill chips, row cards, control
+   buttons) with the same tokens; everything is tap-first — no
+   hover-only affordances. */
+html.ui-v2 #agent-signin-section {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+html.ui-v2 #agent-signin-section .agent-signin + .agent-signin {
+  border-top: 1px solid var(--line);
+  padding-top: 18px;
+}
+html.ui-v2 #agent-signin-section .vault-card {
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -610,19 +620,19 @@ html.ui-v2 #claude-signin-section .vault-card {
   gap: 14px;
   margin-bottom: 8px;
 }
-html.ui-v2 #claude-signin-section .vault-status-line {
+html.ui-v2 #agent-signin-section .vault-status-line {
   gap: 10px;
   font-size: 13px;
   line-height: 1.5;
   color: var(--text-2);
 }
-html.ui-v2 #claude-signin-section .vault-status-line .lbl {
+html.ui-v2 #agent-signin-section .vault-status-line .lbl {
   font-size: 10.5px;
   letter-spacing: .1em;
   text-transform: uppercase;
   color: var(--text-3);
 }
-html.ui-v2 #claude-signin-section .vault-status-line > .vault-chip {
+html.ui-v2 #agent-signin-section .vault-status-line > .vault-chip {
   padding: 3px 10px;
   border-radius: 999px;
   border: 1px solid var(--line-2);
@@ -631,18 +641,18 @@ html.ui-v2 #claude-signin-section .vault-status-line > .vault-chip {
   font-weight: 700;
   color: var(--text-2);
 }
-html.ui-v2 #claude-signin-section .vault-status-line > .vault-chip.ok {
+html.ui-v2 #agent-signin-section .vault-status-line > .vault-chip.ok {
   background: rgba(var(--green-rgb), .12);
   border-color: rgba(var(--green-rgb), .26);
   color: var(--green);
 }
-html.ui-v2 #claude-signin-section .vault-status-line > .vault-chip.warn {
+html.ui-v2 #agent-signin-section .vault-status-line > .vault-chip.warn {
   background: rgba(var(--amber-rgb), .14);
   border-color: rgba(var(--amber-rgb), .26);
   color: var(--amber);
 }
-html.ui-v2 #claude-signin-section .vault-entry-list { gap: 10px; }
-html.ui-v2 #claude-signin-section .vault-entry-row {
+html.ui-v2 #agent-signin-section .vault-entry-list { gap: 10px; }
+html.ui-v2 #agent-signin-section .vault-entry-row {
   gap: 10px;
   border: 1px solid var(--line);
   border-radius: var(--r-card);
@@ -651,14 +661,14 @@ html.ui-v2 #claude-signin-section .vault-entry-row {
   font-size: 12px;
   color: var(--text-2);
 }
-html.ui-v2 #claude-signin-section .vault-entry-row .lbl {
+html.ui-v2 #agent-signin-section .vault-entry-row .lbl {
   font-size: 13.5px;
   font-weight: 700;
   color: var(--text);
   min-width: 0;
   overflow-wrap: anywhere;
 }
-html.ui-v2 #claude-signin-section .vault-entry-row .vault-chip {
+html.ui-v2 #agent-signin-section .vault-entry-row .vault-chip {
   padding: 1px 7px;
   border-radius: 6px;
   border: 0;
@@ -668,15 +678,15 @@ html.ui-v2 #claude-signin-section .vault-entry-row .vault-chip {
   font-weight: 400;
   color: var(--text-2);
 }
-html.ui-v2 #claude-signin-section .vault-entry-row .vault-chip.ok {
+html.ui-v2 #agent-signin-section .vault-entry-row .vault-chip.ok {
   background: rgba(var(--green-rgb), .12);
   color: var(--green);
 }
-html.ui-v2 #claude-signin-section .vault-entry-row .vault-entry-actions {
+html.ui-v2 #agent-signin-section .vault-entry-row .vault-entry-actions {
   margin-left: auto;
   gap: 8px;
 }
-html.ui-v2 #claude-signin-section .ui-btn {
+html.ui-v2 #agent-signin-section .ui-btn {
   min-height: 0;
   display: inline-flex;
   align-items: center;
@@ -692,11 +702,11 @@ html.ui-v2 #claude-signin-section .ui-btn {
   line-height: 1.2;
   transition: background var(--t-med), border-color var(--t-med), color var(--t-med), filter var(--t-med);
 }
-html.ui-v2 #claude-signin-section .ui-btn:hover {
+html.ui-v2 #agent-signin-section .ui-btn:hover {
   background: var(--surface-2);
   border-color: var(--line-2);
 }
-html.ui-v2 #claude-signin-section .ui-btn.primary {
+html.ui-v2 #agent-signin-section .ui-btn.primary {
   border: 0;
   padding: 8px 15px;
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
@@ -704,29 +714,29 @@ html.ui-v2 #claude-signin-section .ui-btn.primary {
   font-weight: 800;
   box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
 }
-html.ui-v2 #claude-signin-section .ui-btn.primary:hover {
+html.ui-v2 #agent-signin-section .ui-btn.primary:hover {
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
   filter: brightness(1.08);
 }
-html.ui-v2 #claude-signin-section .ui-btn.danger {
+html.ui-v2 #agent-signin-section .ui-btn.danger {
   border-color: rgba(var(--rose-rgb), .4);
   background: transparent;
   color: var(--rose);
 }
-html.ui-v2 #claude-signin-section .ui-btn.danger:hover {
+html.ui-v2 #agent-signin-section .ui-btn.danger:hover {
   border-color: rgba(var(--rose-rgb), .55);
   background: rgba(var(--rose-rgb), .1);
 }
-html.ui-v2 #claude-signin-section .ui-btn:focus-visible {
+html.ui-v2 #agent-signin-section .ui-btn:focus-visible {
   outline: 2px solid var(--iris);
   outline-offset: 2px;
 }
-html.ui-v2 #claude-signin-section .vault-note {
+html.ui-v2 #agent-signin-section .vault-note {
   font-size: 12px;
   line-height: 1.55;
   color: var(--text-2);
 }
-html.ui-v2 #claude-signin-section .vault-warning {
+html.ui-v2 #agent-signin-section .vault-warning {
   border: 1px solid rgba(var(--amber-rgb), .32);
   border-radius: 11px;
   padding: 12px 14px;
@@ -735,7 +745,7 @@ html.ui-v2 #claude-signin-section .vault-warning {
   line-height: 1.55;
   color: var(--amber);
 }
-html.ui-v2 #claude-signin-section .vault-error {
+html.ui-v2 #agent-signin-section .vault-error {
   border: 1px solid rgba(var(--rose-rgb), .32);
   border-radius: 11px;
   padding: 10px 12px;
@@ -744,10 +754,11 @@ html.ui-v2 #claude-signin-section .vault-error {
   line-height: 1.5;
   color: var(--rose);
 }
-/* The ceremony's own pieces: numbered steps, the visible sign-in URL,
-   and the code field. The URL is deliberately shown whole (mono,
-   wrap-anywhere) so the owner can eyeball the claude.com origin. */
-html.ui-v2 #claude-signin-section .claude-signin-step {
+/* The ceremonies' own pieces: numbered steps, the visible sign-in URL,
+   the paste-code field (Claude), and the big one-time device code
+   (Codex). The URL is deliberately shown whole (mono, wrap-anywhere)
+   so the owner can eyeball the claude.com / auth.openai.com origin. */
+html.ui-v2 #agent-signin-section .agent-signin-step {
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -756,7 +767,7 @@ html.ui-v2 #claude-signin-section .claude-signin-step {
   background: var(--surface);
   padding: 13px 16px;
 }
-html.ui-v2 #claude-signin-section .claude-signin-url {
+html.ui-v2 #agent-signin-section .agent-signin-url {
   font-family: var(--mono);
   font-size: 11px;
   line-height: 1.5;
@@ -768,7 +779,7 @@ html.ui-v2 #claude-signin-section .claude-signin-url {
   padding: 8px 10px;
   user-select: all;
 }
-html.ui-v2 #claude-signin-section .claude-signin-code {
+html.ui-v2 #agent-signin-section .agent-signin-code {
   flex: 1 1 220px;
   min-width: 0;
   min-height: 34px;
@@ -780,16 +791,42 @@ html.ui-v2 #claude-signin-section .claude-signin-code {
   font-size: 12px;
   padding: 7px 10px;
 }
-html.ui-v2 #claude-signin-section .claude-signin-code:focus-visible {
+html.ui-v2 #agent-signin-section .agent-signin-code:focus-visible {
   outline: 2px solid var(--iris);
   outline-offset: 1px;
 }
+/* The Codex one-time code: BIG, mono, select-all — the owner reads or
+   copies it into OpenAI's page, so legibility is the whole point. */
+html.ui-v2 #agent-signin-section .agent-signin-device-row {
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+html.ui-v2 #agent-signin-section .agent-signin-device-code {
+  font-family: var(--mono);
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  line-height: 1.2;
+  color: var(--text);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
+  background: var(--surface-2);
+  padding: 12px 18px;
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+html.ui-v2 #agent-signin-section .agent-signin-countdown {
+  font-variant-numeric: tabular-nums;
+}
 
-/* Base (chrome-independent) fallbacks for the ceremony's own elements,
+/* Base (chrome-independent) fallbacks for the ceremonies' own elements,
    so the /access admin page keeps a sane layout too. */
-#claude-signin-section .claude-signin-step { display: flex; flex-direction: column; gap: 8px; }
-#claude-signin-section .claude-signin-url { font-family: var(--mono, monospace); font-size: 11px; overflow-wrap: anywhere; user-select: all; }
-#claude-signin-section .claude-signin-code { font-family: var(--mono, monospace); }
+#agent-signin-section .agent-signin-step { display: flex; flex-direction: column; gap: 8px; }
+#agent-signin-section .agent-signin-url { font-family: var(--mono, monospace); font-size: 11px; overflow-wrap: anywhere; user-select: all; }
+#agent-signin-section .agent-signin-code { font-family: var(--mono, monospace); }
+#agent-signin-section .agent-signin-device-code { font-family: var(--mono, monospace); font-size: 26px; font-weight: 700; letter-spacing: 0.1em; user-select: all; }
+#agent-signin-section .agent-signin + .agent-signin { margin-top: 16px; }
 
 /* ── v1 fallback (unflagged, NEW elements only) ──
    Under v1 the #vault pane is reachable only by a hand-typed hash and

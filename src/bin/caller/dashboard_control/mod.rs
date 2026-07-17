@@ -5619,12 +5619,15 @@ mod tests {
                 Residue,
                 Some(Op::CredentialsManage),
             ),
-            // The Claude sign-in ceremony is row-declared custody: every
-            // leaf (the status read included) gates on credentials.manage.
+            // The sign-in ceremonies are row-declared custody: every
+            // leaf (the status reads included) gates on credentials.manage.
             ("api_claude_auth_start", Row, Some(Op::CredentialsManage)),
             ("api_claude_auth_status", Row, Some(Op::CredentialsManage)),
             ("api_claude_auth_code", Row, Some(Op::CredentialsManage)),
             ("api_claude_auth_cancel", Row, Some(Op::CredentialsManage)),
+            ("api_codex_auth_start", Row, Some(Op::CredentialsManage)),
+            ("api_codex_auth_status", Row, Some(Op::CredentialsManage)),
+            ("api_codex_auth_cancel", Row, Some(Op::CredentialsManage)),
             (
                 "api_access_iam_upsert_user_client_grant",
                 Row,
@@ -6063,6 +6066,9 @@ mod tests {
             "api_claude_auth_status",
             "api_claude_auth_code",
             "api_claude_auth_cancel",
+            "api_codex_auth_start",
+            "api_codex_auth_status",
+            "api_codex_auth_cancel",
             "api_project_root",
             "api_external_agents",
             "api_displays",
