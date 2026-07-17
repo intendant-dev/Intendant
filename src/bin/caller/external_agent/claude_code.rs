@@ -3849,12 +3849,16 @@ mod tests {
     #[test]
     fn init_echo_populates_config_facts() {
         let mut reader = test_reader();
-        reader.shared.set_requested_permission_mode("bypassPermissions");
+        reader
+            .shared
+            .set_requested_permission_mode("bypassPermissions");
         let init = r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"mcp_servers":[{"name":"intendant","status":"connected"}],"permissionMode":"bypassPermissions","session_id":"s1"}"#;
         let out = reader.process_line(init);
         let facts = config_facts_of(&out);
         assert!(
-            facts.iter().any(|f| f.model.as_deref() == Some("claude-fable-5")),
+            facts
+                .iter()
+                .any(|f| f.model.as_deref() == Some("claude-fable-5")),
             "init model echo populates the section"
         );
         let mode = facts
@@ -6464,10 +6468,30 @@ mod tests {
             "got: {:?}",
             out.events
         );
-        // Permission-mode status echoes stay silent (no log spam per turn).
-        let out = reader.process_line(
-            r#"{"type":"system","subtype":"status","status":null,"permissionMode":"acceptEdits","session_id":"s1"}"#,
+        // Permission-mode status echoes are consumed as config facts. A
+        // DIVERGENT echo (requested default, running acceptEdits) warns —
+        // once per distinct value, so per-turn re-echoes never spam.
+        let echo = r#"{"type":"system","subtype":"status","status":null,"permissionMode":"acceptEdits","session_id":"s1"}"#;
+        let out = reader.process_line(echo);
+        assert!(
+            logs(&out)
+                .iter()
+                .any(|(l, m)| l == "warn" && m.contains("running acceptEdits")),
+            "divergent status echo warns: {:?}",
+            out.events
         );
-        assert!(logs(&out).is_empty(), "unexpected logs: {:?}", out.events);
+        let out = reader.process_line(echo);
+        assert!(
+            logs(&out).is_empty(),
+            "repeat echo stays silent: {:?}",
+            out.events
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ConfigFacts { .. })),
+            "unchanged echo emits no facts: {:?}",
+            out.events
+        );
     }
 }

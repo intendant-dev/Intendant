@@ -3418,10 +3418,9 @@ pub(crate) fn handle_idle_codex_subagent_event(
             });
         }
         external_agent::AgentEvent::ConfigFacts { facts } => {
-            config.bus.send(AppEvent::SessionConfigFacts {
-                session_id,
-                facts,
-            });
+            config
+                .bus
+                .send(AppEvent::SessionConfigFacts { session_id, facts });
         }
         external_agent::AgentEvent::GoalUpdated { goal } => {
             emit_external_session_goal(config, Some(child_thread_id), Some(goal));

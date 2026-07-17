@@ -384,10 +384,8 @@ impl CodexAgent {
                     .reasoning_effort
                     .clone()
                     .filter(|e| !e.trim().is_empty()),
-                permission_kind: intendant_core::vitals::codex_permission_kind(
-                    &approval, &sandbox,
-                )
-                .map(str::to_string),
+                permission_kind: intendant_core::vitals::codex_permission_kind(&approval, &sandbox)
+                    .map(str::to_string),
                 permission_mode,
                 permission_echoed: true,
             },

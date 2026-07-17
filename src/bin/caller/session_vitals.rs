@@ -1202,9 +1202,7 @@ mod tests {
             facts: SessionConfigVitals {
                 model: Some("gpt-5.5".into()),
                 permission_mode: Some("Medium".into()),
-                permission_kind: Some(
-                    intendant_core::vitals::PERMISSION_KIND_AUTONOMY.to_string(),
-                ),
+                permission_kind: Some(intendant_core::vitals::PERMISSION_KIND_AUTONOMY.to_string()),
                 permission_echoed: true,
                 ..Default::default()
             },
@@ -1220,7 +1218,10 @@ mod tests {
         let (sid, config) = tokio::time::timeout(deadline, wait_config(&mut rx))
             .await
             .expect("autonomy fold emits");
-        assert_eq!(sid, "native-loop", "only the autonomy-backed session updates");
+        assert_eq!(
+            sid, "native-loop",
+            "only the autonomy-backed session updates"
+        );
         assert_eq!(config.permission_mode.as_deref(), Some("Full"));
         assert_eq!(
             config.permission_kind.as_deref(),
@@ -1237,7 +1238,9 @@ mod tests {
             .cloned()
             .expect("cc entry");
         assert_eq!(
-            cc.config.as_ref().and_then(|c| c.permission_mode.as_deref()),
+            cc.config
+                .as_ref()
+                .and_then(|c| c.permission_mode.as_deref()),
             Some("bypassPermissions")
         );
 

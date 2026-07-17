@@ -293,7 +293,10 @@ mod tests {
             claude_permission_kind("acceptEdits"),
             Some(PERMISSION_KIND_AUTO_EDITS)
         );
-        assert_eq!(claude_permission_kind("auto"), Some(PERMISSION_KIND_AUTO_SAFE));
+        assert_eq!(
+            claude_permission_kind("auto"),
+            Some(PERMISSION_KIND_AUTO_SAFE)
+        );
         assert_eq!(
             claude_permission_kind("dontAsk"),
             Some(PERMISSION_KIND_DENY_ASKS)
@@ -399,6 +402,10 @@ mod tests {
 
         let sparse = SessionConfigVitals::default();
         let wire = serde_json::to_value(&sparse).expect("serializes");
-        assert_eq!(wire, serde_json::json!({}), "absent facts serialize to nothing");
+        assert_eq!(
+            wire,
+            serde_json::json!({}),
+            "absent facts serialize to nothing"
+        );
     }
 }
