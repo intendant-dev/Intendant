@@ -1182,7 +1182,14 @@ impl TerminalRegistry {
         let shared = policy.shared;
         let scope = policy.scope.clone();
         self.open_or_attach_with(key, actor, policy.may_spawn, move || {
-            PtySession::spawn(cols, rows, Some(project_root), owner, shared, scope.as_ref())
+            PtySession::spawn(
+                cols,
+                rows,
+                Some(project_root),
+                owner,
+                shared,
+                scope.as_ref(),
+            )
         })
         .await
     }
