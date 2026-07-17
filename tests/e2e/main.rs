@@ -1776,9 +1776,10 @@ async fn display_request_rail_round_trips_over_ws() {
         .expect("send resolve_display_request");
 
         // The approval minted the real grant through the existing path.
-        // Emission order inside the control plane's approve arm: the grant
-        // event first, then the resolution — and a /ws reader consumes
-        // frames in order, so wait for them in that order.
+        // The grant event is emitted before the resolution inside the
+        // control plane's approve arm, so `user_display_granted` strictly
+        // precedes `display_request_resolved` on the wire — wait for it
+        // first.
         let granted = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
             json.get("event").and_then(|v| v.as_str()) == Some("user_display_granted")
         })
@@ -1792,20 +1793,6 @@ async fn display_request_rail_round_trips_over_ws() {
         assert_eq!(granted["display_id"], 0, "{granted}");
         assert_eq!(granted["agent_visible"], true, "{granted}");
 
-        let resolved = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
-            json.get("event").and_then(|v| v.as_str()) == Some("display_request_resolved")
-        })
-        .await
-        .unwrap_or_else(|| {
-            panic!(
-                "display_request_resolved never broadcast:\n{}",
-                daemon.log_tail()
-            )
-        });
-        assert_eq!(resolved["id"], id, "{resolved}");
-        assert_eq!(resolved["outcome"], "approved", "{resolved}");
-        assert_eq!(resolved["duration"], "until_revoked", "{resolved}");
-
         // The grant the approval minted also activated a capture session,
         // and under the suite-wide synthetic display mode that session is
         // the deterministic synthetic source on every platform: 1280×720,
@@ -1814,16 +1801,48 @@ async fn display_request_rail_round_trips_over_ws() {
         // report the host's real resolution (or never come up at all on a
         // headless runner). Any leg-0 display events were consumed by the
         // raised-matcher above, so the next display_ready is this leg's.
-        let ready = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
-            json.get("event").and_then(|v| v.as_str()) == Some("display_ready")
-        })
-        .await
-        .unwrap_or_else(|| {
-            panic!(
-                "display_ready never broadcast after the approved grant:\n{}",
-                daemon.log_tail()
-            )
-        });
+        //
+        // `display_ready` and `display_request_resolved` are UNORDERED
+        // relative to each other: the resolution is sent by the approve
+        // arm after the grant event, but the activation runs concurrently
+        // on the display-lifecycle listener, so its `display_ready` can
+        // legally land between the grant and the resolution (observed on
+        // a loaded merge-group runner 2026-07-17 — a matcher that waited
+        // for `resolved` first silently consumed the interleaved
+        // `display_ready` and then starved for 180 s). Collect both
+        // order-tolerantly.
+        let mut resolved: Option<serde_json::Value> = None;
+        let mut ready: Option<serde_json::Value> = None;
+        while resolved.is_none() || ready.is_none() {
+            let event = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+                matches!(
+                    json.get("event").and_then(|v| v.as_str()),
+                    Some("display_request_resolved") | Some("display_ready")
+                )
+            })
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "approve leg still missing {}{} after the approved grant:\n{}",
+                    if resolved.is_none() {
+                        "display_request_resolved "
+                    } else {
+                        ""
+                    },
+                    if ready.is_none() { "display_ready" } else { "" },
+                    daemon.log_tail()
+                )
+            });
+            match event.get("event").and_then(|v| v.as_str()) {
+                Some("display_request_resolved") => resolved = Some(event),
+                _ => ready = Some(event),
+            }
+        }
+        let resolved = resolved.expect("loop exits only with both events");
+        let ready = ready.expect("loop exits only with both events");
+        assert_eq!(resolved["id"], id, "{resolved}");
+        assert_eq!(resolved["outcome"], "approved", "{resolved}");
+        assert_eq!(resolved["duration"], "until_revoked", "{resolved}");
         assert_eq!(ready["display_id"], 0, "{ready}");
         assert_eq!(ready["width"], 1280, "{ready}");
         assert_eq!(ready["height"], 720, "{ready}");
