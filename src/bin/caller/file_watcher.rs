@@ -3211,7 +3211,7 @@ async fn apply_notify_path(
     let prepared = tokio::task::spawn_blocking({
         let project_root = project_root.to_path_buf();
         let abs_path = abs_path.to_path_buf();
-        let kind = kind.clone();
+        let kind = *kind;
         move || prepare_notify_change(&project_root, &abs_path, &kind)
     })
     .await
