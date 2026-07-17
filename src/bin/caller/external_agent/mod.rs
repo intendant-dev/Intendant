@@ -560,6 +560,17 @@ impl GoalEngine {
 /// injected so tests drive it; only the local-timezone rendering reads
 /// the environment.
 pub(crate) fn limit_reset_phrase(resets_at_epoch: Option<u64>, now_epoch: u64) -> String {
+    limit_reset_phrase_verb("resumes", resets_at_epoch, now_epoch)
+}
+
+/// [`limit_reset_phrase`] with a caller-chosen verb: "resumes" suits a
+/// turn the limit paused, "resets" a window that is merely filling up
+/// (the allowed_warning transition row — nothing paused there).
+pub(crate) fn limit_reset_phrase_verb(
+    verb: &str,
+    resets_at_epoch: Option<u64>,
+    now_epoch: u64,
+) -> String {
     let Some(resets_at) = resets_at_epoch else {
         return "reset time unknown".to_string();
     };
@@ -585,8 +596,8 @@ pub(crate) fn limit_reset_phrase(resets_at_epoch: Option<u64>, now_epoch: u64) -
             }
         });
     match absolute {
-        Some(absolute) => format!("resumes {absolute} ({relative})"),
-        None => format!("resumes {relative}"),
+        Some(absolute) => format!("{verb} {absolute} ({relative})"),
+        None => format!("{verb} {relative}"),
     }
 }
 

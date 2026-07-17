@@ -317,7 +317,7 @@ pub(crate) async fn push_subscribe(
             None,
             json!({}),
         );
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -344,7 +344,7 @@ pub(crate) async fn push_unsubscribe(
         });
         let removed = before - store.push_subscriptions.len();
         if removed > 0 {
-            persist_locked(&state, &store)?;
+            persist_locked(&state, &store).await?;
         }
         removed
     };
@@ -410,7 +410,7 @@ pub(crate) async fn push_preferences(
             record.notify_requests = value;
         }
         let flags = (record.notify_presence, record.notify_requests);
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
         flags
     };
     Ok(Json(json!({
@@ -604,7 +604,7 @@ pub(crate) async fn daemon_notify(
             Some(daemon_id.clone()),
             json!({ "kind": body.kind, "sent": sent }),
         );
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
     }
     Ok(Json(
         json!({ "ok": true, "sent": sent, "pruned": dead.len() }),
@@ -643,7 +643,7 @@ pub(crate) async fn push_test(
         store
             .push_subscriptions
             .retain(|record| !dead.contains(&record.endpoint));
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
     }
     Ok(Json(
         json!({ "ok": true, "sent": sent, "pruned": dead.len() }),
@@ -741,7 +741,7 @@ pub(crate) async fn presence_alert_monitor(state: Arc<AppState>) {
             store
                 .push_subscriptions
                 .retain(|record| !dead.contains(&record.endpoint));
-            if let Err(err) = persist_locked(&state, &store) {
+            if let Err(err) = persist_locked(&state, &store).await {
                 eprintln!("[push] failed to persist pruned subscriptions: {err:?}");
             }
         }
@@ -812,7 +812,7 @@ pub(crate) async fn handle_reclaim_monitor(state: Arc<AppState>) {
             );
             eprintln!("[reclaim] freed dormant handle {freed} (account renamed to {renamed_to})");
         }
-        if let Err(err) = persist_locked(&state, &store) {
+        if let Err(err) = persist_locked(&state, &store).await {
             eprintln!("[reclaim] failed to persist dormant-handle reclamation: {err:?}");
         }
     }
