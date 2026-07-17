@@ -338,7 +338,7 @@ pub(crate) fn spawn_mode_web_gateway(
     // tombed cutover). Bootstrap failure degrades to "memory
     // unavailable" instead of failing the gateway; the plane id is
     // logged so operators can tell incarnations apart across restarts.
-    mcp_http_state.memory = match crate::memory::MemoryHandle::bootstrap() {
+    mcp_http_state.memory = match crate::memory::MemoryHandle::bootstrap(bus.clone()) {
         Ok(handle) => {
             println!(
                 "[memory] ephemeral plane {} (nothing persists across restarts)",

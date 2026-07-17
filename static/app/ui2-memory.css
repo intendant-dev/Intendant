@@ -1,0 +1,201 @@
+/* Memory Explorer tab. Token palette only (16-styles-v2-tokens);
+   scoped under html.ui-v2 like every v2 sheet. */
+
+html.ui-v2 #tab-memory {
+  overflow-y: auto;
+}
+html.ui-v2 .memory-wrap {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 18px 20px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+html.ui-v2 .memory-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+html.ui-v2 .memory-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+  color: var(--text);
+}
+html.ui-v2 .memory-counts {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+/* The honest write-bar banner: this plane forgets on restart. */
+html.ui-v2 .memory-ephemeral-note {
+  font-size: 12px;
+  color: var(--amber);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  padding: 7px 10px;
+}
+html.ui-v2 .memory-compose,
+html.ui-v2 .memory-search {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+html.ui-v2 .memory-compose select,
+html.ui-v2 .memory-compose input,
+html.ui-v2 .memory-compose button,
+html.ui-v2 .memory-search input[type="search"] {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 7px 10px;
+  font-size: 13px;
+}
+html.ui-v2 .memory-compose input,
+html.ui-v2 .memory-search input[type="search"] {
+  flex: 1;
+  min-width: 0;
+}
+html.ui-v2 .memory-compose input:focus,
+html.ui-v2 .memory-search input[type="search"]:focus {
+  outline: none;
+  border-color: var(--iris);
+}
+html.ui-v2 .memory-compose button {
+  cursor: pointer;
+  font-weight: 600;
+}
+html.ui-v2 .memory-compose button:hover {
+  border-color: var(--iris);
+  color: var(--iris);
+}
+html.ui-v2 .memory-compose button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+html.ui-v2 .memory-cand-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+  cursor: pointer;
+}
+html.ui-v2 .memory-note {
+  font-size: 12px;
+  color: var(--amber);
+}
+html.ui-v2 .memory-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+html.ui-v2 .memory-item {
+  border: 1px solid var(--line);
+  border-radius: var(--r-card, 12px);
+  background: var(--surface);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  cursor: pointer;
+}
+html.ui-v2 .memory-item.expanded {
+  border-color: var(--iris);
+}
+html.ui-v2 .memory-item-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+/* Derived status chip: candidate is the authoring state; judgments
+   (a later slice) move claims to the other states. */
+html.ui-v2 .memory-status {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+  color: var(--text-3);
+}
+html.ui-v2 .memory-status[data-status="candidate"] { color: var(--sky); }
+html.ui-v2 .memory-status[data-status="accepted"] { color: var(--green); }
+html.ui-v2 .memory-status[data-status="disputed"] { color: var(--amber); }
+html.ui-v2 .memory-status[data-status="superseded"],
+html.ui-v2 .memory-status[data-status="retired"] { color: var(--text-3); }
+html.ui-v2 .memory-item[data-status="retired"],
+html.ui-v2 .memory-item[data-status="superseded"] {
+  opacity: 0.62;
+}
+html.ui-v2 .memory-item-kind {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 5px;
+}
+/* Statements are quoted data: plain text, never HTML. */
+html.ui-v2 .memory-item-statement {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .memory-chip {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+  background: var(--surface-2);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+html.ui-v2 .memory-chip.sensitivity { color: var(--sky); }
+html.ui-v2 .memory-item-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+html.ui-v2 .memory-item-meta {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+html.ui-v2 .memory-item-detail {
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+html.ui-v2 .memory-detail-row {
+  display: flex;
+  gap: 10px;
+  font-size: 11.5px;
+}
+html.ui-v2 .memory-detail-label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-3);
+  min-width: 110px;
+  padding-top: 1px;
+}
+html.ui-v2 .memory-detail-value {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}

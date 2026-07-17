@@ -771,7 +771,52 @@ const VITALS_SEVERITY_RANK = { '': 0, ok: 0, warn: 1, crit: 2 };
 function vitalsLimitLabelLong(label) {
   if (label === '5h') return '5-hour';
   if (label === '7d') return '7-day';
-  return label;
+  // Unknown window names arrive as raw provider vocabulary — keep every
+  // word (the pane owns the full name), just soften the wire spelling.
+  return String(label || '').replace(/_/g, ' ').trim();
+}
+
+// Compact chip form of a limit-window label. Known labels pass through;
+// unknown provider vocabulary ("seven day overage included",
+// "seven_day_overage_included") compresses to chip grammar: abbreviate a
+// leading "<number> <period>" pair (seven day → 7d), drop filler words,
+// hyphenate the rest — "7d-overage". Compression only, never truncation:
+// the full name stays available in the pane (vitalsLimitLabelLong).
+function vitalsLimitLabelShort(label) {
+  const raw = String(label || '').trim();
+  // Already-compact daemon labels ("5h", "7d", "30d", "1w").
+  if (/^\d+\s*(mo|[smhdw])$/i.test(raw)) return raw.replace(/\s+/g, '');
+  const NUMBER_WORDS = {
+    one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7,
+    eight: 8, nine: 9, ten: 10, twelve: 12, fifteen: 15, twenty: 20,
+    thirty: 30, sixty: 60, ninety: 90,
+  };
+  const PERIOD_WORDS = {
+    second: 's', seconds: 's', sec: 's', secs: 's',
+    minute: 'm', minutes: 'm', min: 'm', mins: 'm',
+    hour: 'h', hours: 'h', hr: 'h', hrs: 'h',
+    day: 'd', days: 'd',
+    week: 'w', weeks: 'w', wk: 'w',
+    month: 'mo', months: 'mo',
+  };
+  const FILLER_WORDS = new Set(['included', 'include', 'window', 'limit', 'limits', 'rate', 'the', 'a', 'an', 'of']);
+  const words = raw.toLowerCase().split(/[\s_-]+/).filter(Boolean);
+  const out = [];
+  let i = 0;
+  if (words.length >= 2) {
+    const n = Object.prototype.hasOwnProperty.call(NUMBER_WORDS, words[0])
+      ? NUMBER_WORDS[words[0]]
+      : (/^\d+$/.test(words[0]) ? Number(words[0]) : null);
+    const period = PERIOD_WORDS[words[1]];
+    if (n !== null && period) {
+      out.push(`${n}${period}`);
+      i = 2;
+    }
+  }
+  for (; i < words.length; i++) {
+    if (!FILLER_WORDS.has(words[i])) out.push(words[i]);
+  }
+  return out.join('-') || raw;
 }
 
 // Live activity — the honest "is the model actually doing something right
@@ -834,7 +879,7 @@ const ACTIVITY_STATE_LABELS = {
 function sessionParkedPillLabel(act) {
   if (!act || act.state !== 'parked-on-tasks') return '';
   const n = (act.backgroundTasks || []).length || 1;
-  return `Parked · ${n} background task${n === 1 ? '' : 's'}`;
+  return `Parked · ${n} task${n === 1 ? '' : 's'}`;
 }
 
 function formatActivityElapsed(seconds) {
@@ -874,7 +919,7 @@ const VITALS_SYMBOLS = {
       if (v.state === 'responding') return `🗒 Responding · ${v.elapsedText}`;
       if (v.state === 'tool-running') return `🔧 Running tools · ${v.elapsedText}`;
       if (v.state === 'awaiting-api') return `⋯ Awaiting model · ${v.elapsedText}`;
-      if (v.state === 'parked-on-tasks') return `⏸ Parked · ${v.bgCount} background task${v.bgCount === 1 ? '' : 's'} · ${v.elapsedText}`;
+      if (v.state === 'parked-on-tasks') return `⏸ Parked · ${v.bgCount} task${v.bgCount === 1 ? '' : 's'} · ${v.elapsedText}`;
       if (v.state === 'stalled') return `⚠ Stalled · quiet ${v.quietText}`;
       if (v.state === 'rate-limited') return `⛔ Rate-limited${v.reset ? ` · resets in ${v.reset}` : ''}`;
       return `${ACTIVITY_STATE_LABELS[v.state] || v.state} · ${v.elapsedText}`;
@@ -1041,11 +1086,15 @@ const VITALS_SYMBOLS = {
     // used_percentage — never fires in the print mode we drive it in).
     // Without one the chip stays honest: named window, status mark, and
     // the reset countdown we DO know — never a synthesized number.
+    // Chips always speak the SHORT window grammar ("▮95% 7d-overage ·
+    // ↻6h") — a full provider sentence in a header chip is the failure
+    // mode; the pane keeps the full name.
     chip: (v) => {
       const reset = v.reset ? ` · ↻${v.reset}` : '';
-      if (v.usedPct !== null) return `▮${v.usedPct}% ${v.label}${reset}`;
+      const label = vitalsLimitLabelShort(v.label);
+      if (v.usedPct !== null) return `▮${v.usedPct}% ${label}${reset}`;
       const mark = v.severity === 'crit' ? '⛔' : v.severity === 'warn' ? '⚠' : v.statusWord;
-      return `${v.label} ${mark}${reset}`;
+      return `${label} ${mark}${reset}`;
     },
     explain: (v) => {
       const lines = [];
@@ -1344,16 +1393,38 @@ function sessionVitalsLimitsSegment(limits) {
   };
 }
 
+// The collapsed header's single attention chip: the most severe elevated
+// symbol (severity rank, then catalog priority as the tiebreak) speaks
+// for the whole set in short grammar; additional attention symbols ride
+// as a "+N" count and the pane names every one (the health verdict's
+// culprit list). Null while nothing is elevated — quiet when healthy.
+function vitalsAttentionSummary(models) {
+  const elevated = models.filter((m) => m.key !== 'health' && m.elevated);
+  if (!elevated.length) return null;
+  const top = elevated.reduce((a, b) => {
+    const d = VITALS_SEVERITY_RANK[b.severity] - VITALS_SEVERITY_RANK[a.severity];
+    if (d !== 0) return d > 0 ? b : a;
+    return (b.priority || 0) > (a.priority || 0) ? b : a;
+  });
+  const extra = elevated.length - 1;
+  return {
+    top,
+    extra,
+    aggregate: extra > 0,
+    text: extra > 0 ? `${top.text} +${extra}` : top.text,
+  };
+}
+
 // Renders the chip row; returns true while a cache countdown is live (the
 // vitals ticker keeps re-rendering until everything is cold or gone).
 //
 // Truncation policy: NEVER mid-string ellipsis. Expanded headers wrap the
-// chips onto extra lines so nothing is ever cut; collapsed headers show
-// the health dot + severity-elevated chips + a "+N" overflow chip that
-// opens the glossary (CSS keys off data-elevated / .header-collapsed).
-// Elevation implies survival: an attention chip is excluded from the +N
-// fold count here and exempt from every CSS drop rule — only quiet chips
-// ever drop, so the dot's culprit is always on screen.
+// chips onto extra lines so nothing is ever cut; collapsed (and minimized)
+// headers fold the whole cluster into the pane behind the health dot and
+// show at most ONE compact attention chip — the most severe elevated
+// symbol plus a "+N" count for the rest (CSS keys off .vit-attn /
+// .header-collapsed / .minimized). Severity-first: a red dot's culprit is
+// always on screen, in short grammar, never as a full sentence.
 function renderSessionWindowVitals(win, vitals) {
   if (!win?.vitals) return false;
   const meta = sessionMetadataById.get(win.sessionId) || {};
@@ -1384,6 +1455,15 @@ function renderSessionWindowVitals(win, vitals) {
         chip.title = model.explainLines[0] || model.label;
       }
     }
+    // The attention chip mirrors its top model's text (elapsed/quiet
+    // countdowns tick) — same in-place update, never a rebuild.
+    const attnChip = win.vitals.querySelector('.vit-attn');
+    if (attnChip) {
+      const attention = vitalsAttentionSummary(models);
+      if (attention && attnChip.textContent !== attention.text) {
+        attnChip.textContent = attention.text;
+      }
+    }
     return models.some((m) => m.ticking);
   }
   win.vitals.dataset.vitSig = signature;
@@ -1406,6 +1486,28 @@ function renderSessionWindowVitals(win, vitals) {
     chip.title = m.explainLines[0] || m.label;
     chip.setAttribute('aria-label', m.text ? `${m.label}: ${m.text}` : m.label);
     nodes.push(chip);
+  }
+  // The compact states' single attention chip, right after the health dot
+  // (next to the status pill in the collapsed one-liner). Hidden while the
+  // header is expanded — the full chips are on screen there.
+  const attention = vitalsAttentionSummary(models);
+  if (attention) {
+    const attn = document.createElement('button');
+    attn.type = 'button';
+    attn.className = 'vit-chip vit-attn';
+    // A lone attention symbol drills straight into its explainer; an
+    // aggregated chip opens the pane, whose verdict names every culprit.
+    attn.dataset.chip = attention.aggregate ? 'attention' : attention.top.id;
+    if (attention.top.severity) attn.dataset.severity = attention.top.severity;
+    attn.dataset.elevated = '1';
+    attn.textContent = attention.text;
+    attn.title = attention.aggregate
+      ? 'Needs attention — show all vitals'
+      : (attention.top.explainLines[0] || attention.top.label);
+    attn.setAttribute('aria-label', attention.aggregate
+      ? `${attention.top.label}: ${attention.top.text}, plus ${attention.extra} more — show all vitals`
+      : `${attention.top.label}: ${attention.top.text}`);
+    nodes.splice(1, 0, attn);
   }
   if (foldedWhenCollapsed > 0) {
     const more = document.createElement('button');
@@ -1434,7 +1536,7 @@ function wireVitalsChipRow(win) {
     event.preventDefault();
     event.stopPropagation();
     const id = chip.dataset.chip || '';
-    if (id === 'health' || id === 'overflow') openVitalsGlossary(win.sessionId, chip);
+    if (id === 'health' || id === 'overflow' || id === 'attention') openVitalsGlossary(win.sessionId, chip);
     else openVitalsExplainer(win.sessionId, id, chip);
   });
 }
@@ -1486,6 +1588,40 @@ function closeVitalsExplainer() {
   if (!host) return;
   host.hidden = true;
   host.classList.remove('sheet', 'popover');
+  host._vxTick = null;
+  stopVitalsPanelTicker();
+}
+
+// ── Live pane ticking. Countdown-bearing rows (cache freshness, parked/
+// activity elapsed, limit resets, goal elapsed) tick while the pane is
+// open — the open panel registers an in-place updater (host._vxTick) and
+// this 1 Hz interval drives it. Same doctrine as the chip row's
+// stable-DOM fast path: update text nodes in place, never rebuild the
+// panel (rebuilds detach buttons mid-tap and reset scroll).
+let vitalsPanelTicker = null;
+
+function startVitalsPanelTicker() {
+  if (vitalsPanelTicker) return;
+  vitalsPanelTicker = setInterval(() => {
+    const host = document.getElementById('vitals-explainer');
+    if (!host || host.hidden || typeof host._vxTick !== 'function') {
+      stopVitalsPanelTicker();
+      return;
+    }
+    try { host._vxTick(); } catch (_) { /* next tick retries */ }
+  }, 1000);
+}
+
+function stopVitalsPanelTicker() {
+  if (!vitalsPanelTicker) return;
+  clearInterval(vitalsPanelTicker);
+  vitalsPanelTicker = null;
+}
+
+// Write-guarded textContent: no-op when the rendered second hasn't
+// rolled over, so ticks never churn text nodes (or observers) idly.
+function setVxText(el, text) {
+  if (el && el.textContent !== text) el.textContent = text;
 }
 
 function vxEl(tag, cls, text) {
@@ -1557,6 +1693,135 @@ function openVitalsExplainer(sessionId, chipId, anchor) {
   // nothing was announced.
   if (model.key === 'activity') appendSessionBackgroundTaskRows(sessionId, panel);
   presentVitalsPanel(host, panel, anchor);
+  // Tick the value and sentences in place while open (elapsed, quiet,
+  // countdowns). Line COUNT changes (a state flip mid-open) skip the
+  // in-place pass — the stale-by-seconds text settles on next open.
+  host._vxTick = () => {
+    const fresh = vitalsModelsForSession(sessionId).find((m) => m.id === chipId);
+    if (!fresh) return;
+    setVxText(panel.querySelector('.vx-head .vx-value'), fresh.text);
+    const lines = panel.querySelectorAll('.vx-line');
+    if (lines.length === fresh.explainLines.length) {
+      fresh.explainLines.forEach((line, i) => setVxText(lines[i], line));
+    }
+  };
+  startVitalsPanelTicker();
+}
+
+function vxVerdictText(health) {
+  return health?.severity === 'crit' ? 'needs attention'
+    : health?.severity === 'warn' ? 'worth a look'
+    : 'all good';
+}
+
+// A folded-fact row for the glossary: same vx-row skeleton the catalog
+// rows use (value column + label/sentence body) so the pane reads as one
+// list and stays extensible. `onTap` makes the row a button; the sentence
+// SAYS what tapping does — no hover-only affordances.
+function vxFactRow({ label, value, desc, absent = false, onTap = null }) {
+  const row = vxEl('div', `vx-row ${absent ? 'absent' : 'present'}`);
+  row.appendChild(vxEl('span', 'vx-glyph', absent ? '—' : (value || '●')));
+  const body = vxEl('div', 'vx-body');
+  body.appendChild(vxEl('div', 'vx-label', label));
+  body.appendChild(vxEl('div', 'vx-desc', desc || ''));
+  row.appendChild(body);
+  if (onTap && !absent) {
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
+    row.addEventListener('click', onTap);
+    row.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onTap(); }
+    });
+  } else {
+    row.classList.add('static');
+  }
+  return row;
+}
+
+// The header's folded facts, as pane rows: project root, working folder,
+// relationship, goal. What the collapsed one-liner no longer shows lives
+// here in plain words — the dot is the door.
+function vitalsGlossaryFactRows(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const meta = sessionMetadataById.get(sid) || {};
+  const rows = [];
+  const projectRoot = String(meta.projectRoot || '').trim();
+  rows.push(vxFactRow(projectRoot ? {
+    label: 'Project',
+    value: meta.projectLabel || compactPathLabel(projectRoot, true),
+    desc: `${projectRoot} — tap to copy the path.`,
+    onTap: () => vitalsCopyText(projectRoot),
+  } : {
+    label: 'Project',
+    desc: 'Project folder not known yet.',
+    absent: true,
+  }));
+  const cwd = String(meta.cwd || '').trim();
+  rows.push(vxFactRow(cwd ? {
+    label: 'Working folder',
+    value: meta.cwdLabel || compactPathLabel(cwd, true),
+    desc: cwd === projectRoot
+      ? 'Same as the project folder — tap to copy the path.'
+      : `${cwd} — tap to copy the path.`,
+    onTap: () => vitalsCopyText(cwd),
+  } : {
+    label: 'Working folder',
+    desc: 'Working folder not known yet.',
+    absent: true,
+  }));
+  const kind = String(meta.relationshipKind || '').trim();
+  const parentId = String(meta.parentId || '').trim();
+  const children = Array.isArray(meta.children) ? meta.children : [];
+  if (kind && parentId) {
+    const kindWord = kind === 'subagent' ? 'sub-agent' : kind;
+    const parentIdentity = typeof sessionIdentityParts === 'function'
+      ? sessionIdentityParts(parentId) : {};
+    const parentLabel = parentIdentity.name || parentIdentity.shortId
+      || (typeof shortSessionId === 'function' ? shortSessionId(parentId) : parentId);
+    rows.push(vxFactRow({
+      label: 'Relationship',
+      value: kindWord,
+      desc: `Started by ${parentLabel} — tap to focus that window.`,
+      onTap: () => {
+        closeVitalsExplainer();
+        if (typeof focusSessionWindow === 'function' && sessionWindows.has(parentId)) {
+          focusSessionWindow(parentId);
+        }
+      },
+    }));
+  } else if (children.length > 0) {
+    const counts = new Map();
+    for (const child of children) {
+      const childKind = String(child?.kind || '').trim().toLowerCase() || 'related';
+      counts.set(childKind, (counts.get(childKind) || 0) + 1);
+    }
+    const summary = Array.from(counts.entries())
+      .map(([k, n]) => `${n} ${k === 'subagent' ? 'sub' : k}`)
+      .join(' · ');
+    rows.push(vxFactRow({
+      label: 'Relationship',
+      value: summary,
+      desc: `Runs ${children.length} related session${children.length === 1 ? '' : 's'} alongside this one.`,
+    }));
+  } else {
+    rows.push(vxFactRow({
+      label: 'Relationship',
+      desc: 'Runs on its own — not started by another session.',
+      absent: true,
+    }));
+  }
+  const goal = meta.goal && typeof meta.goal === 'object' ? meta.goal : null;
+  if (goal?.objective) {
+    const status = normalizeGoalStatus(goal.status);
+    const row = vxFactRow({
+      label: 'Goal',
+      value: formatGoalElapsed(currentSessionGoalElapsedSeconds(goal)),
+      desc: status === 'active' ? goal.objective : `${status} · ${goal.objective}`,
+    });
+    row.dataset.vxGoal = '1';
+    rows.push(row);
+  }
+  return rows;
 }
 
 // ── Background-task inspector: what a parked (or working) session's
@@ -1713,13 +1978,14 @@ function openSessionBackgroundTaskOutput(sessionId, task) {
 // The glossary is the parity surface: EVERY catalog symbol is listed —
 // present ones with their live value and sentence (tap to drill in),
 // absent ones dimmed with "not reported", so what an agent lacks is
-// visible instead of silently missing. The health dot opens this.
+// visible instead of silently missing. The health dot opens this; the
+// header facts the collapsed one-liner folded away lead the list.
 function openVitalsGlossary(sessionId, anchor) {
   const models = vitalsModelsForSession(sessionId);
   const health = models.find((m) => m.key === 'health');
   const host = ensureVitalsExplainerHost();
   const panel = host.querySelector('.vx-panel');
-  const rows = [];
+  const rows = vitalsGlossaryFactRows(sessionId);
   // Quiet is not unavailable: a clean repo REPORTS zero dirty files. When
   // the symbol's family has data but this symbol is at rest, say so in
   // its own words; only families the agent never reported read as such.
@@ -1740,6 +2006,13 @@ function openVitalsGlossary(sessionId, anchor) {
         : 'Not reported for this session yet.');
   const addRow = (model, def, label, key) => {
     const row = vxEl('div', `vx-row ${model ? 'present' : 'absent'}`);
+    if (model) {
+      // Tick + severity handles for the live pane: the 1 Hz updater finds
+      // rows by model id, and severity tints the value column so the
+      // culprit reads at a glance even with the header chips folded away.
+      row.dataset.vxModel = model.id;
+      if (model.tone) row.dataset.severity = model.tone;
+    }
     row.appendChild(vxEl('span', 'vx-glyph', model ? (model.text || '●') : '—'));
     const body = vxEl('div', 'vx-body');
     body.appendChild(vxEl('div', 'vx-label', label || def.label));
@@ -1765,20 +2038,53 @@ function openVitalsGlossary(sessionId, anchor) {
     if (key === 'limit') {
       const limitModels = models.filter((m) => m.key === 'limit');
       if (!limitModels.length) addRow(null, VITALS_SYMBOLS.limit, 'Rate limits', key);
-      for (const m of limitModels) addRow(m, VITALS_SYMBOLS.limit, `Rate limit ${m.id.slice('limit:'.length)}`, key);
+      // The chip compresses the window name; the pane owns the FULL name.
+      for (const m of limitModels) {
+        addRow(m, VITALS_SYMBOLS.limit,
+          `Rate limit · ${vitalsLimitLabelLong(m.id.slice('limit:'.length))}`, key);
+      }
       continue;
     }
     addRow(models.find((m) => m.key === key) || null, VITALS_SYMBOLS[key], undefined, key);
   }
   panel.replaceChildren(
-    vxHeader('Session vitals',
-      health?.severity === 'crit' ? 'needs attention' : health?.severity === 'warn' ? 'worth a look' : 'all good'),
+    vxHeader('Session vitals', vxVerdictText(health)),
     // Every health line: the lead-in plus the named culprits — the whole
     // point of the verdict is that nobody has to hunt for a chip.
     ...(health?.explainLines || []).map((line) => vxEl('p', 'vx-line', line)),
     ...rows
   );
   presentVitalsPanel(host, panel, anchor);
+  // Countdown-bearing rows tick in place while the pane is open: value
+  // column + first sentence per catalog row, the goal row's elapsed, and
+  // the verdict word. Rows never appear/disappear per tick — structure
+  // changes wait for the next open (or a real vitals event re-render).
+  host._vxTick = () => {
+    const fresh = vitalsModelsForSession(sessionId);
+    const byId = new Map(fresh.map((m) => [m.id, m]));
+    for (const row of panel.querySelectorAll('[data-vx-model]')) {
+      const m = byId.get(row.dataset.vxModel);
+      if (!m) continue;
+      setVxText(row.querySelector('.vx-glyph'), m.text || '●');
+      setVxText(row.querySelector('.vx-desc'), m.explainLines[0] || '');
+      const tone = m.tone || '';
+      if ((row.dataset.severity || '') !== tone) {
+        if (tone) row.dataset.severity = tone;
+        else delete row.dataset.severity;
+      }
+    }
+    const goalRow = panel.querySelector('[data-vx-goal]');
+    if (goalRow) {
+      const goal = (sessionMetadataById.get(String(sessionId || '').trim()) || {}).goal;
+      if (goal?.objective) {
+        setVxText(goalRow.querySelector('.vx-glyph'),
+          formatGoalElapsed(currentSessionGoalElapsedSeconds(goal)));
+      }
+    }
+    setVxText(panel.querySelector('.vx-head .vx-value'),
+      vxVerdictText(byId.get('health')));
+  };
+  startVitalsPanelTicker();
 }
 
 function vitalsCopyText(text) {

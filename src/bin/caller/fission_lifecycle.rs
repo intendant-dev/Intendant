@@ -265,7 +265,9 @@ pub fn spawn_fission_lifecycle_watcher(
     let mut rx = bus.subscribe_session_log();
     tokio::spawn(async move {
         let mut state = LifecycleWatcherState::default();
-        while let Some(event) = rx.recv().await {
+        // The lane pairs each event with its enqueue instant (the session-log
+        // writer's latency forensics); this watcher only folds the events.
+        while let Some((event, _enqueued_at)) = rx.recv().await {
             if !matches!(event, AppEvent::FileChanged { .. }) {
                 handle_lifecycle_event(&event, &mut state);
                 continue;
@@ -281,10 +283,10 @@ pub fn spawn_fission_lifecycle_watcher(
             stage_lifecycle_event(&event, &mut state, &mut batch);
             loop {
                 match rx.try_recv() {
-                    Ok(next @ AppEvent::FileChanged { .. }) => {
+                    Ok((next @ AppEvent::FileChanged { .. }, _)) => {
                         stage_lifecycle_event(&next, &mut state, &mut batch);
                     }
-                    Ok(next) => {
+                    Ok((next, _)) => {
                         batch.flush();
                         handle_lifecycle_event(&next, &mut state);
                     }

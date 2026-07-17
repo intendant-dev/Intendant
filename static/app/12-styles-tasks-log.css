@@ -1015,7 +1015,19 @@ body.context-focus-active {
 .session-window:not(.header-collapsed):not(.minimized) {
   max-height: none;
 }
-.session-window.header-collapsed .session-window-task {
+/* Collapsed header = the one-line glance: health dot, status pill,
+   "id · name", plus the control clusters. Everything else — PROJ/CWD,
+   relationship chips, goal, tier, the quiet vitals chips — folds into
+   the vitals pane behind the dot (openVitalsGlossary). The minimized
+   36px bar shows the same glance primitives, tighter. */
+.session-window.header-collapsed .session-window-task,
+.session-window.header-collapsed .session-window-project,
+.session-window.header-collapsed .session-window-cwd,
+.session-window.header-collapsed .session-window-relation-strip,
+.session-window.header-collapsed .session-window-goal,
+.session-window.header-collapsed .session-window-tier,
+.session-window.minimized .session-window-project,
+.session-window.minimized .session-window-relation-strip {
   display: none;
 }
 .session-window.minimized .session-window-goal {
@@ -1024,6 +1036,15 @@ body.context-focus-active {
 .session-window.minimized .session-window-tier {
   display: none;
 }
+/* Glance order: dot (+ the single attention chip) first, status pill,
+   then identity — controls keep the right edge via the menu cluster's
+   auto margin. Applies to both compact states. */
+.session-window.header-collapsed .session-window-vitals,
+.session-window.minimized .session-window-vitals { order: -3; }
+.session-window.header-collapsed .session-window-status,
+.session-window.minimized .session-window-status { order: -2; }
+.session-window.header-collapsed .session-window-title,
+.session-window.minimized .session-window-title { order: -1; }
 .session-window.header-collapsed .session-window-title {
   gap: 1px;
 }
@@ -1050,7 +1071,10 @@ body.context-focus-active {
   cursor: pointer;
 }
 .session-window.header-collapsed .session-window-header {
-  align-items: flex-start;
+  align-items: center;
+  /* One line by design; when a long name meets an attention chip the
+     header wraps rather than clipping anything (never-chop doctrine). */
+  flex-wrap: wrap;
 }
 .session-window-title {
   min-width: 0;
@@ -1060,8 +1084,8 @@ body.context-focus-active {
   gap: 2px;
 }
 .session-window.header-collapsed .session-window-title {
-  flex: 0 1 min(520px, 46%);
-  max-width: min(520px, 46%);
+  flex: 1 1 auto;
+  max-width: none;
 }
 .session-window:not(.header-collapsed):not(.minimized) .session-window-title {
   flex: 1 1 100%;
@@ -1325,12 +1349,6 @@ body.context-focus-active {
   border-color: color-mix(in srgb, var(--blue) 26%, transparent);
   color: var(--blue);
 }
-.session-window.header-collapsed .session-window-tier {
-  max-width: 64px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .session-window:not(.header-collapsed):not(.minimized) .session-window-tier,
 .session-window:not(.header-collapsed):not(.minimized) .session-window-status,
 .session-window:not(.header-collapsed):not(.minimized) .session-window-menu-cluster,
@@ -1354,10 +1372,6 @@ body.context-focus-active {
   line-height: 1.35;
   white-space: nowrap;
   overflow: hidden;
-}
-.session-window.header-collapsed .session-window-goal {
-  flex: 1 1 220px;
-  max-width: min(460px, 38%);
 }
 .session-window:not(.header-collapsed):not(.minimized) .session-window-goal {
   flex: 1 1 100%;
@@ -1399,16 +1413,8 @@ body.context-focus-active {
   color: var(--green);
 }
 @container (max-width: 560px) {
-  .session-window.header-collapsed .session-window-tier {
-    display: none;
-  }
   .session-window:not(.header-collapsed) .session-window-goal {
     display: none;
-  }
-  .session-window.header-collapsed .session-window-goal {
-    flex-basis: 120px;
-    max-width: 180px;
-    padding-inline: 6px;
   }
 }
 @container (max-width: 420px) {
@@ -1485,17 +1491,24 @@ body.context-focus-active {
 }
 .session-window-vitals .vit-health[data-severity="warn"]::before { background: var(--yellow); }
 .session-window-vitals .vit-health[data-severity="crit"]::before { background: var(--red); }
-/* Collapsed header / narrow container: quiet chips fold into "+N", but
-   elevation implies SURVIVAL — an attention chip ([data-elevated]) is
-   never folded into the count, never display:none'd, and never clipped:
-   chips are shrink-proof (flex: none) and the cluster keeps its base
-   flex-wrap (no nowrap override), so surviving chips wrap onto another
-   line instead of vanishing when the header runs tight. A red health
-   dot whose culprit chip is invisible is the one unacceptable outcome. */
-.session-window-vitals .vit-chip.vit-overflow { display: none; }
-.session-window.header-collapsed .session-window-vitals .vit-chip:not([data-elevated]) { display: none; }
-.session-window.header-collapsed .session-window-vitals .vit-chip.vit-overflow { display: inline-flex; }
+/* Compact states (collapsed one-liner, minimized bar): the whole cluster
+   folds into the pane behind the dot — only the dot and the single
+   .vit-attn attention chip render (most severe symbol, short grammar,
+   "+N" count for the rest). Severity-first: a red dot's culprit is
+   always on screen and never a full sentence. Expanded headers show
+   every chip and wrap; the "+N" overflow chip serves only the
+   expanded-but-narrow container fold below. */
+.session-window-vitals .vit-chip.vit-overflow,
+.session-window-vitals .vit-chip.vit-attn { display: none; }
+.session-window.header-collapsed .session-window-vitals .vit-chip:not(.vit-health):not(.vit-attn),
+.session-window.minimized .session-window-vitals .vit-chip:not(.vit-health):not(.vit-attn) { display: none; }
+.session-window.header-collapsed .session-window-vitals .vit-chip.vit-attn,
+.session-window.minimized .session-window-vitals .vit-chip.vit-attn { display: inline-flex; }
 @container (max-width: 560px) {
+  /* Expanded-but-narrow: quiet chips fold into "+N"; attention chips
+     ([data-elevated]) keep their survival. The compact-state rules above
+     outrank the overflow re-show, so collapsed/minimized never grow a
+     second chip here. */
   .session-window-vitals .vit-chip:not([data-elevated]) { display: none; }
   .session-window-vitals .vit-chip.vit-overflow { display: inline-flex; }
 }
@@ -1519,7 +1532,10 @@ body.context-focus-active {
   border-radius: 12px;
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
   padding: 12px 14px;
-  max-width: 340px;
+  max-width: 380px;
+  max-height: min(70vh, 560px);
+  overflow: auto;
+  overscroll-behavior: contain;
   font-size: 12px;
   line-height: 1.5;
   color: var(--subtext1);
@@ -1567,27 +1583,44 @@ body.context-focus-active {
   cursor: pointer;
 }
 .vx-action:hover { background: var(--surface1); }
+/* Pane rows: the NAME leads, the live value sits unclipped at the row's
+   end (wrapping when long — never mid-string ellipsis; the value is the
+   one thing the row exists to show). DOM order stays glyph-then-body for
+   every producer; grid areas put the body first visually. */
 .vx-row {
   display: grid;
-  grid-template-columns: 40px 1fr;
-  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "body value";
+  column-gap: 12px;
   align-items: baseline;
-  padding: 7px 0;
+  padding: 8px 0;
   border-top: 1px solid var(--surface0);
 }
 .vx-row .vx-glyph {
+  grid-area: value;
+  justify-self: end;
+  max-width: min(46%, 24ch);
   font-family: var(--mono, monospace);
   font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
   color: var(--subtext0);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  text-align: right;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
+/* Severity tints the value so the culprit reads at a glance even with
+   the header chips folded away (quiet rows stay quiet). */
+.vx-row[data-severity="warn"] .vx-glyph { color: var(--yellow); }
+.vx-row[data-severity="crit"] .vx-glyph { color: var(--red); }
+.vx-row .vx-body { grid-area: body; min-width: 0; }
 .vx-row .vx-label { color: var(--text, var(--subtext1)); font-weight: 650; }
-.vx-row .vx-desc { margin-top: 2px; font-size: 11.5px; }
+.vx-row .vx-desc { margin-top: 2px; font-size: 11.5px; overflow-wrap: anywhere; }
 .vx-row.absent { opacity: 0.55; }
 .vx-row.present { cursor: pointer; }
 .vx-row.present:hover .vx-label { color: var(--lavender); }
+/* Informational fact rows (no drill-in) don't pretend to be buttons. */
+.vx-row.present.static { cursor: default; }
+.vx-row.present.static:hover .vx-label { color: var(--text, var(--subtext1)); }
 
 /* ── Background-task inspector: task rows inside the activity explainer,
    and the read-only output viewer. Buttons, not hover affordances —
