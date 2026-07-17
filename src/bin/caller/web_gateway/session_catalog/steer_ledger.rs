@@ -130,7 +130,9 @@ fn external_steer_ledger_log_dirs(
 ) -> Vec<(PathBuf, Vec<String>)> {
     let mut dirs: Vec<(PathBuf, Vec<String>)> = Vec::new();
     let mut seen_dirs: HashSet<String> = HashSet::new();
-    let mut push_dir = |dirs: &mut Vec<(PathBuf, Vec<String>)>, path: PathBuf, alias: Option<String>| {
+    let mut push_dir = |dirs: &mut Vec<(PathBuf, Vec<String>)>,
+                        path: PathBuf,
+                        alias: Option<String>| {
         let key = std::fs::canonicalize(&path)
             .unwrap_or_else(|_| path.clone())
             .to_string_lossy()
@@ -255,14 +257,13 @@ pub(crate) fn external_mid_turn_steer_ledger(
                 "steer_accepted" => {
                     injected_ids.insert(id.to_string());
                 }
-                "steer_delivered" => {
+                "steer_delivered"
                     if data
                         .and_then(|d| d.get("mid_turn"))
                         .and_then(|v| v.as_bool())
-                        == Some(true)
-                    {
-                        injected_ids.insert(id.to_string());
-                    }
+                        == Some(true) =>
+                {
+                    injected_ids.insert(id.to_string());
                 }
                 _ => {}
             }
@@ -319,10 +320,7 @@ mod tests {
     }
 
     fn write_wrapper_log(home: &Path, wrapper_id: &str, lines: &[String]) -> PathBuf {
-        let dir = home
-            .join(".intendant")
-            .join("logs")
-            .join(wrapper_id);
+        let dir = home.join(".intendant").join("logs").join(wrapper_id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("session.jsonl"), lines.join("\n")).unwrap();
         dir
@@ -343,13 +341,55 @@ mod tests {
             home.path(),
             wrapper_id,
             &[
-                steer_line("steer_requested", 1_000, "s-accepted", None, Some("also do B"), None),
+                steer_line(
+                    "steer_requested",
+                    1_000,
+                    "s-accepted",
+                    None,
+                    Some("also do B"),
+                    None,
+                ),
                 steer_line("steer_accepted", 1_001, "s-accepted", None, None, None),
-                steer_line("steer_requested", 2_000, "s-boundary", None, Some("queued text"), None),
-                steer_line("steer_delivered", 2_500, "s-boundary", None, None, Some(false)),
-                steer_line("steer_requested", 3_000, "s-pending", None, Some("never landed"), None),
-                steer_line("steer_requested", 4_000, "s-checkpoint", None, Some("mid checkpoint"), None),
-                steer_line("steer_delivered", 4_500, "s-checkpoint", None, None, Some(true)),
+                steer_line(
+                    "steer_requested",
+                    2_000,
+                    "s-boundary",
+                    None,
+                    Some("queued text"),
+                    None,
+                ),
+                steer_line(
+                    "steer_delivered",
+                    2_500,
+                    "s-boundary",
+                    None,
+                    None,
+                    Some(false),
+                ),
+                steer_line(
+                    "steer_requested",
+                    3_000,
+                    "s-pending",
+                    None,
+                    Some("never landed"),
+                    None,
+                ),
+                steer_line(
+                    "steer_requested",
+                    4_000,
+                    "s-checkpoint",
+                    None,
+                    Some("mid checkpoint"),
+                    None,
+                ),
+                steer_line(
+                    "steer_delivered",
+                    4_500,
+                    "s-checkpoint",
+                    None,
+                    None,
+                    Some(true),
+                ),
             ],
         );
         crate::external_wrapper_index::upsert(
@@ -390,7 +430,14 @@ mod tests {
                     Some("side steer"),
                     None,
                 ),
-                steer_line("steer_accepted", 1_001, "s-side", Some("side-thread-id"), None, None),
+                steer_line(
+                    "steer_accepted",
+                    1_001,
+                    "s-side",
+                    Some("side-thread-id"),
+                    None,
+                    None,
+                ),
                 steer_line(
                     "steer_requested",
                     2_000,
@@ -399,7 +446,14 @@ mod tests {
                     Some("alias steer"),
                     None,
                 ),
-                steer_line("steer_accepted", 2_001, "s-alias", Some(wrapper_id), None, None),
+                steer_line(
+                    "steer_accepted",
+                    2_001,
+                    "s-alias",
+                    Some(wrapper_id),
+                    None,
+                    None,
+                ),
                 steer_line(
                     "steer_requested",
                     3_000,
@@ -408,7 +462,14 @@ mod tests {
                     Some("backend steer"),
                     None,
                 ),
-                steer_line("steer_accepted", 3_001, "s-backend", Some(backend_id), None, None),
+                steer_line(
+                    "steer_accepted",
+                    3_001,
+                    "s-backend",
+                    Some(backend_id),
+                    None,
+                    None,
+                ),
             ],
         );
         crate::external_wrapper_index::upsert(

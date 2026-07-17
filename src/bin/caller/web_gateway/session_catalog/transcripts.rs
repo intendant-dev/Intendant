@@ -1000,8 +1000,7 @@ pub(crate) fn parse_claude_session_entries(
                             });
                             if let Some((user_turn_index, user_turn_revision)) = line_turn {
                                 entry["user_turn_index"] = serde_json::json!(user_turn_index);
-                                entry["user_turn_revision"] =
-                                    serde_json::json!(user_turn_revision);
+                                entry["user_turn_revision"] = serde_json::json!(user_turn_revision);
                             }
                             push(entry);
                         }
@@ -2942,7 +2941,8 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        let entries = parse_claude_session_entries(&path, &ExternalSteerLedger::default()).expect("parse");
+        let entries =
+            parse_claude_session_entries(&path, &ExternalSteerLedger::default()).expect("parse");
         let rows: Vec<(String, String, String, String, String)> = entries
             .iter()
             .map(|e| {
@@ -3026,7 +3026,8 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        let entries = parse_claude_session_entries(&path, &ExternalSteerLedger::default()).expect("parse");
+        let entries =
+            parse_claude_session_entries(&path, &ExternalSteerLedger::default()).expect("parse");
         let contents: Vec<&str> = entries
             .iter()
             .map(|e| e["content"].as_str().unwrap_or(""))
@@ -3079,7 +3080,8 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        let entries = parse_claude_session_entries(&path, &ExternalSteerLedger::default()).expect("parse");
+        let entries =
+            parse_claude_session_entries(&path, &ExternalSteerLedger::default()).expect("parse");
         let user_rows: Vec<(&str, u64, u64)> = entries
             .iter()
             .filter(|e| e["source"] == "User")
@@ -3136,11 +3138,7 @@ mod tests {
         let wrapper_id = "wrapper-steer-alignment";
         let steer_text = "also update the docs";
 
-        let wrapper_dir = home
-            .path()
-            .join(".intendant")
-            .join("logs")
-            .join(wrapper_id);
+        let wrapper_dir = home.path().join(".intendant").join("logs").join(wrapper_id);
         std::fs::create_dir_all(&wrapper_dir).unwrap();
         let requested_ts_ms = rfc3339_ms("2026-07-15T10:00:29Z");
         std::fs::write(
@@ -3182,11 +3180,6 @@ mod tests {
                     "timestamp": "2026-07-15T10:00:00Z",
                     "type": "session_meta",
                     "payload": { "id": session_id }
-                }),
-                serde_json::json!({
-                    "timestamp": "2026-07-15T10:00:01Z",
-                    "type": "event_msg",
-                    "payload": { "type": "task_started", "turn_id": "codex-turn-1" }
                 }),
                 serde_json::json!({
                     "timestamp": "2026-07-15T10:00:01Z",
@@ -3241,12 +3234,20 @@ mod tests {
             "the mid-turn steer renders turnless and burns no index"
         );
         // The steer row still belongs to the turn it steered — its thread
-        // projection attributes it to the active turn, not a phantom one.
-        let steer_row = entries
-            .iter()
-            .find(|e| e["source"] == "user" && e["content"] == steer_text)
-            .expect("steer row rendered");
-        assert_eq!(steer_row["turn_id"].as_str(), Some("codex-turn-1"));
+        // projection shares the enclosing turn's id (the first prompt's),
+        // never a phantom turn of its own.
+        let turn_id_of = |content: &str| {
+            entries
+                .iter()
+                .find(|e| e["source"] == "user" && e["content"] == content)
+                .and_then(|e| e["turn_id"].as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| panic!("no turn_id on row {content:?}"))
+        };
+        assert_eq!(
+            turn_id_of(steer_text),
+            turn_id_of("fix the flaky auth test")
+        );
     }
 
     /// Steer classification never collapses or re-classifies repeated
@@ -3333,7 +3334,8 @@ mod tests {
             crate::external_agent::claude_code::CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
-        let initial_prompt = format!("refactor the parser\\n\\n{addendum_marker}\\nsupervisor plumbing");
+        let initial_prompt =
+            format!("refactor the parser\\n\\n{addendum_marker}\\nsupervisor plumbing");
         let lines = [
             format!(
                 r#"{{"type":"user","timestamp":"2026-07-15T12:00:00.000Z","message":{{"role":"user","content":"{initial_prompt}"}}}}"#
@@ -3404,7 +3406,8 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        let entries = parse_claude_session_entries(&path, &ExternalSteerLedger::default()).expect("parse");
+        let entries =
+            parse_claude_session_entries(&path, &ExternalSteerLedger::default()).expect("parse");
         let entry_for = |uuid: &str| {
             entries
                 .iter()
