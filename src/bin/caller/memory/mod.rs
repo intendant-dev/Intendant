@@ -18,8 +18,8 @@
 //! that program order. Do not add persistence here ahead of it.
 //!
 //! This module is deliberately unrelated to the legacy
-//! `store_memory`/`recall_memory`/`.intendant/memory.json` system
-//! (tombed; cutover is a later P1 slice) and reuses none of its
+//! per-project `.intendant/memory.json` key-value system (deleted at
+//! the P1.7 cutover) and reuses none of its
 //! identifiers, so the cutover's exact-denylist CI absence test stays
 //! exact while the two coexist.
 

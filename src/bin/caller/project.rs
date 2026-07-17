@@ -4,22 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MemoryConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct ModelConfig {
@@ -614,10 +598,12 @@ impl Default for ClaudeCodeConfig {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct ProjectConfig {
-    #[serde(default)]
-    pub memory: MemoryConfig,
     #[serde(default)]
     #[allow(dead_code)]
     pub model: ModelConfig,
@@ -1518,10 +1504,6 @@ impl Project {
         Ok(())
     }
 
-    pub fn memory_path(&self) -> PathBuf {
-        self.root.join(".intendant").join("memory.json")
-    }
-
     #[allow(dead_code)]
     pub fn agent_dir(&self) -> PathBuf {
         self.root.join(".intendant")
@@ -1636,7 +1618,6 @@ mod tests {
     #[test]
     fn default_project_config() {
         let config = ProjectConfig::default();
-        assert!(config.memory.enabled);
         assert!(config.model.context_window.is_none());
         assert!(config.model.max_output_tokens.is_none());
         assert!(config.orchestrator.max_parallel_agents.is_none());
@@ -1757,9 +1738,6 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
     #[test]
     fn parse_full_config() {
         let toml_str = r#"
-[memory]
-enabled = true
-
 [model]
 context_window = 200000
 max_output_tokens = 16384
@@ -1768,7 +1746,6 @@ max_output_tokens = 16384
 max_parallel_agents = 4
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.memory.enabled);
         assert_eq!(config.model.context_window, Some(200_000));
         assert_eq!(config.model.max_output_tokens, Some(16_384));
         assert_eq!(config.orchestrator.max_parallel_agents, Some(4));
@@ -1777,18 +1754,6 @@ max_parallel_agents = 4
     #[test]
     fn parse_empty_config() {
         let config: ProjectConfig = toml::from_str("").unwrap();
-        assert!(config.memory.enabled); // default_true
-        assert!(config.model.context_window.is_none());
-    }
-
-    #[test]
-    fn parse_partial_config() {
-        let toml_str = r#"
-[memory]
-enabled = false
-"#;
-        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
-        assert!(!config.memory.enabled);
         assert!(config.model.context_window.is_none());
     }
 
@@ -1799,7 +1764,6 @@ enabled = false
 context_window = 128000
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.memory.enabled); // default
         assert_eq!(config.model.context_window, Some(128_000));
         assert!(config.model.max_output_tokens.is_none());
     }
@@ -1810,10 +1774,6 @@ context_window = 128000
             root: PathBuf::from("/tmp/myproject"),
             config: ProjectConfig::default(),
         };
-        assert_eq!(
-            project.memory_path(),
-            PathBuf::from("/tmp/myproject/.intendant/memory.json")
-        );
         assert_eq!(
             project.agent_dir(),
             PathBuf::from("/tmp/myproject/.intendant")
@@ -2114,9 +2074,6 @@ ice_servers = [
     #[test]
     fn parse_agent_config_backward_compat() {
         let toml_str = r#"
-[memory]
-enabled = true
-
 [model]
 context_window = 200000
 "#;

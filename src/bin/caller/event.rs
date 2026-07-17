@@ -2013,14 +2013,6 @@ pub enum ControlMsg {
         #[serde(default)]
         target: Option<String>,
     },
-    RecallMemory {
-        #[serde(default)]
-        keywords: Option<Vec<String>>,
-        #[serde(default)]
-        tags: Option<Vec<String>>,
-        #[serde(default)]
-        channel: Option<String>,
-    },
     InvokeSkill {
         skill_name: String,
         #[serde(default)]
@@ -4570,11 +4562,6 @@ mod tests {
                 scope: "diff".to_string(),
                 target: None,
             },
-            ControlMsg::RecallMemory {
-                keywords: Some(vec!["auth".to_string()]),
-                tags: None,
-                channel: Some("project_state".to_string()),
-            },
             ControlMsg::TakeDisplay { display_id: 99 },
             ControlMsg::ReleaseDisplay {
                 display_id: 99,
@@ -5266,46 +5253,6 @@ mod tests {
                 assert_eq!(target.as_deref(), Some("src/main.rs"));
             }
             _ => panic!("expected QueryDetail"),
-        }
-    }
-
-    #[test]
-    fn control_msg_recall_memory_deserialize() {
-        let json =
-            r#"{"action":"recall_memory","keywords":["auth","login"],"channel":"project_state"}"#;
-        let msg: ControlMsg = serde_json::from_str(json).unwrap();
-        match msg {
-            ControlMsg::RecallMemory {
-                keywords,
-                tags,
-                channel,
-            } => {
-                assert_eq!(
-                    keywords,
-                    Some(vec!["auth".to_string(), "login".to_string()])
-                );
-                assert!(tags.is_none());
-                assert_eq!(channel.as_deref(), Some("project_state"));
-            }
-            _ => panic!("expected RecallMemory"),
-        }
-    }
-
-    #[test]
-    fn control_msg_recall_memory_minimal() {
-        let json = r#"{"action":"recall_memory"}"#;
-        let msg: ControlMsg = serde_json::from_str(json).unwrap();
-        match msg {
-            ControlMsg::RecallMemory {
-                keywords,
-                tags,
-                channel,
-            } => {
-                assert!(keywords.is_none());
-                assert!(tags.is_none());
-                assert!(channel.is_none());
-            }
-            _ => panic!("expected RecallMemory"),
         }
     }
 

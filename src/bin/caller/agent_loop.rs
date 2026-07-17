@@ -352,10 +352,6 @@ pub(crate) async fn handle_spawn_sub_agent_call(
             .get("worktree")
             .and_then(|w| w.as_bool())
             .unwrap_or(false),
-        inherit_memory: args
-            .get("inherit_memory")
-            .and_then(|i| i.as_bool())
-            .unwrap_or(false),
         name: args
             .get("name")
             .and_then(|n| n.as_str())
@@ -1841,7 +1837,7 @@ pub(crate) async fn run_agent_loop(
             empty_command_streak = 0;
 
             // Inject project context and normalize
-            let json_str = finalize_command_batch(json_str, project);
+            let json_str = finalize_command_batch(json_str);
             // One parse of the final batch answers every per-batch question
             // below (ask-human rail, Xvfb triggers, Activity preview, runtime
             // timeout selection) — these used to be separate full re-parses.
@@ -2415,8 +2411,8 @@ pub(crate) async fn run_agent_loop(
             }
             empty_command_streak = 0;
 
-            // Inject project context (memory_file) into commands and normalize aliases.
-            let json_str = finalize_command_batch(&json_str, project);
+            // Normalize command aliases (writeFile → editFile).
+            let json_str = finalize_command_batch(&json_str);
             // One parse of the final batch answers every per-batch question
             // below (see the JSON-batch twin above).
             let batch_facts = BatchFacts::from_json(&json_str);
@@ -3484,8 +3480,8 @@ mod provenance_parity {
         let add_user_with_images = concat!(".add_", "user_with_images(");
         for (file, users, with_images) in [
             ("agent_loop.rs", 9usize, 2usize),
-            ("main.rs", 17, 1),
-            ("run_modes.rs", 5, 3),
+            ("main.rs", 16, 1),
+            ("run_modes.rs", 4, 3),
             ("display_glue.rs", 1, 2),
             ("presence.rs", 2, 0),
         ] {

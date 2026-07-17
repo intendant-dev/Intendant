@@ -284,7 +284,7 @@ mod tests {
         let card = fake_card(
             "worker-a",
             &format!("ws://127.0.0.1:{port}/ws"),
-            vec![Capability::ComputerUse, Capability::Knowledge],
+            vec![Capability::ComputerUse],
         );
         let peer_id = registry.add_peer_with_card(card).await.unwrap();
         let handle = registry.get(&peer_id).unwrap();
@@ -365,7 +365,7 @@ mod tests {
         let card = fake_card(
             "no-phone",
             &format!("ws://127.0.0.1:{port}/ws"),
-            vec![Capability::ComputerUse, Capability::Knowledge],
+            vec![Capability::ComputerUse],
         );
         let peer_id = registry.add_peer_with_card(card).await.unwrap();
         let handle = registry.get(&peer_id).unwrap();
@@ -459,7 +459,7 @@ mod tests {
         let card = fake_card(
             "worker",
             &format!("ws://127.0.0.1:{port}/ws"),
-            vec![Capability::ComputerUse, Capability::Knowledge],
+            vec![Capability::ComputerUse],
         );
         let peer_id = registry.add_peer_with_card(card).await.unwrap();
         let handle = registry.get(&peer_id).unwrap();

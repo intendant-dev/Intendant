@@ -1201,18 +1201,6 @@ pub(crate) async fn handle_control_command_mcp(
             emit_control_result(control_tx, "query_detail", true, msg, None);
             None
         }
-        ControlMsg::RecallMemory {
-            keywords,
-            tags,
-            channel,
-        } => {
-            let msg = format!(
-                "recall_memory: keywords={:?}, tags={:?}, channel={:?}",
-                keywords, tags, channel
-            );
-            emit_control_result(control_tx, "recall_memory", true, msg, None);
-            None
-        }
         ControlMsg::TakeDisplay { display_id } => {
             bus.send(AppEvent::DisplayTaken { display_id });
             emit_control_result(

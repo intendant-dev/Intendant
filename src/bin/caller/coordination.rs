@@ -617,31 +617,6 @@ mod tests {
         assert_eq!(back.body, "the body");
     }
 
-    /// The P0.5 rewiring pin: the orchestrator's CHECKPOINT duty rides
-    /// the coordination-file kind, not the tombed memory system. (The
-    /// prompt's knowledge-sharing `store_memory` mentions elsewhere die
-    /// with the tools at the cutover — this pins the §9 duty only.)
-    #[test]
-    fn orchestrator_checkpoint_duty_is_rewired() {
-        let prompt = include_str!("../../../SysPrompt_orchestrator.md");
-        let section = prompt
-            .split("## Checkpointing")
-            .nth(1)
-            .expect("a Checkpointing section")
-            .split("## Completion")
-            .next()
-            .expect("bounded section");
-        assert!(section.contains("workflow_checkpoint"));
-        assert!(
-            !section.contains("store_memory"),
-            "checkpoint duty still tombed"
-        );
-        assert!(
-            !section.contains("recall_memory"),
-            "restart duty still tombed"
-        );
-    }
-
     /// 0600/0700 modes on files and directories (unix).
     #[cfg(unix)]
     #[test]

@@ -255,7 +255,7 @@ external scripts and tools. It is opt-in.
 {"action": "get_controller_loop_status"}
 {"action": "query_detail", "scope": "diff"}
 {"action": "query_detail", "scope": "file", "target": "src/main.rs"}
-{"action": "recall_memory", "keywords": ["auth", "login"], "channel": "project_state"}
+{"action": "search_transcripts", "keywords": ["auth", "login"]}
 {"action": "usage"}
 {"action": "quit"}
 ```
@@ -384,7 +384,7 @@ A browser live model calls presence tools via tagged request/response:
 - **Action tools** (`submit_task`, `approve_action`, `deny_action`,
   `skip_action`, `respond_to_question`, `set_autonomy`, `send_message`) dispatch
   through the EventBus — the same path as control-socket commands.
-- **Query tools** (`check_status`, `query_detail`, `recall_memory`) are handled
+- **Query tools** (`check_status`, `query_detail`, `search_transcripts`) are handled
   asynchronously server-side, reading the shared `AgentStateSnapshot`, project
   files, and knowledge store.
 - **Video tools** (`inspect_frame`, `inspect_frames`) examine frames from the
@@ -421,6 +421,6 @@ endpoint table.
 | `send_message` | Action | Send a mid-task interjection to the agent |
 | `check_status` | Query | Current phase, turn, budget, available displays |
 | `query_detail` | Query | git diff, file contents, task results, or log details |
-| `recall_memory` | Query | Search the knowledge store by keywords/channel |
+| `search_transcripts` | Query | Search voice transcripts and session logs by keywords |
 | `inspect_frame` | Video | Examine a specific frame from the frame registry |
 | `inspect_frames` | Video | Examine multiple frames for visual context |

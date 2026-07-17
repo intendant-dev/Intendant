@@ -89,7 +89,7 @@ pub fn format_result_message(result: &SubAgentResult) -> String {
 
 /// PARKED: disk form for orchestrator project state checkpoints.
 ///
-/// The live checkpoint path uses the knowledge store (`store_memory` on the
+/// The live checkpoint path is the workflow_checkpoint coordination
 /// `project_state` channel). These disk helpers remain unwired.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectState {

@@ -23,16 +23,6 @@ pub struct Command {
     pub question: Option<String>,
     // execPty field
     pub shell_id: Option<String>,
-    // storeMemory / recallMemory fields
-    pub memory_key: Option<String>,
-    pub memory_summary: Option<String>,
-    pub memory_query: Option<String>,
-    pub memory_file: Option<String>,
-    // Knowledge system fields
-    pub memory_tags: Option<String>,
-    pub memory_channel: Option<String>,
-    pub memory_source: Option<String>,
-    pub memory_since: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

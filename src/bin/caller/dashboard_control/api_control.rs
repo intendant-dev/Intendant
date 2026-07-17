@@ -1769,7 +1769,6 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::CancelFollowUp { .. } => "cancel_follow_up",
         ControlMsg::EditUserMessage { .. } => "edit_user_message",
         ControlMsg::QueryDetail { .. } => "query_detail",
-        ControlMsg::RecallMemory { .. } => "recall_memory",
         ControlMsg::TakeDisplay { .. } => "take_display",
         ControlMsg::ReleaseDisplay { .. } => "release_display",
         ControlMsg::GrantUserDisplay { .. } => "grant_user_display",

@@ -95,9 +95,6 @@ function:
 | `url` | string | `browse` |
 | `question` | string | `askHuman` |
 | `shell_id` | string | `execPty` (defaults to `default`) |
-| `memory_key`, `memory_summary`, `memory_query`, `memory_file` | string | `storeMemory` / `recallMemory` |
-| `memory_tags`, `memory_channel`, `memory_source` | string | tagged knowledge |
-| `memory_since` | u64 | `recallMemory` time filter |
 
 ## Sequential, Blocking Execution
 
@@ -128,8 +125,6 @@ These are the ~10 functions `intendant-runtime` actually implements:
 | `browse` | HTTP GET, HTML→text via `html2text` (50 KB cap, 15 s timeout, ≤5 redirects) | `url` |
 | `askHuman` | Write a question to the log dir and **poll indefinitely** for a response file | `question` |
 | `execPty` | Run a command in a persistent PTY session for the life of this process | `command`, `shell_id` |
-| `storeMemory` | Store/update a knowledge entry (legacy or tagged format) | `memory_key`, `memory_summary`, `memory_file`, `memory_tags`, `memory_channel`, `memory_source` |
-| `recallMemory` | Keyword search with optional filters | `memory_query`, `memory_file`, `memory_tags`, `memory_channel`, `memory_source`, `memory_since` |
 
 Path-taking functions (`inspectPath`, `editFile`) run through `validate_path()`,
 which blocks `..` traversal and a fixed set of sensitive locations
@@ -232,8 +227,6 @@ snake_case tool names that map onto the runtime functions:
 | `browse_url` | `browse` |
 | `ask_human` | `askHuman` |
 | `exec_pty` | `execPty` |
-| `store_memory` | `storeMemory` |
-| `recall_memory` | `recallMemory` |
 | `manage_context`, `signal_done`, `invoke_skill`, `spawn_live_audio` | *(caller-handled)* |
 
 ## Nonce Variables
@@ -286,37 +279,14 @@ This is the runtime's primary write-boundary; combined with the key-stripping
 and path validation above, it bounds what an agent command can touch even
 though it runs with the user's privileges.
 
-## Knowledge System
+## Knowledge System (removed)
 
-Project knowledge persists across sessions in `<project>/.intendant/memory.json`.
-The runtime supports both the **legacy key-value format** (entries as an object)
-and the **tagged format** (entries as an array with
-`tags`/`channel`/`source`/cursors), auto-detecting which is on disk. Existing
-legacy files stay in the legacy format on write, even when knowledge fields are
-supplied; a new file selects the tagged format only when a tag/channel/source
-field is supplied.
-
-- **`storeMemory`** creates or updates an entry by `(key, source)` in tagged
-  files. Tags come from a comma-separated `memory_tags`; `memory_channel`
-  defaults to `default`; `memory_source` defaults to `agent`. In legacy files it
-  stores only `summary`, `created_at`, and `updated_at` under the key.
-- **`recallMemory`** keyword-searches `key`+`summary`, ranks by match count, and
-  applies optional filters in tagged files: `memory_tags` (any-match),
-  `memory_channel`, `memory_source`, and `memory_since` (Unix-seconds lower
-  bound). A filter-only query with no keywords returns all matching tagged
-  entries. Legacy-file recall ignores those filters and returns only entries
-  with at least one keyword match.
-
-These pub/sub channels and cursors are what the orchestrator uses to route
-findings between sub-agents — see
-[Multi-Agent Orchestration](./multi-agent.md#knowledge-routing-between-agents).
-Knowledge can be disabled entirely:
-
-```toml
-[memory]
-enabled = false   # default: true
-```
-
+The runtime-level knowledge store (`.intendant/memory.json` and its
+key-value tools) was removed at the Memory-plane cutover.
+Durable, machine-wide facts ride the daemon's Memory service
+(`memory_propose`/`memory_search`/`memory_read`); orchestration state
+rides the `workflow_checkpoint` coordination files. Leftover
+`memory.json` files are inert: nothing reads, ingests, or deletes them.
 ## JSON Output Mode (controller, not runtime)
 
 `--json` is a **controller** flag (headless JSONL stdio), not part of the runtime

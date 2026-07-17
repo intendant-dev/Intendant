@@ -156,7 +156,6 @@ pub(crate) async fn run_with_presence(
             task_tx,
             presence_event_rx,
             agent_state.clone(),
-            project.memory_path(),
             log_dir.clone(),
             project.root.clone(),
             presence_paused.clone(),
@@ -3349,7 +3348,6 @@ pub(crate) struct NativeSessionConfig {
     /// INTENDANT_SYSTEM_PROMPT semantic, session-scoped).
     pub(crate) system_prompt_override: Option<String>,
     /// Inject the project knowledge store into fresh conversations.
-    pub(crate) inherit_memory: bool,
     /// Present on supervised (daemon) sessions: grants the loop the
     /// spawn_sub_agent / wait_sub_agents / submit_result capability.
     pub(crate) orchestration: Option<session_supervisor::SessionOrchestration>,
@@ -3366,7 +3364,6 @@ impl NativeSessionConfig {
         Self {
             role: sub_agent::SubAgentRole::Custom("direct".to_string()),
             system_prompt_override: None,
-            inherit_memory: false,
             orchestration: None,
             sub_agent_identity: None,
         }
@@ -3553,20 +3550,7 @@ pub(crate) async fn run_direct_mode(
         conv
     };
 
-    // Inject inherited project knowledge (sub-agents spawned with
-    // inherit_memory). Resumed conversations already carry it.
-    if native.inherit_memory && fresh_conversation && project.config.memory.enabled {
-        if let Ok(kstore) = knowledge::load(&project.memory_path()) {
-            let refs: Vec<&_> = kstore.entries.iter().collect();
-            let msg = knowledge::format_for_injection(&refs);
-            if !msg.is_empty() {
-                conversation.add_user(MessageProvenance::SystemInjection, msg);
-                conversation.add_assistant(
-                    "Acknowledged. I have loaded the project knowledge.".to_string(),
-                );
-            }
-        }
-    }
+    {}
 
     // Register MCP tools so providers include them in API requests
     if let Some(ref mgr) = mcp_mgr {

@@ -231,11 +231,7 @@ pub fn build_local_agent_card(
         env!("CARGO_PKG_VERSION").to_string(),
         Some(env!("INTENDANT_GIT_SHA").to_string()),
         transports,
-        vec![
-            Capability::ComputerUse,
-            Capability::Knowledge,
-            Capability::Display,
-        ],
+        vec![Capability::ComputerUse, Capability::Display],
         auth,
     )
 }

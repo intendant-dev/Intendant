@@ -399,7 +399,6 @@ pub(crate) async fn run_headless_mode(
             agent_state: agent_state.clone(),
             project_root: project.root.clone(),
             log_dir: log_dir.clone(),
-            knowledge_path: project.memory_path(),
             presence_session: Some(presence_session.clone()),
             context_injection: Some(context_injection.clone()),
         });

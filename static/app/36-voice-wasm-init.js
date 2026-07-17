@@ -1215,7 +1215,7 @@ async function main() {
       if (handoverContext) {
         const waitForVoice = () => {
           if (modelConnected) {
-            app.send_text('[System: handover context] ' + handoverContext + '. Full history available via recall_memory.');
+            app.send_text('[System: handover context] ' + handoverContext + '. Full history available via search_transcripts.');
           } else { setTimeout(waitForVoice, 200); }
         };
         setTimeout(waitForVoice, 500);
