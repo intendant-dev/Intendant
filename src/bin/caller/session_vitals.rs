@@ -1406,12 +1406,15 @@ mod tests {
     }
 
     /// A git stand-in that hangs far longer than the probe timeout —
-    /// proves the anti-wedge guard without a hung real git.
+    /// proves the anti-wedge guard without a hung real git. Hermetic on
+    /// the process ledger too: the unix script `exec`s its sleep so the
+    /// pid `kill_on_drop` reaps IS the sleeper (no shell child to
+    /// orphan), and the Windows sleeper self-bounds at ~3s.
     fn write_hanging_git_stub(dir: &Path) -> PathBuf {
         #[cfg(unix)]
         {
             let path = dir.join("hung-git.sh");
-            std::fs::write(&path, "#!/bin/sh\nsleep 30\n").unwrap();
+            std::fs::write(&path, "#!/bin/sh\nexec sleep 30\n").unwrap();
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
@@ -1420,8 +1423,9 @@ mod tests {
         {
             let path = dir.join("hung-git.bat");
             // `ping -n` is the canonical batch sleep (`timeout` refuses
-            // the null stdin the probe runner hands its children).
-            std::fs::write(&path, "@ping -n 30 127.0.0.1 > nul\r\n").unwrap();
+            // the null stdin the probe runner hands its children); the
+            // short count bounds any orphan outliving the killed cmd.exe.
+            std::fs::write(&path, "@ping -n 4 127.0.0.1 > nul\r\n").unwrap();
             path
         }
     }
