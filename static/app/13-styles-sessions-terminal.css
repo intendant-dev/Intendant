@@ -3386,3 +3386,29 @@ html.ui-v2[data-theme="light"] .control-toast {
   color: var(--overlay1);
   font-size: 10px;
 }
+
+/* Recent list: lineage family tree (indent rail + collapse toggle). */
+.session-card.lineage-depth-1 { margin-left: 16px; }
+.session-card.lineage-depth-2 { margin-left: 32px; }
+.session-card.lineage-depth-3 { margin-left: 48px; }
+.session-card.lineage-depth-4 { margin-left: 64px; }
+.session-card[class*='lineage-depth-'] {
+  position: relative;
+  border-left: 2px solid color-mix(in srgb, var(--mauve) 35%, var(--surface1));
+}
+.session-card .lineage-toggle {
+  float: right;
+  margin: 2px 2px 0 6px;
+  padding: 0 6px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--overlay1);
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.session-card .lineage-toggle:hover {
+  color: var(--blue);
+  border-color: var(--blue);
+}
