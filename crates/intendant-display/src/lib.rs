@@ -2213,30 +2213,25 @@ impl DisplaySession {
         self.latest_frame.read().await.clone()
     }
 
-    /// D-3c: register a federated WebRtcPeer for tile streaming and
-    /// queue/send an initial snapshot when a captured frame is already
-    /// available. Local DisplaySlot peers are not registered in D-3.
+    /// D-3c: register a federated WebRtcPeer for tile streaming so the
+    /// bridge's delta/periodic-snapshot fanout includes it. Local
+    /// DisplaySlot peers are not registered in D-3.
+    ///
+    /// No initial snapshot is sent here. The client requests its
+    /// baseline with the reliable `Subscribe` control message once its
+    /// `tile-control` channel opens (see [`Self::build_tile_control_handler`];
+    /// `SnapshotRequest` covers recovery) — registration-time sends
+    /// predate that D-4d2 protocol and encoded/shipped the same
+    /// baseline a second time on every federated join.
     pub async fn register_tile_subscriber(&self, peer_id: PeerId) {
         self.tile_subscribers.write().await.insert(peer_id);
-        let Some(peer) = self.get_peer(peer_id).await else {
-            return;
-        };
-        let Some(frame) = self.latest_frame().await else {
-            return;
-        };
-        let epoch = self.tile_epoch.load(Ordering::Relaxed);
-        let snapshot_id = self.tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
-        let visual_marker_value =
-            current_visual_marker_value(&self.diagnostics_visual_marker, self.session_epoch);
-        send_tile_snapshot_to_peer(
-            peer,
-            frame,
-            epoch,
-            snapshot_id,
-            visual_marker_value,
-            Arc::clone(&self.counters),
-        )
-        .await;
+        if self.get_peer(peer_id).await.is_none() {
+            // Raced with a fast Close: the peer left the map between
+            // handle_offer returning and this registration. Drop the
+            // just-inserted entry (mirrors the Close arm's unregister)
+            // instead of leaving it for the reaper.
+            self.tile_subscribers.write().await.remove(&peer_id);
+        }
     }
 
     /// D-3c: unregister a tile subscriber. Safe to call even when the
@@ -4328,6 +4323,90 @@ mod tests {
         session.remove_peer(7).await;
         assert!(session.get_peer(7).await.is_none());
         assert_eq!(session.counters.peer_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// The initial tile baseline is sent once, from the client's
+    /// reliable `Subscribe` control message — registration alone must
+    /// not encode/send a snapshot (it used to, doubling the join-time
+    /// full-screen encode: once at registration, again on Subscribe).
+    #[tokio::test]
+    async fn tile_snapshot_sent_on_subscribe_not_on_registration() {
+        let session = DisplaySession::new(
+            0,
+            Arc::new(StubBackend {
+                width: 64,
+                height: 64,
+            }),
+        );
+        // Both preconditions the old registration-time send needed: a
+        // live peer in the map and a captured frame available.
+        session.register_test_peer_for_cleanup(7).await;
+        *session.latest_frame.write().await = Some(Arc::new(make_test_bgra(64, 64)));
+
+        session.register_tile_subscriber(7).await;
+        assert!(
+            session.tile_subscribers.read().await.contains(&7),
+            "registration must insert into the subscriber set"
+        );
+        // The old send path was awaited inline, so a still-zero counter
+        // here really pins its removal.
+        assert_eq!(
+            session
+                .counters
+                .tile_snapshot_records
+                .load(Ordering::Relaxed),
+            0,
+            "registering a tile subscriber alone must not encode a snapshot"
+        );
+
+        // Subscribe produces the one initial baseline. The handler
+        // spawns its work, so poll with a deadline.
+        let handler = session.build_tile_control_handler(7);
+        handler(self::webrtc::TileControlMessage::Subscribe { client_id: 1 });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session
+            .counters
+            .tile_snapshot_records
+            .load(Ordering::Relaxed)
+            == 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "Subscribe did not produce a snapshot within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Settle so a hypothetical second send would land, then pin
+        // exactly one: a 64x64 frame is a single 64px tile, so one
+        // snapshot records exactly one tile record.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            session
+                .counters
+                .tile_snapshot_records
+                .load(Ordering::Relaxed),
+            1,
+            "the Subscribe control message must produce exactly one snapshot"
+        );
+        session.shutdown.cancel();
+    }
+
+    /// Registration that raced a fast Close (peer already gone from the
+    /// map) must not leave a dead entry in the subscriber set.
+    #[tokio::test]
+    async fn tile_subscriber_registration_drops_entry_for_departed_peer() {
+        let session = DisplaySession::new(
+            0,
+            Arc::new(StubBackend {
+                width: 64,
+                height: 64,
+            }),
+        );
+        session.register_tile_subscriber(9).await;
+        assert!(
+            !session.tile_subscribers.read().await.contains(&9),
+            "a peer absent from the peer map must not stay registered"
+        );
     }
 
     #[test]
