@@ -412,6 +412,15 @@ function applyExternalAgentAvailabilityToNewSessionPicker() {
       ? `${agent.command || agent.id} was not found on the daemon host`
       : '';
   }
+  // A backend restored from last-used prefs (or picked before this probe
+  // landed) may just have been greyed out — fall back to the inherit
+  // default instead of leaving a doomed launch selected. The re-render
+  // sees the reset value, so this cannot recurse.
+  const selected = select.options[select.selectedIndex];
+  if (selected && selected.disabled) {
+    select.value = '';
+    renderNewSessionAgentControls();
+  }
 }
 
 let unfueledCheckInFlight = false;

@@ -131,6 +131,108 @@ function onNewSessionClaudeModelSelectChange() {
 }
 window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange;
 
+// ── Last-used launch options (per-browser) ──
+// The agent picker and the identity-shaped external options (backend,
+// binary path, model ids, efforts) reset to their inherit choices on
+// every page load, so repeat launches re-select everything. Remember the
+// raw control values from the last submitted launch in localStorage (the
+// client-toggle tier — the "UI preferences that don't belong in
+// intendant.toml" restoreClientToggles covers) and re-apply them at boot.
+// Authority/cost knobs (sandbox, approval policy, Claude permission mode,
+// managed context, context replay, Fast tier) deliberately stay on the
+// settings-seeded flow — resetNewSessionCodexFastModeToDefault after each
+// submit is that decision in code — so a one-off escalation never becomes
+// a sticky default. Every restored value is validated against the live
+// option list before applying and falls back to the inherit default when
+// it is gone; applyExternalAgentAvailabilityToNewSessionPicker clears a
+// restored backend the daemon later reports missing.
+const NEW_SESSION_AGENT_PREFS_KEY = 'intendant_new_session_agent_prefs_v1';
+let newSessionAgentPrefsApplied = false;
+
+function loadNewSessionAgentPrefs() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(NEW_SESSION_AGENT_PREFS_KEY) || 'null');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function saveNewSessionAgentPrefs() {
+  const value = id => document.getElementById(id)?.value ?? '';
+  const prefs = {
+    agent: value('new-session-agent'),
+    command: value('new-session-agent-command').trim(),
+    codex_model: value('new-session-codex-model-select'),
+    codex_model_custom: value('new-session-codex-model').trim(),
+    codex_reasoning_effort: value('new-session-codex-reasoning-effort'),
+    claude_model: value('new-session-claude-model-select'),
+    claude_model_custom: value('new-session-claude-model').trim(),
+    claude_effort: value('new-session-claude-effort'),
+    saved_at: new Date().toISOString(),
+  };
+  try {
+    localStorage.setItem(NEW_SESSION_AGENT_PREFS_KEY, JSON.stringify(prefs));
+  } catch (_) {
+    // Storage denied/full: last-used prefill is best-effort.
+  }
+}
+
+// Assign a <select> only when the saved value is a real, enabled option —
+// a vanished model id or a backend already greyed out by the availability
+// probe falls back to the inherit default instead of restoring an invalid
+// pick.
+function restoreNewSessionSelectValue(id, saved) {
+  const select = document.getElementById(id);
+  const v = typeof saved === 'string' ? saved : '';
+  if (!select || !v) return false;
+  const option = [...select.options].find(o => o.value === v);
+  if (!option || option.disabled) return false;
+  select.value = v;
+  return true;
+}
+
+function applyNewSessionAgentPrefs() {
+  const prefs = loadNewSessionAgentPrefs();
+  if (!prefs) return;
+  const text = v => (typeof v === 'string' ? v.trim() : '');
+  const agentApplied = restoreNewSessionSelectValue('new-session-agent', prefs.agent);
+  const externalAgentApplied = agentApplied && !!normalizeAgentId(prefs.agent);
+  if (externalAgentApplied) {
+    const command = text(prefs.command);
+    const commandInput = document.getElementById('new-session-agent-command');
+    if (commandInput && command) commandInput.value = command;
+  }
+  if (restoreNewSessionSelectValue('new-session-codex-model-select', prefs.codex_model)) {
+    if (prefs.codex_model === '__custom__') {
+      const input = document.getElementById('new-session-codex-model');
+      if (input) input.value = text(prefs.codex_model_custom);
+    }
+    // Recompute the effort options for the restored model before the
+    // effort restore below validates against them.
+    onNewSessionCodexModelSelectChange();
+  }
+  restoreNewSessionSelectValue('new-session-codex-reasoning-effort', prefs.codex_reasoning_effort);
+  if (restoreNewSessionSelectValue('new-session-claude-model-select', prefs.claude_model)) {
+    if (prefs.claude_model === '__custom__') {
+      const input = document.getElementById('new-session-claude-model');
+      if (input) input.value = text(prefs.claude_model_custom);
+    }
+    updateNewSessionClaudeCustomModelRow();
+  }
+  restoreNewSessionSelectValue('new-session-claude-effort', prefs.claude_effort);
+  newSessionAgentPrefsApplied = true;
+  // Sync the fold/enabled state now for a restored external backend. A
+  // render is only safe once the effective agent is known-external —
+  // before the boot settings fetch resolves the configured default
+  // backend, rendering under agent "" / "internal" would clear restored
+  // model fields that ride on that default. Those cases stay untouched
+  // here and the settings-load render resolves them (its populate paths
+  // preserve still-valid values). A fresh browser with no saved prefs
+  // never reaches this, keeping first-load behavior unchanged.
+  if (externalAgentApplied) renderNewSessionAgentControls();
+}
+
 function normalizeContextArchiveMode(mode) {
   return ['summary', 'exact', 'off'].includes(mode) ? mode : 'summary';
 }
@@ -498,6 +600,11 @@ window.qa = Object.assign(window.qa || {}, {
     configuredAgent: newSessionConfiguredAgent || '',
     bannerHidden: !!document.getElementById('new-session-unfueled-banner')?.classList.contains('hidden'),
     startDisabled: !!document.getElementById('new-session-start-btn')?.disabled,
+  }),
+  newSessionAgentPrefs: () => ({
+    saved: loadNewSessionAgentPrefs(),
+    applied: newSessionAgentPrefsApplied,
+    agent: document.getElementById('new-session-agent')?.value ?? null,
   }),
 
 });
@@ -938,6 +1045,10 @@ async function startNewSession() {
     return;
   }
 
+  // The request is on the wire: remember the submitted launch options as
+  // the next visit's prefill (applyNewSessionAgentPrefs).
+  saveNewSessionAgentPrefs();
+
   updateNewSessionSpawnNotice('pending', 'Spawning new session...');
   showControlToast('info', 'Spawning new session...');
   resetNewSessionCodexFastModeToDefault();
@@ -956,3 +1067,11 @@ function onNewSessionWorktreeToggle() {
   document.getElementById('new-session-worktree-branch-row')?.classList.toggle('hidden', !checked);
 }
 window.onNewSessionWorktreeToggle = onNewSessionWorktreeToggle;
+
+// Restore the last-used launch options once the initial (fallback-catalog)
+// pickers above are populated. Runs at the end of this fragment's eval —
+// after every `let` the render path reads is initialized — so a deep link
+// to #sessions/new paints prefilled; the later settings/catalog loads
+// preserve still-valid restored values through their own `previous`
+// handling and validate away the rest.
+applyNewSessionAgentPrefs();
