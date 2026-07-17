@@ -1239,6 +1239,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let snapshot = external_agent::AgentContextSnapshot {
             source: "codex".to_string(),
@@ -1335,6 +1336,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
 
         let snapshot = latest_external_context_snapshot_from_log(&config).expect("snapshot");

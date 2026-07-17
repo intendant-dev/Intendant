@@ -198,6 +198,13 @@ pub(crate) const MCP_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
 /// batches).
 pub(crate) const DIAGNOSTICS_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
 
+/// Body cap for the Claude sign-in ceremony start (`{"mode": …}` only).
+pub(crate) const CLAUDE_AUTH_START_BODY_CAP_BYTES: usize = 4 * 1024;
+
+/// Body cap for the ceremony's pasted authorization code — a short token;
+/// anything bigger is not one.
+pub(crate) const CLAUDE_AUTH_CODE_BODY_CAP_BYTES: usize = 2 * 1024;
+
 /// Links a table row to its dispatch arm in `web_gateway.rs`. The match
 /// there is exhaustive, so a declared route without an arm — or an arm
 /// whose route was deleted — fails to compile; the uniqueness invariant
@@ -269,6 +276,14 @@ pub(crate) enum RouteHandlerId {
     SettingsGet,
     ApiKeysPost,
     ApiKeyStatus,
+    /// Claude sign-in ceremony: start `claude auth login` on a private PTY.
+    ClaudeAuthStart,
+    /// Ceremony state + validated sign-in URL + account info on success.
+    ClaudeAuthStatus,
+    /// Submit the pasted authorization code to the ceremony.
+    ClaudeAuthCode,
+    /// Cancel the ceremony (Ctrl-C + reap; non-destructive to the store).
+    ClaudeAuthCancel,
     ExternalAgents,
     DiagnosticsVisualFreshness,
     Displays,
@@ -1404,6 +1419,49 @@ pub(crate) static ROUTES: &[Route] = &[
         "Which provider keys are configured (presence only)",
     )
     .with_tunnel(tunnel_method("api_key_status")),
+    // ── Claude sign-in ceremony (claude_auth_ceremony.rs): the dashboard
+    //    walks the owner through `claude auth login` on a daemon-private
+    //    PTY. Gated on the credential-custody operation — the same class
+    //    as vault leases and egress, which no peer profile (peer-root
+    //    included) and no scoped default carries — and the handlers
+    //    additionally hard-refuse hosted-provenance clients and custody-
+    //    managed (leased / client-egress) daemons.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/claude-auth/start"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::Capped(CLAUDE_AUTH_START_BODY_CAP_BYTES),
+        RouteHandlerId::ClaudeAuthStart,
+        "Start the Claude sign-in ceremony (`claude auth login` on a daemon-private PTY)",
+    )
+    .with_tunnel(tunnel_method("api_claude_auth_start")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/claude-auth/status"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::ClaudeAuthStatus,
+        "Claude sign-in ceremony state (validated sign-in URL; account info on success)",
+    )
+    .with_tunnel(tunnel_method("api_claude_auth_status")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/claude-auth/code"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::Capped(CLAUDE_AUTH_CODE_BODY_CAP_BYTES),
+        RouteHandlerId::ClaudeAuthCode,
+        "Submit the pasted authorization code to the Claude sign-in ceremony",
+    )
+    .with_tunnel(tunnel_method("api_claude_auth_code")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/claude-auth/cancel"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::ClaudeAuthCancel,
+        "Cancel the Claude sign-in ceremony (non-destructive; prior login keeps working)",
+    )
+    .with_tunnel(tunnel_method("api_claude_auth_cancel")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/external-agents"),
@@ -2538,6 +2596,15 @@ mod tests {
             BodyPolicy::Capped(DIAGNOSTICS_BODY_CAP_BYTES)
         );
         assert_eq!(
+            policy("POST", "/api/claude-auth/start"),
+            BodyPolicy::Capped(CLAUDE_AUTH_START_BODY_CAP_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/claude-auth/code"),
+            BodyPolicy::Capped(CLAUDE_AUTH_CODE_BODY_CAP_BYTES)
+        );
+        assert_eq!(policy("POST", "/api/claude-auth/cancel"), BodyPolicy::None);
+        assert_eq!(
             policy("POST", "/api/access/org-grants"),
             BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES)
         );
@@ -2798,6 +2865,31 @@ mod tests {
         ));
         assert!(matches!(
             classify("GET", "/api/transfers/j1/chunk"),
+            TableClassification::NoMatch
+        ));
+        // The Claude sign-in ceremony is credential custody: every leaf —
+        // the status read included — classifies CredentialsManage, the
+        // operation no peer profile (peer-root included) and no scoped
+        // default carries. A widening here is a custody regression.
+        for (method, path) in [
+            ("POST", "/api/claude-auth/start"),
+            ("GET", "/api/claude-auth/status"),
+            ("POST", "/api/claude-auth/code"),
+            ("POST", "/api/claude-auth/cancel"),
+        ] {
+            match classify(method, path) {
+                TableClassification::Matched(op) => assert_eq!(
+                    op,
+                    Some(PeerOperation::CredentialsManage),
+                    "{method} {path} must gate on credentials.manage"
+                ),
+                TableClassification::NoMatch => {
+                    panic!("{method} {path} must classify via table")
+                }
+            }
+        }
+        assert!(matches!(
+            classify("GET", "/api/claude-auth/start"),
             TableClassification::NoMatch
         ));
     }

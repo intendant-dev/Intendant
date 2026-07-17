@@ -311,6 +311,14 @@ pub(crate) async fn control_request_frame(
             crate::web_gateway::api_key_status_api_response(),
             "api key status",
         ),
+        "api_claude_auth_start" => {
+            api_claude_auth_start_response(id, params.as_ref(), &runtime).await
+        }
+        "api_claude_auth_status" => api_claude_auth_status_response(id, &runtime).await,
+        "api_claude_auth_code" => {
+            api_claude_auth_code_response(id, params.as_ref(), &runtime).await
+        }
+        "api_claude_auth_cancel" => api_claude_auth_cancel_response(id, &runtime).await,
         "api_external_agents" => frame_api_json_body_response(
             id,
             crate::web_gateway::external_agents_api_response(

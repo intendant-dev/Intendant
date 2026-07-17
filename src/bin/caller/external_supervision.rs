@@ -921,6 +921,13 @@ pub(crate) struct DrainConfig<'a> {
     /// does not support mid-turn steering — queued items are drained on
     /// the next turn's follow-up message path.
     pub(crate) context_injection: &'a event::ContextInjectionQueue,
+    /// Reload-credentials handshake with the supervision loop: when a
+    /// `ReloadBackendCredentials` event arrives mid-turn, the drain
+    /// interrupts the backend (stop semantics) and raises this flag; the
+    /// loop applies the in-place respawn once the drain returns. `None`
+    /// for lanes without the in-loop respawn (the foreground persistent
+    /// loop), where the event is simply not consumable mid-turn.
+    pub(crate) reload_credentials: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 pub(crate) const EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);

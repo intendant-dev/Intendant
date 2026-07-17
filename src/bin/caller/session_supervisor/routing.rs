@@ -708,6 +708,48 @@ impl SessionSupervisor {
         });
     }
 
+    /// Ask a supervised EXTERNAL session's loop to respawn its backend in
+    /// place (resume-attach on the same backend id) so the new process
+    /// reads the fresh credential store. The loop owns the mechanics:
+    /// mid-turn interrupt first, rate-limit-park cancel with the pending
+    /// re-send preserved, queued messages flushed after the respawn.
+    pub(crate) async fn route_reload_credentials(&self, session_id: String) {
+        let requested_id = session_id.clone();
+        let Some(target_id) = self.resolve_target_session_id(Some(session_id)).await else {
+            self.warn("Reload-credentials dropped: no active managed session");
+            return;
+        };
+        let source = {
+            let state = self.state.lock().await;
+            state
+                .sessions
+                .get(&target_id)
+                .map(|session| session.source.clone())
+        };
+        match source.as_deref() {
+            None => {
+                let message = format!(
+                    "Reload-credentials dropped: session {} is not managed by this daemon",
+                    short_session(&target_id)
+                );
+                eprintln!("[supervisor] {}", message);
+                self.warn(&message);
+                return;
+            }
+            Some("intendant") | Some("") => {
+                self.warn(&format!(
+                    "Reload-credentials dropped: session {} is a native session (nothing to respawn; native provider credentials reload per request)",
+                    short_session(&target_id)
+                ));
+                return;
+            }
+            Some(_) => {}
+        }
+        self.config.bus.send(AppEvent::ReloadBackendCredentials {
+            session_id: Some(requested_id),
+        });
+    }
+
     pub(crate) async fn stop_managed_session(
         &self,
         session_id: Option<String>,

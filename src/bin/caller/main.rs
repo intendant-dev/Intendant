@@ -13,6 +13,7 @@ mod background_tasks;
 mod browser_workspace;
 #[path = "../../build_info.rs"]
 mod build_info;
+mod claude_auth_ceremony;
 mod computer_use;
 mod connect_rendezvous;
 mod context_rewind;

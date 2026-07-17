@@ -729,6 +729,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(RecordingExternalAgent {
