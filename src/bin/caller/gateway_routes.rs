@@ -205,6 +205,9 @@ pub(crate) const CLAUDE_AUTH_START_BODY_CAP_BYTES: usize = 4 * 1024;
 /// anything bigger is not one.
 pub(crate) const CLAUDE_AUTH_CODE_BODY_CAP_BYTES: usize = 2 * 1024;
 
+/// Body cap for the Codex sign-in ceremony start (`{"mode": …}` only).
+pub(crate) const CODEX_AUTH_START_BODY_CAP_BYTES: usize = 4 * 1024;
+
 /// Links a table row to its dispatch arm in `web_gateway.rs`. The match
 /// there is exhaustive, so a declared route without an arm — or an arm
 /// whose route was deleted — fails to compile; the uniqueness invariant
@@ -284,6 +287,14 @@ pub(crate) enum RouteHandlerId {
     ClaudeAuthCode,
     /// Cancel the ceremony (Ctrl-C + reap; non-destructive to the store).
     ClaudeAuthCancel,
+    /// Codex sign-in ceremony: start `codex login --device-auth` on a
+    /// private PTY.
+    CodexAuthStart,
+    /// Ceremony state + verification URL + one-time code + account info
+    /// on success.
+    CodexAuthStatus,
+    /// Cancel the Codex ceremony (Ctrl-C + reap; non-destructive).
+    CodexAuthCancel,
     ExternalAgents,
     DiagnosticsVisualFreshness,
     Displays,
@@ -1462,6 +1473,40 @@ pub(crate) static ROUTES: &[Route] = &[
         "Cancel the Claude sign-in ceremony (non-destructive; prior login keeps working)",
     )
     .with_tunnel(tunnel_method("api_claude_auth_cancel")),
+    // ── Codex sign-in ceremony (codex_auth_ceremony.rs): the dashboard
+    //    walks the owner through `codex login --device-auth` on a
+    //    daemon-private PTY — same custody class and gates as the Claude
+    //    family above (credentials.manage + hosted-provenance +
+    //    lease/egress refusals), one ceremony at a time across both
+    //    providers. No code-submission leaf: the owner types the
+    //    one-time code into OpenAI's page, never back into the daemon.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/codex-auth/start"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::Capped(CODEX_AUTH_START_BODY_CAP_BYTES),
+        RouteHandlerId::CodexAuthStart,
+        "Start the Codex sign-in ceremony (`codex login --device-auth` on a daemon-private PTY)",
+    )
+    .with_tunnel(tunnel_method("api_codex_auth_start")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/codex-auth/status"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::CodexAuthStatus,
+        "Codex sign-in ceremony state (verification URL + one-time code; account info on success)",
+    )
+    .with_tunnel(tunnel_method("api_codex_auth_status")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/codex-auth/cancel"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::CodexAuthCancel,
+        "Cancel the Codex sign-in ceremony (non-destructive; prior login keeps working)",
+    )
+    .with_tunnel(tunnel_method("api_codex_auth_cancel")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/external-agents"),
@@ -2605,6 +2650,11 @@ mod tests {
         );
         assert_eq!(policy("POST", "/api/claude-auth/cancel"), BodyPolicy::None);
         assert_eq!(
+            policy("POST", "/api/codex-auth/start"),
+            BodyPolicy::Capped(CODEX_AUTH_START_BODY_CAP_BYTES)
+        );
+        assert_eq!(policy("POST", "/api/codex-auth/cancel"), BodyPolicy::None);
+        assert_eq!(
             policy("POST", "/api/access/org-grants"),
             BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES)
         );
@@ -2867,8 +2917,8 @@ mod tests {
             classify("GET", "/api/transfers/j1/chunk"),
             TableClassification::NoMatch
         ));
-        // The Claude sign-in ceremony is credential custody: every leaf —
-        // the status read included — classifies CredentialsManage, the
+        // The sign-in ceremonies are credential custody: every leaf —
+        // the status reads included — classifies CredentialsManage, the
         // operation no peer profile (peer-root included) and no scoped
         // default carries. A widening here is a custody regression.
         for (method, path) in [
@@ -2876,6 +2926,9 @@ mod tests {
             ("GET", "/api/claude-auth/status"),
             ("POST", "/api/claude-auth/code"),
             ("POST", "/api/claude-auth/cancel"),
+            ("POST", "/api/codex-auth/start"),
+            ("GET", "/api/codex-auth/status"),
+            ("POST", "/api/codex-auth/cancel"),
         ] {
             match classify(method, path) {
                 TableClassification::Matched(op) => assert_eq!(
@@ -2890,6 +2943,15 @@ mod tests {
         }
         assert!(matches!(
             classify("GET", "/api/claude-auth/start"),
+            TableClassification::NoMatch
+        ));
+        assert!(matches!(
+            classify("GET", "/api/codex-auth/start"),
+            TableClassification::NoMatch
+        ));
+        // The device flow deliberately has no code-submission leaf.
+        assert!(matches!(
+            classify("POST", "/api/codex-auth/code"),
             TableClassification::NoMatch
         ));
     }

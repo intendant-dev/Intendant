@@ -1674,6 +1674,9 @@ response omits the header.
 | GET | `/api/claude-auth/status` | CredentialsManage | own origin | none | Claude sign-in ceremony state (validated sign-in URL; account info on success) |
 | POST | `/api/claude-auth/code` | CredentialsManage | own origin | ≤ 2 KiB | Submit the pasted authorization code to the Claude sign-in ceremony |
 | POST | `/api/claude-auth/cancel` | CredentialsManage | own origin | none | Cancel the Claude sign-in ceremony (non-destructive; prior login keeps working) |
+| POST | `/api/codex-auth/start` | CredentialsManage | own origin | ≤ 4 KiB | Start the Codex sign-in ceremony (`codex login --device-auth` on a daemon-private PTY) |
+| GET | `/api/codex-auth/status` | CredentialsManage | own origin | none | Codex sign-in ceremony state (verification URL + one-time code; account info on success) |
+| POST | `/api/codex-auth/cancel` | CredentialsManage | own origin | none | Cancel the Codex sign-in ceremony (non-destructive; prior login keeps working) |
 | GET | `/api/external-agents` | SessionInspect | own origin | none | Detected external coding agents (codex, claude) |
 | POST | `/api/diagnostics/visual-freshness` | DisplayInput | own origin | ≤ 16 MiB | Visual-freshness diagnostics transcript sink (NDJSON body) |
 | GET | `/api/displays` | DisplayView | own origin | none | Enumerate active displays |

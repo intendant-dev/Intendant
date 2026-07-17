@@ -66,6 +66,8 @@ mod routes_access;
 pub(crate) use routes_access::*;
 mod routes_claude_auth;
 pub(crate) use routes_claude_auth::*;
+mod routes_codex_auth;
+pub(crate) use routes_codex_auth::*;
 
 mod mcp_gate;
 pub(crate) use mcp_gate::*;
