@@ -858,6 +858,27 @@ pub(crate) async fn run_agent_loop(
     let _activity_guard = activity
         .clone()
         .map(crate::session_activity::ActivityTurnGuard);
+    // Session-config facts (vitals `config` section): the native loop IS
+    // the caller, so its provider selection and the shared autonomy level
+    // are first-hand truth. Effort appears only when a reasoning config
+    // exists (OpenAI reasoning models today) — honest absence otherwise.
+    // Mid-session autonomy changes are folded in by the vitals hub from
+    // `AppEvent::AutonomyChanged`.
+    if let Some(session_id) = local_session_id.clone() {
+        let autonomy_level = autonomy.read().await.level.to_string();
+        bus.send(event::AppEvent::SessionConfigFacts {
+            session_id: Some(session_id),
+            facts: crate::types::SessionConfigVitals {
+                model: Some(provider.model().to_string()),
+                effort: provider.reasoning_effort(),
+                permission_mode: Some(autonomy_level),
+                permission_kind: Some(
+                    intendant_core::vitals::PERMISSION_KIND_AUTONOMY.to_string(),
+                ),
+                permission_echoed: true,
+            },
+        });
+    }
     // Live action-visualization lane for the dashboard: one ephemeral
     // cu_action event per executed CU action (never session-logged).
     let cu_observer = computer_use::CuActionObserver::new(bus.clone(), local_session_id.clone());

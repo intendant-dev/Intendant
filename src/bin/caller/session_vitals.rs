@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::event::{AppEvent, EventBus};
 use crate::frontend::ModelUsageSnapshot;
-use crate::types::{SessionCacheVitals, SessionGitVitals, SessionVitals};
+use crate::types::{SessionCacheVitals, SessionConfigVitals, SessionGitVitals, SessionVitals};
 
 /// Probe cadence. Each tick is a handful of subprocess ref reads per
 /// target; emission only happens when the probed state changes.
@@ -331,6 +331,9 @@ impl SessionVitalsHub {
                 if vitals.activity.is_none() {
                     vitals.activity = orphan.activity;
                 }
+                if vitals.config.is_none() {
+                    vitals.config = orphan.config;
+                }
             });
         }
     }
@@ -347,6 +350,59 @@ impl SessionVitalsHub {
         if let Some(vitals) = changed {
             self.bus
                 .send(AppEvent::SessionVitals { session_id, vitals });
+        }
+    }
+
+    /// Fold a partial config-facts emission into a session's `config`
+    /// section, sticky per field: producers emit what a protocol seam just
+    /// taught them (launch snapshot, a model echo, an accepted mode
+    /// switch), and a known value is never blanked by a later partial
+    /// that omits it. The permission fields travel as one datum — a mode
+    /// update carries its display kind and echo provenance with it.
+    fn apply_config_facts(&self, session_id: &str, update: SessionConfigVitals) {
+        if update == SessionConfigVitals::default() {
+            return;
+        }
+        self.apply(session_id, |vitals| {
+            let config = vitals.config.get_or_insert_with(Default::default);
+            if update.model.is_some() {
+                config.model = update.model;
+            }
+            if update.effort.is_some() {
+                config.effort = update.effort;
+            }
+            if update.permission_mode.is_some() {
+                config.permission_mode = update.permission_mode;
+                config.permission_kind = update.permission_kind;
+                config.permission_echoed = update.permission_echoed;
+            }
+        });
+    }
+
+    /// The daemon-global autonomy level changed: update every session
+    /// whose permission facts are autonomy-backed (native sessions —
+    /// external backends carry their own modes). The level is shared
+    /// state, so this fold is exact, not a heuristic.
+    fn apply_autonomy_change(&self, level: &str) {
+        let autonomy_sessions: Vec<String> = {
+            let sessions = self.sessions.lock().expect("vitals state lock");
+            sessions
+                .iter()
+                .filter(|(_, vitals)| {
+                    vitals.config.as_ref().is_some_and(|config| {
+                        config.permission_kind.as_deref()
+                            == Some(intendant_core::vitals::PERMISSION_KIND_AUTONOMY)
+                    })
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for session_id in autonomy_sessions {
+            self.apply(&session_id, |vitals| {
+                if let Some(config) = vitals.config.as_mut() {
+                    config.permission_mode = Some(level.to_string());
+                }
+            });
         }
     }
 
@@ -449,6 +505,16 @@ fn spawn_cache_vitals_listener(
                     activity,
                 }) => {
                     hub.apply(&session_id, |vitals| vitals.activity = Some(activity));
+                }
+                Ok(AppEvent::SessionConfigFacts {
+                    session_id: Some(session_id),
+                    facts,
+                }) => hub.apply_config_facts(&session_id, facts),
+                // The autonomy level is daemon-global shared state; the
+                // fold updates every autonomy-backed config section so a
+                // Control-tab change shows up mid-session.
+                Ok(AppEvent::AutonomyChanged { autonomy }) => {
+                    hub.apply_autonomy_change(&autonomy);
                 }
                 Ok(AppEvent::SessionIdentity {
                     session_id,
@@ -1062,6 +1128,127 @@ mod tests {
         assert!(
             emissions[2].1.cache.is_none(),
             "removed session re-registers from scratch"
+        );
+    }
+
+    /// The config-facts fold is sticky per field: partial emissions from
+    /// different protocol seams (launch snapshot, model echo, mode
+    /// switch) accumulate instead of blanking each other, the permission
+    /// fields travel as one datum, and a mid-session autonomy change
+    /// updates exactly the autonomy-backed sections.
+    #[tokio::test]
+    async fn config_facts_fold_sticky_and_autonomy_change_scoped() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let hub = SessionVitalsHub::new(bus.clone());
+        let _listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
+
+        let deadline = std::time::Duration::from_secs(5);
+        async fn wait_config(
+            rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+        ) -> (String, SessionConfigVitals) {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    if let Some(config) = vitals.config {
+                        return (session_id, config);
+                    }
+                }
+            }
+        }
+
+        // Launch snapshot: unconfirmed mode + configured effort.
+        bus.send(AppEvent::SessionConfigFacts {
+            session_id: Some("cc-1".into()),
+            facts: SessionConfigVitals {
+                model: Some("claude-fable-5".into()),
+                effort: Some("max".into()),
+                permission_mode: Some("bypassPermissions".into()),
+                permission_kind: Some("bypass".into()),
+                permission_echoed: false,
+            },
+        });
+        let (sid, config) = tokio::time::timeout(deadline, wait_config(&mut rx))
+            .await
+            .expect("launch facts emit");
+        assert_eq!(sid, "cc-1");
+        assert_eq!(config.model.as_deref(), Some("claude-fable-5"));
+        assert!(!config.permission_echoed);
+
+        // Init mode echo: partial — model/effort must survive the fold.
+        bus.send(AppEvent::SessionConfigFacts {
+            session_id: Some("cc-1".into()),
+            facts: SessionConfigVitals {
+                permission_mode: Some("bypassPermissions".into()),
+                permission_kind: Some("bypass".into()),
+                permission_echoed: true,
+                ..Default::default()
+            },
+        });
+        let (_, config) = tokio::time::timeout(deadline, wait_config(&mut rx))
+            .await
+            .expect("echo upgrade emits");
+        assert!(config.permission_echoed, "echo provenance upgraded");
+        assert_eq!(
+            config.model.as_deref(),
+            Some("claude-fable-5"),
+            "partial mode echo must not blank the model"
+        );
+        assert_eq!(config.effort.as_deref(), Some("max"));
+
+        // A native session with autonomy-backed permissions, plus the CC
+        // session above: an autonomy change updates only the former.
+        bus.send(AppEvent::SessionConfigFacts {
+            session_id: Some("native-loop".into()),
+            facts: SessionConfigVitals {
+                model: Some("gpt-5.5".into()),
+                permission_mode: Some("Medium".into()),
+                permission_kind: Some(
+                    intendant_core::vitals::PERMISSION_KIND_AUTONOMY.to_string(),
+                ),
+                permission_echoed: true,
+                ..Default::default()
+            },
+        });
+        let (sid, _) = tokio::time::timeout(deadline, wait_config(&mut rx))
+            .await
+            .expect("native facts emit");
+        assert_eq!(sid, "native-loop");
+
+        bus.send(AppEvent::AutonomyChanged {
+            autonomy: "Full".into(),
+        });
+        let (sid, config) = tokio::time::timeout(deadline, wait_config(&mut rx))
+            .await
+            .expect("autonomy fold emits");
+        assert_eq!(sid, "native-loop", "only the autonomy-backed session updates");
+        assert_eq!(config.permission_mode.as_deref(), Some("Full"));
+        assert_eq!(
+            config.permission_kind.as_deref(),
+            Some(intendant_core::vitals::PERMISSION_KIND_AUTONOMY)
+        );
+
+        // The CC session's mode is untouched (no further cc-1 emission —
+        // the autonomy fold matched nothing there, so nothing changed).
+        let cc = hub
+            .sessions
+            .lock()
+            .expect("vitals state lock")
+            .get("cc-1")
+            .cloned()
+            .expect("cc entry");
+        assert_eq!(
+            cc.config.as_ref().and_then(|c| c.permission_mode.as_deref()),
+            Some("bypassPermissions")
+        );
+
+        // An all-empty facts emission is a no-op, never an empty section.
+        hub.apply_config_facts("fresh", SessionConfigVitals::default());
+        assert!(
+            !hub.sessions
+                .lock()
+                .expect("vitals state lock")
+                .contains_key("fresh"),
+            "empty facts must not materialize an entry"
         );
     }
 
@@ -1734,7 +1921,6 @@ mod tests {
             since_epoch: 100,
             last_stream_byte_epoch: 104,
             stalled_after_seconds: Some(20),
-            effort: Some("max".into()),
             ..Default::default()
         };
         bus.send(AppEvent::SessionActivity {
@@ -1846,6 +2032,8 @@ mod tests {
         for key in [
             "health:",
             "activity:",
+            "model:",
+            "permissions:",
             "branch:",
             "worktree:",
             "dirty:",
@@ -1860,8 +2048,8 @@ mod tests {
             assert!(catalog.contains(key), "catalog lost symbol {key}");
         }
         // The serde-camelCase wire fields of SessionVitals/SessionGitVitals/
-        // SessionCacheVitals/SessionLimitWindow/SessionActivityVitals the
-        // catalog must consume.
+        // SessionCacheVitals/SessionLimitWindow/SessionActivityVitals/
+        // SessionConfigVitals the catalog must consume.
         for field in [
             "branch",
             "dirtyFiles",
@@ -1884,10 +2072,23 @@ mod tests {
             "stalledAfterSeconds",
             "effort",
             "backgroundTasks",
+            "model",
+            "permissionMode",
+            "permissionKind",
+            "permissionEchoed",
         ] {
             assert!(
                 catalog.contains(field),
                 "catalog stopped consuming wire field {field} — SessionVitals and VITALS_SYMBOLS drifted"
+            );
+        }
+        // The permission display kinds (the daemon-side catalog in
+        // intendant-core vitals.rs) must each have plain-language copy in
+        // the frontend catalog — one vocabulary, two responsibilities.
+        for kind in intendant_core::vitals::PERMISSION_DISPLAY_KINDS {
+            assert!(
+                catalog.contains(kind),
+                "catalog lost permission display kind {kind} — extend PERMISSION_KIND_COPY alongside PERMISSION_DISPLAY_KINDS"
             );
         }
         // The wire spellings of the activity states the catalog renders —

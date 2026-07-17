@@ -100,7 +100,6 @@ pub(crate) struct ActivityMachine {
     since_epoch: u64,
     last_stream_byte_epoch: u64,
     delta_heartbeat: bool,
-    effort: Option<String>,
     resets_at_epoch: Option<u64>,
     turn_active: bool,
     /// Short descriptions of the backend-announced background tasks
@@ -113,27 +112,13 @@ pub(crate) struct ActivityMachine {
 }
 
 impl ActivityMachine {
-    pub(crate) fn new(effort: Option<String>) -> Self {
-        Self {
-            effort,
-            ..Self::default()
-        }
-    }
-
-    /// Adopt the backend's own effort echo (first-hand only — callers
-    /// pass values the backend itself stated, or the launch config).
-    pub(crate) fn set_effort(&mut self, effort: Option<String>) {
-        if let Some(effort) = effort
-            .map(|e| e.trim().to_string())
-            .filter(|e| !e.is_empty())
-        {
-            self.effort = Some(effort);
-        }
-    }
-
     /// Feed one wire observation. Returns the snapshot to publish when
-    /// the observable section changed (state/effort/reset flips always;
-    /// pure liveness only per [`HEARTBEAT_QUANTUM_SECS`]).
+    /// the observable section changed (state/reset flips always; pure
+    /// liveness only per [`HEARTBEAT_QUANTUM_SECS`]).
+    ///
+    /// Reasoning effort deliberately does NOT live here: it is a session
+    /// configuration fact, carried by the vitals `config` section
+    /// (`SessionConfigVitals`) — one canonical carrier on the wire.
     pub(crate) fn observe(
         &mut self,
         obs: ActivityObservation,
@@ -274,7 +259,6 @@ impl ActivityMachine {
             since_epoch: self.since_epoch,
             last_stream_byte_epoch: self.last_stream_byte_epoch,
             stalled_after_seconds: stall_armed.then_some(STALL_AFTER_SECS),
-            effort: self.effort.clone(),
             resets_at_epoch: self.resets_at_epoch,
             background_tasks: self.background_tasks.clone(),
         }
@@ -399,14 +383,13 @@ mod tests {
 
     #[test]
     fn dispatch_then_first_bytes_walk_awaiting_reasoning_responding() {
-        let mut m = ActivityMachine::new(Some("max".into()));
+        let mut m = ActivityMachine::default();
         let s = m
             .observe(Obs::TurnDispatched, 100)
             .expect("dispatch publishes");
         assert_eq!(s.state, SessionActivityState::AwaitingApi);
         assert_eq!(s.since_epoch, 100);
         assert_eq!(s.last_stream_byte_epoch, 100);
-        assert_eq!(s.effort.as_deref(), Some("max"));
         assert_eq!(
             s.stalled_after_seconds,
             Some(STALL_AFTER_SECS),
@@ -447,7 +430,7 @@ mod tests {
 
     #[test]
     fn thinking_requires_recent_deltas_quiet_degrades_to_stalled() {
-        let mut m = ActivityMachine::new(None);
+        let mut m = ActivityMachine::default();
         m.observe(Obs::TurnDispatched, 100);
         m.observe(
             Obs::ReasoningStarted {
@@ -477,7 +460,7 @@ mod tests {
     fn deltaless_reasoning_never_claims_stalled_or_heartbeat() {
         // Codex shape: reasoning items open on the wire but promise no
         // mid-item bytes — quiet is normal, stalled must not be claimed.
-        let mut m = ActivityMachine::new(Some("high".into()));
+        let mut m = ActivityMachine::default();
         m.observe(Obs::TurnDispatched, 100);
         let s = m
             .observe(
@@ -501,7 +484,7 @@ mod tests {
 
     #[test]
     fn awaiting_api_stalls_but_tools_never_do() {
-        let mut m = ActivityMachine::new(None);
+        let mut m = ActivityMachine::default();
         m.observe(Obs::TurnDispatched, 100);
         assert_eq!(
             m.effective_state(100 + u64::from(STALL_AFTER_SECS) + 1),
@@ -526,7 +509,7 @@ mod tests {
 
     #[test]
     fn rate_limited_carries_reset_and_clears_to_awaiting() {
-        let mut m = ActivityMachine::new(None);
+        let mut m = ActivityMachine::default();
         m.observe(Obs::TurnDispatched, 100);
         let s = m
             .observe(
@@ -561,7 +544,7 @@ mod tests {
 
     #[test]
     fn turn_settled_goes_idle_and_ambient_bytes_stay_idle() {
-        let mut m = ActivityMachine::new(None);
+        let mut m = ActivityMachine::default();
         m.observe(Obs::TurnDispatched, 100);
         m.observe(Obs::ResponseDelta, 101);
         let s = m.observe(Obs::TurnSettled, 150).expect("idle publishes");
@@ -593,7 +576,7 @@ mod tests {
 
     #[test]
     fn turn_settled_with_armed_tasks_parks_then_drains_to_idle() {
-        let mut m = ActivityMachine::new(None);
+        let mut m = ActivityMachine::default();
         m.observe(Obs::TurnDispatched, 100);
         m.observe(Obs::ToolsRunning, 101);
         // The backend announced a background task mid-turn: carried data,
@@ -634,7 +617,7 @@ mod tests {
 
     #[test]
     fn woken_by_task_reopens_the_turn_and_resettles_parked_while_armed() {
-        let mut m = ActivityMachine::new(None);
+        let mut m = ActivityMachine::default();
         m.observe(Obs::TurnDispatched, 100);
         m.observe(
             Obs::BackgroundTasksChanged {
@@ -677,7 +660,7 @@ mod tests {
 
     #[test]
     fn heartbeat_publishing_is_quantized() {
-        let mut m = ActivityMachine::new(None);
+        let mut m = ActivityMachine::default();
         m.observe(Obs::TurnDispatched, 100);
         m.observe(Obs::ResponseDelta, 100);
         // A flood of deltas inside one quantum publishes nothing new.
@@ -691,28 +674,8 @@ mod tests {
     }
 
     #[test]
-    fn effort_prefers_backend_echo_and_never_blanks() {
-        let mut m = ActivityMachine::new(Some("medium".into()));
-        assert_eq!(m.snapshot().effort.as_deref(), Some("medium"));
-        // Backend echo upgrades the launch value…
-        m.set_effort(Some("xhigh".into()));
-        assert_eq!(m.snapshot().effort.as_deref(), Some("xhigh"));
-        // …but an absent/blank echo never blanks a known value.
-        m.set_effort(None);
-        m.set_effort(Some("  ".into()));
-        assert_eq!(m.snapshot().effort.as_deref(), Some("xhigh"));
-        // Effort changes publish even without a state change.
-        m.observe(Obs::TurnDispatched, 100);
-        m.set_effort(Some("low".into()));
-        let s = m
-            .observe(Obs::StreamByte, 101)
-            .expect("effort change publishes");
-        assert_eq!(s.effort.as_deref(), Some("low"));
-    }
-
-    #[test]
     fn idle_machine_publishes_nothing_until_first_turn() {
-        let mut m = ActivityMachine::new(None);
+        let mut m = ActivityMachine::default();
         assert!(m.observe(Obs::StreamByte, 50).is_none());
         assert!(
             m.observe(Obs::TurnSettled, 60).is_none(),
@@ -729,7 +692,6 @@ mod tests {
             since_epoch: 1,
             last_stream_byte_epoch: 2,
             stalled_after_seconds: Some(20),
-            effort: Some("high".into()),
             resets_at_epoch: None,
             background_tasks: vec!["cargo test".into()],
         };

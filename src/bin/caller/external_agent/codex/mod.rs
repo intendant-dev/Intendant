@@ -359,6 +359,41 @@ impl CodexAgent {
         effective_approval_policy_for_sandbox(&self.sandbox, &self.approval_policy)
     }
 
+    /// Session-config facts from the launch config, emitted once the app
+    /// server accepted the thread lifecycle params — `thread/start` /
+    /// `thread/resume` carried model + approvalPolicy + sandbox, so a
+    /// successful response means those settings are applied (a wire-level
+    /// acceptance, not a guess). `model`/`effort` stay absent when
+    /// Intendant passes no override: the codex binary's own defaults
+    /// apply, and honesty says "not reported" until a wire echo names
+    /// them (`thread/settings/updated` does, when it fires).
+    fn emit_launch_config_facts(&self) {
+        let Some(tx) = &self.event_tx else { return };
+        let approval = self.effective_approval_policy().trim().to_string();
+        let sandbox = self.sandbox.trim().to_string();
+        let permission_mode = match (sandbox.is_empty(), approval.is_empty()) {
+            (true, true) => None,
+            (false, true) => Some(sandbox.clone()),
+            (true, false) => Some(approval.clone()),
+            (false, false) => Some(format!("{sandbox} · {approval}")),
+        };
+        let _ = tx.send(AgentEvent::ConfigFacts {
+            facts: crate::types::SessionConfigVitals {
+                model: self.model.clone().filter(|m| !m.trim().is_empty()),
+                effort: self
+                    .reasoning_effort
+                    .clone()
+                    .filter(|e| !e.trim().is_empty()),
+                permission_kind: intendant_core::vitals::codex_permission_kind(
+                    &approval, &sandbox,
+                )
+                .map(str::to_string),
+                permission_mode,
+                permission_echoed: true,
+            },
+        });
+    }
+
     fn update_service_tier_from_thread_response(&mut self, response: &serde_json::Value) {
         let Some(value) = response.get("serviceTier") else {
             return;
@@ -1327,7 +1362,6 @@ impl ExternalAgent for CodexAgent {
             latest_token_usage,
             context_pressure_floor,
             model,
-            self.reasoning_effort.clone(),
             protocol_watch.clone(),
             writer,
         ));
@@ -1431,6 +1465,10 @@ impl ExternalAgent for CodexAgent {
         // Cache the thread id so interrupt_turn() can build the
         // `turn/interrupt` params without requiring a thread handle.
         *self.active_thread_id.lock().await = Some(thread_id.clone());
+
+        // The thread accepted its lifecycle params — surface the applied
+        // config as session facts for the vitals hub.
+        self.emit_launch_config_facts();
 
         if self.fork_from_rollout_path.is_some() {
             match self.fork_cut.clone() {

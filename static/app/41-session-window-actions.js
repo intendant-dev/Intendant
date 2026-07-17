@@ -468,7 +468,10 @@ function sessionWindowPhaseDisplayLabel(sessionId, phase) {
       }
       const label = (typeof ACTIVITY_STATE_LABELS === 'object' && ACTIVITY_STATE_LABELS[act.state])
         || act.state;
-      return act.state === 'reasoning' && act.effort ? `${label} (${act.effort})` : label;
+      // Effort is a session-config fact (vitals `config` section), not an
+      // activity claim — fetch it from the facts when decorating.
+      const effort = typeof sessionConfigEffort === 'function' ? sessionConfigEffort(sessionId) : '';
+      return act.state === 'reasoning' && effort ? `${label} (${effort})` : label;
     }
   }
   return sessionPhaseLabel(phase);
