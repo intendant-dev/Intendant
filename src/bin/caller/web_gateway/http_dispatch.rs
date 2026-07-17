@@ -2273,8 +2273,7 @@ mod tests {
                     cors,
                     fleet_origin,
                 );
-                let mut split =
-                    shared_json_http_head(200, body.len(), headers, cors, fleet_origin);
+                let mut split = shared_json_http_head(200, body.len(), headers, cors, fleet_origin);
                 split.extend_from_slice(body.as_bytes());
                 assert_eq!(
                     String::from_utf8(split).unwrap(),
