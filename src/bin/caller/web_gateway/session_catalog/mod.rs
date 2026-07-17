@@ -121,7 +121,11 @@ pub(crate) struct SessionListResponseCacheEntry {
     /// (limit-slice / usage-view bodies) keys on it, so projections are
     /// valid exactly as long as the body they were derived from.
     generation: u64,
-    body: String,
+    /// Shared: a cache hit hands out the Arc — and the HTTP write
+    /// boundary writes straight from it — instead of cloning the
+    /// multi-hundred-KB serialized list per request (same reason the
+    /// external-transcript cache above shares its parsed entries).
+    body: Arc<str>,
 }
 
 pub(crate) fn next_session_list_body_generation() -> u64 {
@@ -337,16 +341,43 @@ pub(crate) fn session_list_refresh_inflight() -> &'static Mutex<HashSet<usize>> 
     INFLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Global ceiling on concurrent background session-list refreshes. The
+/// per-slot single-flight below bounds each limit slot to one refresh,
+/// but a stampede of stale hits across DISTINCT slots could still spawn
+/// one native rebuild thread per slot. Past this many in-flight
+/// refreshes a stale hit keeps serving stale without spawning; the
+/// refresh happens when a later stale hit finds capacity free (or the
+/// hard TTL forces an inline rebuild).
+pub(crate) const SESSION_LIST_REFRESH_MAX_CONCURRENT: usize = 4;
+
+/// Claim the single-flight slot for a background refresh of
+/// `limit_slot`. False — the caller must not spawn — when that slot
+/// already has a refresh in flight or the global ceiling is reached. A
+/// successful claim must be released with
+/// [`end_session_list_refresh`].
+pub(crate) fn try_begin_session_list_refresh(limit_slot: usize) -> bool {
+    let mut inflight = session_list_refresh_inflight()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if inflight.len() >= SESSION_LIST_REFRESH_MAX_CONCURRENT {
+        return false;
+    }
+    inflight.insert(limit_slot)
+}
+
+/// Release a claim made by [`try_begin_session_list_refresh`].
+pub(crate) fn end_session_list_refresh(limit_slot: usize) {
+    session_list_refresh_inflight()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&limit_slot);
+}
+
 /// Slot key for the single-flight guard: real limits are 1..SESSION_LIST_LIMIT,
 /// the unlimited list uses SESSION_LIST_LIMIT itself.
 pub(crate) fn spawn_session_list_refresh(limit_slot: usize) {
-    {
-        let mut inflight = session_list_refresh_inflight()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if !inflight.insert(limit_slot) {
-            return;
-        }
+    if !try_begin_session_list_refresh(limit_slot) {
+        return;
     }
     std::thread::spawn(move || {
         let body = if limit_slot >= SESSION_LIST_LIMIT {
@@ -355,18 +386,21 @@ pub(crate) fn spawn_session_list_refresh(limit_slot: usize) {
             list_sessions_from_home_with_limit(&crate::platform::home_dir(), Some(limit_slot))
         };
         store_session_list_response(limit_slot, body);
-        let mut inflight = session_list_refresh_inflight()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        inflight.remove(&limit_slot);
+        end_session_list_refresh(limit_slot);
     });
 }
 
-pub(crate) fn store_session_list_response(limit_slot: usize, body: String) {
+/// Store a rebuilt list body and return the generation minted for it —
+/// atomically paired with the body, so a caller that goes on to serve
+/// `body` keys its projections on the generation of THAT body (the
+/// historical store-then-re-read could pair a concurrent rebuild's
+/// generation with this caller's body).
+pub(crate) fn store_session_list_response(limit_slot: usize, body: impl Into<Arc<str>>) -> u64 {
+    let generation = next_session_list_body_generation();
     let entry = SessionListResponseCacheEntry {
         generated_at: std::time::Instant::now(),
-        generation: next_session_list_body_generation(),
-        body,
+        generation,
+        body: body.into(),
     };
     if limit_slot >= SESSION_LIST_LIMIT {
         let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
@@ -380,6 +414,7 @@ pub(crate) fn store_session_list_response(limit_slot: usize, body: String) {
         }
         guard.insert(limit_slot, entry);
     }
+    generation
 }
 
 /// fresh -> serve; stale-but-usable -> serve + background refresh;
@@ -387,23 +422,24 @@ pub(crate) fn store_session_list_response(limit_slot: usize, body: String) {
 pub(crate) fn serve_session_list_cache_entry(
     limit_slot: usize,
     entry: Option<&SessionListResponseCacheEntry>,
-) -> Option<String> {
+) -> Option<Arc<str>> {
     serve_session_list_cache_entry_with_generation(limit_slot, entry).map(|(body, _)| body)
 }
 
 /// [`serve_session_list_cache_entry`] plus the served body's generation,
-/// for callers that key derived projections on it.
+/// for callers that key derived projections on it. Hits hand out
+/// refcount clones of the stored body, never text copies.
 pub(crate) fn serve_session_list_cache_entry_with_generation(
     limit_slot: usize,
     entry: Option<&SessionListResponseCacheEntry>,
-) -> Option<(String, u64)> {
+) -> Option<(Arc<str>, u64)> {
     let entry = entry?;
     let age = entry.generated_at.elapsed();
     if age <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_CACHE_TTL_SECS) {
-        return Some((entry.body.clone(), entry.generation));
+        return Some((Arc::clone(&entry.body), entry.generation));
     }
     if age <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_STALE_MAX_SECS) {
-        let body = entry.body.clone();
+        let body = Arc::clone(&entry.body);
         let generation = entry.generation;
         spawn_session_list_refresh(limit_slot);
         return Some((body, generation));
@@ -435,16 +471,16 @@ pub(crate) fn invalidate_session_list_response_caches() {
         .clear();
 }
 
-pub(crate) fn cached_list_sessions() -> String {
+pub(crate) fn cached_list_sessions() -> Arc<str> {
     cached_list_sessions_with_generation().0
 }
 
 /// [`cached_list_sessions`] plus the served body's generation for
 /// projection-cache keying (`None` only for exotic paths that bypass the
 /// entry store).
-pub(crate) fn cached_list_sessions_with_generation() -> (String, Option<u64>) {
-    let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
+pub(crate) fn cached_list_sessions_with_generation() -> (Arc<str>, Option<u64>) {
     {
+        let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((body, generation)) =
             serve_session_list_cache_entry_with_generation(SESSION_LIST_LIMIT, guard.as_ref())
@@ -453,24 +489,18 @@ pub(crate) fn cached_list_sessions_with_generation() -> (String, Option<u64>) {
         }
     }
 
-    let body = list_sessions();
-    let generation = next_session_list_body_generation();
-    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    *guard = Some(SessionListResponseCacheEntry {
-        generated_at: std::time::Instant::now(),
-        generation,
-        body: body.clone(),
-    });
+    let body: Arc<str> = list_sessions().into();
+    let generation = store_session_list_response(SESSION_LIST_LIMIT, Arc::clone(&body));
     (body, Some(generation))
 }
 
-pub(crate) fn cached_list_sessions_with_limit(limit: usize) -> String {
+pub(crate) fn cached_list_sessions_with_limit(limit: usize) -> Arc<str> {
     cached_list_sessions_with_limit_and_generation(limit).0
 }
 
 pub(crate) fn cached_list_sessions_with_limit_and_generation(
     limit: usize,
-) -> (String, Option<u64>) {
+) -> (Arc<str>, Option<u64>) {
     let limit = limit.clamp(1, SESSION_LIST_LIMIT);
     if limit >= SESSION_LIST_LIMIT {
         return cached_list_sessions_with_generation();
@@ -486,19 +516,16 @@ pub(crate) fn cached_list_sessions_with_limit_and_generation(
         }
     }
 
-    let body = list_sessions_from_home_with_limit(&crate::platform::home_dir(), Some(limit));
-    store_session_list_response(limit, body.clone());
-    let generation = {
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get(&limit).map(|entry| entry.generation)
-    };
-    (body, generation)
+    let body: Arc<str> =
+        list_sessions_from_home_with_limit(&crate::platform::home_dir(), Some(limit)).into();
+    let generation = store_session_list_response(limit, Arc::clone(&body));
+    (body, Some(generation))
 }
 
-pub(crate) fn cached_session_list_snapshot() -> Option<String> {
+pub(crate) fn cached_session_list_snapshot() -> Option<Arc<str>> {
     let cache = SESSION_LIST_RESPONSE_CACHE.get()?;
     let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    guard.as_ref().map(|entry| entry.body.clone())
+    guard.as_ref().map(|entry| Arc::clone(&entry.body))
 }
 
 pub(crate) fn session_ids_filter_from_request(request_line: &str) -> Option<Vec<String>> {
@@ -715,7 +742,7 @@ pub(crate) fn session_row_answers_to_id(row: &serde_json::Value, id: &str) -> bo
 /// The cached full-list body when the cache can serve one under its normal
 /// fresh/stale policy. No inline rebuild — callers fall back to their own
 /// path on a cold cache.
-fn cached_session_list_body_if_serveable() -> Option<String> {
+fn cached_session_list_body_if_serveable() -> Option<Arc<str>> {
     let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
     let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     serve_session_list_cache_entry(SESSION_LIST_LIMIT, guard.as_ref())
@@ -794,9 +821,10 @@ type SessionListProjectionKey = (u64, Option<usize>, bool);
 /// view), keyed by the source body's generation + the projection params.
 /// A projection is valid exactly while its source generation is being
 /// served, so entries from replaced bodies simply stop matching; the
-/// size cap ages them out.
-fn session_list_projection_cache() -> &'static Mutex<HashMap<SessionListProjectionKey, String>> {
-    static CACHE: OnceLock<Mutex<HashMap<SessionListProjectionKey, String>>> = OnceLock::new();
+/// size cap ages them out. Shared bodies for the same reason as the
+/// response cache: a hit hands out the Arc, not a text copy.
+fn session_list_projection_cache() -> &'static Mutex<HashMap<SessionListProjectionKey, Arc<str>>> {
+    static CACHE: OnceLock<Mutex<HashMap<SessionListProjectionKey, Arc<str>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -814,14 +842,17 @@ pub(crate) fn session_list_projection_cache_len() -> usize {
 /// usage view), computed once per source-body generation instead of
 /// re-parsing + re-serializing the multi-megabyte cached list on every
 /// request. `generation: None` (uncachable source) computes directly.
+/// The identity projection (no limit, no usage view) and every cache
+/// hit are refcount clones — the hot no-projection serve path never
+/// copies the body text.
 pub(crate) fn projected_session_list_body(
     generation: Option<u64>,
-    body: &str,
+    body: Arc<str>,
     limit: Option<usize>,
     usage_view: bool,
-) -> String {
+) -> Arc<str> {
     if limit.is_none() && !usage_view {
-        return body.to_string();
+        return body;
     }
     let key = generation.map(|generation| (generation, limit, usage_view));
     if let Some(key) = &key {
@@ -829,15 +860,16 @@ pub(crate) fn projected_session_list_body(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(projected) = cache.get(key) {
-            return projected.clone();
+            return Arc::clone(projected);
         }
     }
-    let projected = limit_session_list_body(body, limit);
+    let projected = limit_session_list_body(&body, limit);
     let projected = if usage_view {
         session_list_body_usage_view(&projected)
     } else {
         projected
     };
+    let projected: Arc<str> = projected.into();
     if let Some(key) = key {
         let mut cache = session_list_projection_cache()
             .lock()
@@ -845,7 +877,7 @@ pub(crate) fn projected_session_list_body(
         if cache.len() >= SESSION_LIST_PROJECTION_CACHE_LIMIT && !cache.contains_key(&key) {
             cache.clear();
         }
-        cache.insert(key, projected.clone());
+        cache.insert(key, Arc::clone(&projected));
     }
     projected
 }
@@ -2608,7 +2640,7 @@ pub(crate) fn stream_sessions_lines(
 pub(crate) fn stream_sessions_lines_from_home(
     home: &Path,
     requested_limit: Option<usize>,
-    hydrated_body: impl FnOnce() -> String,
+    hydrated_body: impl FnOnce() -> Arc<str>,
     tx: tokio::sync::mpsc::Sender<String>,
 ) {
     let quick_limit = requested_limit
@@ -2679,12 +2711,12 @@ mod tests {
                 Some(SessionListResponseCacheEntry {
                     generated_at: std::time::Instant::now(),
                     generation: next_session_list_body_generation(),
-                    body: "[{\"session_id\":\"stale\"}]".to_string(),
+                    body: "[{\"session_id\":\"stale\"}]".into(),
                 });
         }
         store_session_list_response(5, "[]".to_string());
         // Seed a projection so the invalidation has something to clear.
-        let _ = projected_session_list_body(Some(u64::MAX), "[]", Some(1), false);
+        let _ = projected_session_list_body(Some(u64::MAX), "[]".into(), Some(1), false);
         invalidate_session_list_response_caches();
         assert!(SESSION_LIST_RESPONSE_CACHE
             .get()
@@ -2701,20 +2733,20 @@ mod tests {
 
     #[test]
     fn projected_session_list_body_caches_by_generation_and_matches_direct() {
-        let body = serde_json::json!([
+        let body: Arc<str> = serde_json::json!([
             {"session_id": "s-1", "source": "intendant", "task": "keep",
              "total_tokens": 10, "model": "m", "project_root": "/repo"},
             {"session_id": "s-2", "source": "codex", "task": "drop-by-limit",
              "total_tokens": 20, "model": "m", "project_root": "/repo"},
         ])
-        .to_string();
+        .to_string()
+        .into();
 
-        // Identity projection: no limit, no usage view — body passes
-        // through untouched and nothing is cached for it.
-        assert_eq!(
-            projected_session_list_body(Some(9_100), &body, None, false),
-            body
-        );
+        // Identity projection: no limit, no usage view — the SAME
+        // allocation passes through (a refcount clone, not a text
+        // copy) and nothing is cached for it.
+        let identity = projected_session_list_body(Some(9_100), Arc::clone(&body), None, false);
+        assert!(Arc::ptr_eq(&identity, &body));
 
         for (limit, usage_view) in [(Some(1), false), (Some(1), true), (None, true)] {
             let direct = {
@@ -2728,26 +2760,139 @@ mod tests {
             // Unique generation per case isolates this test from cache
             // state other tests leave behind.
             let generation = 9_200 + limit.unwrap_or(0) as u64 * 2 + usage_view as u64;
-            let first = projected_session_list_body(Some(generation), &body, limit, usage_view);
-            assert_eq!(first, direct);
-            // Second call must serve the cached projection (same result);
-            // a DIFFERENT body under the SAME generation proves the cache
-            // is keyed by generation, not by re-deriving from the body.
-            let second = projected_session_list_body(Some(generation), "[]", limit, usage_view);
-            assert_eq!(second, direct);
+            let first =
+                projected_session_list_body(Some(generation), Arc::clone(&body), limit, usage_view);
+            assert_eq!(&*first, direct.as_str());
+            // Second call must serve the cached projection (same result,
+            // same allocation); a DIFFERENT body under the SAME
+            // generation proves the cache is keyed by generation, not by
+            // re-deriving from the body.
+            let second =
+                projected_session_list_body(Some(generation), "[]".into(), limit, usage_view);
+            assert_eq!(&*second, direct.as_str());
+            assert!(Arc::ptr_eq(&first, &second));
             // A new generation recomputes from the supplied body.
-            let recomputed =
-                projected_session_list_body(Some(generation + 5_000), "[]", limit, usage_view);
-            assert_ne!(recomputed, direct);
+            let recomputed = projected_session_list_body(
+                Some(generation + 5_000),
+                "[]".into(),
+                limit,
+                usage_view,
+            );
+            assert_ne!(&*recomputed, direct.as_str());
         }
 
         // Uncachable source (generation: None) computes directly.
-        let usage = projected_session_list_body(None, &body, None, true);
-        assert_eq!(usage, session_list_body_usage_view(&body));
+        let usage = projected_session_list_body(None, Arc::clone(&body), None, true);
+        assert_eq!(&*usage, session_list_body_usage_view(&body));
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&usage).unwrap();
         assert_eq!(parsed.len(), 2);
         assert!(parsed[0].get("task").is_none(), "usage view strips tasks");
         assert!(parsed[0].get("total_tokens").is_some());
+    }
+
+    #[test]
+    fn served_session_list_bodies_share_the_cached_allocation() {
+        let body: Arc<str> = "[{\"session_id\":\"shared\"}]".into();
+        let entry = SessionListResponseCacheEntry {
+            generated_at: std::time::Instant::now(),
+            generation: 4_242,
+            body: Arc::clone(&body),
+        };
+        let (served, generation) =
+            serve_session_list_cache_entry_with_generation(4_242, Some(&entry))
+                .expect("fresh entry serves");
+        assert_eq!(generation, 4_242);
+        assert!(
+            Arc::ptr_eq(&served, &body),
+            "a fresh hit must hand out the stored Arc, not a text copy"
+        );
+        assert!(serve_session_list_cache_entry_with_generation(4_242, None).is_none());
+    }
+
+    #[test]
+    fn session_list_refresh_is_single_flight_per_slot_and_globally_capped() {
+        // Everything below drives the claim guard directly — no real
+        // refresh thread ever spawns (list scans would leave the temp
+        // roots), and every claim is released before the test returns.
+        // One test fn on purpose: the in-flight set is process-global,
+        // so splitting these assertions across tests would let them
+        // interleave under the multi-threaded default test runner.
+
+        // Two stale hits on one slot ⇒ one refresh: the first claim
+        // wins, the second is refused while the first is in flight.
+        let slot = 61_000;
+        assert!(try_begin_session_list_refresh(slot));
+        assert!(
+            !try_begin_session_list_refresh(slot),
+            "a slot with a refresh in flight must refuse a second claim"
+        );
+
+        // While that refresh is in flight, a stale-but-usable entry
+        // still serves (stale-while-revalidate), and serving does not
+        // spawn a second refresh — the slot claim above stays the only
+        // one. (Instant is monotonic from boot; within the first TTL
+        // seconds after boot there is nothing to back-date into, so the
+        // serve probe is skipped there.)
+        let body: Arc<str> = "[]".into();
+        if let Some(stale_at) = std::time::Instant::now().checked_sub(
+            std::time::Duration::from_secs(SESSION_LIST_RESPONSE_CACHE_TTL_SECS + 1),
+        ) {
+            let stale = SessionListResponseCacheEntry {
+                generated_at: stale_at,
+                generation: 7,
+                body: Arc::clone(&body),
+            };
+            for _ in 0..2 {
+                let (served, generation) =
+                    serve_session_list_cache_entry_with_generation(slot, Some(&stale))
+                        .expect("stale-but-usable entry serves while a refresh is in flight");
+                assert!(Arc::ptr_eq(&served, &body));
+                assert_eq!(generation, 7);
+            }
+            assert!(
+                !try_begin_session_list_refresh(slot),
+                "stale serves must not have released or duplicated the slot claim"
+            );
+        }
+        if let Some(dead_at) = std::time::Instant::now().checked_sub(
+            std::time::Duration::from_secs(SESSION_LIST_RESPONSE_STALE_MAX_SECS + 1),
+        ) {
+            let dead = SessionListResponseCacheEntry {
+                generated_at: dead_at,
+                generation: 8,
+                body: Arc::clone(&body),
+            };
+            assert!(
+                serve_session_list_cache_entry_with_generation(61_001, Some(&dead)).is_none(),
+                "past the stale ceiling nothing serves (and nothing spawns)"
+            );
+        }
+        end_session_list_refresh(slot);
+
+        // Global ceiling: stale hits across DISTINCT slots stop
+        // spawning once the cap of concurrent refreshes is reached.
+        let base = 62_000;
+        let mut claimed = Vec::new();
+        for slot in base.. {
+            if !try_begin_session_list_refresh(slot) {
+                break;
+            }
+            claimed.push(slot);
+        }
+        assert_eq!(claimed.len(), SESSION_LIST_REFRESH_MAX_CONCURRENT);
+        assert!(
+            !try_begin_session_list_refresh(base + 10_000),
+            "at the ceiling every further slot is refused"
+        );
+        end_session_list_refresh(claimed.pop().expect("cap claims"));
+        assert!(
+            try_begin_session_list_refresh(base + 10_000),
+            "a finished refresh frees capacity for other slots"
+        );
+        claimed.push(base + 10_000);
+        for slot in claimed {
+            end_session_list_refresh(slot);
+        }
     }
 
     #[test]

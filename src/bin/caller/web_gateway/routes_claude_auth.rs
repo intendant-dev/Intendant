@@ -207,10 +207,7 @@ mod tests {
     fn response_status_and_body(response: ApiResponse) -> (u16, serde_json::Value) {
         match response {
             ApiResponse::Json { status, body, .. } => {
-                let text = match body {
-                    JsonBody::Value(value) => value.to_string(),
-                    JsonBody::PreSerialized(text) => text,
-                };
+                let text = body.into_string();
                 (status, serde_json::from_str(&text).unwrap())
             }
             _ => panic!("claude-auth responses are JSON"),

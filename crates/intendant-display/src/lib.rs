@@ -1417,6 +1417,22 @@ fn make_damage_backend(
     Box::new(capture::damage::NullDamageBackend::new(width, height))
 }
 
+/// RIDs of the pool's always-on baseline bank
+/// ([`encode::pool::BASELINE_CODEC`]), in spec order (descending
+/// bitrate; last entry is the floor). This is the layer set the
+/// layer-policy coordinator manages: on-demand slots are excluded by
+/// `always_on_ids` (they're lease-refcounted, not policy-managed), and
+/// non-baseline always-on entries don't exist today but are filtered
+/// for robustness. Keyed to `BASELINE_CODEC` — not a codec literal —
+/// so the Windows H.264 bank is governed the same way as the VP8
+/// simulcast bank on macOS/Linux.
+fn baseline_always_on_rids(ids: Vec<encode::pool::EncoderId>) -> Vec<encode::pool::SimulcastRid> {
+    ids.into_iter()
+        .filter(|id| id.codec == encode::pool::BASELINE_CODEC)
+        .map(|id| id.rid)
+        .collect()
+}
+
 /// Encode a full-screen tile snapshot into wire frames **once**; the
 /// caller fans the refcounted frames out to any number of peers. The
 /// raw-copy + RLE + lossless-WebP encode of the whole screen is the
@@ -1900,17 +1916,27 @@ impl DisplaySession {
         // always-on layer handles, so snapshots taken at spawn time
         // would go stale.
         //
-        //   - `get_current_rids` returns the pool's full VP8
-        //     simulcast layer set in spec order (descending
-        //     bitrate; last entry is floor). Coordinator derives
-        //     the floor + upper-layer split internally.
+        // All three are keyed to `encode::pool::BASELINE_CODEC` — the
+        // always-on bank's codec (VP8 simulcast on macOS/Linux, the
+        // single full-resolution H.264 layer on Windows). A literal
+        // `CodecKind::Vp8` here left the coordinator inert on Windows
+        // (no VP8 layers → empty rid set → every tick skipped), so the
+        // zero-peer pause never fired and an unwatched Windows session
+        // converted + encoded at full rate forever.
+        //
+        //   - `get_current_rids` returns the pool's always-on baseline
+        //     layer set in spec order (descending bitrate; last entry
+        //     is floor). Coordinator derives the floor + upper-layer
+        //     split internally; with the single-layer Windows bank the
+        //     one layer IS the floor and the congestion cascade has no
+        //     upper layers to act on.
         //   - `is_layer_paused` queries actual pool state for one
         //     RID — diffing against actual (rather than against an
         //     internal `last_applied`) handles the resize-
         //     regenerates-active case correctly.
         //   - `on_action` routes `CapacityAction::PauseLayer` /
         //     `ResumeLayer` to `pool.pause_layer` /
-        //     `pool.resume_layer` with `CodecKind::Vp8`.
+        //     `pool.resume_layer` with `BASELINE_CODEC`.
         //
         // The 5 s zero-peer pause debounce, the 5 s drop /
         // 1 s restore debounces for both TWCC and RR, and the
@@ -1919,17 +1945,10 @@ impl DisplaySession {
         // configured via `CapacityPolicyConfig::default()`.
         let pool_for_rids = Arc::clone(&pool_arc);
         let get_current_rids: Box<dyn Fn() -> Vec<encode::pool::SimulcastRid> + Send + Sync> =
-            Box::new(move || {
-                pool_for_rids
-                    .always_on_ids()
-                    .into_iter()
-                    .filter(|id| id.codec == encode::pool::CodecKind::Vp8)
-                    .map(|id| id.rid)
-                    .collect()
-            });
+            Box::new(move || baseline_always_on_rids(pool_for_rids.always_on_ids()));
         let pool_for_query = Arc::clone(&pool_arc);
         let is_layer_paused: aggregator::LayerPauseProbe = Box::new(move |rid| {
-            pool_for_query.is_layer_paused(encode::pool::CodecKind::Vp8, rid.clone())
+            pool_for_query.is_layer_paused(encode::pool::BASELINE_CODEC, rid.clone())
         });
         let pool_for_action = Arc::clone(&pool_arc);
         let on_action: Box<dyn Fn(aggregator::CapacityAction) + Send + Sync> =
@@ -1950,10 +1969,10 @@ impl DisplaySession {
                 }
                 match action {
                     aggregator::CapacityAction::PauseLayer(rid) => {
-                        pool_for_action.pause_layer(encode::pool::CodecKind::Vp8, rid);
+                        pool_for_action.pause_layer(encode::pool::BASELINE_CODEC, rid);
                     }
                     aggregator::CapacityAction::ResumeLayer(rid) => {
-                        pool_for_action.resume_layer(encode::pool::CodecKind::Vp8, rid);
+                        pool_for_action.resume_layer(encode::pool::BASELINE_CODEC, rid);
                     }
                 }
             });
@@ -2213,30 +2232,25 @@ impl DisplaySession {
         self.latest_frame.read().await.clone()
     }
 
-    /// D-3c: register a federated WebRtcPeer for tile streaming and
-    /// queue/send an initial snapshot when a captured frame is already
-    /// available. Local DisplaySlot peers are not registered in D-3.
+    /// D-3c: register a federated WebRtcPeer for tile streaming so the
+    /// bridge's delta/periodic-snapshot fanout includes it. Local
+    /// DisplaySlot peers are not registered in D-3.
+    ///
+    /// No initial snapshot is sent here. The client requests its
+    /// baseline with the reliable `Subscribe` control message once its
+    /// `tile-control` channel opens (see [`Self::build_tile_control_handler`];
+    /// `SnapshotRequest` covers recovery) — registration-time sends
+    /// predate that D-4d2 protocol and encoded/shipped the same
+    /// baseline a second time on every federated join.
     pub async fn register_tile_subscriber(&self, peer_id: PeerId) {
         self.tile_subscribers.write().await.insert(peer_id);
-        let Some(peer) = self.get_peer(peer_id).await else {
-            return;
-        };
-        let Some(frame) = self.latest_frame().await else {
-            return;
-        };
-        let epoch = self.tile_epoch.load(Ordering::Relaxed);
-        let snapshot_id = self.tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
-        let visual_marker_value =
-            current_visual_marker_value(&self.diagnostics_visual_marker, self.session_epoch);
-        send_tile_snapshot_to_peer(
-            peer,
-            frame,
-            epoch,
-            snapshot_id,
-            visual_marker_value,
-            Arc::clone(&self.counters),
-        )
-        .await;
+        if self.get_peer(peer_id).await.is_none() {
+            // Raced with a fast Close: the peer left the map between
+            // handle_offer returning and this registration. Drop the
+            // just-inserted entry (mirrors the Close arm's unregister)
+            // instead of leaving it for the reaper.
+            self.tile_subscribers.write().await.remove(&peer_id);
+        }
     }
 
     /// D-3c: unregister a tile subscriber. Safe to call even when the
@@ -4330,12 +4344,124 @@ mod tests {
         assert_eq!(session.counters.peer_count.load(Ordering::Relaxed), 0);
     }
 
+    /// The initial tile baseline is sent once, from the client's
+    /// reliable `Subscribe` control message — registration alone must
+    /// not encode/send a snapshot (it used to, doubling the join-time
+    /// full-screen encode: once at registration, again on Subscribe).
+    #[tokio::test]
+    async fn tile_snapshot_sent_on_subscribe_not_on_registration() {
+        let session = DisplaySession::new(
+            0,
+            Arc::new(StubBackend {
+                width: 64,
+                height: 64,
+            }),
+        );
+        // Both preconditions the old registration-time send needed: a
+        // live peer in the map and a captured frame available.
+        session.register_test_peer_for_cleanup(7).await;
+        *session.latest_frame.write().await = Some(Arc::new(make_test_bgra(64, 64)));
+
+        session.register_tile_subscriber(7).await;
+        assert!(
+            session.tile_subscribers.read().await.contains(&7),
+            "registration must insert into the subscriber set"
+        );
+        // The old send path was awaited inline, so a still-zero counter
+        // here really pins its removal.
+        assert_eq!(
+            session
+                .counters
+                .tile_snapshot_records
+                .load(Ordering::Relaxed),
+            0,
+            "registering a tile subscriber alone must not encode a snapshot"
+        );
+
+        // Subscribe produces the one initial baseline. The handler
+        // spawns its work, so poll with a deadline.
+        let handler = session.build_tile_control_handler(7);
+        handler(self::webrtc::TileControlMessage::Subscribe { client_id: 1 });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session
+            .counters
+            .tile_snapshot_records
+            .load(Ordering::Relaxed)
+            == 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "Subscribe did not produce a snapshot within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Settle so a hypothetical second send would land, then pin
+        // exactly one: a 64x64 frame is a single 64px tile, so one
+        // snapshot records exactly one tile record.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            session
+                .counters
+                .tile_snapshot_records
+                .load(Ordering::Relaxed),
+            1,
+            "the Subscribe control message must produce exactly one snapshot"
+        );
+        session.shutdown.cancel();
+    }
+
+    /// Registration that raced a fast Close (peer already gone from the
+    /// map) must not leave a dead entry in the subscriber set.
+    #[tokio::test]
+    async fn tile_subscriber_registration_drops_entry_for_departed_peer() {
+        let session = DisplaySession::new(
+            0,
+            Arc::new(StubBackend {
+                width: 64,
+                height: 64,
+            }),
+        );
+        session.register_tile_subscriber(9).await;
+        assert!(
+            !session.tile_subscribers.read().await.contains(&9),
+            "a peer absent from the peer map must not stay registered"
+        );
+    }
+
     #[test]
     fn tile_damage_uses_xdamage_only_for_x11_backend() {
         assert!(should_try_xdamage_for_tile_stream("x11"));
         assert!(!should_try_xdamage_for_tile_stream("wayland"));
         assert!(!should_try_xdamage_for_tile_stream("macos"));
         assert!(!should_try_xdamage_for_tile_stream("stub"));
+    }
+
+    /// The layer-policy coordinator's rid feed must follow the
+    /// platform's `BASELINE_CODEC`, not a codec literal. A literal
+    /// `Vp8` filter left the coordinator inert on Windows (H.264
+    /// bank → empty rid set → every tick skipped → the zero-peer
+    /// pause and the conversion idle gate never engaged).
+    /// Platform-agnostic: the non-baseline codec is derived relative
+    /// to `BASELINE_CODEC`, so this pins the same property on all
+    /// three platforms.
+    #[test]
+    fn baseline_rid_filter_keys_on_platform_baseline_codec() {
+        use encode::pool::{CodecKind, EncoderId, SimulcastRid, BASELINE_CODEC};
+        let other = if BASELINE_CODEC == CodecKind::Vp8 {
+            CodecKind::H264
+        } else {
+            CodecKind::Vp8
+        };
+        let ids = vec![
+            EncoderId::new(BASELINE_CODEC, SimulcastRid::full()),
+            EncoderId::new(other, SimulcastRid::federated()),
+            EncoderId::new(BASELINE_CODEC, SimulcastRid::half()),
+        ];
+        assert_eq!(
+            baseline_always_on_rids(ids),
+            vec![SimulcastRid::full(), SimulcastRid::half()],
+            "coordinator rid feed must be keyed to BASELINE_CODEC, in pool order"
+        );
     }
 
     #[test]
