@@ -1355,6 +1355,14 @@ pub struct PeerConfig {
     /// identical behavior to slice 3a.2 before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_tcp_via_url: Option<String>,
+    /// Operator-declared network relationship from this daemon to the peer
+    /// for certificate witnessing. Public destination addresses alone are
+    /// not evidence that the observer is outside the peer's LAN, so the
+    /// default is `unknown`. Set `remote` only when this daemon is
+    /// independently operated from another network; `same_lan` is always a
+    /// weak witness.
+    #[serde(default)]
+    pub certificate_witness_vantage: crate::peer::PeerWitnessVantage,
 }
 
 /// Recording configuration in intendant.toml.
@@ -1708,6 +1716,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     client_key: None,
                     pinned_fingerprints: Vec::new(),
                     browser_tcp_via_url: None,
+                    certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
                 },
                 PeerConfig {
                     card_url: "http://b.local/.well-known/agent-card.json".into(),
@@ -1720,6 +1729,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                         "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
                     ],
                     browser_tcp_via_url: Some("ws://192.168.1.42:8766/ws".into()),
+                    certificate_witness_vantage: crate::peer::PeerWitnessVantage::Remote,
                 },
             ],
             ..ProjectConfig::default()
@@ -1760,6 +1770,14 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
         assert_eq!(
             parsed.peers[1].browser_tcp_via_url.as_deref(),
             Some("ws://192.168.1.42:8766/ws"),
+        );
+        assert_eq!(
+            parsed.peers[0].certificate_witness_vantage,
+            crate::peer::PeerWitnessVantage::Unknown
+        );
+        assert_eq!(
+            parsed.peers[1].certificate_witness_vantage,
+            crate::peer::PeerWitnessVantage::Remote
         );
     }
 

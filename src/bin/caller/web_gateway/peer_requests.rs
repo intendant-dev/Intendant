@@ -91,6 +91,7 @@ pub(crate) fn persist_manual_peer(
                 client_key: None,
                 pinned_fingerprints: req.pinned_fingerprints.clone(),
                 browser_tcp_via_url: req.browser_tcp_via_url.clone(),
+                certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
             });
         }
     }

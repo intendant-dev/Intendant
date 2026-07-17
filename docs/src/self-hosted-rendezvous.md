@@ -612,5 +612,9 @@ separately sign a hosted-control capability on registration. Connect displays
 relay-mode fleet-DNS route, then performs a plain navigation to
 `https://d-<hash>.<zone>/`. The public doorbell at that origin grants nothing;
 the target daemon—not the rendezvous—serves the page, verifies the tab's proof,
-and mints any approved lease. An independently recorded direct daemon URL still
-opens the daemon's own HTTPS/mTLS root-capable origin.
+and mints any approved lease. An enabled daemon may also attach its separately
+signed fleet-certificate ledger to registration. Connect stores and projects
+that document verbatim for signed-application observation; its daemon
+signature, exact fleet origin, and canonical serial set remain independently
+verifiable. An independently recorded direct daemon URL still opens the
+daemon's own HTTPS/mTLS root-capable origin.

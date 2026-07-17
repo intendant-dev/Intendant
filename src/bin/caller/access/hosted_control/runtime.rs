@@ -13,7 +13,7 @@ use crate::daemon_identity::{b64u, verify_b64u, DaemonIdentity};
 
 use super::*;
 
-const ELIGIBLE_SIGNED_APP_DISTRIBUTIONS: &[&str] = &[];
+pub(super) const ELIGIBLE_SIGNED_APP_DISTRIBUTIONS: &[&str] = &[];
 
 pub fn mark_session_created_by_hosted_lease(
     cert_dir: &Path,
@@ -26,6 +26,11 @@ pub fn mark_session_created_by_hosted_lease(
         ));
     }
     iam::transact_state(cert_dir, |state, _| {
+        if compute_current_lane_guard(state).status == HostedLaneGuardStatus::Suspended {
+            return Err(AccessError(
+                "hosted control is suspended by the certificate guard".to_string(),
+            ));
+        }
         let now = now_ms() as u64;
         let lease = state
             .hosted_control
@@ -93,11 +98,12 @@ pub fn mark_session_created_by_hosted_lease(
 
 #[derive(Clone)]
 pub struct HostedControlRuntime {
-    enabled: bool,
-    init_error: Option<String>,
-    cert_dir: PathBuf,
-    identity: Option<Arc<DaemonIdentity>>,
-    daemon_id: String,
+    pub(super) enabled: bool,
+    pub(super) init_error: Option<String>,
+    pub(super) cert_dir: PathBuf,
+    pub(super) identity: Option<Arc<DaemonIdentity>>,
+    pub(super) identity_path: Option<PathBuf>,
+    pub(super) daemon_id: String,
     daemon_label: String,
     display_media_relay_configured: bool,
     /// Replay window for authority-free doorbell creation and polling.
@@ -108,6 +114,7 @@ pub struct HostedControlRuntime {
     tickets: Arc<Mutex<HashMap<String, WsTicketRecord>>>,
     doorbell_rate: Arc<Mutex<DoorbellRateState>>,
     poll_rate: Arc<Mutex<PollRateState>>,
+    pub(super) witness_rate: Arc<Mutex<WitnessRateState>>,
 }
 
 impl std::fmt::Debug for HostedControlRuntime {
@@ -151,6 +158,12 @@ struct DoorbellRateState {
 struct PollRateState {
     global: VecDeque<i64>,
     by_request: HashMap<String, VecDeque<i64>>,
+}
+
+#[derive(Default)]
+pub(super) struct WitnessRateState {
+    pub(super) global: VecDeque<i64>,
+    pub(super) by_binding: HashMap<String, VecDeque<i64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -197,6 +210,7 @@ impl HostedControlRuntime {
             init_error,
             cert_dir,
             identity,
+            identity_path: identity_path.map(Path::to_path_buf),
             daemon_id,
             daemon_label,
             display_media_relay_configured,
@@ -205,6 +219,7 @@ impl HostedControlRuntime {
             tickets: Arc::new(Mutex::new(HashMap::new())),
             doorbell_rate: Arc::new(Mutex::new(DoorbellRateState::default())),
             poll_rate: Arc::new(Mutex::new(PollRateState::default())),
+            witness_rate: Arc::new(Mutex::new(WitnessRateState::default())),
         }
     }
 
@@ -226,6 +241,9 @@ impl HostedControlRuntime {
         let state = iam::load_state_cached_arc(&self.cert_dir)
             .map_err(|error| format!("load hosted-control policy: {error}"))?;
         let identity = self.identity()?;
+        let lane_guard = HostedPublicLaneGuard {
+            status: compute_current_lane_guard(&state).status,
+        };
         Ok(HostedControlBootstrap {
             enabled: true,
             daemon_id: self.daemon_id.clone(),
@@ -238,6 +256,7 @@ impl HostedControlRuntime {
             max_ttl_secs: state.hosted_control.policy.max_ttl_secs,
             request_ttl_ms: PENDING_REQUEST_TTL_MS,
             display_media_relay_configured: self.display_media_relay_configured,
+            lane_guard,
         })
     }
 
@@ -248,6 +267,7 @@ impl HostedControlRuntime {
         source_bucket: Option<&str>,
     ) -> Result<HostedLeaseRequest, String> {
         self.ensure_enabled()?;
+        self.ensure_lane_available()?;
         let identity = self.identity()?;
         let fleet_origin = validate_fleet_origin(fleet_origin)?;
         let (public_key, fingerprint) = validate_browser_public_key(&input.browser_public_key)?;
@@ -445,6 +465,13 @@ impl HostedControlRuntime {
         self.ensure_enabled()?;
         let identity = self.identity()?;
         iam::transact_state(&self.cert_dir, |state, _| {
+            if input.approve
+                && compute_current_lane_guard(state).status == HostedLaneGuardStatus::Suspended
+            {
+                return Err(AccessError(
+                    "hosted control is suspended by the certificate guard".to_string(),
+                ));
+            }
             let now = now_ms() as u64;
             let request_index = state
                 .hosted_control
@@ -630,6 +657,7 @@ impl HostedControlRuntime {
 
     pub fn mint_ws_ticket(&self, verified: &VerifiedHostedLease) -> Result<HostedWsTicket, String> {
         self.ensure_enabled()?;
+        self.ensure_lane_available()?;
         let ticket = random_b64u(32)?;
         let expires = (now_ms() as u64).saturating_add(WS_TICKET_TTL_MS);
         let record = WsTicketRecord {
@@ -687,6 +715,7 @@ impl HostedControlRuntime {
         self.materialize_expirations("principal:local:hosted-control-observer")?;
         let state = iam::load_state_cached_arc(&self.cert_dir)?;
         let now = now_ms() as u64;
+        let lane_guard = compute_current_lane_guard(&state);
         Ok(HostedControlManagementSnapshot {
             configured: self.configured(),
             enabled: self.enabled(),
@@ -715,6 +744,8 @@ impl HostedControlRuntime {
                 .cloned()
                 .collect(),
             signed_app_anchors: state.hosted_control.signed_app_anchors.clone(),
+            certificate_ledger: self.certificate_ledger().ok(),
+            lane_guard,
         })
     }
 
@@ -944,7 +975,7 @@ impl HostedControlRuntime {
         })
     }
 
-    fn ensure_enabled(&self) -> Result<(), String> {
+    pub(super) fn ensure_enabled(&self) -> Result<(), String> {
         if !self.enabled {
             return Err("hosted control is disabled".to_string());
         }
@@ -954,7 +985,7 @@ impl HostedControlRuntime {
         Ok(())
     }
 
-    fn identity(&self) -> Result<&DaemonIdentity, String> {
+    pub(super) fn identity(&self) -> Result<&DaemonIdentity, String> {
         self.identity
             .as_deref()
             .ok_or_else(|| "hosted-control daemon identity is unavailable".to_string())
@@ -990,6 +1021,9 @@ impl HostedControlRuntime {
     ) -> Result<VerifiedHostedLease, String> {
         let state = iam::load_state_cached_arc(&self.cert_dir)
             .map_err(|error| format!("load hosted lease state: {error}"))?;
+        if compute_current_lane_guard(&state).status == HostedLaneGuardStatus::Suspended {
+            return Err("hosted control is suspended by the certificate guard".to_string());
+        }
         let lease = state
             .hosted_control
             .leases
@@ -1174,7 +1208,7 @@ fn project_request_status(mut request: HostedLeaseRequest, now_unix_ms: u64) -> 
     request
 }
 
-fn validate_fleet_origin(origin: &str) -> Result<String, String> {
+pub(super) fn validate_fleet_origin(origin: &str) -> Result<String, String> {
     let parsed = url::Url::parse(origin.trim())
         .map_err(|_| "fleet origin is not a valid URL".to_string())?;
     if parsed.scheme() != "https"
@@ -1207,7 +1241,11 @@ fn validate_browser_public_key(value: &str) -> Result<(String, String), String> 
     ))
 }
 
-fn verify_p256_signature(public_key: &str, payload: &[u8], signature: &str) -> Result<(), String> {
+pub(super) fn verify_p256_signature(
+    public_key: &str,
+    payload: &[u8],
+    signature: &str,
+) -> Result<(), String> {
     let engine = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let key = engine
         .decode(public_key)
@@ -1246,17 +1284,23 @@ fn stable_id_digest(value: &str) -> String {
     b64u(ring::digest::digest(&ring::digest::SHA256, value.as_bytes()).as_ref())
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     crate::access::client_key::now_unix_ms()
 }
 
-fn retain_recent(entries: &mut VecDeque<i64>, cutoff: i64) {
+pub(super) fn retain_recent(entries: &mut VecDeque<i64>, cutoff: i64) {
     while entries.front().is_some_and(|timestamp| *timestamp < cutoff) {
         entries.pop_front();
     }
 }
 
-fn push_audit(state: &mut LocalIamState, actor: &str, action: &str, target: &str, summary: String) {
+pub(super) fn push_audit(
+    state: &mut LocalIamState,
+    actor: &str,
+    action: &str,
+    target: &str,
+    summary: String,
+) {
     state.audit_events.push(IamAuditEvent {
         id: format!("audit:hosted:{}", uuid::Uuid::new_v4().simple()),
         at_unix_ms: Some(now_ms() as u64),
@@ -1445,6 +1489,133 @@ mod tests {
             .verify_request_proof("GET", path, "https://laptop.example.test", &proof, "relay")
             .unwrap_err()
             .contains("already used"));
+    }
+
+    #[test]
+    fn suspended_certificate_guard_stops_every_lease_admission_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let key = browser_key();
+        let (_, document) = issue_lease(&runtime, &key, HostedPreset::Tasks, 3600);
+        let verified = runtime
+            .verify_request_proof(
+                "GET",
+                "/api/sessions",
+                "https://laptop.example.test",
+                &request_proof(
+                    &key,
+                    &document,
+                    "GET",
+                    "/api/sessions",
+                    "before-suspension",
+                    now_ms(),
+                ),
+                "relay",
+            )
+            .unwrap();
+        let ticket = runtime.mint_ws_ticket(&verified).unwrap();
+        let pending_key = browser_key();
+        let pending = runtime
+            .create_request(
+                doorbell_input(&pending_key, HostedPreset::View, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+        iam::transact_state(&runtime.cert_dir, |state, _| {
+            state
+                .hosted_control
+                .witnesses
+                .owner_confirmed_serials
+                .push("abc".to_string());
+            Ok(((), true))
+        })
+        .unwrap();
+
+        let public_guard = serde_json::to_value(
+            runtime
+                .bootstrap("https://laptop.example.test")
+                .unwrap()
+                .lane_guard,
+        )
+        .unwrap();
+        assert_eq!(public_guard, serde_json::json!({"status": "suspended"}));
+        assert!(runtime
+            .mint_ws_ticket(&verified)
+            .unwrap_err()
+            .contains("suspended"));
+        assert!(runtime
+            .consume_ws_ticket(&ticket.ticket, "https://laptop.example.test", "relay")
+            .unwrap_err()
+            .contains("suspended"));
+        assert!(runtime
+            .decide_request(
+                HostedLeaseDecisionInput {
+                    request_id: pending.request_id.clone(),
+                    approve: true,
+                    approved_preset: None,
+                    approved_ttl_secs: None,
+                },
+                &owner(),
+            )
+            .unwrap_err()
+            .contains("suspended"));
+        assert!(runtime
+            .decide_request(
+                HostedLeaseDecisionInput {
+                    request_id: pending.request_id,
+                    approve: false,
+                    approved_preset: None,
+                    approved_ttl_secs: None,
+                },
+                &owner(),
+            )
+            .unwrap()
+            .is_none());
+        assert!(runtime
+            .verify_request_proof(
+                "GET",
+                "/api/sessions",
+                "https://laptop.example.test",
+                &request_proof(
+                    &key,
+                    &document,
+                    "GET",
+                    "/api/sessions",
+                    "after-suspension",
+                    now_ms(),
+                ),
+                "relay",
+            )
+            .unwrap_err()
+            .contains("suspended"));
+        let state = iam::load_state_cached_arc(&runtime.cert_dir).unwrap();
+        assert!(
+            crate::access::hosted_control::hosted_preset_for_principal(
+                &state,
+                &verified.principal,
+            )
+            .unwrap_err()
+            .contains("suspended"),
+            "a live hosted socket must fail its next authority recheck"
+        );
+        assert!(mark_session_created_by_hosted_lease(
+            &runtime.cert_dir,
+            &document.lease_id,
+            "session-after-suspension",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("suspended"));
+        let new_key = browser_key();
+        assert!(runtime
+            .create_request(
+                doorbell_input(&new_key, HostedPreset::View, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap_err()
+            .contains("suspended"));
     }
 
     #[test]

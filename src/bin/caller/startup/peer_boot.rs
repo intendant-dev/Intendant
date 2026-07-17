@@ -134,6 +134,7 @@ pub(crate) fn build_and_hydrate_peer_registry(
         let via_urls = cfg.via_urls.clone();
         let pinned_fingerprints = cfg.pinned_fingerprints.clone();
         let browser_tcp_via_url = cfg.browser_tcp_via_url.clone();
+        let certificate_witness_vantage = cfg.certificate_witness_vantage;
         let explicit_client_identity = match peer_client_identity_from_config(cfg) {
             Ok(identity) => identity,
             Err(e) => {
@@ -156,7 +157,7 @@ pub(crate) fn build_and_hydrate_peer_registry(
             // same URL (primary-side localhost tunnel, split
             // browser/primary machines, etc.).
             if let Err(e) = registry_for_task
-                .add_peer_with_credentials_and_client_identity_and_label(
+                .add_peer_with_credentials_and_client_identity_label_and_witness_vantage(
                     &card_url,
                     via_urls,
                     bearer_token,
@@ -164,6 +165,7 @@ pub(crate) fn build_and_hydrate_peer_registry(
                     browser_tcp_via_url,
                     explicit_client_identity,
                     label,
+                    certificate_witness_vantage,
                 )
                 .await
             {
@@ -219,6 +221,7 @@ mod tests {
             client_key: client_key.map(str::to_string),
             pinned_fingerprints: Vec::new(),
             browser_tcp_via_url: None,
+            certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
         }
     }
 

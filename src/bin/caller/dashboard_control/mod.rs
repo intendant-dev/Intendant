@@ -751,15 +751,23 @@ impl DashboardControlGrant {
                     return false;
                 };
                 let now_unix_ms = crate::access::client_key::now_unix_ms();
-                if let Some(expires_at_unix_ms) = authority_memo.validated_expiry(&current) {
-                    // This exact snapshot already passed the full validation
-                    // below; only the expiry comparison involves the clock.
-                    // Mirrors `IamGrant::is_active_at` (statuses were
-                    // enforced at memo time and are immutable in-snapshot).
-                    return match expires_at_unix_ms {
-                        Some(expires) => (now_unix_ms as u128) < (expires as u128),
-                        None => true,
-                    };
+                let hosted_lease =
+                    crate::access::hosted_control::is_hosted_lease_principal(principal);
+                // Hosted certificate evidence includes the CT monitor's
+                // process state, which can change without replacing the IAM
+                // state Arc. Re-run the hosted guard on every authority beat
+                // instead of accepting an IAM-only memo hit.
+                if !hosted_lease {
+                    if let Some(expires_at_unix_ms) = authority_memo.validated_expiry(&current) {
+                        // This exact snapshot already passed the full validation
+                        // below; only the expiry comparison involves the clock.
+                        // Mirrors `IamGrant::is_active_at` (statuses were
+                        // enforced at memo time and are immutable in-snapshot).
+                        return match expires_at_unix_ms {
+                            Some(expires) => (now_unix_ms as u128) < (expires as u128),
+                            None => true,
+                        };
+                    }
                 }
                 let Some(opening_grant) =
                     iam_state.grants.iter().find(|grant| grant.id == grant_id)
@@ -784,7 +792,7 @@ impl DashboardControlGrant {
                 else {
                     return false;
                 };
-                if crate::access::hosted_control::is_hosted_lease_principal(principal) {
+                if hosted_lease {
                     let records_current = opening_grant == current_grant
                         && opening_principal == current_principal
                         && crate::access::iam::is_enforced_status(&current_grant.status)
@@ -793,10 +801,6 @@ impl DashboardControlGrant {
                             &current, principal,
                         )
                         .is_ok();
-                    if records_current {
-                        authority_memo
-                            .store(Arc::clone(&current), current_grant.expires_at_unix_ms);
-                    }
                     return records_current
                         && match current_grant.expires_at_unix_ms {
                             Some(expires) => (now_unix_ms as u128) < (expires as u128),
@@ -2955,6 +2959,115 @@ mod fs_scope_grant_tests {
             iam_cert_dir: None,
             authority_memo: Default::default(),
         }
+    }
+
+    fn hosted_grant_with_memo() -> (DashboardControlGrant, OpeningAuthorityMemo) {
+        use crate::access::hosted_control::{
+            HostedLeaseDocument, HostedLeaseRecord, HostedLeaseStatus, HostedPreset,
+            HOSTED_AUTHN_KIND, HOSTED_PRINCIPAL_KIND, HOSTED_ROLE_TASKS, HOSTED_SOURCE,
+            LEASE_PROTOCOL,
+        };
+        use crate::access::iam::{AccessPrincipal, IamGrant, IamPrincipal, LocalIamState};
+
+        let now = crate::access::client_key::now_unix_ms().max(0) as u64;
+        let expires = now + 60_000;
+        let principal_id = "principal:hosted-lease:test".to_string();
+        let grant_id = "grant:hosted-lease:test".to_string();
+        let fingerprint = "browser-key".to_string();
+        let authn = vec![serde_json::json!({
+            "kind": HOSTED_AUTHN_KIND,
+            "fingerprint": fingerprint,
+            "public_key": "test",
+        })];
+        let mut state = LocalIamState::default();
+        state.principals.push(IamPrincipal {
+            id: principal_id.clone(),
+            kind: HOSTED_PRINCIPAL_KIND.to_string(),
+            label: "Hosted test".to_string(),
+            status: "active".to_string(),
+            source: HOSTED_SOURCE.to_string(),
+            account: None,
+            organization: None,
+            authn: authn.clone(),
+            notes: None,
+            created_at_unix_ms: Some(now),
+        });
+        state.grants.push(IamGrant {
+            id: grant_id.clone(),
+            principal_id: principal_id.clone(),
+            target_id: "daemon:self".to_string(),
+            role_id: HOSTED_ROLE_TASKS.to_string(),
+            policy_id: "policy:hosted-control-compiled".to_string(),
+            status: "active".to_string(),
+            source: HOSTED_SOURCE.to_string(),
+            reason: "test".to_string(),
+            created_at_unix_ms: Some(now),
+            revoked_at_unix_ms: None,
+            expires_at_unix_ms: Some(expires),
+            issued_via: None,
+            fs_scope: None,
+        });
+        state.hosted_control.leases.push(HostedLeaseRecord {
+            document: HostedLeaseDocument {
+                protocol: LEASE_PROTOCOL.to_string(),
+                lease_id: "lease:test".to_string(),
+                request_id: "request:test".to_string(),
+                daemon_id: "daemon-test".to_string(),
+                daemon_public_key: "daemon-key".to_string(),
+                fleet_origin: "https://fleet.example.test".to_string(),
+                browser_public_key: "test".to_string(),
+                browser_key_fingerprint: fingerprint.clone(),
+                preset: HostedPreset::Tasks,
+                issued_unix_ms: now,
+                expires_unix_ms: expires,
+                principal_id: principal_id.clone(),
+                grant_id: grant_id.clone(),
+                document_sha256: "test".to_string(),
+                signature: "test".to_string(),
+            },
+            status: HostedLeaseStatus::Active,
+            revoked_at_unix_ms: None,
+            revoked_by: None,
+        });
+        let principal = AccessPrincipal {
+            id: principal_id,
+            kind: HOSTED_PRINCIPAL_KIND.to_string(),
+            label: "Hosted test".to_string(),
+            source: HOSTED_SOURCE.to_string(),
+            role_id: HOSTED_ROLE_TASKS.to_string(),
+            grant_id: Some(grant_id),
+            transport: "hosted-relay-wss".to_string(),
+            peer_profile: None,
+            account: None,
+            organization: None,
+            authn,
+            authn_kind: Some(HOSTED_AUTHN_KIND.to_string()),
+            authn_binding: Some(fingerprint),
+            authn_origin: Some("https://fleet.example.test".to_string()),
+            hosted_connect: false,
+        };
+        let memo = OpeningAuthorityMemo::default();
+        (
+            DashboardControlGrant::UserClient {
+                principal,
+                iam_state: Arc::new(state),
+                iam_cert_dir: None,
+                authority_memo: memo.clone(),
+            },
+            memo,
+        )
+    }
+
+    #[test]
+    fn hosted_opening_authority_bypasses_the_iam_only_memo() {
+        let (grant, memo) = hosted_grant_with_memo();
+        assert!(grant.opening_authority_is_current());
+        assert!(
+            !memo.is_primed(),
+            "hosted authority must re-evaluate external certificate evidence"
+        );
+        assert!(grant.opening_authority_is_current());
+        assert!(!memo.is_primed());
     }
 
     #[test]
