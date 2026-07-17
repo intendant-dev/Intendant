@@ -7,16 +7,21 @@ license = "MIT"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# app_state (and the test-only media_envelopes) are pure Rust, so native
+# builds — the daemon's parity dev-dep and `cargo test -p presence-web` —
+# need only these. The browser stack below is wasm32-gated to match
+# lib.rs's cfg gates.
 [dependencies]
 presence-core = { path = "../presence-core" }
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
 
-[dependencies.web-sys]
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
 version = "0.3"
 features = [
   "WebSocket",
