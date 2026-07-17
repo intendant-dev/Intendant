@@ -667,7 +667,15 @@ mod tests {
 
         // A later session takes the kind over.
         let (tx2, _rx2) = mpsc::unbounded_channel();
-        register("s2", "Tab B", "local", &kinds(&[KIND_ANTHROPIC]), false, tx2).unwrap();
+        register(
+            "s2",
+            "Tab B",
+            "local",
+            &kinds(&[KIND_ANTHROPIC]),
+            false,
+            tx2,
+        )
+        .unwrap();
         let status = relay_status();
         assert_eq!(status.len(), 1);
         assert_eq!(status[0].session_id, "s2");
