@@ -241,11 +241,7 @@ impl CeremonyManager {
                 shim_dir,
             });
             // A cancel that raced the spawn: reap immediately.
-            if inner
-                .state
-                .as_ref()
-                .is_some_and(|s| s.phase.is_terminal())
-            {
+            if inner.state.as_ref().is_some_and(|s| s.phase.is_terminal()) {
                 if let Some(runtime) = inner.runtime.as_mut() {
                     runtime.transport.kill();
                 }
@@ -711,7 +707,8 @@ pub(crate) struct ScanFindings {
 
 impl MarkerScanner {
     pub(crate) fn push(&mut self, chunk: &[u8]) -> ScanFindings {
-        self.text.push_str(&strip_ansi(&String::from_utf8_lossy(chunk)));
+        self.text
+            .push_str(&strip_ansi(&String::from_utf8_lossy(chunk)));
         if self.text.len() > SCAN_BUFFER_CAP {
             let cut = self.text.len() - SCAN_BUFFER_CAP;
             // Keep a whole-character tail.
@@ -827,10 +824,9 @@ fn pty_program_invocation(command: &str) -> (String, Vec<String>) {
                     .map(|e| e.to_ascii_lowercase());
                 let resolved_str = resolved.to_string_lossy().into_owned();
                 return match ext.as_deref() {
-                    Some("cmd") | Some("bat") => (
-                        "cmd.exe".to_string(),
-                        vec!["/C".to_string(), resolved_str],
-                    ),
+                    Some("cmd") | Some("bat") => {
+                        ("cmd.exe".to_string(), vec!["/C".to_string(), resolved_str])
+                    }
                     _ => (resolved_str, Vec::new()),
                 };
             }
@@ -878,14 +874,11 @@ fn spawn_ceremony_process(id: u64, command: &str) -> Result<(), String> {
     // ceremonies are swept on the next start.
     let shim_parent = crate::platform::intendant_home().join("claude-auth");
     let _ = std::fs::remove_dir_all(&shim_parent);
+    // Shim assembly failing is not fatal: the PTY parse fallback still
+    // yields the URL; the CLI may open a local browser, which is harmless
+    // on an owner box.
     let shim = if cfg!(unix) {
-        match write_browser_shim(&shim_parent) {
-            Ok(pair) => Some(pair),
-            // Shim assembly failing is not fatal: the PTY parse fallback
-            // still yields the URL; the CLI may open a local browser,
-            // which is harmless on an owner box.
-            Err(_) => None,
-        }
+        write_browser_shim(&shim_parent).ok()
     } else {
         None
     };
@@ -1005,10 +998,7 @@ fn reader_thread(
             manager().url_captured(id, url);
         }
     }
-    let exit_ok = child
-        .wait()
-        .map(|status| status.success())
-        .unwrap_or(false);
+    let exit_ok = child.wait().map(|status| status.success()).unwrap_or(false);
     // Only probe when the ceremony is still deciding — a cancelled or
     // timed-out ceremony skips the probe (its verdict is already set).
     let needs_probe = exit_ok
@@ -1075,7 +1065,10 @@ mod tests {
         assert_eq!(manager.current_phase(), Some(CeremonyPhase::Starting));
 
         manager.url_captured(id, FIXTURE_URL.to_string());
-        assert_eq!(manager.current_phase(), Some(CeremonyPhase::AwaitingBrowser));
+        assert_eq!(
+            manager.current_phase(),
+            Some(CeremonyPhase::AwaitingBrowser)
+        );
         manager.prompt_seen(id);
         assert_eq!(manager.current_phase(), Some(CeremonyPhase::AwaitingCode));
 
@@ -1112,9 +1105,15 @@ mod tests {
         let manager = CeremonyManager::default();
         let id = manager.begin(SUPPORTED_MODE).expect("reserve");
         // Busy from the moment of reservation — before any process exists.
-        assert_eq!(manager.begin(SUPPORTED_MODE).err(), Some(StartRefusal::Busy));
+        assert_eq!(
+            manager.begin(SUPPORTED_MODE).err(),
+            Some(StartRefusal::Busy)
+        );
         manager.install_transport(id, Box::new(MockTransport::default()), None);
-        assert_eq!(manager.begin(SUPPORTED_MODE).err(), Some(StartRefusal::Busy));
+        assert_eq!(
+            manager.begin(SUPPORTED_MODE).err(),
+            Some(StartRefusal::Busy)
+        );
         manager.cancel().expect("cancel");
         // Terminal state: a new ceremony may start and gets a fresh id.
         let next = begin(&manager, MockTransport::default());
@@ -1139,10 +1138,7 @@ mod tests {
     fn spawn_failure_backs_out_the_reservation() {
         let manager = CeremonyManager::default();
         let id = manager.begin(SUPPORTED_MODE).expect("reserve");
-        manager.spawn_failed(
-            id,
-            format!("spawn failed for {FIXTURE_URL}"),
-        );
+        manager.spawn_failed(id, format!("spawn failed for {FIXTURE_URL}"));
         let status = manager.status_value();
         assert_eq!(status["phase"], "failed");
         let error = status["error"].as_str().unwrap();
@@ -1272,7 +1268,10 @@ mod tests {
         );
         let findings = scanner.push(first.as_bytes());
         assert_eq!(findings, ScanFindings::default());
-        let rest = format!("{}\r\n\u{1b}[2mPaste code here if prompted > \u{1b}[0m", &FIXTURE_URL[40..]);
+        let rest = format!(
+            "{}\r\n\u{1b}[2mPaste code here if prompted > \u{1b}[0m",
+            &FIXTURE_URL[40..]
+        );
         let findings = scanner.push(rest.as_bytes());
         assert_eq!(findings.url.as_deref(), Some(FIXTURE_URL));
         assert!(findings.prompt_seen);
@@ -1288,17 +1287,15 @@ mod tests {
         assert!(validated_oauth_url("http://claude.com/cai/oauth/authorize").is_none());
         assert!(validated_oauth_url("https://claude.com/download").is_none());
         assert!(validated_oauth_url("https://evilclaude.com/oauth/authorize").is_none());
-        assert!(
-            validated_oauth_url("https://console.anthropic.com/oauth/authorize?state=synthetic")
-                .is_some()
-        );
+        assert!(validated_oauth_url(
+            "https://console.anthropic.com/oauth/authorize?state=synthetic"
+        )
+        .is_some());
     }
 
     #[test]
     fn find_oauth_url_skips_non_matching_candidates() {
-        let text = format!(
-            "see https://docs.example/help then visit: {FIXTURE_URL} now"
-        );
+        let text = format!("see https://docs.example/help then visit: {FIXTURE_URL} now");
         assert_eq!(find_oauth_url(&text, false).as_deref(), Some(FIXTURE_URL));
         assert_eq!(find_oauth_url("no urls here", true), None);
         // A candidate at the buffer end is deferred in streaming mode: a
@@ -1315,13 +1312,19 @@ mod tests {
     #[test]
     fn redaction_covers_state_challenge_and_code() {
         let redacted = redact_oauth_params(FIXTURE_URL);
-        assert!(!redacted.contains("synthetic-challenge-value"), "{redacted}");
+        assert!(
+            !redacted.contains("synthetic-challenge-value"),
+            "{redacted}"
+        );
         assert!(!redacted.contains("synthetic-state-value"), "{redacted}");
         assert!(redacted.contains("code_challenge=\u{2026}"));
         assert!(redacted.contains("state=\u{2026}"));
         assert!(redacted.contains("code=\u{2026}"));
         // Non-parameter occurrences stay intact.
-        assert_eq!(redact_oauth_params("decode=x barcode=y"), "decode=x barcode=y");
+        assert_eq!(
+            redact_oauth_params("decode=x barcode=y"),
+            "decode=x barcode=y"
+        );
         assert!(redacted.contains("client_id=test-client"));
     }
 
@@ -1345,7 +1348,11 @@ mod tests {
         assert_eq!(probe.account.org_name.as_deref(), Some("Org"));
         assert_eq!(probe.account.auth_method.as_deref(), Some("claudeai"));
         assert_eq!(parse_auth_status("not json"), None);
-        assert_eq!(parse_auth_status("{\"email\":\"x\"}"), None, "loggedIn required");
+        assert_eq!(
+            parse_auth_status("{\"email\":\"x\"}"),
+            None,
+            "loggedIn required"
+        );
     }
 
     // ── Shim assembly ──
@@ -1368,7 +1375,11 @@ mod tests {
             let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(dir_mode, 0o700);
             for name in ["open", "xdg-open"] {
-                let mode = std::fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o777;
+                let mode = std::fs::metadata(dir.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
                 assert_eq!(mode, 0o700, "{name} must be executable and private");
             }
         }

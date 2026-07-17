@@ -829,6 +829,7 @@ pub(crate) async fn run_with_presence(
                         persist_model_responses_inline: false,
                         headless: false,
                         context_injection: &context_injection,
+                        reload_credentials: None,
                     };
                     match apply_external_context_rewind(
                         agent,
@@ -1218,6 +1219,7 @@ pub(crate) async fn run_with_presence(
                         persist_model_responses_inline: false,
                         headless: false,
                         context_injection: &context_injection,
+                        reload_credentials: None,
                     };
                     apply_context_rewind_backout_action(agent, &op, &action_params, &drain_config)
                         .await
@@ -1264,6 +1266,7 @@ pub(crate) async fn run_with_presence(
                         persist_model_responses_inline: false,
                         headless: false,
                         context_injection: &context_injection,
+                        reload_credentials: None,
                     };
                     if is_fission_spawn_action(&op) {
                         apply_fission_spawn_action(agent, &action_params, &drain_config).await
@@ -1370,6 +1373,7 @@ pub(crate) async fn run_with_presence(
                         persist_model_responses_inline: false,
                         headless: false,
                         context_injection: &context_injection,
+                        reload_credentials: None,
                     };
                     persist_codex_service_tier_for_drain(
                         &drain_config,
@@ -1459,6 +1463,7 @@ pub(crate) async fn run_with_presence(
                                 persist_model_responses_inline: false,
                                 headless: false,
                                 context_injection: &context_injection,
+                                reload_credentials: None,
                             };
                             emit_side_session_started(
                                 &drain_config,
@@ -1540,6 +1545,7 @@ pub(crate) async fn run_with_presence(
                     persist_model_responses_inline: false,
                     headless: false,
                     context_injection: &context_injection,
+                    reload_credentials: None,
                 };
                 if let Some(child_thread_id) =
                     scoped_event_codex_subagent_thread_id(&event_thread_id, &cumulative_stats)
@@ -2380,6 +2386,7 @@ pub(crate) async fn run_with_presence(
                     persist_model_responses_inline: false,
                     headless: false,
                     context_injection: &context_injection,
+                    reload_credentials: None,
                 };
                 let codex_managed_context_enabled =
                     matches!(backend, external_agent::AgentBackend::Codex)

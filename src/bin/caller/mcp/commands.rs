@@ -1112,6 +1112,21 @@ pub(crate) async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::ReloadCredentials { session_id } => {
+            // The in-place respawn machinery lives in the daemon's
+            // supervised external loop; this foreground/MCP shape has no
+            // supervisor to land it on. Refuse honestly.
+            emit_control_result(
+                control_tx,
+                "reload_credentials",
+                false,
+                format!(
+                    "reload_credentials is only available for daemon-supervised sessions (requested: {session_id})"
+                ),
+                None,
+            );
+            None
+        }
         ControlMsg::FollowUp {
             text, direct: _, ..
         } => {

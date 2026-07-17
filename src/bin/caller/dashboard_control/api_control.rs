@@ -1671,6 +1671,7 @@ pub(crate) fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::ConfigureSessionAgent { .. }
             | ControlMsg::StopSession { .. }
             | ControlMsg::RestartSession { .. }
+            | ControlMsg::ReloadCredentials { .. }
             | ControlMsg::CreateSession { .. }
             | ControlMsg::SpawnSubAgent { .. }
             | ControlMsg::StartTask { .. }
@@ -1748,6 +1749,7 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::ConfigureSessionAgent { .. } => "configure_session_agent",
         ControlMsg::StopSession { .. } => "stop_session",
         ControlMsg::RestartSession { .. } => "restart_session",
+        ControlMsg::ReloadCredentials { .. } => "reload_credentials",
         ControlMsg::ResumeSession { .. } => "resume_session",
         ControlMsg::ForkSessionAtAnchor { .. } => "fork_session_at_anchor",
         ControlMsg::SetClaudeModel { .. } => "set_claude_model",
@@ -3696,6 +3698,26 @@ mod tests {
             js_set, rust_set,
             "DASHBOARD_ACTION_MSG_RPC_ACTIONS (static/app/31-init-identity-fleet.js) \
              drifted from DASHBOARD_ACTION_MSG_ACTIONS"
+        );
+    }
+
+    /// Reload-credentials rides the session-control lane like restart:
+    /// wire name, lane admission, and the session-manage classification
+    /// (it is session lifecycle — the ceremony that writes the store is
+    /// gated on credentials.manage separately).
+    #[test]
+    fn reload_credentials_control_msg_wires_like_restart() {
+        let msg: ControlMsg = serde_json::from_value(serde_json::json!({
+            "action": "reload_credentials",
+            "session_id": "s1",
+        }))
+        .expect("reload_credentials parses");
+        assert_eq!(dashboard_control_msg_action(&msg), "reload_credentials");
+        assert!(dashboard_session_control_msg_allowed(&msg));
+        assert!(!dashboard_action_msg_allowed(&msg));
+        assert_eq!(
+            crate::access::access_policy::control_msg_operation(&msg),
+            crate::peer::access_policy::PeerOperation::SessionManage,
         );
     }
 

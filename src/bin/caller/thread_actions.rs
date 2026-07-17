@@ -2871,6 +2871,7 @@ pub(crate) async fn drain_external_child_turn(
         persist_model_responses_inline: config.persist_model_responses_inline,
         headless: config.headless,
         context_injection: config.context_injection,
+        reload_credentials: config.reload_credentials,
     };
 
     match drain_external_agent_events(
@@ -3899,6 +3900,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let mut stats = LoopStats::default();
 
@@ -3973,6 +3975,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let mut stats = LoopStats::default();
 
@@ -4092,6 +4095,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let mut stats = LoopStats::default();
 
@@ -4311,6 +4315,7 @@ mod tests {
             persist_model_responses_inline: false,
             headless: true,
             context_injection,
+            reload_credentials: None,
         }
     }
 

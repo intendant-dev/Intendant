@@ -1140,6 +1140,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SessionStarted { .. }
         | AppEvent::SessionAttached { .. }
         | AppEvent::SessionStopRequested { .. }
+        | AppEvent::ReloadBackendCredentials { .. }
         | AppEvent::SessionEnded { .. }
         | AppEvent::DebugScreenReady { .. }
         | AppEvent::DebugScreenTornDown { .. }

@@ -185,6 +185,17 @@ pub enum AppEvent {
     InterruptRequested {
         session_id: Option<String>,
     },
+    /// User asked a supervised external session to reload its backend
+    /// credentials: the supervision loop respawns the backend process
+    /// in place (resume-attach on the same backend session id) so it
+    /// re-reads the credential store. Mid-turn, the drain interrupts the
+    /// backend first (stop semantics) and the loop applies the respawn
+    /// once the turn drain returns; a live rate-limit park is cancelled
+    /// with its pending re-send preserved, so queued/pending messages
+    /// re-deliver after the respawn.
+    ReloadBackendCredentials {
+        session_id: Option<String>,
+    },
     /// User requested that a managed session stop completely. External-agent
     /// loops listen for this and shut down their backend process.
     SessionStopRequested {
@@ -1398,6 +1409,15 @@ pub enum ControlMsg {
     StopSession {
         session_id: String,
     },
+    /// Ask a live supervised external session to reload its backend
+    /// credentials: graceful in-place respawn with `--resume` on the same
+    /// backend session id, so the new process reads the fresh credential
+    /// store (e.g. after a dashboard Claude sign-in). Interrupts a
+    /// mid-turn backend first; cancels a rate-limit park and re-delivers
+    /// its queued/pending messages after the respawn.
+    ReloadCredentials {
+        session_id: String,
+    },
     /// Stop a live external-agent session and immediately resume it using the
     /// persisted launch config for that session.
     RestartSession {
@@ -2335,6 +2355,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
         }),
         AppEvent::SessionStopRequested { .. } => None,
+        // Loop-internal respawn signal; frontends follow the reload through
+        // LogEntry lines and session lifecycle events.
+        AppEvent::ReloadBackendCredentials { .. } => None,
         AppEvent::Interrupted { session_id, reason } => Some(OutboundEvent::Interrupted {
             session_id: session_id.clone(),
             reason: reason.clone(),

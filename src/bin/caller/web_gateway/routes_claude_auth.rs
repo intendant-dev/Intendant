@@ -72,15 +72,13 @@ pub(crate) fn claude_auth_start_api_response(
                 "status": claude_auth_ceremony::manager().status_value(),
             })),
         ),
-        Err(StartRefusal::Busy) => ApiResponse::json_error(
-            409,
-            "a sign-in ceremony is already running on this daemon",
-        ),
+        Err(StartRefusal::Busy) => {
+            ApiResponse::json_error(409, "a sign-in ceremony is already running on this daemon")
+        }
         Err(StartRefusal::BadRequest(error)) => ApiResponse::json_error(400, error),
-        Err(StartRefusal::Spawn(error)) => ApiResponse::json_error(
-            500,
-            format!("could not start the sign-in process: {error}"),
-        ),
+        Err(StartRefusal::Spawn(error)) => {
+            ApiResponse::json_error(500, format!("could not start the sign-in process: {error}"))
+        }
     }
 }
 
@@ -188,8 +186,7 @@ pub(crate) async fn handle_claude_auth_code(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response =
-        claude_auth_code_api_response(request_authority_is_hosted(access), &body_text);
+    let response = claude_auth_code_api_response(request_authority_is_hosted(access), &body_text);
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -270,7 +267,8 @@ mod tests {
 
     #[test]
     fn code_body_shapes_are_validated() {
-        let (status, _) = response_status_and_body(claude_auth_code_api_response(false, "not json"));
+        let (status, _) =
+            response_status_and_body(claude_auth_code_api_response(false, "not json"));
         assert_eq!(status, 400);
         let (status, _) =
             response_status_and_body(claude_auth_code_api_response(false, "{\"nope\":1}"));

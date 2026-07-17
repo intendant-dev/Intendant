@@ -246,6 +246,7 @@ pub fn spawn_event_listener(
                     | AppEvent::ExternalFollowUpRequested { .. }
                     | AppEvent::FollowUpCancelRequested { .. }
                     | AppEvent::SessionStopRequested { .. }
+                    | AppEvent::ReloadBackendCredentials { .. }
                     | AppEvent::SessionRelationship { .. }
                     | AppEvent::SessionForkResult { .. }
                     | AppEvent::TaskReceived { .. }
