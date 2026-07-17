@@ -14,6 +14,7 @@ mod anthropic;
 pub(crate) use anthropic::*;
 mod gemini;
 pub(crate) use gemini::*;
+pub(crate) mod streaming;
 
 /// HTTP client timeout for API requests (120 seconds).
 const API_TIMEOUT: Duration = Duration::from_secs(120);
@@ -75,60 +76,11 @@ async fn send_with_retry(
         .unwrap_or_else(|| CallerError::Provider("request failed after retries".to_string())))
 }
 
-/// Parse Server-Sent Events from a byte stream. Returns (event_type, data) pairs.
-/// Handles multi-line data fields by joining with newlines.
-fn parse_sse_line(line: &str) -> Option<(&str, &str)> {
-    if let Some(rest) = line.strip_prefix("data: ") {
-        Some(("data", rest))
-    } else if let Some(rest) = line.strip_prefix("event: ") {
-        Some(("event", rest))
-    } else {
-        None
-    }
-}
-
-/// Byte-accurate line framing for SSE streams. Network chunks accumulate as
-/// raw bytes and are converted to text only once a complete line is
-/// available: converting each chunk independently (the old per-chunk
-/// `from_utf8_lossy`) corrupted any multibyte UTF-8 codepoint that a chunk
-/// boundary happened to split — common with CJK/emoji streaming — into
-/// U+FFFD replacement characters.
-pub(crate) struct SseLineBuffer {
-    buf: Vec<u8>,
-}
-
-impl SseLineBuffer {
-    pub(crate) fn new() -> Self {
-        Self { buf: Vec::new() }
-    }
-
-    /// Append a raw network chunk.
-    pub(crate) fn push_chunk(&mut self, chunk: &[u8]) {
-        self.buf.extend_from_slice(chunk);
-    }
-
-    /// Pop the next complete line: everything up to the first `'\n'` (which
-    /// is consumed and excluded), with trailing `'\r'`s stripped — the
-    /// byte-level equivalent of the providers' old `trim_end_matches('\r')`.
-    /// Lossy UTF-8 conversion happens only here, on the complete line, so a
-    /// genuinely invalid byte still degrades to U+FFFD but a chunk boundary
-    /// never manufactures one. Returns `None` when no full line is buffered;
-    /// the partial tail stays buffered for the next chunk. Scanning for
-    /// `b'\n'`/`b'\r'` byte-wise is UTF-8-safe: ASCII bytes never occur
-    /// inside a multibyte sequence.
-    pub(crate) fn next_line(&mut self) -> Option<String> {
-        let newline_pos = self.buf.iter().position(|&b| b == b'\n')?;
-        let mut line_end = newline_pos;
-        while line_end > 0 && self.buf[line_end - 1] == b'\r' {
-            line_end -= 1;
-        }
-        let line = String::from_utf8_lossy(&self.buf[..line_end]).into_owned();
-        // Drain the consumed prefix in place instead of reallocating the
-        // remainder into a fresh buffer per line.
-        self.buf.drain(..=newline_pos);
-        Some(line)
-    }
-}
+// SSE mechanics — chunk→event framing, the stream driver, and the
+// per-provider fold seam — live in [`streaming`]. The line-buffer and
+// `parse_sse_line` helpers the three provider loops used to share were
+// superseded by `streaming::SseFramer` (which also fixes the multi-line
+// `data:` joining those helpers documented but never implemented).
 
 /// Streaming timeout for SSE connections (10 minutes).
 const STREAM_TIMEOUT: Duration = Duration::from_secs(600);
@@ -356,14 +308,24 @@ impl ProviderHttpResponse {
 
     fn bytes_stream(
         self,
-    ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Vec<u8>, String>> + Send>> {
+    ) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, String>> + Send>>
+    {
         match self {
+            // reqwest chunks are already refcounted `Bytes` — hand them
+            // through as-is (the old `.to_vec()` copied the entire
+            // response body once per chunk for nothing).
             ProviderHttpResponse::Direct(response) => Box::pin(
                 response
                     .bytes_stream()
-                    .map(|chunk| chunk.map(|bytes| bytes.to_vec()).map_err(|e| e.to_string())),
+                    .map(|chunk| chunk.map_err(|e| e.to_string())),
             ),
-            ProviderHttpResponse::Egress(response) => Box::pin(response.bytes_stream()),
+            // The egress relay assembles owned Vecs from base64 frames;
+            // `Bytes::from(Vec)` takes ownership without copying.
+            ProviderHttpResponse::Egress(response) => Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|chunk| chunk.map(bytes::Bytes::from)),
+            ),
         }
     }
 
@@ -376,6 +338,37 @@ impl ProviderHttpResponse {
             }
             ProviderHttpResponse::Egress(_) => Vec::new(),
         }
+    }
+}
+
+/// One provider request, built exactly once per turn: the serialized
+/// wire bytes plus the stable schema label the Context tab keys on. The
+/// same `Bytes` feed every HTTP attempt (first send and retries are
+/// refcount bumps, not copies) and the snapshot view — parsed back from
+/// those bytes by [`PreparedRequest::snapshot_value`], so the Context
+/// tab's "exact request payload" guarantee holds by construction instead
+/// of by parallel rebuild.
+#[derive(Debug, Clone)]
+pub struct PreparedRequest {
+    /// Stable schema label (e.g. `anthropic.messages.request.v1`).
+    pub(crate) format: String,
+    /// The serialized request body — the exact bytes on the wire.
+    pub(crate) body: bytes::Bytes,
+}
+
+impl PreparedRequest {
+    pub(crate) fn new(format: impl Into<String>, body: Vec<u8>) -> Self {
+        Self {
+            format: format.into(),
+            body: body.into(),
+        }
+    }
+
+    /// The snapshot-facing DOM view, parsed from the wire bytes. Costs
+    /// one parse, so only snapshot consumers (the per-turn Context-tab
+    /// event) pay for it — `chat`/`chat_stream` never do.
+    pub(crate) fn snapshot_value(&self) -> Result<serde_json::Value, CallerError> {
+        serde_json::from_slice(&self.body).map_err(CallerError::Json)
     }
 }
 
@@ -453,18 +446,37 @@ pub trait ChatProvider: Send + Sync {
         vec![]
     }
 
-    /// Build the provider-specific request body that will be sent for this
-    /// message slice. Used by the dashboard Context tab to show the exact
-    /// model request payload after provider role conversion, system/developer
-    /// fields, tools, and native computer-use blocks are applied.
-    fn request_snapshot(
+    /// Build the provider-specific request exactly once: role conversion,
+    /// system/developer fields, tools, native computer-use blocks, and
+    /// serialization. The returned [`PreparedRequest`] carries the exact
+    /// wire bytes; [`ChatProvider::request_snapshot`] and
+    /// [`ChatProvider::chat_stream_prepared`] both derive from it, so the
+    /// agent loop's per-turn Context snapshot and the HTTP body are one
+    /// build instead of two.
+    fn prepare_request(
         &self,
         _messages: &[Message],
         _stream: bool,
-    ) -> Result<(String, serde_json::Value), CallerError> {
+    ) -> Result<PreparedRequest, CallerError> {
         Err(CallerError::Provider(
             "provider does not expose a request payload snapshot".to_string(),
         ))
+    }
+
+    /// The provider request as a `(format, payload)` pair for the
+    /// dashboard Context tab — derived from [`ChatProvider::prepare_request`]
+    /// (the payload is a parse of the exact wire bytes). Kept as a trait
+    /// method for snapshot-only consumers; the agent loop calls
+    /// `prepare_request` directly so the same build also feeds the wire.
+    #[allow(dead_code)]
+    fn request_snapshot(
+        &self,
+        messages: &[Message],
+        stream: bool,
+    ) -> Result<(String, serde_json::Value), CallerError> {
+        let prepared = self.prepare_request(messages, stream)?;
+        let value = prepared.snapshot_value()?;
+        Ok((prepared.format, value))
     }
 
     /// Stream a chat response, emitting deltas via the callback.
@@ -480,6 +492,23 @@ pub trait ChatProvider: Send + Sync {
         }
         on_event(StreamEvent::Complete(response.clone()));
         Ok(response)
+    }
+
+    /// Stream a chat response from an already-built request (`stream:
+    /// true` builds only). The agent loop prepares once per turn and
+    /// hands the same [`PreparedRequest`] to every retry attempt, so
+    /// neither the snapshot nor a retry ever rebuilds or re-serializes
+    /// the request. Providers that implement [`ChatProvider::prepare_request`]
+    /// implement this too; the default mirrors `prepare_request`'s
+    /// absence so callers fall back to [`ChatProvider::chat_stream`].
+    async fn chat_stream_prepared(
+        &self,
+        _prepared: &PreparedRequest,
+        _on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<ChatResponse, CallerError> {
+        Err(CallerError::Provider(
+            "provider does not stream prepared requests".to_string(),
+        ))
     }
 }
 
@@ -1227,77 +1256,6 @@ pub mod mock {
 mod tests {
     use super::*;
 
-    /// Drain every currently complete line.
-    fn drain_lines(buf: &mut SseLineBuffer) -> Vec<String> {
-        let mut lines = Vec::new();
-        while let Some(line) = buf.next_line() {
-            lines.push(line);
-        }
-        lines
-    }
-
-    #[test]
-    fn sse_line_buffer_multibyte_split_across_two_chunks() {
-        // "…" is E2 80 A6; split it mid-sequence the way a network chunk
-        // boundary can. The old per-chunk from_utf8_lossy turned each half
-        // into U+FFFD.
-        let payload = "data: a…b\n".as_bytes();
-        let mut buf = SseLineBuffer::new();
-        buf.push_chunk(&payload[..9]); // "data: a" + E2 80 (mid-codepoint)
-        assert_eq!(buf.next_line(), None);
-        buf.push_chunk(&payload[9..]); // A6 + "b\n"
-        assert_eq!(buf.next_line().as_deref(), Some("data: a…b"));
-        assert_eq!(buf.next_line(), None);
-    }
-
-    #[test]
-    fn sse_line_buffer_emoji_split_across_three_chunks() {
-        // "🦀" is F0 9F A6 80 — four bytes, split across three pushes.
-        let payload = "data: 🦀!\n".as_bytes();
-        let mut buf = SseLineBuffer::new();
-        buf.push_chunk(&payload[..7]); // "data: " + F0
-        assert_eq!(buf.next_line(), None);
-        buf.push_chunk(&payload[7..9]); // 9F A6
-        assert_eq!(buf.next_line(), None);
-        buf.push_chunk(&payload[9..]); // 80 "!\n"
-        let line = buf.next_line().unwrap();
-        assert_eq!(line, "data: 🦀!");
-        assert!(!line.contains('\u{FFFD}'));
-    }
-
-    #[test]
-    fn sse_line_buffer_crlf_and_heartbeat_lines() {
-        let mut buf = SseLineBuffer::new();
-        buf.push_chunk(b"data: hi\r\n\r\n\ndata: x\r\r\n");
-        assert_eq!(
-            drain_lines(&mut buf),
-            // Trailing '\r's are stripped (all of them — trim_end_matches
-            // parity), and heartbeat blank lines come through as empty
-            // strings for the callers' existing is_empty() skip.
-            vec!["data: hi", "", "", "data: x"]
-        );
-    }
-
-    #[test]
-    fn sse_line_buffer_split_mid_data_prefix() {
-        let mut buf = SseLineBuffer::new();
-        buf.push_chunk(b"da");
-        assert_eq!(buf.next_line(), None);
-        buf.push_chunk(b"ta: {\"k\":1}\n");
-        assert_eq!(buf.next_line().as_deref(), Some("data: {\"k\":1}"));
-    }
-
-    #[test]
-    fn sse_line_buffer_multiple_lines_one_chunk_and_partial_tail() {
-        let mut buf = SseLineBuffer::new();
-        buf.push_chunk(b"event: delta\ndata: one\ndata: tw");
-        assert_eq!(drain_lines(&mut buf), vec!["event: delta", "data: one"]);
-        // The partial tail stays buffered until its newline arrives.
-        buf.push_chunk(b"o\n");
-        assert_eq!(buf.next_line().as_deref(), Some("data: two"));
-        assert_eq!(buf.next_line(), None);
-    }
-
     #[test]
     fn project_env_keys_whitelists_provider_keys_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -1689,26 +1647,26 @@ mod tests {
     }
 
     // --- Streaming tests ---
+    // (Framing and driver coverage lives in `streaming::tests`; the
+    // SseLineBuffer/parse_sse_line scenarios were ported there when
+    // SseFramer superseded them.)
 
     #[test]
-    fn parse_sse_line_data() {
-        let (kind, content) = parse_sse_line("data: {\"type\":\"ping\"}").unwrap();
-        assert_eq!(kind, "data");
-        assert_eq!(content, "{\"type\":\"ping\"}");
-    }
-
-    #[test]
-    fn parse_sse_line_event() {
-        let (kind, content) = parse_sse_line("event: message_start").unwrap();
-        assert_eq!(kind, "event");
-        assert_eq!(content, "message_start");
-    }
-
-    #[test]
-    fn parse_sse_line_unknown() {
-        assert!(parse_sse_line("id: 123").is_none());
-        assert!(parse_sse_line("").is_none());
-        assert!(parse_sse_line("random text").is_none());
+    fn providers_without_prepare_request_keep_the_legacy_snapshot_error() {
+        // The agent loop's mock/custom-provider fallback (messages dump +
+        // warn) keys on this exact error; request_snapshot derives from
+        // prepare_request, so both surface it unchanged.
+        let mock = mock::MockOrchestrationProvider::new();
+        let err = mock.prepare_request(&[], true).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Provider error: provider does not expose a request payload snapshot"
+        );
+        let err = mock.request_snapshot(&[], true).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Provider error: provider does not expose a request payload snapshot"
+        );
     }
 
     #[test]
