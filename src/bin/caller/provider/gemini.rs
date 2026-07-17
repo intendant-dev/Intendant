@@ -104,11 +104,13 @@ impl GeminiProvider {
     /// POST a generateContent-family request through whichever auth path
     /// this instance carries. Auth never rides an egress request — the
     /// relay attaches `x-goog-api-key` from the vault. Takes the request
-    /// pre-serialized so the body is produced exactly once per call.
+    /// pre-serialized as shared `Bytes` so the body is produced exactly
+    /// once per turn and every attempt (first send and retries) reuses
+    /// the same allocation via a refcount bump.
     pub(crate) async fn post_generate(
         &self,
         url: &str,
-        request_body: &[u8],
+        request_body: &bytes::Bytes,
         streaming: bool,
     ) -> Result<ProviderHttpResponse, CallerError> {
         match &self.auth {
@@ -119,7 +121,7 @@ impl GeminiProvider {
                         .post(url)
                         .header("content-type", "application/json")
                         .header("x-goog-api-key", api_key)
-                        .body(request_body.to_vec());
+                        .body(request_body.clone());
                     if streaming {
                         request.timeout(STREAM_TIMEOUT)
                     } else {
@@ -135,6 +137,8 @@ impl GeminiProvider {
             }
             ProviderAuth::ClientEgress { kind } => {
                 let headers = vec![("content-type".to_string(), "application/json".to_string())];
+                // The relay ships the request as owned frames — one copy
+                // at this boundary, accepted (egress `fetch` takes Vec).
                 crate::credential_egress::fetch(kind, "POST", url, headers, request_body.to_vec())
                     .await
                     .map(ProviderHttpResponse::Egress)
@@ -155,11 +159,16 @@ pub(crate) fn gemini_role(role: &str) -> &str {
 
 #[async_trait]
 impl ChatProvider for GeminiProvider {
-    fn request_snapshot(
+    /// The one request build: contents assembly, systemInstruction, and a
+    /// single serialization straight to shared bytes. The snapshot, the
+    /// first send, and every retry all derive from this build. The
+    /// `stream` flag does not change the body — Gemini selects streaming
+    /// by endpoint (`:streamGenerateContent?alt=sse`), not by a field.
+    fn prepare_request(
         &self,
         messages: &[Message],
         stream: bool,
-    ) -> Result<(String, serde_json::Value), CallerError> {
+    ) -> Result<PreparedRequest, CallerError> {
         let _ = stream;
         let (system_text, mut request_body) = build_gemini_request_parts(messages, self);
 
@@ -169,30 +178,22 @@ impl ChatProvider for GeminiProvider {
             });
         }
 
-        Ok((
-            "gemini.generate-content.request.v1".to_string(),
-            request_body,
+        Ok(PreparedRequest::new(
+            "gemini.generate-content.request.v1",
+            serde_json::to_vec(&request_body).map_err(CallerError::Json)?,
         ))
     }
 
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
-        let (system_text, mut request_body) = build_gemini_request_parts(messages, self);
-
-        if let Some(ref sys) = system_text {
-            request_body["systemInstruction"] = serde_json::json!({
-                "parts": [{"text": sys}]
-            });
-        }
-
         // Note: Gemini API uses implicit context caching. Requests with the same
         // prefix are automatically cached server-side. No explicit API changes needed.
+        let prepared = self.prepare_request(messages, false)?;
         let url = format!(
             "{}/v1beta/models/{}:generateContent",
             self.endpoint, self.model
         );
 
-        let body_bytes = serde_json::to_vec(&request_body).map_err(CallerError::Json)?;
-        let response = self.post_generate(&url, &body_bytes, false).await?;
+        let response = self.post_generate(&url, &prepared.body, false).await?;
 
         if !response.status_success() {
             let status = response.status_line();
@@ -347,22 +348,22 @@ impl ChatProvider for GeminiProvider {
         messages: &[Message],
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ChatResponse, CallerError> {
-        let (system_text, mut request_body) = build_gemini_request_parts(messages, self);
+        let prepared = self.prepare_request(messages, true)?;
+        self.chat_stream_prepared(&prepared, on_event).await
+    }
 
-        if let Some(ref sys) = system_text {
-            request_body["systemInstruction"] = serde_json::json!({
-                "parts": [{"text": sys}]
-            });
-        }
-
+    async fn chat_stream_prepared(
+        &self,
+        prepared: &PreparedRequest,
+        on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<ChatResponse, CallerError> {
         // Use streamGenerateContent endpoint
         let url = format!(
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
             self.endpoint, self.model
         );
 
-        let body_bytes = serde_json::to_vec(&request_body).map_err(CallerError::Json)?;
-        let response = self.post_generate(&url, &body_bytes, true).await?;
+        let response = self.post_generate(&url, &prepared.body, true).await?;
 
         if !response.status_success() {
             let status = response.status_line();
@@ -1048,6 +1049,68 @@ mod tests {
         assert_eq!(out[1], serde_json::json!({"text": "bc"}));
     }
 
+    // --- PreparedRequest: one build feeds wire and snapshot ---
+
+    #[test]
+    fn prepare_request_builds_wire_and_snapshot_once() {
+        // new_plain: deterministic (no env-dependent tool set, no CU).
+        let provider = GeminiProvider::new_plain(
+            "key".to_string(),
+            "gemini-2.5-pro".to_string(),
+            1_048_576,
+            65_536,
+        );
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                ..Default::default()
+            },
+        ];
+        let prepared = provider.prepare_request(&messages, true).unwrap();
+        assert_eq!(prepared.format, "gemini.generate-content.request.v1");
+
+        // Wire pin: the bytes equal a manual build of the exact request
+        // the old snapshot and stream paths each built separately.
+        let (system_text, mut manual) = build_gemini_request_parts(&messages, &provider);
+        manual["systemInstruction"] = serde_json::json!({
+            "parts": [{"text": system_text.unwrap()}]
+        });
+        assert_eq!(
+            prepared.body.as_ref(),
+            serde_json::to_vec(&manual).unwrap().as_slice()
+        );
+
+        // Snapshot parity: parsed from the wire bytes (by construction)
+        // and equal to the legacy request body Value.
+        let snapshot = prepared.snapshot_value().unwrap();
+        assert_eq!(
+            snapshot,
+            serde_json::from_slice::<serde_json::Value>(&prepared.body).unwrap()
+        );
+        assert_eq!(snapshot, manual);
+
+        // The trait snapshot derives from the same build path.
+        let (format, value) = provider.request_snapshot(&messages, true).unwrap();
+        assert_eq!(format, prepared.format);
+        assert_eq!(value, snapshot);
+
+        // Retries reuse the allocation: a Bytes clone shares the pointer
+        // (each HTTP attempt's `.body(bytes.clone())` is a refcount bump).
+        let retry_view = prepared.body.clone();
+        assert_eq!(retry_view.as_ptr(), prepared.body.as_ptr());
+
+        // The stream flag never changes the body: Gemini selects
+        // streaming by endpoint, so both builds serialize identically.
+        let non_stream = provider.prepare_request(&messages, false).unwrap();
+        assert_eq!(non_stream.body, prepared.body);
+    }
+
     // --- Stream fold (the Gemini arm of the shared SSE driver) ---
 
     /// A realistic streamGenerateContent alt=sse transcript: split text
@@ -1076,10 +1139,7 @@ mod tests {
         assert_eq!(response.tool_calls[0].id, "gemini_call_0");
         assert_eq!(response.tool_calls[0].call_id, "gemini_call_0");
         assert_eq!(response.tool_calls[0].name, "exec_command");
-        assert_eq!(
-            response.tool_calls[0].arguments,
-            "{\"command\":\"ls\"}"
-        );
+        assert_eq!(response.tool_calls[0].arguments, "{\"command\":\"ls\"}");
 
         // Raw parts coalesce pure-text runs but keep the signed part and
         // the functionCall verbatim as boundaries.

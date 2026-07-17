@@ -341,6 +341,37 @@ impl ProviderHttpResponse {
     }
 }
 
+/// One provider request, built exactly once per turn: the serialized
+/// wire bytes plus the stable schema label the Context tab keys on. The
+/// same `Bytes` feed every HTTP attempt (first send and retries are
+/// refcount bumps, not copies) and the snapshot view — parsed back from
+/// those bytes by [`PreparedRequest::snapshot_value`], so the Context
+/// tab's "exact request payload" guarantee holds by construction instead
+/// of by parallel rebuild.
+#[derive(Debug, Clone)]
+pub struct PreparedRequest {
+    /// Stable schema label (e.g. `anthropic.messages.request.v1`).
+    pub(crate) format: String,
+    /// The serialized request body — the exact bytes on the wire.
+    pub(crate) body: bytes::Bytes,
+}
+
+impl PreparedRequest {
+    pub(crate) fn new(format: impl Into<String>, body: Vec<u8>) -> Self {
+        Self {
+            format: format.into(),
+            body: body.into(),
+        }
+    }
+
+    /// The snapshot-facing DOM view, parsed from the wire bytes. Costs
+    /// one parse, so only snapshot consumers (the per-turn Context-tab
+    /// event) pay for it — `chat`/`chat_stream` never do.
+    pub(crate) fn snapshot_value(&self) -> Result<serde_json::Value, CallerError> {
+        serde_json::from_slice(&self.body).map_err(CallerError::Json)
+    }
+}
+
 /// Events emitted during streaming responses.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
@@ -415,18 +446,37 @@ pub trait ChatProvider: Send + Sync {
         vec![]
     }
 
-    /// Build the provider-specific request body that will be sent for this
-    /// message slice. Used by the dashboard Context tab to show the exact
-    /// model request payload after provider role conversion, system/developer
-    /// fields, tools, and native computer-use blocks are applied.
-    fn request_snapshot(
+    /// Build the provider-specific request exactly once: role conversion,
+    /// system/developer fields, tools, native computer-use blocks, and
+    /// serialization. The returned [`PreparedRequest`] carries the exact
+    /// wire bytes; [`ChatProvider::request_snapshot`] and
+    /// [`ChatProvider::chat_stream_prepared`] both derive from it, so the
+    /// agent loop's per-turn Context snapshot and the HTTP body are one
+    /// build instead of two.
+    fn prepare_request(
         &self,
         _messages: &[Message],
         _stream: bool,
-    ) -> Result<(String, serde_json::Value), CallerError> {
+    ) -> Result<PreparedRequest, CallerError> {
         Err(CallerError::Provider(
             "provider does not expose a request payload snapshot".to_string(),
         ))
+    }
+
+    /// The provider request as a `(format, payload)` pair for the
+    /// dashboard Context tab — derived from [`ChatProvider::prepare_request`]
+    /// (the payload is a parse of the exact wire bytes). Kept as a trait
+    /// method for snapshot-only consumers; the agent loop calls
+    /// `prepare_request` directly so the same build also feeds the wire.
+    #[allow(dead_code)]
+    fn request_snapshot(
+        &self,
+        messages: &[Message],
+        stream: bool,
+    ) -> Result<(String, serde_json::Value), CallerError> {
+        let prepared = self.prepare_request(messages, stream)?;
+        let value = prepared.snapshot_value()?;
+        Ok((prepared.format, value))
     }
 
     /// Stream a chat response, emitting deltas via the callback.
@@ -442,6 +492,23 @@ pub trait ChatProvider: Send + Sync {
         }
         on_event(StreamEvent::Complete(response.clone()));
         Ok(response)
+    }
+
+    /// Stream a chat response from an already-built request (`stream:
+    /// true` builds only). The agent loop prepares once per turn and
+    /// hands the same [`PreparedRequest`] to every retry attempt, so
+    /// neither the snapshot nor a retry ever rebuilds or re-serializes
+    /// the request. Providers that implement [`ChatProvider::prepare_request`]
+    /// implement this too; the default mirrors `prepare_request`'s
+    /// absence so callers fall back to [`ChatProvider::chat_stream`].
+    async fn chat_stream_prepared(
+        &self,
+        _prepared: &PreparedRequest,
+        _on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<ChatResponse, CallerError> {
+        Err(CallerError::Provider(
+            "provider does not stream prepared requests".to_string(),
+        ))
     }
 }
 
@@ -1583,6 +1650,24 @@ mod tests {
     // (Framing and driver coverage lives in `streaming::tests`; the
     // SseLineBuffer/parse_sse_line scenarios were ported there when
     // SseFramer superseded them.)
+
+    #[test]
+    fn providers_without_prepare_request_keep_the_legacy_snapshot_error() {
+        // The agent loop's mock/custom-provider fallback (messages dump +
+        // warn) keys on this exact error; request_snapshot derives from
+        // prepare_request, so both surface it unchanged.
+        let mock = mock::MockOrchestrationProvider::new();
+        let err = mock.prepare_request(&[], true).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Provider error: provider does not expose a request payload snapshot"
+        );
+        let err = mock.request_snapshot(&[], true).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Provider error: provider does not expose a request payload snapshot"
+        );
+    }
 
     #[test]
     fn stream_event_delta_clone() {

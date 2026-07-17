@@ -498,10 +498,11 @@ mod tests {
     fn chunk_stream(
         chunks: Vec<Result<&'static [u8], &'static str>>,
     ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, String>> + Unpin {
-        futures_util::stream::iter(chunks.into_iter().map(|c| {
-            c.map(bytes::Bytes::from_static)
-                .map_err(|e| e.to_string())
-        }))
+        futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| c.map(bytes::Bytes::from_static).map_err(|e| e.to_string())),
+        )
     }
 
     #[tokio::test]
@@ -588,10 +589,7 @@ mod tests {
     #[test]
     fn event_json_parses_and_logs_drop_once() {
         let mut json = EventJson::new();
-        assert_eq!(
-            json.parse("{\"a\":1}"),
-            Some(serde_json::json!({"a": 1}))
-        );
+        assert_eq!(json.parse("{\"a\":1}"), Some(serde_json::json!({"a": 1})));
         // Unparseable payloads degrade to None (dropped by folds); the
         // once-per-stream log flag flips on the first one.
         assert!(json.parse("not json").is_none());

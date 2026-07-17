@@ -308,11 +308,14 @@ impl OpenAIProvider {
 
 #[async_trait]
 impl ChatProvider for OpenAIProvider {
-    fn request_snapshot(
+    /// The one request build: part assembly and a single serialization
+    /// straight to shared bytes. The snapshot, the first send, and every
+    /// retry all derive from this build.
+    fn prepare_request(
         &self,
         messages: &[Message],
         stream: bool,
-    ) -> Result<(String, serde_json::Value), CallerError> {
+    ) -> Result<PreparedRequest, CallerError> {
         let (instructions, input, text, tools) = build_openai_request_parts(messages, self);
         let request = OpenAIResponsesRequest {
             model: self.model.clone(),
@@ -324,32 +327,17 @@ impl ChatProvider for OpenAIProvider {
             tools,
             stream,
         };
-        Ok((
-            "openai.responses.request.v1".to_string(),
-            serde_json::to_value(&request).map_err(CallerError::Json)?,
+        Ok(PreparedRequest::new(
+            "openai.responses.request.v1",
+            serde_json::to_vec(&request).map_err(CallerError::Json)?,
         ))
     }
 
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
-        let (instructions, input, text, tools) = build_openai_request_parts(messages, self);
-
-        let request = OpenAIResponsesRequest {
-            model: self.model.clone(),
-            input,
-            instructions,
-            max_output_tokens: Some(self.max_output_tokens),
-            reasoning: self.reasoning.clone(),
-            text,
-            tools,
-            stream: false,
-        };
-
         // Note: OpenAI Responses API uses automatic prompt caching for prompts
         // longer than 1024 tokens. No explicit API changes are needed — caching
         // is applied server-side and reported via usage.prompt_tokens_details.
-        // Serialize once, straight to bytes — `to_value` + `.json()` walked
-        // the full request (images included) twice per call.
-        let request_body = serde_json::to_vec(&request).map_err(CallerError::Json)?;
+        let prepared = self.prepare_request(messages, false)?;
         let client = &self.client;
         let api_key = &self.api_key;
         let response = send_with_retry(
@@ -359,7 +347,8 @@ impl ChatProvider for OpenAIProvider {
                     .post("https://api.openai.com/v1/responses")
                     .header("Authorization", format!("Bearer {}", api_key))
                     .header("content-type", "application/json")
-                    .body(request_body.clone())
+                    // Bytes clone: every attempt reuses the one allocation.
+                    .body(prepared.body.clone())
             },
             MAX_RETRIES,
         )
@@ -567,18 +556,15 @@ impl ChatProvider for OpenAIProvider {
         messages: &[Message],
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ChatResponse, CallerError> {
-        let (instructions, input, text, tools) = build_openai_request_parts(messages, self);
-        let request = OpenAIResponsesRequest {
-            model: self.model.clone(),
-            input,
-            instructions,
-            max_output_tokens: Some(self.max_output_tokens),
-            reasoning: self.reasoning.clone(),
-            text,
-            tools,
-            stream: true,
-        };
-        let request_body = serde_json::to_vec(&request).map_err(CallerError::Json)?;
+        let prepared = self.prepare_request(messages, true)?;
+        self.chat_stream_prepared(&prepared, on_event).await
+    }
+
+    async fn chat_stream_prepared(
+        &self,
+        prepared: &PreparedRequest,
+        on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<ChatResponse, CallerError> {
         let client = &self.client;
         let api_key = &self.api_key;
 
@@ -593,7 +579,8 @@ impl ChatProvider for OpenAIProvider {
                     .header("Authorization", format!("Bearer {}", api_key))
                     .header("content-type", "application/json")
                     .timeout(STREAM_TIMEOUT)
-                    .body(request_body.clone())
+                    // Bytes clone: every attempt reuses the one allocation.
+                    .body(prepared.body.clone())
             },
             MAX_RETRIES,
         )
@@ -788,9 +775,7 @@ impl streaming::SseFold for OpenAIStreamFold {
                             let actions = item
                                 .get("actions")
                                 .and_then(|a| a.as_array())
-                                .map(|arr| {
-                                    arr.iter().filter_map(parse_openai_cu_action).collect()
-                                })
+                                .map(|arr| arr.iter().filter_map(parse_openai_cu_action).collect())
                                 .unwrap_or_default();
                             let safety = item
                                 .get("pending_safety_checks")
@@ -822,14 +807,10 @@ impl streaming::SseFold for OpenAIStreamFold {
             "response.completed" => {
                 if let Some(resp) = event.get("response") {
                     if let Some(u) = resp.get("usage") {
-                        self.usage.prompt_tokens = u
-                            .get("input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        self.usage.completion_tokens = u
-                            .get("output_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
+                        self.usage.prompt_tokens =
+                            u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        self.usage.completion_tokens =
+                            u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                         self.usage.total_tokens = u
                             .get("total_tokens")
                             .and_then(|v| v.as_u64())
@@ -1410,6 +1391,75 @@ mod tests {
         assert_eq!(input[0]["type"].as_str(), Some("function_call_output"));
     }
 
+    // --- PreparedRequest: one build feeds wire and snapshot ---
+
+    #[test]
+    fn prepare_request_builds_wire_and_snapshot_once() {
+        // new_plain: deterministic (no structured output, no reasoning,
+        // no env-dependent tool set, no CU).
+        let provider = OpenAIProvider::new_plain(
+            "key".to_string(),
+            "gpt-5.2-codex".to_string(),
+            400_000,
+            16_384,
+        );
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                ..Default::default()
+            },
+        ];
+        let prepared = provider.prepare_request(&messages, true).unwrap();
+        assert_eq!(prepared.format, "openai.responses.request.v1");
+
+        // Wire pin: the bytes equal a manual build of the exact request
+        // the old snapshot and stream paths each built separately.
+        let (instructions, input, text, tools) = build_openai_request_parts(&messages, &provider);
+        let manual = OpenAIResponsesRequest {
+            model: "gpt-5.2-codex".to_string(),
+            input,
+            instructions,
+            max_output_tokens: Some(16_384),
+            reasoning: None,
+            text,
+            tools,
+            stream: true,
+        };
+        assert_eq!(
+            prepared.body.as_ref(),
+            serde_json::to_vec(&manual).unwrap().as_slice()
+        );
+
+        // Snapshot parity: parsed from the wire bytes (by construction)
+        // and equal to the legacy to_value construction.
+        let snapshot = prepared.snapshot_value().unwrap();
+        assert_eq!(
+            snapshot,
+            serde_json::from_slice::<serde_json::Value>(&prepared.body).unwrap()
+        );
+        assert_eq!(snapshot, serde_json::to_value(&manual).unwrap());
+
+        // The trait snapshot derives from the same build path.
+        let (format, value) = provider.request_snapshot(&messages, true).unwrap();
+        assert_eq!(format, prepared.format);
+        assert_eq!(value, snapshot);
+
+        // Retries reuse the allocation: a Bytes clone shares the pointer
+        // (each HTTP attempt's `.body(bytes.clone())` is a refcount bump).
+        let retry_view = prepared.body.clone();
+        assert_eq!(retry_view.as_ptr(), prepared.body.as_ptr());
+
+        // Non-streaming build omits the stream field entirely (serde skip).
+        let non_stream = provider.prepare_request(&messages, false).unwrap();
+        assert!(non_stream.snapshot_value().unwrap().get("stream").is_none());
+    }
+
     // --- Stream fold (the OpenAI arm of the shared SSE driver) ---
 
     /// A realistic Responses-API SSE transcript: a function call assembled
@@ -1463,7 +1513,10 @@ mod tests {
         assert_eq!(raw.len(), 2);
         assert_eq!(raw[0]["status"].as_str(), Some("completed"));
         assert_eq!(raw[1]["type"].as_str(), Some("message"));
-        assert_eq!(response.reasoning_summary.as_deref(), Some("thought about it"));
+        assert_eq!(
+            response.reasoning_summary.as_deref(),
+            Some("thought about it")
+        );
         assert_eq!(response.reasoning_content, None);
 
         assert_eq!(response.usage.prompt_tokens, 100);
@@ -1507,10 +1560,7 @@ mod tests {
             response.cu_calls[0].actions[..],
             [crate::computer_use::CuAction::Click { x: 10, y: 20, .. }]
         ));
-        assert_eq!(
-            response.cu_calls[0].metadata.pending_safety_checks.len(),
-            1
-        );
+        assert_eq!(response.cu_calls[0].metadata.pending_safety_checks.len(), 1);
 
         // CU-disabled: the computer_call is ignored (no CU lane, no tool
         // call), matching the old loop's guard.

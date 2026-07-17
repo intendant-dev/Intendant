@@ -238,11 +238,12 @@ impl AnthropicProvider {
 
     /// Build the messages POST through whichever auth path this instance
     /// carries. `headers` excludes credentials; the relay adds those.
-    /// Takes the request pre-serialized so the body is produced exactly once
-    /// per call (retries memcpy the bytes instead of re-walking the DOM).
+    /// Takes the request pre-serialized as shared `Bytes` so the body is
+    /// produced exactly once per turn and every attempt (first send and
+    /// retries) reuses the same allocation via a refcount bump.
     pub(crate) async fn post_messages(
         &self,
-        request_body: &[u8],
+        request_body: &bytes::Bytes,
         beta_header: &str,
         streaming: bool,
     ) -> Result<ProviderHttpResponse, CallerError> {
@@ -257,7 +258,7 @@ impl AnthropicProvider {
                         .header("anthropic-version", "2023-06-01")
                         .header("anthropic-beta", beta_header)
                         .header("content-type", "application/json")
-                        .body(request_body.to_vec());
+                        .body(request_body.clone());
                     if streaming {
                         request.timeout(STREAM_TIMEOUT)
                     } else {
@@ -277,6 +278,8 @@ impl AnthropicProvider {
                     ("anthropic-beta".to_string(), beta_header.to_string()),
                     ("content-type".to_string(), "application/json".to_string()),
                 ];
+                // The relay ships the request as owned frames — one copy
+                // at this boundary, accepted (egress `fetch` takes Vec).
                 crate::credential_egress::fetch(kind, "POST", &url, headers, request_body.to_vec())
                     .await
                     .map(ProviderHttpResponse::Egress)
@@ -288,11 +291,15 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl ChatProvider for AnthropicProvider {
-    fn request_snapshot(
+    /// The one request build: message conversion, tools, the pre-4.5
+    /// max_tokens clamp, and a single serialization straight to shared
+    /// bytes. The snapshot, the first send, and every retry all derive
+    /// from this build.
+    fn prepare_request(
         &self,
         messages: &[Message],
         stream: bool,
-    ) -> Result<(String, serde_json::Value), CallerError> {
+    ) -> Result<PreparedRequest, CallerError> {
         let (system, api_messages) = build_anthropic_messages(messages);
 
         let mut tools_vec: Vec<serde_json::Value> = Vec::new();
@@ -324,48 +331,14 @@ impl ChatProvider for AnthropicProvider {
             tools,
             stream,
         };
-        Ok((
-            "anthropic.messages.request.v1".to_string(),
-            serde_json::to_value(&request).map_err(CallerError::Json)?,
+        Ok(PreparedRequest::new(
+            "anthropic.messages.request.v1",
+            serde_json::to_vec(&request).map_err(CallerError::Json)?,
         ))
     }
 
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
-        let (system, api_messages) = build_anthropic_messages(messages);
-
-        let mut tools_vec: Vec<serde_json::Value> = Vec::new();
-        if self.use_tools {
-            let defs = self.tools();
-            tools_vec.extend(defs.iter().map(|t| t.to_anthropic()));
-        }
-        if self.cu_enabled {
-            if let Some((w, h)) = self.cu_display {
-                tools_vec.push(serde_json::json!({
-                    "type": "computer_20251124",
-                    "name": "computer",
-                    "display_width_px": w,
-                    "display_height_px": h
-                }));
-            }
-        }
-        let tools = if tools_vec.is_empty() {
-            None
-        } else {
-            Some(tools_vec)
-        };
-
-        let request = AnthropicChatRequest {
-            model: self.model.clone(),
-            system,
-            messages: api_messages,
-            max_tokens: self.effective_max_tokens(messages, tools.as_deref()),
-            tools,
-            stream: false,
-        };
-
-        // Serialize once, straight to bytes — `to_value` + `.json()` walked
-        // the full request (images included) twice per call.
-        let request_body = serde_json::to_vec(&request).map_err(CallerError::Json)?;
+        let prepared = self.prepare_request(messages, false)?;
 
         let beta_header = if self.cu_enabled {
             "prompt-caching-2024-07-31,computer-use-2025-11-24"
@@ -374,7 +347,7 @@ impl ChatProvider for AnthropicProvider {
         };
 
         let response = self
-            .post_messages(&request_body, beta_header, false)
+            .post_messages(&prepared.body, beta_header, false)
             .await?;
 
         if !response.status_success() {
@@ -511,46 +484,24 @@ impl ChatProvider for AnthropicProvider {
         messages: &[Message],
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ChatResponse, CallerError> {
-        let (system, api_messages) = build_anthropic_messages(messages);
+        let prepared = self.prepare_request(messages, true)?;
+        self.chat_stream_prepared(&prepared, on_event).await
+    }
 
-        let mut tools_vec: Vec<serde_json::Value> = Vec::new();
-        if self.use_tools {
-            let defs = self.tools();
-            tools_vec.extend(defs.iter().map(|t| t.to_anthropic()));
-        }
-        if self.cu_enabled {
-            if let Some((w, h)) = self.cu_display {
-                tools_vec.push(serde_json::json!({
-                    "type": "computer_20251124",
-                    "name": "computer",
-                    "display_width_px": w,
-                    "display_height_px": h
-                }));
-            }
-        }
-        let tools = if tools_vec.is_empty() {
-            None
-        } else {
-            Some(tools_vec)
-        };
-
-        let request = AnthropicChatRequest {
-            model: self.model.clone(),
-            system,
-            messages: api_messages,
-            max_tokens: self.effective_max_tokens(messages, tools.as_deref()),
-            tools,
-            stream: true,
-        };
-        let request_body = serde_json::to_vec(&request).map_err(CallerError::Json)?;
-
+    async fn chat_stream_prepared(
+        &self,
+        prepared: &PreparedRequest,
+        on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<ChatResponse, CallerError> {
         let beta_header = if self.cu_enabled {
             "prompt-caching-2024-07-31,computer-use-2025-11-24"
         } else {
             "prompt-caching-2024-07-31"
         };
 
-        let response = self.post_messages(&request_body, beta_header, true).await?;
+        let response = self
+            .post_messages(&prepared.body, beta_header, true)
+            .await?;
 
         if !response.status_success() {
             let status = response.status_line();
@@ -665,8 +616,7 @@ impl streaming::SseFold for AnthropicStreamFold {
                             }
                         }
                         "input_json_delta" => {
-                            if let Some(json) = delta.get("partial_json").and_then(|t| t.as_str())
-                            {
+                            if let Some(json) = delta.get("partial_json").and_then(|t| t.as_str()) {
                                 self.current_tool_json.push_str(json);
                             }
                         }
@@ -1899,6 +1849,69 @@ mod tests {
         assert_eq!(serialized.matches("image elided").count(), 0);
     }
 
+    // --- PreparedRequest: one build feeds wire and snapshot ---
+
+    #[test]
+    fn prepare_request_builds_wire_and_snapshot_once() {
+        // new_plain: deterministic (no env-dependent tool set, no CU).
+        let provider = AnthropicProvider::new_plain(
+            "key".to_string(),
+            "claude-sonnet-4-5-20250929".to_string(),
+            200_000,
+            64_000,
+        );
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            user_text("hello"),
+        ];
+        let prepared = provider.prepare_request(&messages, true).unwrap();
+        assert_eq!(prepared.format, "anthropic.messages.request.v1");
+
+        // Wire pin: the bytes equal a manual build of the exact request
+        // the old snapshot and stream paths each built separately.
+        let (system, api_messages) = build_anthropic_messages(&messages);
+        let manual = AnthropicChatRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            system,
+            messages: api_messages,
+            max_tokens: 64_000,
+            tools: None,
+            stream: true,
+        };
+        assert_eq!(
+            prepared.body.as_ref(),
+            serde_json::to_vec(&manual).unwrap().as_slice()
+        );
+
+        // Snapshot parity: parsed from the wire bytes (by construction)
+        // and equal to the legacy to_value construction.
+        let snapshot = prepared.snapshot_value().unwrap();
+        assert_eq!(
+            snapshot,
+            serde_json::from_slice::<serde_json::Value>(&prepared.body).unwrap()
+        );
+        assert_eq!(snapshot, serde_json::to_value(&manual).unwrap());
+        assert_eq!(snapshot.get("stream"), Some(&serde_json::Value::Bool(true)));
+
+        // The trait snapshot derives from the same build path.
+        let (format, value) = provider.request_snapshot(&messages, true).unwrap();
+        assert_eq!(format, prepared.format);
+        assert_eq!(value, snapshot);
+
+        // Retries reuse the allocation: a Bytes clone shares the pointer
+        // (each HTTP attempt's `.body(bytes.clone())` is a refcount bump).
+        let retry_view = prepared.body.clone();
+        assert_eq!(retry_view.as_ptr(), prepared.body.as_ptr());
+
+        // Non-streaming build omits the stream field entirely (serde skip).
+        let non_stream = provider.prepare_request(&messages, false).unwrap();
+        assert!(non_stream.snapshot_value().unwrap().get("stream").is_none());
+    }
+
     // --- Stream fold (the Anthropic arm of the shared SSE driver) ---
 
     /// A realistic Messages-API SSE transcript: prompt-side usage in
@@ -1935,12 +1948,8 @@ mod tests {
         // mid-sequence — the framer must never manufacture U+FFFD or
         // fragment an event.
         let mut fold = AnthropicStreamFold::new(false, Vec::new());
-        let deltas = streaming::test_support::drive_transcript(
-            &mut fold,
-            ANTHROPIC_SSE_TRANSCRIPT,
-            7,
-        )
-        .await;
+        let deltas =
+            streaming::test_support::drive_transcript(&mut fold, ANTHROPIC_SSE_TRANSCRIPT, 7).await;
         assert_eq!(deltas, vec!["Hel", "lo é🦀"]);
 
         let response = fold.finish();
