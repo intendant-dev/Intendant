@@ -283,6 +283,19 @@ pub(crate) fn peer_identity_allows_ws_control(
     ctrl: &ControlMsg,
     bus: &EventBus,
 ) -> bool {
+    if matches!(ctrl, ControlMsg::HostedCertificateWitness { .. }) {
+        if identity.is_some() {
+            return true;
+        }
+        bus.send(AppEvent::PresenceLog {
+            message:
+                "[ws] denied hosted certificate witness without an authenticated peer identity"
+                    .to_string(),
+            level: Some(LogLevel::Warn),
+            turn: None,
+        });
+        return false;
+    }
     let Some(identity) = identity else {
         return true;
     };
@@ -616,6 +629,35 @@ mod tests {
     fn verify_bearer_token_passes_when_no_token_configured() {
         let header = "GET /api/peers HTTP/1.1\r\nHost: x\r\n\r\n";
         assert!(verify_bearer_token(header, None).is_ok());
+    }
+
+    #[test]
+    fn certificate_witness_control_frame_requires_a_verified_peer_binding() {
+        let report = crate::access::hosted_control::HostedCertificateWitnessReport {
+            protocol: crate::access::hosted_control::CERTIFICATE_WITNESS_PROTOCOL.to_string(),
+            report_id: "report-1".to_string(),
+            observer_kind: crate::access::hosted_control::HostedWitnessKind::Peer,
+            observer_id: "observer-1".to_string(),
+            observer_public_key: "key".to_string(),
+            target_daemon_id: "target".to_string(),
+            fleet_origin: "https://target.example.test".to_string(),
+            ledger_sha256: "digest".to_string(),
+            observed_serial_hex: "abc".to_string(),
+            vantage: crate::access::hosted_control::HostedWitnessVantage::Remote,
+            observed_unix_ms: 1,
+            signature: "signature".to_string(),
+        };
+        let control = ControlMsg::HostedCertificateWitness { report };
+        let bus = EventBus::new();
+        assert!(!peer_identity_allows_ws_control(None, &control, &bus));
+        let peer = PeerConnectionIdentity {
+            fingerprint: "peer-fingerprint".to_string(),
+            label: "observer".to_string(),
+            profile: "observer".to_string(),
+            filesystem: Default::default(),
+            record: None,
+        };
+        assert!(peer_identity_allows_ws_control(Some(&peer), &control, &bus));
     }
 
     #[test]

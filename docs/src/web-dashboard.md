@@ -1640,10 +1640,10 @@ family (sub-routes elided where the family is uniform):
 | `GET/POST /api/settings`, `POST /api/api-keys`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key management |
 | `GET /api/external-agents` | External-agent backend availability (configured command, installed, auth posture, last used) plus passive zero-quota compatibility status (artifact fingerprint, in-band version, manifest digest, finding counts) — drives the fueling nudge and new-session picker |
 | `GET /api/displays`, `POST /api/diagnostics/visual-freshness` | Display inventory; visual-freshness probe marker |
-| `GET /api/hosted-control/bootstrap`, `POST /api/hosted-control/{requests,requests/poll,anchor-decisions}` | Public hosted doorbell: dark when disabled; request creation/poll proves the tab key, while signed-app decisions verify the enrolled anchor |
+| `GET /api/hosted-control/{bootstrap,certificate-ledger}`, `POST /api/hosted-control/{requests,requests/poll,anchor-decisions,witness-reports}` | Public hosted doorbell and signed certificate-observation records: dark when disabled; the ledger is also readable over authenticated direct peer routes, request creation/poll proves the tab key, and signed-app inputs verify the enrolled anchor |
 | `POST /api/hosted-control/ws-ticket` | Mint a seconds-lived one-use WebSocket ticket from a proved active hosted lease |
 | `GET /api/access/{overview,iam/state}`, `GET /api/dashboard/targets` | Trust-architecture snapshots (IAM state, fleet targets) |
-| `GET/POST /api/access/hosted-control[/*]` | Manage-gated hosted policy, pending decisions, active revocation, and session eligibility |
+| `GET/POST /api/access/hosted-control[/*]` | Manage-gated hosted policy, pending decisions, active revocation, session eligibility, certificate confirmation, and exact-evidence override |
 | `POST /api/access/...` | Trust mutations: enrollment decide, IAM grant upsert/update, hosted lease management, org trust/revoke, org-grant issue/renew/revoke-member, issuer init/delegate/install, revocation-list apply |
 | `GET /api/peers[/*]`, `POST /api/peers[/*]`, `DELETE /api/peers` | Peer federation: registry reads (GET), pairing + management/signaling (POST), registry removal (DELETE) |
 | `POST /api/coordinator/route` | Multi-agent coordinator task routing (peer lane) |
@@ -1767,6 +1767,8 @@ response omits the header.
 | POST | `/api/hosted-control/requests` | public | public | bounded | Submit a bounded hosted-control lease request to daemon-local IAM |
 | POST | `/api/hosted-control/requests/poll` | public | public | bounded | Poll one hosted-control request with proof by its browser key |
 | POST | `/api/hosted-control/anchor-decisions` | public | public | bounded | Present a signed application-anchor decision document |
+| GET | `/api/hosted-control/certificate-ledger` | public | public | none | Read the daemon-signed fleet-certificate ledger (no authority) |
+| POST | `/api/hosted-control/witness-reports` | public | public | ≤ 16 KiB | Present a certificate observation signed by an enrolled application witness |
 | POST | `/api/hosted-control/ws-ticket` | PresenceRead | own origin | none | Mint one short-lived, single-use WebSocket ticket from a proved hosted lease |
 | POST | `/api/access/org-grants` | public | public | ≤ 16 KiB | Present a signed org grant document (verified against locally trusted org keys) |
 | GET | `/api/access/orgs/{org_handle}/revocations` | public | public | none | Org revocation list (ORL) for a trusted org |
@@ -1785,8 +1787,8 @@ response omits the header.
 | GET | `/api/access/enrollment-requests` | AccessInspect | fleet allowlist | none | Staged enrollment capability and normally empty queue |
 | GET | `/api/access/iam/state` | AccessInspect | fleet allowlist | none | Local IAM state (roles, grants, bindings) |
 | GET | `/api/access/overview` | AccessInspect | fleet allowlist | none | Access overview for the calling principal |
-| GET | `/api/access/hosted-control` | AccessManage | own origin | none | Hosted-control policy, pending request, active lease, and signed-app anchor state |
-| POST | `/api/access/hosted-control[/…]` | AccessManage | own origin | bounded | Decide requests, revoke leases, change policy, or mark hosted-eligible sessions |
+| GET | `/api/access/hosted-control` | AccessManage | own origin | none | Hosted-control policy, lease, signed-app anchor, and certificate-guard state |
+| POST | `/api/access/hosted-control[/…]` | AccessManage | own origin | bounded | Decide requests, revoke leases, change policy, mark hosted-eligible sessions, or act on certificate evidence |
 | GET | `/api/access/connect/status` | AccessInspect | fleet allowlist | none | Connect rendezvous status (discovery-link state and provenance; no claim code) |
 | GET | `/api/access/connect/claim-code` | AccessManage | fleet allowlist | none | Reveal the current one-time twelve-word claim code (unlinked daemons only) |
 | POST | `/api/access/connect/config` | AccessManage | fleet allowlist | bounded | Enable/disable the Connect client (persists to intendant.toml, applies live) |
