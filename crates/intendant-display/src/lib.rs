@@ -1317,6 +1317,21 @@ const PEER_JOIN_BURST: Duration = Duration::from_millis(1500);
 /// screenshot doesn't hold full-rate capture for long.
 const EXTERNAL_FRAME_DEMAND_WINDOW: Duration = Duration::from_secs(3);
 
+/// Stamp the capture demand probe's burst deadline to
+/// `now + PEER_JOIN_BURST`, expressed as milliseconds since
+/// `session_epoch` (an `Instant` cannot live in an atomic). Shared by
+/// [`DisplaySession::signal_peer_join_burst`] and the tile bridge's
+/// `fallback_to_video` edge so the two burst writers cannot drift.
+fn stamp_capture_burst(burst_until_ms: &AtomicU64, session_epoch: Instant) {
+    let now_ms = Instant::now()
+        .saturating_duration_since(session_epoch)
+        .as_millis() as u64;
+    burst_until_ms.store(
+        now_ms.saturating_add(PEER_JOIN_BURST.as_millis() as u64),
+        Ordering::Relaxed,
+    );
+}
+
 fn tile_delta_min_interval() -> Duration {
     Duration::from_millis(1_000 / TILE_DELTA_TARGET_FPS as u64)
 }
@@ -3005,11 +3020,7 @@ impl DisplaySession {
         // frames need capturing at full rate even before the layer
         // policy's resume lands), and the probe runs on the capture
         // thread where the bridge task's local window is unreachable.
-        self.capture_burst_until_ms.store(
-            self.session_ms_now()
-                .saturating_add(PEER_JOIN_BURST.as_millis() as u64),
-            Ordering::Relaxed,
-        );
+        stamp_capture_burst(&self.capture_burst_until_ms, self.session_epoch);
         if let Some(tx) = self.pool_feed_keyframe_tx.lock().await.as_ref() {
             let _ = tx.send(());
         }
@@ -4645,47 +4656,58 @@ mod tests {
     ) -> (
         Arc<RwLock<HashMap<PeerId, Arc<webrtc::WebRtcPeer>>>>,
         Arc<RwLock<HashSet<PeerId>>>,
+        Arc<AtomicUsize>,
         Arc<DisplayMetricsCounters>,
         Arc<webrtc::WebRtcPeer>,
     ) {
         let peer = Arc::new(webrtc::WebRtcPeer::new_for_test(peer_id, Vec::new()));
         let peers = Arc::new(RwLock::new(HashMap::from([(peer_id, Arc::clone(&peer))])));
         let tile_subscribers = Arc::new(RwLock::new(HashSet::from([peer_id])));
+        let tile_gauge = Arc::new(AtomicUsize::new(1));
         let counters = Arc::new(DisplayMetricsCounters::new());
         counters.peer_count.store(1, Ordering::Relaxed);
-        (peers, tile_subscribers, counters, peer)
+        (peers, tile_subscribers, tile_gauge, counters, peer)
     }
 
     #[tokio::test]
     async fn reap_removes_the_registered_peer_and_decrements_the_gauge() {
-        let (peers, subs, counters, peer) = reaper_fixture(7);
-        assert!(reap_peer_registration(&peers, &subs, &counters, 7, &peer).await);
+        let (peers, subs, tile_gauge, counters, peer) = reaper_fixture(7);
+        assert!(reap_peer_registration(&peers, &subs, &tile_gauge, &counters, 7, &peer).await);
         assert!(peers.read().await.is_empty());
         assert!(subs.read().await.is_empty());
+        assert_eq!(
+            tile_gauge.load(Ordering::Relaxed),
+            0,
+            "reap must keep the tile-subscriber gauge in lockstep with the set"
+        );
         assert_eq!(counters.peer_count.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn reap_leaves_a_replacement_peer_registered_under_the_same_id() {
-        let (peers, subs, counters, old_peer) = reaper_fixture(7);
+        let (peers, subs, tile_gauge, counters, old_peer) = reaper_fixture(7);
         let replacement = Arc::new(webrtc::WebRtcPeer::new_for_test(7, Vec::new()));
         peers.write().await.insert(7, Arc::clone(&replacement));
-        assert!(!reap_peer_registration(&peers, &subs, &counters, 7, &old_peer).await);
+        assert!(
+            !reap_peer_registration(&peers, &subs, &tile_gauge, &counters, 7, &old_peer).await
+        );
         assert!(Arc::ptr_eq(
             peers.read().await.get(&7).expect("replacement stays"),
             &replacement
         ));
         assert!(subs.read().await.contains(&7));
+        assert_eq!(tile_gauge.load(Ordering::Relaxed), 1);
         assert_eq!(counters.peer_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn reap_is_a_no_op_after_remove_peer_already_deregistered() {
-        let (peers, subs, counters, peer) = reaper_fixture(7);
+        let (peers, subs, tile_gauge, counters, peer) = reaper_fixture(7);
         peers.write().await.remove(&7);
         subs.write().await.remove(&7);
+        tile_gauge.store(0, Ordering::Relaxed);
         counters.peer_count.store(0, Ordering::Relaxed);
-        assert!(!reap_peer_registration(&peers, &subs, &counters, 7, &peer).await);
+        assert!(!reap_peer_registration(&peers, &subs, &tile_gauge, &counters, 7, &peer).await);
         assert_eq!(counters.peer_count.load(Ordering::Relaxed), 0);
     }
 
