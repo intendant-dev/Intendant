@@ -1535,13 +1535,31 @@ fn fsync_parent_dir(parent: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Persist the current store synchronously, before the caller's response.
-/// Callers hold the store lock, so the bytes are a consistent snapshot and
+/// Persist the current store, before the caller's response. Callers hold
+/// the store lock, so the serialized bytes are a consistent snapshot and
 /// the write covers anything the debounced flusher had pending — hence the
 /// dirty flag is cleared on success (marks only ever happen under the same
 /// lock, so none can slip between the write and the clear).
-fn persist_locked(state: &AppState, store: &Store) -> ApiResult<()> {
-    save_store(&state.config.data_file, store).map_err(ApiError::internal)?;
+///
+/// The serialize happens under the lock; the blocking file I/O (tempfile
+/// write + fsync + rename + parent-dir fsync) runs on `spawn_blocking` so
+/// it never parks an async worker — with the store lock still HELD across
+/// the await. That lock-across-write is deliberate, not an oversight: as
+/// documented on `store_flush_monitor_with`, the single-writer ordering
+/// that keeps the file from ever regressing to an older snapshot IS the
+/// lock held over the write.
+async fn persist_locked(state: &AppState, store: &Store) -> ApiResult<()> {
+    let bytes = serialize_store(store).map_err(ApiError::internal)?;
+    let path = state.config.data_file.clone();
+    match tokio::task::spawn_blocking(move || write_store_bytes(&path, &bytes)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(ApiError::internal(err)),
+        Err(err) => {
+            return Err(ApiError::internal(format!(
+                "store persist task failed: {err}"
+            )))
+        }
+    }
     state.store_dirty.clear();
     Ok(())
 }
@@ -1695,14 +1713,14 @@ async fn sweep_in_memory_state(state: &AppState) {
 /// next state first, then publish it to the in-memory store. A failed disk
 /// write therefore cannot leave memory ahead of durable state and poison an
 /// otherwise valid retry (notably account/daemon route release).
-fn update_store_transaction<R>(
+async fn update_store_transaction<R>(
     store: &mut Store,
     mutate: impl FnOnce(&mut Store) -> ApiResult<R>,
-    persist: impl FnOnce(&Store) -> ApiResult<()>,
+    persist: impl AsyncFnOnce(&Store) -> ApiResult<()>,
 ) -> ApiResult<R> {
     let mut next = store.clone();
     let result = mutate(&mut next)?;
-    persist(&next)?;
+    persist(&next).await?;
     *store = next;
     Ok(result)
 }
@@ -2081,13 +2099,32 @@ mod tests {
         let state = production_router_test_state(root.path(), store_with_marker());
         let store = state.store.lock().await;
         mark_store_dirty(&state);
-        persist_locked(&state, &store).unwrap();
+        persist_locked(&state, &store).await.unwrap();
         assert!(
             !state.store_dirty.take(),
             "successful sync persist covers pending marks"
         );
         let on_disk = load_store(&state.config.data_file).unwrap();
         assert_eq!(on_disk.users.len(), 1);
+    }
+
+    /// A failed write must NOT clear the debounce mark: the mutations are
+    /// still memory-only, and the mark is what makes the flusher retry.
+    #[tokio::test]
+    async fn persist_failure_keeps_the_dirty_mark() {
+        let root = tempfile::tempdir().unwrap();
+        // A regular file where the state dir should be makes every write
+        // attempt fail without touching anything outside the tempdir.
+        let blocked = root.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let state = production_router_test_state(&blocked, store_with_marker());
+        let store = state.store.lock().await;
+        mark_store_dirty(&state);
+        assert!(persist_locked(&state, &store).await.is_err());
+        assert!(
+            state.store_dirty.take(),
+            "failed persist must keep the dirty mark for the flusher retry"
+        );
     }
 
     #[tokio::test]

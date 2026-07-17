@@ -2341,8 +2341,10 @@ function vaultLeaseExpiryText(lease) {
 /* ── Client egress: relay provider calls through this browser ──
    The zero-lease fueling mode (credential custody, rollout step 5): the
    daemon ships each provider request here auth-less over the verified
-   tunnel; this tab attaches the key from the unlocked vault, performs
-   the fetch against the provider's fixed origin, and streams the body
+   tunnel (windowed against our `egress_request_ack` refills — the
+   `request_credits` capability this page declares at registration);
+   this tab attaches the key from the unlocked vault, performs the
+   fetch against the provider's fixed origin, and streams the body
    back under the daemon's credit window. The credential never leaves
    the browser, and the capability dies the moment this tab detaches.
    Anthropic and Gemini only — OpenAI refuses browser CORS. */
@@ -2409,7 +2411,15 @@ async function vaultEgressEnsure() {
       for (const kind of stale) vaultEgressState.registered.delete(kind);
     }
     if (desired.length) {
-      const result = await vaultLeaseRpc('api_credential_egress_register', { kinds: desired });
+      // `request_credits`: this page acks request chunks as it consumes
+      // them (`egress_request_ack`), letting the daemon window the
+      // request send instead of pushing whole multi-MB bodies at once.
+      // Daemons that predate the capability ignore the field and keep
+      // the push-all behavior this page also still accepts.
+      const result = await vaultLeaseRpc('api_credential_egress_register', {
+        kinds: desired,
+        request_credits: true,
+      });
       vaultEgressState.registered = new Set(result?.registered || desired);
       vaultEgressState.lastError = '';
     }
@@ -2457,6 +2467,10 @@ function vaultEgressHandleFrame(msg) {
       url: String(msg.url || ''),
       headers: Array.isArray(msg.headers) ? msg.headers : [],
       credit: Number(msg.credit) || 1024 * 1024,
+      // Daemon-announced request-side window: the daemon saw this page
+      // declare `request_credits` at registration and will gate its
+      // chunk sends on our acks. Absent (an older daemon) = never ack.
+      requestCredit: Number(msg.request_credit) > 0,
       chunks: [],
       controller: null,
       creditWaiter: null,
@@ -2468,7 +2482,13 @@ function vaultEgressHandleFrame(msg) {
   if (!job) return;
   if (msg.t === 'egress_request_chunk') {
     try {
-      job.chunks.push(vaultEgressB64Decode(msg.data));
+      const chunk = vaultEgressB64Decode(msg.data);
+      job.chunks.push(chunk);
+      // The chunk is consumed the moment it lands here, so ack its raw
+      // bytes and the daemon tops its send window back up.
+      if (job.requestCredit) {
+        vaultEgressSendFrame({ t: 'egress_request_ack', id, bytes: chunk.length });
+      }
     } catch {
       vaultEgressFail(id, 'malformed request chunk');
     }

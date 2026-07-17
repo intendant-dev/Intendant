@@ -306,9 +306,8 @@ pub fn hosted_tunnel_frame_classification(preset: HostedPreset, frame_type: &str
         | "terminal_share" | "display_input" | "upload_start" | "upload_chunk" | "upload_end" => {
             preset == HostedPreset::Operate
         }
-        "presence_frame" | "egress_response" | "egress_chunk" | "egress_end" | "egress_error" => {
-            false
-        }
+        "presence_frame" | "egress_response" | "egress_chunk" | "egress_end" | "egress_error"
+        | "egress_request_ack" => false,
         _ => return None,
     })
 }

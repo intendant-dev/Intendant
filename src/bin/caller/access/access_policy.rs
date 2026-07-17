@@ -866,6 +866,14 @@ pub const FRAME_LANES: &[FrameLaneSpec] = &[
         tunnel: true,
         note: "error terminator — same gate",
     },
+    FrameLaneSpec {
+        frame: "egress_request_ack",
+        op: Some(PeerOperation::CredentialsManage),
+        ws: false,
+        tunnel: true,
+        note: "request-side credit refill from a relay page that declared request_credits — \
+               same gate and same per-request session binding as egress_response",
+    },
     // ---- both lanes: liveness ----
     FrameLaneSpec {
         frame: "ping",
@@ -1589,6 +1597,7 @@ mod tests {
             ("egress_chunk",                   None,                 Some(CredentialsManage)),
             ("egress_end",                     None,                 Some(CredentialsManage)),
             ("egress_error",                   None,                 Some(CredentialsManage)),
+            ("egress_request_ack",             None,                 Some(CredentialsManage)),
             // -- no-authority dispatch machinery + unknown kinds --
             ("ping",                           None,                 None),
             ("hello",                          None,                 None),

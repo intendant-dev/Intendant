@@ -274,7 +274,8 @@ pub(crate) fn control_frame_response(
         "terminal_close" => control_terminal_close_frame(parsed, runtime, terminal_forwarders),
         "terminal_share" => control_terminal_share_frame(parsed, runtime, terminal_events_tx),
         "presence_frame" => control_presence_frame(parsed, runtime.clone()),
-        "egress_response" | "egress_chunk" | "egress_end" | "egress_error" => {
+        "egress_response" | "egress_chunk" | "egress_end" | "egress_error"
+        | "egress_request_ack" => {
             crate::credential_egress::handle_browser_frame(&runtime.session_id, t, &parsed);
             None
         }
@@ -623,6 +624,13 @@ pub(crate) fn control_frame_response(
                                 .collect()
                         })
                         .unwrap_or_default();
+                    // Relay-attach capability: absent (old/cached relay
+                    // pages) keeps the legacy push-all request path.
+                    let request_credits = params
+                        .as_ref()
+                        .and_then(|p| p.get("request_credits"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     Some(match runtime.control_frames_tx.clone() {
                         None => dashboard_control_error_response(
                             id,
@@ -633,6 +641,7 @@ pub(crate) fn control_frame_response(
                             runtime.grant.label(),
                             runtime.grant.custody_origin_class(),
                             &kinds,
+                            request_credits,
                             frames_tx,
                         ) {
                             Ok(registered) => serde_json::json!({
