@@ -634,7 +634,8 @@ pub fn aggregate_state_wanted_upper_layers(
 /// [`crate::DisplaySession::start`] maps each variant to
 /// [`crate::encode::pool::EncoderPool::pause_layer`] /
 /// [`crate::encode::pool::EncoderPool::resume_layer`]
-/// with `CodecKind::Vp8` (the always-on simulcast codec). The
+/// with [`crate::encode::pool::BASELINE_CODEC`] (the always-on bank:
+/// VP8 simulcast on macOS/Linux, single-layer H.264 on Windows). The
 /// per-RID-RR and aggregate-TWCC policies vote for a wanted set;
 /// the coordinator composes via intersection and emits one
 /// `CapacityAction` per layer whose actual pool state diverges
@@ -841,10 +842,11 @@ pub type LayerPauseProbe = Box<dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sy
 /// state via `is_layer_paused`, and emits exactly one set of
 /// pause/resume actions through `on_action`.
 ///
-/// `get_current_rids` returns the pool's current VP8 simulcast
+/// `get_current_rids` returns the pool's current always-on baseline
 /// layer set in spec order (descending bitrate; the last entry is
 /// the floor). Production wiring captures `Arc<EncoderPool>` and
-/// returns `pool.always_on_ids()` filtered to `CodecKind::Vp8`;
+/// returns `pool.always_on_ids()` filtered to
+/// [`crate::encode::pool::BASELINE_CODEC`];
 /// the coordinator derives floor + upper-layers from this list on
 /// every tick, so a `pool.on_resize` that grows or shrinks the
 /// layer set takes effect at most one tick later.
@@ -858,7 +860,8 @@ pub type LayerPauseProbe = Box<dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sy
 /// excludes them.
 ///
 /// `on_action` applies the requested side effect, mapping to
-/// `pool.pause_layer` / `pool.resume_layer` with `CodecKind::Vp8`.
+/// `pool.pause_layer` / `pool.resume_layer` with
+/// [`crate::encode::pool::BASELINE_CODEC`].
 ///
 /// `config` is shared across the aggregate-TWCC and per-RID-RR
 /// policies — both use the same threshold/debounce constants
@@ -2659,6 +2662,131 @@ mod tests {
                 CapacityAction::PauseLayer(SimulcastRid::quarter()),
             ],
             "expected one PauseLayer per current_rid in spec order",
+        );
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    /// **Single-layer baseline (the Windows H.264 bank shape)**: one
+    /// always-on layer, so that layer IS the floor and the congestion
+    /// cascade has no upper layers to act on. The coordinator must
+    /// (a) leave the floor active while a viewer demands it — no
+    /// policy may blank a single-layer stream; (b) pause it (the
+    /// whole bank) once the display sits at zero peers — the idle
+    /// win the `BASELINE_CODEC` wiring exists for; (c) resume it
+    /// when a viewer returns (the pool forces a keyframe on that
+    /// paused→active edge, covered by the pool's own tests).
+    ///
+    /// Codec-agnostic on purpose: the hooks are injected, so this
+    /// drives the exact production coordinator against the
+    /// single-layer layout on every platform without spawning any
+    /// encoder.
+    #[tokio::test]
+    async fn spawn_coordinator_single_layer_floor_survives_viewer_and_pauses_idle() {
+        use std::sync::Mutex as StdMutex;
+
+        let floor = SimulcastRid::full();
+        let peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        peers.write().await.insert(
+            1,
+            Arc::new(WebRtcPeer::new_for_test(1, vec![floor.clone()])),
+        );
+
+        let recorded: Arc<StdMutex<Vec<CapacityAction>>> = Arc::new(StdMutex::new(Vec::new()));
+        // Shared fake pause state: `on_action` applies each action to
+        // it and `is_layer_paused` reads it, so the coordinator's
+        // diff converges after an action instead of re-firing it
+        // every tick — mirroring the real pool's semantics.
+        let paused: Arc<StdMutex<HashSet<SimulcastRid>>> = Arc::new(StdMutex::new(HashSet::new()));
+
+        let recorded_for_closure = Arc::clone(&recorded);
+        let paused_for_action = Arc::clone(&paused);
+        let on_action: Box<dyn Fn(CapacityAction) + Send + Sync> = Box::new(move |a| {
+            match &a {
+                CapacityAction::PauseLayer(rid) => {
+                    paused_for_action.lock().unwrap().insert(rid.clone());
+                }
+                CapacityAction::ResumeLayer(rid) => {
+                    paused_for_action.lock().unwrap().remove(rid);
+                }
+            }
+            recorded_for_closure.lock().unwrap().push(a);
+        });
+        let floor_for_rids = floor.clone();
+        let get_current_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync> =
+            Box::new(move || vec![floor_for_rids.clone()]);
+        let paused_for_probe = Arc::clone(&paused);
+        let is_layer_paused: LayerPauseProbe =
+            Box::new(move |rid| Some(paused_for_probe.lock().unwrap().contains(rid)));
+
+        let shutdown = CancellationToken::new();
+        let handle = spawn_layer_policy_coordinator(
+            Arc::clone(&peers),
+            get_current_rids,
+            is_layer_paused,
+            on_action,
+            CapacityPolicyConfig::default(),
+            shutdown.clone(),
+        );
+
+        // (a) With a live viewer, ticks must pass with no action: the
+        // single layer is the floor (TWCC/RR union it unconditionally)
+        // and the #48 demand bound keeps it wanted.
+        tokio::time::sleep(TICK * 3).await;
+        assert_eq!(
+            recorded.lock().unwrap().clone(),
+            Vec::new(),
+            "no layer action may fire while a viewer demands the floor",
+        );
+
+        // (b) Remove the viewer: the demand collapse (and later the
+        // presence debounce) must pause the whole bank — floor
+        // included. Generous deadline per the sibling smoke test.
+        peers.write().await.clear();
+        let deadline = Instant::now() + PAUSE_DEBOUNCE + Duration::from_secs(5);
+        loop {
+            if !recorded.lock().unwrap().is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                shutdown.cancel();
+                let _ = handle.await;
+                panic!("zero peers must pause the single-layer bank");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            recorded.lock().unwrap().clone(),
+            vec![CapacityAction::PauseLayer(floor.clone())],
+            "the zero-peer pause must take the floor (the whole bank)",
+        );
+
+        // (c) A returning viewer resumes it.
+        peers.write().await.insert(
+            1,
+            Arc::new(WebRtcPeer::new_for_test(1, vec![floor.clone()])),
+        );
+        let deadline = Instant::now() + PAUSE_DEBOUNCE + Duration::from_secs(5);
+        loop {
+            if recorded.lock().unwrap().len() >= 2 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                shutdown.cancel();
+                let _ = handle.await;
+                panic!("a returning viewer must resume the paused floor");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            recorded.lock().unwrap().clone(),
+            vec![
+                CapacityAction::PauseLayer(floor.clone()),
+                CapacityAction::ResumeLayer(floor),
+            ],
+            "exactly one pause and one resume — nothing else may touch the bank",
         );
 
         shutdown.cancel();

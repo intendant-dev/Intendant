@@ -88,20 +88,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-client-protocol-schema"
-version = "0.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3889095d10943a5fc6f803ba839679def450471ddb96de245e700ce82d601da6"
-dependencies = [
- "anyhow",
- "derive_more",
- "schemars",
- "serde",
- "serde_json",
- "strum",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1162,15 +1148,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "convert_case"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
-dependencies = [
- "unicode-segmentation",
-]
-
-[[package]]
 name = "cookie-factory"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1517,29 +1494,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "derive_more"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d751e9e49156b02b44f9c1815bcb94b984cdcc4396ecc32521c739452808b134"
-dependencies = [
- "derive_more-impl",
-]
-
-[[package]]
-name = "derive_more-impl"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
-dependencies = [
- "convert_case 0.10.0",
- "proc-macro2",
- "quote",
- "rustc_version",
- "syn",
- "unicode-xid",
 ]
 
 [[package]]
@@ -2942,9 +2896,7 @@ name = "intendant"
 version = "0.1.0"
 dependencies = [
  "accessibility-sys",
- "agent-client-protocol-schema",
  "app-html-assembler",
- "arboard",
  "ashpd",
  "async-trait",
  "atspi",
@@ -2957,7 +2909,6 @@ dependencies = [
  "core-graphics",
  "dirs",
  "dotenvy",
- "env-libvpx-sys",
  "env_logger",
  "flate2",
  "futures-util",
@@ -2976,7 +2927,6 @@ dependencies = [
  "p12-keystore",
  "passkey-auth",
  "pem",
- "pipewire",
  "portable-pty",
  "presence-core",
  "presence-web",
@@ -2996,7 +2946,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "shiguredo_video_toolbox",
  "similar",
  "socket2 0.6.2",
  "tempfile",
@@ -3004,7 +2953,6 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
- "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
  "toml",
@@ -3014,7 +2962,6 @@ dependencies = [
  "uuid",
  "which 8.0.2",
  "windows 0.59.0",
- "x11rb",
  "x509-parser 0.18.1",
  "zip",
 ]
@@ -3071,7 +3018,6 @@ dependencies = [
 name = "intendant-platform"
 version = "0.1.0"
 dependencies = [
- "dirs",
  "intendant-core",
  "libc",
  "serde",
@@ -3371,7 +3317,7 @@ checksum = "65f3a4b81b2a2d8c7f300643676202debd1b7c929dbf5c9bb89402ea11d19810"
 dependencies = [
  "bitflags 2.11.0",
  "cc",
- "convert_case 0.6.0",
+ "convert_case",
  "cookie-factory",
  "libc",
  "libspa-sys",
@@ -6001,27 +5947,6 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
-
-[[package]]
-name = "strum"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
-dependencies = [
- "strum_macros",
-]
-
-[[package]]
-name = "strum_macros"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn",
-]
 
 [[package]]
 name = "substring"

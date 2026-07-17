@@ -319,6 +319,11 @@ pub(crate) async fn control_request_frame(
             api_claude_auth_code_response(id, params.as_ref(), &runtime).await
         }
         "api_claude_auth_cancel" => api_claude_auth_cancel_response(id, &runtime).await,
+        "api_codex_auth_start" => {
+            api_codex_auth_start_response(id, params.as_ref(), &runtime).await
+        }
+        "api_codex_auth_status" => api_codex_auth_status_response(id, &runtime).await,
+        "api_codex_auth_cancel" => api_codex_auth_cancel_response(id, &runtime).await,
         "api_external_agents" => frame_api_json_body_response(
             id,
             crate::web_gateway::external_agents_api_response(
@@ -3020,6 +3025,7 @@ mod tests {
                             &hydrate_home,
                             requested_limit,
                         )
+                        .into()
                     },
                     tx,
                 );

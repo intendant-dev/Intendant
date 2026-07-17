@@ -823,13 +823,31 @@ impl AppEventUpcaster {
                             ActivityId(format!("agent-orphan-{seq}"))
                         }
                     };
+                    // Peer wire edge: bound each stream like the local
+                    // outbound edge does — the bus event carries the full
+                    // payload, and observers fetch full output through
+                    // their own session lanes.
                     out.push(PeerEvent::ActivityProgress {
                         id,
-                        text: Some(stdout.clone()),
+                        text: Some(
+                            crate::types::truncate_str(
+                                stdout,
+                                crate::types::AGENT_OUTPUT_WIRE_PREVIEW_BYTES,
+                            )
+                            .to_string(),
+                        ),
                     });
                 }
                 if !stderr.is_empty() {
-                    out.push(log_event(LogLevel::Warn, "agent", stderr.clone()));
+                    out.push(log_event(
+                        LogLevel::Warn,
+                        "agent",
+                        crate::types::truncate_str(
+                            stderr,
+                            crate::types::AGENT_OUTPUT_WIRE_PREVIEW_BYTES,
+                        )
+                        .to_string(),
+                    ));
                 }
                 out
             }
@@ -2267,13 +2285,30 @@ impl WireEventUpcaster {
                             ActivityId(format!("agent-orphan-{seq}"))
                         }
                     };
+                    // A well-behaved peer already bounded these streams at
+                    // its own outbound edge; clip again anyway so an older
+                    // or foreign peer can't relay an unbounded payload.
                     out.push(PeerEvent::ActivityProgress {
                         id,
-                        text: Some(stdout.clone()),
+                        text: Some(
+                            crate::types::truncate_str(
+                                stdout,
+                                crate::types::AGENT_OUTPUT_WIRE_PREVIEW_BYTES,
+                            )
+                            .to_string(),
+                        ),
                     });
                 }
                 if !stderr.is_empty() {
-                    out.push(log_event(LogLevel::Warn, "agent", stderr.clone()));
+                    out.push(log_event(
+                        LogLevel::Warn,
+                        "agent",
+                        crate::types::truncate_str(
+                            stderr,
+                            crate::types::AGENT_OUTPUT_WIRE_PREVIEW_BYTES,
+                        )
+                        .to_string(),
+                    ));
                 }
                 out
             }
@@ -3553,7 +3588,7 @@ mod tests {
         let output = u.upcast(&AppEvent::AgentOutput {
             session_id: None,
             stdout: "file1\nfile2".into(),
-            stderr: String::new(),
+            stderr: "".into(),
             source: None,
             output_id: None,
             item_id: None,
@@ -3586,6 +3621,42 @@ mod tests {
             "DoneSignal must close the agent with its started id. \
              Got: {completed_ids:?}"
         );
+    }
+
+    /// The peer lane is a wire edge: an over-cap stream from the local bus
+    /// is clipped to the shared wire preview bound before it becomes an
+    /// ActivityProgress (observers fetch full output via their own lanes).
+    #[test]
+    fn agent_output_progress_is_bounded_for_peers() {
+        let cap = crate::types::AGENT_OUTPUT_WIRE_PREVIEW_BYTES;
+        let mut u = AppEventUpcaster::new();
+        let big: String = "x".repeat(cap + 4096);
+        let big_err: String = "e".repeat(cap + 4096);
+        let output = u.upcast(&AppEvent::AgentOutput {
+            session_id: None,
+            stdout: big.as_str().into(),
+            stderr: big_err.as_str().into(),
+            source: None,
+            output_id: None,
+            item_id: None,
+        });
+        let progress_text = output
+            .iter()
+            .find_map(|e| match e {
+                PeerEvent::ActivityProgress { text, .. } => text.clone(),
+                _ => None,
+            })
+            .expect("AgentOutput with stdout must emit an ActivityProgress");
+        assert_eq!(progress_text.len(), cap);
+        assert!(big.starts_with(&progress_text));
+        let log_text = output
+            .iter()
+            .find_map(|e| match e {
+                PeerEvent::Log { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("AgentOutput with stderr must emit a Log");
+        assert_eq!(log_text.len(), cap);
     }
 
     /// Same lifecycle guarantee on the wire upcaster. Parity with
@@ -3649,7 +3720,9 @@ mod tests {
         let output = u.upcast(&OutboundEvent::AgentOutput {
             session_id: None,
             stdout: "file1".into(),
-            stderr: String::new(),
+            stderr: "".into(),
+            stdout_truncated: false,
+            stderr_truncated: false,
             source: None,
             output_id: None,
             item_id: None,

@@ -2071,8 +2071,41 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // bootstrap sequence. Fired after the last bootstrap
                     // enqueue; `ws_outbound_task`'s biased select drains
                     // direct frames first, then opens the broadcast lane.
+                    // Dropping the sender without firing (a bootstrap stage
+                    // died mid-generation) closes the connection instead —
+                    // never a partial bootstrap followed by live events.
                     let (bootstrap_flushed_tx, bootstrap_flushed_rx) =
                         tokio::sync::oneshot::channel::<()>();
+
+                    let ws_session_cancel = tokio_util::sync::CancellationToken::new();
+
+                    // Outbound: broadcast + direct responses → WebSocket.
+                    // Spawned BEFORE bootstrap generation so the frames
+                    // queued below stream to the socket as they are
+                    // produced instead of accumulating on the unbounded
+                    // direct lane until generation finishes — the client's
+                    // first byte no longer waits for the whole bootstrap,
+                    // per-connection bootstrap memory is bounded by socket
+                    // drain, and a client that disconnects mid-generation
+                    // is noticed by the writer immediately. The ordering
+                    // barrier above still holds: the task's biased select
+                    // serves the direct lane ahead of the flush arm, so
+                    // the broadcast + authority lanes stay shut until
+                    // every bootstrap frame is on the wire.
+                    let outbound = tokio::spawn(ws_outbound_task(
+                        outbound_rx,
+                        direct_rx,
+                        terminal_forward_rx,
+                        ws_tx,
+                        authority_change_rx,
+                        connection_id.clone(),
+                        display_input_authority.clone(),
+                        session_registry.clone(),
+                        bootstrap_caches.clone(),
+                        bootstrap_flushed_rx,
+                        dashboard_control_grant_for_ws.clone(),
+                        ws_session_cancel.clone(),
+                    ));
 
                     // Send bootstrap state snapshot on connect (with connection_id).
                     // Include config (provider/model) since AgentStateSnapshot
@@ -2345,15 +2378,25 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         // Cache-fast after the first connect, but still file IO on a
                         // miss — keep it off the reactor (single-flight in the cache
                         // coalesces concurrent connects).
-                        let replay_result = tokio::task::spawn_blocking(move || {
-                            session_log_replay_payload_from_dir_with_limit(
-                                &log_dir,
-                                Some(WEBSOCKET_BOOTSTRAP_REPLAY_ENTRY_LIMIT),
-                            )
-                        })
-                        .await
-                        .ok()
-                        .flatten();
+                        //
+                        // The writer is already streaming; once it has exited
+                        // (socket closed, grant revoked) nothing queued here
+                        // can reach the client, so skip the replay read for a
+                        // connection that is already gone. Teardown still runs
+                        // through the normal inbound-spawn + join path below.
+                        let replay_result = if direct_tx.is_closed() {
+                            None
+                        } else {
+                            tokio::task::spawn_blocking(move || {
+                                session_log_replay_payload_from_dir_with_limit(
+                                    &log_dir,
+                                    Some(WEBSOCKET_BOOTSTRAP_REPLAY_ENTRY_LIMIT),
+                                )
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        };
                         if let Some((replay, external_session_id)) = replay_result {
                             if let Some(external_session_id) = external_session_id {
                                 replayed_external_session_ids.insert(external_session_id);
@@ -2389,6 +2432,12 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                             .unwrap_or_default();
                     active_external_sessions.sort_by(|a, b| a.0.cmp(&b.0));
                     for (session_id, source) in active_external_sessions {
+                        // Same early-out as the replay read above: the
+                        // per-session external replay is file IO nobody can
+                        // receive once the writer has exited.
+                        if direct_tx.is_closed() {
+                            break;
+                        }
                         // Wrapper-covered sessions replay from the wrapper
                         // log ONLY. The old mtime tiebreak re-sent the whole
                         // external transcript whenever the backend's file
@@ -2449,8 +2498,6 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     //   {"t":"voice_diagnostic",...}      → AppEvent::VoiceDiagnostic
                     //   {"t":"tool_request", "id":"...", "tool":"...", "args":{}} → tool_response
                     //   {"action":"status", ...}         → AppEvent::ControlCommand
-                    let ws_session_cancel = tokio_util::sync::CancellationToken::new();
-
                     let inbound_ctx = WsInboundCtx {
                         bus: bus.clone(),
                         query_ctx: query_ctx.clone(),
@@ -2488,22 +2535,6 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // Attention-nudge presence: a live `/ws` client is the
                     // "somebody is watching" signal that suppresses pushes.
                     crate::attention_nudge::dashboard_connected();
-
-                    // Outbound: broadcast + direct responses → WebSocket
-                    let outbound = tokio::spawn(ws_outbound_task(
-                        outbound_rx,
-                        direct_rx,
-                        terminal_forward_rx,
-                        ws_tx,
-                        authority_change_rx,
-                        connection_id.clone(),
-                        display_input_authority.clone(),
-                        session_registry.clone(),
-                        bootstrap_caches.clone(),
-                        bootstrap_flushed_rx,
-                        dashboard_control_grant_for_ws.clone(),
-                        ws_session_cancel,
-                    ));
 
                     let _ = tokio::join!(inbound, outbound);
                     crate::attention_nudge::dashboard_disconnected();

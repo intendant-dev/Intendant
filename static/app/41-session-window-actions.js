@@ -1838,6 +1838,11 @@ function commandOutputSummaryHtml(group) {
   else if (group.chunks > 0) parts.push(group.chunks + ' chunk' + (group.chunks === 1 ? '' : 's'));
   if (group.bytes > 0) parts.push(formatCompactBytes(group.bytes));
   if (group.warns > 0) parts.push(`<span class="output-warn">${group.warns} warning${group.warns === 1 ? '' : 's'}</span>`);
+  if (group.truncated) {
+    // The wire carried a clipped preview — expanding fetches the full
+    // persisted output through the agent-output lane.
+    parts.push(`<span class="output-truncated-note">load full output (${formatCompactBytes(group.bytes)} shown)</span>`);
+  }
   const detail = parts.length ? parts.join(' · ') : 'ready';
   // Name the group by the command that produced it (the agent_started
   // preview for the same tool call) — "output · 6 chunks" said nothing
@@ -2027,6 +2032,17 @@ function appendCommandOutputChunk(group, c) {
     group.outputIdSet.add(c.output_id);
     group.outputIds.push(c.output_id);
   }
+  if (c.output_id && truncatedAgentOutputIds.delete(c.output_id)) {
+    // This chunk is a clipped wire preview: the summary advertises the
+    // lazy full-output fetch, and the copy button re-fetches the
+    // persisted text (same mechanism as the >2 MiB stream cap below)
+    // instead of copying the clipped prefix.
+    group.truncated = true;
+    if (group.copyRef && !group.copyRefCapped) {
+      group.copyRefCapped = true;
+      group.copyRef.fetchText = () => fetchCommandOutputGroupText(group);
+    }
+  }
   const stats = commandOutputStats(text);
   group.lines += stats.lines;
   group.bytes += stats.bytes;
@@ -2148,6 +2164,23 @@ function scheduleCommandOutputBatchFinalize(group) {
   });
 }
 
+// A finalized view kept open with its streamed body is normally blessed
+// as loaded; a TRUNCATED group's streamed body is a clipped wire preview,
+// so swap in the full persisted text through the same lane the expand
+// toggle uses. On fetch failure the preview stays and the toggle retries.
+function blessKeptOpenCommandOutputView(group, view) {
+  if (group.truncated && group.outputIds.length && !view.loading) {
+    view.loading = true;
+    loadCommandOutputIntoBody(group, view.body)
+      .then(() => { view.loaded = true; })
+      .catch(() => { view.loaded = false; })
+      .finally(() => { view.loading = false; });
+    return;
+  }
+  view.loaded = true;
+  view.loading = false;
+}
+
 function finalizeCommandOutputGroup(group) {
   if (!group || group.finalized) return;
   group.finalized = true;
@@ -2170,8 +2203,7 @@ function finalizeCommandOutputGroup(group) {
     && (group.userExpanded || defaultExpanded)
     && group.body.childElementCount > 0;
   if (keepOpen) {
-    group.loaded = true;
-    group.loading = false;
+    blessKeptOpenCommandOutputView(group, group);
   } else {
     group.entry.classList.remove('expanded');
     if (!preserveBody) group.body.innerHTML = '';
@@ -2183,8 +2215,7 @@ function finalizeCommandOutputGroup(group) {
     if (view.entry.classList.contains('expanded')
         && (group.userExpanded || defaultExpanded)
         && view.body.childElementCount > 0) {
-      view.loaded = true;
-      view.loading = false;
+      blessKeptOpenCommandOutputView(group, view);
       continue;
     }
     view.entry.classList.remove('expanded');
@@ -2220,6 +2251,43 @@ function finalizeSessionCommandOutputGroups(c) {
   const scope = commandOutputSessionScope(c);
   for (const group of Array.from(activeCommandOutputGroups.values())) {
     if (group.sessionScope === scope) finalizeCommandOutputGroup(group);
+  }
+}
+
+// ── Truncated wire previews ──
+// The daemon bounds each agent_output stream on the wire (64 KiB per
+// stream) and marks the clip with stdout_truncated / stderr_truncated;
+// the full text stays persisted under the event's output_id. The raw
+// server-message dispatcher (36-voice-wasm-init.js) records flagged ids
+// here — live events and bootstrap log_replay entries alike — BEFORE the
+// WASM pipeline emits the add_log_entry commands that render them, and
+// appendCommandOutputChunk consumes an id when its chunk reaches a group:
+// the group advertises the lazy full-output fetch in its summary and the
+// copy button re-fetches instead of copying the clipped prefix.
+const truncatedAgentOutputIds = new Set();
+const TRUNCATED_AGENT_OUTPUT_IDS_CAP = 1024;
+
+function noteTruncatedAgentOutputEvent(entry) {
+  if (!entry || !(entry.stdout_truncated || entry.stderr_truncated)) return;
+  const outputId = String(entry.output_id || entry.outputId || '').trim();
+  if (!outputId) return;
+  if (truncatedAgentOutputIds.size >= TRUNCATED_AGENT_OUTPUT_IDS_CAP) {
+    const oldest = truncatedAgentOutputIds.values().next().value;
+    truncatedAgentOutputIds.delete(oldest);
+  }
+  truncatedAgentOutputIds.add(outputId);
+}
+
+function noteAgentOutputTruncation(d) {
+  if (!d) return;
+  if (d.event === 'agent_output') {
+    noteTruncatedAgentOutputEvent(d);
+    return;
+  }
+  if (d.t === 'log_replay' && Array.isArray(d.entries)) {
+    for (const entry of d.entries) {
+      if (entry && entry.event === 'agent_output') noteTruncatedAgentOutputEvent(entry);
+    }
   }
 }
 

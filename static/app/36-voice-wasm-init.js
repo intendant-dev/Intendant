@@ -590,6 +590,12 @@ async function main() {
         serverMsgStep(d, 'browser_workspace', () => handleBrowserWorkspaceMessage(d));
         return;
       }
+      if (d.event === 'agent_output' || d.t === 'log_replay') {
+        // Clipped-preview bookkeeping for command-output groups: record
+        // stdout_truncated/stderr_truncated ids BEFORE the WASM pipeline
+        // renders these entries (consumed in 41-session-window-actions.js).
+        serverMsgStep(d, 'agent_output_truncation', () => noteAgentOutputTruncation(d));
+      }
       if (d.t === 'log_replay' && Array.isArray(d.entries)) {
         serverMsgStep(d, 'log_replay', () => {
           resetChangesPane();

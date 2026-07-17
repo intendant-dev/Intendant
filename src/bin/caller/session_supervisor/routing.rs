@@ -708,6 +708,24 @@ impl SessionSupervisor {
         });
     }
 
+    /// Session-scoped, user-visible ack for a targeted action that had
+    /// nothing to act on. The supervisor's unscoped warns (`session_id:
+    /// None`) land in the daemon lane only — invisible next to the window
+    /// the user clicked (observed live 2026-07-17: repeated Stop clicks on
+    /// an ended session were dropped with zero feedback). Scoped rows
+    /// render in that session's window through the ordinary log lane, so a
+    /// targeted user action never evaporates silently (`route_interrupt`'s
+    /// `Interrupted` ack is the twin of this pattern).
+    fn ack_targeted_action_noop(&self, session_id: &str, content: &str) {
+        self.config.bus.send(AppEvent::LogEntry {
+            session_id: Some(session_id.to_string()),
+            level: "warn".to_string(),
+            source: "Intendant".to_string(),
+            content: content.to_string(),
+            turn: None,
+        });
+    }
+
     /// Ask a supervised EXTERNAL session's loop to respawn its backend in
     /// place (resume-attach on the same backend id) so the new process
     /// reads the fresh credential store. The loop owns the mechanics:
@@ -734,6 +752,10 @@ impl SessionSupervisor {
                 );
                 eprintln!("[supervisor] {}", message);
                 self.warn(&message);
+                self.ack_targeted_action_noop(
+                    &requested_id,
+                    "Nothing to reload — this session is not attached to a live backend on this daemon.",
+                );
                 return;
             }
             Some("intendant") | Some("") => {
@@ -741,6 +763,10 @@ impl SessionSupervisor {
                     "Reload-credentials dropped: session {} is a native session (nothing to respawn; native provider credentials reload per request)",
                     short_session(&target_id)
                 ));
+                self.ack_targeted_action_noop(
+                    &requested_id,
+                    "Nothing to reload — native sessions pick up fresh credentials on their next request.",
+                );
                 return;
             }
             Some(_) => {}
@@ -761,7 +787,7 @@ impl SessionSupervisor {
         } else {
             reason
         };
-        let removed = {
+        let (removed, target_id) = {
             let mut state = self.state.lock().await;
             let requested_id = session_id
                 .as_deref()
@@ -786,14 +812,20 @@ impl SessionSupervisor {
                     "Stop session dropped: {} is a related Codex thread; stop the parent session instead",
                     short_session(&requested_id)
                 ));
+                self.ack_targeted_action_noop(
+                    &requested_id,
+                    "Nothing to stop here — this is a Codex thread inside its parent session; stop the parent session instead.",
+                );
                 return None;
             }
             let Some(target_id) = state.resolve_session_id(&requested_id) else {
                 // Mirror the interrupt treatment: the halt mark cancels a
                 // pending frontend auto-attach escalation for this session
                 // (see `resume_session`) instead of letting it relaunch
-                // stopped work, and the eprintln puts the drop in the
-                // daemon log (bus warns are dashboard-only).
+                // stopped work, the eprintln puts the drop in the daemon
+                // log (bus warns are dashboard-only), and the scoped ack
+                // tells the clicking user the truth (a repeated Stop on an
+                // ended session was a silent no-op before, 2026-07-17).
                 state.mark_unmanaged_user_halts([requested_id.as_str()]);
                 drop(state);
                 let message = format!(
@@ -802,13 +834,18 @@ impl SessionSupervisor {
                 );
                 eprintln!("[supervisor] {}", message);
                 self.warn(&message);
+                self.ack_targeted_action_noop(
+                    &requested_id,
+                    "Session already ended — nothing to stop.",
+                );
                 return None;
             };
-            state.remove_session(&target_id)
+            (state.remove_session(&target_id), target_id)
         };
 
         let Some((canonical, session)) = removed else {
             self.warn("Stop session dropped: no matching managed session");
+            self.ack_targeted_action_noop(&target_id, "Session already ended — nothing to stop.");
             return None;
         };
         self.config.bus.send(AppEvent::SessionStopRequested {
@@ -1667,6 +1704,42 @@ mod tests {
         );
         let state = supervisor.state.lock().await;
         assert!(state.sessions.contains_key("parent"));
+    }
+
+    /// The 2026-07-17 incident class: a Stop aimed at a session this daemon
+    /// no longer manages (already ended) must answer the clicking user with
+    /// a session-scoped log row — the unscoped supervisor warn lands in the
+    /// daemon lane only, which read as "can't stop this session / no-op".
+    #[tokio::test]
+    async fn stop_for_unmanaged_session_emits_scoped_ack() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+
+        let stopped = supervisor
+            .stop_managed_session(Some("65d2bd17-ghost".to_string()), "stopped by user")
+            .await;
+        assert!(stopped.is_none(), "nothing was managed to stop");
+
+        let mut scoped_ack = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::LogEntry {
+                session_id,
+                content,
+                ..
+            } = event
+            {
+                if session_id.as_deref() == Some("65d2bd17-ghost")
+                    && content == "Session already ended — nothing to stop."
+                {
+                    scoped_ack = true;
+                }
+            }
+        }
+        assert!(
+            scoped_ack,
+            "expected the session-scoped already-ended ack row"
+        );
     }
 
     /// The 2026-07-15 incident class: a stop/interrupt aimed at a session
