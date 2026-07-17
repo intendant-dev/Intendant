@@ -784,8 +784,8 @@ const CAPTURE_FRAME_MAX_F32: usize = CAPTURE_FRAME_MAX_MS * VORTEX_RING_F32_PER_
 
 // Frame cuts must land on decimation-group boundaries.
 const _: () = assert!(
-    CAPTURE_FRAME_MIN_F32 % CAPTURE_DECIMATION_GROUP_F32 == 0
-        && CAPTURE_FRAME_MAX_F32 % CAPTURE_DECIMATION_GROUP_F32 == 0
+    CAPTURE_FRAME_MIN_F32.is_multiple_of(CAPTURE_DECIMATION_GROUP_F32)
+        && CAPTURE_FRAME_MAX_F32.is_multiple_of(CAPTURE_DECIMATION_GROUP_F32)
         && CAPTURE_FRAME_MIN_F32 <= CAPTURE_FRAME_MAX_F32
 );
 
@@ -834,7 +834,7 @@ impl CaptureFrameAggregator {
             return None;
         }
         self.frame.clear();
-        self.frame.extend(self.pending.drain(..));
+        self.frame.append(&mut self.pending);
         Some(&self.frame)
     }
 }
@@ -1943,6 +1943,10 @@ async fn whisper_inbound_loop<T>(
                 let mut line = serde_json::to_string(&entry).unwrap_or_default();
                 line.push('\n');
                 let _ = transcript_file.write_all(line.as_bytes()).await;
+                // tokio's File hands writes to the blocking pool and returns
+                // before they land; flush per entry so the transcript is
+                // durable even if the session aborts this task right after.
+                let _ = transcript_file.flush().await;
             }
         }
     }
@@ -2827,12 +2831,14 @@ mod tests {
     fn direct_capture_convert_matches_two_step_reference() {
         let mut cases: Vec<Vec<f32>> = vec![
             vec![],
-            vec![0.5, -0.5],                    // one stereo frame
-            vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], // odd frame count
+            vec![0.5, -0.5],                                 // one stereo frame
+            vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],              // odd frame count
             vec![2.0, 2.0, -3.0, 1.0, 1.0, 1.0, -1.0, -1.0], // clamping
         ];
         // Deterministic sweep across the clamped range, unaligned length.
-        let sweep: Vec<f32> = (0..1001).map(|i| ((i as f32 * 0.7311) % 3.0) - 1.5).collect();
+        let sweep: Vec<f32> = (0..1001)
+            .map(|i| ((i as f32 * 0.7311) % 3.0) - 1.5)
+            .collect();
         cases.push(sweep);
 
         for samples in &cases {
@@ -2884,7 +2890,7 @@ mod tests {
     fn capture_aggregator_aggregates_5ms_ticks_into_min_frames() {
         let mut agg = CaptureFrameAggregator::new();
         let tick = 5 * VORTEX_RING_F32_PER_MS; // one 5ms poll's worth
-        // Below the 20ms floor nothing is emitted...
+                                               // Below the 20ms floor nothing is emitted...
         for _ in 0..3 {
             for _ in 0..tick {
                 agg.push_sample(0.25);
@@ -2929,7 +2935,10 @@ mod tests {
         for (i, s) in samples.iter().enumerate() {
             assert_eq!(*s, i as f32);
         }
-        assert!(agg.flush().is_none(), "burst divided evenly, nothing pending");
+        assert!(
+            agg.flush().is_none(),
+            "burst divided evenly, nothing pending"
+        );
     }
 
     #[test]
@@ -3043,8 +3052,7 @@ mod tests {
             &self,
             audio_wav: &[u8],
         ) -> Result<crate::transcription::TranscriptSegment, CallerError> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut release = self.release.clone();
             release
                 .wait_for(|open| *open)
