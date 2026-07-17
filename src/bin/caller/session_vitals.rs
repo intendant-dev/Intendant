@@ -408,17 +408,7 @@ impl GitVitalsProber {
 
     async fn probe_checkout(&mut self, toplevel: &Path) -> Option<SessionGitVitals> {
         self.checkout_probes += 1;
-        let status = self
-            .git(
-                toplevel,
-                &[
-                    "--no-optional-locks",
-                    "status",
-                    "--porcelain=v2",
-                    "--branch",
-                ],
-            )
-            .await?;
+        let status = self.git(toplevel, &GIT_STATUS_ARGS).await?;
         let facts = parse_status_v2(&status);
         let unpushed = facts.upstream_ab.map(|(ahead, _)| ahead);
 
