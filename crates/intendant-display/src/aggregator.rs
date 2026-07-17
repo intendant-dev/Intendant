@@ -2699,8 +2699,7 @@ mod tests {
         // it and `is_layer_paused` reads it, so the coordinator's
         // diff converges after an action instead of re-firing it
         // every tick — mirroring the real pool's semantics.
-        let paused: Arc<StdMutex<HashSet<SimulcastRid>>> =
-            Arc::new(StdMutex::new(HashSet::new()));
+        let paused: Arc<StdMutex<HashSet<SimulcastRid>>> = Arc::new(StdMutex::new(HashSet::new()));
 
         let recorded_for_closure = Arc::clone(&recorded);
         let paused_for_action = Arc::clone(&paused);

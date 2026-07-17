@@ -1426,9 +1426,7 @@ fn make_damage_backend(
 /// for robustness. Keyed to `BASELINE_CODEC` — not a codec literal —
 /// so the Windows H.264 bank is governed the same way as the VP8
 /// simulcast bank on macOS/Linux.
-fn baseline_always_on_rids(
-    ids: Vec<encode::pool::EncoderId>,
-) -> Vec<encode::pool::SimulcastRid> {
+fn baseline_always_on_rids(ids: Vec<encode::pool::EncoderId>) -> Vec<encode::pool::SimulcastRid> {
     ids.into_iter()
         .filter(|id| id.codec == encode::pool::BASELINE_CODEC)
         .map(|id| id.rid)
