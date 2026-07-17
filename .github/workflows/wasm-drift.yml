@@ -95,18 +95,20 @@ jobs:
   # scheme — a silent classifier crash can never mask a relevant diff,
   # which is what makes the skipped-equals-satisfied semantics safe here.
   wasm-drift:
-    name: wasm-drift (${{ matrix.os }})
+    # No matrix, deliberately: a job skipped via `if:` never materializes
+    # its matrix, so a matrixed name would report as the literal
+    # `wasm-drift (${{ matrix.os }})` — and the ruleset's pinned
+    # `wasm-drift (macos-latest)` context would simply never arrive,
+    # parking every wasm-irrelevant PR and wedging merge-group entries at
+    # Expected (fleet-wide, live 2026-07-16). The single-OS pair the
+    # matrix carried lives inline in `runs-on` below.
+    name: wasm-drift (macos-latest)
     needs: classify
     if: always() && (needs.classify.result != 'success' || needs.classify.outputs.relevant == 'true')
     # Trust-based routing — same rule as windows.yml: trusted refs on the
     # self-hosted fleet, fork PRs on GitHub-hosted runners.
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'macos-latest' || fromJSON('["self-hosted", "intendant-macos"]') }}
     timeout-minutes: 30
-    strategy:
-      matrix:
-        include:
-          - os: macos-latest
-            runner: [self-hosted, intendant-macos]
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
