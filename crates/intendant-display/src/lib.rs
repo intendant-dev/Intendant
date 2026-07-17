@@ -3413,13 +3413,9 @@ impl DisplaySession {
                                     if let Some(pool) = pool_for_fallback.as_ref() {
                                         pool.request_keyframe_all();
                                     }
-                                    capture_burst_until_ms.store(
-                                        Instant::now()
-                                            .saturating_duration_since(session_epoch)
-                                            .as_millis()
-                                            as u64
-                                            + PEER_JOIN_BURST.as_millis() as u64,
-                                        Ordering::Relaxed,
+                                    stamp_capture_burst(
+                                        &capture_burst_until_ms,
+                                        session_epoch,
                                     );
                                     if let Some(tx) = pool_feed_kf_tx.as_ref() {
                                         let _ = tx.send(());
