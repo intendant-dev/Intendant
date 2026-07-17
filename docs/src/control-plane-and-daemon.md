@@ -101,10 +101,24 @@ the control plane at runtime. Where the control plane owns *settings*, the
 supervisor owns *sessions* — their lifecycle, their per-session resources, and
 the graph of how they relate. `mod.rs` holds the supervisor/state types and
 shared helpers; the behavior is sliced into `dispatch.rs` (ControlMsg intake),
-`launch.rs` (new/resume flows and the shared session spawner),
-`sub_agents.rs` (delegation), `routing.rs` (follow-up/steer/edit/stop),
-`agent_config.rs` (per-session agent config and identity), and `registry.rs`
-(lifecycle observation and registration).
+`exec.rs` (the off-intake per-session executor), `launch.rs` (new/resume flows
+and the shared session spawner), `sub_agents.rs` (delegation), `fork.rs`
+(anchor forks), `routing.rs` (follow-up/steer/edit/stop), `agent_config.rs`
+(per-session agent config and identity), and `registry.rs` (lifecycle
+observation and registration).
+
+The intake is two-tier. The supervisor drains its lossless intent lane
+strictly in order, but `dispatch_control_msg` runs only the fast,
+ordering-critical work inline: validate, mint/reserve session identity, and
+dedup repeat requests. Slow launch bodies — session create (including a
+worktree checkout), resume, restart, fork, dashboard delegation — execute on
+a per-session ordered executor (`exec.rs`) under a small global concurrency
+bound, so one session's multi-second checkout no longer head-of-line-blocks
+another session's approvals, steers, or interrupts. Commands for one session
+still run in arrival order: while a session's launch body (or anything
+deferred behind it) is pending, later commands for that session defer onto
+its queue, and the identity minted at intake keeps the session addressable —
+and its peer-delegation id deduplicated — before the slow body completes.
 
 It subscribes to the bus and handles the session-lifecycle `ControlMsg`s:
 

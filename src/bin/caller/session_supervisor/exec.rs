@@ -149,7 +149,10 @@ impl IntakeExecutor {
     /// The queue key of a pending (not-yet-settled) launch that reserved
     /// this peer-delegation id, if any.
     pub(crate) fn pending_delegation_key(&self, delegation_id: &str) -> Option<String> {
-        self.lock().delegations.get(delegation_id).map(|r| r.key.clone())
+        self.lock()
+            .delegations
+            .get(delegation_id)
+            .map(|r| r.key.clone())
     }
 
     #[cfg(test)]
@@ -300,8 +303,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn wait_until(deadline_ms: u64, mut check: impl FnMut() -> bool) -> bool {
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
         loop {
             if check() {
                 return true;

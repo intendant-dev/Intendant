@@ -36,7 +36,10 @@ fn fast_control_queue_ids(msg: &event::ControlMsg) -> (Vec<String>, bool) {
     match msg {
         // Slash-command paths of the task-shaped arms: route_follow_up
         // into the active session.
-        C::CreateSession { .. } | C::StartTask { session_id: None, .. } => (Vec::new(), true),
+        C::CreateSession { .. }
+        | C::StartTask {
+            session_id: None, ..
+        } => (Vec::new(), true),
         C::StartTask {
             session_id: Some(id),
             ..
@@ -51,10 +54,9 @@ fn fast_control_queue_ids(msg: &event::ControlMsg) -> (Vec<String>, bool) {
         | C::Deny { session_id, .. }
         | C::Skip { session_id, .. }
         | C::ApproveAll { session_id, .. }
-        | C::AnswerQuestion { session_id, .. } => (
-            session_id.iter().cloned().collect(),
-            session_id.is_none(),
-        ),
+        | C::AnswerQuestion { session_id, .. } => {
+            (session_id.iter().cloned().collect(), session_id.is_none())
+        }
         C::StopSession { session_id } | C::ReloadCredentials { session_id } => {
             (vec![session_id.clone()], false)
         }
@@ -247,11 +249,7 @@ impl SessionSupervisor {
     /// original launch (the re-ack contract: the receipt fires only after
     /// dispatch, duplicates re-ack the ORIGINAL session, failed launches
     /// stay unacked and release the reservation for a fresh retry).
-    async fn enqueue_create_control(
-        &self,
-        msg: event::ControlMsg,
-        delegation_id: Option<String>,
-    ) {
+    async fn enqueue_create_control(&self, msg: event::ControlMsg, delegation_id: Option<String>) {
         if let Some(id) = delegation_id.as_deref() {
             let recorded = self
                 .state
@@ -1138,8 +1136,7 @@ mod tests {
     /// asynchronous dispatch effects (route reservations) without sleeps
     /// of fixed length.
     async fn wait_until(what: &str, deadline_ms: u64, mut check: impl FnMut() -> bool) {
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
         loop {
             if check() {
                 return;
@@ -1233,7 +1230,8 @@ mod tests {
         );
 
         // Release the gate: the held create completes and announces.
-        gate.send(true).expect("launch body holds the gate receiver");
+        gate.send(true)
+            .expect("launch body holds the gate receiver");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -1289,7 +1287,8 @@ mod tests {
             }
         }
 
-        gate.send(true).expect("launch body holds the gate receiver");
+        gate.send(true)
+            .expect("launch body holds the gate receiver");
         let mut saw_started = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
@@ -1350,7 +1349,8 @@ mod tests {
         }));
         await_intake_barrier(&bus, &mut bus_rx, "barrier-ghost-2").await;
 
-        gate.send(true).expect("launch body holds the gate receiver");
+        gate.send(true)
+            .expect("launch body holds the gate receiver");
         let mut saw_failed_create = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
@@ -1429,7 +1429,8 @@ mod tests {
         bus.send(AppEvent::ControlCommand(delegated("dg-mid-1")));
         await_intake_barrier(&bus, &mut bus_rx, "barrier-ghost-3").await;
 
-        gate.send(true).expect("launch body holds the gate receiver");
+        gate.send(true)
+            .expect("launch body holds the gate receiver");
         let mut started: Vec<String> = Vec::new();
         let mut receipts: Vec<String> = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
