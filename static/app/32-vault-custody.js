@@ -3122,7 +3122,7 @@ function renderAccessVaultSection() {
   // refresh cadence (30s freshness guard inside).
   renderAccessCustodySection();
   vaultRefreshCustody().catch(() => {});
-  // So does the Claude sign-in card (its own mount + freshness guard).
+  // So do the agent sign-in cards (their own mount + freshness guards).
   renderAgentSigninSection();
   agentSigninRefresh('claude').catch(() => {});
   agentSigninRefresh('codex').catch(() => {});
