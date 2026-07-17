@@ -242,6 +242,24 @@ fn unregister_open_session_log_dir(dir: &Path) {
     lock_open_session_log_dirs().remove(dir);
 }
 
+/// Atomically replace `session_meta.json` in `dir`: write a uniquely named
+/// temp file in the same directory, then rename it over the destination.
+///
+/// Every production writer of `session_meta.json` must route through here.
+/// A plain `fs::write` truncates the file before filling it, so a
+/// concurrent reader — the session catalog scan, `intendant ctl`, the e2e
+/// suite — can observe a torn half-write and fail to parse it (a diagnosed
+/// CI flake). A same-directory rename replaces the file atomically on both
+/// Unix and Windows, so readers see the old meta or the new meta, never a
+/// mix. Concurrent writers (e.g. session launch racing a rename) each get
+/// their own temp file and the last rename wins — the same last-write-wins
+/// outcome plain `fs::write` had.
+pub(crate) fn write_session_meta_atomic(dir: &Path, json: &str) -> std::io::Result<()> {
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(json.as_bytes())?;
+    crate::file_watcher::persist_tempfile(tmp, &dir.join("session_meta.json"))
+}
+
 fn mark_session_meta_interrupted(dir: &Path, last_turn: Option<usize>) -> bool {
     let meta_path = dir.join("session_meta.json");
     if let Ok(meta_str) = fs::read_to_string(&meta_path) {
@@ -250,7 +268,7 @@ fn mark_session_meta_interrupted(dir: &Path, last_turn: Option<usize>) -> bool {
                 meta.status = Some("interrupted".to_string());
                 meta.last_turn = Some(last_turn.or(meta.last_turn).unwrap_or(0));
                 if let Ok(json) = serde_json::to_string_pretty(&meta) {
-                    let _ = fs::write(&meta_path, &json);
+                    let _ = write_session_meta_atomic(dir, &json);
                     return true;
                 }
             }
@@ -282,7 +300,7 @@ fn update_session_meta_after_round_complete(
         meta.rounds = Some(meta.rounds.unwrap_or(0).max(rounds));
     }
     if let Ok(json) = serde_json::to_string_pretty(&meta) {
-        if let Err(e) = fs::write(&meta_path, &json) {
+        if let Err(e) = write_session_meta_atomic(dir, &json) {
             eprintln!("session_log: failed to update session_meta.json: {}", e);
         }
     }
@@ -613,7 +631,7 @@ impl SessionLog {
             worktree: existing_worktree,
         };
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
-            if let Err(e) = fs::write(self.dir.join("session_meta.json"), json) {
+            if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
                 eprintln!("session_log: failed to write session_meta.json: {}", e);
             }
         }
@@ -635,7 +653,7 @@ impl SessionLog {
         };
         meta.worktree = Some(worktree.clone());
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
-            if let Err(e) = fs::write(&meta_path, json) {
+            if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
                 eprintln!("session_log: failed to write session_meta.json: {}", e);
             }
         }
@@ -1561,6 +1579,33 @@ impl Drop for SessionLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_session_meta_atomic_writes_replaces_and_leaves_no_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("session_meta.json");
+
+        // Fresh write creates the file with the exact contents.
+        write_session_meta_atomic(dir.path(), r#"{"session_id":"first"}"#).unwrap();
+        assert_eq!(
+            fs::read_to_string(&meta_path).unwrap(),
+            r#"{"session_id":"first"}"#
+        );
+
+        // A second write replaces the existing file wholesale.
+        write_session_meta_atomic(dir.path(), r#"{"session_id":"second"}"#).unwrap();
+        assert_eq!(
+            fs::read_to_string(&meta_path).unwrap(),
+            r#"{"session_id":"second"}"#
+        );
+
+        // No temp residue: the dir holds exactly session_meta.json.
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["session_meta.json".to_string()]);
+    }
 
     #[test]
     fn open_creates_directory_structure() {

@@ -183,7 +183,8 @@ fn write_intendant_session_name(home: &Path, session_id: &str, name: &str) -> Re
     obj.insert("name".to_string(), Value::String(name.to_string()));
     let json =
         serde_json::to_string_pretty(&meta).map_err(|e| format!("serialize metadata: {e}"))?;
-    std::fs::write(meta_path, json).map_err(|e| format!("write session metadata: {e}"))
+    crate::session_log::write_session_meta_atomic(&dir, &json)
+        .map_err(|e| format!("write session metadata: {e}"))
 }
 
 fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
