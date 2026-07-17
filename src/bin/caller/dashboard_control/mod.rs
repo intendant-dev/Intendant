@@ -5356,6 +5356,16 @@ mod tests {
             ("api_sessions_stream", Row, Some(Op::SessionInspect)),
             ("api_session_detail", Row, Some(Op::SessionInspect)),
             ("api_session_fork_points", Row, Some(Op::SessionInspect)),
+            (
+                "api_session_background_tasks",
+                Row,
+                Some(Op::SessionInspect),
+            ),
+            (
+                "api_session_background_task_output",
+                Row,
+                Some(Op::SessionInspect),
+            ),
             ("api_session_report", Row, Some(Op::SessionInspect)),
             ("api_session_agent_output", Row, Some(Op::SessionInspect)),
             (
@@ -5683,6 +5693,8 @@ mod tests {
             "api_sessions_message_search",
             "api_session_detail",
             "api_session_fork_points",
+            "api_session_background_tasks",
+            "api_session_background_task_output",
             "api_session_report",
             "api_session_context_snapshot",
             "api_session_recordings",

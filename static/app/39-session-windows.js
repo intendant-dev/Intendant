@@ -1679,11 +1679,19 @@ function openVitalsExplainer(sessionId, chipId, anchor) {
   }
   const host = ensureVitalsExplainerHost();
   const panel = host.querySelector('.vx-panel');
+  // Content epoch: async enrichers (the background-task rows) must not
+  // append to a panel that has since shown something else.
+  panel.dataset.vxEpoch = String((Number(panel.dataset.vxEpoch) || 0) + 1);
   panel.replaceChildren(
     vxHeader(model.label, model.text),
     ...model.explainLines.map((line) => vxEl('p', 'vx-line', line)),
     ...(model.action ? [vxActionButton(model.action)] : [])
   );
+  // The model-activity explainer additionally lists the session's
+  // background tasks (live from the daemon's task registry) with a
+  // per-task output peek — additive: absent on fetch failure or when
+  // nothing was announced.
+  if (model.key === 'activity') appendSessionBackgroundTaskRows(sessionId, panel);
   presentVitalsPanel(host, panel, anchor);
   // Tick the value and sentences in place while open (elapsed, quiet,
   // countdowns). Line COUNT changes (a state flip mid-open) skip the
@@ -1814,6 +1822,157 @@ function vitalsGlossaryFactRows(sessionId) {
     rows.push(row);
   }
   return rows;
+}
+
+// ── Background-task inspector: what a parked (or working) session's
+// wire-announced background commands are, and a read-only peek at their
+// output. List + tail come from the daemon's task registry
+// (`/api/session/{id}/background-tasks[...]`, tunnel twins) — the client
+// names task ids, never paths, and tasks without an announced output
+// file simply get no peek affordance (wire-first honesty).
+async function appendSessionBackgroundTaskRows(sessionId, panel) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || typeof daemonApi === 'undefined') return;
+  const epoch = panel.dataset.vxEpoch;
+  let body = null;
+  try {
+    const resp = await daemonApi.request('api_session_background_tasks', { session_id: sid }, { cache: 'no-store' });
+    if (!resp.ok) return;
+    body = resp.body;
+  } catch (_) {
+    return; // absent section, never a broken explainer
+  }
+  if (panel.dataset.vxEpoch !== epoch || !panel.isConnected) return;
+  const tasks = Array.isArray(body?.tasks) ? body.tasks : [];
+  if (!tasks.length) return;
+  const section = vxEl('div', 'vx-bgtasks');
+  section.appendChild(vxEl('div', 'vx-bgtasks-title', 'Background tasks'));
+  const nowSec = Date.now() / 1000;
+  for (const task of tasks) {
+    const row = vxEl('div', 'vx-bgtask-row');
+    const desc = vxEl('div', 'vx-bgtask-desc', String(task.description || 'background command'));
+    desc.title = String(task.description || '');
+    const status = String(task.status || '');
+    const started = Number(task.startedAtEpoch) || 0;
+    const ended = Number(task.endedAtEpoch) || 0;
+    // Running rows show elapsed-so-far; finished rows their outcome.
+    const meta = status === 'running'
+      ? (started ? `running · ${formatActivityElapsed(nowSec - started)}` : 'running')
+      : `${status}${started && ended ? ` · ${formatActivityElapsed(ended - started)}` : ''}`;
+    row.appendChild(desc);
+    row.appendChild(vxEl('span', 'vx-bgtask-meta', meta));
+    if (task.hasOutput && task.taskId) {
+      const view = vxEl('button', 'vx-bgtask-view', 'View output');
+      view.type = 'button';
+      view.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        closeVitalsExplainer();
+        openSessionBackgroundTaskOutput(sid, task);
+      });
+      row.appendChild(view);
+    }
+    section.appendChild(row);
+  }
+  panel.appendChild(section);
+}
+
+// Read-only output viewer: monospace tail of the task's output file,
+// auto-refreshed every ~2s while open and the task still runs. Manual
+// close only (button, backdrop, Escape) — never steals focus back.
+function ensureBgOutputViewerHost() {
+  let host = document.getElementById('bg-output-viewer');
+  if (host) return host;
+  host = document.createElement('div');
+  host.id = 'bg-output-viewer';
+  host.hidden = true;
+  const backdrop = vxEl('div', 'bgov-backdrop');
+  backdrop.addEventListener('click', closeBgOutputViewer);
+  const panel = vxEl('div', 'bgov-panel');
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-label', 'Background task output');
+  host.appendChild(backdrop);
+  host.appendChild(panel);
+  document.body.appendChild(host);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !host.hidden) closeBgOutputViewer();
+  });
+  return host;
+}
+
+function closeBgOutputViewer() {
+  const host = document.getElementById('bg-output-viewer');
+  if (!host) return;
+  host.hidden = true;
+  if (host._refreshTimer) {
+    clearInterval(host._refreshTimer);
+    host._refreshTimer = null;
+  }
+}
+
+function openSessionBackgroundTaskOutput(sessionId, task) {
+  const sid = String(sessionId || '').trim();
+  const taskId = String(task?.taskId || '').trim();
+  if (!sid || !taskId || typeof daemonApi === 'undefined') return;
+  const host = ensureBgOutputViewerHost();
+  const panel = host.querySelector('.bgov-panel');
+  if (host._refreshTimer) {
+    clearInterval(host._refreshTimer);
+    host._refreshTimer = null;
+  }
+
+  const head = vxEl('div', 'bgov-head');
+  const title = vxEl('span', 'bgov-title', String(task?.description || 'Background task output'));
+  title.title = String(task?.description || '');
+  const statusChip = vxEl('span', 'bgov-status', String(task?.status || ''));
+  const close = vxEl('button', 'bgov-close', '✕');
+  close.type = 'button';
+  close.setAttribute('aria-label', 'Close output viewer');
+  close.addEventListener('click', closeBgOutputViewer);
+  head.appendChild(title);
+  head.appendChild(statusChip);
+  head.appendChild(close);
+  const note = vxEl('div', 'bgov-note', 'Loading output…');
+  const pre = vxEl('pre', 'bgov-pre', '');
+  panel.replaceChildren(head, note, pre);
+  host.hidden = false;
+
+  const refresh = async () => {
+    let body = null;
+    try {
+      const resp = await daemonApi.request(
+        'api_session_background_task_output',
+        { session_id: sid, task_id: taskId, tail_kb: 64 },
+        { cache: 'no-store' }
+      );
+      if (!resp.ok) throw new Error(resp?.body?.error || 'output unavailable');
+      body = resp.body;
+    } catch (err) {
+      if (host.hidden) return;
+      note.textContent = `Output unavailable: ${err?.message || err}`;
+      return;
+    }
+    if (host.hidden) return;
+    const status = String(body?.status || '');
+    statusChip.textContent = status;
+    const shownKb = Math.round(String(body?.content || '').length / 1024);
+    const totalKb = Math.round((Number(body?.sizeBytes) || 0) / 1024);
+    note.textContent = body?.truncated
+      ? `Read-only · last ${shownKb} KB of ${totalKb} KB (earlier output not shown)`
+      : `Read-only · ${totalKb} KB`;
+    // Keep the tail in view across refreshes unless the reader scrolled
+    // up to study earlier output.
+    const pinned = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+    pre.textContent = String(body?.content || '');
+    if (pinned) pre.scrollTop = pre.scrollHeight;
+    // A finished task's file no longer moves: stop polling.
+    if (status !== 'running' && host._refreshTimer) {
+      clearInterval(host._refreshTimer);
+      host._refreshTimer = null;
+    }
+  };
+  refresh();
+  host._refreshTimer = setInterval(refresh, 2000);
 }
 
 // The glossary is the parity surface: EVERY catalog symbol is listed —
