@@ -2119,6 +2119,11 @@ pub enum ControlMsg {
 /// low-volume event subset persisted to `session.jsonl`, and
 /// [`EventBus::subscribe_intents`] is the lossless path for user intents
 /// (`ControlCommand`) and the session-bookkeeping events that route them.
+/// Emitters choose the persistence disposition per event: [`EventBus::send`]
+/// routes session-log-subset events onto the lossless lane for the
+/// session-log writer, while [`EventBus::send_already_persisted`] is for
+/// events the emitter has already written to the owning session's log — it
+/// skips the lane so the writer cannot persist a second copy.
 /// One item on the lossless session-log lane: the event plus the instant it
 /// entered the lane at [`EventBus::send`], so the writer can measure
 /// enqueue→consume latency (see [`warn_writer_lane_slow`]).
@@ -2151,6 +2156,30 @@ impl EventBus {
                 sinks.retain(|sink| sink.send((event.clone(), enqueued_at)).is_ok());
             }
         }
+        if app_event_rides_intent_lane(&event) {
+            if let Ok(mut sinks) = self.intent_sinks.lock() {
+                sinks.retain(|sink| sink.send(event.clone()).is_ok());
+            }
+        }
+        let _ = self.tx.send(event);
+    }
+
+    /// Send an event the emitter has ALREADY persisted to its owning
+    /// session's log. Identical to [`Self::send`] except the lossless
+    /// session-log lane is skipped: the session-log writer (and every other
+    /// lane subscriber) never sees the event, so it cannot be persisted a
+    /// second time — and in daemon mode the head-session log stops
+    /// aggregating a copy of a child-owned row. Broadcast and intent lanes
+    /// are unchanged, so live frontends and intent consumers observe the
+    /// event exactly as with [`Self::send`].
+    ///
+    /// Intended for `AppEvent::ModelResponse` from paths that inline-log the
+    /// response at the point of origin (the native agent loop; external
+    /// drains with `persist_model_responses_inline`). Events the
+    /// fission-lifecycle watcher folds (DoneSignal/TaskComplete/Interrupted/
+    /// SessionEnded/FileChanged) must keep using [`Self::send`] — that
+    /// watcher consumes the same lane.
+    pub fn send_already_persisted(&self, event: AppEvent) {
         if app_event_rides_intent_lane(&event) {
             if let Ok(mut sinks) = self.intent_sinks.lock() {
                 sinks.retain(|sink| sink.send(event.clone()).is_ok());
@@ -3211,10 +3240,20 @@ pub fn spawn_outbound_broadcaster(
 /// Spawn a task that persists AppEvents to the session log on disk.
 ///
 /// This is the single point where events flowing through the bus are written
-/// to `session.jsonl`. Events that are already logged inline by the agent loop
-/// (turn_start, model_response, agent_input/output, approval decisions, etc.)
-/// are skipped here to avoid duplication — only events that would otherwise be
-/// lost are handled.
+/// to `session.jsonl`. Which events arrive here is a two-part contract:
+///
+/// - the emitter's disposition: an event already written to its owning
+///   session's log at the point of origin is emitted with
+///   [`EventBus::send_already_persisted`] and never enters the lane (the
+///   native loop's `ModelResponse`; external drains persisting inline),
+///   while [`EventBus::send`] routes an event here when this writer is its
+///   only path to disk (e.g. an external-agent `ModelResponse` with no
+///   inline copy);
+/// - the lane filter ([`app_event_writes_to_session_log`]): the low-volume
+///   subset this writer persists at all. Events inline-logged at their
+///   origin and never lane-routed (turn_start, agent_input/output, approval
+///   decisions, etc.) are simply not handled in
+///   [`write_event_to_session_log`].
 ///
 /// Per item the task measures enqueue→consume (how long the event sat in the
 /// lossless lane) and consume→durable (how long the locked append+flush took)
@@ -3376,7 +3415,8 @@ fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
 }
 
 /// Write a single AppEvent to the session log if it isn't already logged
-/// inline by the agent loop.
+/// inline by the agent loop (see [`spawn_session_log_writer`] for the full
+/// emit-site disposition contract).
 fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &AppEvent) {
     let Ok(mut log) = session_log.lock() else {
         return;
@@ -3746,6 +3786,14 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             log.live_audio_completed(id, status, *quarantine_count);
         }
 
+        // Disposition-routed (see `EventBus::send_already_persisted`): only
+        // `ModelResponse` events whose emitter did NOT persist them inline
+        // reach this lane — external-agent responses with no inline copy
+        // (added in 5f940065 when they were falling through to the wildcard
+        // and never persisting), for which this writer is the only path to
+        // disk. Inline-persisting emitters (the native loop, supervised
+        // external drains) skip the lane at the emit site, so this arm
+        // cannot double-count their tokens or re-append their `model.txt`.
         AppEvent::ModelResponse {
             session_id,
             content,
@@ -3826,11 +3874,14 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         }
 
         // ---- Events already logged inline by the agent loop or web_gateway ----
-        // turn_start, model_response, agent_input/output, approval decisions,
+        // turn_start, agent_input/output, approval decisions,
         // json_extracted, reasoning, budget warnings, loop errors, context
         // management, voice_log, voice_diagnostic, presence_connected/disconnected,
         // presence_checkpoint, user_transcript — all have slog() calls at their
-        // point of origin.
+        // point of origin. (model_response is disposition-routed at the emit
+        // site instead: inline-persisting emitters bypass this writer via
+        // `send_already_persisted`, so the arm above only ever sees copies
+        // it must persist.)
         //
         // ---- Terminal-only / internal / high-frequency events ----
         // Tick, ControlCommand, SessionDirChanged,
@@ -5933,6 +5984,253 @@ mod tests {
         assert!(contents.contains("\"event\":\"steer_delivered\""));
         assert!(contents.contains("\"event\":\"steer_cancelled\""));
         assert!(contents.contains("Keep the full body."));
+    }
+
+    /// `send_already_persisted` is the emit-site disposition for events the
+    /// emitter already wrote to the owning session's log: the lossless
+    /// session-log lane receives nothing (so the writer cannot persist a
+    /// second copy), while broadcast subscribers still observe the event.
+    #[test]
+    fn send_already_persisted_skips_writer_lane_but_still_broadcasts() {
+        let bus = EventBus::new();
+        let mut log_rx = bus.subscribe_session_log();
+        let mut broadcast_rx = bus.subscribe();
+
+        bus.send_already_persisted(AppEvent::ModelResponse {
+            session_id: Some("native-1".to_string()),
+            turn: 3,
+            content: "already in the owning log".to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 1000,
+                completion_tokens: 200,
+                total_tokens: 1200,
+                ..Default::default()
+            },
+            reasoning: None,
+            source: None,
+        });
+
+        assert!(
+            log_rx.try_recv().is_err(),
+            "already-persisted events must not enter the session-log lane"
+        );
+        match broadcast_rx.try_recv() {
+            Ok(AppEvent::ModelResponse { content, usage, .. }) => {
+                assert_eq!(content, "already in the owning log");
+                assert_eq!(usage.total_tokens, 1200);
+            }
+            other => panic!("expected broadcast ModelResponse, got {:?}", other),
+        }
+    }
+
+    /// Regression guard for the writer-owned external path (5f940065): a
+    /// `send`-routed ModelResponse with no inline copy is persisted by the
+    /// bus writer exactly once, source label intact.
+    #[test]
+    fn session_log_writer_persists_external_model_response_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(log));
+
+        write_event_to_session_log(
+            &shared,
+            &AppEvent::ModelResponse {
+                session_id: Some("codex-thread".to_string()),
+                turn: 1,
+                content: "external response body".to_string(),
+                usage: TokenUsage::default(),
+                reasoning: None,
+                source: Some("Codex".to_string()),
+            },
+        );
+        drop(shared);
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let rows = contents
+            .lines()
+            .filter(|l| l.contains("\"event\":\"model_response\""))
+            .count();
+        assert_eq!(rows, 1, "writer-routed external response persists once");
+        assert!(contents.contains("\"source\":\"Codex\""));
+        assert!(contents.contains("external response body"));
+    }
+
+    /// Single-persist invariant for a native turn: the loop logs the
+    /// response inline (tokens counted there) and emits the bus copy as
+    /// already-persisted, so the summary counts the usage exactly once and
+    /// session.jsonl carries exactly one model_response row.
+    #[test]
+    fn native_turn_counts_tokens_once_under_already_persisted_emit() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(log));
+
+        // Inline copy — what the native loop writes at the acceptance point.
+        shared.lock().unwrap().model_response_with_message(
+            1,
+            "the assistant text",
+            1000,
+            500,
+            1500,
+            0,
+            0,
+        );
+
+        // Bus copy — same usage, already-persisted disposition: the
+        // session-log lane must stay empty.
+        let bus = EventBus::new();
+        let mut log_rx = bus.subscribe_session_log();
+        bus.send_already_persisted(AppEvent::ModelResponse {
+            session_id: None,
+            turn: 1,
+            content: "the assistant text".to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 1000,
+                completion_tokens: 500,
+                total_tokens: 1500,
+                ..Default::default()
+            },
+            reasoning: None,
+            source: None,
+        });
+        assert!(log_rx.try_recv().is_err());
+
+        shared.lock().unwrap().write_session_summary();
+        let summary: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(log_dir.join("session_summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            summary["total_tokens"].as_u64(),
+            Some(1500),
+            "usage must be counted exactly once, not once per persisted copy"
+        );
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let rows = contents
+            .lines()
+            .filter(|l| l.contains("\"event\":\"model_response\""))
+            .count();
+        assert_eq!(rows, 1, "exactly one model_response row for the turn");
+    }
+
+    /// Both dispositions end to end through the live writer task: reasoning
+    /// riding an already-persisted ModelResponse never produces a writer
+    /// reasoning row (or any row), while a send-routed external response
+    /// consumed by the same writer lands exactly once.
+    #[tokio::test]
+    async fn writer_task_honors_persistence_disposition() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(log));
+
+        let bus = EventBus::new();
+        let writer = spawn_session_log_writer(bus.subscribe_session_log(), shared.clone());
+
+        // Already persisted inline by its emitter: neither the content nor
+        // the reasoning may be re-persisted by the writer.
+        bus.send_already_persisted(AppEvent::ModelResponse {
+            session_id: Some("native-1".to_string()),
+            turn: 2,
+            content: "inline-owned response".to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 600,
+                completion_tokens: 100,
+                total_tokens: 700,
+                ..Default::default()
+            },
+            reasoning: Some("chain of thought summary".to_string()),
+            source: None,
+        });
+        // Writer-owned external response: the lane is its only path to disk.
+        bus.send(AppEvent::ModelResponse {
+            session_id: Some("codex-thread".to_string()),
+            turn: 2,
+            content: "codex response".to_string(),
+            usage: TokenUsage::default(),
+            reasoning: None,
+            source: Some("Codex".to_string()),
+        });
+
+        // Dropping the bus closes the lane; the writer drains what it
+        // received and exits — deterministic, no polling.
+        drop(bus);
+        writer.await.unwrap();
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        assert!(
+            !contents.contains("\"event\":\"reasoning\""),
+            "already-persisted reasoning must not produce a writer row"
+        );
+        assert!(!contents.contains("inline-owned response"));
+        let rows: Vec<&str> = contents
+            .lines()
+            .filter(|l| l.contains("\"event\":\"model_response\""))
+            .collect();
+        assert_eq!(rows.len(), 1, "only the send-routed response persists");
+        assert!(rows[0].contains("codex response"));
+    }
+
+    /// The CU-only turn shape: the loop inline-logs the EMPTY canonical
+    /// content (tokens counted once) and the bus event carries a
+    /// synthesized non-empty action summary with the SAME usage. The
+    /// already-persisted disposition keeps the writer from counting those
+    /// tokens a second time — the synthesized content used to defeat its
+    /// empty-content guard.
+    #[test]
+    fn cu_only_turn_counts_tokens_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(log));
+
+        // Inline copy: empty canonical content, real usage.
+        let _ = shared
+            .lock()
+            .unwrap()
+            .model_response("", 800, 100, 900, 0, 0, None);
+
+        let bus = EventBus::new();
+        let mut log_rx = bus.subscribe_session_log();
+        bus.send_already_persisted(AppEvent::ModelResponse {
+            session_id: None,
+            turn: 1,
+            content: "click(3,4) → screenshot".to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 800,
+                completion_tokens: 100,
+                total_tokens: 900,
+                ..Default::default()
+            },
+            reasoning: None,
+            source: None,
+        });
+        assert!(log_rx.try_recv().is_err());
+
+        shared.lock().unwrap().write_session_summary();
+        let summary: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(log_dir.join("session_summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            summary["total_tokens"].as_u64(),
+            Some(900),
+            "CU-only usage must be counted exactly once"
+        );
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let rows = contents
+            .lines()
+            .filter(|l| l.contains("\"event\":\"model_response\""))
+            .count();
+        assert_eq!(rows, 1, "only the inline canonical row exists");
+        assert!(
+            !contents.contains("click(3,4)"),
+            "the synthesized action summary is display-only, never persisted"
+        );
     }
 
     #[tokio::test]

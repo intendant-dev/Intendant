@@ -1027,7 +1027,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     stats.last_response = Some(text.clone());
                 }
                 persist_external_model_response_if_needed(config, &text, None);
-                config.bus.send(AppEvent::ModelResponse {
+                config.send_model_response(AppEvent::ModelResponse {
                     session_id: config.session_id.clone(),
                     turn: stats.turns,
                     content: text,
@@ -1065,7 +1065,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 // (visible in Verbose + Debug, hidden in Normal) via the
                 // existing reasoning_summary path in app_state.rs.
                 persist_external_model_response_if_needed(config, "", Some(&text));
-                config.bus.send(AppEvent::ModelResponse {
+                config.send_model_response(AppEvent::ModelResponse {
                     session_id: config.session_id.clone(),
                     turn: stats.turns,
                     content: String::new(),
@@ -1090,7 +1090,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     md.push_str(&format!("- {} {}\n", marker, content));
                 }
                 persist_external_model_response_if_needed(config, &md, None);
-                config.bus.send(AppEvent::ModelResponse {
+                config.send_model_response(AppEvent::ModelResponse {
                     session_id: config.session_id.clone(),
                     turn: stats.turns,
                     content: md,

@@ -3198,7 +3198,7 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 &text,
                 None,
             );
-            config.bus.send(AppEvent::ModelResponse {
+            config.send_model_response(AppEvent::ModelResponse {
                 session_id,
                 turn: stats
                     .codex_subagent_rounds
@@ -3227,7 +3227,7 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 "",
                 Some(&text),
             );
-            config.bus.send(AppEvent::ModelResponse {
+            config.send_model_response(AppEvent::ModelResponse {
                 session_id,
                 turn: stats
                     .codex_subagent_rounds

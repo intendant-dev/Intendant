@@ -1441,7 +1441,15 @@ pub(crate) async fn run_agent_loop(
             response.content.clone()
         };
 
-        bus.send(AppEvent::ModelResponse {
+        // Already persisted above into this session's own log (content +
+        // tokens via model_response*, reasoning via
+        // reasoning_content_for_session) — skip the bus writer lane so the
+        // response persists exactly once: no doubled rows/model.txt/token
+        // totals in the single-log shapes, no duplicate copy in the daemon
+        // head log, and no second token count for CU-only turns (whose
+        // synthesized `display_content` defeats the writer's empty-content
+        // guard while carrying the same usage).
+        bus.send_already_persisted(AppEvent::ModelResponse {
             session_id: local_session_id.clone(),
             turn,
             content: display_content,
