@@ -1503,11 +1503,17 @@ impl Project {
 
     /// Write the current config back to intendant.toml.
     /// Creates the file if it doesn't exist.
+    ///
+    /// The write must be atomic (tempfile + rename): readers — dashboard GETs
+    /// re-reading from disk, the post-save control-plane persist passes,
+    /// external watchers — must never observe a truncated or empty
+    /// intendant.toml. 2026-07-16 CI caught a zero-byte read mid-rewrite under
+    /// the previous truncate-then-write `std::fs::write`.
     pub fn save_config(&self) -> Result<(), CallerError> {
         let config_path = self.root.join("intendant.toml");
         let content = toml::to_string_pretty(&self.config)
             .map_err(|e| CallerError::Config(format!("Failed to serialize config: {}", e)))?;
-        std::fs::write(&config_path, content)
+        crate::file_watcher::atomic_write(&config_path, content.as_bytes())
             .map_err(|e| CallerError::Config(format!("Failed to write intendant.toml: {}", e)))?;
         Ok(())
     }

@@ -94,19 +94,25 @@ jobs:
   # relevance step decides locally exactly like the old single-job
   # scheme — a silent classifier crash can never mask a relevant diff,
   # which is what makes the skipped-equals-satisfied semantics safe here.
+  #
+  # The job name is a LITERAL, never a matrix expansion: skipped-equals-
+  # satisfied only works when the skipped check run carries the ruleset's
+  # pinned context name, and a job skipped via `if:` never expands its
+  # matrix — its check run reports under the raw "wasm-drift
+  # (${{ matrix.os }})" placeholder, the pinned "wasm-drift
+  # (macos-latest)" context then never reports at all, and every
+  # irrelevant-diff PR wedges: arming can't enter the queue and group
+  # entries cycle all-green until ejection (live fleet-wide outage,
+  # 2026-07-16, first landing of the classifier gate). The single-entry
+  # matrix existed only to name os/runner; inline literals cost nothing.
   wasm-drift:
-    name: wasm-drift (${{ matrix.os }})
+    name: wasm-drift (macos-latest)
     needs: classify
     if: always() && (needs.classify.result != 'success' || needs.classify.outputs.relevant == 'true')
     # Trust-based routing — same rule as windows.yml: trusted refs on the
     # self-hosted fleet, fork PRs on GitHub-hosted runners.
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'macos-latest' || fromJSON('["self-hosted", "intendant-macos"]') }}
     timeout-minutes: 30
-    strategy:
-      matrix:
-        include:
-          - os: macos-latest
-            runner: [self-hosted, intendant-macos]
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

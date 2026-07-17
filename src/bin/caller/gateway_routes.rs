@@ -151,6 +151,15 @@ pub(crate) enum CorsPosture {
     OwnOrigin,
     /// The fleet Access APIs: echo only fleet-allowlisted origins.
     FleetAllowlist,
+    /// The session-list lanes the multi-daemon Stats tab reads across
+    /// daemons: echo fleet-allowlisted origins exactly like
+    /// [`CorsPosture::FleetAllowlist`], and additionally echo loopback
+    /// origins when the request itself arrived over loopback — a
+    /// sibling daemon's dashboard on another port of the same machine.
+    /// These rows historically baked a wildcard ACAO into their
+    /// responses; the allowlist echo replaces it, so arbitrary web
+    /// origins get no header at all (and are refused pre-dispatch).
+    FleetOrLoopback,
     /// The public doorbell class: open by design.
     Public,
 }
@@ -497,6 +506,29 @@ const fn op_route(
         pattern,
         authz: RouteAuthz::Operation(op),
         cors: CorsPosture::OwnOrigin,
+        body,
+        handler,
+        doc,
+        tunnel: None,
+    }
+}
+
+/// Session-list rows the multi-daemon Stats tab fetches cross-origin:
+/// IAM-gated like `op_route`, with the fleet-or-loopback CORS echo
+/// instead of own-origin.
+const fn fleet_or_loopback_route(
+    method: RouteMethod,
+    pattern: PathPattern,
+    op: PeerOperation,
+    body: BodyPolicy,
+    handler: RouteHandlerId,
+    doc: &'static str,
+) -> Route {
+    Route {
+        method,
+        pattern,
+        authz: RouteAuthz::Operation(op),
+        cors: CorsPosture::FleetOrLoopback,
         body,
         handler,
         doc,
@@ -1245,7 +1277,7 @@ pub(crate) static ROUTES: &[Route] = &[
     //    for browser principals (peers were already SessionInspect-gated
     //    by federation_http_operation). Declaring the operation here is
     //    the fail-closed fix; the differential test allowlists it.
-    op_route(
+    fleet_or_loopback_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/sessions/stream"),
         PeerOperation::SessionInspect,
@@ -1272,13 +1304,13 @@ pub(crate) static ROUTES: &[Route] = &[
         "Message-lane search over the shard index (q, source, superseded, subagents, cursor)",
     )
     .with_tunnel(tunnel_method("api_sessions_message_search")),
-    op_route(
+    fleet_or_loopback_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/sessions"),
         PeerOperation::SessionInspect,
         BodyPolicy::None,
         RouteHandlerId::SessionsList,
-        "List sessions (id filter, limit, usage view; response CORS * for the fleet Stats tab)",
+        "List sessions (id filter, limit, usage view; fleet/loopback CORS echo for the multi-daemon Stats tab)",
     )
     .with_tunnel(tunnel_method("api_sessions")),
     // ── Settings / info endpoints. Ported method-blind from the legacy
@@ -2121,6 +2153,7 @@ pub(crate) fn render_endpoint_docs() -> String {
         let cors = match route.cors {
             CorsPosture::OwnOrigin => "own origin",
             CorsPosture::FleetAllowlist => "fleet allowlist",
+            CorsPosture::FleetOrLoopback => "fleet or loopback",
             CorsPosture::Public => "public",
         };
         let body = match route.body {
@@ -2278,6 +2311,20 @@ mod tests {
         );
         assert_eq!(
             preflight_posture("/api/fs/write"),
+            Some(CorsPosture::OwnOrigin)
+        );
+        // The Stats-tab session-list lanes: fleet/loopback echo, never
+        // wildcard. Their neighbors keep the own-origin default.
+        assert_eq!(
+            preflight_posture("/api/sessions"),
+            Some(CorsPosture::FleetOrLoopback)
+        );
+        assert_eq!(
+            preflight_posture("/api/sessions/stream"),
+            Some(CorsPosture::FleetOrLoopback)
+        );
+        assert_eq!(
+            preflight_posture("/api/sessions/search"),
             Some(CorsPosture::OwnOrigin)
         );
         assert_eq!(preflight_posture("/api/sessionsfoo"), None);
