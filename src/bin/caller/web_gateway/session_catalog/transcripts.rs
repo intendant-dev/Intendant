@@ -858,10 +858,14 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
         let ts_ms = chrono::DateTime::parse_from_rfc3339(&ts)
             .ok()
             .map(|dt| dt.timestamp_millis());
+        let line_uuid = value_str(&obj, "uuid");
         let mut push = |mut entry: serde_json::Value| {
             entry["ts"] = serde_json::Value::String(ts.clone());
             if let Some(ms) = ts_ms {
                 entry["ts_ms"] = serde_json::Value::from(ms);
+            }
+            if let Some(uuid) = line_uuid.as_deref() {
+                entry["message_uuid"] = serde_json::Value::String(uuid.to_string());
             }
             entries.push(entry);
         };
@@ -1001,7 +1005,36 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
         }
     }
 
+    annotate_claude_entries_off_active_chain(path, &mut entries);
     Some(entries)
+}
+
+/// Flag entries whose transcript line is not on the active uuid chain
+/// (abandoned sibling branches from edits/forks). Chain truth comes from
+/// the same `shared_claude_tree_scan` the fork-point catalog uses, so the
+/// detail view and the catalog can never disagree about which rows are
+/// live history.
+fn annotate_claude_entries_off_active_chain(path: &Path, entries: &mut [serde_json::Value]) {
+    let Ok(tree) = crate::session_fork::shared_claude_tree_scan(path) else {
+        return;
+    };
+    let Some(leaf) = tree.active_leaf.as_deref() else {
+        return;
+    };
+    let on_chain: std::collections::HashSet<&str> = tree
+        .ancestor_chain(leaf)
+        .iter()
+        .map(|node| node.uuid.as_str())
+        .collect();
+    for entry in entries.iter_mut() {
+        let off = match entry.get("message_uuid").and_then(|v| v.as_str()) {
+            Some(uuid) => !on_chain.contains(uuid),
+            None => false,
+        };
+        if off {
+            entry["off_active_chain"] = serde_json::Value::Bool(true);
+        }
+    }
 }
 
 pub(crate) fn parse_gemini_session_entries(
@@ -2913,5 +2946,69 @@ mod tests {
         assert!(entries
             .iter()
             .all(|e| e["source"] != "User" || e["content"] == "real user prompt"));
+    }
+
+    /// Transcript entries carry the line's `message_uuid`, abandoned sibling
+    /// branches are flagged `off_active_chain`, and every Claude fork point's
+    /// `at_message_uuid` display anchor resolves to a rendered row with the
+    /// expected chain membership — the parity that lets the dashboard place
+    /// fork affordances inline on transcript rows.
+    #[test]
+    fn claude_transcript_entries_join_fork_point_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        // u1 → a1 → u2a (abandoned branch); u1 → a1 → u2b → a2 (active tail).
+        let lines = [
+            r#"{"uuid":"u1","parentUuid":null,"type":"user","timestamp":"2026-07-16T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"first prompt"}]}}"#,
+            r#"{"uuid":"a1","parentUuid":"u1","type":"assistant","timestamp":"2026-07-16T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"first reply"}]}}"#,
+            r#"{"uuid":"u2a","parentUuid":"a1","type":"user","timestamp":"2026-07-16T00:00:03.000Z","message":{"role":"user","content":[{"type":"text","text":"abandoned follow-up"}]}}"#,
+            r#"{"uuid":"u2b","parentUuid":"a1","type":"user","timestamp":"2026-07-16T00:00:04.000Z","message":{"role":"user","content":[{"type":"text","text":"kept follow-up"}]}}"#,
+            r#"{"uuid":"a2","parentUuid":"u2b","type":"assistant","timestamp":"2026-07-16T00:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"final reply"}]}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let entries = parse_claude_session_entries(&path).expect("parse");
+        let entry_for = |uuid: &str| {
+            entries
+                .iter()
+                .find(|e| e["message_uuid"] == uuid)
+                .unwrap_or_else(|| panic!("no entry for uuid {uuid}"))
+        };
+        assert!(entries.iter().all(|e| e["message_uuid"].is_string()));
+        assert_eq!(entry_for("u2a")["off_active_chain"], true);
+        for uuid in ["u1", "a1", "u2b", "a2"] {
+            assert!(
+                entry_for(uuid).get("off_active_chain").is_none(),
+                "{uuid} is on the active chain"
+            );
+        }
+
+        let catalog = crate::session_fork::claude_fork_points(
+            "sess",
+            "backend",
+            &path,
+            &crate::session_fork::ForkPointQuery::default(),
+        )
+        .expect("catalog");
+        assert!(catalog.supported);
+        assert!(!catalog.fork_points.is_empty());
+        for point in &catalog.fork_points {
+            let at = point
+                .at_message_uuid
+                .as_deref()
+                .unwrap_or_else(|| panic!("claude point {} lacks at_message_uuid", point.id));
+            let row = entry_for(at);
+            match point.kind {
+                "branch-tip" => assert_eq!(
+                    row["off_active_chain"], true,
+                    "branch tip {at} must land on an off-chain row"
+                ),
+                _ => assert!(
+                    row.get("off_active_chain").is_none(),
+                    "{} point {at} must land on an active-chain row",
+                    point.kind
+                ),
+            }
+        }
     }
 }
