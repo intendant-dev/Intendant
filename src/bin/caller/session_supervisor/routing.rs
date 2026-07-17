@@ -297,20 +297,31 @@ impl SessionSupervisor {
                     ),
                 );
                 self.queue_edit_user_message_after_attach(lookup_id.clone(), request);
-                self.resume_session(
-                    attach.source,
-                    requested_id.clone(),
-                    Some(lookup_id.clone()),
-                    attach.project_root,
-                    None,
-                    Some(attach.direct.unwrap_or(true)),
-                    Vec::new(),
-                    false,
-                    None,
-                    LaunchOverrides::default(),
-                    false,
-                    false,
-                )
+                // The attach spawn is a slow launch body: dispatch it as
+                // the equivalent ResumeSession intent (which the intake
+                // dispatcher queues on the session's executor lane)
+                // instead of awaiting it here — this arm runs inline on
+                // the control intake for the common routed case, and the
+                // attach must not stall every other session's commands.
+                // The queued edit above delivers via its own bus waiter
+                // once the attach registers, exactly as before.
+                self.dispatch_control_msg(event::ControlMsg::ResumeSession {
+                    source: attach.source,
+                    session_id: requested_id.clone(),
+                    resume_id: Some(lookup_id.clone()),
+                    project_root: attach.project_root,
+                    task: None,
+                    direct: Some(attach.direct.unwrap_or(true)),
+                    attachments: Vec::new(),
+                    fork: false,
+                    relationship_kind: None,
+                    auto_attach: false,
+                    agent_command: None,
+                    codex_sandbox: None,
+                    codex_approval_policy: None,
+                    codex_managed_context: None,
+                    codex_context_archive: None,
+                })
                 .await;
                 return;
             }
