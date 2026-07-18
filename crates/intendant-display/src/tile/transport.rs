@@ -308,14 +308,10 @@ pub fn encode_frame(frame: &TileFrame) -> Result<Vec<u8>, TileWireError> {
 }
 
 pub fn decode_frame(bytes: &[u8]) -> Result<TileFrame, TileWireError> {
-    if bytes.len() < HEADER_LEN {
-        return Err(TileWireError::MessageTooShort);
-    }
+    checked_frame_type(bytes)?;
     let mut r = Reader::new(bytes);
     let version = r.u8()?;
-    if version != WIRE_VERSION {
-        return Err(TileWireError::UnsupportedVersion(version));
-    }
+    debug_assert_eq!(version, WIRE_VERSION);
     let frame_type = r.u8()?;
     let _flags = r.u16()?;
     let frame = match frame_type {
@@ -399,6 +395,33 @@ pub fn decode_frame(bytes: &[u8]) -> Result<TileFrame, TileWireError> {
         return Err(TileWireError::TrailingBytes(r.remaining()));
     }
     Ok(frame)
+}
+
+/// Decode a frame received on the client-to-server tile control channel.
+///
+/// The type check deliberately happens before the general decoder touches any
+/// type-specific fields. A client must not be able to make the server allocate
+/// for a snapshot/update record count by sending a server-to-client frame on
+/// the control channel.
+pub(crate) fn decode_client_control_frame(bytes: &[u8]) -> Result<TileFrame, TileWireError> {
+    let frame_type = checked_frame_type(bytes)?;
+    match frame_type {
+        TYPE_SUBSCRIBE | TYPE_SNAPSHOT_REQUEST | TYPE_GAP_REPORT => decode_frame(bytes),
+        other => Err(TileWireError::UnsupportedType(other)),
+    }
+}
+
+fn checked_frame_type(bytes: &[u8]) -> Result<u8, TileWireError> {
+    if bytes.len() > MAX_DATACHANNEL_MESSAGE_SIZE {
+        return Err(TileWireError::MessageTooLarge(bytes.len()));
+    }
+    if bytes.len() < HEADER_LEN {
+        return Err(TileWireError::MessageTooShort);
+    }
+    if bytes[0] != WIRE_VERSION {
+        return Err(TileWireError::UnsupportedVersion(bytes[0]));
+    }
+    Ok(bytes[1])
 }
 
 pub fn pack_snapshot_chunks(
@@ -572,7 +595,14 @@ impl<'a> Reader<'a> {
     }
 
     fn records(&mut self, count: usize) -> Result<Vec<TileRecord>, TileWireError> {
-        let mut records = Vec::with_capacity(count);
+        if count > self.remaining() / RECORD_OVERHEAD {
+            return Err(TileWireError::CountTooLarge(count));
+        }
+
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(count)
+            .map_err(|_| TileWireError::CountTooLarge(count))?;
         for _ in 0..count {
             let tile_x = self.u16()?;
             let tile_y = self.u16()?;
@@ -724,6 +754,71 @@ mod tests {
         let mut encoded = encode_frame(&TileFrame::EpochAdvance { new_epoch: 1 }).unwrap();
         encoded.push(0);
         assert_eq!(decode_frame(&encoded), Err(TileWireError::TrailingBytes(1)));
+    }
+
+    #[test]
+    fn rejects_messages_above_datachannel_cap() {
+        let encoded = vec![0; MAX_DATACHANNEL_MESSAGE_SIZE + 1];
+        assert_eq!(
+            decode_frame(&encoded),
+            Err(TileWireError::MessageTooLarge(encoded.len()))
+        );
+    }
+
+    #[test]
+    fn rejects_impossible_record_counts_before_allocating() {
+        let mut snapshot = vec![WIRE_VERSION, TYPE_SNAPSHOT_CHUNK, 0, 0];
+        snapshot.extend_from_slice(&[0; SNAPSHOT_BODY_OVERHEAD - 4]);
+        snapshot.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            snapshot.len(),
+            HEADER_LEN + SNAPSHOT_BODY_OVERHEAD,
+            "fixture must end immediately after record_count"
+        );
+        assert_eq!(
+            decode_frame(&snapshot),
+            Err(TileWireError::CountTooLarge(u32::MAX as usize))
+        );
+
+        let mut update = vec![WIRE_VERSION, TYPE_TILE_UPDATE, 0, 0];
+        update.extend_from_slice(&[0; UPDATE_BODY_OVERHEAD - 2]);
+        update.extend_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(
+            update.len(),
+            HEADER_LEN + UPDATE_BODY_OVERHEAD,
+            "fixture must end immediately after record_count"
+        );
+        assert_eq!(
+            decode_frame(&update),
+            Err(TileWireError::CountTooLarge(u16::MAX as usize))
+        );
+    }
+
+    #[test]
+    fn client_control_decoder_filters_types_before_general_decode() {
+        for frame in [
+            TileFrame::Subscribe { client_id: 1 },
+            TileFrame::SnapshotRequest {
+                epoch: 2,
+                reason: SnapshotRequestReason::Manual,
+            },
+            TileFrame::GapReport {
+                epoch: 3,
+                last_seen_seq: 4,
+                expected_seq: 5,
+            },
+        ] {
+            let encoded = encode_frame(&frame).unwrap();
+            assert_eq!(decode_client_control_frame(&encoded).unwrap(), frame);
+        }
+
+        let mut malicious_snapshot = vec![WIRE_VERSION, TYPE_SNAPSHOT_CHUNK, 0, 0];
+        malicious_snapshot.extend_from_slice(&[0; SNAPSHOT_BODY_OVERHEAD - 4]);
+        malicious_snapshot.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            decode_client_control_frame(&malicious_snapshot),
+            Err(TileWireError::UnsupportedType(TYPE_SNAPSHOT_CHUNK))
+        );
     }
 
     #[test]

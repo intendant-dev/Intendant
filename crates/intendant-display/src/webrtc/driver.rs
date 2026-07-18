@@ -1897,7 +1897,7 @@ pub(crate) fn parse_authority_channel_message(text: &str) -> Option<AuthorityCha
 }
 
 pub(crate) fn parse_tile_control_message(bytes: &[u8]) -> Option<TileControlMessage> {
-    match tile_transport::decode_frame(bytes).ok()? {
+    match tile_transport::decode_client_control_frame(bytes).ok()? {
         tile_transport::TileFrame::Subscribe { client_id } => {
             Some(TileControlMessage::Subscribe { client_id })
         }
@@ -3075,6 +3075,23 @@ mod tests {
         })
         .unwrap();
         assert_eq!(parse_tile_control_message(&update), None);
+
+        let mut malicious_snapshot =
+            tile_transport::encode_frame(&tile_transport::TileFrame::SnapshotChunk {
+                epoch: 1,
+                snapshot_id: 1,
+                chunk_index: 0,
+                chunk_count: 1,
+                grid_w_tiles: 1,
+                grid_h_tiles: 1,
+                tile_size_px: 64,
+                records: Vec::new(),
+            })
+            .unwrap();
+        let record_count_offset = malicious_snapshot.len() - std::mem::size_of::<u32>();
+        malicious_snapshot[record_count_offset..].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(parse_tile_control_message(&malicious_snapshot), None);
+
         assert_eq!(parse_tile_control_message(b"not tile wire"), None);
     }
 
