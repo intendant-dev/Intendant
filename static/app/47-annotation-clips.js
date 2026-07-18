@@ -976,43 +976,19 @@ function formatSessionDetailTimestamp(value) {
   return formatLogTimestampLabel(raw);
 }
 
-const pendingAttachmentLogReceipts = [];
-const ATTACHMENT_RECEIPT_DEDUPE_MS = 30000;
-
-function normalizeAttachmentReceiptText(text) {
-  return String(text || '').trim().replace(/\s+/g, ' ');
-}
-
-function pruneAttachmentReceiptDedupe(now = Date.now()) {
-  for (let i = pendingAttachmentLogReceipts.length - 1; i >= 0; i--) {
-    if (now - pendingAttachmentLogReceipts[i].createdAt > ATTACHMENT_RECEIPT_DEDUPE_MS) {
-      pendingAttachmentLogReceipts.splice(i, 1);
-    }
-  }
-  while (pendingAttachmentLogReceipts.length > 20) pendingAttachmentLogReceipts.shift();
-}
-
-function rememberAttachmentReceipt(text) {
-  const normalized = normalizeAttachmentReceiptText(text);
-  if (!normalized) return;
-  pruneAttachmentReceiptDedupe();
-  pendingAttachmentLogReceipts.push({ text: normalized, createdAt: Date.now() });
-}
-
-function shouldSuppressAttachmentReceiptDuplicate(c) {
-  const source = String(c && c.source || '').toLowerCase();
-  if (source !== 'user') return false;
-  if (Array.isArray(c.attachment_previews) && c.attachment_previews.length > 0) return false;
-  const text = normalizeAttachmentReceiptText(c.content);
-  if (!text) return false;
-  const now = Date.now();
-  pruneAttachmentReceiptDedupe(now);
-  const idx = pendingAttachmentLogReceipts.findIndex(receipt => receipt.text === text);
-  if (idx < 0) return false;
-  pendingAttachmentLogReceipts.splice(idx, 1);
-  return true;
-}
-
+// Local attachment echo: a STATUS row (source 'attach', never
+// 'user'), so it drops out of YOU semantics — the source-user renderer
+// card, the chapter-nav user classification, and the transcript-signature
+// user pairing all key on source 'user' and ignore it. The canonical YOU
+// row for the same message is the daemon's UserMessageLog log_entry; the
+// old approach (an echo styled AS the user row plus a one-shot live-row
+// suppression) ate the canonical live row and then hydration re-introduced
+// it as a duplicate. The echo deliberately KEEPS the local thumbnails:
+// the live event lane (WASM AddLogEntry) does not carry attachment refs,
+// so this is the instant preview at send time — the canonical row gains
+// its own thumbnail strip from the record lane (session-detail hydration
+// / transcript sync) via the persisted upload refs. The echo itself is
+// local-only and never persisted, so replays show only the canonical row.
 function renderAttachmentReceipt(text, attachments, verb, sessionId) {
   if (!attachments || attachments.length === 0 || typeof renderLogEntry !== 'function') return;
   const previews = attachments.map((att) => ({
@@ -1027,12 +1003,11 @@ function renderAttachmentReceipt(text, attachments, verb, sessionId) {
   renderLogEntry({
     ts: currentLogTime(),
     level: 'info',
-    source: 'user',
+    source: 'attach',
     content,
     session_id: sessionId || undefined,
     attachment_previews: previews,
   });
-  rememberAttachmentReceipt(text);
 }
 
 function uploadAttachButtons() {

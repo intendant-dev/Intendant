@@ -398,6 +398,12 @@ html.ui-v2 .log-entry.source-prsnc .log-level { color: var(--green); }
 html.ui-v2 .log-entry.source-prsnc .log-level::after { content: 'PRESENCE'; }
 html.ui-v2 .log-entry.source-live .log-level { color: var(--sky); }
 html.ui-v2 .log-entry.source-live .log-level::after { content: 'VOICE'; }
+/* local attachment echo (47's renderAttachmentReceipt): a status row, not
+   user speech — quiet eyebrow, and deliberately NOT source-user, so it
+   never reads as (or dedupes against) the canonical YOU row */
+html.ui-v2 .log-entry.source-attach .log-level { font-size: 0; letter-spacing: 0; color: var(--text-3); }
+html.ui-v2 .log-entry.source-attach .log-level::after { content: 'ATTACH'; }
+html.ui-v2 .log-entry.source-attach .log-content { color: var(--text-3); }
 /* role dot tints */
 html.ui-v2 .log-entry.level-model .log-icon { background: var(--iris); }
 html.ui-v2 .log-entry.level-agent .log-icon { background: var(--green); }

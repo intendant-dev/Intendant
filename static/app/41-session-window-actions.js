@@ -2739,6 +2739,25 @@ function sessionNoteAttachmentPreviews(d) {
   }));
 }
 
+// User log_entry rows can carry the same upload-ref shape
+// ({upload_id, name, mime, url}) on `attachments` — the daemon's
+// UserMessageLog lane persists what the user attached. Same strip
+// renderer as session notes, but only image refs get a thumbnail src;
+// non-image files degrade straight to the named chip instead of an
+// <img> that errors into one.
+function userLogAttachmentPreviews(d) {
+  const attachments = Array.isArray(d?.attachments) ? d.attachments : [];
+  return attachments.map(att => {
+    const image = String(att?.mime || '').toLowerCase().startsWith('image/');
+    return {
+      dataUrl: image ? (att?.url || '') : '',
+      url: att?.url || '',
+      name: att?.name || 'attachment',
+      mime: att?.mime || '',
+    };
+  });
+}
+
 // Normalize a session_note wire event (live WS or a raw replay/session-
 // detail entry) into the log-command shape renderLogEntry consumes.
 function sessionNoteLogCommand(d) {
@@ -2899,7 +2918,6 @@ function renderLogEntry(c) {
     return;
   }
   finalizeSessionCommandOutputGroups(c);
-  if (shouldSuppressAttachmentReceiptDuplicate(c)) return;
   inferSessionPhaseFromLog(c);
 
   const { entry } = createLogScaffold(c, '');
