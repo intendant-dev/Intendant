@@ -532,7 +532,7 @@ pub fn daemon_fleet_label(daemon_id: &str) -> Option<String> {
 #[derive(Clone, Debug, Default)]
 pub struct FleetCertStatus {
     /// The delegated zone the rendezvous serves, from the register
-    /// response (`None` = rendezvous has no fleet DNS).
+    /// response (`None` = no currently accepted fleet-zone observation).
     pub zone: Option<String>,
     /// This daemon's fully qualified fleet name.
     pub name: Option<String>,
@@ -650,16 +650,17 @@ fn with_status(update: impl FnOnce(&mut FleetCertStatus)) {
 pub fn note_fleet_dns(zone: Option<String>, name: Option<String>) -> bool {
     fleet_dns_observed_this_process().store(true, Ordering::SeqCst);
     let (zone, name) = match (zone, name) {
-        // An absent hint is a complete observation that this rendezvous has no
-        // current delegated fleet zone. It must not resurrect remembered
-        // live status, but it does not make the historical provenance ledger
-        // incomplete.
+        // An absent hint clears current live status, but it is not affirmative
+        // evidence that a Connect-controlled fleet zone does not exist.
+        // Connect-enabled custom-domain control therefore remains closed until
+        // a coherent current zone/name pair is observed. Historical
+        // provenance remains intact.
         (None, None) => {
             with_status(|status| {
                 status.zone = None;
                 status.name = None;
             });
-            return true;
+            return false;
         }
         (Some(zone), Some(name)) => (zone, name),
         _ => {
@@ -1002,8 +1003,10 @@ pub(crate) fn refresh_installed_state_in(cert_dir: &Path) {
     }
     // Offline/Connect-disabled startup restores the last current name so an
     // installed certificate remains usable. A register response observed in
-    // this process wins, including an explicit null hint; remembered names
-    // remain discovery-only either way.
+    // this process wins for live fleet-name metadata, including an explicit
+    // null hint; a null hint still leaves the Connect-enabled custom-domain
+    // separation gate closed. Remembered names remain discovery-only either
+    // way.
     if !fleet_dns_observed_this_process().load(Ordering::SeqCst) {
         with_status(|status| {
             status.zone = restored.provenance.zone;

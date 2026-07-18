@@ -1006,23 +1006,6 @@ impl HostedControlRuntime {
                     expired_requests.push(request.request_id.clone());
                 }
             }
-            let mut expired_leases = Vec::new();
-            for lease in &mut state.hosted_control.leases {
-                if lease.status == HostedLeaseStatus::Active
-                    && lease.document.expires_unix_ms <= now
-                {
-                    lease.status = HostedLeaseStatus::Expired;
-                    expired_leases.push((
-                        lease.document.lease_id.clone(),
-                        lease.document.grant_id.clone(),
-                    ));
-                }
-            }
-            for (_, grant_id) in &expired_leases {
-                if let Some(grant) = state.grants.iter_mut().find(|grant| grant.id == *grant_id) {
-                    grant.status = "expired".to_string();
-                }
-            }
             for request_id in &expired_requests {
                 push_audit(
                     state,
@@ -1032,16 +1015,8 @@ impl HostedControlRuntime {
                     "Observed expired hosted lease request".to_string(),
                 );
             }
-            for (lease_id, _) in &expired_leases {
-                push_audit(
-                    state,
-                    actor,
-                    "hosted_lease_expire",
-                    lease_id,
-                    "Observed expired hosted lease".to_string(),
-                );
-            }
-            let changed = !expired_requests.is_empty() || !expired_leases.is_empty();
+            let expired_leases = materialize_hosted_lease_expirations(state, now, actor);
+            let changed = !expired_requests.is_empty() || expired_leases > 0;
             Ok(((), changed))
         })
     }
@@ -1257,6 +1232,34 @@ impl HostedControlRuntime {
     }
 }
 
+fn materialize_hosted_lease_expirations(state: &mut LocalIamState, now: u64, actor: &str) -> usize {
+    let mut expired_leases = Vec::new();
+    for lease in &mut state.hosted_control.leases {
+        if lease.status == HostedLeaseStatus::Active && lease.document.expires_unix_ms <= now {
+            lease.status = HostedLeaseStatus::Expired;
+            expired_leases.push((
+                lease.document.lease_id.clone(),
+                lease.document.grant_id.clone(),
+            ));
+        }
+    }
+    for (_, grant_id) in &expired_leases {
+        if let Some(grant) = state.grants.iter_mut().find(|grant| grant.id == *grant_id) {
+            grant.status = "expired".to_string();
+        }
+    }
+    for (lease_id, _) in &expired_leases {
+        push_audit(
+            state,
+            actor,
+            "hosted_lease_expire",
+            lease_id,
+            "Observed expired hosted lease".to_string(),
+        );
+    }
+    expired_leases.len()
+}
+
 fn issue_lease_record(
     state: &mut LocalIamState,
     request: &HostedLeaseRequest,
@@ -1267,6 +1270,22 @@ fn issue_lease_record(
     daemon_id: &str,
 ) -> AccessResult<HostedLeaseDocument> {
     let now = now_ms().max(0) as u64;
+    materialize_hosted_lease_expirations(state, now, &actor.id);
+    iam::normalize_hosted_lease_bindings(state);
+    let active_leases = state
+        .hosted_control
+        .leases
+        .iter()
+        .filter(|lease| {
+            lease.status == HostedLeaseStatus::Active && lease.document.expires_unix_ms > now
+        })
+        .count();
+    if active_leases >= HOSTED_LEASES_CAP {
+        return Err(AccessError(
+            "hosted lease capacity is full; retry after an active lease expires or is revoked"
+                .to_string(),
+        ));
+    }
     let stable = stable_id_digest(&format!(
         "{}\n{}",
         request.request_id, request.browser_key_fingerprint
@@ -1333,7 +1352,7 @@ fn issue_lease_record(
         revoked_at_unix_ms: None,
         revoked_by: None,
     });
-    state.hosted_control.normalize();
+    iam::normalize_hosted_lease_bindings(state);
     push_audit(
         state,
         &actor.id,
@@ -2169,6 +2188,142 @@ mod tests {
             .leases
             .iter()
             .any(|record| record.document.lease_id == lease.lease_id));
+    }
+
+    #[test]
+    fn full_active_lease_capacity_refuses_new_issuance_without_eviction() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let key = browser_key();
+        let seed = runtime
+            .create_request(
+                doorbell_input(&key, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+        let actor = owner();
+        let identity = runtime.identity().unwrap();
+        let mut state = LocalIamState::default();
+        let mut first_lease_id = String::new();
+        for index in 0..HOSTED_LEASES_CAP {
+            let mut request = seed.clone();
+            request.request_id = format!("request:active-capacity-{index}");
+            request.browser_key_fingerprint = format!("fingerprint-{index}");
+            let document = issue_lease_record(
+                &mut state,
+                &request,
+                HostedPreset::Tasks,
+                3600,
+                &actor,
+                identity,
+                "daemon-test",
+            )
+            .unwrap();
+            if index == 0 {
+                first_lease_id = document.lease_id;
+            }
+        }
+
+        let mut overflow = seed;
+        overflow.request_id = "request:active-capacity-overflow".to_string();
+        overflow.browser_key_fingerprint = "fingerprint-overflow".to_string();
+        let error = issue_lease_record(
+            &mut state,
+            &overflow,
+            HostedPreset::Tasks,
+            3600,
+            &actor,
+            identity,
+            "daemon-test",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("capacity is full"));
+        assert_eq!(state.hosted_control.leases.len(), HOSTED_LEASES_CAP);
+        assert!(state
+            .hosted_control
+            .leases
+            .iter()
+            .any(|lease| lease.document.lease_id == first_lease_id));
+        assert_eq!(
+            state
+                .principals
+                .iter()
+                .filter(|principal| principal.source == HOSTED_SOURCE)
+                .count(),
+            HOSTED_LEASES_CAP
+        );
+        assert_eq!(
+            state
+                .grants
+                .iter()
+                .filter(|grant| grant.source == HOSTED_SOURCE)
+                .count(),
+            HOSTED_LEASES_CAP
+        );
+    }
+
+    #[test]
+    fn sustained_lease_turnover_keeps_records_and_iam_bindings_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let key = browser_key();
+        let seed = runtime
+            .create_request(
+                doorbell_input(&key, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+        let actor = owner();
+        let identity = runtime.identity().unwrap();
+        let mut state = LocalIamState::default();
+        let mut newest_lease_id = String::new();
+
+        for index in 0..(HOSTED_LEASES_CAP + 32) {
+            for lease in &mut state.hosted_control.leases {
+                if lease.status == HostedLeaseStatus::Active {
+                    lease.document.expires_unix_ms = 0;
+                }
+            }
+            let mut request = seed.clone();
+            request.request_id = format!("request:turnover-{index}");
+            request.browser_key_fingerprint = format!("turnover-fingerprint-{index}");
+            newest_lease_id = issue_lease_record(
+                &mut state,
+                &request,
+                HostedPreset::Tasks,
+                3600,
+                &actor,
+                identity,
+                "daemon-test",
+            )
+            .unwrap()
+            .lease_id;
+
+            assert!(state.hosted_control.leases.len() <= HOSTED_LEASES_CAP);
+            assert_eq!(
+                state
+                    .principals
+                    .iter()
+                    .filter(|principal| principal.source == HOSTED_SOURCE)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                state
+                    .grants
+                    .iter()
+                    .filter(|grant| grant.source == HOSTED_SOURCE)
+                    .count(),
+                1
+            );
+        }
+
+        assert_eq!(state.hosted_control.leases.len(), HOSTED_LEASES_CAP);
+        assert!(state.hosted_control.leases.iter().any(|lease| {
+            lease.document.lease_id == newest_lease_id && lease.status == HostedLeaseStatus::Active
+        }));
     }
 
     #[test]

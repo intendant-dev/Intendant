@@ -56,10 +56,13 @@ service-controlled name as owner-controlled during startup. HTTP requests and
 WebSocket upgrades recheck that live gate even on an existing TLS connection;
 active custom-domain sockets carry the same gate into their recurring
 authorization and buffered-input checks, so losing eligibility closes them.
-A present fleet-DNS observation is accepted only when both fields form the
-same canonical `d-<20hex>.<zone>` pair; an empty, noncanonical, or mismatched
-pair leaves the gate closed and writes no provenance. An absent fleet-DNS hint
-is the complete observation that the current service has no delegated zone.
+A fleet-DNS observation is accepted only when both fields form the same
+canonical `d-<20hex>.<zone>` pair; an absent, empty, noncanonical, or mismatched
+pair leaves the gate closed and writes no provenance. Absence clears current
+live fleet-name metadata but is not independent evidence that the service has
+no delegated zone. A Connect-enabled custom lane therefore waits for a
+complete current observation; a Connect-disabled deployment does not use that
+service-observation gate.
 The historical exact-name and zone sets, their serialized file, and the
 process cache are all bounded. Invalid or excess history sets a durable
 incomplete marker and closes the owner-name lane; a new Connect observation

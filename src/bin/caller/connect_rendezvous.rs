@@ -403,7 +403,8 @@ struct ClientState {
     /// IP to advertise an ICE-TCP candidate on Connect offers.
     gateway_tcp_port: Option<u16>,
     /// Set only after the currently enabled rendezvous has returned a
-    /// registration response whose fleet-zone provenance was accepted.
+    /// complete registration response whose fleet-zone provenance was
+    /// accepted.
     fleet_zone_observed: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Shared lifecycle for boot-pinned relay/DNS side channels. Runtime
     /// Connect disablement cancels their in-flight work immediately; enabling
@@ -2452,6 +2453,29 @@ mod tests {
         assert!(!observed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    #[test]
+    fn omitted_fleet_dns_hint_does_not_open_the_observation_gate() {
+        let base_url = Url::parse("https://connect.example").unwrap();
+        let observed = std::sync::atomic::AtomicBool::new(true);
+        note_current_register_response(
+            &RegisterResponse {
+                claimed: false,
+                claimed_by_user_id: None,
+                claimed_by_handle: None,
+                claim_code: None,
+                claim_code_expires_unix_ms: None,
+                claim_url: None,
+                daemon_session_token: None,
+                daemon_session_expires_unix_ms: None,
+                observed_ip: None,
+                fleet_dns: None,
+            },
+            &base_url,
+            &observed,
+        );
+        assert!(!observed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     /// A register response asserting a different account link than the daemon's
     /// own signed acknowledgment must surface as a mismatch, not be
     /// silently displayed as truth.
@@ -2493,7 +2517,7 @@ mod tests {
             status_snapshot().claim_binding,
             Some(ClaimBinding::DaemonSigned)
         );
-        assert!(fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
         note_current_register_error("registration refresh unavailable", &fleet_zone_observed);
         assert!(!fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
 
@@ -2517,7 +2541,7 @@ mod tests {
             status_snapshot().claim_binding,
             Some(ClaimBinding::Mismatch)
         );
-        assert!(fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
 
         // During a mixed-version rollout an older service ignores the
         // daemon-minted hash and returns the different plaintext phrase it

@@ -737,6 +737,44 @@ impl Default for LocalIamState {
     }
 }
 
+pub(crate) fn normalize_hosted_lease_bindings(state: &mut LocalIamState) {
+    state.hosted_control.normalize();
+    let now = now_unix_ms();
+    let active_principal_ids = state
+        .hosted_control
+        .leases
+        .iter()
+        .filter(|lease| {
+            lease.status == super::hosted_control::HostedLeaseStatus::Active
+                && lease.document.expires_unix_ms > now
+        })
+        .map(|lease| lease.document.principal_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let active_grant_bindings = state
+        .hosted_control
+        .leases
+        .iter()
+        .filter(|lease| {
+            lease.status == super::hosted_control::HostedLeaseStatus::Active
+                && lease.document.expires_unix_ms > now
+        })
+        .map(|lease| {
+            (
+                lease.document.grant_id.clone(),
+                lease.document.principal_id.clone(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    state.principals.retain(|principal| {
+        principal.source != super::hosted_control::HOSTED_SOURCE
+            || active_principal_ids.contains(&principal.id)
+    });
+    state.grants.retain(|grant| {
+        grant.source != super::hosted_control::HOSTED_SOURCE
+            || active_grant_bindings.contains(&(grant.id.clone(), grant.principal_id.clone()))
+    });
+}
+
 impl LocalIamState {
     fn normalize(mut self) -> Self {
         if self.schema_version < 2 {
@@ -856,7 +894,7 @@ impl LocalIamState {
         self.grants
             .retain(|g| !g.id.trim().is_empty() && !g.principal_id.trim().is_empty());
         self.audit_events.retain(|e| !e.id.trim().is_empty());
-        self.hosted_control.normalize();
+        normalize_hosted_lease_bindings(&mut self);
         // Bound the audit trail to a recent tail, mirroring the credential
         // custody trail's in-memory cap (`credential_audit::MEM_CAP`).
         // Events are appended chronologically, so the head is the oldest.

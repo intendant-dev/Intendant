@@ -586,7 +586,7 @@ impl HostedControlState {
         retain_request_tail(&mut self.requests, HOSTED_REQUESTS_CAP);
         self.leases
             .retain(|lease| valid_id_component(&lease.document.lease_id));
-        retain_tail(&mut self.leases, HOSTED_LEASES_CAP);
+        retain_lease_tail(&mut self.leases, HOSTED_LEASES_CAP);
         self.signed_app_anchors
             .retain(|anchor| valid_id_component(&anchor.device_id));
         retain_tail(&mut self.signed_app_anchors, HOSTED_ANCHORS_CAP);
@@ -675,6 +675,33 @@ fn retain_request_tail(values: &mut Vec<HostedLeaseRequest>, cap: usize) {
     if remaining > 0 {
         values.drain(..remaining);
     }
+}
+
+fn retain_lease_tail(values: &mut Vec<HostedLeaseRecord>, cap: usize) {
+    if values.len() <= cap {
+        return;
+    }
+    // Inactive records are bounded history; active records are live
+    // authority. Prefer pruning the oldest inactive records so normalization
+    // can never invalidate a still-current lease merely because newer records
+    // were appended. Corrupt or legacy state with more than `cap` active
+    // records remains over the retention target until those records retire;
+    // issuance separately refuses to increase that active set.
+    let active = values
+        .iter()
+        .filter(|lease| lease.status == HostedLeaseStatus::Active)
+        .count();
+    let inactive_cap = cap.saturating_sub(active);
+    let inactive = values.len().saturating_sub(active);
+    let mut remaining = inactive.saturating_sub(inactive_cap);
+    values.retain(|lease| {
+        if remaining > 0 && lease.status != HostedLeaseStatus::Active {
+            remaining -= 1;
+            false
+        } else {
+            true
+        }
+    });
 }
 
 fn retain_tail<T>(values: &mut Vec<T>, cap: usize) {

@@ -73,7 +73,9 @@ read deadline at that cap. Larger authenticated request classes receive a
 bounded size-derived extension. Durable public hosted-control operations run
 through a fixed-capacity blocking boundary, so authority-store contention
 cannot occupy async gateway workers; excess work receives a retryable HTTP
-429.
+429. Concurrent active leases have a fixed cap. A full active set refuses new
+issuance without displacing an existing lease; expiry or revocation retires the
+corresponding IAM binding, and inactive lease history remains bounded.
 
 ## Trust anchors
 
