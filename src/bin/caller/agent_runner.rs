@@ -411,21 +411,20 @@ pub async fn run_agent(
                 }
             }
             write_paths.extend(session_paths.iter().cloned());
-            // Windows write grants are ACE stamps on the target dirs; the
-            // daemon stamped the launch set at startup, so per-session
-            // additions need their own refcounted stamp, held until the
-            // child exits (the GRANTS table dedups overlapping sessions,
-            // so only 0→1 transitions touch DACLs).
+            // Windows write grants are ACE stamps on the target dirs.
+            // Stamp the WHOLE effective set per spawn, not just the
+            // session additions: paths granted live after startup (the
+            // consent flow's "always allow", a settings save) arrive via
+            // the env var and would otherwise never get an ACE. The
+            // refcounted GRANTS table makes this cheap — startup-held
+            // paths just bump their count (no DACL write); only genuinely
+            // new paths pay the 0→1 stamp, and the guard's Drop returns
+            // them to 0 when the child exits.
             #[cfg(windows)]
-            let _session_ace = if session_paths.is_empty() {
-                None
-            } else {
-                Some(
-                    crate::win_sandbox::AceGuard::stamp(&[], &session_paths).map_err(|e| {
-                        CallerError::Agent(format!("stamp session write grant: {e}"))
-                    })?,
-                )
-            };
+            let _session_ace = Some(
+                crate::win_sandbox::AceGuard::stamp(&[], &write_paths)
+                    .map_err(|e| CallerError::Agent(format!("stamp session write grant: {e}")))?,
+            );
             #[cfg(not(windows))]
             let _ = &session_paths;
             let sandbox = SandboxConfig {

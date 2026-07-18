@@ -1915,8 +1915,10 @@ Also: {"source": "bare"}"#;
     fn sandbox_enabled_defaults_on_with_explicit_escape_hatches() {
         let mut flags = cli_flags_for_tests();
 
-        // Nothing set anywhere: the write sandbox is ON.
-        assert!(sandbox_enabled(&flags, None));
+        // Nothing set anywhere: the write sandbox is ON — except Windows,
+        // where whole-tree ACE propagation makes default-on a boot hang
+        // and the sandbox stays opt-in (rationale on sandbox_enabled).
+        assert_eq!(sandbox_enabled(&flags, None), !cfg!(windows));
         // Explicit config decides when no flag is given…
         assert!(sandbox_enabled(&flags, Some(true)));
         assert!(!sandbox_enabled(&flags, Some(false)));
@@ -2858,7 +2860,18 @@ fn is_simple_task(task: &str) -> bool {
 /// confinement), `--no-sandbox` forces it off, otherwise an explicit
 /// `[sandbox] enabled` in intendant.toml decides.
 fn sandbox_enabled(flags: &CliFlags, config_enabled: Option<bool>) -> bool {
-    flags.sandbox || (!flags.no_sandbox && config_enabled.unwrap_or(true))
+    // Default ON everywhere except Windows: a Windows write grant is an
+    // inheritable ACE, and `SetNamedSecurityInfoW` propagates it through
+    // the whole granted subtree synchronously — on a real project tree
+    // (or a shared toolchain cache) that turns daemon startup into a
+    // minutes-long DACL rewrite (proven live: every e2e daemon hit its
+    // boot timeout on the CI runner). Until the Windows mechanism is
+    // redesigned (scoped per-spawn stamping like the scoped shells, not
+    // whole-tree startup grants), the Windows sandbox stays opt-in via
+    // `--sandbox` / `[sandbox] enabled = true`, and enabling it accepts
+    // the first-stamp propagation cost on large trees.
+    let platform_default = !cfg!(windows);
+    flags.sandbox || (!flags.no_sandbox && config_enabled.unwrap_or(platform_default))
 }
 
 fn configure_sandbox_env(
