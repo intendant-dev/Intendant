@@ -89,7 +89,11 @@ period makes it reclaimable. Startup and every later certificate pass retry a
 reclaimable journal before creating another challenge, covering crashes,
 cancellation, and transient provider failures. Store the credential as a
 daemon credential lease where possible; configuration names an
-environment-variable fallback but never embeds the secret.
+environment-variable fallback but never embeds the secret. While a cleanup
+journal exists, its fallback name remains in the supervised-child environment
+scrub even if the lane is disabled or later names a different fallback. An
+unreadable journal makes that scrub conservatively remove all DNS-shaped
+credential names until the journal is repaired or retired.
 
 Certificate files are shared across daemon processes. Every renewal pass
 reloads and validates that shared pair before deciding to order. New
@@ -100,9 +104,10 @@ path. A durable owner lease serializes issuance through pair commit. The same
 record retains the ACME order URL, private key, and CSR across cancellation, so
 a replacement process resumes the exact order and finalization material.
 Explicitly missing or expired orders are replaced, and resumable state has a
-bounded lifetime. A sibling process therefore adopts a newly committed
-generation instead of consuming another CA order; a stopped owner lease can be
-reclaimed without changing the order key.
+bounded lifetime measured from the current order's immutable start time;
+ownership claims and retry updates cannot extend it. A sibling process
+therefore adopts a newly committed generation instead of consuming another CA
+order; a stopped owner's lease can be reclaimed without changing the order key.
 
 Custom-domain, relay, and credential wiring is restart-only. The live Connect
 toggle may change enablement or the rendezvous destination, but the running
@@ -151,7 +156,9 @@ admission window. That bucket is an availability hint only: it is not an
 identity, credential, or authorization input. The empty passkey store,
 including its stable WebAuthn user id, is created atomically under that lock
 before any ceremony is exposed. Passkey records and counters stay in the same
-owner-only authority store.
+owner-only authority store. Authentication finish rechecks the current fleet
+zone and durable name provenance inside that same authority transaction before
+it updates a counter or issues a lease.
 
 Opening `https://box.example.com/` creates a non-extractable tab key. A
 successful user-verifying passkey assertion approves only the signed request
@@ -169,9 +176,11 @@ assertions; active leases remain separately visible and revocable.
 ## Operational checks
 
 The daemon checks the stored certificate at boot and checks renewal every
-twelve hours, renewing inside thirty days of expiry. The Access card shows the
-certificate state, expiry, provider, account URI, passkeys, and the last
-configuration or issuance error.
+twelve hours, renewing inside thirty days of expiry. Failed checks retry with a
+bounded backoff, and granting a DNS credential lease wakes both issuance and
+pending cleanup immediately. The Access card shows the certificate state,
+expiry, provider, account URI, passkeys, and the last configuration or issuance
+error.
 
 The custom name and service-assigned fleet name are distinct TLS provenance
 classes. Exact custom SNI must agree with the HTTP Host and browser Origin.

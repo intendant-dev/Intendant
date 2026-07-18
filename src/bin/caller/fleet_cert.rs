@@ -1101,10 +1101,10 @@ fn load_issuance_store_locked_in(cert_dir: &Path) -> Result<InFlightIssuanceStor
     store.orders.retain(|order| {
         // Once ACME has assigned an order URL, this is resumable authority
         // state rather than a local liveness marker. Retain it until the
-        // order reaches an explicit terminal state (which calls `finish`) so
-        // a certificate finalized during a long outage can still have its
-        // serial recorded as our own before the CT guard evaluates it.
-        let age = now.saturating_sub(order.updated_unix_ms.max(order.started_unix_ms));
+        // order reaches an explicit terminal state (which calls `finish`) or
+        // its absolute lifetime ends, so periodic ownership renewals cannot
+        // keep an unusable order alive forever.
+        let age = now.saturating_sub(order.started_unix_ms);
         if order.order_url.is_some() {
             age < FLEET_CERT_RESUMABLE_ORDER_TTL_MS
         } else {
@@ -3161,7 +3161,9 @@ mod tests {
                 .unwrap();
             let stale = now_unix_ms().saturating_sub(FLEET_CERT_RESUMABLE_ORDER_TTL_MS + 1);
             order.started_unix_ms = stale;
-            order.updated_unix_ms = stale;
+            // Ownership retries may update liveness, but cannot extend the
+            // immutable lifetime of the ACME order itself.
+            order.updated_unix_ms = now_unix_ms();
             order.owner_token = None;
             order.owner_lease_expires_unix_ms = 0;
             write_issuance_store_locked_in(temp.path(), &store)

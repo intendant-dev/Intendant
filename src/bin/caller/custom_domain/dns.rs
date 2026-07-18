@@ -19,6 +19,9 @@ const PENDING_CHALLENGE_FILE: &str = "custom-domain-dns-challenge.json";
 const PENDING_CHALLENGE_SCHEMA_VERSION: u32 = 2;
 const PENDING_CHALLENGE_MAX_BYTES: u64 = 64 * 1024;
 const PENDING_CHALLENGE_RETRY_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+const PENDING_CHALLENGE_ACTIVE_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const PENDING_CHALLENGE_ERROR_RETRY_INITIAL: Duration = Duration::from_secs(30);
+const PENDING_CHALLENGE_ERROR_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
 const PENDING_CHALLENGE_CREATE_LEASE_MS: u64 = 2 * 60 * 1000;
 const PENDING_CHALLENGE_ACTIVE_LEASE_MS: u64 = 2 * 60 * 60 * 1000;
 const PENDING_CHALLENGE_CLEANUP_LEASE_MS: u64 = 60 * 60 * 1000;
@@ -278,12 +281,31 @@ async fn cleanup_pending_challenge(pending: &PendingChallenge) -> Result<(), Str
 
 pub(crate) fn spawn_cleanup_loop(cert_dir: PathBuf) {
     tokio::spawn(async move {
+        let mut error_retry = PENDING_CHALLENGE_ERROR_RETRY_INITIAL;
         loop {
             match retry_pending_challenge(&cert_dir).await {
-                Ok(_) => {}
-                Err(error) => eprintln!("[custom-domain] pending DNS-01 cleanup: {error}"),
+                Ok(true) => {
+                    error_retry = PENDING_CHALLENGE_ERROR_RETRY_INITIAL;
+                    tokio::time::sleep(PENDING_CHALLENGE_RETRY_INTERVAL).await;
+                }
+                Ok(false) => {
+                    error_retry = PENDING_CHALLENGE_ERROR_RETRY_INITIAL;
+                    tokio::time::sleep(PENDING_CHALLENGE_ACTIVE_RETRY_INTERVAL).await;
+                }
+                Err(error) => {
+                    eprintln!("[custom-domain] pending DNS-01 cleanup: {error}");
+                    let credential_granted =
+                        crate::credential_leases::wait_for_dns_credential_grant(error_retry).await;
+                    error_retry = if credential_granted {
+                        PENDING_CHALLENGE_ERROR_RETRY_INITIAL
+                    } else {
+                        std::cmp::min(
+                            error_retry.saturating_mul(2),
+                            PENDING_CHALLENGE_ERROR_RETRY_MAX,
+                        )
+                    };
+                }
             }
-            tokio::time::sleep(PENDING_CHALLENGE_RETRY_INTERVAL).await;
         }
     });
 }
@@ -365,6 +387,41 @@ fn load_pending_challenge(cert_dir: &Path) -> Result<Option<PendingChallenge>, S
     .map_err(|error| error.to_string())
 }
 
+fn pending_challenge_credential_env_name(pending: &PendingChallenge) -> Result<String, String> {
+    match &pending.provider {
+        CustomDomainDnsConfig::Cloudflare { token_env, .. } => {
+            crate::credential_leases::dns_credential_env_name(
+                token_env.as_deref(),
+                "CLOUDFLARE_API_TOKEN",
+                "_API_TOKEN",
+            )
+        }
+        CustomDomainDnsConfig::Rfc2136 { secret_env, .. } => {
+            crate::credential_leases::dns_credential_env_name(
+                secret_env.as_deref(),
+                "INTENDANT_RFC2136_TSIG_SECRET",
+                "_TSIG_SECRET",
+            )
+        }
+    }
+}
+
+/// Synchronize the supervised-child scrub with durable cleanup authority.
+/// The scrub setter records an unreadable journal as fail-closed state.
+pub(super) fn refresh_pending_credential_child_scrub(cert_dir: &Path) -> Result<(), String> {
+    let env_name = load_pending_challenge(cert_dir).and_then(|pending| {
+        pending
+            .as_ref()
+            .map(pending_challenge_credential_env_name)
+            .transpose()
+    });
+    crate::credential_leases::configure_pending_dns_credential_child_scrub(
+        cert_dir,
+        env_name.clone(),
+    );
+    env_name.map(|_| ())
+}
+
 fn write_pending_challenge_locked(
     cert_dir: &Path,
     pending: &PendingChallenge,
@@ -397,7 +454,8 @@ fn begin_pending_challenge(cert_dir: &Path, pending: &PendingChallenge) -> Resul
         }
         write_pending_challenge_locked(cert_dir, pending)
     })
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    refresh_pending_credential_child_scrub(cert_dir)
 }
 
 fn require_challenge_owner(
@@ -527,7 +585,8 @@ fn remove_pending_challenge(
         }
         crate::access::authority_store::remove_file_locked(&pending_challenge_path(cert_dir))
     })
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    refresh_pending_credential_child_scrub(cert_dir)
 }
 
 fn now_unix_ms() -> u64 {

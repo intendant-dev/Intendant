@@ -530,11 +530,16 @@ tree head pinned under the daemon state root
 then downloads every listed artifact exactly as a browser would and
 compares hashes — nonzero exit and a per-artifact diff on divergence.
 Metadata bodies, proof arrays, artifact lists, and their strings are all
-bounded before verification work. Each artifact is capped at 64 MiB; one
-manifest run is additionally capped at 256 MiB and five minutes, with bounded
-response-header and between-chunk idle waits. Verification fetches do not
-follow HTTP redirects, so a served log response cannot turn the monitor into a
-request to another origin, loopback, link-local, or LAN service.
+bounded before verification work. Manifests must have unique, strictly sorted
+paths and cover the stable Connect pages, installers, service worker, and brand
+routes; those minimum routes cannot be removed and an empty declaration cannot
+pass. Each artifact is capped at 64 MiB; one manifest run is additionally
+capped at 256 MiB and five minutes, with bytes consumed by an over-limit stream
+charged to that aggregate budget and with bounded response-header and
+between-chunk idle waits.
+Verification fetches do not follow HTTP redirects, so a served log response
+cannot turn the monitor into a request to another origin, loopback, link-local,
+or LAN service.
 Every daemon with Connect enabled also runs this check on boot and then
 daily as an advisory tripwire (the CT tripwire's sibling): a divergence flips
 `hosted_bundle_state` to `alert` on the Connect status payload and
@@ -550,12 +555,12 @@ independent monitors from multiple vantage points buy is that
 *sustained* or *later-denied* equivocation becomes evidenced: the
 operator is publicly committed to a manifest history, every daemon is a
 monitor from its own vantage point, and "we never served that" stops
-being deniable. Coverage is what the service declares — but the HTML
-entrypoints are declared, so undeclared payloads require serving
-modified (hash-diverging) entrypoints. A transforming proxy between
-verifier and service (one that rewrites bodies) will surface as a
-divergence; the verifier sends no `Accept-Encoding`, so ordinary
-compression layers do not.
+being deniable. The verifier fixes a minimum route set independently of the
+service's declaration. Additional embedded assets remain service-declared, but
+an undeclared executable payload still requires a modified (hash-diverging)
+entrypoint or service worker. A transforming proxy between verifier and service
+(one that rewrites bodies) will surface as a divergence; the verifier sends no
+`Accept-Encoding`, so ordinary compression layers do not.
 
 **Reproducibility.** A manifest entry maps back to source: take the entry's
 `git_sha`, check out that commit, and rebuild. The embedded Connect pages are

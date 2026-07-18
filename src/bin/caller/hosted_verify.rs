@@ -387,6 +387,21 @@ struct ManifestArtifact {
     sha256: String,
 }
 
+/// Stable executable entrypoints that every Connect bundle manifest must
+/// cover. Additional embedded assets may evolve, but omitting one of these
+/// paths can never turn a smaller declaration into a successful check.
+const REQUIRED_BUNDLE_PATHS: &[&str] = &[
+    "/",
+    "/access",
+    "/connect",
+    "/favicon.png",
+    "/install.ps1",
+    "/install.sh",
+    "/logo.svg",
+    "/sw.js",
+    "/trust",
+];
+
 /// The parsed `artifact_manifest` leaf, self-integrity verified (the
 /// carried `manifest_hash` recomputes from the carried list).
 #[derive(Clone, Debug)]
@@ -438,6 +453,23 @@ fn parse_manifest_leaf(leaf_json: &str) -> Result<ManifestLeaf, String> {
             Ok(ManifestArtifact { path, sha256 })
         })
         .collect::<Result<_, String>>()?;
+    if artifacts
+        .windows(2)
+        .any(|pair| pair[0].path >= pair[1].path)
+    {
+        return Err("manifest artifact paths are not unique and strictly sorted".to_string());
+    }
+    let missing_required = REQUIRED_BUNDLE_PATHS
+        .iter()
+        .copied()
+        .filter(|required| !artifacts.iter().any(|artifact| artifact.path == *required))
+        .collect::<Vec<_>>();
+    if !missing_required.is_empty() {
+        return Err(format!(
+            "manifest omits required served paths: {}",
+            missing_required.join(", ")
+        ));
+    }
     let manifest_hash = bounded_sha256(
         leaf.get("manifest_hash")
             .and_then(|v| v.as_str())
@@ -630,7 +662,7 @@ const ARTIFACT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 enum ArtifactFetch {
     Hashed { sha256_hex: String, bytes: usize },
     HttpStatus(u16),
-    TooLarge,
+    TooLarge { bytes: usize },
 }
 
 /// The per-artifact verdict: `None` = matches the log.
@@ -644,7 +676,7 @@ fn artifact_mismatch(artifact: &ManifestArtifact, fetched: &ArtifactFetch) -> Op
             short_hash(sha256_hex),
         )),
         ArtifactFetch::HttpStatus(status) => Some(format!("{}: HTTP {status}", artifact.path)),
-        ArtifactFetch::TooLarge => Some(format!(
+        ArtifactFetch::TooLarge { .. } => Some(format!(
             "{}: response exceeded {} MiB",
             artifact.path,
             ARTIFACT_BYTE_CAP / (1024 * 1024)
@@ -840,7 +872,7 @@ async fn fetch_artifact_with_timeouts(
         .content_length()
         .is_some_and(|length| length > byte_cap as u64)
     {
-        return Ok(ArtifactFetch::TooLarge);
+        return Ok(ArtifactFetch::TooLarge { bytes: 0 });
     }
     let mut hasher = Sha256::new();
     let mut total = 0usize;
@@ -855,7 +887,7 @@ async fn fetch_artifact_with_timeouts(
         let chunk = chunk.map_err(|e| format!("GET {url}: {e}"))?;
         total = total.saturating_add(chunk.len());
         if total > byte_cap {
-            return Ok(ArtifactFetch::TooLarge);
+            return Ok(ArtifactFetch::TooLarge { bytes: total });
         }
         hasher.update(&chunk);
     }
@@ -920,10 +952,14 @@ async fn compare_live_artifacts(
                 ArtifactFetch::Hashed { bytes, .. } => {
                     fetched_bytes = fetched_bytes.saturating_add(*bytes);
                 }
-                ArtifactFetch::TooLarge if fetch_cap < limits.per_artifact_bytes => {
-                    return Err(Unavailable(
-                        "hosted bundle verification reached its aggregate byte budget".to_string(),
-                    ));
+                ArtifactFetch::TooLarge { bytes } => {
+                    fetched_bytes = fetched_bytes.saturating_add(*bytes);
+                    if fetch_cap < limits.per_artifact_bytes || fetched_bytes > limits.total_bytes {
+                        return Err(Unavailable(
+                            "hosted bundle verification reached its aggregate byte budget"
+                                .to_string(),
+                        ));
+                    }
                 }
                 _ => {}
             }
@@ -1669,7 +1705,7 @@ pub(crate) async fn verify_hosted_release(
                 ArtifactFetch::HttpStatus(status) => {
                     mismatches.push(format!("{}: download HTTP {status}", artifact.name))
                 }
-                ArtifactFetch::TooLarge => mismatches.push(format!(
+                ArtifactFetch::TooLarge { .. } => mismatches.push(format!(
                     "{}: download exceeded {} GiB",
                     artifact.name,
                     RELEASE_DOWNLOAD_BYTE_CAP / (1024 * 1024 * 1024),
@@ -2067,6 +2103,34 @@ async fn run_release_cli(
 mod tests {
     use super::*;
 
+    fn required_manifest_artifacts(bytes: &[u8]) -> Vec<ManifestArtifact> {
+        REQUIRED_BUNDLE_PATHS
+            .iter()
+            .map(|path| ManifestArtifact {
+                path: (*path).to_string(),
+                sha256: sha256_hex(bytes),
+            })
+            .collect()
+    }
+
+    fn manifest_leaf_json(artifacts: &[ManifestArtifact]) -> String {
+        serde_json::json!({
+            "kind": "artifact_manifest",
+            "unix_ms": 42,
+            "bundle_version": "0.1.0",
+            "git_sha": "abc1234",
+            "manifest_hash": manifest_hash_hex(artifacts),
+            "artifacts": artifacts
+                .iter()
+                .map(|artifact| serde_json::json!({
+                    "path": artifact.path,
+                    "sha256": artifact.sha256,
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
     #[tokio::test(start_paused = true)]
     async fn daemon_monitor_checks_on_boot_then_daily() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2393,21 +2457,10 @@ mod tests {
 
     #[test]
     fn manifest_leaf_parses_and_self_verifies() {
-        let artifacts = vec![ManifestArtifact {
-            path: "/app.html".to_string(),
-            sha256: sha256_hex(b"bundle"),
-        }];
-        let good = serde_json::json!({
-            "kind": "artifact_manifest",
-            "unix_ms": 42,
-            "bundle_version": "0.1.0",
-            "git_sha": "abc1234",
-            "manifest_hash": manifest_hash_hex(&artifacts),
-            "artifacts": [{ "path": "/app.html", "sha256": sha256_hex(b"bundle") }],
-        })
-        .to_string();
+        let artifacts = required_manifest_artifacts(b"bundle");
+        let good = manifest_leaf_json(&artifacts);
         let leaf = parse_manifest_leaf(&good).unwrap();
-        assert_eq!(leaf.artifacts.len(), 1);
+        assert_eq!(leaf.artifacts.len(), REQUIRED_BUNDLE_PATHS.len());
         assert_eq!(leaf.bundle_version, "0.1.0");
         assert_eq!(leaf.git_sha, "abc1234");
         assert_eq!(leaf.unix_ms, 42);
@@ -2425,6 +2478,22 @@ mod tests {
         })
         .to_string();
         assert!(parse_manifest_leaf(&relative).is_err());
+
+        let empty = manifest_leaf_json(&[]);
+        assert!(parse_manifest_leaf(&empty)
+            .unwrap_err()
+            .contains("omits required served paths"));
+
+        let subset = manifest_leaf_json(&required_manifest_artifacts(b"bundle")[..1]);
+        assert!(parse_manifest_leaf(&subset)
+            .unwrap_err()
+            .contains("/connect"));
+
+        let mut duplicate = required_manifest_artifacts(b"bundle");
+        duplicate.insert(1, duplicate[0].clone());
+        assert!(parse_manifest_leaf(&manifest_leaf_json(&duplicate))
+            .unwrap_err()
+            .contains("not unique"));
     }
 
     /// The golden mismatch case: a fabricated manifest against fabricated
@@ -2461,9 +2530,11 @@ mod tests {
             artifact_mismatch(&expected, &ArtifactFetch::HttpStatus(404)).unwrap(),
             "/app.html: HTTP 404"
         );
-        assert!(artifact_mismatch(&expected, &ArtifactFetch::TooLarge)
-            .unwrap()
-            .contains("exceeded"));
+        assert!(
+            artifact_mismatch(&expected, &ArtifactFetch::TooLarge { bytes: 17 })
+                .unwrap()
+                .contains("exceeded")
+        );
     }
 
     async fn spawn_artifact_budget_server() -> (Url, tokio::task::JoinHandle<()>) {
@@ -2495,6 +2566,15 @@ mod tests {
                             Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"x")),
                             index + 1,
                         ))
+                    });
+                    axum::body::Body::from_stream(stream)
+                }),
+            )
+            .route(
+                "/oversized",
+                axum::routing::get(|| async {
+                    let stream = futures_util::stream::once(async {
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"abcdef"))
                     });
                     axum::body::Body::from_stream(stream)
                 }),
@@ -2533,6 +2613,32 @@ mod tests {
                 assert!(error.contains("aggregate byte budget"), "{error}");
             }
             other => panic!("aggregate byte budget must stop the fetch, got {other:?}"),
+        }
+
+        let oversized = [
+            ManifestArtifact {
+                path: "/oversized".to_string(),
+                sha256: sha256_hex(b"abcdef"),
+            },
+            ManifestArtifact {
+                path: "/oversized".to_string(),
+                sha256: sha256_hex(b"abcdef"),
+            },
+        ];
+        let limits = BundleFetchLimits {
+            per_artifact_bytes: 4,
+            total_bytes: 8,
+            total_timeout: Duration::from_secs(1),
+            response_timeout: Duration::from_secs(1),
+            idle_timeout: Duration::from_secs(1),
+        };
+        match compare_live_artifacts(&client, &base, &oversized, limits).await {
+            Err(VerifyFailure::Unavailable(error)) => {
+                assert!(error.contains("aggregate byte budget"), "{error}");
+            }
+            other => {
+                panic!("oversized streams must count against the aggregate budget, got {other:?}")
+            }
         }
 
         let slow = [ManifestArtifact {

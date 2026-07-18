@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -486,6 +487,7 @@ impl PasskeyRuntime {
         &self,
         input: AuthenticationFinishInput,
         origin: &str,
+        current_fleet_zone_observed: Option<&AtomicBool>,
     ) -> Result<PasskeyLeaseResult, String> {
         self.require_origin(origin)?;
         let mut pending = self.mutate_ceremonies(|ceremonies| {
@@ -504,6 +506,11 @@ impl PasskeyRuntime {
         let credential_id = CredentialId::from_b64url(&input.credential.id)
             .map_err(|error| format!("passkey credential id: {error}"))?;
         self.with_passkey_lease_transaction(|| {
+            // Fleet provenance and passkey state share this authority lock.
+            // Recheck after acquiring it so a zone observation committed
+            // between the HTTP precheck and this transaction cannot mint a
+            // lease from a lane that has just become ineligible.
+            self.require_lane_eligible_locked(current_fleet_zone_observed)?;
             self.mutate_store(|store| {
                 if store.user_id != pending.user_id {
                     return Err(
@@ -648,6 +655,20 @@ impl PasskeyRuntime {
             operation().map_err(crate::access::AccessError)
         })
         .map_err(|error| error.to_string())
+    }
+
+    fn require_lane_eligible_locked(
+        &self,
+        current_fleet_zone_observed: Option<&AtomicBool>,
+    ) -> Result<(), String> {
+        match super::domain_control_error_in(
+            &self.cert_dir,
+            &self.domain,
+            current_fleet_zone_observed,
+        ) {
+            None => Ok(()),
+            Some(error) => Err(error),
+        }
     }
 }
 
@@ -973,6 +994,46 @@ mod tests {
             String::new(),
             false,
         ))
+    }
+
+    #[test]
+    fn lease_transaction_rechecks_current_fleet_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = PasskeyRuntime::new(
+            domain(),
+            dir.path().to_path_buf(),
+            hosted_runtime(dir.path()),
+        )
+        .unwrap();
+        let observed = AtomicBool::new(true);
+
+        runtime
+            .with_passkey_lease_transaction(|| {
+                runtime.require_lane_eligible_locked(Some(&observed))
+            })
+            .unwrap();
+
+        observed.store(false, std::sync::atomic::Ordering::SeqCst);
+        let error = runtime
+            .with_passkey_lease_transaction(|| {
+                runtime.require_lane_eligible_locked(Some(&observed))
+            })
+            .unwrap_err();
+        assert!(error.contains("waiting for the current Connect fleet-zone observation"));
+
+        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::fleet_cert::remember_fleet_origin_for_test(
+            dir.path(),
+            Some("example.test"),
+            "fleet.example.test",
+        )
+        .unwrap();
+        let error = runtime
+            .with_passkey_lease_transaction(|| {
+                runtime.require_lane_eligible_locked(Some(&observed))
+            })
+            .unwrap_err();
+        assert!(error.contains("overlaps a service-controlled fleet name or zone"));
     }
 
     #[test]

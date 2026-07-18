@@ -15,6 +15,8 @@ const CERT_PAIR_FILE: &str = "custom-domain-certificate-pair.json";
 const CERT_PAIR_SCHEMA_VERSION: u32 = 1;
 const CERT_PAIR_MAX_BYTES: u64 = 512 * 1024;
 const CHECK_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+const ERROR_RETRY_INITIAL: Duration = Duration::from_secs(30);
+const ERROR_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
 const RENEW_BEFORE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const DNS_CHALLENGE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const ISSUANCE_LEASE_FILE: &str = "custom-domain-cert-issuance.json";
@@ -81,17 +83,24 @@ pub(super) fn restore(
     let (cert_pem, key_pem) = match read_stored_certificate_pair(cert_dir)? {
         Some(pair) => pair,
         None => {
-            update_status(status, |current| current.last_error = account_error);
+            update_status(status, |current| {
+                current.state = "pending".to_string();
+                current.not_after_unix_ms = None;
+                current.restore_error = None;
+                current.last_error = account_error;
+            });
             return Ok(());
         }
     };
     require_exact_dns_name(&cert_pem, &domain.name)?;
+    crate::web_tls::validate_custom_domain_certificate_key_pair(&cert_pem, &key_pem)?;
     let not_after = crate::fleet_cert::cert_not_after_unix_ms(&cert_pem)
         .ok_or_else(|| "custom-domain certificate has no usable expiry".to_string())?;
     if not_after <= now_unix_ms() {
         update_status(status, |current| {
             current.state = "expired".to_string();
             current.not_after_unix_ms = Some(not_after);
+            current.restore_error = None;
             current.last_error = account_error;
         });
         return Ok(());
@@ -100,6 +109,7 @@ pub(super) fn restore(
     update_status(status, |current| {
         current.state = "valid".to_string();
         current.not_after_unix_ms = Some(not_after);
+        current.restore_error = None;
         current.last_error = account_error;
     });
     Ok(())
@@ -276,7 +286,7 @@ fn load_issuance_lease_locked(cert_dir: &Path) -> Result<Option<IssuanceLeaseRec
         ));
     }
     let now = now_unix_ms();
-    let age = now.saturating_sub(record.updated_unix_ms.max(record.started_unix_ms));
+    let age = now.saturating_sub(record.started_unix_ms);
     if (record.order_url.is_some() && age >= ISSUANCE_RESUMABLE_TTL_MS)
         || (record.order_url.is_none() && age >= ISSUANCE_LOCAL_TTL_MS)
     {
@@ -551,6 +561,7 @@ pub(super) fn spawn(
     current_fleet_zone_observed: Option<Arc<AtomicBool>>,
 ) {
     tokio::spawn(async move {
+        let mut error_retry = ERROR_RETRY_INITIAL;
         loop {
             if current_fleet_zone_observed
                 .as_ref()
@@ -573,7 +584,16 @@ pub(super) fn spawn(
                     current.last_error = Some(error.clone());
                 });
                 eprintln!("[custom-domain] certificate check: {error}");
+                let credential_granted =
+                    crate::credential_leases::wait_for_dns_credential_grant(error_retry).await;
+                error_retry = if credential_granted {
+                    ERROR_RETRY_INITIAL
+                } else {
+                    std::cmp::min(error_retry.saturating_mul(2), ERROR_RETRY_MAX)
+                };
+                continue;
             }
+            error_retry = ERROR_RETRY_INITIAL;
             tokio::time::sleep(CHECK_INTERVAL).await;
         }
     });
@@ -1033,7 +1053,9 @@ mod tests {
         .unwrap();
         let expiry = refresh_shared_certificate_status(&domain, dir.path(), &status).unwrap();
         assert!(expiry.is_some());
-        assert_eq!(status.read().unwrap().state, "valid");
+        let status = status.read().unwrap();
+        assert_eq!(status.state, "valid");
+        assert_eq!(status.restore_error, None);
     }
 
     #[test]
@@ -1050,12 +1072,23 @@ mod tests {
             certificate.signing_key.serialize_pem(),
         )
         .unwrap();
-        let status = Arc::new(RwLock::new(CertificateStatus::default()));
+        let status = Arc::new(RwLock::new(CertificateStatus {
+            state: "valid".to_string(),
+            not_after_unix_ms: Some(u64::MAX),
+            restore_error: Some("stale restore error".to_string()),
+            ..Default::default()
+        }));
 
         assert_eq!(
             refresh_shared_certificate_status(&domain, dir.path(), &status).unwrap(),
             None
         );
+        {
+            let status = status.read().unwrap();
+            assert_eq!(status.state, "pending");
+            assert_eq!(status.not_after_unix_ms, None);
+            assert_eq!(status.restore_error, None);
+        }
         let guard = match IssuanceLeaseGuard::begin(&domain, dir.path()).unwrap() {
             IssuanceClaim::Acquired(guard) => *guard,
             IssuanceClaim::CertificateCurrent => panic!("the legacy pair is incomplete"),
@@ -1199,7 +1232,8 @@ mod tests {
                 .unwrap();
             let stale = now_unix_ms().saturating_sub(ISSUANCE_RESUMABLE_TTL_MS + 1);
             record.started_unix_ms = stale;
-            record.updated_unix_ms = stale;
+            // Reclaims update liveness but must not renew the order itself.
+            record.updated_unix_ms = now_unix_ms();
             record.owner_token = None;
             record.owner_lease_expires_unix_ms = 0;
             write_issuance_lease_locked(dir.path(), &record)

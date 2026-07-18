@@ -3,7 +3,7 @@ mod dns;
 mod passkeys;
 
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -20,6 +20,36 @@ pub(crate) struct RelayCertificateMaterial {
     pub(crate) server_name: String,
     pub(crate) certificate_chain_pem: String,
     pub(crate) private_key_pem: String,
+}
+
+/// Load durable DNS-cleanup authority at the process boundary before any
+/// supervised coding child can inherit the controller environment. Gateway
+/// construction repeats this against its explicit store for testability.
+pub(crate) fn configure_pending_credential_child_scrub() {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    if let Err(error) = dns::refresh_pending_credential_child_scrub(&cert_dir) {
+        eprintln!("[custom-domain] load pending DNS credential child-scrub state: {error}");
+    }
+}
+
+fn domain_control_error_in(
+    cert_dir: &Path,
+    domain: &ValidatedCustomDomain,
+    current_fleet_zone_observed: Option<&AtomicBool>,
+) -> Option<String> {
+    if current_fleet_zone_observed.is_some_and(|observed| !observed.load(Ordering::SeqCst)) {
+        return Some(
+            "custom-domain control is waiting for the current Connect fleet-zone observation"
+                .to_string(),
+        );
+    }
+    match crate::fleet_cert::is_service_controlled_name_in(cert_dir, &domain.name) {
+        Ok(false) => None,
+        Ok(true) => {
+            Some("custom-domain name overlaps a service-controlled fleet name or zone".to_string())
+        }
+        Err(error) => Some(format!("check custom-domain name provenance: {error}")),
+    }
 }
 
 pub(crate) fn relay_certificate_material(
@@ -109,6 +139,9 @@ impl CustomDomainRuntime {
         hosted: Arc<HostedControlRuntime>,
         current_fleet_zone_observed: Option<Arc<AtomicBool>>,
     ) -> Self {
+        if let Err(error) = dns::refresh_pending_credential_child_scrub(&cert_dir) {
+            eprintln!("[custom-domain] load pending DNS credential child-scrub state: {error}");
+        }
         if !config.enabled {
             return Self {
                 configured: false,
@@ -329,7 +362,11 @@ impl CustomDomainRuntime {
         input: AuthenticationFinishInput,
         origin: &str,
     ) -> Result<PasskeyLeaseResult, String> {
-        self.passkeys()?.authentication_finish(input, origin)
+        self.passkeys()?.authentication_finish(
+            input,
+            origin,
+            self.current_fleet_zone_observed.as_deref(),
+        )
     }
 
     pub(crate) fn revoke(&self, input: RevokeInput) -> Result<bool, String> {
@@ -349,23 +386,11 @@ impl CustomDomainRuntime {
 
     fn domain_control_error(&self) -> Option<String> {
         let domain = self.domain.as_ref()?;
-        if self
-            .current_fleet_zone_observed
-            .as_ref()
-            .is_some_and(|observed| !observed.load(Ordering::SeqCst))
-        {
-            return Some(
-                "custom-domain control is waiting for the current Connect fleet-zone observation"
-                    .to_string(),
-            );
-        }
-        match crate::fleet_cert::is_service_controlled_name_in(&self.cert_dir, &domain.name) {
-            Ok(false) => None,
-            Ok(true) => Some(
-                "custom-domain name overlaps a service-controlled fleet name or zone".to_string(),
-            ),
-            Err(error) => Some(format!("check custom-domain name provenance: {error}")),
-        }
+        domain_control_error_in(
+            &self.cert_dir,
+            domain,
+            self.current_fleet_zone_observed.as_deref(),
+        )
     }
 }
 
