@@ -147,9 +147,6 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
     managed_context_density_handoff: bool,
     managed_context_density_handoff_completed: bool,
 ) -> DrainOutcome {
-    use std::sync::atomic::Ordering;
-
-    let approval_counter = std::sync::atomic::AtomicU64::new(1);
     let mut turns_in_round = 0usize;
     let local_session_id = config.session_id.clone();
     let alias_session_id = config.alias_session_id.clone();
@@ -1816,7 +1813,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         });
                     }
                 } else {
-                    let id = approval_counter.fetch_add(1, Ordering::Relaxed);
+                    let id = event::next_approval_id();
                     // Arm the responder BEFORE announcing the approval: a
                     // frontend that reacts to the event instantly (scripted
                     // control-socket clients) must find the registry entry,
@@ -1963,7 +1960,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         });
                     }
                 } else {
-                    let id = approval_counter.fetch_add(1, Ordering::Relaxed);
+                    let id = event::next_approval_id();
                     // Arm the responder BEFORE announcing the question (same
                     // race as approvals: an instant answer must find the
                     // registry entry).
@@ -2163,7 +2160,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         });
                     }
                 } else {
-                    let id = approval_counter.fetch_add(1, Ordering::Relaxed);
+                    let id = event::next_approval_id();
                     // Arm the responder BEFORE announcing (same race as the
                     // command-approval arm above).
                     let rx = if let Some(slot) = config.json_approval {

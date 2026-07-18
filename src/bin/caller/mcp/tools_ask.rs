@@ -12,10 +12,8 @@
 //! Resolution rides the same wire as every other frontend intent: the
 //! waiter subscribes to the event bus and reacts to the
 //! `ControlMsg::AnswerQuestion` / approval-verb `ControlCommand`s that name
-//! its id. Ask ids are allocated from [`ASK_USER_ID_BASE`], a range
-//! disjoint from the per-session loop counters (which count turns/approvals
-//! from 1), so an MCP-armed ask can never collide with a session's own
-//! pending approvals in the shared id space.
+//! its id. Ask ids use the same process-wide allocator as every approval and
+//! structured-question rail, so concurrent sessions cannot collide.
 //!
 //! `notify_user` is the opposite shape: it broadcasts
 //! [`AppEvent::UserNotification`] and returns immediately. Urgency levels
@@ -37,20 +35,6 @@ pub(crate) const ASK_USER_DEFAULT_WAIT_SECS: u64 = 300;
 pub(crate) const ASK_USER_MAX_WAIT_SECS: u64 = 900;
 /// Maximum notification text size. Notifications are alerts, not documents.
 pub(crate) const NOTIFY_USER_MAX_TEXT_BYTES: usize = 4096;
-
-/// Base of the MCP ask id range. Per-session agent loops allocate approval
-/// and question ids from small local counters (turn numbers, counters from
-/// 1); MCP-armed asks share the same `u64` id space on the wire, so they
-/// draw from a disjoint high range instead. Still well below JS's
-/// `Number.MAX_SAFE_INTEGER` (2^53) — dashboards handle the id as a number.
-pub(crate) const ASK_USER_ID_BASE: u64 = 1 << 40;
-
-static ASK_ID_COUNTER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(ASK_USER_ID_BASE);
-
-fn next_ask_id() -> u64 {
-    ASK_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
 
 /// Ids of `ask_user` questions currently blocked on an answer. Advisory
 /// registry: resolution happens in the waiter (via the bus), but other
@@ -294,7 +278,7 @@ impl IntendantServer {
             );
         };
 
-        let id = next_ask_id();
+        let id = crate::event::next_approval_id();
 
         // No frontend can ever answer in this shape (headless without a web
         // gateway): tell the model to proceed instead of blocking on nobody
@@ -365,8 +349,8 @@ impl IntendantServer {
             // Every frontend intent rides the bus as a ControlCommand
             // (web /ws, dashboard tunnel, control socket, MCP twins), so
             // matching here resolves uniformly across daemon shapes. Ids
-            // from the dedicated ask range are globally unique — match on
-            // id alone.
+            // from the process-wide allocator are globally unique — match
+            // on id alone.
             let AppEvent::ControlCommand(msg) = event else {
                 continue;
             };
@@ -555,10 +539,11 @@ mod tests {
     }
 
     #[test]
-    fn ask_ids_come_from_the_disjoint_range() {
-        // Loop-local approval counters count from 1; the shared id space
-        // only stays collision-free if MCP asks never dip below the base.
-        assert!(next_ask_id() >= ASK_USER_ID_BASE);
+    fn ask_ids_use_the_process_wide_wire_allocator() {
+        let first = crate::event::next_approval_id();
+        let second = crate::event::next_approval_id();
+        assert!(second > first);
+        assert!(second <= (1_u64 << 53) - 1);
     }
 
     #[test]
@@ -640,7 +625,7 @@ mod tests {
             }
             other => panic!("expected UserQuestionRequired, got {other:?}"),
         };
-        assert!(id >= ASK_USER_ID_BASE, "ask id {id} below the MCP range");
+        assert!(id <= (1_u64 << 53) - 1, "ask id is not wire-safe: {id}");
         assert_eq!(questions.len(), 1);
         assert_eq!(questions[0].question, "Which color?");
         assert!(ask_user_question_pending(id));

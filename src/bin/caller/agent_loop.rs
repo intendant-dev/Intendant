@@ -834,17 +834,6 @@ pub(crate) async fn handle_peer_tool_call(
     }
 }
 
-/// Approval ids for controller-tool gates (outbound MCP calls,
-/// `invoke_skill`, `spawn_sub_agent`, `workflow_checkpoint`). Own base keeps
-/// them disjoint from the turn-numbered runtime approval ids and the
-/// live-audio consent range (`1 << 41`).
-const CONTROLLER_TOOL_APPROVAL_ID_BASE: u64 = 1 << 42;
-static CONTROLLER_TOOL_APPROVAL_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(CONTROLLER_TOOL_APPROVAL_ID_BASE);
-fn next_controller_tool_approval_id() -> u64 {
-    CONTROLLER_TOOL_APPROVAL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Outcome of the controller-tool approval gate.
 enum ControllerToolGate {
     /// Dispatch the call.
@@ -919,7 +908,7 @@ async fn gate_controller_tool_call(
     slog(session_log, |l| {
         l.approval(&category.to_string(), preview, "waiting")
     });
-    let id = next_controller_tool_approval_id();
+    let id = event::next_approval_id();
 
     // (response, via_json): on the JSON stdin lane this waiter emits
     // ApprovalResolved itself; on the registry lane the resolver
@@ -2298,7 +2287,7 @@ pub(crate) async fn run_agent_loop(
                     .clone()
                     .unwrap_or_else(|| "The agent asked for your input.".to_string());
                 slog(&session_log, |l| l.human_question(&question));
-                let question_id = turn as u64;
+                let question_id = event::next_approval_id();
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 approval_registry.lock().unwrap().insert(question_id, tx);
                 bus.send(AppEvent::UserQuestionRequired {
@@ -2425,18 +2414,19 @@ pub(crate) async fn run_agent_loop(
                         return Ok((loop_stats, LoopExitReason::Denied));
                     }
 
+                    let approval_id = event::next_approval_id();
                     if let Some(slot) = json_approval {
                         // JSON mode: emit approval event and wait for stdin response
                         bus.send(AppEvent::ApprovalRequired {
                             session_id: local_session_id.clone(),
-                            id: turn as u64,
+                            id: approval_id,
                             command_preview: preview.clone(),
                             category: cat,
                         });
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         {
                             let mut guard = slot.lock().unwrap();
-                            *guard = Some((turn as u64, tx));
+                            *guard = Some((approval_id, tx));
                         }
                         match rx.await {
                             Ok(event::ApprovalResponse::Approve) => {
@@ -2445,7 +2435,7 @@ pub(crate) async fn run_agent_loop(
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "approve".to_string(),
                                 });
                                 apply_user_approval(
@@ -2464,7 +2454,7 @@ pub(crate) async fn run_agent_loop(
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "approve_all".to_string(),
                                 });
                                 apply_user_approval(
@@ -2483,7 +2473,7 @@ pub(crate) async fn run_agent_loop(
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "skip".to_string(),
                                 });
                                 should_skip = true;
@@ -2500,7 +2490,7 @@ pub(crate) async fn run_agent_loop(
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "deny".to_string(),
                                 });
                                 bus.send(AppEvent::TaskComplete {
@@ -2524,10 +2514,10 @@ pub(crate) async fn run_agent_loop(
                     } else {
                         // Interactive mode (TUI/MCP): approval via registry
                         let (tx, rx) = tokio::sync::oneshot::channel();
-                        approval_registry.lock().unwrap().insert(turn as u64, tx);
+                        approval_registry.lock().unwrap().insert(approval_id, tx);
                         bus.send(AppEvent::ApprovalRequired {
                             session_id: local_session_id.clone(),
-                            id: turn as u64,
+                            id: approval_id,
                             command_preview: preview.clone(),
                             category: cat,
                         });
@@ -2897,7 +2887,7 @@ Proceed with explicit assumptions and continue without additional questions."
                     .clone()
                     .unwrap_or_else(|| "The agent asked for your input.".to_string());
                 slog(&session_log, |l| l.human_question(&question));
-                let question_id = turn as u64;
+                let question_id = event::next_approval_id();
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 approval_registry.lock().unwrap().insert(question_id, tx);
                 bus.send(AppEvent::UserQuestionRequired {
@@ -3008,18 +2998,19 @@ Proceed with explicit assumptions and continue without additional questions."
                         return Ok((loop_stats, LoopExitReason::Denied));
                     }
 
+                    let approval_id = event::next_approval_id();
                     if let Some(slot) = json_approval {
                         // JSON mode: emit approval event and wait for stdin response
                         bus.send(AppEvent::ApprovalRequired {
                             session_id: local_session_id.clone(),
-                            id: turn as u64,
+                            id: approval_id,
                             command_preview: preview.clone(),
                             category: cat,
                         });
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         {
                             let mut guard = slot.lock().unwrap();
-                            *guard = Some((turn as u64, tx));
+                            *guard = Some((approval_id, tx));
                         }
                         match rx.await {
                             Ok(event::ApprovalResponse::Approve) => {
@@ -3028,7 +3019,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "approve".to_string(),
                                 });
                                 apply_user_approval(
@@ -3047,7 +3038,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "approve_all".to_string(),
                                 });
                                 apply_user_approval(
@@ -3066,7 +3057,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "skip".to_string(),
                                 });
                                 should_skip = true;
@@ -3083,7 +3074,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "deny".to_string(),
                                 });
                                 bus.send(AppEvent::TaskComplete {
@@ -3107,10 +3098,10 @@ Proceed with explicit assumptions and continue without additional questions."
                     } else {
                         // Interactive mode (TUI/MCP): approval via registry
                         let (tx, rx) = tokio::sync::oneshot::channel();
-                        approval_registry.lock().unwrap().insert(turn as u64, tx);
+                        approval_registry.lock().unwrap().insert(approval_id, tx);
                         bus.send(AppEvent::ApprovalRequired {
                             session_id: local_session_id.clone(),
-                            id: turn as u64,
+                            id: approval_id,
                             command_preview: preview.clone(),
                             category: cat,
                         });
@@ -3818,12 +3809,6 @@ fn messages_json_dump_enabled() -> bool {
     *ENABLED
 }
 
-/// Distinct id space for sandbox-consent question prompts (turn ids count
-/// up from zero, live-audio consent uses 1<<41, controller-tool gates
-/// 1<<42).
-const SANDBOX_CONSENT_ID_BASE: u64 = 1 << 43;
-static SANDBOX_CONSENT_ID_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// One sandbox write denial worth offering a grant for.
 struct SandboxDenial {
     /// The path the runtime was refused on, as reported.
@@ -4006,8 +3991,7 @@ fn raise_sandbox_consent_cards(
                 continue;
             }
         }
-        let id = SANDBOX_CONSENT_ID_BASE
-            + SANDBOX_CONSENT_ID_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = event::next_approval_id();
         let (tx, rx) = tokio::sync::oneshot::channel();
         approval_registry
             .lock()
