@@ -826,7 +826,7 @@ mod tests {
         use crate::keymap::dom_code_to_x11_keycode;
         // Spot-check well-known evdev+8 keycodes across the key classes the
         // browser input path sends; the full table (and its per-row tests)
-        // lives in display/keymap.rs.
+        // lives in keymap.rs.
         assert_eq!(dom_code_to_x11_keycode("KeyA"), Some(38));
         assert_eq!(dom_code_to_x11_keycode("Digit1"), Some(10));
         assert_eq!(dom_code_to_x11_keycode("F1"), Some(67));

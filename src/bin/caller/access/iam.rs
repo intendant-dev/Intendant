@@ -2505,7 +2505,7 @@ fn permission_summary(id: &str) -> &'static str {
         "agenda.read" => "Read the daemon's agenda ledger (parked items and counts).",
         "agenda.write" => "Park, edit, complete, reopen, and retire agenda items.",
         "memory.read" => "Search and read Memory claims (bounded, provenance-labeled).",
-        "memory.write" => "Propose Memory claims (the candidate lane; ephemeral in P1.1).",
+        "memory.write" => "Propose Memory claims (the candidate lane).",
         _ => "Operation permission.",
     }
 }
@@ -3230,7 +3230,9 @@ fn builtin_role_templates() -> Vec<IamRole> {
             id: "role:scoped-human".to_string(),
             label: "Scoped human".to_string(),
             status: "enforced".to_string(),
-            summary: "Minimal user/client IAM role for stable browser mTLS and Connect account request bindings.".to_string(),
+            summary:
+                "Minimal human/client IAM role for stable browser or native mTLS bindings."
+                    .to_string(),
             permissions: vec!["access.inspect".to_string()],
             source: "builtin".to_string(),
         },

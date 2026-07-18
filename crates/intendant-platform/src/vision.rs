@@ -454,6 +454,7 @@ mod tests {
     // `test_support::TEST_ENV_LOCK`: serializes env-mutating tests within
     // this test binary. A lock cannot serialize across crates' separate
     // test processes anyway, so crate-local is exactly as strong.
+    #[cfg(not(target_os = "macos"))]
     static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]

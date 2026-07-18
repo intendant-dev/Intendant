@@ -54,13 +54,15 @@ macOS keychain). Consequences:
   use under their current terms) are duplicated onto every machine, with
   no central place to see or withdraw them.
 
-Meanwhile the browser presence client already demonstrates the other
-model: voice API keys live in browser `localStorage` and calls go
-straight from the client to the provider. The daemon never holds them.
-That precedent generalizes — but not naively, because agentic traffic is
-not voice traffic. The design below decomposes the problem into three
-independent decisions: **custody** (where credentials live), **authority
-transport** (how a daemon gets to use them), and **egress** (whose
+Meanwhile the browser presence client already demonstrates a narrower version
+of the other model: Gemini voice can keep its API key in the unlocked client
+vault (legacy fallback: browser `localStorage`) and call Gemini directly.
+OpenAI voice instead asks the daemon to mint a short-lived Realtime client
+secret from daemon-held or leased authority; the browser never receives the
+long-lived OpenAI key. That precedent generalizes — but not naively, because
+agentic traffic is not voice traffic. The design below decomposes the problem
+into three independent decisions: **custody** (where credentials live),
+**authority transport** (how a daemon gets to use them), and **egress** (whose
 network path carries model calls).
 
 ## Custody: the vault
@@ -97,7 +99,8 @@ store chip on the vault card):
   dashboard vault client or crypto worker, so users cannot create, unseal, or
   spend this store through the shipped hosted UI.
 - **Daemon store** (direct dashboards): the daemon itself keeps the
-  blob at `~/.intendant/vault-blob.json` (0600), served over the
+  blob at `<state-root>/vault-blob.json` (0600; the state root defaults
+  to `~/.intendant`), served over the
   verified control channel (`api_daemon_vault_fetch` /
   `api_daemon_vault_publish`, `credentials.manage`-gated). No Connect
   service is in the loop: a direct dashboard creates, unseals, and
@@ -213,12 +216,12 @@ the asymmetric sealing half, shipped: a P-256 deposit keypair lives
 *inside* the sealed body (`settings.deposit_lane`, so it reaches every
 unlocking device but exists only as ciphertext at rest), and an unlocked
 dashboard publishes its public half to the daemon
-(`~/.intendant/vault-deposit-key.pub.json`). The CLI reads a secret from
+(`<state-root>/vault-deposit-key.pub.json`). The CLI reads a secret from
 **stdin** — piped, so the plaintext never rides a web UI, a terminal
 echo, or this daemon's disk — seals it ECIES-style to that public key
 (ephemeral P-256 → HKDF-SHA256 → AES-256-GCM, the label bound into both
 the KDF info and the AEAD AAD), and queues one ciphertext record per
-deposit under `~/.intendant/vault-deposits.d/`. The next unlocked
+deposit under `<state-root>/vault-deposits.d/`. The next unlocked
 dashboard on this daemon folds queued deposits into the vault as
 ordinary entries and deletes them **only after** the re-wrapped blob has
 published; a deposit sealed to a superseded key stays queued and visible
@@ -264,14 +267,32 @@ raw frame names are reserved for the `egress_*` relay path):
 | `api_credential_lease_renew` | browser → daemon request with `lease_id` (or legacy `leaseId`) | `lease_id`, new `expires_at_unix_ms` |
 | `api_credential_lease_revoke` | browser → daemon request with optional `lease_id` / `leaseId` / `kind`; omitted revokes every lease on the daemon | `revoked` count |
 | `api_credential_lease_status` | browser → daemon request with no params | active `leases` (`lease_id`, `kind`, `label`, `mode`, grant/renew/expiry timestamps, `ttl_ms`, `offline_ms`, `use_count`), active `egress` relays, and `expired_note` |
-| `api_credential_custody_trail` | browser → daemon request with no params | recent custody events (`at_unix_ms`, `event`, `kind`, `label`, `actor`, `origin`, `detail`) from the daemon's own record — lease grants/expiries/revocations, relay changes, restart resets; metadata only, never material. `origin` stamps the session's origin class on ceremonies (`hosted` / `direct` / `local` / `peer`; empty on sessionless events and pre-field records). Kept at `~/.intendant/custody-audit.jsonl` (0600, bounded), rendered in Access → Advanced → Custody trail |
+| `api_credential_custody_trail` | browser → daemon request with no params | recent custody events (`at_unix_ms`, `event`, `kind`, `label`, `actor`, `origin`, `detail`) from the daemon's own record — lease grants/expiries/revocations, relay changes, restart resets; metadata only, never material. `origin` stamps the session's origin class on ceremonies (`hosted` / `direct` / `local` / `peer`; empty on sessionless events and pre-field records). Kept at `<state-root>/custody-audit.jsonl` (0600, bounded), rendered in Access → Advanced → Custody trail |
 | `api_daemon_vault_fetch` | browser → daemon request with no params | the daemon-stored sealed blob, if any: `revision`, `vault` (E2E ciphertext the daemon cannot read), `updated_unix_ms`; `revision: 0, vault: null` when empty |
 | `api_daemon_vault_publish` | browser → daemon request with `revision` and the full `vault` blob | `stored` (`false` = idempotent same-revision republish); rollback, same-revision divergence, and MAC-stripping are refused with a `vault revision conflict:`-prefixed error the dashboard treats like the hosted store's HTTP 409 |
+| `api_daemon_vault_deposit_key_fetch` | browser → daemon request with no params | whether the write-only deposit public key is present and, when present, its `alg`, `pub_raw_b64u`, and publication time |
+| `api_daemon_vault_deposit_key_publish` | browser → daemon request with `pub_raw_b64u` and optional `alg` (default `ECDH-P256`) | `stored: true` after the public key is written |
+| `api_daemon_vault_deposits_fetch` | browser → daemon request with no params | queued sealed deposit records; ciphertext and metadata only |
+| `api_daemon_vault_deposits_consume` | browser → daemon request with deposit `ids` | `removed` count; the dashboard calls this only after the re-wrapped vault blob has published |
+| `api_credential_egress_register` | browser → daemon request with provider `kinds` and optional `request_credits` capability | registered provider kinds for this authenticated dashboard-control session |
+| `api_credential_egress_unregister` | browser → daemon request with optional provider `kinds`; omitted removes every relay for the session | `unregistered` count |
+| `api_credential_egress_probe` | browser → daemon request with `kind` (`anthropic` or `gemini`) and optional `model` | forced relay test result (`text`, `model`), even when a local key or lease exists |
 
 Leases ride the same per-frame IAM checks as every other tunnel
 operation; granting requires a session whose principal holds a new
 `credentials.manage` gate (IAM v2 catalog), so a scoped guest session
 cannot fuel or drain a daemon.
+
+The same gate covers **executable repointing**: the external-agent
+command paths (`codex_command`, `codex_managed_command`,
+`claude_command`) decide which binary runs with the machine's
+credentials and workspace, so changing them — via POST `/api/settings`
+(per-field: everything else on the settings surface stays
+Settings-class, and a full-payload round trip that merely echoes the
+current values saves fine) or via the `SetCodexCommand` /
+`SetCodexManagedCommand` ControlMsg twins — requires
+`credentials.manage`. A federated peer or scoped session holding only
+Settings cannot repoint what the daemon executes.
 
 **Lifetime.** Two knobs, both user-visible:
 
@@ -333,16 +354,24 @@ durable from ephemeral authority:
 **External-agent materialization (a documented weakening).** Codex and
 Claude Code are child processes that read credentials from files, not
 from process memory we control. A lease for them therefore materializes
-a daemon-private temporary home under `~/.intendant/leased-auth`, outside
+a daemon-private temporary home under `<state-root>/leased-auth`, outside
 any project worktree: `codex-home/auth.json` for Codex and
 `claude-home/.credentials.json` for Claude Code. The directories are
-0700, the auth files are 0600, and spawns point the child process at
-them with `CODEX_HOME` or `CLAUDE_CONFIG_DIR`. The materialization is
+0700 and the auth files are 0600 on Unix; Windows relies on the user's
+profile ACLs. Spawns point the child process at them with `CODEX_HOME` or
+`CLAUDE_CONFIG_DIR`. The materialization is
 deleted on lease expiry, revocation, and daemon shutdown. During an
 active lease those bytes are on disk; the ledger says so plainly.
 Mitigations: the materialization root is outside worktrees and is never
 seen by rewind/snapshot machinery, the file exists only while leased,
 and crash recovery deletes stale materializations at startup.
+
+To preserve CLI behavior, materialization also attempts to copy Codex
+`config.toml` or Claude `settings.json` from the user's ordinary home. Those
+copies are currently **best-effort and silent on failure**, and the daemon does
+not inspect arbitrary user configuration to prove it contains no secrets; only
+the known auth files are deliberately excluded. A missing/failed copy can
+therefore change backend behavior without a surfaced custody error.
 
 One deliberate exception on the expiry leg: if a leased CLI session is
 **still running** when its lease expires, the home's deletion is deferred
@@ -361,7 +390,7 @@ immediately, live session or not.
 agent's session transcripts (Codex `sessions/`, Claude `projects/`), and
 deleting the home would erase them from message search. Cleanup therefore
 first *renames* those transcript subdirectories into a credential-free
-staging area under `~/.intendant/cache/message_search/staging/`
+staging area under `<state-root>/cache/message_search/staging/`
 (same-volume rename — effectively instant), then deletes the home
 immediately (`lease_transcript_staging.rs`). Staging is strictly
 best-effort and never delays secret deletion: on any failure a marker
@@ -553,7 +582,7 @@ create the missing cross-origin delivery bridge.
    plumbing. `.env` fallback untouched; distinct "unfueled" error.
 3. ✅ OAuth materialization for Codex (`CODEX_HOME`) and Claude Code
    (`CLAUDE_CONFIG_DIR`): private temporary homes under
-   `~/.intendant/leased-auth/{codex-home,claude-home}`, outside
+   `<state-root>/leased-auth/{codex-home,claude-home}`, outside
    worktrees and snapshots, deleted on expiry, revocation, shutdown, and
    a startup recovery sweep; full-credential opt-in per daemon (OFF by
    default in the browser UX). Access-token mode shipped as the browser

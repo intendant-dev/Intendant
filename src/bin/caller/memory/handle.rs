@@ -1,11 +1,10 @@
 //! The daemon-side Memory authority. One [`MemoryHandle`] exists per
 //! daemon process; every surface — HTTP route, dashboard tunnel twin,
 //! MCP tool, ctl — funnels through it, which serializes writes under
-//! one lock (the single-writer contract for the ephemeral plane).
-//! Mirrors `agenda::AgendaHandle`, minus persistence: the plane is
-//! EPHEMERAL by the ratified P1 write bar, so there is no store dir,
-//! no refresh-from-disk, and nothing survives a restart — every view
-//! says so (`durability: "ephemeral"`).
+//! one lock (the plane's single-writer contract). Storage is selected
+//! at bootstrap: the primary OS normally uses the durable store while
+//! other modes use an in-memory plane. Every view reports the
+//! effective `durability` (`"durable"` or `"ephemeral"`).
 
 use std::sync::Mutex;
 

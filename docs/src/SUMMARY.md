@@ -8,6 +8,7 @@
 - [Multi-Agent Orchestration](./multi-agent.md)
 - [External-Agent Orchestration](./external-agent-orchestration.md)
 - [Control Plane & Daemon](./control-plane-and-daemon.md)
+- [Agenda and Memory](./agenda-and-memory.md)
 - [Display Pipeline](./display-pipeline.md)
 - [Peer Federation](./peer-federation.md)
 - [Self-Hosted Rendezvous](./self-hosted-rendezvous.md)

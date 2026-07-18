@@ -2251,7 +2251,7 @@ pub(crate) async fn run_agent_loop(
             };
             empty_command_streak = 0;
 
-            // Inject project context and normalize
+            // Normalize legacy command aliases before classification.
             let json_str = finalize_command_batch(json_str);
             // One parse of the final batch answers every per-batch question
             // below (ask-human rail, Xvfb triggers, Activity preview, runtime
@@ -2287,79 +2287,79 @@ pub(crate) async fn run_agent_loop(
             // AnswerQuestion into this session's approval registry) instead
             // of dispatching to the runtime, which would park on the
             // human_question file no frontend watches under the daemon.
-            // Scope: batches that are entirely askHuman (the shape models
-            // emit — a blocking question stands alone); a mixed batch keeps
-            // the legacy path and logs why.
+            // ANY batch containing askHuman is consumed by the question (the
+            // text loop's ratified semantics): the askHuman call gets the
+            // answer, and the other calls of a mixed batch get a not-executed
+            // note asking the model to re-issue them. (A mixed batch
+            // previously fell to the runtime file prompt nothing watched.)
             if !headless && json_approval.is_none() && batch_facts.has_ask_human {
-                if batch_facts.all_ask_human {
-                    let question = batch_facts
-                        .ask_human_question
-                        .clone()
-                        .unwrap_or_else(|| "The agent asked for your input.".to_string());
-                    slog(&session_log, |l| l.human_question(&question));
-                    let question_id = turn as u64;
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    approval_registry.lock().unwrap().insert(question_id, tx);
-                    bus.send(AppEvent::UserQuestionRequired {
-                        session_id: local_session_id.clone(),
-                        id: question_id,
-                        questions: vec![crate::types::UserQuestion {
-                            question: question.clone(),
-                            header: String::new(),
-                            options: Vec::new(),
-                            multi_select: false,
-                        }],
-                    });
-                    let answer = match rx.await {
-                        Ok(event::ApprovalResponse::Answer { answers }) => answers
-                            .get(&question)
-                            .cloned()
-                            .or_else(|| answers.values().next().cloned())
-                            .unwrap_or_default(),
-                        Ok(_) | Err(_) => String::new(),
-                    };
-                    let answered = !answer.trim().is_empty();
-                    let reply = if answered {
-                        slog(&session_log, |l| l.human_response_sent());
-                        answer
-                    } else {
-                        "The user dismissed the question without answering. Proceed with \
-                         your best judgment; you can re-ask later if it is still relevant."
-                            .to_string()
-                    };
-                    let mut first_result_seq: Option<u64> = None;
-                    for (call_id, tool_name) in &batch.call_id_names {
-                        if handled_call_ids.contains(call_id) {
-                            continue;
-                        }
-                        let seq = conversation.add_tool_result(call_id, tool_name, &reply);
+                let question = batch_facts
+                    .ask_human_question
+                    .clone()
+                    .unwrap_or_else(|| "The agent asked for your input.".to_string());
+                slog(&session_log, |l| l.human_question(&question));
+                let question_id = turn as u64;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                approval_registry.lock().unwrap().insert(question_id, tx);
+                bus.send(AppEvent::UserQuestionRequired {
+                    session_id: local_session_id.clone(),
+                    id: question_id,
+                    questions: vec![crate::types::UserQuestion {
+                        question: question.clone(),
+                        header: String::new(),
+                        options: Vec::new(),
+                        multi_select: false,
+                    }],
+                });
+                let answer = match rx.await {
+                    Ok(event::ApprovalResponse::Answer { answers }) => answers
+                        .get(&question)
+                        .cloned()
+                        .or_else(|| answers.values().next().cloned())
+                        .unwrap_or_default(),
+                    Ok(_) | Err(_) => String::new(),
+                };
+                let answered = !answer.trim().is_empty();
+                let reply = if answered {
+                    slog(&session_log, |l| l.human_response_sent());
+                    answer
+                } else {
+                    "The user dismissed the question without answering. Proceed with \
+                     your best judgment; you can re-ask later if it is still relevant."
+                        .to_string()
+                };
+                const NOT_EXECUTED: &str = "Not executed: this batch paused for the \
+                     user's answer to askHuman. Read the answer from the askHuman \
+                     result and re-issue this command if it is still needed.";
+                let mut first_result_seq: Option<u64> = None;
+                for (call_id, tool_name) in &batch.call_id_names {
+                    if handled_call_ids.contains(call_id) {
+                        continue;
+                    }
+                    let is_ask = tool_name == "ask_human";
+                    let text = if is_ask { reply.as_str() } else { NOT_EXECUTED };
+                    let seq = conversation.add_tool_result(call_id, tool_name, text);
+                    if is_ask {
                         first_result_seq.get_or_insert(seq);
                     }
-                    // Native-tool askHuman answers enter the conversation as
-                    // tool results; project the raw answer into the message
-                    // lane referencing that result's seq (rewind cuts cover
-                    // it through ref_seq).
-                    if answered {
-                        if let Some(seq) = first_result_seq {
-                            slog(&session_log, |l| {
-                                let _ = l.conversation_message_user(
-                                    seq,
-                                    MessageProvenance::AskHumanAnswer,
-                                    &reply,
-                                    Some(seq),
-                                );
-                            });
-                        }
-                    }
-                    continue;
                 }
-                slog(&session_log, |l| {
-                    l.warn(
-                        "askHuman arrived mixed into a command batch; the runtime file \
-                         prompt handles it, which no dashboard surfaces — answer via MCP \
-                         or expect the model to re-ask",
-                    )
-                });
+                // Native-tool askHuman answers enter the conversation as
+                // tool results; project the raw answer into the message
+                // lane referencing the first askHuman result's seq (rewind
+                // cuts cover it through ref_seq).
+                if answered {
+                    if let Some(seq) = first_result_seq {
+                        slog(&session_log, |l| {
+                            let _ = l.conversation_message_user(
+                                seq,
+                                MessageProvenance::AskHumanAnswer,
+                                &reply,
+                                Some(seq),
+                            );
+                        });
+                    }
+                }
+                continue;
             }
 
             // Autonomy / approval check (same as text path)

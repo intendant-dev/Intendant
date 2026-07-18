@@ -144,7 +144,7 @@ Getting a direct control origin today: use a typed/pinned address, an
 owner-controlled hostname, mDNS or a tailnet route, then complete the direct
 mTLS enrollment ceremony. The fleet strip may remember that independently
 verified URL, and the daemon-store vault
-([Credential Custody](./credential-custody.md#the-vault)) makes the trusted
+([Credential Custody](./credential-custody.md#custody-the-vault)) makes the trusted
 tab self-sufficient.
 
 **Fleet certificates are different.** A rendezvous serving a delegated DNS subzone
@@ -171,12 +171,13 @@ With it on, unproved fleet traffic remains anonymous `role:none`; protected
 traffic must prove an approved short-lived lease and pass the exact
 route/method/frame/action projection. The rendezvous controls the name and can
 serve code at the same origin, so the lease ceiling and immutable floor—not the
-name—bound that code. Peer certificate witnesses are shipped; an eligible
-signed application may also report when a qualifying signed distribution
-exists, while the current unsigned development bundle is never accepted as a
-witness. CT monitoring remains the slower fallback. None of those signals
-grants authority. Certless root exists only on verified loopback;
-`--allow-public-plaintext` and fleet WebPKI grant no authority by themselves.
+name—bound that code. Peer certificate witnesses are shipped. The
+signed-application witness protocol may also report when a qualifying signed
+distribution exists, but the current unsigned development artifact is never
+eligible. CT remains the slower fallback when no outside vantage is available.
+None of those signals grants authority. Certless root exists only on verified
+loopback; `--allow-public-plaintext` and fleet WebPKI grant no authority by
+themselves.
 
 A worked example, one fleet:
 
@@ -221,10 +222,10 @@ Three rungs, ordered by what betrayal costs the attacker:
    bytes only. The optional hosted lane does not promote the origin; it admits
    only a confirmed, short-lived lease under a compiled preset, while all
    unproved protected HTTP/MCP/signaling/WebSocket traffic remains refused.
-   Peer witnessing is shipped, eligible signed-application witnesses are
-   accepted only when a qualifying distribution anchor exists, and CT remains
-   the fallback when neither outside vantage is available. Detection is not
-   authority. Assigned fleet names are remembered
+   Peer witnessing is shipped, an eligible signed application can report only
+   when a qualifying distribution anchor exists, and CT remains the fallback
+   when neither outside vantage is available. Detection is not authority.
+   Assigned fleet names are remembered
    durably even when Connect is later disabled or reports no current zone; a
    previously service-controlled name never decays into a direct anchor.
    Pre-provenance installs recover exact names from `fleet-cert.pem` on
@@ -359,7 +360,7 @@ the owner's memory. All four are **shipped**:
    (`hosted`/`direct`/`local`/`peer`). Any future hosted vault client would need
    to honor the trusted-only policy, but that would remain client-side mistake
    prevention, not protection from a malicious served bundle. See the **local
-   vault** in [Credential Custody](./credential-custody.md#the-vault).
+   vault** in [Credential Custody](./credential-custody.md#custody-the-vault).
 4. **First-contact route, surfaced and watched.** Historical/staged enrollment approvals
    carry a route chip computed daemon-side (`iam::origin_route_class`:
    hosted / fleet / direct / unknown — route provenance for approval
@@ -377,8 +378,10 @@ the owner's memory. All four are **shipped**:
    overwriting newer evidence, and only a locally recorded own serial removes
    one.
    A foreign serial or unreadable durable verdict suspends hosted-lease
-   admission. A crt.sh fetch failure creates no new evidence, preserves the
-   last durable verdict, and does not block certificate renewal.
+   admission while leaving direct/local management and certificate renewal
+   available. A crt.sh fetch failure creates no new evidence, preserves the
+   last durable verdict, and stamps `ct_last_error` rather than blocking
+   renewal.
 
 ## Two lanes: whose authority a pane spends
 

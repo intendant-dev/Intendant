@@ -105,7 +105,7 @@ pub struct ComputerUseConfig {
     #[serde(default)]
     pub model: Option<String>,
     /// Display backend for input/screenshot. Default: "auto" (detect from env).
-    /// Values: "x11", "wayland", "macos", "auto".
+    /// Values: "x11", "wayland", "macos", "windows", "auto".
     #[serde(default = "default_backend")]
     pub backend: String,
 }
@@ -911,9 +911,8 @@ pub struct ConnectConfig {
     #[serde(default)]
     pub relay_enabled: bool,
     /// `host:port` of the relay's raw passthrough port, where this daemon dials
-    /// back browser connections (e.g. `relay.example.com:443`). Learned from
-    /// the register response when the rendezvous advertises one; this override
-    /// pins it explicitly.
+    /// back browser connections (e.g. `relay.example.com:443`). Configure this
+    /// explicitly here or with `INTENDANT_CONNECT_RELAY_ENDPOINT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_endpoint: Option<String>,
     /// Optional daemon-local hosted-control lane. This switch is deliberately
@@ -1141,10 +1140,10 @@ impl ConnectConfigStore {
 /// and what it requires of inbound peer connections.
 /// Lives under `[server]` in intendant.toml.
 ///
-/// The CLI flag `--advertise-url` (repeatable) is *additive* over the
-/// `advertise` field via `web_gateway::resolve_advertise_urls`:
-/// operator overrides come first, auto-detected interface URLs append
-/// behind them.
+/// The CLI flag `--advertise-url` (repeatable) replaces the `advertise`
+/// field when present. The selected operator list is then passed to
+/// `web_gateway::resolve_advertise_urls`, where auto-detected interface
+/// URLs append behind it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// IP address the web dashboard listens on. Empty/default means the
@@ -1675,8 +1674,8 @@ impl Default for LiveAudioConfig {
 #[allow(dead_code)]
 pub struct SandboxProjectConfig {
     /// Explicit write-sandbox opt-in/opt-out. Unset (`None`) means the
-    /// default applies: the runtime write sandbox is ON. The effective
-    /// resolution (CLI flags override this value) lives in
+    /// platform default applies: ON for macOS/Linux, OFF for Windows. The
+    /// effective resolution (CLI flags override this value) lives in
     /// `configure_sandbox_env` / `sandbox_enabled` in the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,

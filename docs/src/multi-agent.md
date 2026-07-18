@@ -9,7 +9,7 @@ and supervises it — that path has its own chapter,
 
 This chapter covers Intendant's *native* execution: how a session's shape is
 chosen, and the sub-agent machinery (the spawn/wait/submit tools, supervised
-child sessions, worktrees, role prompts, and knowledge routing).
+child sessions, worktrees, role prompts, and Memory/checkpoint coordination).
 
 Historically these were separate *process* modes — orchestration ran as a
 subprocess pipeline (`run_user_mode` → `INTENDANT_ROLE=…` child processes →
@@ -21,10 +21,10 @@ sessions, orchestration sessions, sub-agents, and external agents alike.
 
 | Shape | Selected by | What runs | Source entry point |
 |-------|-------------|-----------|--------------------|
-| **Direct** | `--direct`, a "simple" task heuristic, or any non-daemon CLI path | One supervised agent loop, no delegation | `run_direct_mode` (`main.rs`) |
+| **Direct** | `--direct`, a "simple" task heuristic, or any native non-daemon CLI path | One supervised agent loop, no delegation | `run_direct_mode` (`run_modes.rs`) |
 | **Orchestrate** | Default for non-trivial tasks under the daemon (no `--direct`); explicit `orchestrate` flag on task submission | The same loop with the orchestration prompt; delegates via `spawn_sub_agent` | `run_direct_mode` with `SubAgentRole::Orchestrator` |
 | **Sub-Agent** | Spawned by another session's `spawn_sub_agent` tool call | A supervised child session with a role prompt; reports back with `submit_result` | `SessionSupervisor::start_sub_agent_session` (`session_supervisor/sub_agents.rs`) |
-| **External-Agent** | `--agent <backend>` or `[agent] default_backend`, or `backend` on `spawn_sub_agent` | A supervised third-party coding CLI wired to Intendant's MCP server | `run_external_agent_mode` (`main.rs`) — see [External-Agent Orchestration](./external-agent-orchestration.md) |
+| **External-Agent** | `--agent <backend>` or `[agent] default_backend`, or `backend` on `spawn_sub_agent` | A supervised third-party coding CLI wired to Intendant's MCP server | `run_external_agent_mode` (`external_mode.rs`) — see [External-Agent Orchestration](./external-agent-orchestration.md) |
 
 These are configurations of one thing, not modes of different things: every
 native session is `run_direct_mode` with a `NativeSessionConfig` (role,
@@ -38,8 +38,9 @@ the orchestration handle that enables the spawn tools).
   key. If neither names a backend, native execution is used.
 - **Direct vs. Orchestrate** (daemon sessions): an explicit `direct` /
   `orchestrate` flag on the task submission wins. Otherwise the
-  `is_simple_task()` heuristic decides — a task of three lines or fewer that
-  contains none of the "complex" keywords (`research`, `investigate`,
+  `is_simple_task()` heuristic decides — a task shorter than 100 bytes, of
+  three lines or fewer, that contains none of the "complex" keywords
+  (`research`, `investigate`,
   `implement`, `build`, `refactor`, `migrate`, `deploy`, `set up`, `analyze`,
   `compare`, `design`, `create a`) runs Direct; anything else gets the
   orchestration prompt.
@@ -89,9 +90,9 @@ Parent's wait_sub_agents call returns the structured results
   re-delegate their own task.
 - **Collection is explicit**: `wait_sub_agents` blocks until the requested
   children finish (`mode: "all"`, default), the first finishes
-  (`mode: "any"`), or `timeout_secs` lapses — then returns each finished
-  child's result and lists what is still running. The wait honors user
-  interrupts and session stop.
+  (`mode: "any"`), or `timeout_secs` lapses (default 600 seconds, clamped to
+  5–7,200) — then returns each finished child's result and lists what is still
+  running. The wait honors user interrupts and session stop.
 - **Results are structured**: a child reports with `submit_result`
   (status/summary/brief/findings/artifacts — the `SubAgentResult` shape in
   `sub_agent.rs`). A child that finishes without submitting gets a result
@@ -282,6 +283,7 @@ checkpoint first, restoring awareness of what is done and what remains
 The disk helper `write_project_state()` (`sub_agent.rs`) is PARKED and
 unwired: it can write `project_state.json` and `project_state.md`, but the
 live checkpoint path is the coordination file.
+
 ## Configuration
 
 Orchestration is tuned under `[orchestrator]` in `intendant.toml`

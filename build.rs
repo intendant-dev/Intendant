@@ -286,11 +286,11 @@ impl WasmCrate {
 fn main() {
     // Assemble static/app.html from the static/app/ fragments (see
     // crates/app-html-assembler) before anything compiles, so the
-    // `include_str!` embed in web_gateway.rs always matches the fragment
-    // sources. Watching the artifact itself means a stray hand-edit to the
-    // generated file is reverted to fragment truth on the next build rather
-    // than silently shipping. Fail loudly on manifest ↔ directory mismatch:
-    // a silently dropped fragment would embed a broken dashboard.
+    // `include_str!` embed in web_gateway/static_assets.rs always matches the
+    // fragment sources. Watching the artifact itself means a stray hand-edit
+    // to the generated file is reverted to fragment truth on the next build
+    // rather than silently shipping. Fail loudly on manifest ↔ directory
+    // mismatch: a silently dropped fragment would embed a broken dashboard.
     println!(
         "cargo:rerun-if-changed={}/",
         app_html_assembler::FRAGMENT_DIR

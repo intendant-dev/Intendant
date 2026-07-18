@@ -66,7 +66,7 @@ on **claude-haiku** — never a more expensive model.
 ## Run
 
 ```bash
-cargo build --release
+cargo build --release --bin intendant --bin intendant-runtime
 node tests/skills/claude-code-e2e/driver.cjs            # uses target/release/intendant
 # options: --binary <path> --workdir <path> --port <n> --keep
 ```

@@ -274,12 +274,12 @@ struct CliFlags {
     control_socket: bool,
     /// --json: Emit JSONL events to stdout (headless stdio; implies --no-web).
     json_output: bool,
-    /// --sandbox: Force the runtime filesystem write sandbox ON. The
-    /// sandbox is on by default; this overrides both a config-file opt-out
-    /// and --no-sandbox.
+    /// --sandbox: Force the runtime filesystem write sandbox ON. This
+    /// overrides both a config-file opt-out and --no-sandbox (the platform
+    /// default is on for macOS/Linux and off for Windows).
     sandbox: bool,
     /// --no-sandbox: Disable the runtime filesystem write sandbox for this
-    /// run (an explicit escape hatch — unset config defaults to on).
+    /// run (an explicit escape hatch from the macOS/Linux default).
     no_sandbox: bool,
     /// --direct: Force single-agent mode (skip orchestrator/sub-agent delegation).
     /// Does NOT disable the UI — use --no-web for headless output.
@@ -355,7 +355,7 @@ fn print_help() {
     println!("    --verbose, -v         Enable verbose output");
     println!("    --control-socket      Enable Unix control socket");
     println!("    --json                Emit JSONL events to stdout (headless stdio)");
-    println!("    --sandbox             Force the runtime write sandbox on (default: on; overrides config and --no-sandbox)");
+    println!("    --sandbox             Force the runtime write sandbox on (default: on macOS/Linux, off Windows)");
     println!("    --no-sandbox          Disable the runtime write sandbox (Landlock/Seatbelt/restricted token)");
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
@@ -402,13 +402,13 @@ fn print_help() {
     println!("    setup                 Install or verify host-level Intendant dependencies");
     println!();
     println!("SESSION LOGS:");
-    println!(
-        "    Logs are always written to ~/.intendant/logs/<uuid>/ (override with --log-file)."
-    );
+    println!("    Default: $INTENDANT_HOME/logs/<uuid>/ when INTENDANT_HOME is non-empty;");
+    println!("             otherwise ~/.intendant/logs/<uuid>/ (override with --log-file).");
     println!("    The log directory contains:");
     println!("      session.jsonl           Structured JSONL event log (one JSON object per line)");
     println!("      turns/turn_NNN_*.txt    Full model responses, agent I/O per turn");
-    println!("      summary.json            Post-session summary");
+    println!("      summary.json            Terminal task/outcome/turn summary");
+    println!("      session_summary.json    Rich post-session statistics");
     println!();
     println!("    AI agents can grep session.jsonl by event type, turn number, or level,");
     println!("    then read specific turn files for full content.");
@@ -971,12 +971,8 @@ fn apply_context_directives(json_str: &str, conversation: &mut Conversation) -> 
     )
 }
 
-/// Finalize a command batch before dispatch: inject project context
-/// normalize command aliases
-/// (`writeFile` → `editFile`) in ONE parse + serialize. These were two
-/// separate helpers (`inject_project_context`, `normalize_command_batch`)
-/// chained on every batch, each paying its own full parse and re-serialize
-/// of a payload that can embed megabytes of editFile content.
+/// Finalize a command batch before dispatch by normalizing legacy command
+/// aliases (`writeFile` → `editFile`) in one parse and serialize.
 pub(crate) fn finalize_command_batch(json_str: &str) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
@@ -2663,7 +2659,8 @@ Also: {"source": "bare"}"#;
     }
 }
 
-/// Set up a fresh conversation with project context, memory, and skills (without a task).
+/// Set up a fresh conversation with the working directory, project instructions,
+/// and skills (without a task).
 /// Used by both `setup_fresh_conversation` and the persistent presence conversation.
 fn setup_fresh_conversation_no_task(conv: &mut Conversation, project: &Project) {
     // Inject project root so the model knows which directory to work in
@@ -2694,16 +2691,18 @@ All relative paths and commands execute from this directory.",
     }
 }
 
-/// Set up a fresh conversation with project context, memory, skills, and task.
+/// Set up a fresh conversation with the working directory, project instructions,
+/// skills, and a task.
 #[allow(dead_code)]
 fn setup_fresh_conversation(conv: &mut Conversation, project: &Project, task: &str) -> u64 {
     setup_fresh_conversation_no_task(conv, project);
     conv.add_user(MessageProvenance::Task, task.to_string())
 }
 
-/// Set up a fresh conversation with project context, memory, skills, task, and
-/// optional user-attached images.  When images are present, they are added to
-/// the same user message as the task so the model sees them as inline context.
+/// Set up a fresh conversation with the working directory, project instructions,
+/// skills, a task, and optional user-attached images. When images are present,
+/// they are added to the same user message as the task so the model sees them
+/// as inline context.
 /// Returns the seq of the task message, so callers can emit its canonical
 /// `conversation_message` record (this helper has no session-log handle).
 fn setup_fresh_conversation_with_attachments(
@@ -2856,10 +2855,11 @@ fn is_simple_task(task: &str) -> bool {
     task.len() < 100
 }
 
-/// Effective write-sandbox enablement: ON by default. `--sandbox` forces
-/// it on (winning over `--no-sandbox` — when both are given, keep the
-/// confinement), `--no-sandbox` forces it off, otherwise an explicit
-/// `[sandbox] enabled` in intendant.toml decides.
+/// Effective write-sandbox enablement: ON by default on macOS/Linux and
+/// opt-in on Windows. `--sandbox` forces it on (winning over
+/// `--no-sandbox` — when both are given, keep the confinement),
+/// `--no-sandbox` forces it off, otherwise an explicit `[sandbox] enabled`
+/// in intendant.toml decides before the platform default.
 fn sandbox_enabled(flags: &CliFlags, config_enabled: Option<bool>) -> bool {
     // Default ON everywhere except Windows: a Windows write grant is an
     // inheritable ACE, and `SetNamedSecurityInfoW` propagates it through
@@ -2879,9 +2879,10 @@ fn configure_sandbox_env(
     flags: &CliFlags,
     project: &Project,
     log_dir: &std::path::Path,
-    // `None` = projectless daemon: the write scope is scratch + logs +
-    // ~/.intendant + explicit absolute grants only — the launch cwd never
-    // becomes writable by accident. Every other path passes the project root.
+    // `None` = projectless daemon: the write scope is scratch + the session
+    // log dir + the daemon state root's `logs/` subtree + explicit absolute
+    // grants only — the launch cwd and credential-bearing state siblings never
+    // become writable by accident. Every other path passes the project root.
     project_write_scope: Option<&std::path::Path>,
 ) {
     let enabled = sandbox_enabled(flags, project.config.sandbox.enabled);

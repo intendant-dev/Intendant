@@ -4,15 +4,18 @@ description: >
   Make a voice call through any app (Element, FaceTime, WhatsApp, etc.)
   using computer use to navigate the UI and spawn_live_audio for the
   AI voice conversation. Returns typed structured data.
-compatibility: macOS or Linux with display. Requires Vortex Audio HAL plugin and a GUI session with TCC mic permission.
+compatibility: macOS or Linux with a display and supported virtual-audio bridge; macOS needs a GUI session with TCC mic permission.
 ---
 
 # Voice Call via App + Live Audio
 
 ## Prerequisites
 
-- **Vortex Audio** HAL plugin installed and set as default input AND output
-- **Intendant launched from GUI** (required for macOS mic access / TCC)
+- A supported bidirectional virtual-audio bridge: **Vortex Audio** is
+  preferred on macOS when its shared-memory segment is present; macOS can
+  fall back to BlackHole 2ch + 16ch, and Linux uses PulseAudio null sinks
+- **Intendant launched from a GUI session on macOS** (required for mic access
+  / TCC)
 - **Target app** installed and logged in
 
 ## Steps
@@ -53,12 +56,14 @@ If your tools support multiple calls in one turn, combine the
 Legacy Call click and spawn_live_audio in the same turn to minimize
 dead air.
 
-**ALL of these parameters are REQUIRED:**
+**Required parameters:**
 - `id`: unique session identifier
 - `provider`: `openai`
 - `playbook`: the conversation script
 - `response_schema`: MANDATORY — see below
-- `timeout_secs`: max call duration (default 120)
+
+**Optional parameters:**
+- `timeout_secs`: max call duration (default 300)
 - `voice`: e.g. `alloy`, `shimmer`
 - Do NOT set `initial_message`
 
@@ -71,7 +76,9 @@ do NOT re-read the transcript or take screenshots first.
 Status values:
 - **Completed**: model called `submit_response` with structured data
 - **TimedOut**: exceeded timeout without submitting response
+- **Disconnected**: the live connection ended before completion
 - **SchemaError**: response didn't match schema
+- **Failed**: setup or provider/audio processing failed
 
 ### 5. Clean up
 

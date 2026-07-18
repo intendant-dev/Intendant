@@ -1,13 +1,8 @@
-//! The P1.5 Gate-B-lite custody adapter: a production durable store
-//! for the Memory plane on the primary OS (macOS), plus the crash
-//! battery that is its terminating acceptance.
-//!
-//! **The write bar holds — this module is a de-risking ARTIFACT.**
-//! Nothing here is wired under `MemoryService`/`MemoryHandle`: the
-//! live plane stays ephemeral until the ratified sequence completes
-//! (custody subset → P0.5 checkpoint replacement → tombed cutover →
-//! P1.8 durable writes). The adapter exists so durable writes, when
-//! they unlock, land on proven machinery in the spec's own format.
+//! The Gate-B-lite custody adapter: the production durable store for
+//! the Memory plane on the primary OS (macOS), plus its crash battery.
+//! `MemoryService::new_durable` opens this path; daemon bootstrap
+//! falls back to an honestly labeled ephemeral plane if it cannot be
+//! opened.
 //!
 //! On-disk shape = spec §6.2 verbatim (owner ruling D-35):
 //!
@@ -533,11 +528,13 @@ impl DurableStore {
 /// The composed durable plane — the crash battery's harness shape
 /// (production wiring composes the same pieces inside
 /// `MemoryService`).
+#[allow(dead_code)]
 pub(crate) struct DurablePlane {
     pub plane: EphemeralPlane,
     store: DurableStore,
 }
 
+#[allow(dead_code)]
 impl DurablePlane {
     pub(crate) fn create(dir: &Path) -> Result<DurablePlane, StoreError> {
         let (plane, custody) = EphemeralPlane::bootstrap_with_custody()?;

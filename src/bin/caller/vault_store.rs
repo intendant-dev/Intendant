@@ -5,7 +5,7 @@
 //! hosted Connect service stores it per account; this module gives a
 //! daemon the same blind storage so a **direct** dashboard (no Connect
 //! service in the loop) has a vault home: the blob lives at
-//! `~/.intendant/vault-blob.json` (0600), the daemon can neither read
+//! `<state-root>/vault-blob.json` (0600 on Unix), the daemon can neither read
 //! nor forge it, and the browser seals/unseals exactly as it does
 //! against the hosted store.
 //!
@@ -207,7 +207,7 @@ mod tests {
     /// the explicit-path convention from state_paths.rs: this bin's test
     /// build compiles intendant-core WITHOUT cfg(test), so the bare
     /// `fetch()`/`publish()` would hit the developer's LIVE
-    /// `~/.intendant/vault-blob.json` (and nextest's process-per-test
+    /// live `<state-root>/vault-blob.json` (and nextest's process-per-test
     /// would race it cross-process). Tests never call the bare entry
     /// points.
     struct ScratchBlob(PathBuf);

@@ -14,7 +14,7 @@ clients with the expected values in both sections. No API keys, no
 network, ~10 seconds.
 
 ```bash
-cargo build --release
+cargo build --release --bin intendant --bin intendant-runtime
 node tests/skills/session-vitals-smoke/driver.cjs "$PWD/target/release/intendant"
 ```
 

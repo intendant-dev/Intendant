@@ -277,7 +277,7 @@ pub enum PeerOperation {
     AgendaWrite,
     /// Search and read Memory claims (bounded, provenance-labeled).
     MemoryRead,
-    /// Propose Memory claims (the candidate lane; ephemeral in P1.1).
+    /// Propose Memory claims (the candidate lane).
     MemoryWrite,
 }
 
@@ -942,11 +942,19 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::Skip { .. }
         | ControlMsg::ApproveAll { .. }
         | ControlMsg::AnswerQuestion { .. } => PeerOperation::Approval,
+        // Executable repointing is credential-adjacent, not Settings: the
+        // command path decides WHICH binary external-agent sessions run
+        // with the owner's credentials and workspace, so it takes the same
+        // credentials.manage authority as /api/api-keys (an operation no
+        // peer profile grants). POST /api/settings enforces the same rule
+        // per-field (`executable_repoint_denials`); `claude_command` has no
+        // ControlMsg twin and is covered there alone.
+        ControlMsg::SetCodexCommand { .. } | ControlMsg::SetCodexManagedCommand { .. } => {
+            PeerOperation::CredentialsManage
+        }
         ControlMsg::SetAutonomy { .. }
         | ControlMsg::SetApprovalRule { .. }
         | ControlMsg::SetExternalAgent { .. }
-        | ControlMsg::SetCodexCommand { .. }
-        | ControlMsg::SetCodexManagedCommand { .. }
         | ControlMsg::SetCodexSandbox { .. }
         | ControlMsg::SetCodexApprovalPolicy { .. }
         | ControlMsg::SetCodexModel { .. }
