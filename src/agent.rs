@@ -18,6 +18,7 @@ use std::{
 };
 
 use chrono::Local;
+use futures_util::StreamExt as _;
 use tokio::process::Command;
 
 use portable_pty::{native_pty_system, CommandBuilder as PtyCommandBuilder, PtySize};
@@ -1395,6 +1396,10 @@ impl Agent {
             let mut builder = reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::none())
+                // Ambient HTTP(S)_PROXY settings would bypass both the
+                // validated socket addresses and DNS pinning. `browse` is a
+                // direct public-internet fetcher, so never inherit them.
+                .no_proxy()
                 .user_agent("Agent/1.0");
             if !pinned.is_empty() {
                 if let Some(host) = current.host_str() {
@@ -1445,25 +1450,28 @@ impl Agent {
             .unwrap_or("")
             .to_string();
 
-        let body = response
-            .text()
-            .await
-            .map_err(|e| AgentError::Process(format!("Failed to read response body: {}", e)))?;
+        let content_length = response.content_length();
+        let (body, mut truncated) = read_browse_body(
+            response.bytes_stream(),
+            content_length,
+            BROWSE_MAX_BODY_BYTES,
+        )
+        .await?;
 
-        let content = if content_type.contains("text/html") {
-            html2text::from_read(body.as_bytes(), 120)
+        let mut content = if content_type.contains("text/html") {
+            html2text::from_read(body.as_slice(), 120)
                 .map_err(|e| AgentError::Process(format!("Failed to parse HTML response: {}", e)))?
         } else {
-            body
+            String::from_utf8_lossy(&body).into_owned()
         };
 
-        let max_size = 50 * 1024;
-        let truncated = content.len() > max_size;
-        let content = if truncated {
-            truncate_utf8_by_bytes(&content, max_size).to_string()
-        } else {
-            content
-        };
+        // HTML rendering can expand a bounded source slightly (for example,
+        // link annotations), so keep the externally returned text under the
+        // same hard cap too.
+        if content.len() > BROWSE_MAX_BODY_BYTES {
+            content.truncate(truncate_utf8_by_bytes(&content, BROWSE_MAX_BODY_BYTES).len());
+            truncated = true;
+        }
 
         Ok(serde_json::json!({
             "success": true,
@@ -1855,35 +1863,113 @@ fn cap_pty_output(final_output: String, log_dir: &Path, nonce: u64) -> (String, 
 /// Redirect-hop budget for `browse` (formerly `redirect::Policy::limited(5)`;
 /// hops are now followed manually so each target is validated).
 const BROWSE_MAX_REDIRECTS: usize = 5;
+const BROWSE_MAX_BODY_BYTES: usize = 50 * 1024;
 
-/// True when `ip` must not be reachable through `browse`: link-local
-/// ranges (where cloud metadata services live) plus the metadata-service
-/// addresses that sit outside them. Loopback and RFC1918 stay reachable
-/// on purpose — agents legitimately browse localhost dev servers and LAN
-/// dashboards.
+/// True when `ip` is not public unicast and therefore must not be reachable
+/// through `browse`.
+///
+/// This is intentionally an allow-public policy rather than a metadata-only
+/// denylist. Loopback, private/LAN, link-local, carrier-grade NAT, protocol
+/// assignment, documentation, benchmark, multicast, and reserved ranges can
+/// all front privileged services in some deployment. Conservative exclusions
+/// are preferable to turning an automatically allowed HTTP tool into a network
+/// pivot.
 fn browse_blocked_ip(ip: std::net::IpAddr) -> bool {
-    use std::net::{IpAddr, Ipv6Addr};
+    use std::net::IpAddr;
     match ip {
-        // 169.254.0.0/16 (includes 169.254.169.254 — AWS/GCP/Azure/
-        // OpenStack metadata) plus Alibaba Cloud's 100.100.100.200.
-        IpAddr::V4(v4) => v4.is_link_local() || v4.octets() == [100, 100, 100, 200],
+        IpAddr::V4(v4) => {
+            let [a, b, c, _d] = v4.octets();
+            a == 0
+                || a == 10
+                || a == 127
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 192 && b == 168)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+                || a >= 224
+        }
         IpAddr::V6(v6) => {
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return browse_blocked_ip(IpAddr::V4(mapped));
             }
-            // fe80::/10 link-local, plus the AWS IMDS IPv6 endpoint.
-            (v6.segments()[0] & 0xffc0) == 0xfe80
-                || v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)
+            let segments = v6.segments();
+            // Public IPv6 unicast currently lives in 2000::/3. Exclude
+            // special-purpose subranges inside it as well: 2001::/23
+            // (protocol assignments), 2001:db8::/32 (documentation),
+            // 2002::/16 (deprecated 6to4), and 3fff::/20 (documentation).
+            (segments[0] & 0xe000) != 0x2000
+                || (segments[0] == 0x2001 && segments[1] <= 0x01ff)
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || segments[0] == 0x2002
+                || (segments[0] == 0x3fff && (segments[1] & 0xf000) == 0)
         }
     }
 }
 
-/// True when `host` names a cloud metadata service by name.
+/// True when `host` is reserved for local/private resolution or names a known
+/// cloud metadata service. DNS answers are checked separately; this preflight
+/// also avoids sending local-only names to the resolver.
 fn browse_blocked_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host == "metadata.google.internal"
+    host.is_empty()
+        || !host.contains('.')
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".localdomain")
+        || host.ends_with(".lan")
+        || host == "home.arpa"
+        || host.ends_with(".home.arpa")
+        || host.ends_with(".internal")
+        || host == "metadata.google.internal"
         || host == "metadata.goog"
         || host.ends_with(".metadata.goog")
+}
+
+/// Consume an HTTP body without ever retaining more than `max_bytes`.
+///
+/// Unknown-length bodies that fill the cap are conservatively reported as
+/// truncated and are dropped immediately instead of polling for one more
+/// chunk. That keeps a peer from holding the runtime open after delivering
+/// exactly the allowed prefix.
+async fn read_browse_body<S, E>(
+    chunks: S,
+    content_length: Option<u64>,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool), AgentError>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>>,
+    E: std::fmt::Display,
+{
+    futures_util::pin_mut!(chunks);
+    let initial_capacity = content_length
+        .and_then(|len| usize::try_from(len).ok())
+        .unwrap_or(0)
+        .min(max_bytes);
+    let mut body = Vec::with_capacity(initial_capacity);
+
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk
+            .map_err(|e| AgentError::Process(format!("Failed to read response body: {}", e)))?;
+        let remaining = max_bytes.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            return Ok((body, true));
+        }
+        body.extend_from_slice(&chunk);
+        if body.len() == max_bytes {
+            let truncated = content_length != Some(max_bytes as u64);
+            return Ok((body, truncated));
+        }
+    }
+
+    Ok((body, false))
 }
 
 /// Validate one `browse` target: scheme, host classification, and — for
@@ -1904,7 +1990,7 @@ async fn browse_validate_url(url: &reqwest::Url) -> Result<Vec<std::net::SocketA
         Some(url::Host::Ipv4(v4)) => {
             if browse_blocked_ip(v4.into()) {
                 Err(AgentError::Process(format!(
-                    "Blocked address for browse: {} (link-local/metadata range)",
+                    "Blocked address for browse: {} (non-public/private range)",
                     v4
                 )))
             } else {
@@ -1914,7 +2000,7 @@ async fn browse_validate_url(url: &reqwest::Url) -> Result<Vec<std::net::SocketA
         Some(url::Host::Ipv6(v6)) => {
             if browse_blocked_ip(v6.into()) {
                 Err(AgentError::Process(format!(
-                    "Blocked address for browse: {} (link-local/metadata range)",
+                    "Blocked address for browse: {} (non-public/private range)",
                     v6
                 )))
             } else {
@@ -1924,7 +2010,7 @@ async fn browse_validate_url(url: &reqwest::Url) -> Result<Vec<std::net::SocketA
         Some(url::Host::Domain(domain)) => {
             if browse_blocked_host(domain) {
                 return Err(AgentError::Process(format!(
-                    "Blocked host for browse: {} (metadata service)",
+                    "Blocked host for browse: {} (local/private name)",
                     domain
                 )));
             }
@@ -1944,7 +2030,7 @@ async fn browse_validate_url(url: &reqwest::Url) -> Result<Vec<std::net::SocketA
             }
             if let Some(bad) = addrs.iter().find(|a| browse_blocked_ip(a.ip())) {
                 return Err(AgentError::Process(format!(
-                    "Blocked host for browse: {} resolves to {} (link-local/metadata range)",
+                    "Blocked host for browse: {} resolves to {} (non-public/private range)",
                     domain,
                     bad.ip()
                 )));
@@ -2667,32 +2753,50 @@ mod tests {
     }
 
     #[test]
-    fn browse_ip_classifier_blocks_link_local_and_metadata() {
+    fn browse_ip_classifier_allows_only_public_unicast() {
         use std::net::IpAddr;
         for ip in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "100.100.100.200",
+            "127.0.0.1",
             "169.254.169.254",
             "169.254.0.1",
-            "100.100.100.200",
+            "172.16.0.1",
+            "192.0.0.9",
+            "192.0.2.1",
+            "192.88.99.1",
+            "192.168.1.10",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
             "fe80::1",
+            "fd00::1",
             "fd00:ec2::254",
             "::ffff:169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "2001:2::1",
+            "2001:db8::1",
+            "2002:a9fe:a9fe::1",
+            "3fff::1",
+            "ff02::1",
         ] {
             assert!(
                 browse_blocked_ip(ip.parse::<IpAddr>().unwrap()),
                 "{ip} must be blocked"
             );
         }
-        // Loopback and RFC1918 are deliberately reachable (localhost dev
-        // servers, LAN dashboards).
         for ip in [
-            "127.0.0.1",
-            "10.0.0.1",
-            "172.16.0.1",
-            "192.168.1.10",
-            "100.100.100.199",
+            "1.1.1.1",
             "8.8.8.8",
-            "::1",
-            "fd00::1",
+            "93.184.216.34",
+            "192.31.196.1",
+            "2001:4860:4860::8888",
             "2606:4700:4700::1111",
         ] {
             assert!(
@@ -2703,13 +2807,22 @@ mod tests {
     }
 
     #[test]
-    fn browse_host_classifier_blocks_metadata_names() {
+    fn browse_host_classifier_blocks_local_and_metadata_names() {
         for host in [
             "metadata.google.internal",
             "METADATA.GOOGLE.INTERNAL",
             "metadata.google.internal.",
             "metadata.goog",
             "instance.metadata.goog",
+            "localhost",
+            "api.localhost",
+            "printer.local",
+            "router.lan",
+            "service.localdomain",
+            "home.arpa",
+            "host.home.arpa",
+            "service.internal",
+            "intranet",
         ] {
             assert!(browse_blocked_host(host), "{host} must be blocked");
         }
@@ -2717,8 +2830,8 @@ mod tests {
             "example.com",
             "metadata.google.com",
             "mymetadata.goog",
-            "google.internal",
-            "localhost",
+            "internal.example.com",
+            "local.example.com",
         ] {
             assert!(!browse_blocked_host(host), "{host} must stay reachable");
         }
@@ -2735,6 +2848,11 @@ mod tests {
             "http://100.100.100.200/",
             "http://metadata.google.internal/computeMetadata/v1/",
             "http://metadata.goog/",
+            "http://127.0.0.1/",
+            "http://10.0.0.1/",
+            "http://192.168.1.1/",
+            "http://[::1]/",
+            "http://[fd00::1]/",
             // Non-dotted IPv4 literal forms normalize in URL parsing.
             "http://0xA9FEA9FE/",
         ] {
@@ -2749,7 +2867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browse_redirect_to_metadata_blocked() {
+    async fn browse_rejects_loopback_before_any_request() {
         let (agent, _log) = create_test_agent();
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(l) => l,
@@ -2757,22 +2875,6 @@ mod tests {
             Err(e) => panic!("unexpected bind error: {}", e),
         };
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            if let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf).await;
-                let _ = sock
-                    .write_all(
-                        b"HTTP/1.1 302 Found\r\n\
-                          Location: http://169.254.169.254/latest/meta-data/\r\n\
-                          Content-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .await;
-            }
-        });
-        // Loopback itself is allowed (the first hop succeeds); the redirect
-        // into the metadata range must fail.
         let cmd = AgentCommand {
             function: "browse".to_string(),
             nonce: 1,
@@ -2786,6 +2888,54 @@ mod tests {
             "expected blocked-address error, got: {}",
             msg
         );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "browse must reject loopback before opening a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn browse_body_reader_stops_at_the_hard_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let polled = Arc::new(AtomicUsize::new(0));
+        let observed = polled.clone();
+        let chunks = futures_util::stream::iter([
+            Ok::<_, &'static str>(bytes::Bytes::from_static(b"1234")),
+            Ok(bytes::Bytes::from_static(b"5678")),
+            Ok(bytes::Bytes::from_static(b"must-not-be-polled")),
+        ])
+        .inspect(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let (body, truncated) = read_browse_body(chunks, None, 6).await.unwrap();
+        assert_eq!(body, b"123456");
+        assert!(truncated);
+        assert_eq!(
+            polled.load(Ordering::SeqCst),
+            2,
+            "the reader must drop the stream as soon as the cap is reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn browse_body_reader_handles_exact_and_declared_lengths() {
+        let exact = futures_util::stream::iter([Ok::<_, &'static str>(bytes::Bytes::from_static(
+            b"123456",
+        ))]);
+        let (body, truncated) = read_browse_body(exact, Some(6), 6).await.unwrap();
+        assert_eq!(body, b"123456");
+        assert!(!truncated);
+
+        let declared_over = futures_util::stream::iter([Ok::<_, &'static str>(
+            bytes::Bytes::from_static(b"123456"),
+        )]);
+        let (body, truncated) = read_browse_body(declared_over, Some(100), 6).await.unwrap();
+        assert_eq!(body, b"123456");
+        assert!(truncated);
     }
 
     // --- shell env scrub tests ---

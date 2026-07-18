@@ -137,7 +137,16 @@ These are the ~10 functions `intendant-runtime` actually implements:
 | `inspectPath` | Filesystem metadata (type, size, mtime; plus mode/uid/gid on Unix) | `path` |
 | `editFile` | Structured file editing without a shell | `file_path`, `operation`, `content`, `match_content`, `line_number`, `end_line` |
 | `writeFile` | Back-compat alias — rewritten to `editFile` with `operation:"write"` if unset | `file_path`, `content` |
-| `browse` | HTTP GET, HTML→text via `html2text` (50 KB cap, 15 s timeout, ≤5 redirects) | `url` |
+| `browse` | Public-internet HTTP GET, HTML→text via `html2text` (streamed 50 KiB hard cap, 15 s timeout, ≤5 validated redirects) | `url` |
+
+`browse` is not a LAN client: every initial URL and redirect hop is resolved
+before connecting, DNS is pinned to the checked answers, and any loopback,
+private, link-local, carrier-grade NAT, local-name, multicast, documentation,
+benchmark, or reserved address fails closed. Mixed public/private DNS answers
+are rejected as a unit. Ambient HTTP proxy variables are disabled for this
+path so they cannot bypass address validation or DNS pinning. The body reader
+stops and drops the response stream as soon as the 50 KiB prefix is full; it
+never buffers the remainder before truncating.
 | `askHuman` | Write a question to the log dir and **poll indefinitely** for a response file | `question` |
 | `execPty` | Run a command in a persistent PTY session for the life of this process | `command`, `shell_id` |
 
