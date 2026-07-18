@@ -9,8 +9,8 @@ use std::os::unix::fs::MetadataExt;
 
 use std::{
     collections::HashMap,
-    fs::{self, OpenOptions},
-    io::{Read as _, Seek, SeekFrom},
+    fs::{self, File, OpenOptions},
+    io::{Read as _, Seek, SeekFrom, Write as _},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, LazyLock, RwLock},
@@ -72,6 +72,45 @@ const DSR_CPR_REPLY: &[u8] = b"\x1b[1;1R";
 
 const HUMAN_POLL_MS: u64 = 500;
 const LOG_TAIL_BYTES: u64 = 10 * 1024; // 10KB
+const COMMAND_LOG_CREATE_ATTEMPTS: usize = 16;
+
+/// Atomically create a new runtime artifact. `create_new` is the portable
+/// O_CREAT|O_EXCL equivalent: an existing regular file, device, or symlink
+/// is refused instead of followed.
+fn open_new_log_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Create an unpredictable per-command artifact inside `log_dir`.
+///
+/// The model controls `nonce`, and an earlier/background command can write
+/// in the session log directory. A random suffix plus atomic creation keeps
+/// it from pre-planting a symlink or other file at the path the runtime will
+/// open. The already-open handle remains authoritative even if the directory
+/// entry is later replaced.
+fn create_command_log(
+    log_dir: &Path,
+    nonce: u64,
+    stream: &str,
+) -> std::io::Result<(PathBuf, File)> {
+    for _ in 0..COMMAND_LOG_CREATE_ATTEMPTS {
+        let suffix = uuid::Uuid::new_v4().simple();
+        let path = log_dir.join(format!("{nonce}_{suffix}_{stream}.log"));
+        match open_new_log_file(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique runtime log file",
+    ))
+}
 
 // exec_pty sentinel marker pieces. The assembled per-command markers are
 // `{prefix}_{nonce}__`; the typed input only ever carries a *split* form
@@ -205,6 +244,8 @@ pub struct Agent {
     session_xauthority: Option<PathBuf>,
     /// See [`crate::models::AgentInput::human_response_token`].
     human_response_token: Option<String>,
+    /// See [`crate::models::AgentInput::runtime_protocol_token`].
+    runtime_protocol_token: Option<String>,
 }
 
 impl Agent {
@@ -222,6 +263,7 @@ impl Agent {
             available_displays: vec![],
             session_xauthority: None,
             human_response_token: None,
+            runtime_protocol_token: None,
         })
     }
 
@@ -242,6 +284,7 @@ impl Agent {
             available_displays,
             session_xauthority,
             human_response_token: None,
+            runtime_protocol_token: None,
         })
     }
 
@@ -249,6 +292,12 @@ impl Agent {
     /// [`crate::models::AgentInput::human_response_token`]).
     pub fn with_human_response_token(mut self, token: Option<String>) -> Self {
         self.human_response_token = token;
+        self
+    }
+
+    /// Adopt the controller-minted result-stream authentication token.
+    pub fn with_runtime_protocol_token(mut self, token: Option<String>) -> Self {
+        self.runtime_protocol_token = token;
         self
     }
 
@@ -584,14 +633,7 @@ impl Agent {
     }
 
     /// Read the tail of a log file (up to max_bytes from the end).
-    fn read_log_tail(path: &Path, max_bytes: u64) -> String {
-        if !path.exists() {
-            return String::new();
-        }
-        let mut file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(_) => return String::new(),
-        };
+    fn read_open_log_tail(file: &mut File, max_bytes: u64) -> String {
         let total_size = file.metadata().map(|m| m.len()).unwrap_or(0);
         let offset = total_size.saturating_sub(max_bytes);
         let _ = file.seek(SeekFrom::Start(offset));
@@ -600,6 +642,15 @@ impl Agent {
         let bytes_read = file.read(&mut buf).unwrap_or(0);
         buf.truncate(bytes_read);
         String::from_utf8_lossy(&buf).to_string()
+    }
+
+    #[cfg(test)]
+    fn read_log_tail(path: &Path, max_bytes: u64) -> String {
+        let mut file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return String::new(),
+        };
+        Self::read_open_log_tail(&mut file, max_bytes)
     }
 
     async fn exec_as_agent(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
@@ -625,19 +676,13 @@ impl Agent {
         let command = self.replace_nonce_refs(command)?;
 
         // Setup output files for this command
-        let stdout_path = self.log_dir.join(format!("{}_stdout.log", cmd.nonce));
-        let stderr_path = self.log_dir.join(format!("{}_stderr.log", cmd.nonce));
-
-        let stdout_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&stdout_path)?;
-        let stderr_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&stderr_path)?;
+        let (_stdout_path, stdout_file) = create_command_log(&self.log_dir, cmd.nonce, "stdout")?;
+        let (_stderr_path, stderr_file) = create_command_log(&self.log_dir, cmd.nonce, "stderr")?;
+        // Read tails through clones of the handles that were atomically
+        // opened above. Reopening by pathname after the shell exits would
+        // reintroduce a replacement/symlink race.
+        let mut stdout_reader = stdout_file.try_clone()?;
+        let mut stderr_reader = stderr_file.try_clone()?;
 
         // Execute command
         let display_id = cmd.display.unwrap_or_else(|| {
@@ -715,8 +760,8 @@ impl Agent {
         self.update_process_info(cmd.nonce, pid, status, exit_code)?;
 
         // Read stdout/stderr tails
-        let stdout_tail = Self::read_log_tail(&stdout_path, LOG_TAIL_BYTES);
-        let stderr_tail = Self::read_log_tail(&stderr_path, LOG_TAIL_BYTES);
+        let stdout_tail = Self::read_open_log_tail(&mut stdout_reader, LOG_TAIL_BYTES);
+        let stderr_tail = Self::read_open_log_tail(&mut stderr_reader, LOG_TAIL_BYTES);
 
         Ok(serde_json::json!({
             "nonce": cmd.nonce,
@@ -1206,10 +1251,7 @@ impl Agent {
 
         let final_output = lines.join("\n");
 
-        let (final_output, truncated) = cap_pty_output(
-            final_output,
-            &self.log_dir.join(format!("{}_pty.log", cmd.nonce)),
-        );
+        let (final_output, truncated) = cap_pty_output(final_output, &self.log_dir, cmd.nonce);
 
         Ok(serde_json::json!({
             "success": true,
@@ -1590,19 +1632,28 @@ impl Agent {
         }
     }
 
-    fn result_json(nonce: u64, data: &str) -> String {
-        serde_json::json!({
+    fn result_json(&self, nonce: u64, data: &str) -> String {
+        let mut result = serde_json::json!({
             "type": "result",
             "nonce": nonce,
             "data": data
-        })
-        .to_string()
+        });
+        if let Some(token) = &self.runtime_protocol_token {
+            result
+                .as_object_mut()
+                .expect("result envelope is an object")
+                .insert(
+                    "runtime_protocol_token".to_string(),
+                    serde_json::Value::String(token.clone()),
+                );
+        }
+        result.to_string()
     }
 
-    fn result_or_error(nonce: u64, result: Result<String, AgentError>) -> String {
+    fn result_or_error(&self, nonce: u64, result: Result<String, AgentError>) -> String {
         match result {
-            Ok(result) => Self::result_json(nonce, &result),
-            Err(e) => Self::result_json(nonce, &format!("Error: {}", e)),
+            Ok(result) => self.result_json(nonce, &result),
+            Err(e) => self.result_json(nonce, &format!("Error: {}", e)),
         }
     }
 
@@ -1621,14 +1672,14 @@ impl Agent {
             let line = match cmd.function.as_str() {
                 "execAsAgent" => {
                     let result = self.exec_as_agent(&cmd).await?;
-                    Self::result_json(cmd.nonce, &result)
+                    self.result_json(cmd.nonce, &result)
                 }
                 "captureScreen" => {
                     let result = self.capture_screen(&cmd).await?;
-                    Self::result_json(cmd.nonce, &result)
+                    self.result_json(cmd.nonce, &result)
                 }
-                "inspectPath" => Self::result_or_error(cmd.nonce, self.inspect_path(&cmd)),
-                "editFile" => Self::result_or_error(cmd.nonce, self.edit_file(&cmd)),
+                "inspectPath" => self.result_or_error(cmd.nonce, self.inspect_path(&cmd)),
+                "editFile" => self.result_or_error(cmd.nonce, self.edit_file(&cmd)),
                 "writeFile" => {
                     // writeFile is editFile with the operation defaulted to
                     // "write"; rewrite the owned command in place (cloning it
@@ -1637,11 +1688,11 @@ impl Agent {
                     if cmd.operation.is_none() {
                         cmd.operation = Some("write".to_string());
                     }
-                    Self::result_or_error(cmd.nonce, self.edit_file(&cmd))
+                    self.result_or_error(cmd.nonce, self.edit_file(&cmd))
                 }
-                "browse" => Self::result_or_error(cmd.nonce, self.browse(&cmd).await),
-                "askHuman" => Self::result_or_error(cmd.nonce, self.ask_human(&cmd).await),
-                "execPty" => Self::result_or_error(cmd.nonce, self.exec_pty(&cmd).await),
+                "browse" => self.result_or_error(cmd.nonce, self.browse(&cmd).await),
+                "askHuman" => self.result_or_error(cmd.nonce, self.ask_human(&cmd).await),
+                "execPty" => self.result_or_error(cmd.nonce, self.exec_pty(&cmd).await),
                 _ => {
                     return Err(AgentError::Process(format!(
                         "Unknown function: {}",
@@ -1773,8 +1824,9 @@ fn incremental_marker_scan(
 /// conversation, mirroring exec_as_agent's 10 KB stdout/stderr tails — an
 /// uncapped PTY transcript (a cargo build, a full test suite) otherwise
 /// rides in the context for the rest of the session. Over-cap output is
-/// preserved in full at `full_log_path` and the truncation marker names it.
-fn cap_pty_output(final_output: String, full_log_path: &Path) -> (String, bool) {
+/// preserved in a random, atomically-created file in `log_dir` and the
+/// truncation marker names it.
+fn cap_pty_output(final_output: String, log_dir: &Path, nonce: u64) -> (String, bool) {
     let tail_cap = LOG_TAIL_BYTES as usize;
     if final_output.len() <= tail_cap {
         return (final_output, false);
@@ -1782,9 +1834,12 @@ fn cap_pty_output(final_output: String, full_log_path: &Path) -> (String, bool) 
     // Be honest about data loss: if the full transcript can't be preserved
     // (disk full, unwritable log dir), the result must say so rather than
     // silently truncating the only copy.
-    let log_note = match fs::write(full_log_path, &final_output) {
-        Ok(()) => format!("; full output: {}", full_log_path.display()),
-        Err(e) => format!("; full transcript unavailable: {}", e),
+    let log_note = match create_command_log(log_dir, nonce, "pty").and_then(|(path, mut file)| {
+        file.write_all(final_output.as_bytes())?;
+        Ok(path)
+    }) {
+        Ok(path) => format!("; full output: {}", path.display()),
+        Err(e) => format!("; full transcript unavailable: {e}"),
     };
     let tail = tail_utf8_by_bytes(&final_output, tail_cap);
     let capped = format!(
@@ -1911,10 +1966,45 @@ mod tests {
         (agent, log_dir)
     }
 
+    fn command_log_paths(log_dir: &Path, nonce: u64, stream: &str) -> Vec<PathBuf> {
+        let prefix = format!("{nonce}_");
+        let suffix = format!("_{stream}.log");
+        let mut paths: Vec<PathBuf> = fs::read_dir(log_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix(&prefix))
+                    .and_then(|name| name.strip_suffix(&suffix))
+                    .is_some_and(|random| {
+                        random.len() == 32 && random.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
     #[test]
     fn truncate_utf8_by_bytes_stops_at_char_boundary() {
         let text = format!("{}{}", "a".repeat(199), "\u{00e9}");
         assert_eq!(truncate_utf8_by_bytes(&text, 200), "a".repeat(199));
+    }
+
+    #[test]
+    fn result_envelope_carries_runtime_protocol_token_when_armed() {
+        let (agent, _log) = create_test_agent();
+        let agent = agent.with_runtime_protocol_token(Some("controller-secret".to_string()));
+        let parsed: serde_json::Value = serde_json::from_str(&agent.result_json(7, "ok")).unwrap();
+        assert_eq!(parsed["type"], "result");
+        assert_eq!(parsed["nonce"], 7);
+        assert_eq!(parsed["data"], "ok");
+        assert_eq!(
+            parsed["runtime_protocol_token"],
+            serde_json::Value::String("controller-secret".to_string())
+        );
     }
 
     #[tokio::test]
@@ -2063,11 +2153,64 @@ mod tests {
             .unwrap()
             .contains("test_output"));
 
-        // Log files should exist
-        let stdout_path = log_dir.path().join("10_stdout.log");
-        let stderr_path = log_dir.path().join("10_stderr.log");
-        assert!(stdout_path.exists(), "stdout log should be created");
-        assert!(stderr_path.exists(), "stderr log should be created");
+        // Each stream gets one unpredictable, atomically-created log.
+        let stdout_paths = command_log_paths(log_dir.path(), 10, "stdout");
+        let stderr_paths = command_log_paths(log_dir.path(), 10, "stderr");
+        assert_eq!(stdout_paths.len(), 1, "stdout log should be created");
+        assert_eq!(stderr_paths.len(), 1, "stderr log should be created");
+        assert_ne!(stdout_paths[0], log_dir.path().join("10_stdout.log"));
+        assert_ne!(stderr_paths[0], log_dir.path().join("10_stderr.log"));
+        assert!(fs::read_to_string(&stdout_paths[0])
+            .unwrap()
+            .contains("test_output"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_log_creation_refuses_preplanted_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("stdout.log");
+        fs::write(&target, "sentinel").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = open_new_log_file(&link).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(target).unwrap(), "sentinel");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_as_agent_ignores_legacy_log_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let (agent, log_dir) = create_test_agent();
+        let target = log_dir.path().join("symlink-target");
+        let legacy_path = log_dir.path().join("10_stdout.log");
+        fs::write(&target, "sentinel").unwrap();
+        symlink(&target, &legacy_path).unwrap();
+        let cmd = AgentCommand {
+            function: "execAsAgent".to_string(),
+            command: Some("printf legitimate".to_string()),
+            nonce: 10,
+            display: Some(1),
+            ..Default::default()
+        };
+
+        let result = agent.exec_as_agent(&cmd).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["stdout_tail"], "legitimate");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "sentinel");
+        assert!(
+            fs::symlink_metadata(&legacy_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the attacker-planted path must never be opened or replaced"
+        );
+        assert_eq!(command_log_paths(log_dir.path(), 10, "stdout").len(), 1);
     }
 
     #[tokio::test]
@@ -2116,6 +2259,7 @@ mod tests {
     async fn process_input_exec_returns_result() {
         let (agent, _log) = create_test_agent();
         let input = AgentInput {
+            runtime_protocol_token: None,
             human_response_token: None,
             commands: vec![AgentCommand {
                 function: "execAsAgent".to_string(),
@@ -2130,6 +2274,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
         assert_eq!(parsed["type"], "result");
         assert_eq!(parsed["nonce"], 1);
+        assert!(parsed.get("runtime_protocol_token").is_none());
         // Data contains the exec result with exit_code
         let data: serde_json::Value =
             serde_json::from_str(parsed["data"].as_str().unwrap()).unwrap();
@@ -2140,6 +2285,7 @@ mod tests {
     async fn process_input_unknown_function() {
         let (agent, _log) = create_test_agent();
         let input = AgentInput {
+            runtime_protocol_token: None,
             human_response_token: None,
             commands: vec![AgentCommand {
                 function: "unknownFunc".to_string(),
@@ -2157,6 +2303,7 @@ mod tests {
         let dir = tmp.path().to_str().unwrap().to_string();
         let (agent, _log) = create_test_agent();
         let input = AgentInput {
+            runtime_protocol_token: None,
             human_response_token: None,
             commands: vec![AgentCommand {
                 function: "inspectPath".to_string(),
@@ -2183,6 +2330,7 @@ mod tests {
         let dir = tmp.path().to_str().unwrap().to_string();
         let (agent, _log) = create_test_agent();
         let input = AgentInput {
+            runtime_protocol_token: None,
             human_response_token: None,
             commands: vec![
                 AgentCommand {
@@ -2477,6 +2625,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("integration.txt");
         let input = AgentInput {
+            runtime_protocol_token: None,
             human_response_token: None,
             commands: vec![AgentCommand {
                 function: "editFile".to_string(),
@@ -3128,8 +3277,11 @@ mod tests {
         );
         // Marker line + 10 KB tail, nowhere near the full transcript.
         assert!(output.len() < 11 * 1024, "output len {}", output.len());
-        // The full transcript is preserved on disk.
-        let full = fs::read_to_string(log_dir.path().join("77_pty.log")).unwrap();
+        // The full transcript is preserved in one random, atomic artifact.
+        let paths = command_log_paths(log_dir.path(), 77, "pty");
+        assert_eq!(paths.len(), 1);
+        assert_ne!(paths[0], log_dir.path().join("77_pty.log"));
+        let full = fs::read_to_string(&paths[0]).unwrap();
         assert!(
             full.len() > LOG_TAIL_BYTES as usize,
             "full log should exceed the cap, got {}",
@@ -3201,24 +3353,25 @@ mod tests {
     #[test]
     fn cap_pty_output_caps_and_preserves_full_log() {
         let tmp = TempDir::new().unwrap();
-        let log_path = tmp.path().join("1_pty.log");
 
         // Under the cap: untouched, no log file.
         let small = "small output".to_string();
-        let (out, truncated) = cap_pty_output(small.clone(), &log_path);
+        let (out, truncated) = cap_pty_output(small.clone(), tmp.path(), 1);
         assert_eq!(out, small);
         assert!(!truncated);
-        assert!(!log_path.exists());
+        assert!(command_log_paths(tmp.path(), 1, "pty").is_empty());
 
         // Over the cap: marker + tail, full transcript on disk.
         let big = "z".repeat(20_000);
-        let (out, truncated) = cap_pty_output(big.clone(), &log_path);
+        let (out, truncated) = cap_pty_output(big.clone(), tmp.path(), 1);
+        let paths = command_log_paths(tmp.path(), 1, "pty");
+        assert_eq!(paths.len(), 1);
         assert!(truncated);
         assert!(out.starts_with("[execPty output truncated: showing last "));
-        assert!(out.contains(&log_path.display().to_string()));
+        assert!(out.contains(&paths[0].display().to_string()));
         assert!(out.ends_with(&"z".repeat(LOG_TAIL_BYTES as usize)));
         assert!(out.len() < 11 * 1024, "capped len {}", out.len());
-        assert_eq!(fs::read_to_string(&log_path).unwrap(), big);
+        assert_eq!(fs::read_to_string(&paths[0]).unwrap(), big);
 
         // Preservation failure is surfaced, not silently swallowed: the
         // capped result must say the untruncated copy is gone.
@@ -3228,7 +3381,7 @@ mod tests {
             let ro_dir = tmp.path().join("ro");
             fs::create_dir(&ro_dir).unwrap();
             fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o555)).unwrap();
-            let (out, truncated) = cap_pty_output("w".repeat(20_000), &ro_dir.join("1_pty.log"));
+            let (out, truncated) = cap_pty_output("w".repeat(20_000), &ro_dir, 1);
             fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o755)).unwrap();
             assert!(truncated);
             assert!(
@@ -3238,6 +3391,31 @@ mod tests {
             );
             assert!(out.ends_with(&"w".repeat(LOG_TAIL_BYTES as usize)));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cap_pty_output_ignores_legacy_log_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("target");
+        let legacy_path = tmp.path().join("9_pty.log");
+        fs::write(&target, "sentinel").unwrap();
+        symlink(&target, &legacy_path).unwrap();
+
+        let full = "p".repeat(20_000);
+        let (out, truncated) = cap_pty_output(full.clone(), tmp.path(), 9);
+        assert!(truncated);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "sentinel");
+        assert!(fs::symlink_metadata(&legacy_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let paths = command_log_paths(tmp.path(), 9, "pty");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(fs::read_to_string(&paths[0]).unwrap(), full);
+        assert!(out.contains(&paths[0].display().to_string()));
     }
 
     #[tokio::test]
