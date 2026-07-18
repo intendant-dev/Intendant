@@ -202,6 +202,14 @@ Per-category approval rules. Each value is `auto` (run without asking), `ask`
 | `destructive` | rule | `ask` | Destructive |
 | `display_control` | rule | `ask` | DisplayControl |
 
+Arbitrary `CommandExec` is governed by the strictest configured rule among
+`command_exec` and every effect a shell can reach: `file_read`, `file_write`,
+`file_delete`, `network`, `destructive`, and `display_control` (`deny` >
+`ask` > `auto`). Consequently the default effective shell rule is `ask` even
+though the `command_exec` field itself defaults to `auto`. This composition is
+deliberate: shell syntax cannot be classified completely, so effect rules must
+not be bypassable with indirection or a different executable spelling.
+
 The `HumanInput` and `LiveAudioSpawn` categories always require a human and are
 not configurable here.
 
@@ -1105,7 +1113,8 @@ Approval is decided by a three-layer model (full UI details in
    `medium`). `low` asks for everything except file reads; `full` keeps the
    human entirely out of the loop (auto-approve) except for `HumanInput`.
 2. **Category rules** — the `[approval]` section above (`auto`/`ask`/`deny`) per
-   category.
+   category. Arbitrary shell execution inherits the strictest rule of every
+   effect it can reach.
 3. **Per-action approval** — `y` / `s` / `a` / `n` (approve / skip / approve-all
    / deny) prompts in any frontend.
 

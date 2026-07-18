@@ -21,7 +21,7 @@ Set with `--autonomy`, from the dashboard, or with
 | Level | Behavior |
 |-------|----------|
 | Low | Ask before every category except `FileRead` |
-| Medium (default) | Apply category rules; defaults ask for writes, deletes, and destructive actions (`network` defaults to auto) |
+| Medium (default) | Apply category rules; defaults ask for arbitrary shell execution, writes, deletes, and destructive actions (`network` defaults to auto for the structured `browse` tool) |
 | High | Auto-approve ordinary `ask` rules; native policy denials and hard gates remain |
 | Full | Native runtime and controller actions auto-approve except policy denials and the `HumanInput` / `LiveAudioSpawn` hard gates; see the external-agent caveat below |
 
@@ -38,6 +38,14 @@ their rule is `auto`, while High and Full auto-approve ordinary `ask` rules.
 None of these rules bypasses the human-input/live-audio hard gates or the
 separate user-display grant. External-agent requests take a separate path,
 described below.
+
+`CommandExec` is capability-composed rather than parser-composed. Its effective
+rule is the strictest of `command_exec`, `file_read`, `file_write`,
+`file_delete`, `network`, `destructive`, and `display_control` (`deny` >
+`ask` > `auto`). A shell can reach all of those effects through interpreters,
+subshells, variable expansion, or binaries the classifier has never seen, so
+setting only `command_exec = "auto"` cannot weaken a stricter effect rule. To
+auto-allow arbitrary shell execution, every reachable category must permit it.
 
 ## Layer 3 — per-action approval
 
@@ -115,8 +123,8 @@ The precise logic (`AutonomyState::needs_approval`) has nuances worth knowing:
   explicit-deny check.
 - **Low** — asks for everything except `FileRead` (a `deny` rule still blocks).
 - **Medium / High** — start from the per-category rule. For an `ask` rule,
-  Medium asks only for `FileWrite` / `FileDelete` / `Destructive` /
-  `NetworkRequest` / `ToolCall` (the last only under an explicit
+  Medium asks only for `CommandExec` / `FileWrite` / `FileDelete` /
+  `Destructive` / `NetworkRequest` / `ToolCall` (the last only under an explicit
   `tool_call = "ask"` — its default rule is `auto`); High asks for none of
   them.
 
@@ -133,8 +141,11 @@ not re-prompt. Two properties bound that memory:
   `writeFile`/`editFile` it includes a digest of the full command (minus the
   per-call `nonce`), so approving one edit of a path never covers different
   content aimed at the same path; controller-dispatched tool calls digest
-  their full arguments the same way. Exec commands keep exact-string matching
-  (with the display/nonce normalization that recognizes benign retries).
+  their full arguments the same way. Exec commands keep byte-exact string
+  matching. In particular, display selectors and `$NONCE[...]` process
+  references remain part of the identity because they change the target and
+  may contain executable shell syntax. Only the structured runtime call's
+  top-level JSON `nonce` is removed before hashing.
 
 ## Controller-dispatched tools
 
@@ -209,12 +220,15 @@ binary paths like `/bin/rm`, and `find … -delete`/`-exec rm`), network
 tools, and file writes (redirects, `tee`, `mv`, `cp`). A `sudo` prefix is
 flagged Destructive *and* the command after `sudo` is classified too. When
 multiple categories apply, the highest-severity one drives the prompt label.
+Every shell command also carries `CommandExec`, whose effective policy is the
+strictest reachable rule described above.
 
-The shell classifier is **best-effort keyword matching for approval
-prompting — UX, not a security boundary**: string matching cannot see
-through variable indirection, subshells, or novel spellings. The runtime's
-filesystem/exec sandbox is what actually confines commands; an evasion
-dodges the prompt, never the sandbox.
+The shell substring classifier is **display enrichment, not an authorization
+parser**: it cannot see through variable indirection, subshells, interpreters,
+or novel spellings. Missing one of those spellings no longer downgrades the
+decision because `CommandExec` governs the whole shell capability. The
+runtime's filesystem/exec sandbox remains an independent hard boundary on
+where an approved command can act.
 
 `ToolCall` is not produced by ordinary runtime `classify_command`; it governs
 [controller-dispatched tools](#controller-dispatched-tools) and
