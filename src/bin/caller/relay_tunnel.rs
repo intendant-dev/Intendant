@@ -23,7 +23,7 @@
 //! reachability, not trust.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{net::SocketAddr, time::Duration};
 
 use futures_util::StreamExt as _;
@@ -31,12 +31,12 @@ use reqwest::{Client, Url};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 use tokio::task::JoinSet;
 
 use crate::connect_rendezvous::{
-    authenticated, dns_publish_addresses_for_config, dns_publish_via_relay, join_url,
-    signed_daemon_context_for_config, RELAY_CONTROL_PROTOCOL, RELAY_CONTROL_PROTOCOL_V1,
+    authenticated, dns_publish_addresses, dns_publish_addresses_for_config, dns_publish_via_relay,
+    join_url, signed_daemon_context_for_config, RELAY_CONTROL_PROTOCOL, RELAY_CONTROL_PROTOCOL_V1,
     RELAY_DISCONNECT_PROTOCOL,
 };
 use crate::daemon_identity::DaemonIdentity;
@@ -145,6 +145,44 @@ fn has_rendezvous_destination(config: &ConnectConfig) -> bool {
         .is_some_and(|url| !url.is_empty())
 }
 
+#[derive(Default)]
+struct RelayDnsPublicationState {
+    relay_active: bool,
+}
+
+fn relay_dns_publication_state() -> &'static Mutex<RelayDnsPublicationState> {
+    static STATE: OnceLock<Mutex<RelayDnsPublicationState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(RelayDnsPublicationState::default()))
+}
+
+/// Publish direct fleet addresses unless this process has successfully
+/// established relay-mode DNS. The same coordinator serializes relay and
+/// direct writes, so certificate renewal cannot overwrite a live relay route.
+pub(crate) async fn publish_fleet_dns_addresses(
+    addresses: &[String],
+) -> Result<Vec<String>, String> {
+    publish_fleet_dns_addresses_with(relay_dns_publication_state(), addresses, || async {
+        dns_publish_addresses(addresses).await
+    })
+    .await
+}
+
+async fn publish_fleet_dns_addresses_with<D, DirectFuture>(
+    publication: &Mutex<RelayDnsPublicationState>,
+    addresses: &[String],
+    direct_publish: D,
+) -> Result<Vec<String>, String>
+where
+    D: FnOnce() -> DirectFuture,
+    DirectFuture: std::future::Future<Output = Result<Vec<String>, String>>,
+{
+    let state = publication.lock().await;
+    if state.relay_active {
+        return Ok(addresses.to_vec());
+    }
+    direct_publish().await
+}
+
 async fn relay_dns_reassert_loop(
     config: ConnectConfig,
     lifecycle: watch::Receiver<bool>,
@@ -161,7 +199,8 @@ async fn relay_dns_reassert_loop(
             let config = publish_config.clone();
             let direct_config = config.clone();
             async move {
-                publish_relay_dns_state_with(
+                publish_relay_dns_state_coordinated_with(
+                    relay_dns_publication_state(),
                     enable,
                     move |enable| async move { dns_publish_via_relay(&config, enable).await },
                     move || async move {
@@ -181,6 +220,32 @@ async fn relay_dns_reassert_loop(
         },
     )
     .await;
+}
+
+async fn publish_relay_dns_state_coordinated_with<R, RelayFuture, D, DirectFuture>(
+    publication: &Mutex<RelayDnsPublicationState>,
+    enable: bool,
+    relay_publish: R,
+    direct_publish: D,
+) -> Result<(), String>
+where
+    R: FnOnce(bool) -> RelayFuture,
+    RelayFuture: std::future::Future<Output = Result<(), String>>,
+    D: FnOnce() -> DirectFuture,
+    DirectFuture: std::future::Future<Output = Result<(), String>>,
+{
+    let mut state = publication.lock().await;
+    if !enable {
+        // This is the desired state even when the remote withdrawal result
+        // is ambiguous. A later direct publication may safely reinforce it,
+        // and the reconciler keeps retrying the full withdrawal transition.
+        state.relay_active = false;
+    }
+    let result = publish_relay_dns_state_with(enable, relay_publish, direct_publish).await;
+    if enable && result.is_ok() {
+        state.relay_active = true;
+    }
+    result
 }
 
 async fn publish_relay_dns_state_with<R, RelayFuture, D, DirectFuture>(
@@ -1074,6 +1139,94 @@ mod tests {
         .await
         .is_ok());
         assert_eq!(calls.lock().unwrap().as_slice(), ["relay-enable"]);
+    }
+
+    #[tokio::test]
+    async fn relay_ready_certificate_address_refresh_preserves_relay_dns() {
+        let publication = Mutex::new(RelayDnsPublicationState::default());
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay_calls = Arc::clone(&calls);
+        let unexpected_direct_calls = Arc::clone(&calls);
+        publish_relay_dns_state_coordinated_with(
+            &publication,
+            true,
+            move |enable| {
+                let calls = Arc::clone(&relay_calls);
+                async move {
+                    calls.lock().unwrap().push(if enable {
+                        "relay-enable"
+                    } else {
+                        "relay-disable"
+                    });
+                    Ok(())
+                }
+            },
+            || async { Ok(()) },
+        )
+        .await
+        .unwrap();
+
+        let addresses = vec!["192.0.2.10".to_string()];
+        let accepted = publish_fleet_dns_addresses_with(&publication, &addresses, move || {
+            let calls = Arc::clone(&unexpected_direct_calls);
+            async move {
+                calls.lock().unwrap().push("direct-refresh");
+                Ok(Vec::new())
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(accepted, addresses);
+        assert_eq!(calls.lock().unwrap().as_slice(), ["relay-enable"]);
+
+        let relay_calls = Arc::clone(&calls);
+        let withdrawal_calls = Arc::clone(&calls);
+        publish_relay_dns_state_coordinated_with(
+            &publication,
+            false,
+            move |enable| {
+                let calls = Arc::clone(&relay_calls);
+                async move {
+                    calls.lock().unwrap().push(if enable {
+                        "relay-enable"
+                    } else {
+                        "relay-disable"
+                    });
+                    Ok(())
+                }
+            },
+            move || {
+                let calls = Arc::clone(&withdrawal_calls);
+                async move {
+                    calls.lock().unwrap().push("direct-restore");
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let direct_calls = Arc::clone(&calls);
+        let direct_addresses = addresses.clone();
+        let accepted = publish_fleet_dns_addresses_with(&publication, &addresses, move || {
+            let calls = Arc::clone(&direct_calls);
+            let addresses = direct_addresses;
+            async move {
+                calls.lock().unwrap().push("direct-refresh");
+                Ok(addresses)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(accepted, vec!["192.0.2.10".to_string()]);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                "relay-enable",
+                "relay-disable",
+                "direct-restore",
+                "direct-refresh"
+            ]
+        );
     }
 
     #[tokio::test]

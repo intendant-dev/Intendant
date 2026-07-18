@@ -176,6 +176,29 @@ impl FleetZone {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn daemon_addresses_for_test(&self, daemon_id: &str) -> Vec<IpAddr> {
+        let Some(label) = daemon_label(daemon_id) else {
+            return Vec::new();
+        };
+        let data = self.data.read().unwrap_or_else(|error| error.into_inner());
+        data.v4
+            .get(&label)
+            .into_iter()
+            .flatten()
+            .copied()
+            .map(IpAddr::V4)
+            .chain(
+                data.v6
+                    .get(&label)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .map(IpAddr::V6),
+            )
+            .collect()
+    }
+
     /// Drop every record for a daemon (release/sweep lifecycle).
     pub fn remove_daemon(&self, daemon_id: &str) {
         let Some(label) = daemon_label(daemon_id) else {

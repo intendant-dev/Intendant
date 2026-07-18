@@ -109,8 +109,11 @@ becomes an idempotent exact cleanup after its lease plus grace period. The
 primary journal carries creation, active-validation, and cleanup phases with
 bounded owner leases. A sibling process therefore leaves a live challenge
 alone; only an explicit handoff to cleanup or an expired lease plus grace
-period makes it reclaimable. Startup and every later certificate pass retry a
-reclaimable journal before creating another challenge, covering crashes,
+period makes it reclaimable. The active worker renews the DNS lease throughout
+every post-creation propagation and ACME authorization wait, so a slow request
+cannot make a still-required TXT value reclaimable. Startup and every later
+certificate pass retries a reclaimable journal before creating another
+challenge, covering crashes,
 cancellation, and transient provider failures. Store the credential as a
 daemon credential lease where possible; configuration names an
 environment-variable fallback but never embeds the secret. While a cleanup

@@ -2155,29 +2155,19 @@ pub(crate) async fn dns_publish(
     let name = zone
         .daemon_fqdn(&daemon_id)
         .ok_or_else(|| ApiError::bad_request("daemon id does not derive a DNS label"))?;
-    zone.set_daemon_addresses(&daemon_id, &addresses)
-        .map_err(ApiError::bad_request)?;
-    let now = now_unix_ms();
-    {
-        let mut store = state.store.lock().await;
-        store.dns_records.retain(|r| r.daemon_id != daemon_id);
-        if !addresses.is_empty() {
-            store.dns_records.push(DnsRecordEntry {
-                daemon_id: daemon_id.clone(),
-                addresses: addresses.iter().map(|ip| ip.to_string()).collect(),
-                updated_unix_ms: now,
-                via_relay: false,
-            });
-        }
-        audit(
-            &mut store,
-            "dns_publish",
-            daemon.owner_user_id,
-            Some(daemon_id.clone()),
-            json!({ "name": name, "addresses": addresses.len() }),
-        );
-        persist_locked(&state, &store).await?;
-    }
+    commit_dns_record_update(
+        &state,
+        &zone,
+        &daemon_id,
+        &addresses,
+        false,
+        DnsRecordAudit {
+            event: "dns_publish",
+            user_id: daemon.owner_user_id,
+            detail: json!({ "name": name, "addresses": addresses.len() }),
+        },
+    )
+    .await?;
     Ok(Json(json!({
         "ok": true,
         "zone": zone.origin_utf8(),

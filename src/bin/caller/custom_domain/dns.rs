@@ -341,6 +341,80 @@ pub(crate) fn renew_pending_challenge(
     .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
+pub(crate) fn seed_active_challenge_for_test(
+    cert_dir: &Path,
+    domain: &str,
+) -> Result<DnsChallengeLease, String> {
+    let lease = DnsChallengeLease {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        owner_token: uuid::Uuid::new_v4().simple().to_string(),
+    };
+    let pending = PendingChallenge {
+        schema_version: PENDING_CHALLENGE_SCHEMA_VERSION,
+        id: lease.id.clone(),
+        domain: domain.to_string(),
+        record_name: format!("_acme-challenge.{domain}"),
+        value: "test-active-challenge".to_string(),
+        provider: CustomDomainDnsConfig::Cloudflare {
+            zone_id: "test-zone".to_string(),
+            token_env: Some("TEST_DNS_API_TOKEN".to_string()),
+            propagation_delay_secs: 0,
+        },
+        cloudflare_record_id: Some("testrecord".to_string()),
+        phase: PendingChallengePhase::Active,
+        owner_token: Some(lease.owner_token.clone()),
+        lease_expires_unix_ms: now_unix_ms().saturating_add(PENDING_CHALLENGE_ACTIVE_LEASE_MS),
+        mutation_complete: true,
+    };
+    crate::access::authority_store::with_lock(cert_dir, || {
+        write_pending_challenge_locked(cert_dir, &pending)
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(lease)
+}
+
+#[cfg(test)]
+pub(crate) fn expire_active_challenge_for_test(
+    cert_dir: &Path,
+    lease: &DnsChallengeLease,
+) -> Result<(), String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let mut pending = load_pending_challenge_locked(cert_dir)
+            .map_err(crate::access::AccessError)?
+            .ok_or_else(|| {
+                crate::access::AccessError("test DNS challenge disappeared".to_string())
+            })?;
+        require_challenge_owner(&pending, lease)?;
+        if pending.phase != PendingChallengePhase::Active {
+            return Err(crate::access::AccessError(
+                "test DNS challenge is no longer active".to_string(),
+            ));
+        }
+        pending.lease_expires_unix_ms = now_unix_ms().saturating_sub(1);
+        write_pending_challenge_locked(cert_dir, &pending)
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn active_challenge_lease_is_current_for_test(
+    cert_dir: &Path,
+    lease: &DnsChallengeLease,
+) -> Result<bool, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let pending =
+            load_pending_challenge_locked(cert_dir).map_err(crate::access::AccessError)?;
+        Ok(pending.is_some_and(|pending| {
+            pending.id == lease.id
+                && pending.owner_token.as_deref() == Some(lease.owner_token.as_str())
+                && pending.phase == PendingChallengePhase::Active
+                && pending.lease_expires_unix_ms > now_unix_ms()
+        }))
+    })
+    .map_err(|error| error.to_string())
+}
+
 pub(crate) fn mark_pending_challenge_cleanup(
     cert_dir: &Path,
     lease: &DnsChallengeLease,

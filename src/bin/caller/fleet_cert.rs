@@ -2188,7 +2188,7 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
 
     // 1. Make the name resolve: publish the addresses (daemon-signed).
     let published = issuance
-        .await_with_heartbeat(crate::connect_rendezvous::dns_publish_addresses(&addresses))
+        .await_with_heartbeat(crate::relay_tunnel::publish_fleet_dns_addresses(&addresses))
         .await??;
     with_status(|status| status.addresses = published.clone());
 

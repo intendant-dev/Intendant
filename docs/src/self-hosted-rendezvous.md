@@ -119,7 +119,10 @@ canonical `d-<20hex>.<zone>` form; incomplete or inconsistent metadata does
 not become durable fleet provenance.
 Address records persist in the state file and follow the daemon-record
 lifecycle (they survive link/release; the stale-unlinked sweep drops
-them). ACME TXT challenges are in-memory and self-expire. Posture:
+them). Each address generation is serialized per daemon, persisted before it
+replaces the live zone answer, and leaves both memory and the live answer on
+the prior generation if persistence fails. ACME TXT challenges are in-memory
+and self-expire. Posture:
 authoritative-only, `Refused` outside the zone, no AXFR, RFC 8482
 minimal `ANY`, 60 s TTLs. Daemons validating against Let's Encrypt
 *staging* set `INTENDANT_ACME_DIRECTORY` to the staging directory URL.
@@ -388,7 +391,10 @@ tunnel state explicitly converges toward `enable = false`, including stale
 relay publication left by a prior process. A successful withdrawal is not
 complete until the daemon has republished its direct addresses against the
 same pinned rendezvous generation; failure of either step keeps the whole
-transition retryable. That ingress
+transition retryable. Certificate issuance and renewal publish address
+refreshes through the same coordinator: while relay mode is established they
+retain the daemon's direct fallback locally without overwriting the live relay
+answer. That ingress
 binds only to an ephemeral `127.0.0.1` port, is never advertised, and
 does not share the public listener's trusted-local classification. Connect
 runtime settings may move the ordinary registration client to another

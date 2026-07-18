@@ -1725,6 +1725,81 @@ async fn update_store_transaction<R>(
     Ok(result)
 }
 
+struct DnsRecordAudit<'a> {
+    event: &'a str,
+    user_id: Option<Uuid>,
+    detail: serde_json::Value,
+}
+
+async fn update_dns_record_transaction(
+    store: &Mutex<Store>,
+    zone: &FleetZone,
+    daemon_id: &str,
+    addresses: &[IpAddr],
+    via_relay: bool,
+    record_audit: DnsRecordAudit<'_>,
+    persist: impl AsyncFnOnce(&Store) -> ApiResult<()>,
+) -> ApiResult<()> {
+    // Validate before the durable commit. `set_daemon_addresses` has the same
+    // sole validation rule, so its post-persist call cannot reject this id.
+    zone.daemon_fqdn(daemon_id)
+        .ok_or_else(|| ApiError::bad_request("daemon id does not derive a DNS label"))?;
+    let stored_addresses: Vec<String> = addresses.iter().map(ToString::to_string).collect();
+    let now = now_unix_ms();
+    let mut store = store.lock().await;
+    let prior_dns_records = store.dns_records.clone();
+    let prior_audit = store.audit.clone();
+    store
+        .dns_records
+        .retain(|record| record.daemon_id != daemon_id);
+    if !addresses.is_empty() {
+        store.dns_records.push(DnsRecordEntry {
+            daemon_id: daemon_id.to_string(),
+            addresses: stored_addresses,
+            updated_unix_ms: now,
+            via_relay,
+        });
+    }
+    audit(
+        &mut store,
+        record_audit.event,
+        record_audit.user_id,
+        Some(daemon_id.to_string()),
+        record_audit.detail,
+    );
+    if let Err(error) = persist(&store).await {
+        store.dns_records = prior_dns_records;
+        store.audit = prior_audit;
+        return Err(error);
+    }
+    zone.set_daemon_addresses(daemon_id, addresses)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "publish persisted fleet DNS record for validated daemon: {error}"
+            ))
+        })
+}
+
+async fn commit_dns_record_update(
+    state: &AppState,
+    zone: &FleetZone,
+    daemon_id: &str,
+    addresses: &[IpAddr],
+    via_relay: bool,
+    record_audit: DnsRecordAudit<'_>,
+) -> ApiResult<()> {
+    update_dns_record_transaction(
+        &state.store,
+        zone,
+        daemon_id,
+        addresses,
+        via_relay,
+        record_audit,
+        async |next| persist_locked(state, next).await,
+    )
+    .await
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2034,6 +2109,128 @@ mod tests {
             daemon_hosted_control_url(&state, &store, &daemon),
             None,
             "direct-mode DNS does not imply HTTPS on the relay's public port"
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_record_persist_failure_keeps_live_and_memory_generation() {
+        let old_address: IpAddr = "192.0.2.10".parse().unwrap();
+        let new_address: IpAddr = "192.0.2.11".parse().unwrap();
+        let store = Mutex::new(Store {
+            dns_records: vec![DnsRecordEntry {
+                daemon_id: "daemon-1".to_string(),
+                addresses: vec![old_address.to_string()],
+                updated_unix_ms: 1,
+                via_relay: false,
+            }],
+            ..Store::default()
+        });
+        let zone = FleetZone::new("fleet.example.test", "ns.fleet.example.test").unwrap();
+        zone.set_daemon_addresses("daemon-1", &[old_address])
+            .unwrap();
+
+        let result = update_dns_record_transaction(
+            &store,
+            &zone,
+            "daemon-1",
+            &[new_address],
+            true,
+            DnsRecordAudit {
+                event: "dns_relay",
+                user_id: None,
+                detail: json!({ "enable": true }),
+            },
+            async |_| Err(ApiError::internal("forced persist failure")),
+        )
+        .await;
+        assert!(result.is_err());
+        let store = store.lock().await;
+        assert_eq!(store.dns_records[0].addresses, [old_address.to_string()]);
+        assert!(!store.dns_records[0].via_relay);
+        assert!(store.audit.is_empty());
+        drop(store);
+        assert_eq!(
+            zone.daemon_addresses_for_test("daemon-1"),
+            vec![old_address]
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_dns_updates_serialize_live_and_durable_generations() {
+        let first_address: IpAddr = "192.0.2.20".parse().unwrap();
+        let second_address: IpAddr = "192.0.2.21".parse().unwrap();
+        let store = Arc::new(Mutex::new(Store::default()));
+        let zone = Arc::new(FleetZone::new("fleet.example.test", "ns.fleet.example.test").unwrap());
+        let (first_persist_tx, first_persist_rx) = oneshot::channel();
+        let (release_first_tx, release_first_rx) = oneshot::channel();
+        let first_store = Arc::clone(&store);
+        let first_zone = Arc::clone(&zone);
+        let first = tokio::spawn(async move {
+            update_dns_record_transaction(
+                &first_store,
+                &first_zone,
+                "daemon-1",
+                &[first_address],
+                false,
+                DnsRecordAudit {
+                    event: "dns_publish",
+                    user_id: None,
+                    detail: json!({ "generation": 1 }),
+                },
+                async move |_| {
+                    let _ = first_persist_tx.send(());
+                    let _ = release_first_rx.await;
+                    Ok(())
+                },
+            )
+            .await
+        });
+        first_persist_rx.await.unwrap();
+
+        let (second_persist_tx, mut second_persist_rx) = oneshot::channel();
+        let second_store = Arc::clone(&store);
+        let second_zone = Arc::clone(&zone);
+        let second = tokio::spawn(async move {
+            update_dns_record_transaction(
+                &second_store,
+                &second_zone,
+                "daemon-1",
+                &[second_address],
+                true,
+                DnsRecordAudit {
+                    event: "dns_relay",
+                    user_id: None,
+                    detail: json!({ "generation": 2 }),
+                },
+                async move |_| {
+                    let _ = second_persist_tx.send(());
+                    Ok(())
+                },
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second_persist_rx)
+                .await
+                .is_err(),
+            "the second DNS generation reached persistence before the first released the store"
+        );
+        release_first_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), &mut second_persist_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        second.await.unwrap().unwrap();
+
+        let store = store.lock().await;
+        assert_eq!(store.dns_records[0].addresses, [second_address.to_string()]);
+        assert!(store.dns_records[0].via_relay);
+        assert_eq!(store.audit.len(), 2);
+        drop(store);
+        assert_eq!(
+            zone.daemon_addresses_for_test("daemon-1"),
+            vec![second_address]
         );
     }
 

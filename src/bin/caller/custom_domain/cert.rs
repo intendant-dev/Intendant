@@ -437,6 +437,59 @@ impl IssuanceLeaseGuard {
         }
     }
 
+    async fn await_with_dns_heartbeat<F>(
+        &mut self,
+        dns_lease: &super::dns::DnsChallengeLease,
+        future: F,
+    ) -> Result<F::Output, String>
+    where
+        F: std::future::Future,
+    {
+        self.await_with_dns_heartbeat_at_interval(
+            dns_lease,
+            DNS_CHALLENGE_LEASE_RENEW_INTERVAL,
+            future,
+        )
+        .await
+    }
+
+    async fn await_with_dns_heartbeat_at_interval<F>(
+        &mut self,
+        dns_lease: &super::dns::DnsChallengeLease,
+        dns_interval: Duration,
+        future: F,
+    ) -> Result<F::Output, String>
+    where
+        F: std::future::Future,
+    {
+        self.renew()?;
+        super::dns::renew_pending_challenge(&self.cert_dir, dns_lease)?;
+        let mut issuance_heartbeat = tokio::time::interval(ISSUANCE_HEARTBEAT_INTERVAL);
+        issuance_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut dns_heartbeat = tokio::time::interval(dns_interval);
+        dns_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Both interval streams tick immediately. Ownership was renewed
+        // above before the network future is first polled.
+        issuance_heartbeat.tick().await;
+        dns_heartbeat.tick().await;
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                output = &mut future => {
+                    self.renew()?;
+                    super::dns::renew_pending_challenge(&self.cert_dir, dns_lease)?;
+                    return Ok(output);
+                }
+                _ = issuance_heartbeat.tick() => {
+                    self.renew()?;
+                }
+                _ = dns_heartbeat.tick() => {
+                    super::dns::renew_pending_challenge(&self.cert_dir, dns_lease)?;
+                }
+            }
+        }
+    }
+
     fn order_url(&self) -> Option<&str> {
         self.record.order_url.as_deref()
     }
@@ -810,9 +863,17 @@ async fn request_certificate(
         if order_status == instant_acme::OrderStatus::Pending {
             {
                 let mut authorizations = order.authorizations();
-                while let Some(result) =
-                    issuance.await_with_heartbeat(authorizations.next()).await?
-                {
+                loop {
+                    let next = if let Some(lease) = dns_challenge_lease.as_ref() {
+                        issuance
+                            .await_with_dns_heartbeat(lease, authorizations.next())
+                            .await?
+                    } else {
+                        issuance.await_with_heartbeat(authorizations.next()).await?
+                    };
+                    let Some(result) = next else {
+                        break;
+                    };
                     let mut authorization = result
                         .map_err(|error| format!("custom-domain ACME authorization: {error}"))?;
                     match authorization.status {
@@ -843,28 +904,35 @@ async fn request_certificate(
                         Duration::from_secs(super::dns::propagation_delay_secs(dns_config));
                     while !propagation_wait.is_zero() {
                         let wait = propagation_wait.min(DNS_CHALLENGE_LEASE_RENEW_INTERVAL);
+                        let lease = dns_challenge_lease
+                            .as_ref()
+                            .expect("DNS challenge lease was just stored");
                         issuance
-                            .await_with_heartbeat(tokio::time::sleep(wait))
+                            .await_with_dns_heartbeat(lease, tokio::time::sleep(wait))
                             .await?;
                         propagation_wait = propagation_wait.saturating_sub(wait);
-                        super::dns::renew_pending_challenge(
-                            cert_dir,
-                            dns_challenge_lease
-                                .as_ref()
-                                .expect("DNS challenge lease was just stored"),
-                        )?;
                     }
+                    let lease = dns_challenge_lease
+                        .as_ref()
+                        .expect("DNS challenge lease was just stored");
                     issuance
-                        .await_with_heartbeat(challenge.set_ready())
+                        .await_with_dns_heartbeat(lease, challenge.set_ready())
                         .await?
                         .map_err(|error| format!("custom-domain ACME challenge ready: {error}"))?;
                 }
             }
             let retry = instant_acme::RetryPolicy::default();
-            order_status = issuance
-                .await_with_heartbeat(order.poll_ready(&retry))
-                .await?
-                .map_err(|error| format!("custom-domain ACME validation: {error}"))?;
+            let ready = if let Some(lease) = dns_challenge_lease.as_ref() {
+                issuance
+                    .await_with_dns_heartbeat(lease, order.poll_ready(&retry))
+                    .await?
+            } else {
+                issuance
+                    .await_with_heartbeat(order.poll_ready(&retry))
+                    .await?
+            };
+            order_status =
+                ready.map_err(|error| format!("custom-domain ACME validation: {error}"))?;
         }
         Ok(order_status)
     }
@@ -1287,6 +1355,54 @@ mod tests {
             IssuanceLeaseGuard::begin(&domain, dir.path()).unwrap(),
             IssuanceClaim::CertificateCurrent
         ));
+    }
+
+    #[tokio::test]
+    async fn acme_wait_renews_an_active_dns_lease_before_cleanup_can_claim_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = ValidatedCustomDomain {
+            name: "box.example.test".to_string(),
+            rp_id: "box.example.test".to_string(),
+            origin: "https://box.example.test".to_string(),
+        };
+        let mut issuance = match IssuanceLeaseGuard::begin(&domain, dir.path()).unwrap() {
+            IssuanceClaim::Acquired(guard) => *guard,
+            IssuanceClaim::CertificateCurrent => panic!("no certificate exists yet"),
+        };
+        let lease =
+            super::super::dns::seed_active_challenge_for_test(dir.path(), &domain.name).unwrap();
+        let cert_dir = dir.path().to_path_buf();
+        let observed = issuance
+            .await_with_dns_heartbeat_at_interval(&lease, Duration::from_millis(5), async {
+                // Model a post-propagation ACME request stalled past the
+                // two-hour active lease without making the test wait.
+                super::super::dns::expire_active_challenge_for_test(&cert_dir, &lease).unwrap();
+                let mut renewed = false;
+                for _ in 0..200 {
+                    if super::super::dns::active_challenge_lease_is_current_for_test(
+                        &cert_dir, &lease,
+                    )
+                    .unwrap()
+                    {
+                        renewed = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                assert!(renewed, "the ACME wait did not renew its DNS lease");
+                assert!(
+                    !super::super::dns::retry_pending_challenge(&cert_dir)
+                        .await
+                        .unwrap(),
+                    "concurrent cleanup claimed an active renewed challenge"
+                );
+                super::super::dns::active_challenge_lease_is_current_for_test(&cert_dir, &lease)
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+        assert!(observed);
+        issuance.finish().unwrap();
     }
 
     #[test]
