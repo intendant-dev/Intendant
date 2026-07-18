@@ -363,6 +363,11 @@ pub(crate) fn permission_denied_signature(text: &str) -> bool {
     lower.contains("permission denied")
         || lower.contains("operation not permitted")
         || lower.contains("access is denied")
+        // PowerShell's phrase splits around the path: "Access to the
+        // path 'C:\x' is denied." — no contiguous "access is denied"
+        // substring (cost five CI-only failures to notice: the
+        // cfg(windows) assert never runs locally).
+        || (lower.contains("access to the path") && lower.contains("is denied"))
 }
 
 /// Classify one tool result as a sandbox write denial worth a consent
@@ -690,6 +695,12 @@ mod tests {
         ));
         assert!(permission_denied_signature(
             "Access is denied. (os error 5)"
+        ));
+        // PowerShell splits the phrase around the path — the signature
+        // must match it on EVERY platform's build of this test (a
+        // cfg(windows)-only assert hid this for five CI rounds).
+        assert!(permission_denied_signature(
+            "Access to the path 'C:\\denied\\f.txt' is denied."
         ));
         assert!(!permission_denied_signature("No such file or directory"));
     }
