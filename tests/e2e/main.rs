@@ -3325,6 +3325,12 @@ async fn supervised_session_ask_human_reaches_the_question_rail() {
 /// rail, answering "Always allow" persists the grant to intendant.toml and
 /// live-applies it, and the retried write then succeeds — no restart.
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "the write sandbox is opt-in on Windows (ACE-propagation cost) and the \
+              restricted-runtime consent chain there is unvalidated — Windows consent-path \
+              e2e rides the Windows sandbox redesign follow-up"
+)]
 async fn sandbox_denial_raises_consent_card_and_always_allow_unblocks_retry() {
     use futures_util::SinkExt;
 
