@@ -40,6 +40,123 @@ pub(crate) fn session_scoped_mcp_token(base_token: &str, session_id: &str) -> St
         .collect()
 }
 
+/// One supervised backend session's daemon-side `/mcp` serve tracking.
+///
+/// The gate is the ground truth for *transport and serving*: it sees the
+/// backend's MCP client connect (first `initialize`) and receive the tool
+/// list (first successful `tools/list`) the moment they happen, while the
+/// backend's own status echo (e.g. Claude Code's per-turn `system:init`
+/// blob) only surfaces at the next turn boundary — and speaks to
+/// client-side *registration*, a different fact (a client can accept the
+/// transport yet reject the served tool list). Both truths are reported
+/// into the session's timeline as complementary lines; the daemon-side
+/// pair is emitted by [`note_supervised_mcp_serve`].
+struct SupervisedMcpServeEntry {
+    /// Weak so this registry never extends a session log's lifetime: when
+    /// the owning session ends and its log is dropped, the entry is dead
+    /// (skipped on serve, swept on the next registration).
+    session_log: std::sync::Weak<Mutex<crate::session_log::SessionLog>>,
+    initialize_reported: bool,
+    tools_reported: bool,
+}
+
+/// Supervised session id → serve tracking. Bounded: entries are created
+/// only at backend construction ([`register_supervised_mcp_session`]),
+/// die with their session's log (weak upgrade fails), and dead entries
+/// are swept on every registration.
+static SUPERVISED_MCP_SERVES: OnceLock<Mutex<HashMap<String, SupervisedMcpServeEntry>>> =
+    OnceLock::new();
+
+fn supervised_mcp_serves() -> &'static Mutex<HashMap<String, SupervisedMcpServeEntry>> {
+    SUPERVISED_MCP_SERVES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register a supervised backend session for daemon-side `/mcp` serve
+/// status lines. Called at backend construction, before the child process
+/// spawns, so the client's very first request is attributable. A respawn
+/// (credential reload) re-registers and resets the once-flags: a fresh
+/// backend process reconnecting is a fresh transport fact worth fresh
+/// lines.
+pub(crate) fn register_supervised_mcp_session(
+    session_id: &str,
+    session_log: &Arc<Mutex<crate::session_log::SessionLog>>,
+) {
+    let Ok(mut map) = supervised_mcp_serves().lock() else {
+        return;
+    };
+    map.retain(|_, entry| entry.session_log.strong_count() > 0);
+    map.insert(
+        session_id.to_string(),
+        SupervisedMcpServeEntry {
+            session_log: Arc::downgrade(session_log),
+            initialize_reported: false,
+            tools_reported: false,
+        },
+    );
+}
+
+/// The serve milestones the daemon reports firsthand for a supervised
+/// session's `/mcp` endpoint.
+#[derive(Clone, Copy)]
+pub(crate) enum McpServeMilestone {
+    /// The session's client completed its first `initialize` handshake.
+    Initialize,
+    /// The first successful `tools/list`, with the tool count served
+    /// (after IAM filtering — what the client was actually handed).
+    ToolsServed(usize),
+}
+
+/// Emit the daemon-side serve status line for a supervised session, once
+/// per milestone per registration: an `info` line into the session's own
+/// log (replay) plus an `AppEvent::LogEntry` on the bus (live timeline) —
+/// the same two sinks the external-supervision drain writes its status
+/// lines through (`external_events`' `AgentEvent::Log` handler), so the
+/// lines render everywhere those do. No-op for callers that never
+/// registered (browser, mTLS, bare-loopback lanes) and for repeat serves.
+pub(crate) fn note_supervised_mcp_serve(
+    bus: &EventBus,
+    session_id: &str,
+    milestone: McpServeMilestone,
+) {
+    let session_log = {
+        let Ok(mut map) = supervised_mcp_serves().lock() else {
+            return;
+        };
+        let Some(entry) = map.get_mut(session_id) else {
+            return;
+        };
+        let reported = match milestone {
+            McpServeMilestone::Initialize => &mut entry.initialize_reported,
+            McpServeMilestone::ToolsServed(_) => &mut entry.tools_reported,
+        };
+        if *reported {
+            return;
+        }
+        let Some(session_log) = entry.session_log.upgrade() else {
+            map.remove(session_id);
+            return;
+        };
+        *reported = true;
+        session_log
+    };
+    let content = match milestone {
+        McpServeMilestone::Initialize => "Intendant MCP endpoint: client connected".to_string(),
+        McpServeMilestone::ToolsServed(count) => {
+            format!("Intendant MCP endpoint: served {count} tools")
+        }
+    };
+    if let Ok(mut log) = session_log.lock() {
+        log.info(&content);
+    }
+    bus.send(AppEvent::LogEntry {
+        session_id: Some(session_id.to_string()),
+        level: "info".to_string(),
+        source: "Intendant".to_string(),
+        content,
+        turn: None,
+    });
+}
+
 /// How a request authenticated against this daemon's MCP token, if at all.
 #[derive(Debug, PartialEq)]
 pub(crate) enum McpTokenBinding {
@@ -271,6 +388,7 @@ pub(crate) fn mcp_permission_denied_result(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_mcp_http_request(
     body: &str,
     server: &crate::mcp::IntendantServer,
@@ -279,8 +397,10 @@ pub(crate) async fn handle_mcp_http_request(
     tool_profile: Option<&str>,
     access: &HttpAccessContext,
     // The session identity the token binding itself named (never a bare
-    // query echo) — see `mcp_gate_session`. Feeds actor attribution.
+    // query echo) — see `mcp_gate_session`. Feeds actor attribution and
+    // the daemon-side serve status lines.
     gate_session: Option<String>,
+    bus: &EventBus,
 ) -> McpHttpOutcome {
     let request: McpHttpRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -302,14 +422,22 @@ pub(crate) async fn handle_mcp_http_request(
     let is_notification = request.id.is_none();
 
     let result = match request.method.as_str() {
-        "initialize" => Ok(serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "serverInfo": {
-                "name": "intendant",
-                "version": env!("CARGO_PKG_VERSION"),
+        "initialize" => {
+            // Daemon-side ground truth, immediately: the supervised
+            // session's client reached this endpoint. The backend's own
+            // echo of the same fact only arrives at a turn boundary.
+            if let Some(sid) = gate_session.as_deref() {
+                note_supervised_mcp_serve(bus, sid, McpServeMilestone::Initialize);
             }
-        })),
+            Ok(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": "intendant",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            }))
+        }
         "notifications/initialized"
         | "notifications/cancelled"
         | "notifications/progress"
@@ -322,6 +450,14 @@ pub(crate) async fn handle_mcp_http_request(
                 .list_tools_json_for_session(session_id, codex_managed_context, tool_profile)
                 .await;
             filter_mcp_tools_by_access(&mut listed, access);
+            if let Some(sid) = gate_session.as_deref() {
+                let served = listed
+                    .get("tools")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|tools| tools.len())
+                    .unwrap_or(0);
+                note_supervised_mcp_serve(bus, sid, McpServeMilestone::ToolsServed(served));
+            }
             Ok(listed)
         }
         "tools/call" => {
@@ -409,6 +545,7 @@ pub(crate) async fn handle_mcp_post(
     tls_client_cert_present: bool,
     tls_client_cert_fingerprint: Option<String>,
     peer_addr: std::net::SocketAddr,
+    bus: EventBus,
 ) {
     // MCP Streamable HTTP endpoint.
     //
@@ -471,6 +608,7 @@ pub(crate) async fn handle_mcp_post(
             tool_profile.as_deref(),
             &mcp_access,
             mcp_gate_session(header_text),
+            &bus,
         )
         .await;
         // Keep-alive opt-in (response leg): both shapes are self-framing
@@ -958,6 +1096,206 @@ mod tests {
         );
     }
 
+    /// Drain the broadcast receiver, returning the daemon-side MCP serve
+    /// status lines (level, content, session_id) it carried.
+    fn drain_mcp_serve_lines(
+        rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+    ) -> Vec<(String, String, Option<String>)> {
+        let mut lines = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::LogEntry {
+                session_id,
+                level,
+                source,
+                content,
+                ..
+            } = event
+            {
+                if source == "Intendant" && content.starts_with("Intendant MCP endpoint:") {
+                    lines.push((level, content, session_id));
+                }
+            }
+        }
+        lines
+    }
+
+    fn temp_session_log(dir: &std::path::Path) -> Arc<Mutex<crate::session_log::SessionLog>> {
+        Arc::new(Mutex::new(
+            crate::session_log::SessionLog::open(dir.to_path_buf()).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn supervised_mcp_serve_reports_once_per_milestone_per_registration() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bus = crate::event::EventBus::new();
+        let mut rx = bus.subscribe();
+        let log = temp_session_log(&tmp.path().join("sess"));
+        register_supervised_mcp_session("serve-once-sess", &log);
+
+        note_supervised_mcp_serve(&bus, "serve-once-sess", McpServeMilestone::Initialize);
+        // Repeat serves are quiet — the first line was the news.
+        note_supervised_mcp_serve(&bus, "serve-once-sess", McpServeMilestone::Initialize);
+        note_supervised_mcp_serve(&bus, "serve-once-sess", McpServeMilestone::ToolsServed(7));
+        note_supervised_mcp_serve(&bus, "serve-once-sess", McpServeMilestone::ToolsServed(9));
+        // Never-registered callers (browser, ctl, peer lanes) emit nothing.
+        note_supervised_mcp_serve(&bus, "serve-once-unregistered", McpServeMilestone::Initialize);
+
+        let lines = drain_mcp_serve_lines(&mut rx);
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    "info".to_string(),
+                    "Intendant MCP endpoint: client connected".to_string(),
+                    Some("serve-once-sess".to_string()),
+                ),
+                (
+                    "info".to_string(),
+                    "Intendant MCP endpoint: served 7 tools".to_string(),
+                    Some("serve-once-sess".to_string()),
+                ),
+            ]
+        );
+
+        // Both lines were also persisted into the owning session's log,
+        // so replay renders them without any live bus.
+        let persisted =
+            std::fs::read_to_string(log.lock().unwrap().dir().join("session.jsonl")).unwrap();
+        assert!(persisted.contains("Intendant MCP endpoint: client connected"));
+        assert!(persisted.contains("Intendant MCP endpoint: served 7 tools"));
+
+        // A respawn re-registers, and the fresh backend's first serves
+        // report again.
+        register_supervised_mcp_session("serve-once-sess", &log);
+        note_supervised_mcp_serve(&bus, "serve-once-sess", McpServeMilestone::Initialize);
+        let lines = drain_mcp_serve_lines(&mut rx);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].1, "Intendant MCP endpoint: client connected");
+    }
+
+    #[test]
+    fn supervised_mcp_serve_entries_die_with_their_session_log() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bus = crate::event::EventBus::new();
+        let mut rx = bus.subscribe();
+        let log = temp_session_log(&tmp.path().join("sess"));
+        register_supervised_mcp_session("dead-log-sess", &log);
+        drop(log);
+        // The session's log is gone (session ended): no line, and the
+        // dead entry is dropped rather than retained forever.
+        note_supervised_mcp_serve(&bus, "dead-log-sess", McpServeMilestone::Initialize);
+        assert!(drain_mcp_serve_lines(&mut rx).is_empty());
+        assert!(!supervised_mcp_serves()
+            .lock()
+            .unwrap()
+            .contains_key("dead-log-sess"));
+    }
+
+    /// The full gate lane: a supervised session's first `initialize` and
+    /// first `tools/list` serve status lines into its timeline (with the
+    /// served tool count), repeats stay quiet, and callers without a
+    /// gate-bound session identity never emit.
+    #[tokio::test]
+    async fn mcp_gate_reports_first_serves_into_the_session_timeline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bus = crate::event::EventBus::new();
+        let mut rx = bus.subscribe();
+        let state = crate::mcp::McpAppState::new(
+            "test".into(),
+            "test".into(),
+            crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
+            tmp.path().join("logs"),
+        );
+        let server = crate::mcp::IntendantServer::new(
+            std::sync::Arc::new(tokio::sync::RwLock::new(state)),
+            bus.clone(),
+        );
+        let log = temp_session_log(&tmp.path().join("sess"));
+        register_supervised_mcp_session("gate-serve-sess", &log);
+        let access = HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+                "gate-serve-sess",
+                "http",
+                true,
+            ),
+            iam_state: None,
+        };
+
+        let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        for _ in 0..2 {
+            handle_mcp_http_request(
+                initialize,
+                &server,
+                Some("gate-serve-sess"),
+                None,
+                None,
+                &access,
+                Some("gate-serve-sess".to_string()),
+                &bus,
+            )
+            .await;
+        }
+
+        let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let outcome = handle_mcp_http_request(
+            list,
+            &server,
+            Some("gate-serve-sess"),
+            None,
+            None,
+            &access,
+            Some("gate-serve-sess".to_string()),
+            &bus,
+        )
+        .await;
+        let McpHttpOutcome::Response(resp) = outcome else {
+            panic!("expected a response outcome");
+        };
+        let served = resp.result.expect("tools/list result")["tools"]
+            .as_array()
+            .expect("tools array")
+            .len();
+
+        // A caller with no gate-bound session identity (dashboard lane —
+        // the query-string sid is context selection, not actor identity)
+        // emits nothing, even for a registered session's id.
+        let dashboard_access = HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+                "test", "https",
+            ),
+            iam_state: None,
+        };
+        handle_mcp_http_request(
+            list,
+            &server,
+            Some("gate-serve-sess"),
+            None,
+            None,
+            &dashboard_access,
+            None,
+            &bus,
+        )
+        .await;
+
+        let lines = drain_mcp_serve_lines(&mut rx);
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    "info".to_string(),
+                    "Intendant MCP endpoint: client connected".to_string(),
+                    Some("gate-serve-sess".to_string()),
+                ),
+                (
+                    "info".to_string(),
+                    format!("Intendant MCP endpoint: served {served} tools"),
+                    Some("gate-serve-sess".to_string()),
+                ),
+            ]
+        );
+    }
+
     fn agenda_item_from_outcome(outcome: McpHttpOutcome) -> serde_json::Value {
         let McpHttpOutcome::Response(resp) = outcome else {
             panic!("expected a response outcome");
@@ -997,7 +1335,7 @@ mod tests {
         )));
         let server = crate::mcp::IntendantServer::new(
             std::sync::Arc::new(tokio::sync::RwLock::new(state)),
-            bus,
+            bus.clone(),
         );
         let call = |title: &str| {
             serde_json::json!({
@@ -1025,6 +1363,7 @@ mod tests {
             None,
             &session_access,
             Some("sess-e2e".to_string()),
+            &bus,
         )
         .await;
         let item = agenda_item_from_outcome(outcome);
@@ -1049,6 +1388,7 @@ mod tests {
             None,
             &dashboard_access,
             None,
+            &bus,
         )
         .await;
         let item = agenda_item_from_outcome(outcome);
@@ -1103,7 +1443,7 @@ mod tests {
         ));
         let server = crate::mcp::IntendantServer::new(
             std::sync::Arc::new(tokio::sync::RwLock::new(state)),
-            bus,
+            bus.clone(),
         );
         let call = |statement: &str| {
             serde_json::json!({
@@ -1131,6 +1471,7 @@ mod tests {
             None,
             &session_access,
             Some("sess-e2e".to_string()),
+            &bus,
         )
         .await;
         let claim = memory_claim_from_outcome(outcome);
@@ -1160,6 +1501,7 @@ mod tests {
             None,
             &dashboard_access,
             None,
+            &bus,
         )
         .await;
         let claim = memory_claim_from_outcome(outcome);

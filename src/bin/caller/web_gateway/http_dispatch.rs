@@ -1646,6 +1646,7 @@ pub(crate) async fn serve_http_request(
                     tls_client_cert_present,
                     tls_client_cert_fingerprint,
                     peer_addr,
+                    bus.clone(),
                 )
                 .await;
             }
