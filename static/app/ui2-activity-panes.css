@@ -34,9 +34,11 @@ html.ui-v2 #activity-control-pane input[type="text"] {
 }
 html.ui-v2 #activity-context-pane select:focus,
 html.ui-v2 #activity-managed-pane select:focus,
+html.ui-v2 #activity-changes-pane select:focus,
 html.ui-v2 #activity-control-pane select:focus,
 html.ui-v2 #activity-context-pane input[type="text"]:focus,
 html.ui-v2 #activity-managed-pane input[type="text"]:focus,
+html.ui-v2 #activity-changes-pane input[type="text"]:focus,
 html.ui-v2 #activity-control-pane input[type="text"]:focus {
   border-color: rgba(var(--iris-rgb), .45);
   box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .18);

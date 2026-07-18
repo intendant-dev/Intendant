@@ -146,15 +146,20 @@
                   title="Minimize every finished sub-agent window">
             Minimize done<span class="ui2-minimize-done-count" id="ui2-minimize-done-count">0</span>
           </button>
+          <!-- vertical sliders, NOT the Control tab's horizontal pair —
+               two adjacent controls must not share a glyph -->
           <button type="button" class="ui2-view-options-btn" id="ui2-view-options-btn"
                   aria-haspopup="true" aria-expanded="false" title="Timeline display options">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10"/><path d="M18 7h2"/><circle cx="16" cy="7" r="2"/><path d="M4 17h4"/><path d="M12 17h8"/><circle cx="10" cy="17" r="2"/></svg>Options
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4v6"/><path d="M6 14v6"/><circle cx="6" cy="12" r="2"/><path d="M12 4v2"/><path d="M12 10v10"/><circle cx="12" cy="8" r="2"/><path d="M18 4v8"/><path d="M18 16v4"/><circle cx="18" cy="14" r="2"/></svg>Options
           </button>
         </div>
         <!-- The Options popover panel: still #activity-log-controls, still
              hidden off-log by the router's .hidden (!important) — the v3
-             popover's .open is deliberately weaker so off-log always wins. -->
-        <div class="activity-subtab-controls" id="activity-log-controls">
+             popover's .open is deliberately weaker so off-log always wins
+             (and ui2WireViewOptions fully closes on that hide so the open
+             state can't go stale). -->
+        <div class="activity-subtab-controls" id="activity-log-controls"
+             role="group" aria-label="Timeline display options">
           <label class="subtab-control-label" for="verbosity-select">Verbosity</label>
           <select class="verbosity-select" id="verbosity-select" title="Log verbosity">
             <option value="normal" selected>Normal</option>

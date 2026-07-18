@@ -494,6 +494,18 @@ function ui2WireViewOptions() {
     setOpen(false);
     btn.focus();
   });
+  // The router's off-log hide (.hidden) only STACKS over .open — fully
+  // close instead, so aria-expanded and the stamped anchor don't go stale
+  // and returning to the Timeline doesn't resurface an unrequested popover.
+  // (Removing .open here re-fires the observer once; it no-ops on a panel
+  // that is no longer .open.)
+  new MutationObserver(() => {
+    if (panel.classList.contains('hidden') && panel.classList.contains('open')) setOpen(false);
+  }).observe(panel, { attributes: true, attributeFilter: ['class'] });
+  // position:fixed captures the anchor at open time — track resizes.
+  window.addEventListener('resize', () => {
+    if (panel.classList.contains('open')) setOpen(true);
+  });
 }
 
 // The rail describes the session Focus is SHOWING, so it derives from the
