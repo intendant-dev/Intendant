@@ -3377,7 +3377,10 @@ async fn sandbox_denial_raises_consent_card_and_always_allow_unblocks_retry() {
 
     let mut cmd = rig.command();
     cmd.env("INTENDANT_MOCK_SCRIPT", &script)
-        .args(["--no-tls", "--web", "18946"]);
+        // --sandbox explicitly: the write sandbox is the mechanism under
+        // test, and Windows defaults it off (ACE-propagation cost) — the
+        // flag makes the denial real on all three platforms.
+        .args(["--sandbox", "--no-tls", "--web", "18946"]);
     let mut child = cmd.spawn().expect("spawn intendant daemon");
     let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
