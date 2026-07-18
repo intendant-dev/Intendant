@@ -1888,6 +1888,7 @@ function rebuildSessionDetailViewRows(view) {
   view.expandableRowCount = countSessionDetailExpandableRows(view.rows);
   view.expandedRows = new Set();
   if (detailExpandAll) setSessionDetailRowsExpanded(view, true);
+  else seedSessionDetailProseExpanded(view);
 }
 
 function updateSessionDetailLogsBadge(view, fallbackCount = 0) {
@@ -2067,6 +2068,35 @@ function setSessionDetailRowsExpanded(view, expanded) {
   if (!expanded) return;
   for (let i = 0; i < view.rows.length; i++) {
     if (sessionDetailRowIsExpandable(view.rows[i])) view.expandedRows.add(i);
+  }
+}
+
+// Conversational prose in the detail lane — the chapter-nav detail
+// vocabulary (57c: the renderer's own displaySource decision for user
+// rows — so the external Tool relabel is already applied — plus
+// model-level non-reasoning records) plus steer rows. Diffs are never
+// prose: they render through the diff branch whatever their level.
+function sessionDetailRowIsProse(row) {
+  if (!row || row.kind !== 'entry') return false;
+  const record = row.record || {};
+  if (isDiffLog(record)) return false;
+  if (row.displaySource === sessionDetailSourceLabels.user) return true;
+  if (String(record.source || '').toLowerCase() === 'steer') return true;
+  return record.level === 'model' && record.kind !== 'reasoning';
+}
+
+// Default expansion for a freshly built row set: prose reads open,
+// payloads read compact. expandedRows keeps its polarity (member =
+// expanded), so the per-row toggle and the Expand/Collapse-all sweep
+// stay untouched; an explicit sweep overrides this default until the
+// next rebuild (rebuilds already reset every per-row toggle — the index
+// Set cannot survive one).
+function seedSessionDetailProseExpanded(view) {
+  for (let i = 0; i < view.rows.length; i++) {
+    const row = view.rows[i];
+    if (sessionDetailRowIsProse(row) && sessionDetailRowIsExpandable(row)) {
+      view.expandedRows.add(i);
+    }
   }
 }
 
