@@ -538,7 +538,10 @@ fn native_locator_outcome(
 fn external_transcript_path(home: &Path, source: &str, session_id: &str) -> Option<PathBuf> {
     match source {
         "codex" => find_codex_session_file(home, session_id),
-        "claude-code" => find_claude_session_file_for_transcript(home, session_id),
+        // Same fallback the entries dispatch uses: a Task-tool child id
+        // anchors against its subagent transcript.
+        "claude-code" => find_claude_session_file_for_transcript(home, session_id)
+            .or_else(|| find_claude_task_subagent_transcript(home, session_id)),
         "gemini" => find_gemini_session_file_for_transcript(home, session_id),
         _ => None,
     }
