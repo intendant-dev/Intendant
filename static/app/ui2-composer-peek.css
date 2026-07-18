@@ -161,47 +161,20 @@ html.ui-v2 .ui2-composer-peek .log-entry pre {
   padding: 8px 10px;
 }
 
-/* long payloads clamp; the fade appears only on entries that really clip
-   (JS tags .ui2-peek-clamped — CSS cannot see overflow). The blanket
-   content:none also retires v1's side fade on collapsible entries, whose
-   1.5em clamp the max-height below supersedes inside the peek. */
-html.ui-v2 .ui2-composer-peek .log-entry .log-content {
-  position: relative;
-  max-height: 8.5em;
-  overflow: hidden;
-}
-/* …but never the TAIL entry — the last one that actually clips, marked
-   .ui2-peek-tail-open by JS. :last-child is not enough: completion meta
-   lines (Done / Round complete) trail the final message. Content
-   clipped INSIDE an entry is not in the list's scroll flow, so the tail
-   of a long latest message was unreachable — the list hit scroll-bottom
-   while the fade obscured the end permanently. Opened, the list
-   scroller carries the full text. max-height:none (not a larger cap)
-   so this also keeps superseding the base collapsible 1.5em clamp,
-   exactly like the 8.5em rule it lifts. */
-html.ui-v2 .ui2-composer-peek .log-entry.ui2-peek-tail-open .log-content {
-  max-height: none;
-}
-html.ui-v2 .ui2-composer-peek .log-entry:not(.ui2-peek-clamped) .log-content::after { content: none; }
-html.ui-v2 .ui2-composer-peek .log-entry.ui2-peek-clamped .log-content::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  top: auto;
-  width: auto;
-  height: 1.8em;
-  background: linear-gradient(to bottom, transparent, var(--surface));
-  pointer-events: none;
-}
-/* diff bodies: same digest clamp, same tail exemption — on the tail
-   entry the body falls back to the base .diff-log-body scroll box
-   (max-height 460px, overflow auto), so a trailing diff stays readable
-   in place instead of hard-clipping. */
-html.ui-v2 .ui2-composer-peek .diff-log-entry:not(.ui2-peek-tail-open) .diff-log-body {
-  max-height: 8.5em;
-  overflow: hidden;
+/* No per-message clamp: conversational prose starts expanded (40/41's
+   collapse defaults) and renders in FULL — the list scroller carries
+   length, with the follow logic and the container-level more-below cue
+   below. Collapsed rows (tool payloads and other long non-prose) keep
+   the base compact 1.5em state instead: command groups and diffs read
+   as their summary lines, generic collapsed rows as one line with the
+   base right-edge fade as the "there's more" cue — retinted to the
+   sheet's surface (the base gradient fades to --base, the page bg).
+   The toggles are hidden here and clones carry no wiring, so drop the
+   pointer cursor they would lie with; the full text is one tap away in
+   Activity. */
+html.ui-v2 .ui2-composer-peek .log-entry.collapsible { cursor: default; }
+html.ui-v2 .ui2-composer-peek .log-entry.collapsible:not(.expanded) .log-content::after {
+  background: linear-gradient(to right, transparent, var(--surface));
 }
 
 /* container-level "more below" cue: pinned to the sheet, not the scroll

@@ -793,6 +793,30 @@ function minimizeDoneSubagentWindows() {
   return changed;
 }
 
+// Bulk grid sweep behind the "Collapse all / Expand all" pill
+// (ui2-activity.js owns the button): EVERY session window, not just done
+// sub-agents, so the user can drop the grid to a stack of header bars
+// and glance across all of them at once. Explicit intent, per-window
+// MANUAL semantics — exactly toggleSessionWindowMinimized's contract:
+// a collapse leaves autoMinimized false, so the done→active crossing
+// never pops open a window the user swept closed; a restore of a done
+// sub-agent is recorded (userRestoredWhileDone) so the auto-minimize
+// derivation does not immediately re-collapse it. A maximized window is
+// released by setSessionWindowMinimized itself when minimized. Returns
+// how many windows changed state.
+function setAllSessionWindowsMinimized(minimized) {
+  const target = !!minimized;
+  let changed = 0;
+  for (const [sid, win] of sessionWindows) {
+    if (!win || !!win.minimized === target) continue;
+    win.autoMinimized = false;
+    win.userRestoredWhileDone = !target && sessionWindowIsDoneSubagent(sid);
+    setSessionWindowMinimized(sid, target);
+    changed += 1;
+  }
+  return changed;
+}
+
 function updateSessionWindowMaximizeState() {
   const grid = document.getElementById('session-window-grid');
   if (!grid) return;

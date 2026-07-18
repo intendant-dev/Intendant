@@ -87,33 +87,6 @@
     return 'No output yet';
   }
 
-  // CSS cannot see overflow, and "the tail" is not simply :last-child —
-  // completion meta lines (Done / Round complete) trail the final
-  // message. Two-phase pass over every rendered clone: measure each one
-  // under the digest clamp, then open the LAST entry that actually
-  // clips (the newest clipping content is the conversation tail the
-  // user must be able to finish reading — the list scroller carries
-  // it), and fade-tag the earlier clippers, whose full text is one tap
-  // away in Activity. Re-run on every render: appends and in-place
-  // growth both move which entry is the tail.
-  function peekRetagClamped() {
-    for (const r of peekRendered) r.clone.classList.remove('ui2-peek-tail-open');
-    const measured = [];
-    for (const r of peekRendered) {
-      const content = r.clone.querySelector('.log-content');
-      measured.push([r.clone, !!content && content.scrollHeight > content.clientHeight + 1]);
-    }
-    let tailOpen = null;
-    for (let i = measured.length - 1; i >= 0; i--) {
-      if (measured[i][1]) { tailOpen = measured[i][0]; break; }
-    }
-    for (const [clone, clips] of measured) {
-      const isTail = clone === tailOpen;
-      clone.classList.toggle('ui2-peek-tail-open', isTail);
-      clone.classList.toggle('ui2-peek-clamped', clips && !isTail);
-    }
-  }
-
   // The container-level "more below" fade must never obscure the tail:
   // it shows only while unread content sits below the viewport and goes
   // away at scroll-bottom. Re-synced on scroll and after every render
@@ -163,7 +136,6 @@
       if (r.clone === cursor) cursor = cursor.nextElementSibling;
       else peekList.insertBefore(r.clone, cursor);
     }
-    peekRetagClamped();
     peekPendingDirty.clear();
     if (peekFollow) peekList.scrollTop = peekList.scrollHeight;
     peekSyncMoreBelow();
@@ -192,9 +164,6 @@
     }
     peekPendingDirty.clear();
     if (touched) {
-      // Full re-tag, not per-clone: in-place growth (streaming output)
-      // can turn a short entry into the new tail clipper.
-      peekRetagClamped();
       if (peekFollow) peekList.scrollTop = peekList.scrollHeight;
       peekSyncMoreBelow();
     }

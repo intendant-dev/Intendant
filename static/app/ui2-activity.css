@@ -215,6 +215,29 @@ html.ui-v2 #activity-subtabs .ui2-minimize-done-count {
   font-size: 9.5px;
 }
 
+/* collapse/expand-all: the grid sweep twin of the hygiene pill — neutral
+   ink (a layout action, not an attention nudge), and grid-only: Focus
+   hides the session windows the sweep acts on (ui2-activity.js keeps the
+   label naming the direction one click will act) */
+html.ui-v2 #activity-subtabs .ui2-collapse-all {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #activity-subtabs .ui2-collapse-all:hover { color: var(--text); background: var(--hover-wash); }
+html.ui-v2 #activity-subtabs .ui2-collapse-all[hidden],
+html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-collapse-all { display: none; }
+
 /* Options trigger */
 html.ui-v2 #activity-subtabs .ui2-view-options-btn {
   display: inline-flex;
@@ -409,6 +432,33 @@ html.ui-v2 .log-entry.source-user .log-content {
   color: var(--text);
 }
 html.ui-v2 .log-entry.source-user { padding-top: 7px; padding-bottom: 7px; }
+/* …and the agent's replies get the same quiet card in the model/iris
+   family — a shade quieter than the user's amber (model prose is the
+   bulk of a transcript), same geometry, so saying reads as cards and
+   doing stays bare work rows. Keyed on the stamped renderer vocabulary
+   exactly like the chapter-nav classifier (57c): level-model minus
+   reasoning; the structural :nots keep entry kinds that ride the model
+   level (thinking rows, diffs, output groups) on their own grammar.
+   Native model rows and external claude-code/codex/gemini prose all
+   stamp level-model, so every surface (grid/Focus, stream, detail,
+   peek) gets the card from this one rule. Steer rows deliberately keep
+   their dimmed meta hairline — not restyled here. */
+html.ui-v2 .log-entry.level-model:not([data-kind="reasoning"]):not(.reasoning-log-entry):not(.diff-log-entry):not(.command-output-group) .log-content {
+  background: rgba(var(--iris-rgb), .05);
+  border: 1px solid rgba(var(--iris-rgb), .12);
+  border-radius: 12px;
+  padding: 7px 12px;
+}
+html.ui-v2 .log-entry.level-model:not([data-kind="reasoning"]):not(.reasoning-log-entry):not(.diff-log-entry):not(.command-output-group) {
+  padding-top: 7px;
+  padding-bottom: 7px;
+}
+/* border-box: a collapsed card's 1.5em clamp would otherwise be eaten by
+   its own padding — keep one text line visible inside collapsed bubbles */
+html.ui-v2 .log-entry.collapsible:not(.expanded).source-user .log-content,
+html.ui-v2 .log-entry.collapsible:not(.expanded).level-model:not([data-kind="reasoning"]):not(.reasoning-log-entry):not(.diff-log-entry):not(.command-output-group) .log-content {
+  max-height: calc(1.5em + 16px);
+}
 
 /* markdown body rhythm */
 html.ui-v2 .log-entry .log-markdown { min-width: 0; }
