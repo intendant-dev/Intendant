@@ -385,7 +385,10 @@ and publishes relay-mode fleet DNS only after a successful control poll has
 established this process's readiness. Every boot with a configured rendezvous
 starts the DNS reconciler: disabled, invalid, disconnected, or not-yet-ready
 tunnel state explicitly converges toward `enable = false`, including stale
-relay publication left by a prior process. That ingress
+relay publication left by a prior process. A successful withdrawal is not
+complete until the daemon has republished its direct addresses against the
+same pinned rendezvous generation; failure of either step keeps the whole
+transition retryable. That ingress
 binds only to an ephemeral `127.0.0.1` port, is never advertised, and
 does not share the public listener's trusted-local classification. Connect
 runtime settings may move the ordinary registration client to another

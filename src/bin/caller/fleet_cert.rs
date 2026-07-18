@@ -495,15 +495,19 @@ pub(crate) fn is_service_controlled_name_in(cert_dir: &Path, name: &str) -> Resu
     provenance_controls_name(&provenance, name)
 }
 
-/// Classify a synchronous request-serving path without waiting for an
+/// Classify a synchronous request-serving path without waiting for the target
 /// authority-store lock. Lock contention rejects the custom-domain lane
-/// closed; a successful immediate lock preserves the cross-process fence on
-/// an absent provenance record.
+/// closed; a successful immediate lock fences both present and absent
+/// provenance generations against cross-process replacement.
 pub(crate) fn is_service_controlled_name_live_in(
     cert_dir: &Path,
     name: &str,
 ) -> Result<bool, String> {
-    let provenance = load_fleet_origin_provenance_cached_arc_with_absence_fence_in(cert_dir, true)?;
+    let provenance = crate::access::authority_store::try_with_lock(cert_dir, || {
+        load_fleet_origin_provenance_cached_arc_with_absence_fence_in(cert_dir, true)
+            .map_err(crate::access::AccessError)
+    })
+    .map_err(|error| error.to_string())?;
     provenance_controls_name(&provenance, name)
 }
 

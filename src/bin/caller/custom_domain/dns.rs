@@ -1746,7 +1746,7 @@ struct CloudflareRecord {
 
 #[derive(Deserialize)]
 struct CloudflareResultInfo {
-    #[serde(default)]
+    page: u64,
     total_pages: u64,
 }
 
@@ -1886,18 +1886,26 @@ async fn cloudflare_find_exact(
             cloudflare_error_text(&envelope.errors)
         ));
     }
-    if envelope
+    cloudflare_exact_record_ids(envelope, name, value)
+}
+
+fn cloudflare_exact_record_ids(
+    envelope: CloudflareEnvelope<Vec<CloudflareRecord>>,
+    name: &str,
+    value: &str,
+) -> Result<Vec<String>, String> {
+    let records = envelope
+        .result
+        .ok_or_else(|| "Cloudflare DNS cleanup lookup omitted result".to_string())?;
+    let result_info = envelope
         .result_info
-        .as_ref()
-        .is_some_and(|info| info.total_pages > 1)
-    {
+        .ok_or_else(|| "Cloudflare DNS cleanup lookup omitted result_info".to_string())?;
+    if result_info.page != 1 || result_info.total_pages > 1 {
         return Err(
-            "Cloudflare DNS cleanup lookup returned more than 100 exact-name records".to_string(),
+            "Cloudflare DNS cleanup lookup did not return one complete bounded page".to_string(),
         );
     }
-    Ok(envelope
-        .result
-        .unwrap_or_default()
+    Ok(records
         .into_iter()
         .filter(|record| {
             record.record_type == "TXT"
@@ -2380,6 +2388,73 @@ mod tests {
         let error = append_cloudflare_response_chunk(&mut body, &[3], "response").unwrap_err();
         assert!(error.contains("size cap"), "{error}");
         assert_eq!(body.len(), before, "the over-cap chunk is never retained");
+    }
+
+    #[test]
+    fn cloudflare_cleanup_lookup_requires_complete_result_metadata() {
+        let parse = |value: serde_json::Value| {
+            serde_json::from_value::<CloudflareEnvelope<Vec<CloudflareRecord>>>(value)
+        };
+        let exact = serde_json::json!({
+            "success": true,
+            "errors": [],
+            "result": [{
+                "id": "record123",
+                "name": "_acme-challenge.box.example.test",
+                "content": "challenge-value",
+                "type": "TXT"
+            }],
+            "result_info": {
+                "page": 1,
+                "total_pages": 1
+            }
+        });
+        assert_eq!(
+            cloudflare_exact_record_ids(
+                parse(exact.clone()).unwrap(),
+                "_acme-challenge.box.example.test",
+                "challenge-value",
+            )
+            .unwrap(),
+            vec!["record123".to_string()]
+        );
+
+        let mut missing_result = exact.clone();
+        missing_result.as_object_mut().unwrap().remove("result");
+        assert!(cloudflare_exact_record_ids(
+            parse(missing_result).unwrap(),
+            "_acme-challenge.box.example.test",
+            "challenge-value",
+        )
+        .unwrap_err()
+        .contains("omitted result"));
+
+        let mut missing_info = exact.clone();
+        missing_info.as_object_mut().unwrap().remove("result_info");
+        assert!(cloudflare_exact_record_ids(
+            parse(missing_info).unwrap(),
+            "_acme-challenge.box.example.test",
+            "challenge-value",
+        )
+        .unwrap_err()
+        .contains("omitted result_info"));
+
+        let mut incomplete = exact.clone();
+        incomplete["result_info"]["total_pages"] = serde_json::json!(2);
+        assert!(cloudflare_exact_record_ids(
+            parse(incomplete).unwrap(),
+            "_acme-challenge.box.example.test",
+            "challenge-value",
+        )
+        .unwrap_err()
+        .contains("complete bounded page"));
+
+        let mut missing_total_pages = exact;
+        missing_total_pages["result_info"]
+            .as_object_mut()
+            .unwrap()
+            .remove("total_pages");
+        assert!(parse(missing_total_pages).is_err());
     }
 
     #[test]

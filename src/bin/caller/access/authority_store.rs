@@ -106,16 +106,17 @@ fn acquire_process_lock(cert_dir: &Path, started: Instant) -> AccessResult<Proce
 
 fn try_acquire_process_lock(cert_dir: &Path) -> AccessResult<ProcessStoreLock> {
     let lock_path = cert_dir.join(LOCK_FILE);
-    let mut locks = match process_locks().try_lock() {
-        Ok(locks) => locks,
-        Err(std::sync::TryLockError::WouldBlock) => return Err(lock_busy_error(&lock_path)),
-        Err(std::sync::TryLockError::Poisoned(_)) => {
-            return Err(AccessError(
-                "authority-store process locks were poisoned; refusing to mutate authority state"
-                    .to_string(),
-            ));
-        }
-    };
+    // This mutex protects only the in-memory set and is never held across a
+    // file lock or caller operation. Waiting for that tiny bookkeeping
+    // critical section avoids treating activity on an unrelated store as
+    // contention on this one; the exact target path and OS file lock below
+    // remain immediate, fail-closed checks.
+    let mut locks = process_locks().lock().map_err(|_| {
+        AccessError(
+            "authority-store process locks were poisoned; refusing to mutate authority state"
+                .to_string(),
+        )
+    })?;
     if !locks.insert(cert_dir.to_path_buf()) {
         return Err(lock_busy_error(&lock_path));
     }

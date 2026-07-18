@@ -68,7 +68,9 @@ process cache are all bounded. Invalid or excess history sets a durable
 incomplete marker and closes the owner-name lane; a new Connect observation
 cannot grow the live TLS classifier past the same exact-name cap. Repeated
 route checks reuse only a cache entry whose cross-platform file identity and
-change stamp still match the authority record.
+change stamp still match the authority record, and every live route check
+takes the immediate per-store authority fence before accepting either a
+present cache entry or a fresh read. Contention closes the custom-domain lane.
 
 ## Pin certificate issuance
 
@@ -113,7 +115,10 @@ cancellation, and transient provider failures. Store the credential as a
 daemon credential lease where possible; configuration names an
 environment-variable fallback but never embeds the secret. While a cleanup
 journal is being reaped, its mutation-completion generation is compared again
-before removal. If a newer challenge already owns the primary journal, the
+before removal. Lookup-based cleanup accepts absence only from a complete,
+bounded first-page result with explicit result and pagination metadata;
+incomplete provider responses retain the cleanup obligation. If a newer
+challenge already owns the primary journal, the
 secondary reservation retains the older exact cleanup independently and
 blocks further challenge creation until it is drained. A late TXT write
 therefore cannot land after the last durable cleanup record disappeared. While

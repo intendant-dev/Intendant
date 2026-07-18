@@ -466,6 +466,12 @@ mod tests {
     #[test]
     fn runtime_live_guard_rejects_authority_store_contention() {
         let dir = tempfile::tempdir().unwrap();
+        crate::fleet_cert::remember_fleet_origin_for_test(
+            dir.path(),
+            Some("fleet.example.test"),
+            "d-1234567890abcdef1234.fleet.example.test",
+        )
+        .unwrap();
         let hosted = Arc::new(HostedControlRuntime::new(
             false,
             dir.path().to_path_buf(),

@@ -1873,8 +1873,28 @@ async fn dns_signed_post_with_context(
 /// Publish this daemon's A/AAAA addresses for its fleet name. Returns
 /// the address list the service accepted.
 pub(crate) async fn dns_publish_addresses(addresses: &[String]) -> Result<Vec<String>, String> {
+    dns_publish_addresses_with_context(signed_daemon_context()?, addresses).await
+}
+
+/// Publish direct fleet-DNS addresses against one immutable rendezvous
+/// generation. Long-lived side channels use this when leaving relay mode so
+/// the withdrawal and direct replacement cannot straddle a live config
+/// change.
+pub(crate) async fn dns_publish_addresses_for_config(
+    config: &ConnectConfig,
+    addresses: &[String],
+) -> Result<Vec<String>, String> {
+    dns_publish_addresses_with_context(signed_daemon_context_for_config(config.clone())?, addresses)
+        .await
+}
+
+async fn dns_publish_addresses_with_context(
+    context: (ConnectConfig, Url, DaemonIdentity, String),
+    addresses: &[String],
+) -> Result<Vec<String>, String> {
     let addresses_csv = addresses.join(",");
-    let body = dns_signed_post(
+    let body = dns_signed_post_with_context(
+        context,
         "api/dns/publish",
         DNS_PUBLISH_PROTOCOL,
         &addresses_csv,
