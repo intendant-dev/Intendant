@@ -410,6 +410,15 @@ struct ClientState {
     /// Connect disablement cancels their in-flight work immediately; enabling
     /// resumes the same immutable boot generation.
     relay_lifecycle: Option<tokio::sync::watch::Sender<bool>>,
+    /// Exact normalized rendezvous generation captured with the boot-pinned
+    /// relay. A live client may observe another service, but that observation
+    /// cannot authorize custom-name material on the boot relay.
+    relay_rendezvous_key: Option<String>,
+}
+
+struct RendezvousClientGeneration {
+    epoch: u64,
+    relay_rendezvous_key: Option<String>,
 }
 
 fn client_state() -> &'static Mutex<ClientState> {
@@ -424,6 +433,7 @@ fn client_state() -> &'static Mutex<ClientState> {
             gateway_tcp_port: None,
             fleet_zone_observed: None,
             relay_lifecycle: None,
+            relay_rendezvous_key: None,
         })
     })
 }
@@ -459,9 +469,38 @@ fn with_current_client_epoch(epoch: u64, update: impl FnOnce()) -> bool {
     true
 }
 
+fn configured_rendezvous_value(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn rendezvous_origin_key(value: Option<&str>) -> Option<String> {
+    let url = Url::parse(configured_rendezvous_value(value)?).ok()?;
+    Some(base_origin(&url))
+}
+
+fn rendezvous_endpoint_key(value: Option<&str>) -> Option<String> {
+    let mut url = Url::parse(configured_rendezvous_value(value)?).ok()?;
+    url.set_fragment(None);
+    Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn rendezvous_origin_changed(current: Option<&str>, requested: Option<&str>) -> bool {
+    match (
+        rendezvous_origin_key(current),
+        rendezvous_origin_key(requested),
+    ) {
+        (Some(current), Some(requested)) => current != requested,
+        (None, None) => {
+            configured_rendezvous_value(current) != configured_rendezvous_value(requested)
+        }
+        (Some(_), None) | (None, Some(_)) => true,
+    }
+}
+
 /// Only enablement, destination, and explicit daemon identity are live
 /// settings. The relay/custom-domain/auth fields belong to the boot-wired
-/// runtime and take effect together on restart.
+/// runtime and take effect together on restart. A boot bearer remains usable
+/// only while the live destination stays on the same normalized origin.
 fn live_reconfigured_connect_config(
     current: Option<&ConnectConfig>,
     requested: ConnectConfig,
@@ -471,6 +510,12 @@ fn live_reconfigured_connect_config(
     };
     let mut effective = current.clone();
     effective.enabled = requested.enabled;
+    if rendezvous_origin_changed(
+        current.rendezvous_url.as_deref(),
+        requested.rendezvous_url.as_deref(),
+    ) {
+        effective.auth_token = None;
+    }
     effective.rendezvous_url = requested.rendezvous_url;
     effective.daemon_id = requested.daemon_id;
     effective
@@ -485,6 +530,7 @@ pub fn spawn_connect_rendezvous_client(
     relay_lifecycle: tokio::sync::watch::Sender<bool>,
 ) {
     with_client_reconfiguration(|| {
+        let relay_rendezvous_key = rendezvous_endpoint_key(config.rendezvous_url.as_deref());
         {
             let mut state = client_state()
                 .lock()
@@ -494,6 +540,7 @@ pub fn spawn_connect_rendezvous_client(
             state.gateway_tcp_port = gateway_tcp_port;
             state.fleet_zone_observed = Some(Arc::clone(&fleet_zone_observed));
             state.relay_lifecycle = Some(relay_lifecycle);
+            state.relay_rendezvous_key = relay_rendezvous_key;
         }
         start_client(
             config,
@@ -620,14 +667,18 @@ fn start_client(
     fleet_zone_observed: Arc<std::sync::atomic::AtomicBool>,
 ) {
     crate::credential_leases::configure_dns_credential_child_scrub(&config.custom_domain);
-    let epoch = {
+    let generation = {
         let mut state = client_state()
             .lock()
             .expect("connect client state poisoned");
         state.epoch = state.epoch.wrapping_add(1);
         state.effective_config = Some(config.clone());
-        state.epoch
+        RendezvousClientGeneration {
+            epoch: state.epoch,
+            relay_rendezvous_key: state.relay_rendezvous_key.clone(),
+        }
     };
+    let epoch = generation.epoch;
     with_status(|status| {
         status.configured = config.enabled;
         status.env_forced = ConnectConfig::env_forced();
@@ -693,7 +744,7 @@ fn start_client(
             gateway_tcp_port,
             hosted_control,
             fleet_zone_observed,
-            epoch,
+            generation,
         )
         .await;
         // Natural exit (identity or HTTP-client construction failure) —
@@ -733,8 +784,10 @@ async fn run_connect_rendezvous_client(
     gateway_tcp_port: Option<u16>,
     hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
     fleet_zone_observed: Arc<std::sync::atomic::AtomicBool>,
-    epoch: u64,
+    generation: RendezvousClientGeneration,
 ) {
+    let epoch = generation.epoch;
+    let relay_rendezvous_key = generation.relay_rendezvous_key;
     let identity = match DaemonIdentity::load_or_create_default() {
         Ok(identity) => identity,
         Err(e) => {
@@ -792,9 +845,13 @@ async fn run_connect_rendezvous_client(
         )
         .await
         {
-            Ok(response) => {
-                note_register_response(&response, &base_url, &fleet_zone_observed, epoch)
-            }
+            Ok(response) => note_register_response(
+                &response,
+                &base_url,
+                &fleet_zone_observed,
+                relay_rendezvous_key.as_deref(),
+                epoch,
+            ),
             Err(RegisterError::Rejected(e)) => {
                 eprintln!(
                     "[connect] register rejected: {e} — the rendezvous refused this daemon \
@@ -876,7 +933,13 @@ async fn run_connect_rendezvous_client(
                 .await
                 {
                     Ok(response) => {
-                        note_register_response(&response, &base_url, &fleet_zone_observed, epoch);
+                        note_register_response(
+                            &response,
+                            &base_url,
+                            &fleet_zone_observed,
+                            relay_rendezvous_key.as_deref(),
+                            epoch,
+                        );
                         last_register = Instant::now();
                     }
                     Err(RegisterError::Rejected(e)) => {
@@ -928,17 +991,30 @@ fn note_register_response(
     response: &RegisterResponse,
     base_url: &Url,
     fleet_zone_observed: &std::sync::atomic::AtomicBool,
+    relay_rendezvous_key: Option<&str>,
     epoch: u64,
 ) {
     with_current_client_epoch(epoch, || {
-        note_current_register_response(response, base_url, fleet_zone_observed);
+        note_current_register_response_for_relay(
+            response,
+            base_url,
+            fleet_zone_observed,
+            relay_rendezvous_key,
+        );
     });
 }
 
-fn note_current_register_response(
+fn registration_matches_relay_endpoint(base_url: &Url, relay_rendezvous_key: Option<&str>) -> bool {
+    relay_rendezvous_key.is_some_and(|expected| {
+        rendezvous_endpoint_key(Some(base_url.as_str())).as_deref() == Some(expected)
+    })
+}
+
+fn note_current_register_response_for_relay(
     response: &RegisterResponse,
     base_url: &Url,
     fleet_zone_observed: &std::sync::atomic::AtomicBool,
+    relay_rendezvous_key: Option<&str>,
 ) {
     let now = crate::access::client_key::now_unix_ms();
     let mut print_claim: Option<String> = None;
@@ -959,7 +1035,10 @@ fn note_current_register_response(
         }
         None => crate::fleet_cert::note_fleet_dns(None, None),
     };
-    fleet_zone_observed.store(provenance_accepted, std::sync::atomic::Ordering::SeqCst);
+    fleet_zone_observed.store(
+        provenance_accepted && registration_matches_relay_endpoint(base_url, relay_rendezvous_key),
+        std::sync::atomic::Ordering::SeqCst,
+    );
     with_status(|status| {
         status.registered = true;
         status.last_register_unix_ms = Some(now);
@@ -1039,6 +1118,21 @@ fn note_current_register_response(
     if let Some(line) = print_claim {
         eprintln!("[connect] {line}");
     }
+}
+
+#[cfg(test)]
+fn note_current_register_response(
+    response: &RegisterResponse,
+    base_url: &Url,
+    fleet_zone_observed: &std::sync::atomic::AtomicBool,
+) {
+    let relay_rendezvous_key = rendezvous_endpoint_key(Some(base_url.as_str()));
+    note_current_register_response_for_relay(
+        response,
+        base_url,
+        fleet_zone_observed,
+        relay_rendezvous_key.as_deref(),
+    );
 }
 
 /// Report leases that expired without an .env fallback (credential
@@ -1685,9 +1779,16 @@ fn signed_daemon_config(stored: Option<ConnectConfig>, status: &ConnectStatus) -
     let mut config =
         stored.unwrap_or_else(|| crate::project::ConnectConfig::default().effective_with_env());
     // URL and daemon id are the two settings that can change live. Preserve
-    // every other startup field (notably auth_token and custom_domain) while
-    // following the running client's current destination and identity.
+    // every other startup field while following the running client's current
+    // destination and identity. A bearer is scoped to its configured origin;
+    // custom-domain wiring remains boot-pinned.
     if status.rendezvous_url.is_some() {
+        if rendezvous_origin_changed(
+            config.rendezvous_url.as_deref(),
+            status.rendezvous_url.as_deref(),
+        ) {
+            config.auth_token = None;
+        }
         config.rendezvous_url.clone_from(&status.rendezvous_url);
     }
     if status.daemon_id.is_some() {
@@ -2351,7 +2452,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_signed_side_channels_preserve_private_effective_config() {
+    fn daemon_signed_side_channels_drop_bearer_across_origins() {
         let mut stored = ConnectConfig {
             enabled: true,
             rendezvous_url: Some("https://old.example".to_string()),
@@ -2373,7 +2474,7 @@ mod tests {
             Some("https://current.example")
         );
         assert_eq!(effective.daemon_id.as_deref(), Some("current-daemon"));
-        assert_eq!(effective.auth_token.as_deref(), Some("configured-token"));
+        assert_eq!(effective.auth_token, None);
         assert_eq!(
             effective.custom_domain.name.as_deref(),
             Some("box.example.test")
@@ -2474,6 +2575,27 @@ mod tests {
             &observed,
         );
         assert!(!observed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn relay_observation_is_bound_to_the_boot_rendezvous_generation() {
+        let boot = rendezvous_endpoint_key(Some("https://boot.example/base")).unwrap();
+        assert!(registration_matches_relay_endpoint(
+            &Url::parse("https://boot.example/base").unwrap(),
+            Some(&boot),
+        ));
+        assert!(!registration_matches_relay_endpoint(
+            &Url::parse("https://other.example/base").unwrap(),
+            Some(&boot),
+        ));
+        assert!(!registration_matches_relay_endpoint(
+            &Url::parse("https://boot.example/other").unwrap(),
+            Some(&boot),
+        ));
+        assert!(!registration_matches_relay_endpoint(
+            &Url::parse("https://boot.example/base").unwrap(),
+            None,
+        ));
     }
 
     /// A register response asserting a different account link than the daemon's
@@ -2609,7 +2731,7 @@ mod tests {
     }
 
     #[test]
-    fn live_reconfigure_preserves_boot_wired_custom_domain_and_credentials() {
+    fn live_reconfigure_clears_boot_bearer_on_origin_change() {
         let mut current = ConnectConfig {
             enabled: true,
             rendezvous_url: Some("https://old.example".to_string()),
@@ -2640,7 +2762,7 @@ mod tests {
             effective.rendezvous_url.as_deref(),
             Some("https://new.example")
         );
-        assert_eq!(effective.auth_token.as_deref(), Some("boot-token"));
+        assert_eq!(effective.auth_token, None);
         assert_eq!(
             effective.custom_domain.name.as_deref(),
             Some("box.example.test")
@@ -2652,6 +2774,26 @@ mod tests {
                 .as_deref(),
             Some("BOOT_DNS_API_TOKEN")
         );
+    }
+
+    #[test]
+    fn live_reconfigure_preserves_boot_bearer_on_the_same_origin() {
+        let current = ConnectConfig {
+            enabled: true,
+            rendezvous_url: Some("https://connect.example/base".to_string()),
+            auth_token: Some("boot-token".to_string()),
+            ..ConnectConfig::default()
+        };
+        let mut requested = current.clone();
+        requested.rendezvous_url = Some("https://CONNECT.example:443/other".to_string());
+        requested.auth_token = Some("ignored-live-token".to_string());
+
+        let effective = live_reconfigured_connect_config(Some(&current), requested);
+        assert_eq!(
+            effective.rendezvous_url.as_deref(),
+            Some("https://CONNECT.example:443/other")
+        );
+        assert_eq!(effective.auth_token.as_deref(), Some("boot-token"));
     }
 
     #[test]

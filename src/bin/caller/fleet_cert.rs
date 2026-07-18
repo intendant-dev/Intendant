@@ -238,6 +238,12 @@ fn fleet_origin_provenance_cache(
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+#[cfg(test)]
+thread_local! {
+    static FLEET_ORIGIN_ABSENCE_OBSERVER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 fn current_cached_fleet_origin_provenance(
     path: &Path,
     fingerprint: &FleetOriginProvenanceFingerprint,
@@ -386,7 +392,22 @@ fn load_fleet_origin_provenance_cached_arc_in(
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Arc::new(FleetOriginProvenance::default()));
+            #[cfg(test)]
+            FLEET_ORIGIN_ABSENCE_OBSERVER.with(|observer| {
+                if let Some(observer) = observer.borrow_mut().take() {
+                    observer();
+                }
+            });
+            // Absence is shared-authority state too. Fence the second read
+            // with the same lock used by first creation so another process
+            // cannot create provenance between the missing metadata result
+            // and an empty classification.
+            return crate::access::authority_store::with_lock(cert_dir, || {
+                load_fleet_origin_provenance_uncached_in(cert_dir)
+                    .map(Arc::new)
+                    .map_err(crate::access::AccessError)
+            })
+            .map_err(|error| error.to_string());
         }
         Err(_) => {
             return load_fleet_origin_provenance_uncached_in(cert_dir).map(Arc::new);
@@ -3229,6 +3250,37 @@ mod tests {
         let changed = load_fleet_origin_provenance_cached_arc_in(temp.path()).unwrap();
         assert!(!Arc::ptr_eq(&first, &changed));
         assert_eq!(changed.name.as_deref(), Some(second_name));
+    }
+
+    #[test]
+    fn first_provenance_creation_is_fenced_against_an_absent_cached_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let cert_dir = temp.path().to_path_buf();
+        let reader_dir = cert_dir.clone();
+        let (absence_seen_tx, absence_seen_rx) = std::sync::mpsc::channel();
+        let (creation_done_tx, creation_done_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            FLEET_ORIGIN_ABSENCE_OBSERVER.with(|observer| {
+                *observer.borrow_mut() = Some(Box::new(move || {
+                    absence_seen_tx.send(()).unwrap();
+                    creation_done_rx.recv().unwrap();
+                }));
+            });
+            is_service_controlled_name_in(&reader_dir, "owner.fleet.example.test").unwrap()
+        });
+
+        absence_seen_rx.recv().unwrap();
+        remember_fleet_origin_in(
+            &cert_dir,
+            Some("fleet.example.test"),
+            "d-00000000000000000000.fleet.example.test",
+        )
+        .unwrap();
+        creation_done_tx.send(()).unwrap();
+        assert!(
+            reader.join().unwrap(),
+            "the fenced absence read must observe the concurrently committed fleet zone"
+        );
     }
 
     #[test]

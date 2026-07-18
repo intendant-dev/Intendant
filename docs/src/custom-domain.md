@@ -158,8 +158,11 @@ dialback endpoint to that same boot configuration generation, so a live
 Connect destination change cannot split a nonce and its data endpoint. Turning
 Connect off cancels the boot-pinned poll and its active dialback tasks, sends a
 signed poller disconnect, and explicitly withdraws relay-mode fleet DNS.
-Turning it back on resumes only after the new registration has closed the
-fleet-zone observation gate again.
+Turning it back on at the boot rendezvous resumes custom-name registration only
+after a fresh registration has closed the fleet-zone observation gate again.
+A live destination change never sends the boot rendezvous bearer to a different
+origin, and observations from that new destination cannot open custom-name
+registration on the boot-pinned relay; restart binds a new relay generation.
 
 Cloudflare requires a narrowly scoped token with DNS edit access to the named
 zone. Generic RFC2136 is also supported:

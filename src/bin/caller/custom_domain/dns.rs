@@ -765,6 +765,10 @@ fn write_pending_challenge_locked(
 }
 
 fn begin_pending_challenge(cert_dir: &Path, pending: &PendingChallenge) -> Result<(), String> {
+    // Validate scrub metadata before writing either journal. A configuration
+    // rejected at this point has made no provider call and therefore must not
+    // leave a cleanup obligation that waits for an unusable credential name.
+    pending_challenge_credential_env_name(pending)?;
     let result = crate::access::authority_store::with_lock(cert_dir, || {
         if load_pending_challenge_locked(cert_dir)
             .map_err(crate::access::AccessError)?
@@ -1826,6 +1830,34 @@ mod tests {
             "_TSIG_SECRET",
         )
         .is_err());
+    }
+
+    #[test]
+    fn invalid_scrub_metadata_is_rejected_before_journaling() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = PendingChallenge {
+            schema_version: PENDING_CHALLENGE_SCHEMA_VERSION,
+            id: "flow-invalid-scrub".to_string(),
+            domain: "box.example.test".to_string(),
+            record_name: "_acme-challenge.box.example.test".to_string(),
+            value: "challenge-value".to_string(),
+            provider: CustomDomainDnsConfig::Cloudflare {
+                zone_id: "abc123".to_string(),
+                token_env: Some("NOT_A_DNS_CREDENTIAL".to_string()),
+                propagation_delay_secs: 0,
+            },
+            cloudflare_record_id: None,
+            phase: PendingChallengePhase::Creating,
+            owner_token: Some("44444444444444444444444444444444".to_string()),
+            lease_expires_unix_ms: now_unix_ms().saturating_add(PENDING_CHALLENGE_CREATE_LEASE_MS),
+            mutation_complete: false,
+        };
+        assert!(begin_pending_challenge(dir.path(), &pending).is_err());
+        assert!(load_pending_challenge(dir.path()).unwrap().is_none());
+        assert!(load_late_mutation_store(dir.path())
+            .unwrap()
+            .entries
+            .is_empty());
     }
 
     #[test]
