@@ -178,7 +178,7 @@ rows explicitly marked future remain design constraints:
 | TURN relay | Denial of service; traffic analysis | Media remains separate from the Connect SNI relay; any deployment must use short-lived credentials and preserve authenticated, end-to-end encrypted daemon channels |
 | Fleet metadata store | Denial of service; false labels/routes or a substituted self-signed record on a new device | Private fields are encrypted; the current browser detects same-key alteration; records carry no daemon authority. An owner/device signer trust set is not shipped yet. |
 | Name directory | Handle confusion at first introduction | Key-first identity; handles are labels; org keys sign membership; append-only transparency log over all name bindings (STH pinned + consistency-verified by browsers; inclusion proofs on claims), optional DNS/GitHub attestation badges, invite-gated registration + reserved handles + dormant-handle reclamation |
-| Fleet DNS zone + WebPKI (fleet-name route) | Controls the endpoint and origin-scoped code reached through the fleet name | With hosted control off, the route is discovery-only. With it on, unproved traffic is still anonymous `role:none`; protected routes require a short-lived daemon-minted lease bound to a tab key and exact compiled preset. The immutable floor and trusted confirmation cap same-origin authority. CT is the current slower fallback; planned peer/app witnesses shorten the detection window. Neither detection path mints authority. |
+| Fleet DNS zone + WebPKI (fleet-name route) | Controls the endpoint and origin-scoped code reached through the fleet name | With hosted control off, the route is discovery-only. With it on, unproved traffic is still anonymous `role:none`; protected routes require a short-lived daemon-minted lease bound to a tab key and exact compiled preset. The immutable floor and trusted confirmation cap same-origin authority. Shipped peer witnesses shorten the detection window; the signed-application protocol is present but no current unsigned development artifact qualifies, and CT remains the slower fallback. No detection path mints authority. |
 | Hosted Connect origin (directory lane) | Controls account/route/presence metadata, page-visible or unlocked state, navigation, and served installers | Claims, passkeys, and account assertions grant nothing, and raw hosted provenance remains immutable `role:none`. The optional navigation hint is daemon-signed and leads only to the daemon's lease doorbell. Served artifacts are transparency-logged (evidence, not prevention); installers remain a real software-supply-chain trust boundary. |
 | Foreign browser origin / DNS rebinding | Drive a browser-held mTLS certificate or loopback root fallback cross-site | Every non-public HTTP route, direct dashboard signaling, and `/ws` reject foreign browser Origins before resolving transport authority; cross-/same-site Fetch Metadata closes navigation and subresource requests that omit `Origin`. Explicit authority-free shell/assets/discovery/signed-document doorbells run as anonymous `role:none`. Cleartext "own origin" is limited to `localhost` or a literal loopback address, so matching attacker-controlled Origin and Host values do not bypass the gate; non-loopback browser administration uses HTTPS/mTLS. |
 
@@ -238,11 +238,14 @@ resource-owner portal; global Connect itself cannot be opted into authority.
 **Org identity.** An organization is an Ed25519 root keypair plus a handle.
 The root key lives on an org-designated daemon
 (`intendant org init <handle>` →
-`~/.intendant/access-certs/org/<handle>/root.pk8`, 0600), following the
+`<access-cert-dir>/org/<handle>/root.pk8`, 0600), following the
 existing daemon-identity custody pattern; it is exportable for offline
-custody. Day-to-day signing can move to delegated issuer keys certified by
-the root; root-signed documents carry no chain, and delegated documents
-carry the issuer certificate beside the signature it explains.
+custody. The access-cert directory is `<state-root>/access-certs` on
+macOS/Linux (default `~/.intendant/access-certs`) and the OS data directory's
+`intendant/access-certs` on Windows. Day-to-day signing can move to delegated
+issuer keys certified by the root; root-signed documents carry no chain, and
+delegated documents carry the issuer certificate beside the signature it
+explains.
 
 **Org grant document.** A self-contained, signed statement a member presents
 to any daemon that trusts the org key:
@@ -566,7 +569,8 @@ verification value; documents stay self-contained.
 
 The pieces that implement the model, mapped to the codebase:
 
-- **Daemon-local IAM** (`~/.intendant/access-certs/iam.json`): principals
+- **Daemon-local IAM** (`<access-cert-dir>/iam.json`, with the platform
+  location described above): principals
   (browser certificate, client key, metadata-only Connect account records,
   human user, peer daemon, exact hosted lease), grants (principal → role on
   this daemon), roles over the daemon permission catalog defined in
@@ -741,9 +745,11 @@ loopback surface remains reachable from sandboxed shells — closing it
 properly means authenticating the loopback lane (per-boot secret or
 peer-credential checks) or binding its unauthenticated form to a read-only
 route subset, an open design decision. The same asymmetry applies to the
-state-root secrets: every platform now excludes the trust store
-(`access-certs/`), leased auth, and the custody trail from the runtime's
-*write* grants, but only macOS can additionally deny *reads* of them.
+state-root secrets: every platform's **default** grant set excludes the trust
+store (`access-certs/`), leased auth, and the custody trail from runtime writes,
+but a project root or operator-supplied `extra_write_paths` that overlaps those
+locations can reopen them. Only macOS can additionally deny reads of the
+credential locations at the OS-policy layer.
 
 ## Alpha implementation status
 
@@ -772,6 +778,8 @@ authentication from staged identity vocabulary:
    are implemented** — every daemon still makes its own trust and
    authorization decision.
 5. **General browser-key login remains future work** — it cannot reactivate the
-   retired Connect path or broaden the dedicated hosted-lease principal.
-   Signed-application confirmation becomes available only after a qualifying
-   signed/notarized distribution and platform-keystore enrollment ship.
+   retired Connect path or broaden the dedicated hosted-lease principal. The
+   signed-application witness/anchor protocol is implemented, but the current
+   `-unsigned-dev` artifact is deliberately ineligible; operational
+   signed-application confirmation still requires a qualifying
+   signed/notarized distribution and platform-keystore enrollment.

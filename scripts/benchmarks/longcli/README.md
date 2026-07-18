@@ -1,5 +1,11 @@
 # LongCLI-Bench lanes (density-first managed-context evaluation)
 
+> **Historical harness snapshot (2026-06-12).** This directory records the
+> pinned binaries, Codex versions, task set, and CLI used for that benchmark
+> campaign. Commands intentionally preserve campaign-era compatibility flags
+> such as the now-no-op `--no-tui`; use current repo docs for ordinary
+> development and operation.
+
 Port of the two benchmark lanes (vanilla Codex / Intendant-managed Codex)
 from the harbor harness (`../harbor_*.py`, terminal-bench dataset) to
 **LongCLI-Bench** — arXiv 2602.14337, github.com/finyorko/longcli-bench — 20

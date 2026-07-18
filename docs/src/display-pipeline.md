@@ -14,10 +14,10 @@ the Windows-specific backends, see [Windows Support](./windows-support.md).
 
 ## Overview
 
-A `DisplaySession` (`src/bin/caller/display/mod.rs`) owns one display's whole
-pipeline: the platform capture backend, a broadcast fan-out of raw frames, the
-encoder pool, the set of connected WebRTC peers, the clipboard monitor, and the
-tile-streaming bridge. The high-level data flow:
+A `DisplaySession` (`crates/intendant-display/src/lib.rs`) owns one display's
+whole pipeline: the platform capture backend, a broadcast fan-out of raw
+frames, the encoder pool, the set of connected WebRTC peers, the clipboard
+monitor, and the tile-streaming bridge. The high-level data flow:
 
 ```
                     ┌──────────────────────────────────────────────┐
@@ -71,9 +71,10 @@ viewer):
 
 ## The Encoder Pool
 
-The redesign's centerpiece (`display/encode/pool/`: vocabulary types, the
-subscription lease + keyframe coalescer, the orchestrating `EncoderPool`, and
-the encoder worker threads). The pre-pool design used
+The redesign's centerpiece (`crates/intendant-display/src/encode/pool/`:
+vocabulary types, the subscription lease + keyframe coalescer, the
+orchestrating `EncoderPool`, and the encoder worker threads). The pre-pool
+design used
 **one encoder per session** with the codec locked to the *first* peer's offer:
 every later viewer had to accept that codec or its WebRTC offer failed outright.
 The naive fix — one encoder per peer — is what transcoding gateways do, and it
@@ -129,10 +130,11 @@ against a stale lease decrementing a replaced slot after a resize.
 
 ### Layer policy coordinator
 
-A single coordinator task per display (`display/aggregator.rs`) is the sole owner
-of `pool.pause_layer` / `pool.resume_layer` decisions. Three policies **vote**,
-and the coordinator composes their votes **by intersection — pause wins; resume
-requires every active policy to agree**:
+A single coordinator task per display
+(`crates/intendant-display/src/aggregator.rs`) is the sole owner of
+`pool.pause_layer` / `pool.resume_layer` decisions. Three policies **vote**,
+and the coordinator composes their votes **by intersection — pause wins;
+resume requires every active policy to agree**:
 
 - **Presence policy** — pauses all layers after the display sits at zero peers
   for a 5 s debounce (absorbs browser refreshes and federation reconnect blips),
@@ -146,18 +148,19 @@ requires every active policy to agree**:
   retained frame on demand.
 
   Demand also propagates one stage further upstream, into **capture pacing**
-  (`display/capture/pacing.rs`): the session composes a demand probe —
+  (`crates/intendant-display/src/capture/pacing.rs`): the session composes a
+  demand probe —
   encoder-pool consumers, the peer-join burst window, tile subscribers,
   external raw-frame subscribers, and recent external `latest_frame` reads or
-  injected input — and installs it on the backend. Polling backends (X11,
-  synthetic) then drop the capture copy itself from configured fps to a
+  injected input — and installs it on the backend. The X11 and synthetic
+  backends consult it and drop the capture copy itself from configured fps to a
   **1 fps keepalive** while nothing consumes frames, waking within one 50 ms
   poll slice when demand returns. It is a rate reduction, never a stop: a
   stopped capture has cold-start latency and breaks `latest_frame` consumers,
   while the 1 fps floor keeps `latest_frame` fresh enough for an instant
   first paint, a ≤1 s-stale screenshot, and the FrameRegistry's 1 Hz sampler.
-  Event-driven backends (ScreenCaptureKit, PipeWire, DXGI) ignore the probe —
-  they already emit nothing while the desktop is idle.
+  ScreenCaptureKit and PipeWire keep their event-driven pacing; the Windows
+  GDI/DXGI backend currently ignores the probe and keeps its own capture rate.
 
   Per-peer demand is released under **tile mode** as well: a federated viewer
   whose client is painting tiles (video element hidden) enters *video
@@ -191,11 +194,12 @@ seen one, so the decoder never renders garbage.
 
 ## Per-Peer WebRTC Driver (`rtc`-rs, sans-I/O)
 
-Each browser connection is a `WebRtcPeer` (`display/webrtc/`: the peer handle in
-`mod.rs`, ICE-TCP registries in `tcp_mux.rs`, candidate gathering in `ice.rs`,
-offer handling + construction in `offer.rs`, the driver task in `driver.rs`, and
-pool glue in `pool_glue.rs`) that runs its own
-tokio **driver task**. The driver holds a sans-I/O
+Each browser connection is a `WebRtcPeer`
+(`crates/intendant-display/src/webrtc/`: the peer handle in `mod.rs`, ICE-TCP
+registries in `tcp_mux.rs`, candidate gathering in `ice.rs`, offer handling +
+construction in `offer.rs`, the driver task in `driver.rs`, and pool glue in
+`pool_glue.rs`) that runs its own tokio **driver task**. The driver holds a
+sans-I/O
 [`rtc` crate](https://crates.io/crates/rtc) (rtc-rs, pinned to `=0.9.0`)
 `RTCPeerConnection` plus its own UDP/TCP sockets, and pumps everything in a single
 `select!` loop:
@@ -214,17 +218,19 @@ owns two responsibilities the library would otherwise hide:
 - **Socket pumping.** The driver task is the only code that can write RTP for its
   peer, which is exactly why per-peer codec/layer selection and packetization
   live *inside* the driver rather than in a separate forwarder module (a separate
-  task can't reach the driver's RTC state). `display/forward.rs` is now reduced to
+  task can't reach the driver's RTC state).
+  `crates/intendant-display/src/forward.rs` is now reduced to
   SDP/codec-preference helpers.
 - **TWCC tapping.** `rtc` 0.9 consumes inbound TWCC (transport-wide congestion
   control) feedback internally and never surfaces it to the application, and its
   remote-inbound stats accumulator stays at zero. The only place to observe the
   signal without patching `rtc` is inside its interceptor chain.
-  `display/twcc_tap.rs` wires a passive `TwccTapInterceptor` as the outermost
-  interceptor: it downcasts each inbound RTCP packet, projects a compact event
-  onto a channel, and forwards the original unchanged. A health aggregator turns
-  that event stream into a 1 s `TwccHealth` snapshot the layer-policy coordinator
-  reads. (The driver also derives a recent send-bitrate estimate from
+  `crates/intendant-display/src/twcc_tap.rs` wires a passive
+  `TwccTapInterceptor` as the outermost interceptor: it downcasts each inbound
+  RTCP packet, projects a compact event onto a channel, and forwards the
+  original unchanged. A health aggregator turns that event stream into a 1 s
+  `TwccHealth` snapshot the layer-policy coordinator reads. (The driver also
+  derives a recent send-bitrate estimate from
   `bytes_sent` deltas, because `rtc` 0.9's `available_outgoing_bitrate` field is
   never written.)
 
@@ -298,9 +304,10 @@ server costs zero added latency.
 Whole-frame VP8 spends bytes re-encoding the static background even when 90-95% of
 the frame is unchanged, which fails the visual-freshness bar at full resolution
 regardless of bitrate. Tile streaming inverts the model — **encode only what
-changed** — the way VNC/RFB and its derivatives (Spice, RDP, Citrix HDX) have for
-decades. The implementation lives in `display/tile/`; the full design rationale
-is in [`docs/design-tile-streaming.md`](https://github.com/intendant-dev/Intendant/blob/main/docs/design-tile-streaming.md).
+changed** — the way VNC/RFB and its derivatives (Spice, RDP, Citrix HDX) have
+for decades. The implementation lives in
+`crates/intendant-display/src/tile/`; the full design rationale is in
+[`docs/design-tile-streaming.md`](https://github.com/intendant-dev/Intendant/blob/main/docs/design-tile-streaming.md).
 
 ### Data channels
 
@@ -324,7 +331,8 @@ per-tile staleness check.
 
 - **Tiles** are **64×64 px** (`TILE_STREAM_TILE_SIZE_PX`).
 - **Damage** comes from platform metadata when possible. On **X11**, XDamage
-  (`display/capture/x11_damage.rs`) reports real OS-level dirty rects
+  (`crates/intendant-display/src/capture/x11_damage.rs`) reports real OS-level
+  dirty rects
   (`ReportLevel::BoundingBox`). On **macOS**, ScreenCaptureKit dirty rect
   extraction is **on by default** (`INTENDANT_MACOS_SCK_DIRTY_RECTS=0` is the
   opt-out escape hatch): frames carry SCK's native dirty rects, a frame whose
@@ -332,17 +340,20 @@ per-tile staleness check.
   Chromium missing-attachment rule), and the composited cursor
   (`shows_cursor(true)`) is content change inside the same pipeline that mints
   the rects — so the X11 hardware-cursor hazard does not transfer. Other paths
-  use a CPU-bound **frame-diff fallback** (`display/capture/frame_diff.rs`)
-  that hashes every tile and emits the ones whose hash changed; where neither
-  is available the capability reports `None` and the policy forces video mode,
-  so the platform keeps the proven VP8 path until its damage backend lands.
-- **Tile ↔ video fallback policy** (`display/tile/policy.rs`) switches to
+  use a CPU-bound **frame-diff fallback**
+  (`crates/intendant-display/src/capture/frame_diff.rs`) that hashes every
+  tile and emits the ones whose hash changed. A damage backend reporting
+  `DamageCapability::None` means no platform damage metadata is active; the
+  bridge still runs that CPU frame-diff fallback.
+- **Tile ↔ video fallback policy**
+  (`crates/intendant-display/src/tile/policy.rs`) switches to
   whole-frame video on high-motion content and back to tiles when motion subsides,
   with hysteresis to prevent flapping: **enter video at 25% dirty fraction
   (`ENTER_VIDEO_THRESHOLD`), exit at 15% (`EXIT_VIDEO_THRESHOLD`)**, over a
   rolling window of 8 samples (`HISTORY_K`), with a **500 ms minimum dwell**
   (`MIN_DWELL`) capping switches at 2/sec. The fallback target is the proven
-  VP8-q video track, which stays **negotiated** the whole time; while a
+  baseline video track (VP8-q on macOS/Linux, the full-resolution H.264 layer
+  on Windows), which stays **negotiated** the whole time; while a
   viewer's tile stream is active its video *encoders* idle in per-peer
   standby (see the layer-policy section above), and the fallback edge
   restores demand + forces a keyframe before the surface switch.
@@ -356,25 +367,28 @@ per-tile staleness check.
 Recovery is bounded so it can never become the flood it's recovering from. A
 periodic snapshot bounds time-to-recover from any silent corruption (30 s in tile
 mode, 60 s in video-fallback mode). Browser `GapReport`s are satisfied from a
-bounded per-tile replay buffer (`display/tile/recovery.rs`) when the whole missing
+bounded per-tile replay buffer
+(`crates/intendant-display/src/tile/recovery.rs`) when the whole missing
 sequence range is still present, otherwise a fresh (rate-limited) snapshot is
-sent. Tile-delta sends are gated by a backpressure monitor
-(`display/tile/backpressure.rs`) watching each channel's buffered amount; the
-control channel is never throttled, so input and cursor stay prompt under tile
-pressure.
+sent. The initial baseline is also single-source: peer registration sends no
+snapshot; the browser's reliable `Subscribe` control message requests exactly
+one after its channels are ready. Tile-delta sends are gated by a backpressure
+monitor (`crates/intendant-display/src/tile/backpressure.rs`) watching each
+channel's buffered amount; the control channel is never throttled, so input and
+cursor stay prompt under tile pressure.
 
 ## Per-Platform Backend Matrix
 
-| Platform | Capture | Input injection | Hardware H.264 encode | Clipboard |
+| Platform | Capture | Input injection | H.264 encode | Clipboard |
 |---|---|---|---|---|
-| **Linux / X11** | XShm/root-window capture via `x11rb` (`display/x11.rs`), `XGetImage` fallback | `x11rb`/XTest in-process | ffmpeg VA-API, `libx264` software fallback (`encode/h264_linux.rs`) | `x11rb` clipboard in-process |
-| **Linux / Wayland** | PipeWire via XDG Desktop Portal `ScreenCast` (`display/wayland.rs`) | XDG Desktop Portal `RemoteDesktop` `notify_*` D-Bus methods (via `ashpd`) | same as X11 | `wl-copy` / `wl-paste` |
-| **macOS** | ScreenCaptureKit (`display/macos.rs`) | CoreGraphics `CGEvent` in-process | VideoToolbox, zero-copy from SCK frames (`encode/h264_macos.rs`) | `pbcopy` / `pbpaste`, `osascript` for images |
-| **Windows** | GDI `BitBlt` default, DXGI Desktop Duplication opt-in via `INTENDANT_WINDOWS_CAPTURE=dxgi` (`display/windows.rs`) | Win32 `SendInput` | Media Foundation software MFT, NVENC where available (`encode/h264_windows.rs`) — this is the **baseline** codec on Windows | `arboard` crate (in-process Win32) |
+| **Linux / X11** | XShm/root-window capture via `x11rb` (`crates/intendant-display/src/x11.rs`), `XGetImage` fallback | `x11rb`/XTest in-process | ffmpeg VA-API, `libx264` software fallback (`crates/intendant-display/src/encode/h264_linux.rs`) | `x11rb` clipboard in-process |
+| **Linux / Wayland** | PipeWire via XDG Desktop Portal `ScreenCast` (`crates/intendant-display/src/wayland.rs`) | XDG Desktop Portal `RemoteDesktop` `notify_*` D-Bus methods (via `ashpd`) | same as X11 | `wl-copy` / `wl-paste` |
+| **macOS** | ScreenCaptureKit (`crates/intendant-display/src/macos.rs`) | CoreGraphics `CGEvent` in-process | VideoToolbox, zero-copy from SCK frames (`crates/intendant-display/src/encode/h264_macos.rs`) | `pbcopy` / `pbpaste`, `osascript` for images |
+| **Windows** | GDI `BitBlt` default, DXGI Desktop Duplication opt-in via `INTENDANT_WINDOWS_CAPTURE=dxgi` (`crates/intendant-display/src/windows.rs`) | Win32 `SendInput` | Synchronous software Media Foundation MFT (`crates/intendant-display/src/encode/h264_windows.rs`) — this is the **baseline** codec on Windows | `arboard` crate (in-process Win32) |
 
-VP8 (`encode/vp8.rs`, libvpx) is the always-on baseline on macOS/Linux and is
-gated off Windows entirely. See [Windows Support](./windows-support.md) for the
-Windows backends in detail.
+VP8 (`crates/intendant-display/src/encode/vp8.rs`, libvpx) is the always-on
+baseline on macOS/Linux and is gated off Windows entirely. See
+[Windows Support](./windows-support.md) for the Windows backends in detail.
 
 `DisplayBackend` auto-detects the active backend at runtime: on Linux it checks
 `WAYLAND_DISPLAY` before falling back to `DISPLAY`; macOS and Windows always use
@@ -458,15 +472,15 @@ injected before the follow-up screenshot).
 
 ## Bidirectional Clipboard
 
-The `ClipboardMonitor` (`display/clipboard.rs`) polls the system clipboard every
-500 ms and syncs changes over a WebRTC data channel in both directions. It
-supports text and images (PNG, capped at 5 MB). On copy in the browser, content is
-pushed to the display's clipboard; on copy in the display, content is pushed to
-the browser. A `DisplayView` grant alone does not enable that channel: both
-inbound mutation and outbound clipboard content require the same live
-`DisplayInput` authority as interactive keyboard/mouse control, rechecked again
-when a queued clipboard command is sent. The per-platform read/write tools are
-listed in the matrix above.
+The `ClipboardMonitor` (`crates/intendant-display/src/clipboard.rs`) polls the
+system clipboard every 500 ms and syncs changes over a WebRTC data channel in
+both directions. It supports text and images (PNG, capped at 5 MB). On copy in
+the browser, content is pushed to the display's clipboard; on copy in the
+display, content is pushed to the browser. A `DisplayView` grant alone does not
+enable that channel: both inbound mutation and outbound clipboard content
+require the same live `DisplayInput` authority as interactive keyboard/mouse
+control, rechecked again when a queued clipboard command is sent. The
+per-platform read/write tools are listed in the matrix above.
 Polling is **gated on viewer presence**: with zero connected peers each tick is
 a no-op (no `pbpaste`/`osascript`/`xclip`/`wl-paste` subprocess is spawned for a
 sync nobody receives), and content that changed during the pause is re-baselined
@@ -489,8 +503,9 @@ the agent's click coordinates match the screenshot it receives.
 ## Recording
 
 Display recording runs in parallel with WebRTC streaming, with ffmpeg strictly
-as the encoder (`recording.rs`). When a `DisplaySession` exists, frames are
-polled from the session, JPEG-encoded, and piped to ffmpeg via `image2pipe`.
+as the encoder (`src/bin/caller/recording.rs`). When a `DisplaySession` exists,
+frames are polled from the session, JPEG-encoded, and piped to ffmpeg via
+`image2pipe`.
 Without a session (`--record-display`, the debug screen), Linux lets ffmpeg
 capture directly via `x11grab`, while macOS captures the requested display
 in-process via ScreenCaptureKit and bridges the frames into the same

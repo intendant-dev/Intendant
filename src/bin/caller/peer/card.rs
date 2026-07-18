@@ -286,7 +286,6 @@ pub enum Capability {
     Phone,
     /// Has computer-use (screen + keyboard + mouse) on its own host.
     ComputerUse,
-    /// Has a tagged knowledge store the peer can be queried against.
     /// Has display / session recording.
     Recording,
     /// Accepts task delegation from peers (implements `PeerDelegator`).

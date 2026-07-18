@@ -2729,15 +2729,13 @@ impl DisplaySession {
     /// handler consults before forwarding events to [`DisplayBackend::inject_input`]
     /// and before either direction of clipboard sync. A display-view grant is
     /// intentionally insufficient for either host mutation.
-    /// `display/mod.rs` deliberately does NOT know how authority is
+    /// This display module deliberately does NOT know how authority is
     /// stored — the closure is the entire boundary. Phase 5a.1.
     ///
-    /// Callers that don't gate input (test harnesses, federated paths
-    /// that explicitly opt out of authority enforcement) pass
+    /// Test harnesses that do not exercise authority pass
     /// `Arc::new(|| true)` or `Arc::new(|| false)`. The local `/ws`
-    /// display-offer path in `web_gateway` builds a closure capturing
-    /// `(display_id, this_connection_id, authority_map)`; the federated
-    /// path passes deny-by-default until federation authority lands.
+    /// display-offer path builds a closure over the local holder map; the
+    /// federated path builds one over its peer/session holder identity.
     pub async fn handle_offer(
         &self,
         peer_id: PeerId,
@@ -6709,7 +6707,7 @@ mod tests {
             session.pool_feed_bridge_handle.lock().await.is_none(),
             "stop() must take + await the pool-feed bridge handle, \
              leaving the slot empty (parity with capture/encoder/\
-             clipboard cleanup at display/mod.rs:792-800)"
+             clipboard cleanup in DisplaySession::stop)"
         );
     }
 
@@ -6874,7 +6872,7 @@ mod tests {
 
     // ---- Phase 5a.1 gated-input-handler tests ------------------------
     //
-    // Per the slice spec: in display/mod.rs, test ONLY closure plumbing
+    // Per the slice spec: in this module, test ONLY closure plumbing
     // (true → backend gets called; false → backend doesn't).  Holder /
     // non-holder authority semantics belong in `web_gateway` tests
     // because that's where the closure is built from the authority map.

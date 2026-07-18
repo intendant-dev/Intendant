@@ -1,7 +1,7 @@
 //! Live filesystem watcher: observes file changes in the project directory,
 //! stores copy-on-write baseline snapshots, and emits `AppEvent::FileChanged`
-//! events. Works for all agent types (native, Codex, Claude Code, Gemini CLI)
-//! by watching the filesystem directly rather than relying on git.
+//! events. Works for native sessions and supervised external agents (Codex and
+//! Claude Code) by watching the filesystem directly rather than relying on git.
 //!
 //! Also provides per-round content-addressed snapshots for rollback / redo /
 //! branching. On each [`AppEvent::RoundComplete`], a new [`HistoryRound`] is

@@ -1,8 +1,8 @@
 name: Cross-platform tests
 
-# Runs the unit-test suite (`cargo test --bins`) for both binaries on every
-# supported platform so cross-platform regressions surface in CI rather than
-# only when someone builds on a non-Linux box.
+# Runs the Intendant package's binary tests plus the extracted native library
+# crates on every supported platform so cross-platform regressions surface in
+# CI rather than only when someone builds on a non-Linux box.
 #
 # Windows is the point: the codebase is mostly developed on macOS/Linux, and
 # Unix-only APIs and path assumptions slip in unnoticed because they compile
@@ -103,7 +103,7 @@ jobs:
         # required context in the main ruleset — renaming it means a
         # coordinated ruleset edit) AND the hosted-runner label fork PRs
         # route to; `runner` is the self-hosted fleet placement for trusted
-        # refs (dell-206, macbook-vm, samsung-win — build state persists in
+        # refs (dell-206, macbook-a, samsung-win — build state persists in
         # the external per-listener target cache set up below; the
         # in-workspace target/ is wiped by checkout's `git clean -ffdx`
         # every job, so warmth never lives there). Provisioning steps
@@ -334,10 +334,11 @@ jobs:
           cargo check -p intendant --bins --locked --target ${{ matrix.target }}
           cargo check -p intendant-core -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --tests --locked --target ${{ matrix.target }}
 
-      # Build and run the unit tests of the whole `intendant` package — both
-      # binaries (the `intendant` controller and the `intendant-runtime`
-      # executor) and their shared modules — for this target. `--bins` is the
-      # same invocation the repo docs prescribe locally; `-p intendant`
+      # Build and run the unit tests of the whole `intendant` package — all
+      # three binaries (`intendant`, `intendant-runtime`, and
+      # `intendant-connect`) and their shared modules — for this target.
+      # `--bins` is the same invocation the repo docs prescribe locally;
+      # `-p intendant`
       # deliberately excludes the wasm workspace members (`presence-web`,
       # `station-web`), which have their own wasm-pack builds and don't build
       # against a native target.

@@ -70,9 +70,11 @@ pub fn is_ambient_credential_env(name: &str) -> bool {
 }
 
 /// Controller-side env var holding comma-separated exact env names
-/// (case-insensitive) the user deliberately exempts from the ambient
-/// scrub at spawn boundaries — e.g. `SSH_AUTH_SOCK` for agent shells that
-/// must push over SSH. Provider/model-API keys are never exempted.
+/// (case-insensitive) the user deliberately exempts from ambient scrubs at
+/// controller spawn boundaries. Supervised external CLIs receive these
+/// names; the native runtime process may inherit them, but its exec/PTY
+/// shell layer applies an independent scrub that currently does not honor
+/// this exemption. Provider/model-API keys are never exempted.
 pub const ENV_PASSTHROUGH_VAR: &str = "INTENDANT_ENV_PASSTHROUGH";
 
 /// Parse a raw [`ENV_PASSTHROUGH_VAR`] value into the exemption set:

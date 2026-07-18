@@ -1,5 +1,6 @@
-//! The Memory service: propose / search / read over the ephemeral
-//! plane, with the reducer-derived status on every view.
+//! The Memory service: propose / search / read over a local plane,
+//! with reducer-derived status and effective durability on every
+//! view.
 
 use std::collections::BTreeMap;
 
@@ -81,7 +82,7 @@ pub(crate) struct MemoryService {
 }
 
 impl MemoryService {
-    /// Bootstrap an ephemeral plane and an empty claim registry.
+    /// Bootstrap an in-memory plane and an empty claim registry.
     pub(crate) fn new() -> Result<MemoryService, MemoryError> {
         Ok(MemoryService {
             plane: EphemeralPlane::bootstrap()?,
@@ -222,7 +223,8 @@ impl MemoryService {
     }
 
     /// The plane id (hex) — logged at wiring so an operator can tell
-    /// one ephemeral plane incarnation from the next across restarts.
+    /// one plane incarnation from the next (especially in ephemeral
+    /// mode, where a restart mints a new plane).
     pub(crate) fn plane_id_hex(&self) -> String {
         hex32(&self.plane.plane_id)
     }

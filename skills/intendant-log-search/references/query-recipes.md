@@ -3,7 +3,8 @@
 Use this for concrete commands. Set `S` to the session directory first:
 
 ```bash
-S="$HOME/.intendant/logs/<session-id>"
+IHOME="${INTENDANT_HOME:-$HOME/.intendant}"
+S="$IHOME/logs/<session-id>"
 ```
 
 ## Contents
@@ -22,7 +23,7 @@ S="$HOME/.intendant/logs/<session-id>"
 Newest sessions:
 
 ```bash
-find "$HOME/.intendant/logs" -type f -name session_meta.json -print 2>/dev/null |
+find "$IHOME/logs" -type f -name session_meta.json -print 2>/dev/null |
 while IFS= read -r f; do
   jq -r '[.created_at // "", .session_id // (input_filename|split("/")[-2]), .status // "", .project_root // "", .task // ""] | @tsv' "$f"
 done | sort -r | head -50
@@ -31,7 +32,7 @@ done | sort -r | head -50
 Sessions for the current project:
 
 ```bash
-find "$HOME/.intendant/logs" -type f -name session_meta.json -print 2>/dev/null |
+find "$IHOME/logs" -type f -name session_meta.json -print 2>/dev/null |
 while IFS= read -r f; do
   jq -r --arg p "$PWD" 'select((.project_root // "") == $p) | [.created_at // "", .session_id // (input_filename|split("/")[-2]), .status // "", .task // ""] | @tsv' "$f"
 done | sort -r
@@ -41,8 +42,8 @@ Find a session by full or prefix id:
 
 ```bash
 SID="<id-or-prefix>"
-find "$HOME/.intendant/logs" -type d -name "$SID*" -print 2>/dev/null
-find "$HOME/.intendant/logs" -type f -name session_meta.json -print 2>/dev/null |
+find "$IHOME/logs" -type d -name "$SID*" -print 2>/dev/null
+find "$IHOME/logs" -type f -name session_meta.json -print 2>/dev/null |
 while IFS= read -r f; do
   rg -l "\"session_id\"\\s*:\\s*\"$SID" "$f" 2>/dev/null
 done
@@ -53,7 +54,7 @@ Find wrapper logs for a backend external-agent id:
 ```bash
 BACKEND="<backend-session-id>"
 jq -r --arg id "$BACKEND" '.wrappers[]? | select((.backend_session_id // "") == $id or (.backend_session_id // "" | contains($id))) | [.source, .backend_session_id, .intendant_session_id, .log_path, (.project_root // "")] | @tsv' \
-  "$HOME/.intendant/external_wrapper_index.json"
+  "$IHOME/external_wrapper_index.json"
 ```
 
 ## Inspect a Session Quickly
@@ -250,7 +251,7 @@ Find wrapper records globally:
 
 ```bash
 jq -r '.wrappers[]? | [.source, .backend_session_id, .intendant_session_id, .log_path, (.project_root // ""), (.updated_at_secs // "")] | @tsv' \
-  "$HOME/.intendant/external_wrapper_index.json" 2>/dev/null | sort
+  "$IHOME/external_wrapper_index.json" 2>/dev/null | sort
 ```
 
 Find a Codex native rollout by backend id:
@@ -352,13 +353,14 @@ Dashboard deep search:
 - Searches full log files and recursively collects every JSON string field.
 - Searches beyond the recent-session display window.
 - Can prefilter by project directory.
-- Filters parent-log references to deleted external sessions using `~/.intendant/deleted_external_sessions.json`.
+- Filters parent-log references to deleted external sessions using
+  `$IHOME/deleted_external_sessions.json`.
 
 Manual equivalent for exact phrase over Intendant sessions:
 
 ```bash
 phrase="needle phrase"
-find "$HOME/.intendant/logs" -type f -name session.jsonl -print 2>/dev/null |
+find "$IHOME/logs" -type f -name session.jsonl -print 2>/dev/null |
 while IFS= read -r f; do
   rg -qi --fixed-strings "$phrase" "$f" && printf '%s\n' "$(dirname "$f")"
 done

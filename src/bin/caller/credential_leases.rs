@@ -410,10 +410,11 @@ private home directory (0700) holding exactly the leased auth file
 and it is deleted on lease expiry, revocation, and daemon shutdown —
 normal exits via the `LeaseShutdownGuard` held by `main`, signal
 shutdown via the handler's explicit revoke — with the startup
-recovery sweep covering crashes where neither ran. Non-secret
-configuration (config.toml / settings.json) is copied in so behavior
-is preserved; the user's own auth files never are. The directory
-lives under ~/.intendant, outside any project worktree, so the
+recovery sweep covering crashes where neither ran. Configuration
+(config.toml / settings.json) is copied best-effort so behavior is normally
+preserved; copy failures are currently silent, arbitrary user configuration is
+not inspected for embedded secrets, and the user's known auth files never are.
+The directory lives under the daemon state root, outside any project worktree, so the
 rewind/snapshot machinery never sees it. Deletion stages the home's
 transcript subdirectories out first (rename-only, best-effort — see
 `lease_transcript_staging`) so leased sessions stay searchable after

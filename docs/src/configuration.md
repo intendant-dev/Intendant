@@ -53,13 +53,14 @@ for the headless `tests/e2e/` suite and demos) and requires
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, access certs, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), and the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves). |
+| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. On macOS/Linux it also holds `access-certs/`; Windows keeps that store under the OS data directory instead. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), the Windows access-cert store, the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves), and the current macOS durable Memory plane at `~/.intendant/memory-plane` (which does not yet honor `INTENDANT_HOME`). |
+| `INTENDANT_MEMORY_EPHEMERAL` | unset | Set to `1` to force the owner-plane Memory service to use an in-memory plane. With the variable unset, macOS attempts durable storage at `~/.intendant/memory-plane` and falls back softly to an honestly labeled ephemeral plane if bootstrap fails; Linux and Windows currently use the ephemeral plane. |
 
 ### Child-process environment
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INTENDANT_ENV_PASSTHROUGH` | unset | Comma-separated exact env-var names (case-insensitive) exempted from the ambient-credential scrub at model-driven child boundaries: the runtime spawn, its shells, and supervised external CLIs (which otherwise start from a cleared, allowlisted environment). For sessions that deliberately need e.g. `SSH_AUTH_SOCK` or `CARGO_TARGET_DIR` in agent shells. Provider API keys never pass regardless of this list. |
+| `INTENDANT_ENV_PASSTHROUGH` | unset | Comma-separated exact env-var names (case-insensitive) added to a supervised external CLI's cleared environment allowlist and exempted from the controller→runtime ambient-credential scrub. Provider API keys never pass. Native runtime exec/PTY shells apply a second scrub that currently does **not** honor this override, so classified ambient credentials such as `SSH_AUTH_SOCK` remain unavailable there; ordinary non-classified variables already inherit without naming them. |
 
 ### Model and behavior tuning
 
@@ -95,6 +96,10 @@ precedence is **explicit config > env var > auto-detect**.
 | `INTENDANT_BROWSER_WORKSPACE_EXECUTABLE` | managed browser cache | Explicit Chromium/Chrome-for-Testing executable for CDP browser workspaces |
 | `INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER` | `false` on macOS, `true` elsewhere | On macOS, explicitly permit CDP workspaces to launch system Chrome/Chromium apps such as `/Applications/Google Chrome.app` |
 
+The older `INTENDANT_BROWSER_EXECUTABLE` and
+`INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_CHROME` names remain accepted as
+compatibility aliases; new configuration should use the names in the table.
+
 The default CDP resolver prefers managed Playwright/Puppeteer/Chrome-for-Testing
 browser caches and Intendant's own browser cache locations. This avoids
 attributing Google Chrome updater/app-bundle activity to Intendant on macOS. Set
@@ -104,6 +109,12 @@ Run `intendant setup browsers` to download Chrome for Testing into Intendant's
 managed cache. The helper accepts `--check`, `--force`,
 `--channel stable|beta|dev|canary`, `--json`, and `--print-path`; use
 `--check` to verify the cache without network access.
+
+### Display diagnostics
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INTENDANT_DISPLAY_INPUT_TELEMETRY` | unset (off) | Set to `1`, `true`, `yes`, or `on` to emit once-per-second aggregate data-channel, authority-drop, input-queue, and injection timing counters while display input is active |
 
 ### Dashboard dev override
 
@@ -116,9 +127,14 @@ with `cargo run -p app-html-assembler` after each fragment edit — the next
 browser refresh picks up the change with no daemon rebuild or restart. The
 disk copy gets the same `?v=` asset-URL rewriting as the embedded one;
 everything else (WASM, vendored JS/CSS, icons) stays embedded and still
-needs a normal build. A read failure serves a loud 500 naming the override
-rather than silently falling back to the embedded copy, and the gateway
-logs the active override at startup.
+needs a normal build, except `/vault-kernel.js`: when a sibling
+`vault-kernel.js` exists beside the overridden `app.html`, the gateway also
+re-reads that file on every request so its bytes match the assembler-injected
+hash pin. A missing or unreadable sibling falls back to the embedded kernel,
+whose mismatch the page's integrity check will reject. An `app.html` read
+failure serves a loud 500 naming the override rather than silently falling
+back to the embedded copy, and the gateway logs the active override at
+startup.
 
 ### Session-log retention variables
 
@@ -139,6 +155,7 @@ sessions spawned in-process via the `spawn_sub_agent` tool (see
 |----------|-------------|
 | `INTENDANT_TASK` | Task description fallback when no CLI task argument is given |
 | `INTENDANT_SYSTEM_PROMPT` | Replaces the resolved system prompt wholesale for a direct CLI invocation (escape hatch; per-session overrides use `spawn_sub_agent`'s `system_prompt`) |
+| `INTENDANT_PROJECT_ROOT` | Explicit project root for MCP helper surfaces that otherwise use the current directory; selects the controller-loop state directory and the project-local live-audio prompt override |
 | `INTENDANT_SANDBOX_WRITE_PATHS` | Sandbox write paths (set by the caller when sandboxing; enforced by Landlock on Linux, Seatbelt on macOS, restricted tokens on Windows) |
 | `INTENDANT_LOG_DIR` | Session log directory (set by the caller for the runtime) |
 
@@ -151,11 +168,10 @@ daemon-wide file while `/api/project-root` remains null. Every section is
 optional; an absent section uses its defaults. The structure and defaults below
 are taken directly from `src/bin/caller/project.rs`.
 
-### `[memory]`
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `enabled` | bool | `true` | Enable the persistent project memory store (`.intendant/memory.json`) |
+Memory is no longer project configuration: the legacy `[memory]` table and
+`.intendant/memory.json` store were removed. Owner-plane Memory durability is
+selected at daemon startup by platform and `INTENDANT_MEMORY_EPHEMERAL`, as
+described above.
 
 ### `[model]`
 
@@ -251,7 +267,7 @@ rows while that routing is off.
 |-----|------|---------|-------------|
 | `provider` | string | auto-detect | CU model provider |
 | `model` | string | auto-detect | CU model |
-| `backend` | string | `auto` | Input/screenshot backend: `x11`, `wayland`, `macos`, or `auto` |
+| `backend` | string | `auto` | Input/screenshot backend: `x11`, `wayland`, `macos`, `windows`, or `auto` |
 
 ### `[experimental]`
 
@@ -278,6 +294,7 @@ Routes coding tasks to an external CLI agent instead of the native loop (see
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `command` | string | `codex` | Path or command name for the Codex binary |
+| `managed_command` | string | unset (fall back to `command`) | Path or command name for an Intendant-aware Codex fork. Managed-context sessions prefer this binary; vanilla sessions always use `command`. Leaving it unset preserves legacy setups but makes managed-fork capability ambiguous in the dashboard |
 | `model` | string | unset | Model override |
 | `approval_policy` | string | `on-request` | `untrusted`, `on-request`, or `never` (UI set; `on-failure` is deprecated upstream) |
 | `sandbox` | string | `workspace-write` | `read-only`, `workspace-write`, or `danger-full-access` |
@@ -340,23 +357,31 @@ explicit `enabled` here decides, otherwise the platform default.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | unset (= platform default) | Explicitly enable/disable filesystem sandboxing; the CLI flags override it |
-| `extra_write_paths` | array | `[]` | Extra writable paths beyond the default grant set: project root (plus the session's own project root for dashboard-picked projects), the OS scratch dir (`TMPDIR` / `/tmp` / `%TEMP%`), the log dir, `~/.intendant`, and — Unix only — the toolchain caches (`~/.cargo`, `~/.rustup`, the user cache dir); on Windows toolchain-cache writes are instead granted on demand through the denial-consent card |
+| `extra_write_paths` | array | `[]` | Extra writable paths beyond the default grant set: project root (plus the session's own project root for dashboard-picked projects), the OS scratch dir (`TMPDIR` / `/tmp` / `%TEMP%`), the session log dir and the state root's `logs/` subtree, and — Unix only — the toolchain caches (`~/.cargo`, `~/.rustup`, the user cache dir). The state root itself is deliberately **not** granted: it also holds access credentials, leased auth, and custody state. On Windows toolchain-cache writes are instead granted on demand through the denial-consent card |
 
 The dashboard's Settings → Security card edits both values live (new
 commands pick the change up without a restart; a `--sandbox`/`--no-sandbox`
 flag pins the live state for that daemon run, so saves then only persist
 intent), and approving a sandbox write-denial consent prompt can append
 grants — for the session, or persisted here via "always allow".
+On Windows, an extra-path-only Settings save currently resolves an omitted
+`enabled` value as `true`, not the Windows platform default, and does not perform
+startup's full ACE-stamping lifecycle. Treat that as a Settings defect: include
+the intended enabled state explicitly and restart after changing Windows
+sandbox grants.
 
-A sandbox that cannot apply fails the run rather than continuing
-unconfined, on all three platforms — on Linux kernels without Landlock
-support the runtime refuses to start until `--no-sandbox` (or
-`enabled = false`) makes the unconfined run explicit. Reads stay open
-except the credential carve-outs (macOS denies `~/.ssh`, `~/.gnupg`, the
-intendant config home, and the `.env` search path at the OS layer; on
-Linux, Landlock cannot express read carve-outs under a broad read grant,
-so project/config `.env` files remain readable — credential custody is
-the tracked fix).
+Once the sandbox reaches a runtime, an enforcement failure aborts that run
+rather than continuing unconfined: for example, a Linux kernel without
+Landlock support refuses the runtime until `--no-sandbox` (or `enabled =
+false`) makes the opt-out explicit, and Windows restricted-token re-exec fails
+closed. One controller-edge caveat remains: if startup cannot encode the
+write-grant environment, it currently logs the error, removes the sandbox
+variable, and continues; a Windows ACE-stamping failure instead leaves the
+restricted runtime unable to write. Reads stay open except the credential
+carve-outs (macOS denies `~/.ssh`, `~/.gnupg`, the intendant config home, and
+the `.env` search path at the OS layer; on Linux, Landlock cannot express read
+carve-outs under a broad read grant, so project/config `.env` files remain
+readable — credential custody is the tracked fix).
 
 ### `[webrtc]`
 
@@ -575,8 +600,14 @@ The service accepts these deployment flags and equivalent environment variables:
 | `INTENDANT_CONNECT_STATIC_ROOT` | `--static-root` | ignored | Deprecated compatibility input. Accepted but never read or mounted; Connect serves only its explicit embedded allowlist |
 | `INTENDANT_CONNECT_DATA_FILE` | `--data-file` | platform data dir `intendant/connect/state.json` | JSON state file |
 | `INTENDANT_CONNECT_TOKEN` | `--daemon-token` | unset | Shared deployment bearer for registration unless open registration is enabled; still guards admin surfaces. It does not replace the daemon's signed registration proof or rotating daemon-session credential |
+| `INTENDANT_CONNECT_RELEASE_TOKEN` | `--release-token` | unset | Dedicated bearer for `POST /api/log/release-manifest`. Deliberately separate from the operator/admin daemon token; without it, release-manifest submission returns 503 |
 | `INTENDANT_CONNECT_INVITE_REQUIRED` | `--invite-required` | `false` | Require a valid invite code for new account registration |
 | `INTENDANT_CONNECT_OPEN_REGISTRATION` | `--open-registration` | `false` | Skip only the shared deployment bearer on registration. Daemons still sign a fresh key-possession proof, and successful registration rotates a short-lived daemon-session credential required by poll/answer/error/dry/claim-proof endpoints |
+| `INTENDANT_CONNECT_DNS_ZONE` | `--dns-zone` | unset | Delegated fleet DNS zone. Must be configured together with `INTENDANT_CONNECT_DNS_NS_NAME` and `INTENDANT_CONNECT_DNS_LISTEN` |
+| `INTENDANT_CONNECT_DNS_NS_NAME` | `--dns-ns-name` | unset | Authoritative nameserver host served in the fleet-zone apex SOA/NS records |
+| `INTENDANT_CONNECT_DNS_LISTEN` | `--dns-listen` | unset | UDP+TCP bind address for the embedded authoritative DNS server |
+| `INTENDANT_CONNECT_RELAY_LISTEN` | `--relay-listen` | unset | Raw TCP bind address for the TLS/SNI passthrough relay. Must be configured together with at least one relay address |
+| `INTENDANT_CONNECT_RELAY_ADDRESS` | `--relay-address` | unset | Comma-separated public IP list published for relay-mode fleet DNS |
 
 The service also accepts environment-only operational overrides for
 self-hosting and tests:
@@ -640,7 +671,9 @@ node scripts/connect-transport-e2e.cjs
 
 ### `[server]` (daemon and federation)
 
-What this daemon advertises to peers and requires of inbound connections. Most
+What this daemon advertises to peers and requires of inbound connections.
+Those are related but independently configured; in particular the Agent
+Card's advertised transport is not inferred from the gateway's TLS mode. Most
 deployments only ever touch `[server.tls]`.
 
 `[server]`:
@@ -654,12 +687,14 @@ deployments only ever touch `[server.tls]`.
 `rustls` + `rcgen`, all platforms; ORed with the `--tls` flag). The dashboard
 defaults to mTLS. This section supplies HTTPS/WSS and a browser secure context,
 but it does not give a certless remote browser daemon authority: only loopback
-certless requests receive the local-root posture, and protected remote
-HTTP/WebSocket/control requests still require mTLS:
+certless requests receive the local-root posture. TLS-only mode does not load a
+client CA, so protected remote HTTP/WebSocket/control requests are denied unless
+they carry a separately authenticated peer or hosted-lease identity; use the
+default mTLS mode when client-certificate authentication is required:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable HTTPS/WSS; certless access is local-root only on loopback, while remote protected routes still require mTLS |
+| `enabled` | bool | `false` | Enable TLS-only HTTPS/WSS. Certless access is local-root only on loopback; remote protected routes require an authenticated peer/hosted-lease identity and ordinary client certificates cannot authenticate because this mode loads no client CA |
 | `cert` | string | installed access certs, then auto self-signed | PEM cert (chain) overriding the default cert selection; pair with `key` |
 | `key` | string | — | PEM private key (PKCS#8, PKCS#1, or SEC1) matching `cert` |
 | `hostname` | string | — | Extra SAN hostname for the self-signed cert (in addition to bind IP + `localhost`) |
@@ -675,7 +710,7 @@ certificate.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Explicitly require browser/client certificates during the TLS handshake; default behavior already does this unless `--tls` / `[server.tls]` or `--no-tls` is used |
+| `enabled` | bool | `false` | Enable client-certificate authentication (also the default dashboard transport unless `--tls` / `[server.tls]` or `--no-tls` is used). TLS accepts a certless handshake so public shell/discovery bytes remain reachable; protected HTTP routes and every ordinary WebSocket then require a CA-verified client certificate or another authenticated peer/hosted-lease identity |
 | `ca` | string | installed access CA | PEM CA bundle used to verify client certificates |
 
 Use `[server.tls]` for a secure context on loopback or for public/bootstrap
@@ -725,6 +760,12 @@ locally before any client certificate is issued. Set
 |-----|------|---------|-------------|
 | `advertised_transport` | string | `none` | What the Agent Card advertises: `none`, `mutual-tls`, or `pin-self-cert` |
 | `bearer_token` | string | none | Legacy/advanced: require `Authorization: Bearer <token>` on inbound HTTP/WS; prefer mTLS/client certificates for normal access |
+
+`advertised_transport` is declarative rather than derived. Its compatibility
+default remains `none` even though the dashboard gateway now defaults to mTLS.
+Federation deployments using that default gateway must set
+`advertised_transport = "mutual-tls"` (or `pin-self-cert`) so the Agent Card
+does not understate what a connecting peer must present.
 
 ### `[[peer]]` — federated peers
 
@@ -779,11 +820,12 @@ Schema version 3 contains:
 | `schema_version` | State schema version; currently `3` |
 | `principals` | Local managed human/device principal records |
 | `roles` | Built-in or local role templates |
-| `grants` | Local IAM grant records targeting daemon IDs (optional `expires_at_unix_ms` stops enforcement after that instant; shown as `expired`) |
+| `grants` | Local IAM grant records targeting daemon IDs. Optional `expires_at_unix_ms` stops enforcement after that instant (shown as `expired`); `issued_via` records a delegated org issuer, and `fs_scope` confines mediated file reads/writes to normalized roots |
 | `audit_events` | Local IAM audit metadata |
 | `role_ceilings` | Per-binding-kind effective-role caps for low-provenance sessions (see below) |
 | `hosted_origins` | Origins treated as hosted app sources when recorded on client-key bindings |
 | `trusted_orgs` | Organizations whose signed grant documents this daemon accepts, each with a local `max_role` cap (implemented; see [Trust Architecture](./trust-architecture.md)) |
+| `tier` | Optional owner-selected daemon trust tier (`integrated` or `disposable`). It informs doctrine and UI warnings but grants or denies nothing by itself |
 | `hosted_control` | Daemon-local hosted policy, pending doorbells, active/recent lease records, and qualifying signed-app anchors. Defaults to a Tasks ceiling and empty request/lease/anchor sets |
 
 The daemon loads this file into `/api/access/overview` under the `iam` object
@@ -879,10 +921,13 @@ grants. New mixed-version attempts are blocked at both service and daemon.
 
 The enforced built-in user/client roles are `role:scoped-human`,
 `role:observer`, `role:session-reader`, `role:terminal`, `role:files-read`,
-`role:files-write`, `role:operator`, and `role:root`. `role:peer-profile` is
-visible in the same Access overview so daemon peer grants and human grants can
-be compared, but it is daemon-to-daemon only and cannot be assigned to a
-browser certificate or Connect account.
+`role:files-write`, `role:peer-user`, `role:operator`, and `role:root`.
+`role:peer-user` admits this principal to the local daemon's peer-routed
+terminal/file/display surfaces; the target peer still authorizes each tunnel
+under this daemon's grant there. `role:peer-profile` is visible in the same
+Access overview so daemon peer grants and human grants can be compared, but it
+is daemon-to-daemon only and cannot be assigned to a browser certificate or
+Connect account.
 
 Hosted leases use three reserved compiled role ids:
 `role:hosted-view`, `role:hosted-tasks`, and `role:hosted-operate`. Their
@@ -928,9 +973,6 @@ an array-of-tables entry.
 A reasonably full `intendant.toml`:
 
 ```toml
-[memory]
-enabled = true
-
 [model]
 context_window = 200000
 max_output_tokens = 8192
@@ -1004,8 +1046,9 @@ openai_model = "gpt-4o-realtime-preview"
 sample_rate = 24000
 
 [sandbox]
-enabled = false
-extra_write_paths = ["/var/log"]
+# Omit `enabled` for the platform default (on macOS/Linux, off Windows).
+# enabled = true
+extra_write_paths = []
 
 [webrtc]
 federation_allow_h264 = false
@@ -1076,10 +1119,15 @@ level or category rule.
 ## Skills
 
 Skills are named instruction sets stored as `SKILL.md` files with YAML
-frontmatter, discovered from two directories (project-scoped first):
+frontmatter. Discovery checks these locations in order; the first skill with a
+given name wins:
 
-1. `<project-root>/.intendant/skills/<name>/SKILL.md`
-2. `~/.intendant/skills/<name>/SKILL.md`
+1. `<project-root>/.agents/skills/<name>/SKILL.md` (Agent Skills standard)
+2. `<project-root>/.intendant/skills/<name>/SKILL.md` (legacy project path)
+3. `<project-root>/skills/<name>/SKILL.md` (visible repository path)
+4. `~/.agents/skills/<name>/SKILL.md` (personal standard path)
+5. `<state-root>/skills/<name>/SKILL.md` (legacy personal path; default
+   `~/.intendant/skills`)
 
 ```yaml
 ---
@@ -1108,7 +1156,8 @@ take precedence over personal skills of the same name.
 Place `INTENDANT.md` in your project root or at
 `~/.config/intendant/INTENDANT.md` for global instructions. Both are loaded if
 present (global first, project-local second) and injected into the conversation
-at session start, before knowledge/memory.
+at session start, after the working-directory context and before the skill
+catalog. Memory is pull-only and is not injected into fresh conversations.
 
 ## System prompts
 

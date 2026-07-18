@@ -70,8 +70,7 @@ authenticate*:
   ],
   "capabilities": [
     { "kind": "display" },
-    { "kind": "computer-use" },
-    { "kind": "voice" }
+    { "kind": "computer-use" }
   ],
   "auth": { "transport": { "scheme": "none" } }
 }
@@ -88,11 +87,15 @@ Key fields:
   `intendant-ws` (native), `a2a`, `mcp` (with a nested transport kind), and
   `openclaw-ws` (with a role).
 - **`capabilities`** — what the peer *offers* as services: `display`, `voice`,
-  `phone`, `computer-use`, `knowledge`, `recording`, `task-delegation`,
-  `message-relay`, or a string-tagged `custom:<name>`. The coordinator routes work
-  by matching against this list.
-- **`auth`** — what the peer *requires* of inbound connections (see
-  [Authentication](#authentication) below).
+  `phone`, `computer-use`, `recording`, `task-delegation`, `message-relay`, or
+  a string-tagged `custom:<name>`. The coordinator routes work by matching
+  against this list. The local Intendant card currently emits
+  `computer-use` and `display`; the other variants are shipped wire vocabulary
+  for peers that actually provide them.
+- **`auth`** — what the card *declares* a connecting peer should present (see
+  [How auth maps to the Agent Card](#how-auth-maps-to-the-agent-card) below).
+  It is operator-configured rather than derived and can understate the live
+  gateway requirement if left at its compatibility default.
 
 A peer that advertises something an older build doesn't recognize (a future
 transport, capability, or auth scheme) deserializes that one position to an
@@ -167,12 +170,21 @@ cross-machine display (see below).
   backoff** (500 ms initial, 30 s cap, jitter, reset on every successful connect).
   Inbound events fan out **durable-first**: to a bounded log sink (must not drop —
   if it's slow the actor pauses, transitively back-pressuring the wire), then to a
-  lossy broadcast for UI subscribers. Commands are only processed while
-  `Connected`; ones that arrive mid-reconnect wait in the bounded command channel.
+  lossy broadcast for UI subscribers. Streaming partials stay out of
+  `peers.jsonl`; the actor keeps at most eight bounded tail folds and writes one
+  coalesced `partial: true` salvage record per surviving message if the
+  connection drops. The log rotates at 64 MiB and retains one previous
+  generation. During reconnect the actor drains commands: `Disconnect`
+  short-circuits the backoff, while `Send` fails immediately with
+  `PeerError::NotConnected` so stale work is never applied to a later
+  connection.
 - **`PeerRegistry`** (`peer/registry.rs`) owns the `HashMap<PeerId, PeerHandle>`.
-  `add_peer` fetches the card from `/.well-known/agent-card.json`, picks the first
-  supported `TransportSpec`, constructs the transport, and spawns the actor. If no
-  supported transport is advertised it fails cleanly with `PeerError::CardFetch`.
+  `add_peer` fetches the card from `/.well-known/agent-card.json`, filters all
+  supported `TransportSpec` entries while preserving preference order, wraps
+  their concrete transports in `MultiTransport`, and spawns the actor. The first
+  candidate whose `connect()` succeeds wins, and every reconnect probes the full
+  list again. If no supported transport is advertised it fails cleanly with
+  `PeerError::CardFetch`.
 - **`Coordinator`** (`peer/coordinator.rs`) sits on top and does **capability-based
   routing**: given a `TaskRequest` with `required_capabilities`, it picks the first
   eligible peer — one that is `Connected` *and* whose card advertises every
@@ -253,7 +265,7 @@ The per-peer actor mirrors the fold into a watch-published displays view
 the `list_peers` MCP tool — seeds late joiners and every pushed snapshot
 replaces the row losslessly. On the dashboard each known peer display gets
 its own Station chip (`label · :id`) wired to the existing federated WebRTC
-view path, and the Activity → Log rail narrates transitions with the display
+view path, and the Activity → Timeline rail narrates transitions with the display
 id and geometry (`display :99 ready (1920x1080)`). An agent that brings up a
 display on a peer is therefore *discoverable* the moment the peer announces
 it — no display id needs to be guessed or typed.
@@ -460,6 +472,13 @@ optional `:` separators (the OpenSSL format). Pinning replaces only the cert-pat
 check — the TLS handshake **signature** is still verified normally, so an attacker
 who steals the cert bytes but not the private key still fails the handshake.
 
+The card fetch, WebSocket transport, and peer `/mcp` side-channel clone one
+credential bundle and share its cached rustls configuration and pooled HTTP
+client. Each use rechecks the client certificate/key file identity (including
+inode identity on Unix) and the pin set, so an atomic certificate rotation
+rebuilds the TLS material on the next request without requiring a daemon
+restart.
+
 ## Cross-Machine Display
 
 Federated Intendants can share each other's displays in the browser. The defining
@@ -525,7 +544,8 @@ typically through TURN: when a TURN server is configured in `[webrtc].ice_server
 the federated path pins the browser to `iceTransportPolicy: 'relay'` and both ends
 can allocate on the configured coturn (without a TURN server the policy is left at
 its default). When no direct path can be formed, a **primary-relay TCP fallback**
-kicks in (`display/webrtc/tcp_mux.rs` `TcpRelayRegistry`):
+kicks in (`crates/intendant-display/src/webrtc/tcp_mux.rs`
+`TcpRelayRegistry`):
 
 1. As the peer's `Answer` flows back through the primary, the primary parses the
    peer's ICE ufrag and resolves the peer's advertised URL to a `SocketAddr`,
@@ -552,10 +572,12 @@ bounded so a registration can never become a standing open relay or SSRF hook:
   already federates with.
 - **TTL expiry + capacity cap.** Entries expire (`RELAY_ENTRY_TTL`) and the table
   is capped (`MAX_RELAY_ENTRIES`); a re-`Answer` (peer reconnect / ICE restart)
-  refreshes the live entry. `unregister` removes an entry on session teardown.
+  refreshes the live entry. `unregister_session` removes every entry for that
+  signaling session on teardown.
 - **Bounded splice.** Each relayed connection is capped per ufrag
-  (`MAX_RELAY_CONNS_PER_UFRAG`) and torn down on an idle gap in **either**
-  direction (`RELAY_IDLE_TIMEOUT`) or at an absolute `RELAY_MAX_LIFETIME`.
+  (`MAX_RELAY_CONNS_PER_UFRAG`) and torn down when **neither direction**
+  transfers bytes for `RELAY_IDLE_TIMEOUT`, or at an absolute
+  `RELAY_MAX_LIFETIME`.
 
 The gateway accept path itself is bounded the same way against a pre-auth
 slowloris: peek + TLS handshake + first request head must complete within one
@@ -619,7 +641,7 @@ stream to the existing HTTP/WebSocket handling.
 
 ```bash
 intendant                                      # default: mTLS with access certs
-intendant --tls                                # TLS-only; installed access certs when present, else self-signed
+intendant --tls                                # TLS-only; installed server cert/key when present, else self-signed
 intendant --no-tls --bind 127.0.0.1           # explicit local plaintext/debug escape
 intendant --tls-cert chain.pem --tls-key key.pem   # explicit PEM (implies --tls)
 ```
@@ -904,8 +926,13 @@ via the `AuthRequirements` helpers:
 
 | Helper | `transport` | `application` | Use when |
 |---|---|---|---|
-| `none()` | `None` | — | Trusted network: loopback, tailnet, LAN behind a firewall (the phase-1 default) |
-| `mutual_tls()` | `MutualTls` | — | Normal federation behind `intendant access setup` |
+| `none()` | `None` | — | A gateway that really permits transport-auth-free access, such as explicit trusted-network/plaintext or TLS-only operation |
+| `mutual_tls()` | `MutualTls` | — | Normal federation behind the default mTLS gateway and `intendant access setup` |
+
+The card value comes from `[server.auth] advertised_transport`; it is not
+derived from the gateway mode. Its compatibility default is still `none` while
+the gateway itself defaults to mTLS, so a federating daemon should set
+`advertised_transport = "mutual-tls"` or `pin-self-cert` explicitly.
 
 For daemon-to-daemon mTLS, the connecting daemon presents a client certificate
 during the HTTPS/WSS handshake. Config-driven peers can set

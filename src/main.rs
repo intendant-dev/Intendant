@@ -85,10 +85,11 @@ fn apply_sandbox_from_env() -> Result<(), AgentError> {
         .map_err(|e| AgentError::Process(format!("Landlock restrict_self failed: {}", e)))?;
     if status.ruleset == landlock::RulesetStatus::NotEnforced {
         // Fail closed: a configured sandbox must never silently degrade to
-        // unrestricted execution (scoped shells and the Windows runtime
-        // already refuse in this situation). The sandbox is on by default,
-        // so on a Landlock-less kernel this is the error operators see —
-        // name the explicit opt-outs rather than degrading silently.
+        // unrestricted execution (scoped shells and an explicitly enabled
+        // Windows runtime already refuse in this situation). Linux defaults
+        // the sandbox on, so on a Landlock-less kernel this is the error
+        // operators see — name the explicit opt-outs rather than degrading
+        // silently.
         return Err(AgentError::Process(
             "Filesystem sandbox is enabled (the default) but Landlock is not enforced by this \
              kernel; refusing to run unsandboxed. Pass --no-sandbox or set [sandbox] \

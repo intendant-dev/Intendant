@@ -35,7 +35,7 @@
 //! peers consume; each peer's RTC driver picks which codec/layer it can
 //! decode and forwards just those frames. The per-peer forwarding
 //! logic lives inside the `WebRtcPeer` driver task (in
-//! `display/webrtc.rs`), not in a separate module — the driver owns
+//! `crate::webrtc`), not in a separate module — the driver owns
 //! the RTC peer connection and is the only caller that can write RTP.
 //!
 //! ## Pool composition
@@ -81,7 +81,7 @@
 //! The pool produces [`Arc<EncodedFrame>`] payloads keyed by
 //! [`SimulcastRid`]. The per-peer forwarding
 //! lives inside each peer's `WebRtcPeer` driver task
-//! (`display/webrtc.rs`), which owns the peer's RTC connection and therefore
+//! (`crate::webrtc`), which owns the peer's RTC connection and therefore
 //! the only path that can write RTP. Each frame carries a
 //! [`crate::encode::PayloadSpec`]; the driver checks it against the
 //! negotiated sender codec before packetizing. An earlier design sketch had a

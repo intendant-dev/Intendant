@@ -3389,7 +3389,6 @@ pub(crate) struct NativeSessionConfig {
     /// Replaces the role-resolved system prompt wholesale (the
     /// INTENDANT_SYSTEM_PROMPT semantic, session-scoped).
     pub(crate) system_prompt_override: Option<String>,
-    /// Inject the project knowledge store into fresh conversations.
     /// Present on supervised (daemon) sessions: grants the loop the
     /// spawn_sub_agent / wait_sub_agents / submit_result capability.
     pub(crate) orchestration: Option<session_supervisor::SessionOrchestration>,
