@@ -1160,16 +1160,27 @@ const OFF_IN_READ_POS: usize = 48;
 const OFF_OUT_BUFFER: usize = 56;
 const OFF_IN_BUFFER: usize = OFF_OUT_BUFFER + VORTEX_RING_SAMPLES * 4;
 
+/// Owners below this uid are system daemons, not peer users. The Vortex
+/// HAL plugin runs inside `coreaudiod`, so the legitimate object is owned
+/// by `_coreaudiod` (uid 202 — observed live) or root, never by the
+/// console user; macOS system service uids sit below 500 (Linux below
+/// 1000, but 500 covers the daemon accounts that matter and keeps every
+/// ordinary-user squatter out on both).
+#[cfg(unix)]
+const VORTEX_SHM_SYSTEM_UID_CEILING: libc::uid_t = 500;
+
 /// Pre-`mmap` validation of the Vortex shm object's `fstat` results,
 /// factored out of [`start_vortex_shm_bridge`] so the checks are unit
 /// testable without a live shm object.
 ///
-/// A foreign-owned object means the well-known name was squatted by
-/// another user — refuse it. An undersized object would SIGBUS on the
-/// first ring access past EOF — refuse it before mapping. Same-uid
-/// writers remain inside the trust boundary: POSIX shm offers no OS
-/// boundary between same-user processes, so shm audio is necessarily
-/// trusted once these checks pass.
+/// An object owned by another ordinary user means the well-known name was
+/// squatted — refuse it. The current user and system-daemon owners
+/// (`coreaudiod` hosts the HAL plugin that creates the object) are the
+/// legitimate cases. An undersized object would SIGBUS on the first ring
+/// access past EOF — refuse it before mapping. Same-uid writers remain
+/// inside the trust boundary: POSIX shm offers no OS boundary between
+/// same-user processes, so shm audio is necessarily trusted once these
+/// checks pass.
 #[cfg(unix)]
 fn validate_vortex_shm_object(
     st_size: i64,
@@ -1177,10 +1188,10 @@ fn validate_vortex_shm_object(
     required_size: usize,
     euid: libc::uid_t,
 ) -> Result<(), String> {
-    if st_uid != euid {
+    if st_uid != euid && st_uid >= VORTEX_SHM_SYSTEM_UID_CEILING {
         return Err(format!(
-            "vortex shm object is owned by uid {st_uid}, not the current user (uid {euid}); \
-             refusing to attach"
+            "vortex shm object is owned by uid {st_uid}, not the current user (uid {euid}) \
+             or a system audio daemon; refusing to attach"
         ));
     }
     if st_size < 0 || (st_size as u64) < required_size as u64 {
@@ -2793,9 +2804,15 @@ mod tests {
         assert!(validate_vortex_shm_object(required as i64, 501, required, 501).is_ok());
         assert!(validate_vortex_shm_object((required + 4096) as i64, 501, required, 501).is_ok());
 
-        // Foreign owner: the well-known name was squatted by another user.
-        let err = validate_vortex_shm_object(required as i64, 0, required, 501).unwrap_err();
-        assert!(err.contains("owned by uid 0"), "{err}");
+        // System-daemon owners are legitimate: the HAL plugin creates the
+        // object inside coreaudiod (`_coreaudiod` = 202; root when older
+        // configurations apply), not as the console user.
+        assert!(validate_vortex_shm_object(required as i64, 202, required, 501).is_ok());
+        assert!(validate_vortex_shm_object(required as i64, 0, required, 501).is_ok());
+
+        // Foreign ordinary user: the well-known name was squatted.
+        let err = validate_vortex_shm_object(required as i64, 502, required, 501).unwrap_err();
+        assert!(err.contains("owned by uid 502"), "{err}");
 
         // Undersized (or nonsense-sized) object: mapping it would SIGBUS.
         let err = validate_vortex_shm_object(required as i64 - 1, 501, required, 501).unwrap_err();
@@ -2803,10 +2820,13 @@ mod tests {
         assert!(validate_vortex_shm_object(0, 501, required, 501).is_err());
         assert!(validate_vortex_shm_object(-1, 501, required, 501).is_err());
 
+        // A system-owned but undersized object still refuses on size.
+        assert!(validate_vortex_shm_object(0, 202, required, 501).is_err());
+
         // Ownership is checked before size: a foreign object is reported as
         // foreign even when also undersized.
-        let err = validate_vortex_shm_object(0, 0, required, 501).unwrap_err();
-        assert!(err.contains("owned by uid 0"), "{err}");
+        let err = validate_vortex_shm_object(0, 502, required, 501).unwrap_err();
+        assert!(err.contains("owned by uid 502"), "{err}");
     }
 
     // -----------------------------------------------------------------------

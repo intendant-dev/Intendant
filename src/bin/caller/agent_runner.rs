@@ -24,6 +24,13 @@ fn human_response_tokens() -> &'static std::sync::Mutex<std::collections::HashMa
     TOKENS.get_or_init(Default::default)
 }
 
+/// The registry key for a batch's log dir: canonicalized so the arm site
+/// (agent loop) and the answer writers (frontends) agree even when one of
+/// them holds a symlinked spelling (macOS `/var` vs `/private/var`).
+fn human_response_token_key(log_dir: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf())
+}
+
 /// Removes the batch's token entry when the runtime spawn returns.
 struct HumanResponseTokenGuard {
     log_dir: PathBuf,
@@ -59,15 +66,14 @@ fn arm_human_response_token(
         "human_response_token".to_string(),
         serde_json::Value::String(token.clone()),
     );
+    let key = human_response_token_key(log_dir);
     human_response_tokens()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(log_dir.to_path_buf(), token);
+        .insert(key.clone(), token);
     (
         Some(parsed.to_string()),
-        Some(HumanResponseTokenGuard {
-            log_dir: log_dir.to_path_buf(),
-        }),
+        Some(HumanResponseTokenGuard { log_dir: key }),
     )
 }
 
@@ -78,7 +84,7 @@ pub(crate) fn write_human_response(log_dir: &std::path::Path, text: &str) -> std
     let token = human_response_tokens()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(log_dir)
+        .get(&human_response_token_key(log_dir))
         .cloned();
     let payload = match token {
         Some(token) => format!("{token}\n{text}"),

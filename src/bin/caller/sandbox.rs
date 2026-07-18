@@ -77,36 +77,19 @@ fn seatbelt_deny_clause_for(dirs: &[PathBuf], files: &[PathBuf]) -> Result<Strin
     ))
 }
 
-/// Seatbelt deny rules for user-secret locations. Two families:
+/// Seatbelt deny rules for the user-secret directories the runtime's
+/// `validate_path` denylist protects (`~/.ssh`, `~/.gnupg`). The denylist
+/// only guards structured tool arguments (editFile/inspectPath) — command
+/// strings run by executeCommand bypass it entirely, and no string
+/// inspection can close that honestly. This clause is the always-on
+/// baseline: it rides every macOS runtime profile including the
+/// `--no-sandbox` sensitive-only wrap.
 ///
-/// - The directories the runtime's `validate_path` denylist protects
-///   (`~/.ssh`, `~/.gnupg`). The denylist only guards structured tool
-///   arguments (editFile/inspectPath) — command strings run by
-///   executeCommand bypass it entirely, and no string inspection can close
-///   that honestly.
-/// - The provider-credential files the controller loads at startup: the
-///   per-user intendant config home (`dirs::config_dir()/intendant`, which
-///   holds the global `.env` fallback) and every `.env` on the
-///   `dotenvy` search path (launch cwd + ancestors, covering the project
-///   root). The controller strips key variables from the runtime's
-///   environment, but the *files* those keys live in would otherwise stay
-///   readable — `curl -d @.env` is exactly the exfiltration the
-///   runtime/controller split exists to prevent.
-///
-/// This clause closes both at the OS level: appended LAST to a profile it
-/// wins over every allow (last-match-wins), so secrets stay denied even
-/// when a write path or `(allow default)` would otherwise cover them.
+/// Appended LAST to a profile it wins over every allow (last-match-wins).
 /// `/proc`, `/sys`, and `/etc/shadow` from the denylist are Linux paths
 /// with no macOS counterpart, and `/dev` cannot be blanket-denied (every
 /// process needs its tty and /dev/null). Returns an empty clause when
 /// nothing is resolvable to protect.
-///
-/// Linux has no equivalent: Landlock is allowlist-only and cannot
-/// subtract read access from a granted tree, so there the denylist on
-/// structured tools plus the write sandbox remain the whole story, and
-/// project/config `.env` files stay readable to sandboxed commands —
-/// moving keys out of agent-readable files (credential custody) is the
-/// tracked fix (see docs/src/architecture.md).
 #[cfg(target_os = "macos")]
 pub(crate) fn seatbelt_sensitive_deny_clause() -> Result<String, String> {
     let mut deny_dirs: Vec<PathBuf> = Vec::new();
@@ -115,6 +98,32 @@ pub(crate) fn seatbelt_sensitive_deny_clause() -> Result<String, String> {
         deny_dirs.push(home.join(".ssh"));
         deny_dirs.push(home.join(".gnupg"));
     }
+    seatbelt_deny_clause_for(&deny_dirs, &[])
+}
+
+/// Seatbelt deny rules for the provider-credential files the controller
+/// loads at startup: the per-user intendant config home
+/// (`dirs::config_dir()/intendant`, which holds the global `.env`
+/// fallback) and every `.env` on the `dotenvy` search path (launch cwd +
+/// ancestors, covering the project root). The controller strips key
+/// variables from the runtime's environment, but the *files* those keys
+/// live in would otherwise stay readable — `curl -d @.env` is exactly the
+/// exfiltration the runtime/controller split exists to prevent.
+///
+/// This clause rides the write-restricted (sandbox-enabled) profiles and
+/// the scoped-shell profile, NOT the `--no-sandbox` sensitive-only wrap:
+/// the explicit opt-out restores the agent's ability to work on the
+/// project's own `.env` when the operator accepts that trade.
+///
+/// Linux has no equivalent: Landlock is allowlist-only and cannot
+/// subtract read access from a granted tree, so there the denylist on
+/// structured tools plus the write sandbox remain the whole story, and
+/// project/config `.env` files stay readable to sandboxed commands —
+/// moving keys out of agent-readable files (credential custody) is the
+/// tracked fix (see docs/src/architecture.md).
+#[cfg(target_os = "macos")]
+pub(crate) fn seatbelt_credential_deny_clause() -> Result<String, String> {
+    let mut deny_dirs: Vec<PathBuf> = Vec::new();
     if let Some(config) = dirs::config_dir() {
         deny_dirs.push(canonicalize_for_profile(&config.join("intendant")));
     }
@@ -294,8 +303,9 @@ impl SandboxConfig {
              (allow default)\n\
              (deny file-write*)\n\
              (allow file-write* {subpaths})\n\
-             {sensitive}",
+             {sensitive}{credential}",
             sensitive = seatbelt_sensitive_deny_clause()?,
+            credential = seatbelt_credential_deny_clause()?,
         ))
     }
 
@@ -476,9 +486,10 @@ mod tests {
         assert!(stdout.contains("READ_OK"), "{stdout}");
     }
 
-    /// The write-only profile carries the sensitive clause appended last,
-    /// so ~/.ssh stays denied even when a configured write path (e.g. a
-    /// project rooted at $HOME) would otherwise cover it.
+    /// The write-only profile carries the sensitive AND credential deny
+    /// clauses appended last, so ~/.ssh and the `.env` walk stay denied
+    /// even when a configured write path (e.g. a project rooted at $HOME)
+    /// would otherwise cover them.
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_write_only_profile_keeps_secrets_denied_inside_write_paths() {
@@ -492,14 +503,34 @@ mod tests {
         };
         let profile = config.seatbelt_write_only_profile().unwrap();
         let canonical_home = std::fs::canonicalize(&home).unwrap_or(home);
-        let deny_line = profile
+        let allow_line_idx = profile
             .lines()
-            .find(|line| line.starts_with("(deny file-read* file-write*"))
-            .expect("sensitive deny clause present");
-        assert!(deny_line.contains(&format!("{}/.ssh", canonical_home.display())));
-        // Appended last: the deny clause is the final rule, after the
-        // write-path allow that covers $HOME.
-        assert_eq!(profile.trim_end().lines().last().unwrap(), deny_line);
+            .position(|line| line.starts_with("(allow file-write*"))
+            .expect("write-path allow present");
+        let deny_lines: Vec<(usize, &str)> = profile
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with("(deny file-read* file-write*"))
+            .collect();
+        assert!(
+            deny_lines
+                .iter()
+                .any(|(_, line)| line.contains(&format!("{}/.ssh", canonical_home.display()))),
+            "{profile}"
+        );
+        assert!(
+            deny_lines.iter().any(|(_, line)| line.contains(".env")),
+            "{profile}"
+        );
+        // Appended last: every deny clause follows the write-path allow
+        // that covers $HOME, and the profile ends on one.
+        assert!(deny_lines.iter().all(|(idx, _)| *idx > allow_line_idx));
+        assert!(profile
+            .trim_end()
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("(deny file-read* file-write*"));
     }
 
     /// The composed deny clause is enforced by the real Seatbelt kernel:
@@ -571,7 +602,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn sensitive_deny_clause_covers_credential_files() {
-        let clause = seatbelt_sensitive_deny_clause().unwrap();
+        // The credential clause carries the config home + .env walk; the
+        // always-on sensitive clause deliberately does NOT (the
+        // --no-sandbox opt-out restores agent access to the project .env).
+        let sensitive = seatbelt_sensitive_deny_clause().unwrap();
+        assert!(!sensitive.contains(".env"), "{sensitive}");
+        let clause = seatbelt_credential_deny_clause().unwrap();
         if let Some(config) = dirs::config_dir() {
             let config = canonicalize_for_profile(&config.join("intendant"));
             assert!(
