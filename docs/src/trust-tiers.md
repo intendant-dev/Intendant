@@ -371,8 +371,10 @@ the owner's memory. All four are **shipped**:
    separately. The **CT tripwire** is a route diagnostic: `fleet_cert`
    records the serial of every certificate it obtains (before install, so a
    crash cannot make an own certificate look foreign), polls crt.sh for the
-   daemon's exact fleet name on each renewal tick, and flips the Connect card
-   to **CT ALERT** on any serial the daemon never requested. The exact-name
+   daemon's exact fleet name on each renewal tick, filters search results to
+   certificate identities that cover that name exactly or by a valid
+   one-label wildcard, and flips the Connect card to **CT ALERT** on any
+   matching serial the daemon never requested. The exact-name
    verdict and resumable active-order journal are durable under the
    cross-process authority lock; processes merge foreign serials instead of
    overwriting newer evidence, and only a locally recorded own serial removes

@@ -47,6 +47,8 @@ const FLEET_CT_SERIAL_MAX_BYTES: usize = 128;
 const FLEET_CT_SUMMARY_MAX_BYTES: usize = 1024;
 const FLEET_CT_ISSUER_MAX_BYTES: usize = 768;
 const FLEET_CT_NOT_BEFORE_MAX_BYTES: usize = 128;
+const FLEET_CT_NAME_VALUE_MAX_BYTES: usize = 64 * 1024;
+const FLEET_CT_IDENTITIES_MAX: usize = 512;
 const FLEET_CERT_ISSUANCE_FILE: &str = "fleet-cert-issuance.json";
 const FLEET_CERT_ISSUANCE_SCHEMA_VERSION: u32 = 2;
 const FLEET_CERT_ISSUANCE_MAX_BYTES: u64 = 64 * 1024;
@@ -2803,12 +2805,17 @@ fn extend_ct_response(bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<(), String> {
 
 /// Parse a crt.sh `output=json` response, deduplicating the
 /// precertificate/leaf pairs that share a serial.
-fn parse_crt_sh_entries(json_text: &str) -> Result<Vec<CtEntry>, String> {
+fn parse_crt_sh_entries(json_text: &str, expected_name: &str) -> Result<Vec<CtEntry>, String> {
+    let expected_name = normalized_dns_name(expected_name)
+        .ok_or_else(|| "cannot parse CT evidence for an invalid fleet name".to_string())?;
     let rows: Vec<serde_json::Value> =
         serde_json::from_str(json_text).map_err(|e| format!("crt.sh response: {e}"))?;
     let mut seen = std::collections::HashSet::new();
     let mut entries = Vec::new();
     for (index, row) in rows.into_iter().enumerate() {
+        if !crt_sh_row_covers_name(&row, &expected_name, index)? {
+            continue;
+        }
         let raw_serial = row
             .get("serial_number")
             .and_then(|v| v.as_str())
@@ -2849,6 +2856,61 @@ fn parse_crt_sh_entries(json_text: &str) -> Result<Vec<CtEntry>, String> {
         entries.push(entry);
     }
     Ok(entries)
+}
+
+fn crt_sh_row_covers_name(
+    row: &serde_json::Value,
+    expected_name: &str,
+    index: usize,
+) -> Result<bool, String> {
+    let name_value = match row.get("name_value") {
+        Some(serde_json::Value::String(value)) => value,
+        Some(_) => return Err(format!("crt.sh row {index} has a non-string name_value")),
+        None => return Err(format!("crt.sh row {index} has no name_value")),
+    };
+    if name_value.len() > FLEET_CT_NAME_VALUE_MAX_BYTES
+        || name_value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\r' | '\n'))
+    {
+        return Err(format!("crt.sh row {index} has an invalid name_value"));
+    }
+    let mut identities = 0usize;
+    let mut covers = false;
+    for identity in name_value
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        identities += 1;
+        if identities > FLEET_CT_IDENTITIES_MAX {
+            return Err(format!(
+                "crt.sh row {index} carries too many certificate identities"
+            ));
+        }
+        covers |= ct_dns_identity_covers_name(identity, expected_name);
+    }
+    if identities == 0 {
+        return Err(format!("crt.sh row {index} has no certificate identities"));
+    }
+    Ok(covers)
+}
+
+fn ct_dns_identity_covers_name(identity: &str, expected_name: &str) -> bool {
+    let identity = identity.trim().trim_end_matches('.').to_ascii_lowercase();
+    if let Some(suffix) = identity.strip_prefix("*.") {
+        if suffix.contains('*') {
+            return false;
+        }
+        let Some(suffix) = normalized_dns_name(suffix) else {
+            return false;
+        };
+        let Some(label) = expected_name.strip_suffix(&format!(".{suffix}")) else {
+            return false;
+        };
+        return !label.is_empty() && !label.contains('.');
+    }
+    normalized_dns_name(&identity).as_deref() == Some(expected_name)
 }
 
 fn bounded_crt_sh_text(
@@ -3017,7 +3079,7 @@ pub async fn ct_check_once() {
         }
         let text = std::str::from_utf8(&bytes)
             .map_err(|error| format!("crt.sh response is not UTF-8: {error}"))?;
-        parse_crt_sh_entries(text)
+        parse_crt_sh_entries(text, &name)
     }
     .await;
     let now = now_unix_ms();
@@ -4324,11 +4386,11 @@ mod tests {
     #[test]
     fn crt_sh_parsing_dedupes_precert_pairs_and_flags_foreign_serials() {
         let fixture = r#"[
-            {"issuer_name":"C=US, O=Let's Encrypt, CN=R11","serial_number":"03AB01","not_before":"2026-07-09T00:00:00"},
-            {"issuer_name":"C=US, O=Let's Encrypt, CN=R11","serial_number":"03ab01","not_before":"2026-07-09T00:00:00"},
-            {"issuer_name":"C=US, O=Evil CA","serial_number":"04ff02","not_before":"2026-07-10T00:00:00"}
+            {"name_value":"d-1.fleet.example","issuer_name":"C=US, O=Let's Encrypt, CN=R11","serial_number":"03AB01","not_before":"2026-07-09T00:00:00"},
+            {"name_value":"d-1.fleet.example","issuer_name":"C=US, O=Let's Encrypt, CN=R11","serial_number":"03ab01","not_before":"2026-07-09T00:00:00"},
+            {"name_value":"d-1.fleet.example","issuer_name":"C=US, O=Evil CA","serial_number":"04ff02","not_before":"2026-07-10T00:00:00"}
         ]"#;
-        let entries = parse_crt_sh_entries(fixture).unwrap();
+        let entries = parse_crt_sh_entries(fixture, "d-1.fleet.example").unwrap();
         assert_eq!(entries.len(), 2, "precert/leaf pair must dedupe");
 
         let own = vec!["3ab01".to_string()];
@@ -4337,39 +4399,70 @@ mod tests {
         assert_eq!(foreign[0].serial_hex, "4ff02");
         assert!(foreign[0].issuer.contains("Evil CA"));
 
-        assert!(parse_crt_sh_entries("<html>rate limited</html>").is_err());
-        assert_eq!(parse_crt_sh_entries("[]").unwrap().len(), 0);
+        assert!(parse_crt_sh_entries("<html>rate limited</html>", "d-1.fleet.example").is_err());
+        assert_eq!(
+            parse_crt_sh_entries("[]", "d-1.fleet.example")
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn crt_sh_parsing_keeps_only_exact_or_one_label_wildcard_coverage() {
+        let fixture = r#"[
+            {"name_value":"d-1.fleet.example","issuer_name":"issuer","serial_number":"01","not_before":"2026-07-09T00:00:00"},
+            {"name_value":"other.example\n*.fleet.example","issuer_name":"issuer","serial_number":"02","not_before":"2026-07-09T00:00:00"},
+            {"name_value":"d-1.fleet.example.unrelated.test","issuer_name":"issuer","serial_number":"03","not_before":"2026-07-09T00:00:00"},
+            {"name_value":"operator@d-1.fleet.example","issuer_name":"issuer","serial_number":"04","not_before":"2026-07-09T00:00:00"},
+            {"name_value":"*.example","issuer_name":"issuer","serial_number":"05","not_before":"2026-07-09T00:00:00"},
+            {"name_value":"d-*.fleet.example","issuer_name":"issuer","serial_number":"06","not_before":"2026-07-09T00:00:00"}
+        ]"#;
+        let entries = parse_crt_sh_entries(fixture, "D-1.FLEET.EXAMPLE.").unwrap();
+        assert_eq!(
+            entries
+                .into_iter()
+                .map(|entry| entry.serial_hex)
+                .collect::<Vec<_>>(),
+            vec!["1".to_string(), "2".to_string()]
+        );
     }
 
     #[test]
     fn crt_sh_parsing_rejects_fields_the_durable_verdict_cannot_represent() {
         let cases = [
             serde_json::json!([{
+                "name_value": "d-1.fleet.example",
                 "issuer_name": "issuer",
                 "serial_number": "not-hex",
                 "not_before": "2026-07-09T00:00:00"
             }]),
             serde_json::json!([{
+                "name_value": "d-1.fleet.example",
                 "issuer_name": "issuer",
                 "serial_number": "a".repeat(FLEET_CT_SERIAL_MAX_BYTES + 1),
                 "not_before": "2026-07-09T00:00:00"
             }]),
             serde_json::json!([{
+                "name_value": "d-1.fleet.example",
                 "issuer_name": "i".repeat(FLEET_CT_ISSUER_MAX_BYTES + 1),
                 "serial_number": "1",
                 "not_before": "2026-07-09T00:00:00"
             }]),
             serde_json::json!([{
+                "name_value": "d-1.fleet.example",
                 "issuer_name": "issuer\ninjected",
                 "serial_number": "1",
                 "not_before": "2026-07-09T00:00:00"
             }]),
             serde_json::json!([{
+                "name_value": "d-1.fleet.example",
                 "issuer_name": "issuer",
                 "serial_number": "1",
                 "not_before": "t".repeat(FLEET_CT_NOT_BEFORE_MAX_BYTES + 1)
             }]),
             serde_json::json!([{
+                "name_value": "d-1.fleet.example",
                 "issuer_name": "issuer",
                 "serial_number": 1,
                 "not_before": "2026-07-09T00:00:00"
@@ -4377,7 +4470,29 @@ mod tests {
         ];
         for case in cases {
             let json = serde_json::to_string(&case).unwrap();
-            assert!(parse_crt_sh_entries(&json).is_err(), "{json}");
+            assert!(
+                parse_crt_sh_entries(&json, "d-1.fleet.example").is_err(),
+                "{json}"
+            );
+        }
+        for name_value in [
+            serde_json::Value::Null,
+            serde_json::json!(7),
+            serde_json::json!(""),
+            serde_json::json!("d-1.fleet.example\u{0000}"),
+            serde_json::json!("x".repeat(FLEET_CT_NAME_VALUE_MAX_BYTES + 1)),
+        ] {
+            let json = serde_json::json!([{
+                "name_value": name_value,
+                "issuer_name": "issuer",
+                "serial_number": "1",
+                "not_before": "2026-07-09T00:00:00"
+            }])
+            .to_string();
+            assert!(
+                parse_crt_sh_entries(&json, "d-1.fleet.example").is_err(),
+                "{json}"
+            );
         }
     }
 
