@@ -30,7 +30,7 @@ every session launched at runtime.
 $INTENDANT_LOG_DIR/           │             ▼            ▼             ▼        │
  (per-session dir:            │      ┌────────────┐ ┌──────────┐ ┌──────────┐  │
   session.jsonl, turns/,      │      │  Control   │ │ Session  │ │   Task   │  │
-  <nonce>_stdout.log, …)      │      │   Plane    │ │Supervisor│ │ Dispatch │  │
+  random command logs, …)    │      │   Plane    │ │Supervisor│ │ Dispatch │  │
                               │      │(single     │ │(owns     │ │(presence/│  │
                               │      │ writer of  │ │ session  │ │ task/    │  │
                               │      │ shared     │ │ graph +  │ │ follow-up│  │
@@ -91,10 +91,14 @@ The runtime/controller split is a deliberate security boundary:
   `INTENDANT_*` control namespace), together with ambient host credentials such
   as agent sockets, forge/cloud/registry tokens, and credential-store pointers.
   Both runtime shell handlers independently repeat the provider and ambient
-  scrub as defense in depth. It
-  reads JSON commands from stdin, executes them sequentially, and writes results
-  to stdout. The write sandbox is **on by default on macOS/Linux and opt-in
-  on Windows** (`--sandbox` forces it on, `--no-sandbox` forces it off, and
+  scrub as defense in depth. It reads JSON commands from stdin, executes them
+  sequentially, and writes results
+  to stdout. Each controller spawn authenticates those result envelopes with a
+  fresh secret delivered over stdin and stripped after verification, so a
+  model-driven descendant cannot spoof controller results by finding another
+  writable path to the stdout pipe. The write sandbox is **on by default on
+  macOS/Linux and opt-in on Windows** (`--sandbox` forces it on,
+  `--no-sandbox` forces it off, and
   `[sandbox] enabled` overrides the platform default): reads stay open, writes
   are confined to the project root, scratch/log dirs, the daemon state root's
   `logs/` subtree, and — on Unix — the toolchain caches. On macOS the Seatbelt
@@ -136,9 +140,9 @@ survive a runtime restart, and each runtime invocation starts with an empty map.
 Commands are processed **sequentially**. Each blocks until completion and
 returns its result directly (exit code, stdout tail, stderr tail). The runtime
 exits after processing the batch. Daemons backgrounded in a shell continue after
-the tool returns. Per-nonce stdout/stderr go to `<nonce>_stdout.log` /
-`<nonce>_stderr.log` inside the session directory the controller passes via
-`INTENDANT_LOG_DIR`.
+the tool returns. Per-command stdout/stderr go to atomically-created
+`<nonce>_<random>_stdout.log` / `<nonce>_<random>_stderr.log` files inside the
+session directory the controller passes via `INTENDANT_LOG_DIR`.
 
 ## Execution Shapes
 

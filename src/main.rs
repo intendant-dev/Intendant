@@ -178,7 +178,9 @@ async fn main() -> Result<(), AgentError> {
     apply_sandbox_from_env()?;
 
     // Create agent instance
-    let agent = Agent::new()?.with_human_response_token(input.human_response_token.clone());
+    let agent = Agent::new()?
+        .with_human_response_token(input.human_response_token.clone())
+        .with_runtime_protocol_token(input.runtime_protocol_token.clone());
 
     // Process commands sequentially, streaming each JSONL result line as its
     // command completes — the caller consumes partial output when the

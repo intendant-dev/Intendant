@@ -58,9 +58,9 @@ land in the same place.
 ├── model-request-traces/    # exact Codex request archive (exact mode only)
 ├── human_question           # askHuman IPC: question file (session-scoped)
 ├── human_response           # askHuman IPC: response file (session-scoped)
-├── <nonce>_stdout.log       # runtime stdout for command nonce N  (e.g. 1_stdout.log)
-├── <nonce>_stderr.log       # runtime stderr for command nonce N
-├── <nonce>_pty.log          # full over-cap execPty transcript (only when needed)
+├── <nonce>_<random>_stdout.log # runtime stdout for command nonce N
+├── <nonce>_<random>_stderr.log # runtime stderr for command nonce N
+├── <nonce>_<random>_pty.log    # full over-cap execPty transcript (only when needed)
 ├── frames/                  # display & camera frame captures
 │   ├── frames.jsonl         #   frame manifest (id, stream, timestamp, sent_to_live)
 │   └── *.jpg                #   HQ JPEG frames
@@ -100,10 +100,12 @@ full-context dumps measured ~47% of a real fleet log store):
   restores the archive-everything behavior.
 
 Turn files are named `turn_{NNN}_{suffix}` with `NNN` zero-padded to three digits
-(`write_turn_file` / `append_turn_file`). Per-nonce runtime logs are named
-`{nonce}_stdout.log` / `{nonce}_stderr.log`; an `execPty` result larger than
-10 KiB additionally attempts to preserve its full text in `{nonce}_pty.log`
-(`agent.rs`).
+(`write_turn_file` / `append_turn_file`). Per-command runtime logs are named
+`{nonce}_{random}_stdout.log` / `{nonce}_{random}_stderr.log`; an `execPty`
+result larger than 10 KiB additionally attempts to preserve its full text in
+`{nonce}_{random}_pty.log` (`agent.rs`). The random component is a 32-hex-digit
+UUID. Each file is atomically created as new so a model-chosen nonce cannot
+target a pre-planted symlink.
 
 ### `session_meta.json`
 
