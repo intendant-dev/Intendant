@@ -941,11 +941,36 @@ pub(crate) fn with_allowed_origin_cors(response: String, origin: Option<&str>) -
 /// and ICE batches stay far below this; authentication must not turn a
 /// malformed request into an unbounded allocation.
 pub(crate) const CONNECT_SIGNALING_BODY_CAP_BYTES: usize = 256 * 1024;
+const REQUEST_BODY_BASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const REQUEST_BODY_READ_CHUNK_BYTES: usize = 16 * 1024;
+const REQUEST_BODY_TIMEOUT_FREE_BYTES: usize = 64 * 1024;
+const REQUEST_BODY_TIMEOUT_BYTES_PER_SEC: usize = 128 * 1024;
+
+fn request_body_read_timeout(max_bytes: usize) -> std::time::Duration {
+    let excess = max_bytes.saturating_sub(REQUEST_BODY_TIMEOUT_FREE_BYTES);
+    let extra_secs = excess.div_ceil(REQUEST_BODY_TIMEOUT_BYTES_PER_SEC) as u64;
+    REQUEST_BODY_BASE_TIMEOUT.saturating_add(std::time::Duration::from_secs(extra_secs))
+}
 
 pub(crate) async fn read_request_body_capped<S: AsyncRead + Unpin>(
     stream: &mut S,
     header_text: &str,
     max_bytes: usize,
+) -> Result<String, (u16, String)> {
+    read_request_body_capped_with_timeout(
+        stream,
+        header_text,
+        max_bytes,
+        request_body_read_timeout(max_bytes),
+    )
+    .await
+}
+
+async fn read_request_body_capped_with_timeout<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    header_text: &str,
+    max_bytes: usize,
+    timeout: std::time::Duration,
 ) -> Result<String, (u16, String)> {
     use tokio::io::AsyncReadExt;
     let content_length: usize = header_text
@@ -967,13 +992,49 @@ pub(crate) async fn read_request_body_capped<S: AsyncRead + Unpin>(
     if peeked_body.len() >= content_length {
         return Ok(crate::types::truncate_str(peeked_body, content_length).to_string());
     }
-    let remaining = content_length.saturating_sub(peeked_body.len());
-    let mut full = peeked_body.to_string();
-    let mut rest = vec![0u8; remaining];
-    if stream.read_exact(&mut rest).await.is_ok() {
-        full.push_str(&String::from_utf8_lossy(&rest));
+    let mut full = Vec::with_capacity(
+        peeked_body
+            .len()
+            .saturating_add(REQUEST_BODY_READ_CHUNK_BYTES)
+            .min(content_length),
+    );
+    full.extend_from_slice(peeked_body.as_bytes());
+    let read = tokio::time::timeout(timeout, async {
+        let mut chunk = [0u8; REQUEST_BODY_READ_CHUNK_BYTES];
+        while full.len() < content_length {
+            let remaining = content_length - full.len();
+            let n = stream
+                .read(&mut chunk[..remaining.min(REQUEST_BODY_READ_CHUNK_BYTES)])
+                .await
+                .map_err(|error| {
+                    (
+                        400,
+                        serde_json::json!({
+                            "error": format!("read request body: {error}")
+                        })
+                        .to_string(),
+                    )
+                })?;
+            if n == 0 {
+                return Err((
+                    400,
+                    serde_json::json!({"error": "request body ended before Content-Length"})
+                        .to_string(),
+                ));
+            }
+            full.extend_from_slice(&chunk[..n]);
+        }
+        Ok::<(), (u16, String)>(())
+    })
+    .await;
+    match read {
+        Ok(Ok(())) => Ok(String::from_utf8_lossy(&full).into_owned()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err((
+            408,
+            serde_json::json!({"error": "request body read timed out"}).to_string(),
+        )),
     }
-    Ok(full)
 }
 
 /// Numeric code of a status line (`"404 Not Found"` → 404); unparseable
@@ -1215,6 +1276,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body, "");
+    }
+
+    #[tokio::test]
+    async fn read_request_body_capped_times_out_without_preallocating_the_declared_body() {
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        let header_text =
+            "POST /api/hosted-control/requests HTTP/1.1\r\nContent-Length: 65536\r\n\r\n";
+        let error = read_request_body_capped_with_timeout(
+            &mut reader,
+            header_text,
+            64 * 1024,
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, 408);
+    }
+
+    #[test]
+    fn request_body_deadline_scales_only_above_the_public_proof_cap() {
+        assert_eq!(
+            request_body_read_timeout(64 * 1024),
+            REQUEST_BODY_BASE_TIMEOUT
+        );
+        assert!(
+            request_body_read_timeout(crate::gateway_routes::MCP_BODY_CAP_BYTES)
+                > REQUEST_BODY_BASE_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn read_request_body_capped_rejects_an_early_eof() {
+        let mut reader = tokio::io::empty();
+        let header_text =
+            "POST /api/hosted-control/requests HTTP/1.1\r\nContent-Length: 65536\r\n\r\n";
+        let error = read_request_body_capped_with_timeout(
+            &mut reader,
+            header_text,
+            64 * 1024,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, 400);
     }
 
     #[test]

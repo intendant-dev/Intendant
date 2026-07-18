@@ -94,14 +94,15 @@ fn json_value<T: serde::Serialize>(value: T) -> ApiResponse {
     }
 }
 
-const HOSTED_AUTHORITY_BUSY_ERROR: &str =
+pub(crate) const HOSTED_AUTHORITY_BUSY_ERROR: &str =
     "hosted-control authority work is busy; retry the request";
 static HOSTED_AUTHORITY_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
-async fn run_hosted_authority_io<T: Send + 'static>(
+async fn run_bounded_authority_io<T: Send + 'static>(
+    workers: &'static tokio::sync::Semaphore,
     operation: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
-    let permit = HOSTED_AUTHORITY_WORKERS
+    let permit = workers
         .try_acquire()
         .map_err(|_| HOSTED_AUTHORITY_BUSY_ERROR.to_string())?;
     match tokio::task::spawn_blocking(move || {
@@ -113,6 +114,12 @@ async fn run_hosted_authority_io<T: Send + 'static>(
         Ok(result) => result,
         Err(_) => Err("hosted-control authority worker stopped unexpectedly".to_string()),
     }
+}
+
+pub(crate) async fn run_hosted_authority_io<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    run_bounded_authority_io(&HOSTED_AUTHORITY_WORKERS, operation).await
 }
 
 pub(crate) fn fleet_origin_from_request(header_text: &str, is_tls: bool) -> Result<String, String> {
@@ -221,10 +228,21 @@ pub(crate) async fn handle_hosted_control_request_create(
     let input =
         serde_json::from_str::<crate::access::hosted_control::HostedLeaseRequestInput>(&body)
             .map_err(|error| format!("invalid hosted lease request: {error}"));
-    let response = match input.and_then(|input| {
+    let result = match input.and_then(|input| {
         let origin = public_origin?;
-        runtime.create_request(input, &origin, source_bucket)
+        Ok((input, origin))
     }) {
+        Ok((input, origin)) => {
+            let runtime = Arc::clone(&runtime);
+            let source_bucket = source_bucket.map(str::to_string);
+            run_hosted_authority_io(move || {
+                runtime.create_request(input, &origin, source_bucket.as_deref())
+            })
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    let response = match result {
         Ok(request) => {
             tokio::spawn(async {
                 let _ =
@@ -235,6 +253,7 @@ pub(crate) async fn handle_hosted_control_request_create(
         }
         Err(error) if !runtime.configured() => ApiResponse::json_error(404, error),
         Err(error) if !runtime.enabled() => ApiResponse::json_error(503, error),
+        Err(error) if error == HOSTED_AUTHORITY_BUSY_ERROR => ApiResponse::json_error(429, error),
         Err(error) => ApiResponse::json_error(400, error),
     };
     write_api_response(stream, response, cors, None).await;
@@ -358,16 +377,22 @@ pub(crate) async fn handle_hosted_control_request_poll(
     runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
     cors: crate::gateway_routes::CorsPosture,
 ) {
-    let response =
-        match serde_json::from_str::<crate::access::hosted_control::HostedLeasePollProof>(&body)
-            .map_err(|error| format!("invalid hosted lease poll proof: {error}"))
-            .and_then(|proof| runtime.poll_request(&proof))
-        {
-            Ok(result) => json_value(result),
-            Err(error) if !runtime.configured() => ApiResponse::json_error(404, error),
-            Err(error) if !runtime.enabled() => ApiResponse::json_error(503, error),
-            Err(error) => ApiResponse::json_error(400, error),
-        };
+    let result = serde_json::from_str::<crate::access::hosted_control::HostedLeasePollProof>(&body)
+        .map_err(|error| format!("invalid hosted lease poll proof: {error}"));
+    let result = match result {
+        Ok(proof) => {
+            let runtime = Arc::clone(&runtime);
+            run_hosted_authority_io(move || runtime.poll_request(&proof)).await
+        }
+        Err(error) => Err(error),
+    };
+    let response = match result {
+        Ok(result) => json_value(result),
+        Err(error) if !runtime.configured() => ApiResponse::json_error(404, error),
+        Err(error) if !runtime.enabled() => ApiResponse::json_error(503, error),
+        Err(error) if error == HOSTED_AUTHORITY_BUSY_ERROR => ApiResponse::json_error(429, error),
+        Err(error) => ApiResponse::json_error(400, error),
+    };
     write_api_response(stream, response, cors, None).await;
 }
 
@@ -392,10 +417,13 @@ pub(crate) async fn handle_hosted_control_certificate_ledger(
     runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
     cors: crate::gateway_routes::CorsPosture,
 ) {
-    let response = match runtime.certificate_ledger() {
+    let ledger_runtime = Arc::clone(&runtime);
+    let result = run_hosted_authority_io(move || ledger_runtime.certificate_ledger()).await;
+    let response = match result {
         Ok(ledger) => json_value(ledger),
         Err(error) if !runtime.configured() => ApiResponse::json_error(404, error),
         Err(error) if !runtime.enabled() => ApiResponse::json_error(503, error),
+        Err(error) if error == HOSTED_AUTHORITY_BUSY_ERROR => ApiResponse::json_error(429, error),
         Err(error) => ApiResponse::json_error(503, error),
     };
     write_api_response(stream, response, cors, None).await;
@@ -409,7 +437,7 @@ pub(crate) async fn handle_hosted_control_witness_report(
     is_tls: bool,
     cors: crate::gateway_routes::CorsPosture,
 ) {
-    let response = match serde_json::from_str::<
+    let report = serde_json::from_str::<
         crate::access::hosted_control::HostedCertificateWitnessReport,
     >(&body)
     .map_err(|error| format!("invalid certificate witness report: {error}"))
@@ -418,13 +446,22 @@ pub(crate) async fn handle_hosted_control_witness_report(
         if report.fleet_origin != request_origin {
             return Err("certificate witness fleet origin does not match the request".to_string());
         }
-        runtime.receive_signed_app_witness(report)
-    }) {
+        Ok(report)
+    });
+    let result = match report {
+        Ok(report) => {
+            let runtime = Arc::clone(&runtime);
+            run_hosted_authority_io(move || runtime.receive_signed_app_witness(report)).await
+        }
+        Err(error) => Err(error),
+    };
+    let response = match result {
         Ok(guard) => json_value(crate::access::hosted_control::HostedPublicLaneGuard {
             status: guard.status,
         }),
         Err(error) if !runtime.configured() => ApiResponse::json_error(404, error),
         Err(error) if !runtime.enabled() => ApiResponse::json_error(503, error),
+        Err(error) if error == HOSTED_AUTHORITY_BUSY_ERROR => ApiResponse::json_error(429, error),
         Err(error) if error.contains("no qualifying signed application distribution") => {
             ApiResponse::json_error(503, error)
         }
@@ -440,10 +477,16 @@ pub(crate) async fn handle_hosted_control_ws_ticket(
     cors: crate::gateway_routes::CorsPosture,
 ) {
     let response = match verified {
-        Some(verified) => match runtime.mint_ws_ticket(&verified) {
-            Ok(ticket) => json_value(ticket),
-            Err(error) => ApiResponse::json_error(403, error),
-        },
+        Some(verified) => {
+            let ticket_runtime = Arc::clone(&runtime);
+            match run_hosted_authority_io(move || ticket_runtime.mint_ws_ticket(&verified)).await {
+                Ok(ticket) => json_value(ticket),
+                Err(error) if error == HOSTED_AUTHORITY_BUSY_ERROR => {
+                    ApiResponse::json_error(429, error)
+                }
+                Err(error) => ApiResponse::json_error(403, error),
+            }
+        }
         None => ApiResponse::json_error(401, "a valid hosted request proof is required"),
     };
     write_api_response(stream, response, cors, None).await;
@@ -673,18 +716,20 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn hosted_authority_io_is_offloaded_and_admission_bounded() {
+        static TEST_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
         let runtime_thread = std::thread::current().id();
-        let authority_thread = run_hosted_authority_io(|| Ok(std::thread::current().id()))
-            .await
-            .unwrap();
+        let authority_thread =
+            run_bounded_authority_io(&TEST_WORKERS, || Ok(std::thread::current().id()))
+                .await
+                .unwrap();
         assert_ne!(authority_thread, runtime_thread);
 
-        let permits = (0..HOSTED_AUTHORITY_WORKERS.available_permits())
-            .map(|_| HOSTED_AUTHORITY_WORKERS.try_acquire().unwrap())
+        let permits = (0..TEST_WORKERS.available_permits())
+            .map(|_| TEST_WORKERS.try_acquire().unwrap())
             .collect::<Vec<_>>();
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran_in_work = Arc::clone(&ran);
-        let error = run_hosted_authority_io(move || {
+        let error = run_bounded_authority_io(&TEST_WORKERS, move || {
             ran_in_work.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         })
@@ -693,6 +738,48 @@ mod tests {
         assert_eq!(error, HOSTED_AUTHORITY_BUSY_ERROR);
         assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
         drop(permits);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn held_authority_lock_does_not_stall_the_async_runtime() {
+        static TEST_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        let dir = tempfile::tempdir().unwrap();
+        let cert_dir = dir.path().to_path_buf();
+        let lock_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lock_held_in_worker = Arc::clone(&lock_held);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_dir = cert_dir.clone();
+        let first = tokio::spawn(run_bounded_authority_io(&TEST_WORKERS, move || {
+            crate::access::authority_store::with_lock(&first_dir, || {
+                lock_held_in_worker.store(true, std::sync::atomic::Ordering::SeqCst);
+                release_rx
+                    .recv()
+                    .map_err(|error| crate::access::AccessError(error.to_string()))?;
+                Ok(())
+            })
+            .map_err(|error| error.to_string())
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !lock_held.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let second = tokio::spawn(run_bounded_authority_io(&TEST_WORKERS, move || {
+            crate::access::authority_store::with_lock(&cert_dir, || Ok(()))
+                .map_err(|error| error.to_string())
+        }));
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            tokio::time::sleep(std::time::Duration::from_millis(10)),
+        )
+        .await
+        .expect("a held durable lock must not block the current-thread runtime");
+        release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
     }
 
     #[test]

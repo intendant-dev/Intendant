@@ -570,85 +570,119 @@ impl HostedControlRuntime {
                     "approved TTL may not exceed the request or daemon limit".to_string(),
                 ));
             }
-            let stable = stable_id_digest(&format!(
-                "{}\n{}",
-                request.request_id, request.browser_key_fingerprint
-            ));
-            let lease_id = format!("lease:{stable}");
-            let principal_id = format!("principal:hosted-lease:{stable}");
-            let grant_id = format!("grant:hosted-lease:{stable}");
-            let expires = now.saturating_add(ttl.saturating_mul(1000));
-            let principal = IamPrincipal {
-                id: principal_id.clone(),
-                kind: HOSTED_PRINCIPAL_KIND.to_string(),
-                label: format!("Hosted lease {}", &stable[..12]),
-                status: "active".to_string(),
-                source: HOSTED_SOURCE.to_string(),
-                account: None,
-                organization: None,
-                authn: vec![json!({
-                    "kind": HOSTED_AUTHN_KIND,
-                    "fingerprint": request.browser_key_fingerprint,
-                    "public_key": request.browser_public_key,
-                })],
-                notes: None,
-                created_at_unix_ms: Some(now),
-            };
-            let grant = IamGrant {
-                id: grant_id.clone(),
-                principal_id: principal_id.clone(),
-                target_id: "daemon:self".to_string(),
-                role_id: preset.role_id().to_string(),
-                policy_id: "policy:hosted-control-compiled".to_string(),
-                status: "active".to_string(),
-                source: HOSTED_SOURCE.to_string(),
-                reason: "daemon-local hosted lease approval".to_string(),
-                created_at_unix_ms: Some(now),
-                revoked_at_unix_ms: None,
-                expires_at_unix_ms: Some(expires),
-                issued_via: None,
-                fs_scope: None,
-            };
-            let mut document = HostedLeaseDocument {
-                protocol: LEASE_PROTOCOL.to_string(),
-                lease_id: lease_id.clone(),
-                request_id: request.request_id.clone(),
-                daemon_id: self.daemon_id.clone(),
-                daemon_public_key: identity.public_key_b64u(),
-                fleet_origin: request.fleet_origin.clone(),
-                browser_public_key: request.browser_public_key.clone(),
-                browser_key_fingerprint: request.browser_key_fingerprint.clone(),
+            let document = issue_lease_record(
+                state,
+                &request,
                 preset,
-                issued_unix_ms: now,
-                expires_unix_ms: expires,
-                principal_id: principal_id.clone(),
-                grant_id: grant_id.clone(),
-                document_sha256: String::new(),
-                signature: String::new(),
-            };
-            document.document_sha256 = document.expected_document_sha256();
-            document.signature = identity.sign_b64u(document.signing_payload().as_bytes());
-            state.principals.push(principal);
-            state.grants.push(grant);
-            state.hosted_control.leases.push(HostedLeaseRecord {
-                document: document.clone(),
-                status: HostedLeaseStatus::Active,
-                revoked_at_unix_ms: None,
-                revoked_by: None,
-            });
+                ttl,
+                actor,
+                identity,
+                &self.daemon_id,
+            )?;
             state.hosted_control.requests[request_index].status =
                 HostedLeaseRequestStatus::Approved;
-            state.hosted_control.requests[request_index].approved_lease_id = Some(lease_id.clone());
-            push_audit(
-                state,
-                &actor.id,
-                "hosted_lease_issue",
-                &lease_id,
-                format!("Issued {} lease for {} seconds", preset.as_str(), ttl),
-            );
+            state.hosted_control.requests[request_index].approved_lease_id =
+                Some(document.lease_id.clone());
             Ok((Some(document), true))
         })
         .map_err(|error| format!("decide hosted lease request: {error}"))
+    }
+
+    /// Issue a lease after a successful custom-domain passkey ceremony.
+    ///
+    /// This path validates the browser-key proof and the exact same daemon
+    /// ceiling/TTL/guard invariants as a doorbell approval, but deliberately
+    /// does not consume anonymous doorbell rate or pending-request capacity.
+    pub(crate) fn issue_passkey_lease(
+        &self,
+        mut input: HostedLeaseRequestInput,
+        fleet_origin: &str,
+        actor: &AccessPrincipal,
+    ) -> Result<HostedLeaseDocument, String> {
+        self.ensure_enabled()?;
+        self.ensure_lane_available()?;
+        let identity = self.identity()?;
+        let fleet_origin = validate_fleet_origin(fleet_origin)?;
+        let (public_key, fingerprint) = validate_browser_public_key(&input.browser_public_key)?;
+        let label = input.requester_label.trim().to_string();
+        if label.is_empty() || label.len() > 96 || label.chars().any(char::is_control) {
+            return Err("requester_label must contain 1 to 96 printable characters".to_string());
+        }
+        if !valid_id_component(&input.nonce) {
+            return Err("doorbell proof nonce is invalid".to_string());
+        }
+        verify_timestamp(input.timestamp_unix_ms)?;
+        if !(MIN_LEASE_TTL_SECS..=HARD_MAX_LEASE_TTL_SECS).contains(&input.requested_ttl_secs) {
+            return Err(format!(
+                "requested_ttl_secs must be between {MIN_LEASE_TTL_SECS} and {HARD_MAX_LEASE_TTL_SECS}"
+            ));
+        }
+        input.browser_public_key = public_key.clone();
+        input.requester_label = label.clone();
+        verify_p256_signature(
+            &public_key,
+            input
+                .proof_payload(&self.daemon_id, &fleet_origin)
+                .as_bytes(),
+            &input.signature,
+        )?;
+        self.record_nonce(
+            &format!("passkey:{}:{fingerprint}", actor.id),
+            &input.nonce,
+            input.timestamp_unix_ms,
+        )?;
+        let now = now_ms().max(0) as u64;
+        let mut request = HostedLeaseRequest {
+            protocol: DOORBELL_PROTOCOL.to_string(),
+            request_id: format!("passkey-request:{}", uuid::Uuid::new_v4().simple()),
+            request_nonce: random_b64u(32)?,
+            browser_public_key: public_key,
+            browser_key_fingerprint: fingerprint,
+            requested_preset: input.requested_preset,
+            requested_ttl_secs: input.requested_ttl_secs,
+            requester_label: label,
+            fleet_origin,
+            daemon_id: self.daemon_id.clone(),
+            daemon_label: self.daemon_label.clone(),
+            daemon_public_key: identity.public_key_b64u(),
+            created_unix_ms: now,
+            expires_unix_ms: now.saturating_add(PENDING_REQUEST_TTL_MS),
+            status: HostedLeaseRequestStatus::Pending,
+            approved_lease_id: None,
+            doorbell_signature: String::new(),
+        };
+        request.doorbell_signature = identity.sign_b64u(request.signing_payload().as_bytes());
+        iam::transact_state(&self.cert_dir, |state, _| {
+            if compute_current_lane_guard(state).status == HostedLaneGuardStatus::Suspended {
+                return Err(AccessError(
+                    "hosted control is suspended by the certificate guard".to_string(),
+                ));
+            }
+            if request.requested_preset > state.hosted_control.policy.ceiling {
+                return Err(AccessError(
+                    "requested preset exceeds the daemon ceiling".to_string(),
+                ));
+            }
+            if !(MIN_LEASE_TTL_SECS..=state.hosted_control.policy.max_ttl_secs)
+                .contains(&request.requested_ttl_secs)
+            {
+                return Err(AccessError(format!(
+                    "requested_ttl_secs must be between {MIN_LEASE_TTL_SECS} and {}",
+                    state.hosted_control.policy.max_ttl_secs
+                )));
+            }
+            let document = issue_lease_record(
+                state,
+                &request,
+                request.requested_preset,
+                request.requested_ttl_secs,
+                actor,
+                identity,
+                &self.daemon_id,
+            )?;
+            Ok((document, true))
+        })
+        .map_err(|error| format!("issue passkey-authorized hosted lease: {error}"))
     }
 
     pub fn verify_request_proof(
@@ -1221,6 +1255,93 @@ impl HostedControlRuntime {
             Ok(())
         })
     }
+}
+
+fn issue_lease_record(
+    state: &mut LocalIamState,
+    request: &HostedLeaseRequest,
+    preset: HostedPreset,
+    ttl_secs: u64,
+    actor: &AccessPrincipal,
+    identity: &DaemonIdentity,
+    daemon_id: &str,
+) -> AccessResult<HostedLeaseDocument> {
+    let now = now_ms().max(0) as u64;
+    let stable = stable_id_digest(&format!(
+        "{}\n{}",
+        request.request_id, request.browser_key_fingerprint
+    ));
+    let lease_id = format!("lease:{stable}");
+    let principal_id = format!("principal:hosted-lease:{stable}");
+    let grant_id = format!("grant:hosted-lease:{stable}");
+    let expires = now.saturating_add(ttl_secs.saturating_mul(1000));
+    let principal = IamPrincipal {
+        id: principal_id.clone(),
+        kind: HOSTED_PRINCIPAL_KIND.to_string(),
+        label: format!("Hosted lease {}", &stable[..12]),
+        status: "active".to_string(),
+        source: HOSTED_SOURCE.to_string(),
+        account: None,
+        organization: None,
+        authn: vec![json!({
+            "kind": HOSTED_AUTHN_KIND,
+            "fingerprint": request.browser_key_fingerprint,
+            "public_key": request.browser_public_key,
+        })],
+        notes: None,
+        created_at_unix_ms: Some(now),
+    };
+    let grant = IamGrant {
+        id: grant_id.clone(),
+        principal_id: principal_id.clone(),
+        target_id: "daemon:self".to_string(),
+        role_id: preset.role_id().to_string(),
+        policy_id: "policy:hosted-control-compiled".to_string(),
+        status: "active".to_string(),
+        source: HOSTED_SOURCE.to_string(),
+        reason: "daemon-local hosted lease approval".to_string(),
+        created_at_unix_ms: Some(now),
+        revoked_at_unix_ms: None,
+        expires_at_unix_ms: Some(expires),
+        issued_via: None,
+        fs_scope: None,
+    };
+    let mut document = HostedLeaseDocument {
+        protocol: LEASE_PROTOCOL.to_string(),
+        lease_id: lease_id.clone(),
+        request_id: request.request_id.clone(),
+        daemon_id: daemon_id.to_string(),
+        daemon_public_key: identity.public_key_b64u(),
+        fleet_origin: request.fleet_origin.clone(),
+        browser_public_key: request.browser_public_key.clone(),
+        browser_key_fingerprint: request.browser_key_fingerprint.clone(),
+        preset,
+        issued_unix_ms: now,
+        expires_unix_ms: expires,
+        principal_id: principal_id.clone(),
+        grant_id: grant_id.clone(),
+        document_sha256: String::new(),
+        signature: String::new(),
+    };
+    document.document_sha256 = document.expected_document_sha256();
+    document.signature = identity.sign_b64u(document.signing_payload().as_bytes());
+    state.principals.push(principal);
+    state.grants.push(grant);
+    state.hosted_control.leases.push(HostedLeaseRecord {
+        document: document.clone(),
+        status: HostedLeaseStatus::Active,
+        revoked_at_unix_ms: None,
+        revoked_by: None,
+    });
+    state.hosted_control.normalize();
+    push_audit(
+        state,
+        &actor.id,
+        "hosted_lease_issue",
+        &lease_id,
+        format!("Issued {} lease for {} seconds", preset.as_str(), ttl_secs),
+    );
+    Ok(document)
 }
 
 fn record_nonce_in(
@@ -1985,6 +2106,69 @@ mod tests {
             shared_transient(&runtime).public_replay.is_empty(),
             "rate-limited doorbells must not consume the shared proof nonce window"
         );
+    }
+
+    #[test]
+    fn passkey_authorized_issuance_ignores_anonymous_queue_and_rate_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let seed_key = browser_key();
+        let seed = runtime
+            .create_request(
+                doorbell_input(&seed_key, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+        iam::transact_state(&runtime.cert_dir, |state, _| {
+            state.hosted_control.requests = (0..HOSTED_REQUESTS_CAP)
+                .map(|index| {
+                    let mut request = seed.clone();
+                    request.request_id = format!("request:anonymous-capacity-{index}");
+                    request.request_nonce = format!("pending-{index}");
+                    request.created_unix_ms = now_ms().max(0) as u64;
+                    request.expires_unix_ms = request
+                        .created_unix_ms
+                        .saturating_add(PENDING_REQUEST_TTL_MS);
+                    request.status = HostedLeaseRequestStatus::Pending;
+                    request.approved_lease_id = None;
+                    request.doorbell_signature = runtime
+                        .identity()
+                        .unwrap()
+                        .sign_b64u(request.signing_payload().as_bytes());
+                    request
+                })
+                .collect();
+            Ok(((), true))
+        })
+        .unwrap();
+        replace_shared_transient(&runtime, |state| {
+            state.doorbell_rate.global =
+                std::iter::repeat_n(now_ms(), DOORBELL_GLOBAL_PER_MINUTE).collect();
+            state.doorbell_rate.by_key.clear();
+            state.doorbell_rate.by_source.clear();
+        });
+
+        let passkey_browser = browser_key();
+        let lease = runtime
+            .issue_passkey_lease(
+                doorbell_input(&passkey_browser, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                &owner(),
+            )
+            .unwrap();
+        assert_eq!(lease.preset, HostedPreset::Tasks);
+        let state = iam::load_state_cached_arc(&runtime.cert_dir).unwrap();
+        assert_eq!(
+            state.hosted_control.requests.len(),
+            HOSTED_REQUESTS_CAP,
+            "passkey issuance must not enqueue an anonymous request"
+        );
+        assert!(state
+            .hosted_control
+            .leases
+            .iter()
+            .any(|record| record.document.lease_id == lease.lease_id));
     }
 
     #[test]

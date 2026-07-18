@@ -60,6 +60,12 @@ A present fleet-DNS observation is accepted only when both fields form the
 same canonical `d-<20hex>.<zone>` pair; an empty, noncanonical, or mismatched
 pair leaves the gate closed and writes no provenance. An absent fleet-DNS hint
 is the complete observation that the current service has no delegated zone.
+The historical exact-name and zone sets, their serialized file, and the
+process cache are all bounded. Invalid or excess history sets a durable
+incomplete marker and closes the owner-name lane; a new Connect observation
+cannot grow the live TLS classifier past the same exact-name cap. Repeated
+route checks reuse only a cache entry whose cross-platform file identity and
+change stamp still match the authority record.
 
 ## Pin certificate issuance
 
@@ -89,8 +95,14 @@ client. The DNS credential can add and remove only the exact `_acme-challenge`
 TXT value for the order. Before changing DNS, the daemon durably journals the
 provider, exact name, and exact value without storing the provider secret.
 Cleanup removes that journal only after the provider confirms the exact record
-is gone. The journal carries creation, active-validation, and cleanup phases
-with bounded owner leases. A sibling process therefore leaves a live challenge
+is gone. Before the provider call begins, the daemon also reserves the exact
+name, value, and provider in a bounded secondary cleanup journal. Provider
+completion first makes that reservation cleanup-capable, then commits the
+primary phase, and retires the reservation last. A crashed creator therefore
+leaves either a completed cleanup entry or a stale creation reservation that
+becomes an idempotent exact cleanup after its lease plus grace period. The
+primary journal carries creation, active-validation, and cleanup phases with
+bounded owner leases. A sibling process therefore leaves a live challenge
 alone; only an explicit handoff to cleanup or an expired lease plus grace
 period makes it reclaimable. Startup and every later certificate pass retry a
 reclaimable journal before creating another challenge, covering crashes,
@@ -98,16 +110,13 @@ cancellation, and transient provider failures. Store the credential as a
 daemon credential lease where possible; configuration names an
 environment-variable fallback but never embeds the secret. While a cleanup
 journal is being reaped, its mutation-completion generation is compared again
-before removal. A provider mutation that returns after its creator lost the
-lease re-creates the exact cleanup obligation (including the provider record
-id when available); if a newer challenge already owns the primary journal, a
-bounded secondary backlog retains the older exact cleanup independently and
-blocks further challenge creation until it is drained. A
-late TXT write therefore cannot land after the last durable cleanup record
-disappeared. While a cleanup
-journal exists, its fallback name remains in the supervised-child environment
-scrub even if the lane is disabled or later names a different fallback. An
-unreadable journal makes that scrub conservatively remove all DNS-shaped
+before removal. If a newer challenge already owns the primary journal, the
+secondary reservation retains the older exact cleanup independently and
+blocks further challenge creation until it is drained. A late TXT write
+therefore cannot land after the last durable cleanup record disappeared. While
+a cleanup journal exists, its fallback name remains in the supervised-child
+environment scrub even if the lane is disabled or later names a different
+fallback. An unreadable journal makes that scrub conservatively remove all DNS-shaped
 credential names until the journal is repaired or retired. Every supervised
 coding-agent spawn reloads the shared journal immediately before constructing
 the child environment and holds the shared authority lock until the operating
@@ -190,10 +199,16 @@ connection source address so unrelated relay clients do not share one
 admission window. That bucket is an availability hint only: it is not an
 identity, credential, or authorization input. The empty passkey store,
 including its stable WebAuthn user id, is created atomically under that lock
-before any ceremony is exposed. Passkey records and counters stay in the same
+before any ceremony is exposed. Each exact custom name and `rp_id` has its own
+derived store generation; changing the configured identity starts an empty
+generation without deleting the old one, and returning to the former identity
+reopens only its matching credentials. A legacy singleton store migrates only
+when both fields match. Passkey records and counters stay in the same
 owner-only authority store. Authentication finish rechecks the current fleet
 zone and durable name provenance inside that same authority transaction before
-it updates a counter or issues a lease.
+it updates a counter or issues a lease. Its proved issuance does not enter or
+consume the anonymous doorbell queue and rate windows; passkey ceremony
+admission retains its independent per-source and global bounds.
 
 Opening `https://box.example.com/` creates a non-extractable tab key. A
 successful user-verifying passkey assertion approves only the signed request

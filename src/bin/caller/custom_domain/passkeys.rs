@@ -11,15 +11,17 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::access::hosted_control::{
-    HostedControlRuntime, HostedLeaseDecisionInput, HostedLeaseDocument, HostedLeaseRequestInput,
+    HostedControlRuntime, HostedLeaseDocument, HostedLeaseRequestInput,
 };
 use crate::access::iam::AccessPrincipal;
 use crate::project::ValidatedCustomDomain;
 
-const STORE_FILE: &str = "custom-domain-passkeys.json";
+const LEGACY_STORE_FILE: &str = "custom-domain-passkeys.json";
+const STORE_FILE_PREFIX: &str = "custom-domain-passkeys";
 const STORE_SCHEMA_VERSION: u32 = 1;
 const STORE_MAX_BYTES: u64 = 1024 * 1024;
-const CEREMONY_STORE_FILE: &str = "custom-domain-passkey-ceremonies.json";
+const LEGACY_CEREMONY_STORE_FILE: &str = "custom-domain-passkey-ceremonies.json";
+const CEREMONY_STORE_FILE_PREFIX: &str = "custom-domain-passkey-ceremonies";
 const CEREMONY_STORE_SCHEMA_VERSION: u32 = 1;
 const CEREMONY_STORE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const FLOW_TTL_MS: u64 = 5 * 60 * 1000;
@@ -187,20 +189,23 @@ impl PasskeyRuntime {
         hosted: Arc<HostedControlRuntime>,
     ) -> Result<Self, String> {
         crate::access::authority_store::with_lock(&cert_dir, || {
-            let store_missing = match std::fs::metadata(store_path(&cert_dir)) {
+            let store_missing = match std::fs::metadata(store_path(&cert_dir, &domain)) {
                 Ok(_) => false,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                 Err(error) => {
                     return Err(crate::access::AccessError(format!(
                         "inspect {}: {error}",
-                        store_path(&cert_dir).display()
+                        store_path(&cert_dir, &domain).display()
                     )));
                 }
             };
-            let store = load_store(&cert_dir, &domain).map_err(crate::access::AccessError)?;
+            let store = load_or_migrate_store_locked(&cert_dir, &domain)
+                .map_err(crate::access::AccessError)?;
             if store_missing {
                 save_store_locked(&cert_dir, &store)?;
             }
+            migrate_legacy_ceremony_store_locked(&cert_dir, &domain)
+                .map_err(crate::access::AccessError)?;
             load_ceremony_store_locked(&cert_dir, &domain).map_err(crate::access::AccessError)?;
             Ok(store)
         })
@@ -533,24 +538,10 @@ impl PasskeyRuntime {
                 Ok(((), true))
             })?;
 
-            let request = self.hosted.create_request(
-                pending.input,
-                origin,
-                pending.source_bucket.as_deref(),
-            )?;
             let actor = passkey_actor(&credential_id);
             let lease = self
                 .hosted
-                .decide_request(
-                    HostedLeaseDecisionInput {
-                        request_id: request.request_id,
-                        approve: true,
-                        approved_preset: Some(request.requested_preset),
-                        approved_ttl_secs: Some(request.requested_ttl_secs),
-                    },
-                    &actor,
-                )?
-                .ok_or_else(|| "passkey-approved lease was not issued".to_string())?;
+                .issue_passkey_lease(pending.input, origin, &actor)?;
             Ok(PasskeyLeaseResult { ok: true, lease })
         })
     }
@@ -724,12 +715,43 @@ fn now_unix_ms() -> u64 {
     crate::access::client_key::now_unix_ms().max(0) as u64
 }
 
-fn store_path(cert_dir: &Path) -> PathBuf {
-    cert_dir.join(STORE_FILE)
+fn store_generation(name: &str, rp_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"intendant-custom-domain-passkey-generation-v1\n");
+    hasher.update(name.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(rp_id.as_bytes());
+    crate::daemon_identity::b64u(&hasher.finalize())
 }
 
-fn ceremony_store_path(cert_dir: &Path) -> PathBuf {
-    cert_dir.join(CEREMONY_STORE_FILE)
+fn store_path_for_identity(cert_dir: &Path, name: &str, rp_id: &str) -> PathBuf {
+    cert_dir.join(format!(
+        "{STORE_FILE_PREFIX}-{}.json",
+        store_generation(name, rp_id)
+    ))
+}
+
+fn store_path(cert_dir: &Path, domain: &ValidatedCustomDomain) -> PathBuf {
+    store_path_for_identity(cert_dir, &domain.name, &domain.rp_id)
+}
+
+fn legacy_store_path(cert_dir: &Path) -> PathBuf {
+    cert_dir.join(LEGACY_STORE_FILE)
+}
+
+fn ceremony_store_path_for_identity(cert_dir: &Path, name: &str, rp_id: &str) -> PathBuf {
+    cert_dir.join(format!(
+        "{CEREMONY_STORE_FILE_PREFIX}-{}.json",
+        store_generation(name, rp_id)
+    ))
+}
+
+fn ceremony_store_path(cert_dir: &Path, domain: &ValidatedCustomDomain) -> PathBuf {
+    ceremony_store_path_for_identity(cert_dir, &domain.name, &domain.rp_id)
+}
+
+fn legacy_ceremony_store_path(cert_dir: &Path) -> PathBuf {
+    cert_dir.join(LEGACY_CEREMONY_STORE_FILE)
 }
 
 fn empty_ceremony_store(domain: &ValidatedCustomDomain) -> CeremonyStore {
@@ -777,8 +799,15 @@ fn load_ceremony_store_locked(
     cert_dir: &Path,
     domain: &ValidatedCustomDomain,
 ) -> Result<CeremonyStore, String> {
-    let path = ceremony_store_path(cert_dir);
-    let metadata = match std::fs::metadata(&path) {
+    let path = ceremony_store_path(cert_dir, domain);
+    load_ceremony_store_from_path(&path, domain)
+}
+
+fn load_ceremony_store_from_path(
+    path: &Path,
+    domain: &ValidatedCustomDomain,
+) -> Result<CeremonyStore, String> {
+    let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(empty_ceremony_store(domain));
@@ -791,8 +820,7 @@ fn load_ceremony_store_locked(
             path.display()
         ));
     }
-    let bytes =
-        std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     let store: CeremonyStore = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse {}: {error}", path.display()))?;
     if store.schema_version != CEREMONY_STORE_SCHEMA_VERSION {
@@ -840,6 +868,40 @@ fn load_ceremony_store_locked(
     Ok(store)
 }
 
+fn migrate_legacy_ceremony_store_locked(
+    cert_dir: &Path,
+    domain: &ValidatedCustomDomain,
+) -> Result<(), String> {
+    let generation_path = ceremony_store_path(cert_dir, domain);
+    if generation_path.exists() {
+        return Ok(());
+    }
+    let legacy_path = legacy_ceremony_store_path(cert_dir);
+    if !legacy_path.exists() {
+        return Ok(());
+    }
+    let legacy: CeremonyStore = {
+        let metadata = std::fs::metadata(&legacy_path)
+            .map_err(|error| format!("inspect {}: {error}", legacy_path.display()))?;
+        if metadata.len() > CEREMONY_STORE_MAX_BYTES {
+            return Err(format!(
+                "{} exceeds the passkey-ceremony store size cap",
+                legacy_path.display()
+            ));
+        }
+        let bytes = std::fs::read(&legacy_path)
+            .map_err(|error| format!("read {}: {error}", legacy_path.display()))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|error| format!("parse {}: {error}", legacy_path.display()))?
+    };
+    if legacy.name != domain.name || legacy.rp_id != domain.rp_id {
+        return Ok(());
+    }
+    // Reuse the complete validator before copying a legacy generation.
+    let validated = load_ceremony_store_from_path(&legacy_path, domain)?;
+    save_ceremony_store_locked(cert_dir, &validated).map_err(|error| error.to_string())
+}
+
 fn serialized_ceremony_store(store: &CeremonyStore) -> Result<Vec<u8>, String> {
     let mut bytes = serde_json::to_vec_pretty(store)
         .map_err(|error| format!("serialize custom-domain passkey ceremonies: {error}"))?;
@@ -856,23 +918,29 @@ fn save_ceremony_store_locked(
 ) -> crate::access::AccessResult<()> {
     let bytes = serialized_ceremony_store(store).map_err(crate::access::AccessError)?;
     crate::access::authority_store::atomic_write_private_locked(
-        &ceremony_store_path(cert_dir),
+        &ceremony_store_path_for_identity(cert_dir, &store.name, &store.rp_id),
         &bytes,
     )
 }
 
-fn load_store(cert_dir: &Path, domain: &ValidatedCustomDomain) -> Result<PasskeyStore, String> {
-    let path = store_path(cert_dir);
-    let metadata = match std::fs::metadata(&path) {
+fn empty_passkey_store(domain: &ValidatedCustomDomain) -> PasskeyStore {
+    PasskeyStore {
+        schema_version: STORE_SCHEMA_VERSION,
+        name: domain.name.clone(),
+        rp_id: domain.rp_id.clone(),
+        user_id: Uuid::new_v4(),
+        passkeys: Vec::new(),
+    }
+}
+
+fn load_store_from_path(
+    path: &Path,
+    domain: &ValidatedCustomDomain,
+) -> Result<PasskeyStore, String> {
+    let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PasskeyStore {
-                schema_version: STORE_SCHEMA_VERSION,
-                name: domain.name.clone(),
-                rp_id: domain.rp_id.clone(),
-                user_id: Uuid::new_v4(),
-                passkeys: Vec::new(),
-            });
+            return Ok(empty_passkey_store(domain));
         }
         Err(error) => return Err(format!("inspect {}: {error}", path.display())),
     };
@@ -882,8 +950,7 @@ fn load_store(cert_dir: &Path, domain: &ValidatedCustomDomain) -> Result<Passkey
             path.display()
         ));
     }
-    let bytes =
-        std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     let store: PasskeyStore = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse {}: {error}", path.display()))?;
     if store.schema_version != STORE_SCHEMA_VERSION {
@@ -904,19 +971,53 @@ fn load_store(cert_dir: &Path, domain: &ValidatedCustomDomain) -> Result<Passkey
     Ok(store)
 }
 
+fn load_store(cert_dir: &Path, domain: &ValidatedCustomDomain) -> Result<PasskeyStore, String> {
+    load_store_from_path(&store_path(cert_dir, domain), domain)
+}
+
+fn load_or_migrate_store_locked(
+    cert_dir: &Path,
+    domain: &ValidatedCustomDomain,
+) -> Result<PasskeyStore, String> {
+    let generation_path = store_path(cert_dir, domain);
+    if generation_path.exists() {
+        return load_store_from_path(&generation_path, domain);
+    }
+    let legacy_path = legacy_store_path(cert_dir);
+    if !legacy_path.exists() {
+        return Ok(empty_passkey_store(domain));
+    }
+    let metadata = std::fs::metadata(&legacy_path)
+        .map_err(|error| format!("inspect {}: {error}", legacy_path.display()))?;
+    if metadata.len() > STORE_MAX_BYTES {
+        return Err(format!(
+            "{} exceeds the passkey-store size cap",
+            legacy_path.display()
+        ));
+    }
+    let bytes = std::fs::read(&legacy_path)
+        .map_err(|error| format!("read {}: {error}", legacy_path.display()))?;
+    let legacy: PasskeyStore = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", legacy_path.display()))?;
+    if legacy.name != domain.name || legacy.rp_id != domain.rp_id {
+        return Ok(empty_passkey_store(domain));
+    }
+    load_store_from_path(&legacy_path, domain)
+}
+
 fn load_current_store_locked(
     cert_dir: &Path,
     domain: &ValidatedCustomDomain,
 ) -> Result<PasskeyStore, String> {
-    match std::fs::metadata(store_path(cert_dir)) {
+    match std::fs::metadata(store_path(cert_dir, domain)) {
         Ok(_) => load_store(cert_dir, domain),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
             "{} disappeared after passkey initialization",
-            store_path(cert_dir).display()
+            store_path(cert_dir, domain).display()
         )),
         Err(error) => Err(format!(
             "inspect {}: {error}",
-            store_path(cert_dir).display()
+            store_path(cert_dir, domain).display()
         )),
     }
 }
@@ -933,7 +1034,10 @@ fn serialized_store(store: &PasskeyStore) -> Result<Vec<u8>, String> {
 
 fn save_store_locked(cert_dir: &Path, store: &PasskeyStore) -> crate::access::AccessResult<()> {
     let bytes = serialized_store(store).map_err(crate::access::AccessError)?;
-    crate::access::authority_store::atomic_write_private_locked(&store_path(cert_dir), &bytes)
+    crate::access::authority_store::atomic_write_private_locked(
+        &store_path_for_identity(cert_dir, &store.name, &store.rp_id),
+        &bytes,
+    )
 }
 
 #[cfg(test)]
@@ -1060,10 +1164,86 @@ mod tests {
         )
         .unwrap();
         let first_user_id = first.store.lock().unwrap().user_id;
-        assert!(store_path(dir.path()).is_file());
+        assert!(store_path(dir.path(), &domain).is_file());
 
         let second = PasskeyRuntime::new(domain, dir.path().to_path_buf(), hosted).unwrap();
         assert_eq!(second.store.lock().unwrap().user_id, first_user_id);
+    }
+
+    #[test]
+    fn passkey_generations_are_namespaced_by_domain_and_rp_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain_a = domain();
+        let hosted = hosted_runtime(dir.path());
+        let first = PasskeyRuntime::new(
+            domain_a.clone(),
+            dir.path().to_path_buf(),
+            Arc::clone(&hosted),
+        )
+        .unwrap();
+        first
+            .mutate_store(|store| {
+                store.passkeys.push(stored_passkey(7, "Domain A key"));
+                Ok(((), true))
+            })
+            .unwrap();
+        let domain_b = ValidatedCustomDomain {
+            name: "other.example.test".to_string(),
+            rp_id: "other.example.test".to_string(),
+            origin: "https://other.example.test".to_string(),
+        };
+        assert_ne!(
+            store_path(dir.path(), &domain_a),
+            store_path(dir.path(), &domain_b)
+        );
+
+        let second =
+            PasskeyRuntime::new(domain_b, dir.path().to_path_buf(), Arc::clone(&hosted)).unwrap();
+        assert!(second.views().unwrap().is_empty());
+        assert!(!second
+            .revoke(RevokeInput {
+                credential_id: CredentialId(vec![7]).to_b64url(),
+            })
+            .unwrap());
+
+        let restored = PasskeyRuntime::new(domain_a, dir.path().to_path_buf(), hosted).unwrap();
+        assert_eq!(restored.views().unwrap().len(), 1);
+        assert_eq!(restored.views().unwrap()[0].label, "Domain A key");
+    }
+
+    #[test]
+    fn legacy_singleton_migrates_only_to_its_matching_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain_a = domain();
+        let legacy = PasskeyStore {
+            schema_version: STORE_SCHEMA_VERSION,
+            name: domain_a.name.clone(),
+            rp_id: domain_a.rp_id.clone(),
+            user_id: Uuid::new_v4(),
+            passkeys: vec![stored_passkey(9, "Legacy key")],
+        };
+        std::fs::write(
+            legacy_store_path(dir.path()),
+            serialized_store(&legacy).unwrap(),
+        )
+        .unwrap();
+        let hosted = hosted_runtime(dir.path());
+        let migrated = PasskeyRuntime::new(
+            domain_a.clone(),
+            dir.path().to_path_buf(),
+            Arc::clone(&hosted),
+        )
+        .unwrap();
+        assert_eq!(migrated.views().unwrap().len(), 1);
+        assert!(store_path(dir.path(), &domain_a).is_file());
+
+        let domain_b = ValidatedCustomDomain {
+            name: "replacement.example.test".to_string(),
+            rp_id: "replacement.example.test".to_string(),
+            origin: "https://replacement.example.test".to_string(),
+        };
+        let replacement = PasskeyRuntime::new(domain_b, dir.path().to_path_buf(), hosted).unwrap();
+        assert!(replacement.views().unwrap().is_empty());
     }
 
     #[test]
@@ -1309,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn a_store_cannot_be_reused_under_a_different_rp_id() {
+    fn a_store_is_not_reused_under_a_different_rp_id() {
         let dir = tempfile::tempdir().unwrap();
         let store = PasskeyStore {
             schema_version: STORE_SCHEMA_VERSION,
@@ -1319,9 +1499,15 @@ mod tests {
             passkeys: Vec::new(),
         };
         persist_store(dir.path(), &store).unwrap();
-        assert!(load_store(dir.path(), &domain())
-            .unwrap_err()
-            .contains("different custom-domain"));
+        let current = domain();
+        let loaded = load_store(dir.path(), &current).unwrap();
+        assert_eq!(loaded.name, current.name);
+        assert_eq!(loaded.rp_id, current.rp_id);
+        assert!(loaded.passkeys.is_empty());
+        assert_ne!(
+            store_path_for_identity(dir.path(), &store.name, &store.rp_id),
+            store_path(dir.path(), &current)
+        );
     }
 
     #[test]
@@ -1432,6 +1618,7 @@ mod tests {
     fn passkey_store_cap_is_enforced_before_write() {
         let dir = tempfile::tempdir().unwrap();
         let domain = domain();
+        let path = store_path(dir.path(), &domain);
         let error = persist_store(
             dir.path(),
             &PasskeyStore {
@@ -1444,7 +1631,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("size cap"), "{error}");
-        assert!(!store_path(dir.path()).exists());
+        assert!(!path.exists());
     }
 
     #[test]

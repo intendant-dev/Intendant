@@ -493,7 +493,14 @@ mod tests {
         // Seed the durable passkey store as an existing installation.
         let seeded = CustomDomainRuntime::new(&config, dir.path().into(), hosted(), None);
         assert!(seeded.enabled());
-        assert!(dir.path().join("custom-domain-passkeys.json").is_file());
+        assert!(std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .is_some_and(|name| {
+                    name.starts_with("custom-domain-passkeys-") && name.ends_with(".json")
+                })
+        }));
         drop(seeded);
 
         let observed = Arc::new(AtomicBool::new(false));

@@ -68,6 +68,12 @@ loopback last hop carries a process-salted opaque bucket derived from the route
 and the browser connection's source address. The bucket separates anonymous
 admission windows for availability but is never treated as an identity,
 credential, or authority input; the shared global bounds remain the backstop.
+Public request and poll documents cap at 64 KiB and have a 15-second total
+read deadline at that cap. Larger authenticated request classes receive a
+bounded size-derived extension. Durable public hosted-control operations run
+through a fixed-capacity blocking boundary, so authority-store contention
+cannot occupy async gateway workers; excess work receives a retryable HTTP
+429.
 
 ## Trust anchors
 

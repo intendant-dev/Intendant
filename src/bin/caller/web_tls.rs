@@ -16,6 +16,9 @@
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+
+const MAX_REMEMBERED_FLEET_SERVER_NAMES: usize =
+    crate::fleet_cert::FLEET_ORIGIN_PROVENANCE_MAX_NAMES;
 use std::task::{Context, Poll};
 
 use rustls::{RootCertStore, ServerConfig};
@@ -318,16 +321,28 @@ impl FleetSniResolver {
         *self.base.write().expect("tls resolver poisoned") = Some(key);
     }
 
-    fn set_fleet(&self, name: String, key: Arc<rustls::sign::CertifiedKey>) {
-        self.register_fleet_name(&name);
+    fn set_fleet(&self, name: String, key: Arc<rustls::sign::CertifiedKey>) -> Result<(), String> {
+        if !self.register_fleet_name(&name) {
+            return Err(
+                "fleet server-name history is full; refusing an unclassified certificate name"
+                    .to_string(),
+            );
+        }
         *self.fleet.write().expect("tls resolver poisoned") = Some((name, key));
+        Ok(())
     }
 
-    fn register_fleet_name(&self, name: &str) {
-        self.fleet_names
-            .write()
-            .expect("tls resolver poisoned")
-            .insert(name.trim().trim_end_matches('.').to_ascii_lowercase());
+    fn register_fleet_name(&self, name: &str) -> bool {
+        let normalized = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        let mut names = self.fleet_names.write().expect("tls resolver poisoned");
+        if names.contains(&normalized) {
+            return true;
+        }
+        if names.len() >= MAX_REMEMBERED_FLEET_SERVER_NAMES {
+            return false;
+        }
+        names.insert(normalized);
+        true
     }
 
     fn is_fleet_name(&self, name: &str) -> bool {
@@ -410,8 +425,8 @@ pub fn is_fleet_server_name(name: Option<&str>) -> bool {
 /// Remember a rendezvous-assigned fleet route before certificate issuance.
 /// Classification follows service-controlled name provenance, not whichever
 /// certificate happens to be active at the moment.
-pub fn register_fleet_server_name(name: &str) {
-    fleet_sni_resolver().register_fleet_name(name);
+pub fn register_fleet_server_name(name: &str) -> bool {
+    fleet_sni_resolver().register_fleet_name(name)
 }
 
 /// Whether an accepted TLS connection named a configured user-owned origin.
@@ -439,8 +454,7 @@ pub fn install_fleet_certificate(
     fleet_sni_resolver().set_fleet(
         name.trim().trim_end_matches('.').to_ascii_lowercase(),
         certified_key,
-    );
-    Ok(())
+    )
 }
 
 fn checked_fleet_certificate(
@@ -739,6 +753,35 @@ mod tests {
         assert!(is_fleet_server_name(Some(second_name)));
         assert!(is_fleet_server_name(Some("OLD-FLEET-ORIGIN.TEST.")));
         assert!(!is_fleet_server_name(Some("direct-daemon.test")));
+    }
+
+    #[test]
+    fn fleet_origin_classification_history_is_bounded() {
+        let resolver = FleetSniResolver::default();
+        for index in 0..MAX_REMEMBERED_FLEET_SERVER_NAMES {
+            assert!(resolver.register_fleet_name(&format!("d-{index:020x}.fleet.example.test")));
+        }
+        assert_eq!(
+            resolver
+                .fleet_names
+                .read()
+                .expect("tls resolver poisoned")
+                .len(),
+            MAX_REMEMBERED_FLEET_SERVER_NAMES
+        );
+        assert!(!resolver.register_fleet_name("d-ffffffffffffffffffff.overflow.fleet.example.test"));
+        assert_eq!(
+            resolver
+                .fleet_names
+                .read()
+                .expect("tls resolver poisoned")
+                .len(),
+            MAX_REMEMBERED_FLEET_SERVER_NAMES
+        );
+        assert!(
+            resolver.register_fleet_name("D-00000000000000000000.FLEET.EXAMPLE.TEST."),
+            "an already remembered name remains admissible at the cap"
+        );
     }
 
     #[test]

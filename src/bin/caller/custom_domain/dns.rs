@@ -19,7 +19,7 @@ const PENDING_CHALLENGE_FILE: &str = "custom-domain-dns-challenge.json";
 const PENDING_CHALLENGE_SCHEMA_VERSION: u32 = 3;
 const PENDING_CHALLENGE_MAX_BYTES: u64 = 64 * 1024;
 const LATE_MUTATION_FILE: &str = "custom-domain-dns-late-cleanup.json";
-const LATE_MUTATION_SCHEMA_VERSION: u32 = 1;
+const LATE_MUTATION_SCHEMA_VERSION: u32 = 2;
 const LATE_MUTATION_MAX_BYTES: u64 = 256 * 1024;
 const LATE_MUTATION_MAX_ENTRIES: usize = 16;
 const PENDING_CHALLENGE_RETRY_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
@@ -72,6 +72,12 @@ struct PendingChallenge {
 struct LateMutationStore {
     schema_version: u32,
     entries: Vec<PendingChallenge>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_LATE_MUTATION_WRITE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[derive(Clone, Debug)]
@@ -490,15 +496,19 @@ fn load_late_mutation_store_locked(cert_dir: &Path) -> Result<LateMutationStore,
             path.display()
         ));
     }
-    let store: LateMutationStore = serde_json::from_slice(&bytes)
+    let mut store: LateMutationStore = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if store.schema_version == 1 {
+        store.schema_version = LATE_MUTATION_SCHEMA_VERSION;
+    }
     let mut ids = std::collections::HashSet::new();
     if store.schema_version != LATE_MUTATION_SCHEMA_VERSION
         || store.entries.len() > LATE_MUTATION_MAX_ENTRIES
         || store.entries.iter().any(|pending| {
-            pending.phase != PendingChallengePhase::Cleanup
-                || !pending.mutation_complete
-                || !pending_challenge_is_valid(pending, false)
+            !matches!(
+                (pending.phase, pending.mutation_complete),
+                (PendingChallengePhase::Creating, false) | (PendingChallengePhase::Cleanup, true)
+            ) || !pending_challenge_is_valid(pending, false)
                 || !ids.insert(pending.id.clone())
         })
     {
@@ -521,6 +531,12 @@ fn write_late_mutation_store_locked(
     cert_dir: &Path,
     store: &LateMutationStore,
 ) -> crate::access::AccessResult<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_LATE_MUTATION_WRITE.with(|fail| fail.replace(false)) {
+        return Err(crate::access::AccessError(
+            "injected late DNS cleanup write failure".to_string(),
+        ));
+    }
     if store.entries.is_empty() {
         return crate::access::authority_store::remove_file_locked(&late_mutation_path(cert_dir));
     }
@@ -539,30 +555,28 @@ fn write_late_mutation_store_locked(
     )
 }
 
-fn append_late_mutation_locked(
+fn reserve_late_mutation_locked(
     cert_dir: &Path,
-    mut pending: PendingChallenge,
+    pending: PendingChallenge,
 ) -> crate::access::AccessResult<()> {
     let mut store =
         load_late_mutation_store_locked(cert_dir).map_err(crate::access::AccessError)?;
-    pending.phase = PendingChallengePhase::Cleanup;
-    pending.owner_token = None;
-    pending.lease_expires_unix_ms = 0;
-    pending.mutation_complete = true;
-    if let Some(existing) = store
-        .entries
-        .iter_mut()
-        .find(|existing| existing.id == pending.id)
-    {
-        *existing = pending;
-    } else {
-        if store.entries.len() >= LATE_MUTATION_MAX_ENTRIES {
-            return Err(crate::access::AccessError(
-                "late DNS cleanup backlog is full".to_string(),
-            ));
-        }
-        store.entries.push(pending);
+    if pending.phase != PendingChallengePhase::Creating || pending.mutation_complete {
+        return Err(crate::access::AccessError(
+            "late DNS cleanup reservation is invalid".to_string(),
+        ));
     }
+    if store.entries.iter().any(|entry| entry.id == pending.id) {
+        return Err(crate::access::AccessError(
+            "late DNS cleanup reservation already exists".to_string(),
+        ));
+    }
+    if store.entries.len() >= LATE_MUTATION_MAX_ENTRIES {
+        return Err(crate::access::AccessError(
+            "late DNS cleanup backlog is full".to_string(),
+        ));
+    }
+    store.entries.push(pending);
     write_late_mutation_store_locked(cert_dir, &store)
 }
 
@@ -678,7 +692,7 @@ fn write_pending_challenge_locked(
 }
 
 fn begin_pending_challenge(cert_dir: &Path, pending: &PendingChallenge) -> Result<(), String> {
-    crate::access::authority_store::with_lock(cert_dir, || {
+    let result = crate::access::authority_store::with_lock(cert_dir, || {
         if load_pending_challenge_locked(cert_dir)
             .map_err(crate::access::AccessError)?
             .is_some()
@@ -692,10 +706,16 @@ fn begin_pending_challenge(cert_dir: &Path, pending: &PendingChallenge) -> Resul
                     .to_string(),
             ));
         }
+        // Reserve a durable exact-cleanup slot before the provider call. If
+        // the primary creation lease is reaped or replaced while that call is
+        // in flight, this reservation remains sufficient to find/delete the
+        // exact name+value after restart.
+        reserve_late_mutation_locked(cert_dir, pending.clone())?;
         write_pending_challenge_locked(cert_dir, pending)
-    })
-    .map_err(|error| error.to_string())?;
-    refresh_pending_credential_child_scrub(cert_dir)
+    });
+    let refresh = refresh_pending_credential_child_scrub(cert_dir);
+    result.map_err(|error| error.to_string())?;
+    refresh
 }
 
 fn require_challenge_owner(
@@ -740,23 +760,53 @@ fn record_challenge_mutation_complete_with_mode(
         return Err("Cloudflare DNS create returned an invalid record id".to_string());
     }
     let result = crate::access::authority_store::with_lock(cert_dir, || {
+        let mut late_store =
+            load_late_mutation_store_locked(cert_dir).map_err(crate::access::AccessError)?;
+        let reservation = late_store
+            .entries
+            .iter_mut()
+            .find(|pending| pending.id == lease.id)
+            .ok_or_else(|| {
+                crate::access::AccessError(
+                    "late DNS cleanup reservation disappeared before provider completion"
+                        .to_string(),
+                )
+            })?;
+        let reserved_provider = serde_json::to_vec(&reservation.provider).map_err(|error| {
+            crate::access::AccessError(format!(
+                "serialize reserved DNS provider configuration: {error}"
+            ))
+        })?;
+        let template_provider = serde_json::to_vec(&template.provider).map_err(|error| {
+            crate::access::AccessError(format!(
+                "serialize completed DNS provider configuration: {error}"
+            ))
+        })?;
+        if reservation.domain != template.domain
+            || reservation.record_name != template.record_name
+            || reservation.value != template.value
+            || reserved_provider != template_provider
+        {
+            return Err(crate::access::AccessError(
+                "late DNS cleanup reservation changed before provider completion".to_string(),
+            ));
+        }
+        reservation.cloudflare_record_id = record_id.clone();
+        reservation.phase = PendingChallengePhase::Cleanup;
+        reservation.owner_token = None;
+        reservation.lease_expires_unix_ms = 0;
+        reservation.mutation_complete = true;
+        // Persist the cleanup-capable state before consulting the replaceable
+        // primary journal. A failed write leaves the pre-call Creating
+        // reservation intact, which stale recovery also treats as an exact
+        // cleanup obligation.
+        write_late_mutation_store_locked(cert_dir, &late_store)?;
+
         let current =
             load_pending_challenge_locked(cert_dir).map_err(crate::access::AccessError)?;
         let mut pending = match current {
             Some(pending) if pending.id == lease.id => pending,
-            Some(_) => {
-                let mut late = template.clone();
-                late.cloudflare_record_id = record_id;
-                append_late_mutation_locked(cert_dir, late)?;
-                return Ok(ChallengeMutationCompletion::CleanupRequired);
-            }
-            None => {
-                let mut pending = template.clone();
-                pending.phase = PendingChallengePhase::Cleanup;
-                pending.owner_token = None;
-                pending.lease_expires_unix_ms = 0;
-                pending
-            }
+            Some(_) | None => return Ok(ChallengeMutationCompletion::CleanupRequired),
         };
         let owner_is_current = require_challenge_owner(&pending, lease).is_ok()
             && pending.phase == PendingChallengePhase::Creating
@@ -780,6 +830,13 @@ fn record_challenge_mutation_complete_with_mode(
             ChallengeMutationCompletion::CleanupRequired
         };
         write_pending_challenge_locked(cert_dir, &pending)?;
+        // The primary journal now carries the full obligation. Retire the
+        // reservation last; if this write fails, duplicate durable cleanup is
+        // safe and the caller does not proceed as though creation succeeded.
+        late_store
+            .entries
+            .retain(|reservation| reservation.id != lease.id);
+        write_late_mutation_store_locked(cert_dir, &late_store)?;
         Ok(completion)
     })
     .map_err(|error| error.to_string())?;
@@ -795,14 +852,25 @@ fn claim_late_mutation_cleanup(
             load_late_mutation_store_locked(cert_dir).map_err(crate::access::AccessError)?;
         let now = now_unix_ms();
         let Some(pending) = store.entries.iter_mut().find(|pending| {
-            pending.owner_token.is_none()
-                || now
-                    > pending
-                        .lease_expires_unix_ms
-                        .saturating_add(PENDING_CHALLENGE_STALE_GRACE_MS)
+            let stale = now
+                > pending
+                    .lease_expires_unix_ms
+                    .saturating_add(PENDING_CHALLENGE_STALE_GRACE_MS);
+            match pending.phase {
+                PendingChallengePhase::Creating => stale,
+                PendingChallengePhase::Cleanup => pending.owner_token.is_none() || stale,
+                PendingChallengePhase::Active => false,
+            }
         }) else {
             return Ok(None);
         };
+        if pending.phase == PendingChallengePhase::Creating {
+            // A process ended while the provider effect was ambiguous. The
+            // pre-call reservation already binds the exact name/value, so it
+            // now becomes an ordinary idempotent cleanup entry.
+            pending.phase = PendingChallengePhase::Cleanup;
+            pending.mutation_complete = true;
+        }
         let cleanup_token = uuid::Uuid::new_v4().simple().to_string();
         pending.owner_token = Some(cleanup_token.clone());
         pending.lease_expires_unix_ms = now.saturating_add(PENDING_CHALLENGE_CLEANUP_LEASE_MS);
@@ -1548,7 +1616,10 @@ mod tests {
             .unwrap(),
             ChallengeMutationCompletion::CleanupRequired
         );
-        let restored = load_pending_challenge(dir.path()).unwrap().unwrap();
+        assert!(load_pending_challenge(dir.path()).unwrap().is_none());
+        let backlog = load_late_mutation_store(dir.path()).unwrap();
+        assert_eq!(backlog.entries.len(), 1);
+        let restored = &backlog.entries[0];
         assert_eq!(restored.phase, PendingChallengePhase::Cleanup);
         assert!(restored.mutation_complete);
         assert_eq!(
@@ -1596,7 +1667,12 @@ mod tests {
         replacement.owner_token = Some("ffffffffffffffffffffffffffffffff".to_string());
         replacement.lease_expires_unix_ms =
             now_unix_ms().saturating_add(PENDING_CHALLENGE_CREATE_LEASE_MS);
-        begin_pending_challenge(dir.path(), &replacement).unwrap();
+        // Simulate a newer primary written by a pre-reservation generation.
+        // New code blocks this state until the durable reservation is retired.
+        crate::access::authority_store::with_lock(dir.path(), || {
+            write_pending_challenge_locked(dir.path(), &replacement)
+        })
+        .unwrap();
 
         assert_eq!(
             record_challenge_mutation_complete(
@@ -1624,6 +1700,83 @@ mod tests {
         assert!(
             begin_pending_challenge(dir.path(), &next).is_err(),
             "the late-cleanup backlog prevents a third challenge from exhausting its bound"
+        );
+    }
+
+    #[test]
+    fn pre_call_reservation_survives_completion_and_cleanup_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = DnsChallengeLease {
+            id: "flow-reserved".to_string(),
+            owner_token: "11111111111111111111111111111111".to_string(),
+        };
+        let old = PendingChallenge {
+            schema_version: PENDING_CHALLENGE_SCHEMA_VERSION,
+            id: lease.id.clone(),
+            domain: "box.example.test".to_string(),
+            record_name: "_acme-challenge.box.example.test".to_string(),
+            value: "reserved-value".to_string(),
+            provider: CustomDomainDnsConfig::Cloudflare {
+                zone_id: "abc123".to_string(),
+                token_env: Some("OWNER_DNS_API_TOKEN".to_string()),
+                propagation_delay_secs: 0,
+            },
+            cloudflare_record_id: None,
+            phase: PendingChallengePhase::Creating,
+            owner_token: Some(lease.owner_token.clone()),
+            lease_expires_unix_ms: now_unix_ms().saturating_add(PENDING_CHALLENGE_CREATE_LEASE_MS),
+            mutation_complete: false,
+        };
+        begin_pending_challenge(dir.path(), &old).unwrap();
+        let mut replacement = old.clone();
+        replacement.id = "flow-replacement".to_string();
+        replacement.value = "replacement-value".to_string();
+        replacement.owner_token = Some("22222222222222222222222222222222".to_string());
+        crate::access::authority_store::with_lock(dir.path(), || {
+            write_pending_challenge_locked(dir.path(), &replacement)
+        })
+        .unwrap();
+
+        FAIL_NEXT_LATE_MUTATION_WRITE.with(|fail| fail.set(true));
+        let error = record_challenge_mutation_complete(
+            dir.path(),
+            &old,
+            &lease,
+            Some("reservedRecord123".to_string()),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected late DNS cleanup write failure"));
+        let reserved = load_late_mutation_store(dir.path()).unwrap();
+        assert_eq!(reserved.entries.len(), 1);
+        assert_eq!(reserved.entries[0].phase, PendingChallengePhase::Creating);
+        assert_eq!(reserved.entries[0].record_name, old.record_name);
+        assert_eq!(reserved.entries[0].value, old.value);
+
+        crate::access::authority_store::with_lock(dir.path(), || {
+            let mut store =
+                load_late_mutation_store_locked(dir.path()).map_err(crate::access::AccessError)?;
+            store.entries[0].lease_expires_unix_ms =
+                now_unix_ms().saturating_sub(PENDING_CHALLENGE_STALE_GRACE_MS + 1);
+            write_late_mutation_store_locked(dir.path(), &store)
+        })
+        .unwrap();
+        let (claimed, token) = claim_late_mutation_cleanup(dir.path()).unwrap().unwrap();
+        assert_eq!(claimed.record_name, old.record_name);
+        assert_eq!(claimed.value, old.value);
+        release_late_mutation_cleanup(dir.path(), &claimed.id, &token).unwrap();
+
+        let restarted = load_late_mutation_store_locked(dir.path()).unwrap();
+        assert_eq!(restarted.entries.len(), 1);
+        assert_eq!(restarted.entries[0].phase, PendingChallengePhase::Cleanup);
+        let (claimed, token) = claim_late_mutation_cleanup(dir.path()).unwrap().unwrap();
+        remove_late_mutation_cleanup(dir.path(), &claimed, &token).unwrap();
+        assert!(load_late_mutation_store(dir.path())
+            .unwrap()
+            .entries
+            .is_empty());
+        assert_eq!(
+            load_pending_challenge(dir.path()).unwrap().unwrap().id,
+            replacement.id
         );
     }
 

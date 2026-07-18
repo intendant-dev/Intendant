@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::{net::SocketAddr, time::Duration};
 
+use futures_util::StreamExt as _;
 use reqwest::{Client, Url};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -64,6 +65,8 @@ pub(crate) const GATEWAY_RELAY_SOURCE_MAGIC: &str = "ITGWS1";
 pub(crate) const GATEWAY_RELAY_SOURCE_MAX_BYTES: usize = 64;
 /// Control long-poll timeout requested of the relay.
 const CONTROL_POLL_TIMEOUT_MS: u64 = 15_000;
+const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTROL_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 /// Reconnect backoff bounds after control-channel errors.
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -73,8 +76,17 @@ const DNS_REASSERT_INTERVAL: Duration = Duration::from_secs(240);
 /// Idle teardown + per-direction byte cap on a spliced dial-back connection.
 const SPLICE_IDLE: Duration = Duration::from_secs(120);
 const SPLICE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const DIALBACK_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ACTIVE_DIALBACKS: usize = 64;
 
-/// Start the relay tunnel client when the config opts in. No-op otherwise.
+fn dialback_capacity_available(active: usize) -> bool {
+    active < MAX_ACTIVE_DIALBACKS
+}
+
+/// Start the relay tunnel client when the config opts in. Whenever a
+/// rendezvous destination is configured, the DNS reconciler starts even if
+/// the relay is disabled or invalid: a previous process may have left
+/// relay-mode DNS published, so startup must explicitly withdraw it.
 /// `gateway_ingress_addr` is the gateway's dedicated loopback-only relay
 /// listener. It serves the fleet-certificate handshake while preserving
 /// immutable relay provenance at the accept edge.
@@ -84,6 +96,18 @@ pub fn spawn_relay_tunnel_client(
     current_fleet_zone_observed: Arc<AtomicBool>,
     lifecycle: watch::Receiver<bool>,
 ) {
+    let (readiness_tx, readiness_rx) = watch::channel(false);
+    if has_rendezvous_destination(&config) {
+        let dns_config = config.clone();
+        let dns_lifecycle = lifecycle.clone();
+        let readiness_guard = readiness_tx.clone();
+        tokio::spawn(relay_dns_reassert_loop(
+            dns_config,
+            dns_lifecycle,
+            readiness_rx,
+            readiness_guard,
+        ));
+    }
     if !config.relay_enabled {
         return;
     }
@@ -101,7 +125,6 @@ pub fn spawn_relay_tunnel_client(
         eprintln!("[relay] tunnel enabled but its dedicated gateway ingress is unavailable");
         return;
     };
-    let dns_config = config.clone();
     let tunnel_lifecycle = lifecycle.clone();
     tokio::spawn(run_relay_tunnel(
         config,
@@ -109,22 +132,61 @@ pub fn spawn_relay_tunnel_client(
         gateway_ingress_addr,
         current_fleet_zone_observed,
         tunnel_lifecycle,
+        readiness_tx,
     ));
-    tokio::spawn(relay_dns_reassert_loop(dns_config, lifecycle));
 }
 
-/// Best-effort: keep the fleet name pointed at the relay while the tunnel is
-/// up. Only meaningful when the rendezvous runs both fleet DNS and the relay;
-/// failures are expected weather for other configurations and logged quietly.
-async fn relay_dns_reassert_loop(config: ConnectConfig, mut lifecycle: watch::Receiver<bool>) {
+fn has_rendezvous_destination(config: &ConnectConfig) -> bool {
+    config
+        .rendezvous_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|url| !url.is_empty())
+}
+
+async fn relay_dns_reassert_loop(
+    config: ConnectConfig,
+    lifecycle: watch::Receiver<bool>,
+    readiness: watch::Receiver<bool>,
+    readiness_guard: watch::Sender<bool>,
+) {
+    let publish_config = config.clone();
+    relay_dns_reassert_loop_with(
+        config.relay_enabled,
+        lifecycle,
+        readiness,
+        readiness_guard,
+        move |enable| {
+            let config = publish_config.clone();
+            async move { dns_publish_via_relay(&config, enable).await }
+        },
+    )
+    .await;
+}
+
+/// Best-effort DNS state machine. Relay-mode publication is allowed only after
+/// a successful control poll established this process's tunnel registration.
+/// All other states converge toward an explicit withdrawal.
+async fn relay_dns_reassert_loop_with<F, Fut>(
+    relay_configured: bool,
+    mut lifecycle: watch::Receiver<bool>,
+    mut readiness: watch::Receiver<bool>,
+    _readiness_guard: watch::Sender<bool>,
+    mut publish: F,
+) where
+    F: FnMut(bool) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
     // A prior process may have exited after publishing relay mode. Begin
     // conservatively so disabled startup also sends one explicit withdrawal.
     let mut relay_dns_may_be_published = true;
     let mut withdrawal_backoff = BACKOFF_MIN;
     loop {
-        if !*lifecycle.borrow_and_update() {
+        let should_publish =
+            relay_configured && *lifecycle.borrow_and_update() && *readiness.borrow_and_update();
+        if !should_publish {
             if relay_dns_may_be_published {
-                match dns_publish_via_relay(&config, false).await {
+                match publish(false).await {
                     Ok(()) => {
                         relay_dns_may_be_published = false;
                         withdrawal_backoff = BACKOFF_MIN;
@@ -138,6 +200,11 @@ async fn relay_dns_reassert_loop(config: ConnectConfig, mut lifecycle: watch::Re
                                     return;
                                 }
                             }
+                            changed = readiness.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                            }
                             _ = tokio::time::sleep(withdrawal_backoff) => {
                                 withdrawal_backoff =
                                     (withdrawal_backoff * 2).min(BACKOFF_MAX);
@@ -147,8 +214,17 @@ async fn relay_dns_reassert_loop(config: ConnectConfig, mut lifecycle: watch::Re
                 }
                 continue;
             }
-            if lifecycle.changed().await.is_err() {
-                return;
+            tokio::select! {
+                changed = lifecycle.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                changed = readiness.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
             }
             continue;
         }
@@ -164,7 +240,13 @@ async fn relay_dns_reassert_loop(config: ConnectConfig, mut lifecycle: watch::Re
                 }
                 None
             }
-            result = dns_publish_via_relay(&config, true) => Some(result),
+            changed = readiness.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                None
+            }
+            result = publish(true) => Some(result),
         };
         let Some(publish) = publish else {
             continue;
@@ -172,12 +254,17 @@ async fn relay_dns_reassert_loop(config: ConnectConfig, mut lifecycle: watch::Re
         if let Err(error) = publish {
             eprintln!("[relay] relay-mode dns publish (best-effort): {error}");
         }
-        if !*lifecycle.borrow_and_update() {
+        if !relay_configured || !*lifecycle.borrow_and_update() || !*readiness.borrow_and_update() {
             continue;
         }
         tokio::select! {
             biased;
             changed = lifecycle.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            changed = readiness.changed() => {
                 if changed.is_err() {
                     return;
                 }
@@ -193,9 +280,11 @@ async fn run_relay_tunnel(
     gateway_ingress_addr: SocketAddr,
     current_fleet_zone_observed: Arc<AtomicBool>,
     mut lifecycle: watch::Receiver<bool>,
+    readiness: watch::Sender<bool>,
 ) {
     let client = match Client::builder()
         .timeout(Duration::from_millis(CONTROL_POLL_TIMEOUT_MS + 10_000))
+        .connect_timeout(CONTROL_CONNECT_TIMEOUT)
         .build()
     {
         Ok(client) => client,
@@ -207,6 +296,7 @@ async fn run_relay_tunnel(
     eprintln!("[relay] tunnel client enabled (dial-back via {relay_endpoint})");
     loop {
         while !*lifecycle.borrow_and_update() {
+            readiness.send_replace(false);
             if lifecycle.changed().await.is_err() {
                 return;
             }
@@ -220,8 +310,10 @@ async fn run_relay_tunnel(
             &client,
             &poller_id,
             &mut lifecycle,
+            &readiness,
         )
         .await;
+        readiness.send_replace(false);
         if let Err(error) = withdraw_relay_name_registration(&config, &client, &poller_id).await {
             eprintln!("[relay] exact-name withdrawal (best-effort): {error}");
         }
@@ -231,6 +323,7 @@ async fn run_relay_tunnel(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_enabled_relay_tunnel(
     config: &ConnectConfig,
     relay_endpoint: &str,
@@ -239,14 +332,17 @@ async fn run_enabled_relay_tunnel(
     client: &Client,
     poller_id: &str,
     lifecycle: &mut watch::Receiver<bool>,
+    readiness: &watch::Sender<bool>,
 ) {
     let mut backoff = BACKOFF_MIN;
     let mut last_custom_error: Option<String> = None;
     let mut dialbacks = JoinSet::new();
     loop {
         if !*lifecycle.borrow_and_update() {
+            readiness.send_replace(false);
             return;
         }
+        while dialbacks.try_join_next().is_some() {}
         // Another daemon process may have renewed the shared fleet pair.
         // Relay readiness is process-local, so reload it before registering
         // this poller as a possible dialback recipient.
@@ -259,6 +355,7 @@ async fn run_enabled_relay_tunnel(
             match signed_daemon_context_for_config(config.clone()) {
                 Ok(context) => context,
                 Err(error) => {
+                    readiness.send_replace(false);
                     eprintln!("[relay] tunnel context unavailable: {error}");
                     backoff = match sleep_backoff_or_disabled(backoff, lifecycle).await {
                         Some(next) => next,
@@ -310,27 +407,41 @@ async fn run_enabled_relay_tunnel(
             result = poll_relay_next(&poll, &name_materials) => Some(result),
         };
         let Some(poll_result) = poll_result else {
+            readiness.send_replace(false);
             return;
         };
         if !*lifecycle.borrow_and_update() {
+            readiness.send_replace(false);
             return;
         }
         match poll_result {
             Ok(Some(dialback)) => {
+                readiness.send_replace(true);
                 backoff = BACKOFF_MIN;
-                let endpoint = relay_endpoint.to_string();
-                dialbacks.spawn(async move {
-                    if let Err(error) =
-                        handle_dialback(&endpoint, gateway_ingress_addr, &dialback).await
-                    {
-                        eprintln!("[relay] dial-back failed: {error}");
-                    }
-                });
+                if !dialback_capacity_available(dialbacks.len()) {
+                    // Keep polling so the server-side tunnel registration
+                    // stays live; the relay closes this unclaimed nonce on
+                    // its own bounded dialback deadline. Waiting here would
+                    // let the 45-second registration lapse behind a
+                    // 120-second active splice.
+                    eprintln!("[relay] dial-back capacity reached; refusing one excess connection");
+                } else {
+                    let endpoint = relay_endpoint.to_string();
+                    dialbacks.spawn(async move {
+                        if let Err(error) =
+                            handle_dialback(&endpoint, gateway_ingress_addr, &dialback).await
+                        {
+                            eprintln!("[relay] dial-back failed: {error}");
+                        }
+                    });
+                }
             }
             Ok(None) => {
+                readiness.send_replace(true);
                 backoff = BACKOFF_MIN;
             }
             Err(error) => {
+                readiness.send_replace(false);
                 eprintln!("[relay] control poll failed: {error}");
                 backoff = match sleep_backoff_or_disabled(backoff, lifecycle).await {
                     Some(next) => next,
@@ -338,7 +449,6 @@ async fn run_enabled_relay_tunnel(
                 };
             }
         }
-        while dialbacks.try_join_next().is_some() {}
     }
 }
 
@@ -408,7 +518,7 @@ async fn poll_relay_next(
     let mut response = send_relay_poll(poll, &v2_body).await?;
     if !response.status().is_success() {
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let text = relay_response_text_capped(response, "control rejection").await?;
         if exact_name_registration_rejected(status, &text) {
             eprintln!(
                 "[relay] exact-name registration rejected ({status} {text}); retaining fleet-label compatibility via control v1"
@@ -574,15 +684,17 @@ fn relay_name_proof_signing_payload(
 async fn decode_relay_poll_response(
     response: reqwest::Response,
 ) -> Result<Option<RelayDialback>, String> {
-    if response.status().as_u16() == 204 {
+    let status = response.status();
+    if status.as_u16() == 204 {
         return Ok(None);
     }
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let text = relay_response_text_capped(response, "control rejection").await?;
         return Err(format!("relay control poll rejected: HTTP {status} {text}"));
     }
-    let value: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    let body = relay_response_body_capped(response, "control response").await?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|error| format!("parse relay response: {error}"))?;
     let Some(nonce) = value.pointer("/dialback/nonce").and_then(|v| v.as_str()) else {
         return Ok(None);
     };
@@ -603,6 +715,33 @@ async fn decode_relay_poll_response(
         nonce: nonce.to_string(),
         source_bucket,
     }))
+}
+
+async fn relay_response_text_capped(
+    response: reqwest::Response,
+    label: &str,
+) -> Result<String, String> {
+    relay_response_body_capped(response, label)
+        .await
+        .map(|body| String::from_utf8_lossy(&body).into_owned())
+}
+
+async fn relay_response_body_capped(
+    response: reqwest::Response,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|error| format!("read relay {label}: {error}"))?;
+        if body.len().saturating_add(chunk.len()) > CONTROL_RESPONSE_MAX_BYTES {
+            return Err(format!(
+                "relay {label} exceeds the {CONTROL_RESPONSE_MAX_BYTES}-byte cap"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn relay_control_signing_payload(
@@ -642,26 +781,56 @@ async fn handle_dialback(
     gateway_ingress_addr: SocketAddr,
     dialback: &RelayDialback,
 ) -> Result<(), String> {
-    let mut data = TcpStream::connect(relay_endpoint)
-        .await
-        .map_err(|e| format!("connect relay {relay_endpoint}: {e}"))?;
-    data.write_all(format!("{DIALBACK_MAGIC} {}\n", dialback.nonce).as_bytes())
-        .await
-        .map_err(|e| format!("write dial-back hello: {e}"))?;
-    let mut gateway = TcpStream::connect(gateway_ingress_addr)
-        .await
-        .map_err(|e| format!("connect dedicated gateway ingress {gateway_ingress_addr}: {e}"))?;
-    let source_bucket = dialback
-        .source_bucket
-        .clone()
-        .filter(|bucket| valid_source_bucket(bucket))
-        .unwrap_or_else(shared_relay_source_bucket);
-    gateway
-        .write_all(format!("{GATEWAY_RELAY_SOURCE_MAGIC} {source_bucket}\n").as_bytes())
-        .await
-        .map_err(|error| format!("write gateway relay-source preamble: {error}"))?;
+    let (data, gateway) = dialback_setup_with_timeout(
+        relay_endpoint,
+        gateway_ingress_addr,
+        dialback,
+        DIALBACK_SETUP_TIMEOUT,
+    )
+    .await?;
     splice(data, gateway).await;
     Ok(())
+}
+
+async fn dialback_setup_with_timeout(
+    relay_endpoint: &str,
+    gateway_ingress_addr: SocketAddr,
+    dialback: &RelayDialback,
+    timeout: Duration,
+) -> Result<(TcpStream, TcpStream), String> {
+    run_with_dialback_setup_timeout(timeout, async {
+        let mut data = TcpStream::connect(relay_endpoint)
+            .await
+            .map_err(|error| format!("connect relay {relay_endpoint}: {error}"))?;
+        data.write_all(format!("{DIALBACK_MAGIC} {}\n", dialback.nonce).as_bytes())
+            .await
+            .map_err(|error| format!("write dial-back hello: {error}"))?;
+        let mut gateway = TcpStream::connect(gateway_ingress_addr)
+            .await
+            .map_err(|error| {
+                format!("connect dedicated gateway ingress {gateway_ingress_addr}: {error}")
+            })?;
+        let source_bucket = dialback
+            .source_bucket
+            .clone()
+            .filter(|bucket| valid_source_bucket(bucket))
+            .unwrap_or_else(shared_relay_source_bucket);
+        gateway
+            .write_all(format!("{GATEWAY_RELAY_SOURCE_MAGIC} {source_bucket}\n").as_bytes())
+            .await
+            .map_err(|error| format!("write gateway relay-source preamble: {error}"))?;
+        Ok((data, gateway))
+    })
+    .await
+}
+
+async fn run_with_dialback_setup_timeout<T>(
+    timeout: Duration,
+    setup: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::time::timeout(timeout, setup)
+        .await
+        .map_err(|_| "relay dial-back setup timed out".to_string())?
 }
 
 fn valid_source_bucket(bucket: &str) -> bool {
@@ -717,28 +886,94 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
 
-    fn relay_disabled() -> ConnectConfig {
-        ConnectConfig {
-            enabled: true,
+    #[test]
+    fn dns_reconciliation_requires_a_configured_rendezvous_not_relay_enablement() {
+        assert!(!has_rendezvous_destination(&ConnectConfig::default()));
+        let configured = ConnectConfig {
+            rendezvous_url: Some("https://connect.example.test".to_string()),
             relay_enabled: false,
             ..ConnectConfig::default()
-        }
+        };
+        assert!(has_rendezvous_destination(&configured));
     }
 
     #[test]
-    fn spawn_is_a_noop_when_relay_is_disabled() {
-        // No panic, no task: disabled config returns immediately. (A running
-        // tokio runtime is not required because we never spawn.)
-        let ingress = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 8765)));
-        let observed = Arc::new(AtomicBool::new(true));
-        let (_, lifecycle) = watch::channel(false);
-        spawn_relay_tunnel_client(
-            relay_disabled(),
-            ingress,
-            Arc::clone(&observed),
-            lifecycle.clone(),
+    fn dialback_capacity_refuses_excess_without_an_unbounded_task_set() {
+        assert!(dialback_capacity_available(MAX_ACTIVE_DIALBACKS - 1));
+        assert!(!dialback_capacity_available(MAX_ACTIVE_DIALBACKS));
+        assert!(!dialback_capacity_available(MAX_ACTIVE_DIALBACKS + 1));
+    }
+
+    #[tokio::test]
+    async fn dns_reconciler_withdraws_when_disabled_and_waits_for_tunnel_readiness() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (lifecycle_tx, lifecycle_rx) = watch::channel(false);
+        let (readiness_tx, readiness_rx) = watch::channel(false);
+        let calls_for_disabled = Arc::clone(&calls);
+        let disabled = tokio::spawn(relay_dns_reassert_loop_with(
+            false,
+            lifecycle_rx,
+            readiness_rx,
+            readiness_tx.clone(),
+            move |enable| {
+                let calls = Arc::clone(&calls_for_disabled);
+                async move {
+                    calls.lock().unwrap().push(enable);
+                    Ok(())
+                }
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.lock().unwrap().as_slice(), [false]);
+        disabled.abort();
+        drop(lifecycle_tx);
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (lifecycle_tx, lifecycle_rx) = watch::channel(true);
+        let (readiness_tx, readiness_rx) = watch::channel(false);
+        let calls_for_waiting = Arc::clone(&calls);
+        let waiting = tokio::spawn(relay_dns_reassert_loop_with(
+            true,
+            lifecycle_rx,
+            readiness_rx,
+            readiness_tx.clone(),
+            move |enable| {
+                let calls = Arc::clone(&calls_for_waiting);
+                async move {
+                    calls.lock().unwrap().push(enable);
+                    Ok(())
+                }
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.lock().unwrap().as_slice(), [false]);
+        readiness_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !calls.lock().unwrap().contains(&true) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            calls.lock().unwrap().iter().position(|enable| *enable),
+            Some(1),
+            "relay DNS must not publish before a control poll established readiness"
         );
-        spawn_relay_tunnel_client(ConnectConfig::default(), ingress, observed, lifecycle);
+        waiting.abort();
+        drop(lifecycle_tx);
     }
 
     #[test]
@@ -960,6 +1195,45 @@ mod tests {
         );
         drop(dir);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_chunked_control_response_is_rejected_incrementally() {
+        let router = axum::Router::new().route(
+            "/oversized",
+            axum::routing::get(|| async {
+                let chunks = futures_util::stream::iter((0..5).map(|_| {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(vec![
+                        b'x';
+                        CONTROL_RESPONSE_MAX_BYTES
+                            / 4
+                    ]))
+                }));
+                axum::response::Response::new(axum::body::Body::from_stream(chunks))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/oversized", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        let response = reqwest::get(url).await.unwrap();
+        let error = relay_response_body_capped(response, "test response")
+            .await
+            .unwrap_err();
+        assert!(error.contains("exceeds"), "{error}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn blackholed_dialback_setup_has_an_explicit_deadline() {
+        let error = run_with_dialback_setup_timeout(
+            Duration::from_millis(20),
+            std::future::pending::<Result<(), String>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
     }
 
     /// The dial-back path splices the relay data connection to the dedicated

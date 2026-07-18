@@ -1774,8 +1774,8 @@ response omits the header.
 | GET | `/api/displays` | DisplayView | own origin | none | Enumerate active displays |
 | any | `/api/peer-pairing/requests[/…]` | public | public | streaming | Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath) |
 | GET | `/api/hosted-control/bootstrap` | public | public | none | Hosted-control doorbell bootstrap (dark unless enabled; no authority) |
-| POST | `/api/hosted-control/requests` | public | public | bounded | Submit a bounded hosted-control lease request to daemon-local IAM |
-| POST | `/api/hosted-control/requests/poll` | public | public | bounded | Poll one hosted-control request with proof by its browser key |
+| POST | `/api/hosted-control/requests` | public | public | ≤ 64 KiB | Submit a bounded hosted-control lease request to daemon-local IAM |
+| POST | `/api/hosted-control/requests/poll` | public | public | ≤ 64 KiB | Poll one hosted-control request with proof by its browser key |
 | POST | `/api/hosted-control/anchor-decisions` | public | public | bounded | Present a signed application-anchor decision document |
 | GET | `/api/hosted-control/certificate-ledger` | public | public | none | Read the daemon-signed fleet-certificate ledger (no authority) |
 | POST | `/api/hosted-control/witness-reports` | public | public | ≤ 16 KiB | Present a certificate observation signed by an enrolled application witness |

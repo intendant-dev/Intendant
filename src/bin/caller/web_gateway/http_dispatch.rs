@@ -357,27 +357,49 @@ pub(crate) async fn serve_http_request(
         && req_path != "/mcp"
         && http_header_value(header_text, "x-intendant-hosted-lease").is_some()
     {
-        let result = hosted_request_proof_from_headers(header_text).and_then(|proof| {
+        let proof = hosted_request_proof_from_headers(header_text).and_then(|proof| {
             let fleet_origin = public_origin_from_request(header_text, is_tls, tls_custom_domain)?;
-            hosted_control.verify_request_proof(
-                req_method,
-                request_line.split_whitespace().nth(1).unwrap_or(req_path),
-                &fleet_origin,
-                &proof,
-                if tls_custom_domain.is_some() {
+            Ok((proof, fleet_origin))
+        });
+        let result = match proof {
+            Ok((proof, fleet_origin)) => {
+                let runtime = Arc::clone(&hosted_control);
+                let method = req_method.to_string();
+                let raw_path_and_query = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or(req_path)
+                    .to_string();
+                let transport = if tls_custom_domain.is_some() {
                     "custom-domain-https"
                 } else if gateway_ingress.is_reachability_relay() {
                     "hosted-relay-https"
                 } else {
                     "hosted-fleet-https"
-                },
-            )
-        });
+                };
+                run_hosted_authority_io(move || {
+                    runtime.verify_request_proof(
+                        &method,
+                        &raw_path_and_query,
+                        &fleet_origin,
+                        &proof,
+                        transport,
+                    )
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
         match result {
             Ok(verified) => Some(verified),
             Err(error) => {
                 use tokio::io::AsyncWriteExt;
-                let response = json_error("401 Unauthorized", error);
+                let status = if error == HOSTED_AUTHORITY_BUSY_ERROR {
+                    "429 Too Many Requests"
+                } else {
+                    "401 Unauthorized"
+                };
+                let response = json_error(status, error);
                 let _ = stream.write_all(response.as_bytes()).await;
                 finalize_http_stream(&mut stream).await;
                 return;

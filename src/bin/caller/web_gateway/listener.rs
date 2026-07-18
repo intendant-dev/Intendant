@@ -1933,33 +1933,45 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         let ticket =
                             query_param(header_text.lines().next().unwrap_or(""), "hosted_ticket");
                         match ticket {
-                            Some(ticket) => match public_origin_from_request(
-                                &header_text,
-                                is_tls,
-                                live_tls_custom_domain,
-                            )
-                            .and_then(|origin| {
-                                hosted_control.consume_ws_ticket(
-                                    &ticket,
-                                    &origin,
-                                    if live_tls_custom_domain.is_some() {
-                                        "custom-domain-wss"
-                                    } else if gateway_ingress.is_reachability_relay() {
-                                        "hosted-relay-wss"
-                                    } else {
-                                        "hosted-fleet-wss"
-                                    },
-                                )
-                            }) {
-                                Ok(verified) => Some(verified),
-                                Err(error) => {
-                                    use tokio::io::AsyncWriteExt;
-                                    let response = json_error("401 Unauthorized", error);
-                                    let _ = stream.write_all(response.as_bytes()).await;
-                                    finalize_http_stream(&mut stream).await;
-                                    return;
+                            Some(ticket) => {
+                                let origin = public_origin_from_request(
+                                    &header_text,
+                                    is_tls,
+                                    live_tls_custom_domain,
+                                );
+                                let result = match origin {
+                                    Ok(origin) => {
+                                        let runtime = Arc::clone(&hosted_control);
+                                        let transport = if live_tls_custom_domain.is_some() {
+                                            "custom-domain-wss"
+                                        } else if gateway_ingress.is_reachability_relay() {
+                                            "hosted-relay-wss"
+                                        } else {
+                                            "hosted-fleet-wss"
+                                        };
+                                        run_hosted_authority_io(move || {
+                                            runtime.consume_ws_ticket(&ticket, &origin, transport)
+                                        })
+                                        .await
+                                    }
+                                    Err(error) => Err(error),
+                                };
+                                match result {
+                                    Ok(verified) => Some(verified),
+                                    Err(error) => {
+                                        use tokio::io::AsyncWriteExt;
+                                        let status = if error == HOSTED_AUTHORITY_BUSY_ERROR {
+                                            "429 Too Many Requests"
+                                        } else {
+                                            "401 Unauthorized"
+                                        };
+                                        let response = json_error(status, error);
+                                        let _ = stream.write_all(response.as_bytes()).await;
+                                        finalize_http_stream(&mut stream).await;
+                                        return;
+                                    }
                                 }
-                            },
+                            }
                             None => None,
                         }
                     } else {

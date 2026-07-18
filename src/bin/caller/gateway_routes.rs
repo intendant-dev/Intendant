@@ -190,6 +190,10 @@ pub(crate) enum BodyPolicy {
 /// Content-Length. Generous headroom over every legitimate payload.
 pub(crate) const DEFAULT_BODY_CAP_BYTES: usize = 4 * 1024 * 1024;
 
+/// Browser-key request and poll proofs are compact JSON documents. Keep these
+/// unauthenticated hosted entry points well below the generic command-body cap.
+pub(crate) const HOSTED_CONTROL_REQUEST_BODY_CAP_BYTES: usize = 64 * 1024;
+
 /// Body cap for `POST /mcp` — JSON-RPC tool calls can legitimately carry
 /// file-sized arguments (fs tools, upload-adjacent flows).
 pub(crate) const MCP_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
@@ -1595,14 +1599,14 @@ pub(crate) static ROUTES: &[Route] = &[
     public_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/hosted-control/requests"),
-        BodyPolicy::Default,
+        BodyPolicy::Capped(HOSTED_CONTROL_REQUEST_BODY_CAP_BYTES),
         RouteHandlerId::HostedControlRequestCreate,
         "Submit a bounded hosted-control lease request to daemon-local IAM",
     ),
     public_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/hosted-control/requests/poll"),
-        BodyPolicy::Default,
+        BodyPolicy::Capped(HOSTED_CONTROL_REQUEST_BODY_CAP_BYTES),
         RouteHandlerId::HostedControlRequestPoll,
         "Poll one hosted-control request with proof by its browser key",
     ),
@@ -2799,6 +2803,14 @@ mod tests {
         assert_eq!(
             policy("POST", "/api/access/org-grants/renew"),
             BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/hosted-control/requests"),
+            BodyPolicy::Capped(HOSTED_CONTROL_REQUEST_BODY_CAP_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/hosted-control/requests/poll"),
+            BodyPolicy::Capped(HOSTED_CONTROL_REQUEST_BODY_CAP_BYTES)
         );
         assert_eq!(
             policy("POST", "/api/hosted-control/witness-reports"),

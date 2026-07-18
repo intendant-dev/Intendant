@@ -28,10 +28,14 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const FLEET_ORIGIN_PROVENANCE_FILE: &str = "fleet-origin-provenance.json";
 const FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION: u32 = 2;
+const FLEET_ORIGIN_PROVENANCE_MAX_BYTES: u64 = 128 * 1024;
+pub(crate) const FLEET_ORIGIN_PROVENANCE_MAX_NAMES: usize = 128;
+const FLEET_ORIGIN_PROVENANCE_MAX_ZONES: usize = 128;
+const FLEET_ORIGIN_PROVENANCE_CACHE_MAX_DIRS: usize = 8;
 const FLEET_CERT_REQUESTED_FILE: &str = "fleet-cert-requested";
 const FLEET_CERT_REQUESTED_MARKER: &[u8] = b"intendant-fleet-certificate-requested-v1\n";
 const FLEET_CERT_SERIALS_MAX_BYTES: u64 = 1024 * 1024;
@@ -94,7 +98,14 @@ impl Default for FleetOriginProvenance {
 
 fn normalized_dns_name(value: &str) -> Option<String> {
     let normalized = value.trim().trim_end_matches('.').to_ascii_lowercase();
-    (!normalized.is_empty()).then_some(normalized)
+    if normalized.is_empty() || normalized.len() > 253 {
+        return None;
+    }
+    matches!(
+        rustls::pki_types::ServerName::try_from(normalized.clone()).ok()?,
+        rustls::pki_types::ServerName::DnsName(_)
+    )
+    .then_some(normalized)
 }
 
 fn fleet_zone_from_exact_name(name: &str) -> Option<String> {
@@ -119,10 +130,27 @@ fn write_fleet_origin_provenance_locked(
     cert_dir: &Path,
     provenance: &FleetOriginProvenance,
 ) -> crate::access::AccessResult<()> {
+    if provenance.known_names.len() > FLEET_ORIGIN_PROVENANCE_MAX_NAMES
+        || provenance.known_zones.len() > FLEET_ORIGIN_PROVENANCE_MAX_ZONES
+        || provenance
+            .known_names
+            .iter()
+            .chain(&provenance.known_zones)
+            .any(|value| normalized_dns_name(value).as_deref() != Some(value.as_str()))
+    {
+        return Err(crate::access::AccessError(
+            "fleet origin provenance exceeds its entry bounds".to_string(),
+        ));
+    }
     let mut bytes = serde_json::to_vec_pretty(provenance).map_err(|error| {
         crate::access::AccessError(format!("serialize fleet origin provenance: {error}"))
     })?;
     bytes.push(b'\n');
+    if bytes.len() as u64 > FLEET_ORIGIN_PROVENANCE_MAX_BYTES {
+        return Err(crate::access::AccessError(
+            "fleet origin provenance exceeds its size cap".to_string(),
+        ));
+    }
     crate::access::authority_store::atomic_write_private_locked(
         &fleet_origin_provenance_path_in(cert_dir),
         &bytes,
@@ -130,24 +158,137 @@ fn write_fleet_origin_provenance_locked(
 }
 
 fn fleet_origin_provenance_needs_rewrite_in(cert_dir: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(fleet_origin_provenance_path_in(cert_dir)) else {
+    use std::io::Read as _;
+
+    let Ok(file) = std::fs::File::open(fleet_origin_provenance_path_in(cert_dir)) else {
         return false;
     };
-    serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|value| value.get("schema_version")?.as_u64())
+    let mut bytes = Vec::new();
+    if file
+        .take(FLEET_ORIGIN_PROVENANCE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > FLEET_ORIGIN_PROVENANCE_MAX_BYTES
+    {
+        return true;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return true;
+    };
+    if value.get("schema_version").and_then(|value| value.as_u64())
         != Some(FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION as u64)
+    {
+        return true;
+    }
+    let Ok(stored) = serde_json::from_value::<FleetOriginProvenance>(value) else {
+        return true;
+    };
+    load_fleet_origin_provenance_uncached_in(cert_dir)
+        .map(|normalized| stored != normalized)
+        .unwrap_or(true)
 }
 
-fn load_fleet_origin_provenance_in(cert_dir: &Path) -> Result<FleetOriginProvenance, String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FleetOriginProvenanceFingerprint {
+    len: u64,
+    mtime_nanos: u128,
+    change_stamp: crate::platform::FileChangeStamp,
+}
+
+fn fleet_origin_provenance_fingerprint(path: &Path) -> Option<FleetOriginProvenanceFingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    fleet_origin_provenance_fingerprint_from_metadata(path, &metadata)
+}
+
+fn fleet_origin_provenance_fingerprint_from_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Option<FleetOriginProvenanceFingerprint> {
+    if !metadata.is_file() {
+        return None;
+    }
+    let change_stamp = crate::platform::file_change_stamp(path, metadata)?;
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Some(FleetOriginProvenanceFingerprint {
+        len: metadata.len(),
+        mtime_nanos,
+        change_stamp,
+    })
+}
+
+struct FleetOriginProvenanceCacheEntry {
+    fingerprint: FleetOriginProvenanceFingerprint,
+    provenance: Arc<FleetOriginProvenance>,
+}
+
+fn fleet_origin_provenance_cache(
+) -> &'static Mutex<std::collections::HashMap<PathBuf, FleetOriginProvenanceCacheEntry>> {
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<PathBuf, FleetOriginProvenanceCacheEntry>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn normalize_provenance_entries(values: Vec<String>, cap: usize) -> (Vec<String>, bool) {
+    let original_len = values.len();
+    let mut invalid = false;
+    let mut normalized = values
+        .into_iter()
+        .filter_map(|value| match normalized_dns_name(&value) {
+            Some(value) => Some(value),
+            None => {
+                invalid = true;
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    let overflow = normalized.len() > cap;
+    normalized.truncate(cap);
+    (normalized, invalid || overflow || original_len > cap)
+}
+
+fn insert_bounded_provenance_entry(entries: &mut Vec<String>, value: String, cap: usize) -> bool {
+    if entries.iter().any(|known| known == &value) {
+        return true;
+    }
+    if entries.len() >= cap {
+        return false;
+    }
+    entries.push(value);
+    entries.sort();
+    true
+}
+
+fn load_fleet_origin_provenance_uncached_in(
+    cert_dir: &Path,
+) -> Result<FleetOriginProvenance, String> {
+    use std::io::Read as _;
+
     let path = fleet_origin_provenance_path_in(cert_dir);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(FleetOriginProvenance::default());
         }
         Err(error) => return Err(format!("read {}: {error}", path.display())),
     };
+    let mut bytes = Vec::new();
+    file.take(FLEET_ORIGIN_PROVENANCE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > FLEET_ORIGIN_PROVENANCE_MAX_BYTES {
+        return Err(format!(
+            "{} exceeds the fleet origin provenance size cap",
+            path.display()
+        ));
+    }
     let mut provenance: FleetOriginProvenance = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse {}: {error}", path.display()))?;
     let loaded_schema_version = provenance.schema_version;
@@ -159,44 +300,114 @@ fn load_fleet_origin_provenance_in(cert_dir: &Path) -> Result<FleetOriginProvena
         ));
     }
     provenance.schema_version = FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION;
-    provenance.zone = provenance.zone.as_deref().and_then(normalized_dns_name);
-    provenance.name = provenance.name.as_deref().and_then(normalized_dns_name);
-    provenance.known_zones = provenance
-        .known_zones
-        .iter()
-        .filter_map(|zone| normalized_dns_name(zone))
-        .collect();
+    let original_zone = provenance.zone.take();
+    provenance.zone = original_zone.as_deref().and_then(normalized_dns_name);
+    provenance.provenance_incomplete |= original_zone.is_some() && provenance.zone.is_none();
+    let original_name = provenance.name.take();
+    provenance.name = original_name.as_deref().and_then(normalized_dns_name);
+    provenance.provenance_incomplete |= original_name.is_some() && provenance.name.is_none();
+    let (known_zones, zones_incomplete) = normalize_provenance_entries(
+        std::mem::take(&mut provenance.known_zones),
+        FLEET_ORIGIN_PROVENANCE_MAX_ZONES,
+    );
+    provenance.known_zones = known_zones;
+    provenance.provenance_incomplete |= zones_incomplete;
     if let Some(zone) = provenance.zone.clone() {
-        provenance.known_zones.push(zone);
+        provenance.provenance_incomplete |= !insert_bounded_provenance_entry(
+            &mut provenance.known_zones,
+            zone,
+            FLEET_ORIGIN_PROVENANCE_MAX_ZONES,
+        );
     }
-    provenance.known_zones.sort();
-    provenance.known_zones.dedup();
-    provenance.known_names = provenance
-        .known_names
-        .iter()
-        .filter_map(|name| normalized_dns_name(name))
-        .collect();
+    let (known_names, names_incomplete) = normalize_provenance_entries(
+        std::mem::take(&mut provenance.known_names),
+        FLEET_ORIGIN_PROVENANCE_MAX_NAMES,
+    );
+    provenance.known_names = known_names;
+    provenance.provenance_incomplete |= names_incomplete;
     if let Some(name) = provenance.name.clone() {
-        provenance.known_names.push(name);
+        provenance.provenance_incomplete |= !insert_bounded_provenance_entry(
+            &mut provenance.known_names,
+            name,
+            FLEET_ORIGIN_PROVENANCE_MAX_NAMES,
+        );
     }
-    provenance.known_names.sort();
-    provenance.known_names.dedup();
     if loaded_schema_version < 2 {
         let mut recovered_all_zones = true;
         for name in &provenance.known_names {
             if let Some(zone) = fleet_zone_from_exact_name(name) {
-                provenance.known_zones.push(zone);
+                recovered_all_zones &= insert_bounded_provenance_entry(
+                    &mut provenance.known_zones,
+                    zone,
+                    FLEET_ORIGIN_PROVENANCE_MAX_ZONES,
+                );
             } else {
                 recovered_all_zones = false;
             }
         }
-        provenance.known_zones.sort();
-        provenance.known_zones.dedup();
         if !recovered_all_zones {
             provenance.provenance_incomplete = true;
         }
     }
     Ok(provenance)
+}
+
+fn load_fleet_origin_provenance_cached_arc_in(
+    cert_dir: &Path,
+) -> Result<Arc<FleetOriginProvenance>, String> {
+    let path = fleet_origin_provenance_path_in(cert_dir);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Arc::new(FleetOriginProvenance::default()));
+        }
+        Err(_) => {
+            return load_fleet_origin_provenance_uncached_in(cert_dir).map(Arc::new);
+        }
+    };
+    let Some(fingerprint) = fleet_origin_provenance_fingerprint_from_metadata(&path, &metadata)
+    else {
+        // Windows change-time queries can fail for a locked file or a
+        // filesystem without a reliable signal. `None` means uncacheable,
+        // never absent: re-read the authority record instead of projecting
+        // an empty provenance set.
+        return load_fleet_origin_provenance_uncached_in(cert_dir).map(Arc::new);
+    };
+    {
+        let cache = fleet_origin_provenance_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(entry) = cache
+            .get(&path)
+            .filter(|entry| entry.fingerprint == fingerprint)
+        {
+            return Ok(Arc::clone(&entry.provenance));
+        }
+    }
+    let provenance = Arc::new(load_fleet_origin_provenance_uncached_in(cert_dir)?);
+    if matches!(
+        fleet_origin_provenance_fingerprint(&path),
+        Some(after) if after == fingerprint
+    ) {
+        let mut cache = fleet_origin_provenance_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if cache.len() >= FLEET_ORIGIN_PROVENANCE_CACHE_MAX_DIRS && !cache.contains_key(&path) {
+            cache.clear();
+        }
+        cache.insert(
+            path,
+            FleetOriginProvenanceCacheEntry {
+                fingerprint,
+                provenance: Arc::clone(&provenance),
+            },
+        );
+    }
+    Ok(provenance)
+}
+
+fn load_fleet_origin_provenance_in(cert_dir: &Path) -> Result<FleetOriginProvenance, String> {
+    load_fleet_origin_provenance_cached_arc_in(cert_dir).map(|provenance| (*provenance).clone())
 }
 
 pub(crate) fn current_fleet_name_in(cert_dir: &Path) -> Result<Option<String>, String> {
@@ -207,7 +418,7 @@ pub(crate) fn is_service_controlled_name_in(cert_dir: &Path, name: &str) -> Resu
     let Some(name) = normalized_dns_name(name) else {
         return Ok(false);
     };
-    let provenance = load_fleet_origin_provenance_in(cert_dir)?;
+    let provenance = load_fleet_origin_provenance_cached_arc_in(cert_dir)?;
     if provenance.provenance_incomplete {
         return Err(
             "fleet-origin provenance is incomplete; custom-domain separation cannot be proven"
@@ -228,8 +439,9 @@ fn remember_fleet_origin_in(
     zone: Option<&str>,
     name: &str,
 ) -> Result<FleetOriginProvenance, String> {
-    let name = normalized_dns_name(name)
-        .ok_or_else(|| "rendezvous returned an empty fleet name".to_string())?;
+    let name = normalized_dns_name(name).ok_or_else(|| {
+        "rendezvous returned a fleet name outside the canonical DNS form".to_string()
+    })?;
     let derived_zone = fleet_zone_from_exact_name(&name).ok_or_else(|| {
         "rendezvous returned a fleet name outside the canonical d-<20hex>.<zone> form".to_string()
     })?;
@@ -247,13 +459,17 @@ fn remember_fleet_origin_in(
             load_fleet_origin_provenance_in(cert_dir).map_err(crate::access::AccessError)?;
         let before = provenance.clone();
         provenance.zone = Some(derived_zone.clone());
-        provenance.known_zones.push(derived_zone);
-        provenance.known_zones.sort();
-        provenance.known_zones.dedup();
+        provenance.provenance_incomplete |= !insert_bounded_provenance_entry(
+            &mut provenance.known_zones,
+            derived_zone,
+            FLEET_ORIGIN_PROVENANCE_MAX_ZONES,
+        );
         provenance.name = Some(name.clone());
-        provenance.known_names.push(name);
-        provenance.known_names.sort();
-        provenance.known_names.dedup();
+        provenance.provenance_incomplete |= !insert_bounded_provenance_entry(
+            &mut provenance.known_names,
+            name,
+            FLEET_ORIGIN_PROVENANCE_MAX_NAMES,
+        );
         if provenance == before && !needs_rewrite {
             return Ok(provenance);
         }
@@ -477,6 +693,14 @@ pub fn note_fleet_dns(zone: Option<String>, name: Option<String>) -> bool {
     let provenance_accepted = !provenance.provenance_incomplete;
     if !provenance_accepted {
         mark_fleet_origin_provenance_incomplete();
+        with_status(|status| {
+            status.zone = None;
+            status.name = None;
+        });
+        eprintln!(
+            "[fleet-cert] rejected fleet DNS update because its durable provenance set is incomplete"
+        );
+        return false;
     }
     let zone = provenance
         .zone
@@ -497,7 +721,7 @@ pub fn note_fleet_dns(zone: Option<String>, name: Option<String>) -> bool {
     if newly_named {
         refresh_installed_state();
     }
-    provenance_accepted
+    true
 }
 
 fn cert_dir() -> PathBuf {
@@ -633,7 +857,11 @@ fn merge_recovered_fleet_names(
     }
     for name in recovered_names {
         if let Some(zone) = fleet_zone_from_exact_name(&name) {
-            provenance.known_zones.push(zone);
+            provenance.provenance_incomplete |= !insert_bounded_provenance_entry(
+                &mut provenance.known_zones,
+                zone,
+                FLEET_ORIGIN_PROVENANCE_MAX_ZONES,
+            );
         } else {
             // A pre-provenance certificate proves an exact historical name,
             // but only the canonical derived fleet-label form proves the
@@ -641,12 +869,12 @@ fn merge_recovered_fleet_names(
             // exact name and fail closed for owner-name classification.
             provenance.provenance_incomplete = true;
         }
-        provenance.known_names.push(name);
+        provenance.provenance_incomplete |= !insert_bounded_provenance_entry(
+            &mut provenance.known_names,
+            name,
+            FLEET_ORIGIN_PROVENANCE_MAX_NAMES,
+        );
     }
-    provenance.known_names.sort();
-    provenance.known_names.dedup();
-    provenance.known_zones.sort();
-    provenance.known_zones.dedup();
 }
 
 #[derive(Debug)]
@@ -749,6 +977,9 @@ fn restore_fleet_origin_provenance_in(cert_dir: &Path) -> RestoredFleetOriginPro
 
 fn register_restored_fleet_origins(provenance: &FleetOriginProvenance) {
     for name in &provenance.known_names {
+        crate::web_tls::register_fleet_server_name(name);
+    }
+    if let Some(name) = provenance.name.as_deref() {
         crate::web_tls::register_fleet_server_name(name);
     }
 }
@@ -2745,6 +2976,110 @@ mod tests {
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         }
         let _ = metadata;
+    }
+
+    #[test]
+    fn fleet_origin_provenance_is_bounded_and_overflow_stays_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..=FLEET_ORIGIN_PROVENANCE_MAX_NAMES {
+            let zone = format!("fleet-{index}.example.test");
+            let name = format!("d-{index:020x}.{zone}");
+            remember_fleet_origin_in(temp.path(), Some(&zone), &name).unwrap();
+        }
+        let restored = load_fleet_origin_provenance_in(temp.path()).unwrap();
+        assert_eq!(
+            restored.known_names.len(),
+            FLEET_ORIGIN_PROVENANCE_MAX_NAMES
+        );
+        assert_eq!(
+            restored.known_zones.len(),
+            FLEET_ORIGIN_PROVENANCE_MAX_ZONES
+        );
+        assert!(restored.provenance_incomplete);
+        assert!(
+            std::fs::metadata(fleet_origin_provenance_path_in(temp.path()))
+                .unwrap()
+                .len()
+                <= FLEET_ORIGIN_PROVENANCE_MAX_BYTES
+        );
+        assert!(is_service_controlled_name_in(temp.path(), "owner.example.test").is_err());
+
+        let restarted = load_fleet_origin_provenance_uncached_in(temp.path()).unwrap();
+        assert!(restarted.provenance_incomplete);
+        assert_eq!(
+            restarted.known_names.len(),
+            FLEET_ORIGIN_PROVENANCE_MAX_NAMES
+        );
+    }
+
+    #[test]
+    fn fleet_origin_provenance_cache_reuses_only_an_exact_file_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_name = "d-00000000000000000000.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), first_name).unwrap();
+        let first = load_fleet_origin_provenance_cached_arc_in(temp.path()).unwrap();
+        let hit = load_fleet_origin_provenance_cached_arc_in(temp.path()).unwrap();
+        assert!(Arc::ptr_eq(&first, &hit));
+
+        let second_name = "d-11111111111111111111.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), second_name).unwrap();
+        let changed = load_fleet_origin_provenance_cached_arc_in(temp.path()).unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed.name.as_deref(), Some(second_name));
+    }
+
+    #[test]
+    fn oversized_fleet_origin_provenance_is_rejected_before_parsing() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fleet_origin_provenance_path_in(temp.path()),
+            vec![b' '; FLEET_ORIGIN_PROVENANCE_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(load_fleet_origin_provenance_in(temp.path())
+            .unwrap_err()
+            .contains("size cap"));
+    }
+
+    #[test]
+    fn uncacheable_provenance_path_is_read_and_fails_closed_instead_of_looking_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fleet_origin_provenance_path_in(temp.path())).unwrap();
+        assert!(
+            load_fleet_origin_provenance_cached_arc_in(temp.path()).is_err(),
+            "an existing path without a cacheable file stamp must be read, not projected as empty"
+        );
+    }
+
+    #[test]
+    fn normalized_v2_provenance_is_rewritten_with_a_durable_incomplete_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let names = (0..=FLEET_ORIGIN_PROVENANCE_MAX_NAMES)
+            .map(|index| format!("d-{index:020x}.fleet.example.test"))
+            .collect::<Vec<_>>();
+        std::fs::write(
+            fleet_origin_provenance_path_in(temp.path()),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION,
+                "zone": "fleet.example.test",
+                "name": names.last().unwrap(),
+                "known_names": names,
+                "known_zones": ["fleet.example.test"],
+                "provenance_incomplete": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let restored = restore_fleet_origin_provenance_in(temp.path());
+        assert!(restored.provenance.provenance_incomplete);
+        let persisted = load_fleet_origin_provenance_uncached_in(temp.path()).unwrap();
+        assert!(persisted.provenance_incomplete);
+        assert_eq!(
+            persisted.known_names.len(),
+            FLEET_ORIGIN_PROVENANCE_MAX_NAMES
+        );
+        assert!(!fleet_origin_provenance_needs_rewrite_in(temp.path()));
     }
 
     #[test]
