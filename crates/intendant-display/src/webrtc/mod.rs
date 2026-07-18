@@ -560,7 +560,7 @@ impl WebRtcPeer {
 /// Personalized display-input authority state for one viewer.
 ///
 /// Wire vocabulary matches the local 5c data-channel protocol exactly
-/// (see `web_gateway.rs::compute_bootstrap_authority_snapshots`). Used
+/// (see `web_gateway/input_authority.rs`). Used
 /// by [`WebRtcPeer::send_authority_state`] for the federated path's
 /// `display_input_authority` data channel — peer broadcasts a
 /// personalized value to each subscribed federated browser.
@@ -599,14 +599,13 @@ impl DisplayInputAuthorityState {
 /// { "t": "display_input_authority_release", "display_id": 0 }
 /// ```
 ///
-/// `display/webrtc.rs` parses these frames off the wire and hands
+/// This module parses these frames off the wire and hands
 /// them to an opaque [`AuthorityChannelHandler`] without applying any
 /// policy. The handler — built outside the transport in
-/// `web_gateway.rs` by the slice that wires the registry — consults
-/// the federated authority registry and decides whether to grant /
-/// release / no-op. Same separation as the existing
-/// `input_handler`: webrtc.rs parses the wire shape, the gate lives
-/// outside.
+/// `web_gateway/input_authority.rs` by the slice that wires the registry —
+/// consults the federated authority registry and decides whether to grant /
+/// release / no-op. Same separation as the existing `input_handler`: this
+/// module parses the wire shape, while the gate lives outside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthorityChannelMessage {
     Request { display_id: u32 },

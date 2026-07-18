@@ -53,7 +53,7 @@ function ui2AugmentApprovalPanel() {
   if (allBtn) {
     allBtn.classList.add('ui2-full-escape');
     allBtn.innerHTML = 'Switch to Full autonomy';
-    allBtn.title = 'The previous "Approve all": flips autonomy to Full — everything runs unattended from here.';
+    allBtn.title = 'The previous "Approve all": flips daemon autonomy to Full. Native explicit Deny rules and hard consent gates remain; external-agent policy has separate caveats.';
   }
 
   // `a` follows the category semantics under the flag. Capture phase so

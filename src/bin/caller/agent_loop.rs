@@ -2251,7 +2251,7 @@ pub(crate) async fn run_agent_loop(
             };
             empty_command_streak = 0;
 
-            // Inject project context and normalize
+            // Normalize legacy command aliases before classification.
             let json_str = finalize_command_batch(json_str);
             // One parse of the final batch answers every per-batch question
             // below (ask-human rail, Xvfb triggers, Activity preview, runtime

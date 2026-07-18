@@ -54,9 +54,14 @@ pub fn home_dir() -> std::path::PathBuf {
 }
 
 /// The Intendant state root — where the daemon keeps session logs, the
-/// session-index cache, recordings, quarantine, leased credentials, access
-/// certs, and every other piece of machine-local daemon state.
-/// `~/.intendant` by default.
+/// session-index cache, recordings, quarantine, leased credentials, and most
+/// other machine-local daemon state. It is `~/.intendant` by default.
+///
+/// Known platform/product exceptions do not use this seam: Windows keeps its
+/// access-certificate/IAM store under the OS data directory, the durable
+/// daemon identity key uses the OS data directory on every platform, and the
+/// current macOS durable Memory plane still hard-codes
+/// `~/.intendant/memory-plane`.
 ///
 /// `$INTENDANT_HOME` overrides the root for the whole process (scratch
 /// daemons, hermetic harnesses, packaged installs): an absolute value is

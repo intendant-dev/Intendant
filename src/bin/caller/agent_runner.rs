@@ -273,9 +273,10 @@ fn scrub_provider_credential_env<'a>(
 ///
 /// `passthrough` holds ASCII-uppercased exact names the user deliberately
 /// exempted via `INTENDANT_ENV_PASSTHROUGH` (comma-separated,
-/// case-insensitive) — e.g. `SSH_AUTH_SOCK` for sessions that must push
-/// over SSH. It exempts names from THIS scrub only; provider credentials
-/// are removed by `scrub_provider_credential_env` regardless.
+/// case-insensitive). It exempts names from THIS controller→runtime scrub
+/// only; the runtime's exec/PTY shell layer applies its own scrub without
+/// this exemption. Provider credentials are removed by
+/// `scrub_provider_credential_env` regardless.
 fn scrub_ambient_credential_env<'a>(
     cmd: &mut Command,
     inherited_names: impl IntoIterator<Item = &'a str>,

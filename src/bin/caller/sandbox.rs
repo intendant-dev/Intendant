@@ -334,11 +334,16 @@ pub(crate) fn path_within_grants(path: &Path, grants: &[PathBuf]) -> bool {
 }
 
 /// Paths the consent flow must never OFFER to grant: the user-secret
-/// directories and the credential files the sandbox exists to protect.
+/// directories and config credential files currently covered by this filter.
 /// On Linux there is no deny layer under a grant (Landlock is
 /// allowlist-only), so a grant here would genuinely open the material —
 /// the consent card simply never proposes it. The edge resolves the live
 /// home/config dirs; the core is parameterized for hermetic tests.
+///
+/// SECURITY TODO: this does not yet cover credential-bearing daemon-state
+/// subtrees or Windows' separate access-cert directory. A denial there can
+/// still produce a consent offer on Linux/Windows. macOS' later Seatbelt deny
+/// protects the state-root paths it knows about.
 pub(crate) fn grant_offer_forbidden(path: &Path) -> bool {
     grant_offer_forbidden_in(path, dirs::home_dir(), dirs::config_dir())
 }
@@ -531,8 +536,9 @@ fn env_or_home_dir(
 }
 
 /// Build caches a standard dev workflow writes even when fully warm.
-/// Without these grants the default-on write sandbox breaks ordinary
-/// builds, which would push users toward `--no-sandbox` wholesale:
+/// Without these grants the default-enabled macOS/Linux write sandbox
+/// breaks ordinary builds, which would push users toward `--no-sandbox`
+/// wholesale:
 /// - cargo home: `cargo` takes its `.package-cache` lock on every
 ///   invocation, so even a fully cached `cargo build` needs the write.
 /// - rustup home: a `rust-toolchain` pin triggers a toolchain install.
@@ -556,8 +562,8 @@ fn toolchain_cache_write_paths(
 impl SandboxConfig {
     /// Build a default config for the given project.
     /// - Read: `/` (everything)
-    /// - Write: project root, the OS scratch dir(s), log directory, home
-    ///   `.intendant`, and the toolchain caches
+    /// - Write: project root, the OS scratch dir(s), session-log roots, and
+    ///   the Unix toolchain caches
     ///   (`toolchain_cache_write_paths`)
     pub fn default_for_project(project_root: &Path, log_dir: &Path) -> Self {
         let mut config = Self::projectless(log_dir);
@@ -567,8 +573,8 @@ impl SandboxConfig {
 
     /// Default config for a daemon with **no project** (projectless): the
     /// same base scope as `default_for_project` minus the project root —
-    /// scratch dirs, log dir, `~/.intendant`, and the toolchain caches
-    /// only. Absence of a project must shrink the write scope, never
+    /// scratch dirs, session-log roots, and the Unix toolchain caches only.
+    /// Absence of a project must shrink the write scope, never
     /// widen it: in particular the daemon's launch cwd is *not* writable.
     pub fn projectless(log_dir: &Path) -> Self {
         // Scratch: the live platform temp dir (honors `TMPDIR`/`%TEMP%` —
@@ -922,9 +928,6 @@ mod tests {
             None
         );
     }
-
-    use super::*;
-
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_write_only_profile_embeds_canonical_write_paths() {

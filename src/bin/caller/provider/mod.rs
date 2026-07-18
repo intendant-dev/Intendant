@@ -988,7 +988,7 @@ pub fn select_cu_provider(
 /// Select a provider for the presence layer (text mode).
 ///
 /// Priority: explicit config > PRESENCE_PROVIDER/PRESENCE_MODEL env > auto-detect.
-/// Auto-detect prefers gemini (gemini-2.5-flash) when GEMINI_API_KEY is set,
+/// Auto-detect prefers gemini (`gemini-3-flash-preview`) when GEMINI_API_KEY is set,
 /// falling back to the cheapest available provider.
 ///
 /// Presence providers receive the presence-native tool set through provider

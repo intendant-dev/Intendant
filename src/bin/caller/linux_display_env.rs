@@ -146,9 +146,9 @@ pub fn ensure_gui_session_env(_context: &str) -> GuiEnvAdoption {
 /// over which an unlocked desktop keyring answers. Adoption
 /// (`ensure_gui_session_env`) still manages the full set on the
 /// controller's own env; only child propagation is filtered, and the spawn
-/// boundaries' scrubs enforce the same line. A user who deliberately wants
-/// the bus in agent shells names it in `INTENDANT_ENV_PASSTHROUGH`, which
-/// exempts it from the runtime spawn scrub so plain inheritance carries it.
+/// boundaries' scrubs enforce the same line. `INTENDANT_ENV_PASSTHROUGH`
+/// can exempt the bus at the controller→runtime boundary, but the runtime's
+/// exec/PTY shell layer independently removes it today.
 #[cfg(target_os = "linux")]
 fn propagated_gui_env_keys() -> impl Iterator<Item = &'static str> {
     GUI_ENV_KEYS

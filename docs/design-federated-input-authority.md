@@ -1,13 +1,23 @@
 # Federated input authority — design
 
+> **Status: implemented historical design.** F-1 through F-3 landed from
+> 2026-04-30 through 2026-05-02. Current source lives in
+> `src/bin/caller/web_gateway/input_authority.rs`,
+> `crates/intendant-display/src/webrtc/`, and
+> `static/app/52-peer-display.js`; current operational documentation is
+> [`docs/src/display-pipeline.md`](src/display-pipeline.md) and
+> [`docs/src/peer-federation.md`](src/peer-federation.md). The future tense
+> below records the staged security review rather than current absence.
+
 ## Goal
 
 Make federated peer displays controllable from the federated browser
-with the same authority semantics as local displays — replacing the
-current `build_federated_input_authorizer() → || false` deny-by-default
-closure. Input authority arbitration on the peer is unified across
-local WS holders and federated WebRTC holders, with explicit
-provenance and no shape-based inference.
+with the same authority semantics as local displays. The landed work
+replaced the former `build_federated_input_authorizer() → || false`
+deny-by-default closure with a registry lookup. Input authority
+arbitration on the peer is unified across local WS holders and
+federated WebRTC holders, with explicit provenance and no shape-based
+inference.
 
 ## Architectural principles
 
@@ -27,7 +37,7 @@ provenance and no shape-based inference.
   duplicate of any existing one.
 - **Federated input reuses the existing `control` / `pointer`
   channels** with raw `InputEvent` JSON. The peer's existing
-  `display/webrtc.rs::handle_message` parser dispatches on
+  `crates/intendant-display/src/webrtc/` parser dispatches on
   `control | pointer` as `InputEvent` and calls an `input_handler`
   closure; that closure's predicate is what changes from
   deny-by-default to a registry lookup. No new `display_input`
@@ -100,7 +110,7 @@ overloading.
 Federated input events flow on `control` and `pointer` data channels
 on the federated `PeerDisplayConnection`. The wire format is the
 existing raw `InputEvent` JSON used by local DisplaySlot today —
-parsed by `display/webrtc.rs::handle_message` as `InputEvent`, e.g.:
+parsed by `crates/intendant-display/src/webrtc/` as `InputEvent`, e.g.:
 
 ```json
 { "t": "kd", ... }     // key-down
@@ -209,7 +219,7 @@ authority messages.
 ## Server→browser send path for authority state
 
 Mirrors the existing `Command::SendClipboard` pattern in
-`display/webrtc.rs`:
+`crates/intendant-display/src/webrtc/`:
 
 - New driver command: `Command::SendAuthorityState { display_id, state }`.
 - Public method on `WebRtcPeer`: `send_authority_state(display_id, state) -> Result<bool>`,
@@ -339,6 +349,8 @@ check is UX courtesy only.
   to `unclaimed` within ~1s (WebRtcPeer drop edge).
 
 ## Slice boundaries
+
+All three slices in this historical plan landed.
 
 | Slice | Scope | Ships |
 |---|---|---|

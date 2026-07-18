@@ -6,7 +6,7 @@ Design constraints, matching docs/src/credential-custody.md:
 - Events carry metadata only — kinds, labels, principals, timings.
   Credential material never enters this module.
 - The trail is daemon-local truth: it lives beside the daemon
-  (~/.intendant/custody-audit.jsonl, 0600) and is served only over the
+  (<state-root>/custody-audit.jsonl, 0600 on Unix) and is served only over the
   credentials.manage-gated dashboard control channel. Nothing here is
   pushed to the rendezvous.
 - Bounded: a small in-memory tail serves queries; the JSONL file is

@@ -18,13 +18,18 @@ Use this when you need to know where evidence lives and what each artifact can p
 
 ## Roots and Session Identity
 
-Default session root:
+State root and default session root:
 
 ```text
-~/.intendant/logs/<uuid>/
+IHOME=${INTENDANT_HOME:-$HOME/.intendant}
+$IHOME/logs/<uuid>/
 ```
 
-The controller can override this with `--log-file <DIR>`. At startup it prints `Session log: <dir>/session.jsonl` and `Session ID: <id>`. The runtime receives the directory through `INTENDANT_LOG_DIR`.
+`INTENDANT_HOME` replaces the entire `~/.intendant` state root when set; it
+does not add another `.intendant` component. The controller can override one
+session directory with `--log-file <DIR>`. At startup it prints `Session log:
+<dir>/session.jsonl` and `Session ID: <id>`. The runtime receives the directory
+through `INTENDANT_LOG_DIR`.
 
 If `SessionLog::open()` cannot create/open the requested dir, startup may fall back to `/tmp/intendant_session`.
 
@@ -229,7 +234,7 @@ Uploads:
 
 Wrapper logs:
 
-- External Codex and Claude Code sessions also get Intendant wrapper dirs under `~/.intendant/logs/<uuid>/`.
+- External Codex and Claude Code sessions also get Intendant wrapper dirs under `$IHOME/logs/<uuid>/`.
 - The wrapper `session.jsonl` normalizes backend activity into Intendant events.
 - `session_identity` rows map wrapper id to backend-native id.
 - `session_agent_config.json` persists launch config: `source`, `project_root`, `agent_command`, Codex sandbox/approval/managed-context/service-tier values, `codex_context_archive`, and `codex_home`.
@@ -237,7 +242,7 @@ Wrapper logs:
 Global wrapper index:
 
 ```text
-~/.intendant/external_wrapper_index.json
+$IHOME/external_wrapper_index.json
 ```
 
 Schema:
@@ -247,8 +252,8 @@ Schema:
 
 Other global session overlays:
 
-- `~/.intendant/session_names.json`: external session display-name overrides, keyed by source and session id.
-- `~/.intendant/deleted_external_sessions.json`: external sessions hidden/deleted in the dashboard, keyed by source to arrays of ids. Dashboard deep search filters parent references to these ids.
+- `$IHOME/session_names.json`: external session display-name overrides, keyed by source and session id.
+- `$IHOME/deleted_external_sessions.json`: external sessions hidden/deleted in the dashboard, keyed by source to arrays of ids. Dashboard deep search filters parent references to these ids.
 
 Codex native logs:
 
@@ -328,11 +333,11 @@ If behavior changes, start with these files instead of rediscovering the whole r
 - `src/agent.rs`: sandboxed runtime log files, screenshot files, `askHuman` temp files, stdout/stderr tailing.
 - `src/bin/caller/main.rs`: controller session creation/resume, daemon log tee install, runtime env, frame/recording/file-watcher setup.
 - `src/bin/caller/session_supervisor/`: daemon-created sessions, related sessions, external resume/attach flows.
-- `src/bin/caller/web_gateway.rs`: dashboard session list/search/detail/replay, external native log discovery, deleted-session filtering.
+- `src/bin/caller/web_gateway/session_catalog/`: dashboard session list/search/detail/replay, external native log discovery, deleted-session filtering.
 - `src/bin/caller/external_wrapper_index.rs`: global backend-id to wrapper-log index.
 - `src/bin/caller/session_config.rs`: `session_agent_config.json` and effective Codex home.
-- `src/bin/caller/external_agent/mod.rs` and `src/bin/caller/external_agent/codex.rs`: normalized external-agent events, Codex rollout/context trace behavior.
-- `src/bin/caller/frames.rs`: `frames/frames.jsonl` and saved JPEGs.
+- `src/bin/caller/external_agent/mod.rs` and `src/bin/caller/external_agent/codex/`: normalized external-agent events, Codex rollout/context trace behavior.
+- `crates/intendant-core/src/frames.rs`: `frames/frames.jsonl` and saved JPEGs.
 - `src/bin/caller/recording.rs`: recording manifests, segment CSVs, ffmpeg logs, empty recording deletion.
 - `src/bin/caller/file_watcher.rs`: `file_snapshots/`, `history.json`, rollback/redo/prune behavior.
 - `src/bin/caller/context_rewind.rs` and `src/bin/caller/fission_ledger.rs`: managed-context rewind/fission sidecars.

@@ -26,7 +26,7 @@ managed-instructions mechanism.
 ### Arm A — generic managed policy (control)
 
 Exactly the policy as merged: `MANAGED_CONTEXT_DEVELOPER_INSTRUCTIONS` in
-`src/bin/caller/external_agent/codex.rs`, whose fission section already says
+`src/bin/caller/external_agent/codex/mod.rs`, whose fission section already says
 (verbatim, the relevant lines):
 
 > Fission (full-context branch spawning), when fission tools are available:
@@ -67,8 +67,9 @@ exactly where a real deployment would put it.
 ## Delivery mechanism (verified in source)
 
 `<working_dir>/.intendant/codex-managed-instructions.md` is the **existing**
-per-project extension point for managed sessions —
-`src/bin/caller/external_agent/codex.rs`:
+per-project extension point for managed sessions. `start_thread()` lives in
+`src/bin/caller/external_agent/codex/mod.rs`; the instruction-composition
+helpers live in `src/bin/caller/external_agent/codex/threads.rs`:
 
 - `start_thread()` → `effective_managed_context_developer_instructions()`
   (only when `managed_context` is on) →

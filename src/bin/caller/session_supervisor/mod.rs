@@ -197,7 +197,7 @@ pub struct SubAgentSpawnParams {
     /// Isolate the child in a fresh git worktree branched off the parent
     /// project's HEAD.
     pub worktree: bool,
-    /// Inject the project knowledge store into the child's conversation.
+    /// Optional caller-selected name for the child session.
     pub name: Option<String>,
 }
 

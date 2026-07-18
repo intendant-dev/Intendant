@@ -1,5 +1,10 @@
 # Computer Use live E2E findings — 2026-07-13
 
+> **Historical test record.** The executive verdict below describes the
+> 2026-07-13 binary, not current `main`. The 2026-07-15 disposition addendum
+> records the CU fixes; a 2026-07-18 note below records the later Agenda
+> surface that closed the deferred owner-follow-up gap.
+
 ## Executive result
 
 **Verdict: partial pass with one high-priority core-input defect and one high-priority readiness/reporting defect.**
@@ -215,3 +220,12 @@ Every finding above was triaged into the 2026-07-13/14 CU program (PRs #302–#3
 | EV-02 no version provenance | **Fixed** (#302): `--version`/`-V` on both binaries (version, commit, build timestamp, target triple) and `daemon_version` in `ctl status`. |
 
 The same program also landed the architecture-comparison items that sat behind these findings: `observe: pixels|ax|auto|none` on `execute_cu_actions`, lazy single-encode screenshots, bounded `settle` quiescence reporting, and per-batch CU metrics (#306, #307).
+
+### Owner-follow-up update — 2026-07-18
+
+EV-01's broader owner-retrieval lane now exists as the machine-wide
+**Agenda**: agents can park durable notes, tasks, non-blocking questions, due
+reminders, and owner-approved scheduled-session manifests with `intendant ctl
+agenda` (also exposed through MCP, HTTP/tunnel, and the dashboard). Session
+notes remain transcript-local evidence; Agenda is the cross-session owner
+follow-up surface the original disposition said was still planned.

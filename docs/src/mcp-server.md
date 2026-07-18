@@ -2,9 +2,10 @@
 
 The `--mcp` flag runs Intendant as a [Model Context Protocol](https://modelcontextprotocol.io/)
 server over stdio JSON-RPC (`src/bin/caller/mcp/`). It lets an external agent
-(Claude Code, Codex, etc.) observe and control Intendant: every action a human
-can take in the dashboard is exposed as an MCP tool, plus display/CU/frame
-tools, live audio, and a controller-orchestration surface.
+(Claude Code, Codex, etc.) observe and control Intendant through a broad
+operational tool surface: session actions, display/CU/frame tools, shared-view
+collaboration, live audio, managed context, and controller orchestration.
+Presentation-only dashboard affordances are not necessarily one-for-one tools.
 
 Architecturally the MCP server is a **frontend peer of the dashboard**: it
 subscribes to the same `EventBus`, and user intents are
@@ -53,16 +54,22 @@ Add Intendant to your MCP client config (Claude Code
 The full MCP tool surface (dispatched in `call_tool_by_name`) is broad. For
 model clients that front-load tool schemas into every request, prefer the
 HTTP transport's `tool_profile=core` query parameter and the `intendant ctl`
-CLI for lazy discovery. `tool_profile=core` advertises the bootstrap set:
-status, shared-view collaboration, and the minimal real-display/CU tools
-(`list_displays`, `grant_user_display`, `request_user_display`,
-`revoke_user_display`, `read_screen`,
-`take_screenshot`, `execute_cu_actions`) — managed and vanilla alike; managed
-context additionally advertises the managed-context rewind/backout and fission
-tools. Omitting `tool_profile` keeps the historical full tool list. Profile
-filtering applies to `tools/list` only — hidden tools remain callable (that
-is the lazy `ctl tools call` path). *Authorization* is separate: see the next
-section.
+CLI for lazy discovery. `tool_profile=core` advertises `get_status`; the
+agent-to-user collaboration primitives (`post_session_note`, `ask_user`,
+`notify_user`); Agenda and Memory list/read/propose tools; the shared-view
+tools; and the minimal real-display/CU set (`list_displays`,
+`grant_user_display`, `request_user_display`, `revoke_user_display`,
+`take_screenshot`, `read_screen`, `execute_cu_actions`,
+`display_readiness`) — managed and vanilla alike. Managed context additionally
+advertises rewind/backout and fission tools. Omitting `tool_profile` keeps the
+historical full tool list. Profile filtering applies to `tools/list` only —
+hidden HTTP tools remain callable (the lazy `ctl tools call` path).
+*Authorization* is separate: see the next section.
+
+The tables below describe the full daemon HTTP MCP surface as well as the
+stdio-backed tools. Bare `--mcp` stdio mode does not carry the daemon's Agenda
+or Memory service handles and does not advertise those HTTP-only definitions;
+the wired daemon `/mcp` surface is the shape that exposes them.
 
 ### /mcp authorization
 
@@ -208,24 +215,84 @@ Full MCP tool groups:
 | `notify_user`   | Fire-and-forget **notification** to the user; returns immediately, renders as a dashboard toast plus a transcript row (persisted for replay), never enters model context. `urgency` escalates delivery: `info` (default) dashboard-only; `attention` + tab badge and hidden-tab browser notification; `urgent` + an immediate content-free push nudge to the owner's opted-in browsers. Cap: 4 KB text. Also `intendant ctl notify`. | `text`, `title?`, `urgency?` (`info`/`attention`/`urgent`), `session_id?` |
 | `set_autonomy`  | Set autonomy. Denied to agent-session callers — the setting is daemon-global. | `level`: `low`/`medium`/`high`/`full` |
 | `set_verbosity` | Set log verbosity. | `level`: `quiet`/`normal`/`verbose`/`debug` |
-| `start_task`    | Start a new agent task (also used as follow-up when waiting). | `task` |
+| `start_task`    | Start work, route a follow-up to `session_id`, or resume a persisted external-agent wrapper. A non-empty `reference_frame_ids` list is the supervisor's CU-routing gate; `display_target` selects the display for that grounded request but is not sufficient by itself. | `task`, `session_id?`, `orchestrate?`, `reference_frame_ids?`, `display_target?` |
 | `quit`          | Shut down the agent. | — |
+
+`start_task` currently has two routing caveats. A new-session CU request needs
+at least one frame id that resolves in the frame registry: a `display_target`
+alone, or only stale/unknown frame ids, is accepted and acknowledged as “CU
+task dispatched” by the MCP edge but falls through to an ordinary task in the
+supervisor. With `session_id`, any supplied frame ids and `display_target` are
+discarded and only the text is routed as a follow-up. Treat those acknowledgments
+as enqueue acknowledgments, not proof that grounded CU started; both behaviors
+are tracked implementation defects.
+
+### Agenda & Memory
+
+Agenda is the durable, append-only parking ledger; Memory is a bounded
+provenance-labeled claim plane. Both render their text as quoted data, never
+instructions. Agenda effect approval/revocation is owner-only even though
+agents and peers may propose an effect. Memory proposals enter the candidate
+lane; this slice exposes no judgment command.
+
+| Tool | Description | Params |
+|------|-------------|--------|
+| `agenda_list` | List oldest-first items plus Open / Done / Retired counts; optionally filter by status. | `status?` |
+| `agenda_op` | Apply one tagged operation: `add`, `answer`, `patch`, `complete`, `reopen`, `retire`, `propose_effect`, `approve_effect`, or `revoke_effect`. | operation-specific `op` shape |
+| `memory_search` | Bounded claim search (default 10, maximum 50); candidates are excluded unless explicitly requested. Responses report effective durability. | `query?`, `limit?`, `include_candidates?` |
+| `memory_read` | Read one claim by an id prefix of at least eight hex characters. | `id` |
+| `memory_propose` | Propose a typed, sensitivity-labeled candidate. Authorship comes from the gate-bound caller, not writer-supplied context fields. | `kind`, `statement`, `sensitivity?`, `session?`, `project?`, `model?`, `labels?` |
 
 ### Display, computer use & frames
 
 | Tool                 | Description | Params |
 |----------------------|-------------|--------|
 | `list_displays`      | Enumerate displays with their session state. | — |
-| `take_display`       | Take control of a display. | `display_id` |
+| `take_display`       | Optional dashboard signal that an agent is using a display; it neither grants input authority nor is required before screenshot/CU calls. | `display_id` |
 | `release_display`    | Release control of a display. | `display_id`, `note?` |
 | `grant_user_display` | Grant access to the user's real display session (owner surfaces only — this call *is* the opt-in); on Wayland, enable **Allow Remote Interaction** in the GNOME portal before clicking **Share** so CU input works. | `display_id?` |
 | `request_user_display` | Ask the user for their display: raises the dashboard doorbell popup with your reason and blocks for their click — the only thing that can grant it (never auto-approved; see [Autonomy — the display request rail](./autonomy.md#the-display-request-rail-doorbell)). `access="view"` shares the stream without CU input; `"view_and_control"` requests the full grant. | `reason`, `access?`, `wait_seconds?`, `session_id?` |
 | `revoke_user_display` | Revoke access to the user's real display session. | `display_id?`, `note?` |
 | `take_screenshot`    | Capture a screenshot (returns image content). | display params |
-| `read_screen`        | Frontmost app's accessibility element tree — cheap textual grounding (macOS user session). | `display_target?`, `format?` |
+| `read_screen`        | User session's frontmost-app accessibility tree — macOS AX, Linux AT-SPI, or Windows UIA. | `display_target?`, `format?`, `full_values?` |
+| `display_readiness`  | Probe display authority, capture/accessibility permission, target availability, and input backend live; names each missing layer. | `display_target?` |
 | `execute_cu_actions` | Run a batch of [computer-use](./computer-use-and-audio.md) actions. | CU action params |
 | `list_frames`        | List captured video frames. | filter params |
 | `read_frame`         | Read a specific frame. | `frame_id` |
+
+### Shared-view collaboration
+
+These tools control the agent-owned display presentation the user sees. They
+do not silently grant keyboard/mouse authority: in particular,
+`request_shared_view_input` only raises an advisory request and the user must
+click the dashboard control.
+
+| Tool | Description | Params |
+|------|-------------|--------|
+| `show_shared_view` | Open/foreground a shared display, optionally with an initial highlighted region. | `display_target?`, `display_id?`, `reason?`, `focus_region?` |
+| `hide_shared_view` | Dismiss the shared-view banner and focus overlay. | `reason?` |
+| `focus_shared_view` | Highlight a normalized region and optional note. | `region`, `display_target?`, `display_id?`, `note?` |
+| `clear_shared_view_focus` | Clear only the focus annotation; safe when none exists. | `reason?` |
+| `request_shared_view_input` | Ask the dashboard user to take input authority; never grants it. | `display_target?`, `display_id?`, `reason?` |
+| `capture_shared_view_frame` | Foreground the shared view and return its current frame as an MCP image. | `display_target?`, `display_id?`, `reason?` |
+
+### Managed context & fission
+
+These definitions are advertised only for sessions whose Codex managed-context
+mode is enabled; calls against a vanilla session fail with an explicit
+disabled-mode error. Rewind tools operate on exact Codex item ids. Fission
+forks the completed-turn context into real sibling sessions and records their
+group/canonical state in the lineage ledger.
+
+| Tool | Description | Params |
+|------|-------------|--------|
+| `list_rewind_anchors` | Return bounded exact rewind anchors, with optional paging/search and density/recovery estimates. | `session_id?`, paging/filter/density flags |
+| `inspect_rewind_anchor` | Inspect a compact window around one exact anchor. | `item_id`, `session_id?`, `radius?` |
+| `rewind_context` | Schedule rollback to `anchor.position` (`before`/`after`) and inject a required carry-forward primer. | `anchor`, `reason`, `primer`, `session_id?`, `preserve?`, `discard?`, `artifacts?`, `next_steps?` |
+| `rewind_backout` | Inspect, restore, or fork/back out a prior rewind record. | `record_id`, `session_id?`, `mode?`, `name?` |
+| `fission_spawn` | Fork 1–4 full-context sibling branches; write-scoped branches use isolated worktrees by default. | `branches`, `session_id?`, `use_worktree?` |
+| `fission_control` | `wait`, `import`, `cancel`, or `detach` one fission branch/group. | `group_id`, `op`, `session_id?`, `branch_session_id?`, `timeout_s?` |
+| `claim_fission_canonical` | Claim or compare-and-swap the group's canonical continuation. | `group_id`, `branch_session_id`, `expected_canonical_session_id?` |
 
 ### Browser workspaces
 

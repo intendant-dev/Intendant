@@ -31,8 +31,8 @@ pub enum MessageProvenance {
     Steer,
     /// An accepted askHuman answer.
     AskHumanAnswer,
-    /// Controller-injected context (working dir, memory, skills, frame
-    /// preludes, nudges, acks) — never user-authored.
+    /// Controller-injected context (working directory, project instructions,
+    /// skills, frame preludes, nudges, acks) — never user-authored.
     SystemInjection,
     /// Tool or agent output, including external-agent stdout wrapped as a
     /// user message and synthetic results from tool-call repair.

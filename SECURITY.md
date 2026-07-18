@@ -32,6 +32,10 @@ Highest-value reports, roughly in order:
   immutable `role:none`, fleet-name (discovery-only) origins reaching
   control surfaces, grant/role/ceiling bypasses, org-document or
   revocation-list forgery.
+- **Owner state** — owner-plane writer/reducer disagreement, forged Memory
+  admission or provenance, durable-store custody/corruption failures, or an
+  Agenda scheduled session launching without owner approval of the exact
+  manifest digest.
 - **Credential custody** — vault unsealing without the owner, lease
   escalation or exfiltration, leaking materialized OAuth files beyond
   their documented lifetime.

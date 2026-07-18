@@ -5,9 +5,9 @@
 //! spawn_user_display_listener (the grant/revoke event listener that
 //! drives activate/deactivate here) stays in main.rs: moving that one
 //! fn into any module trips ~20 rustc 1.94.0 dead-code false positives
-//! across display/, event.rs, frames.rs (bisected 2026-07-05; import
-//! style, glob re-export, and visibility ruled out). Move it here when
-//! a newer toolchain stops misfiring.
+//! across `intendant-display`, event.rs, and `intendant-core::frames`
+//! (bisected 2026-07-05; import style, glob re-export, and visibility
+//! ruled out). Move it here when a newer toolchain stops misfiring.
 
 // Same entangled class as the drain (external_events.rs): keeps the
 // crate-root view it was written against. Narrowing to named imports

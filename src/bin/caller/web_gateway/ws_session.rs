@@ -1611,7 +1611,7 @@ pub(crate) async fn ws_inbound_task(
                             // returns true when this connection is the
                             // authority holder OR when the display has no
                             // holder (unclaimed = pre-phase-5 default).
-                            // `display/mod.rs` only sees this boolean; it
+                            // `intendant-display` only sees this boolean; it
                             // never learns about DisplayInputHolder, the
                             // map, or connection IDs.  See
                             // [`build_local_ws_input_authorizer`] for the

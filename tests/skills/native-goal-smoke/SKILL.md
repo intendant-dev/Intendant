@@ -10,7 +10,7 @@ running in `run_with_presence`) against real binaries with the scripted mock
 provider — no API keys, no network, ~5 seconds.
 
 ```bash
-cargo build --release
+cargo build --release --bin intendant --bin intendant-runtime
 node tests/skills/native-goal-smoke/driver.cjs "$PWD/target/release/intendant"
 ```
 

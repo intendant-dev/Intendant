@@ -9,7 +9,7 @@ on the host, never in these files.**
 
 ## fleet-watchdog
 
-The in-job disk preflight (windows.yml / smokes.yml) fails a job
+The in-job disk preflight (`windows.yml`) fails a job
 *after* the queue assigned it — a full disk burns whole speculative
 merge-queue entries (seven macOS validations died at 18G free on
 2026-07-10). The watchdog acts *before* assignment, as root, every
@@ -275,7 +275,10 @@ is re-read by every invocation (and once per poll tick by in-flight
 waiters — link-slot waiters included), so
 `/usr/local/etc/intendant-governor.toml` is live: flipping
 `enabled = false` drains the governor within ~100ms, no listener
-restarts. Observability: one acquisition line per *governed* invocation
+restarts. `INTENDANT_GOVERNOR_CONFIG` overrides that path; acceptance tests use
+it to point the wrapper at a tempdir rig, and operators can use it for a
+deliberately isolated diagnostic invocation. Observability: one acquisition
+line per *governed* invocation
 in `<permit_dir>/governor.log` — timestamp, pid, class, crate,
 `kind=compile` / `kind=link link_slot=… link_wait_ms=…` /
 `kind=link-ungated reason=off|degraded`, permit, wait_ms — plus one
@@ -583,8 +586,8 @@ connects time out". Empty port (default) disables it.
 
 - The workflow cache steps and this watchdog share the cache layout
   contract: per-listener key dirs with a `.last-used` marker. Change
-  one, change both (windows.yml / smokes.yml "External cargo target
-  dir" steps ↔ `fleet-watchdog.sh` prune/evict).
+  one, change both (`windows.yml` "External cargo target dir" steps ↔
+  `fleet-watchdog.sh` prune/evict).
 - The in-job preflight floor (20G) is deliberately BELOW `STOP_GB`:
   the watchdog should pause listeners long before any job can see a
   sub-floor disk, leaving the preflight as the backstop for the

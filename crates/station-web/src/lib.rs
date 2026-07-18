@@ -791,8 +791,9 @@ impl StationInner {
     }
 
     /// One persistent rAF callback drives rendering. `schedule_frame` arms it
-    /// after any state change; the tick re-arms itself only while something
-    /// is actually animating, so an idle station costs zero CPU.
+    /// after any state change; the tick re-arms itself while something is
+    /// animating. The Canvas2D fallback parks when idle, while active WebGPU
+    /// keeps a present-only loop alive to preserve the compositor surface.
     fn start_loop(inner: Rc<RefCell<Self>>) {
         let loop_inner = inner.clone();
         let cb = Closure::wrap(Box::new(move |time_ms: f64| {

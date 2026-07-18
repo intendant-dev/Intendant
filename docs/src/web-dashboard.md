@@ -5,7 +5,8 @@ served by the controller's built-in HTTP/WebSocket gateway, running entirely in
 the browser with WASM-powered state management (the `presence-web` crate,
 mobile-responsive). Since the design-overhaul flip the default look is the
 **v2 chrome** (Iris accent: left navigation rail, oversight bar, ⌘K command
-palette, bottom composer). Dark is the default theme; a **light theme** ships
+palette, bottom composer); Activity uses its newer v3 presentation inside that
+permanent `html.ui-v2` namespace. Dark is the default theme; a **light theme** ships
 alongside it (Settings → Appearance, or the ⌘K theme toggle — browser-scoped,
 persisted per browser). The previous Catppuccin Mocha generation and its
 `?ui=v1` escape hatch were deleted after the soak period. The SPA is served as one
@@ -42,7 +43,7 @@ open `https://<host>:<port>/` in a browser after running
 > `--mcp`". Earlier docs described `--web` as opt-in and tied to MCP mode —
 > neither is true now.
 
-## Secure Browser Contexts
+## Secure Browser Contexts and LAN Access
 
 The dashboard shell, Activity log, Sessions, Settings, and basic display viewing
 can run over ordinary HTTP. Some browser capabilities are different: browsers
@@ -92,15 +93,22 @@ the idle daemon loop.
 
 ## Tabs
 
-The v2 chrome groups eleven destinations in the left navigation rail —
-**Activity** and **Sessions** (Work), **Live display** and **Station** (Watch),
-**Terminal** and **Files** (Machine), **Usage** (Insight), **Access** and
-**Vault** (Trust), **Settings** and **Debug** (System). The oversight bar on
-top carries the phase pill, stop control, context meter, transport state, the
-Activity Focus/Grid layout toggle, and the ⌘K command palette; the composer —
-the global task input — docks at the bottom and reaches the daemon from any
-destination. New events arriving while you are elsewhere raise a badge on the
-rail item.
+The v2 chrome groups thirteen destinations in the left navigation rail —
+**Activity**, **Sessions**, **Agenda**, and **Memory** (Work), **Live display**
+and **Station** (Watch), **Terminal** and **Files** (Machine), **Usage**
+(Insight), **Access** and **Vault** (Trust), **Settings** and **Debug**
+(System). The oversight bar on top carries the phase pill, stop control,
+context meter, transport state, and the ⌘K command palette. Activity's own
+header carries its five-view switch and Timeline-only session/layout controls;
+the composer — the global task input — docks at the bottom
+and reaches the daemon from any destination. New events arriving while you are
+elsewhere raise a badge on the rail item.
+
+On content-heavy destinations the composer can collapse to a compact pill and
+expand in place; each tab remembers its own state. Its target switcher can move
+the prompt to another live session without leaving the current destination, and
+the conversation peek mirrors the target transcript's latest 12 entries
+read-only, updates live, and links back to the full Activity view.
 
 The section headings below keep the internal pane names (`Video` is the Live
 display destination, `Stats` is Usage) — ids, routes, and deep links are
@@ -156,11 +164,12 @@ JSON-serializable snapshot. Current probes: `qa.sessionsHydration()`
 (sessions-tab relationship-hydration termination, `40-session-launch.js`),
 `qa.sessionsFuel()` (new-session credential preflight,
 `55b-session-launch.js`), `qa.newSessionAgentPrefs()` (last-used
-launch-option prefill state, same fragment),
-and `qa.station()` — a pointer to `window.stationProbe`, which predates the
-namespace and keeps its legacy name (the validator's `--station-*` probes
-and smoke skills depend on it). `window.__intendantPaneDiag` above is the
-other legacy surface.
+launch-option prefill state, same fragment), `qa.focusSurface()` (Activity
+Focus target/promotion state), `qa.minimizeDone()` (sub-agent auto-minimize
+and bulk-control state), and `qa.station()` — a pointer to
+`window.stationProbe`, which predates the namespace and keeps its legacy name
+(the validator's `--station-*` probes and smoke skills depend on it).
+`window.__intendantPaneDiag` above is the other legacy surface.
 
 `scripts/validate-dashboard.cjs` reads probes back without a bespoke sink
 via the repeatable `--probe-json EXPR` flag (optional `label=EXPR` form):
@@ -178,36 +187,43 @@ node scripts/validate-dashboard.cjs --url "http://127.0.0.1:<port>/#sessions" \
 
 ### Activity
 
-The default tab, and the classic DOM control surface. It remains fully
-supported as the legacy fallback (the accessibility floor, the low-GPU path,
-and the surface most automation drives today), but [Station](./station.md)
-is the designated canonical control surface going forward.
+The default tab and the dashboard's canonical DOM control surface. Activity v3
+re-presents the established behavior in a calmer card/timeline language while
+retaining the accessibility floor, low-GPU path, stable element ids, deep
+links, and automation hooks. [Station](./station.md) is the rendered-canvas
+alternative and immersive roadmap; both dispatch through the same control
+plane.
 
-Five subtabs:
+Five visible views (the first retains the internal `log` id for compatibility):
 
-- **Log** — a scrollable, color-coded event stream of everything in the system,
-  grouped by turn with visual separators, with a verbosity selector
-  (Normal/Verbose). Event sources are color-coded:
+- **Timeline** — a scrollable event stream of everything in the system,
+  grouped by centered turn separators. User prose, worker/command activity,
+  and system metadata have distinct reading tiers; the **Options** popover
+  carries Normal/Verbose/Debug density plus the host filter. Event sources
+  remain classified as:
   - **system** — session lifecycle, approvals, context management
   - **worker** — model responses, reasoning summaries, task completion
   - **agent** — command execution output (stdout/stderr, exit codes)
   - **live** — voice transcripts, presence lifecycle, tool requests
   - **server** — presence model internals (thinking, tool calls)
 
-  Under v2 the Log pane has two layouts, toggled from the oversight bar and
-  persisted per browser: **Focus** (the default) shows the combined stream as
-  one centered timeline with role eyebrows, and on wide viewports a vitals
-  rail for the foreground session (working tree, context budget, prompt
-  cache, rate limits, changes); **Grid** shows the classic per-session
-  window grid with relationship wires and the concurrent stream below.
+  The Activity header carries two layouts, persisted per browser. **Focus**
+  (the default) promotes the selected/prompt-target session's existing,
+  hydrated session window as the timeline; with no target it falls back to
+  the combined all-session stream. On wide viewports a vitals rail follows
+  the foreground session (working tree, context budget, prompt cache, rate
+  limits, changes). **Grid** shows the per-session window grid with
+  relationship wires and the concurrent stream below. The same header holds
+  the session switcher and context-sensitive **Minimize done** control.
 
-  The Log pane also carries the approval card. **Approve** clears the
+  Timeline also carries the approval card. **Approve** clears the
   pending command once; **Approve all like this** sets that approval
   category's rule to `auto` (the shipped per-category machinery, scoped and
   revocable in Settings) and then approves; **Switch to Full autonomy** is
-  the old approve-all — it lifts every gate, and is labeled for what it is.
-  Skip and Deny complete the set (`y` / `a` / `s` / `n`). A follow-up text
-  input sends a message after a round completes.
+  the old native approve-all and is labeled for its broader, daemon-wide
+  scope. Explicit native `deny` rules and hard human/live-audio gates still
+  remain. Skip and Deny complete the set (`y` / `a` / `s` / `n`). A follow-up
+  text input sends a message after a round completes.
 
   Pending requests also escalate beyond the open tab (the **attention
   center**, `static/app/57-attention-notifications.js`): every pending
@@ -257,6 +273,14 @@ the tab is hidden) — early enough that a follow-up still reuses the warm
 cache, never after the fact. Sections appear as producers fill them; the
 chip hides in narrow windows. Station's agent focus panel shows the same
 vitals as git / cache / limits rows.
+
+When a backend announces background commands (currently Claude Code's
+wire-reported task registry), the activity explainer inside that vitals panel
+adds a **Background tasks** list. A task with an announced output file gets a
+read-only output viewer: it requests the last 64 KiB by task id, refreshes
+about every 2 s while the task is running, and stops polling at a terminal
+state. The server resolves ids through its registry and caps any requested tail
+at 256 KiB; the browser never supplies an arbitrary file path.
 
 #### Managed (Activity → Managed)
 
@@ -331,6 +355,38 @@ Rewind, backout, inspect, and fission spawn stay disabled unless the selected
 session is live and effectively managed. The pane refreshes when the Managed
 subtab is opened and re-schedules itself (only while the subtab is active)
 after each pane action, thread-action result, session start, and usage update.
+
+### Agenda
+
+A durable daemon ledger for intent that must outlive the current model context:
+tasks, notes, questions, and deferred follow-ups. The tab can add items, filter
+Open / Done / Retired / All, answer questions, complete, reopen, or retire
+entries, and tune due-reminder delivery (including quiet hours and per-item
+urgency). Bodies and answers are rendered as quoted data, never executed as
+instructions. The same cache feeds a compact Activity card and refreshes over
+the live `agenda_changed` lane.
+
+Agenda also carries proposed scheduled-session effects. Agents may propose a
+goal and fire time, but no work runs until an owner surface approves the exact
+manifest digest shown in the tab; revising a proposal invalidates the prior
+approval. The eventual session outcome is written back onto the item.
+
+### Memory
+
+The Memory explorer searches the daemon's bounded claim plane and proposes
+typed claims (`observation`, `decision`, `episode`, `procedure`, or
+`preference`) with an explicit sensitivity. Results show derived status,
+labels, provenance, and claim details; candidates are normally excluded by
+the service but the review-oriented dashboard opts into them by default and
+offers a visible toggle. Statements are quoted data, never instructions, and
+`memory_changed` refreshes the filtered server-side query.
+
+Every response reports the effective storage mode. On the current primary-OS
+daemon (macOS), the normal durable plane survives daemon restarts under
+`~/.intendant/memory-plane`; other platforms, the
+`INTENDANT_MEMORY_EPHEMERAL=1` kill switch, or a failed durable bootstrap use
+an honestly labeled ephemeral plane. Memory does not yet sync claims across
+machines.
 
 ### Stats
 
@@ -465,9 +521,14 @@ Sessions, Peers/displays, and Control. The `station-web` crate draws the whole
 scene into a single canvas: WebGPU when the browser exposes it (a secure
 context is required — see Secure Browser Contexts above), with a canvas-2D
 WASM fallback used automatically when WebGPU is unavailable or forced with
-`?station_gpu=canvas`. The renderer runs on `requestAnimationFrame` and
-re-renders only when state or view input changes, so an idle Station stays
-cheap.
+`?station_gpu=canvas`. One persistent `requestAnimationFrame` callback is
+armed while Station is active and has work to animate. Explicit state changes
+and the 150 ms interaction window paint at display rate; ambient presentation
+is capped at about 30 fps, with full breathing-HUD raster work throttled to
+about 10 fps and live video thumbnails refreshed by small `drawImage` calls.
+With motion set to zero, a static WebGPU scene re-presents persistent buffers
+without rebuilding or uploading them (required as a surface keepalive), while
+the Canvas-2D fallback can park completely when idle.
 
 There is no DOM dock: the rendered scene is the UI. An invisible hotspot
 overlay mirrors the scene's interactive elements so they stay reachable from
@@ -477,11 +538,12 @@ canonical dashboard equivalent. View settings shape the scene: layout
 (`orbital` / `constellation`), mood (`calm` / `cockpit`), and fov, motion, ar,
 and density tuning.
 
-Station is the designated successor to the classic Activity surface as the
-canonical way to operate agents; the DOM Logs view remains the legacy
-fallback. Today the scene is a 3D constellation backdrop with the working UI
-painted as screen-space HUD panels; the destination is action panes living
-*in* the scene, and eventually WebXR spatial computing. The dedicated
+Station is the rendered-canvas counterpart to Activity, not a separate
+authority surface. Today the scene is a 3D constellation backdrop with the
+working UI painted as screen-space HUD panels; the destination is action panes
+living *in* the scene, and eventually WebXR spatial computing. Activity remains
+the default DOM control surface while Station carries that immersive roadmap.
+The dedicated
 [Station](./station.md) chapter carries the architecture, an honest
 current-state inventory, and the roadmap.
 
@@ -1019,6 +1081,23 @@ signaling and the daemon drops legacy Connect control events before the
 registry. A fleet-origin tab admitted with a one-use hosted WebSocket ticket
 does appear, labeled by its hosted lease rather than a Connect account.
 
+### Vault
+
+The v2 dashboard gives credential custody its own top-level home. It reuses the
+existing **Credential vault**, **Agent accounts**, and **Custody trail**
+sections (the standalone `/access` page keeps them under Access → Advanced):
+create or unlock the client-encrypted sealed vault with a passkey or recovery
+phrase, manage provider credentials and external-agent sign-ins, fuel daemon
+sessions with time-boxed leases, and inspect lease/egress custody events.
+Secrets are decrypted only inside the verified vault worker while unlocked;
+full-credential leases may temporarily materialize a provider's native auth
+files, as described in [Credential Custody](./credential-custody.md).
+
+The shipped dashboard stores the sealed blob on the daemon through its trusted
+control channel. Connect retains an account-vault storage API, but the default
+Connect page has no vault client and there is no bridge from a
+Connect-origin account vault to a trusted daemon session in this alpha.
+
 ### Debug
 
 Observer display and browser workspaces (daemon diagnostics and raw event
@@ -1086,11 +1165,17 @@ When activated:
 
 ### Voice setup
 
-1. Enter your provider API key on first visit (Gemini or OpenAI).
-2. Keys are stored in browser **localStorage** and are never sent to the
-   Intendant server (the server only mints short-lived session tokens via
-   `POST /session`).
-3. Click the microphone button to connect.
+1. Choose the live provider in Settings.
+2. For **Gemini**, enter the long-lived API key in the browser. An unlocked
+   client vault is preferred; per-origin browser `localStorage` is the legacy
+   fallback and migration source. The browser sends that key directly to
+   Gemini Live, not to the daemon.
+3. For **OpenAI**, configure or lease the credential to the daemon. The
+   browser requests a short-lived Realtime client secret through
+   `api_voice_session` (or `POST /session` when the control tunnel is down)
+   and never receives the daemon's long-lived `OPENAI_API_KEY`.
+4. Click the microphone button. After either credential flow, realtime audio
+   connects directly from the browser to the selected provider.
 
 ### Active vs. passive browsers
 
@@ -1149,13 +1234,16 @@ and written to the session log. See
     [Getting Started](./getting-started.md#macos-app-bundle)). The bundle starts
     its daemon with native mTLS by default so remote browsers get a safe context
     over `https://` and must present an enrolled client identity.
-- **API key for voice:** Gemini or OpenAI, stored browser-side only.
+- **Voice credentials:** Gemini's long-lived key is held in the browser
+  (preferably in the unlocked client vault; `localStorage` is the legacy
+  fallback). OpenAI's long-lived credential stays with the daemon or a lease;
+  the browser receives only a short-lived Realtime client secret.
 
 ### HTTPS / TLS
 
 ```bash
 ./target/release/intendant                       # default: mTLS, requires access certs
-./target/release/intendant --tls                 # TLS-only; installed access certs when present, else self-signed
+./target/release/intendant --tls                 # TLS-only; installed server cert/key when present, else self-signed
 ./target/release/intendant --no-tls --bind 127.0.0.1 # explicit local plaintext/debug escape
 ./target/release/intendant --tls-cert c.pem --tls-key k.pem   # bring your own
 ```
@@ -1167,6 +1255,11 @@ override, TLS-only uses installed access server certs when present and falls bac
 to an auto self-signed certificate. Plain HTTP via `--no-tls` is intended for
 local/programmatic debugging; wildcard plaintext refuses startup when the host
 has a public interface unless `--allow-public-plaintext` is passed.
+TLS-only mode loads no client CA. It gives remote browsers HTTPS and a secure
+context, but certless remote requests to protected HTTP, WebSocket, and
+dashboard-control routes are still denied unless another authenticated
+peer/hosted-lease identity applies; use the default mTLS mode for browser client
+certificate authentication.
 The gateway demuxes per connection: a first byte of `0x16` (a TLS ClientHello)
 is wrapped in the rustls acceptor, while raw WebRTC ICE-TCP/UDP media is left
 untouched. The TLS stack is pure Rust (`rustls` + `rcgen`) and works on every
@@ -1728,7 +1821,7 @@ response omits the header.
 | POST | `/api/agenda/reminders/policy` | Settings | own origin | bounded | Merge-patch the agenda reminder policy (quiet hours, urgency, per-item overrides) |
 | GET | `/api/memory/search` | MemoryRead | own origin | none | Bounded Memory claim search (q, limit, candidates); results carry derived status |
 | GET | `/api/memory/claim` | MemoryRead | own origin | none | Read one Memory claim by id prefix (id); status derived at read time |
-| POST | `/api/memory/propose` | MemoryWrite | own origin | bounded | Propose one Memory claim (candidate lane; ephemeral plane in P1.1) |
+| POST | `/api/memory/propose` | MemoryWrite | own origin | bounded | Propose one Memory claim (candidate lane; response reports effective durability) |
 | POST | `/api/session/current/redo` | SessionManage | own origin | bounded | Redo the last rolled-back round |
 | POST | `/api/session/current/prune` | SessionManage | own origin | bounded | Prune rollback state for the current session |
 | POST | `/api/session/current/agent-output` | SessionManage | own origin | bounded | Fetch the current session's persisted agent output by id (POST-shaped read) |

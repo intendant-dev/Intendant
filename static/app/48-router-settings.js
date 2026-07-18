@@ -33,7 +33,7 @@ document.querySelectorAll('#sessions-subtabs .subtab-btn[data-sessions-tab]').fo
   btn.addEventListener('click', () => routeTo('sessions', btn.dataset.sessionsTab));
 });
 
-// Activity sub-tab switching (Log | Context | Managed | Changes | Control).
+// Activity sub-tab switching (Timeline (`log` route key) | Context | Managed | Changes | Control).
 document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').forEach(btn => {
   btn.addEventListener('click', () => routeTo('activity', btn.dataset.activityTab));
 });

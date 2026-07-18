@@ -1,11 +1,11 @@
-//! The ephemeral local plane: keys, the genesis ceremony, the
-//! in-memory op log, and the fold cache.
+//! The local Memory plane: keys, the genesis ceremony, the op set,
+//! and the fold cache.
 //!
 //! The ceremony mirrors the stamped reference rig (`tranche.rs`
 //! `PlaneRig::new_with` on the asset branch) with one deliberate
 //! difference: identifiers and key seeds come from the OS CSPRNG, not
-//! a recorded deterministic stream — this is a real (if ephemeral)
-//! plane, not a fixture. Every object construction, encoding, and
+//! a recorded deterministic stream — this is a real plane, not a
+//! fixture. Every object construction, encoding, and
 //! signature flows through the vendored `owner_plane_core` writer, and
 //! every appended operation is adjudicated by the vendored
 //! `owner_plane_reducer` fold; the tests pin that the ceremony ADMITS
@@ -114,10 +114,9 @@ const GENESIS_BUDGET: Budget = Budget {
 };
 
 /// The plane's custody-tier secrets, surfaced ONLY by
-/// [`EphemeralPlane::bootstrap_with_custody`] for the P1.5 durable
-/// custody adapter (`memory::store`) and its battery. The ephemeral
-/// service path ([`EphemeralPlane::bootstrap`]) drops them.
-#[allow(dead_code)]
+/// [`EphemeralPlane::bootstrap_with_custody`] for the durable custody
+/// adapter (`memory::store`). The in-memory service path
+/// ([`EphemeralPlane::bootstrap`]) drops them.
 pub(crate) struct PlaneCustody {
     pub root_seed: [u8; 32],
     pub recovery_seed: [u8; 32],
@@ -137,7 +136,6 @@ pub(crate) struct PlaneCustody {
 /// cert/grant MUST hash back to the ceremony's `H_cert`/`H_grant` —
 /// the stamped fold rejects the first resumed append otherwise, which
 /// is exactly what the crash battery proves.
-#[allow(dead_code)]
 pub(crate) struct PlaneResume {
     pub custody: PlaneCustody,
     pub plane_id: [u8; 32],
@@ -162,9 +160,13 @@ pub(crate) struct WriterDevice {
     pub cert: Cert,
 }
 
-/// The ephemeral plane: genesis ceremony + op log + fold cache.
+/// The in-process plane: genesis ceremony + op set + fold cache.
+///
+/// The historical type name predates durable storage. In durable
+/// mode the same representation is recovered from and persisted to
+/// [`crate::memory::store::DurableStore`].
 /// Signing keys are re-derived from held seeds at each seal site (the
-/// seeds are the ephemeral secret; the dalek type is never held).
+/// seeds are the held secret; the dalek type is never held).
 pub(crate) struct EphemeralPlane {
     pub plane_id: [u8; 32],
     pub zone_id: [u8; 16],
@@ -208,11 +210,10 @@ impl EphemeralPlane {
     }
 
     /// [`Self::bootstrap`] plus the ceremony's custody-tier secrets —
-    /// the create path of the P1.5 durable custody adapter
+    /// the create path of the durable custody adapter
     /// (`memory::store`). Everything the ceremony mints randomly and
     /// then needs again at reopen rides [`PlaneCustody`]; the
-    /// ephemeral path discards it.
-    #[allow(dead_code)] // consumed by the store artifact + its battery until P1.8
+    /// in-memory path discards it.
     pub(crate) fn bootstrap_with_custody() -> Result<(EphemeralPlane, PlaneCustody), MemoryError> {
         let created_ms = now_ms();
         let root_seed = rand32();
@@ -406,18 +407,16 @@ impl EphemeralPlane {
 
     /// The held op set (name → signed-op bytes; genesis included) —
     /// what the durable adapter persists at create time.
-    #[allow(dead_code)] // consumed by the store artifact + its battery until P1.8
     pub(crate) fn held_items(&self) -> &BTreeMap<String, Vec<u8>> {
         &self.items
     }
 
     /// Rebuild a WRITABLE plane from recovered custody + the recovered
-    /// op set (the P1.5 durable adapter's reopen path). Admission of
+    /// op set (the durable adapter's reopen path). Admission of
     /// the recovered set rides the STAMPED fold — any rejected
     /// recovered op surfaces its named outcome verbatim — and the
     /// writer chain resumes from the fold's own chain head, never
     /// from a second parse of the log.
-    #[allow(dead_code)] // consumed by the store artifact + its battery until P1.8
     pub(crate) fn resume(
         r: &PlaneResume,
         items: BTreeMap<String, Vec<u8>>,
