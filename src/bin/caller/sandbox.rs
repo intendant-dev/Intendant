@@ -592,8 +592,8 @@ impl SandboxConfig {
         // whole subtree: stamping a multi-gigabyte `%CARGO_HOME%` takes
         // minutes and rewrites every descendant's DACL (proven live —
         // daemon boots hit the e2e 180s timeout on the CI cache). Windows
-        // defaults therefore stay small (project, temp, logs, state
-        // root); a sandboxed toolchain write there is denied loudly and
+        // defaults therefore stay small (project, temp, the state
+        // root's logs/); a sandboxed toolchain write is denied loudly and
         // the denial-consent card is the recovery path — one grant,
         // scoped to the path that actually needs it, persisted.
         #[cfg(not(windows))]
