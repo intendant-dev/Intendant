@@ -744,7 +744,13 @@ struct CcTaskChild {
 /// spawning tool_use id (the correlation key Claude Code stamps on child
 /// envelopes as `parent_tool_use_id`), with the constant `toolu_01` prefix
 /// stripped so 8-char short forms stay distinctive.
-fn task_tool_child_id(tool_use_id: &str) -> String {
+///
+/// `pub(crate)`: the session catalog's task-thread resolver
+/// (`web_gateway::session_catalog::task_threads`) maps these ids back to
+/// the subagent transcript Claude Code persisted by minting each sidecar's
+/// `toolUseId` through this SAME function — the sanitization must never
+/// fork into a second copy.
+pub(crate) fn task_tool_child_id(tool_use_id: &str) -> String {
     let suffix = tool_use_id
         .strip_prefix("toolu_")
         .unwrap_or(tool_use_id)
