@@ -530,20 +530,25 @@ impl SandboxConfig {
         // $INTENDANT_HOME when overridden).
         write_paths.push(crate::platform::intendant_home());
 
-        // Toolchain caches (rationale on toolchain_cache_write_paths).
-        // The user cache dir is skipped on Windows: it is %LOCALAPPDATA%
-        // wholesale, far too broad for a default ACE grant, and %TEMP%
-        // (granted above) already lives inside it.
-        let home = dirs::home_dir();
-        write_paths.extend(toolchain_cache_write_paths(
-            env_or_home_dir(std::env::var_os("CARGO_HOME"), home.as_deref(), ".cargo"),
-            env_or_home_dir(std::env::var_os("RUSTUP_HOME"), home.as_deref(), ".rustup"),
-            if cfg!(windows) {
-                None
-            } else {
-                dirs::cache_dir()
-            },
-        ));
+        // Toolchain caches (rationale on toolchain_cache_write_paths) —
+        // Unix only. On Windows a write grant is an INHERITABLE ACE, and
+        // `SetNamedSecurityInfoW` propagates it synchronously through the
+        // whole subtree: stamping a multi-gigabyte `%CARGO_HOME%` takes
+        // minutes and rewrites every descendant's DACL (proven live —
+        // daemon boots hit the e2e 180s timeout on the CI cache). Windows
+        // defaults therefore stay small (project, temp, logs, state
+        // root); a sandboxed toolchain write there is denied loudly and
+        // the denial-consent card is the recovery path — one grant,
+        // scoped to the path that actually needs it, persisted.
+        #[cfg(not(windows))]
+        {
+            let home = dirs::home_dir();
+            write_paths.extend(toolchain_cache_write_paths(
+                env_or_home_dir(std::env::var_os("CARGO_HOME"), home.as_deref(), ".cargo"),
+                env_or_home_dir(std::env::var_os("RUSTUP_HOME"), home.as_deref(), ".rustup"),
+                dirs::cache_dir(),
+            ));
+        }
 
         Self {
             read_paths: vec![PathBuf::from("/")],
@@ -810,23 +815,35 @@ mod tests {
 
     #[test]
     fn extract_denied_path_reads_shell_error_shapes() {
+        #[cfg(unix)]
         assert_eq!(
             extract_denied_path("bash: /Users/vm/.zshrc: Permission denied"),
             Some(PathBuf::from("/Users/vm/.zshrc"))
         );
+        #[cfg(unix)]
         assert_eq!(
             extract_denied_path("mkdir: /denied-root: Permission denied"),
             Some(PathBuf::from("/denied-root"))
         );
-        // dash/POSIX-sh prose shape.
+        // dash/POSIX-sh prose shape. Unix-only assertions: "/denied/…"
+        // is not an absolute path on Windows (no drive), where these
+        // shell shapes cannot occur anyway.
+        #[cfg(unix)]
         assert_eq!(
             extract_denied_path("sh: 1: cannot create /denied/f.txt: Permission denied"),
             Some(PathBuf::from("/denied/f.txt"))
         );
         // Seatbelt denials surface as EPERM.
+        #[cfg(unix)]
         assert_eq!(
             extract_denied_path("sh: /denied/f.txt: Operation not permitted"),
             Some(PathBuf::from("/denied/f.txt"))
+        );
+        // PowerShell's denial shape carries a quoted drive path.
+        #[cfg(windows)]
+        assert_eq!(
+            extract_denied_path("Access to the path 'C:\\denied\\f.txt' is denied."),
+            Some(PathBuf::from("C:\\denied\\f.txt"))
         );
         assert_eq!(
             extract_denied_path("some ordinary output\nno denial here"),

@@ -684,15 +684,26 @@ fn path_parent_or_cwd(path: &Path) -> &Path {
 /// Write `content` to `path` through a unique tempfile in the destination
 /// directory, sync it, then atomically replace the destination.
 pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
+    // Stage + path context on every error: a bare `NotFound` from a
+    // five-stage helper is undiagnosable from CI logs (proven by the
+    // Windows protocol-watch triage, where the failing stage could not
+    // be told apart from the failing path).
+    let stage = |name: &'static str| {
+        let path = path.to_path_buf();
+        move |e: io::Error| io::Error::new(e.kind(), format!("{name} for {}: {e}", path.display()))
+    };
     let parent = path_parent_or_cwd(path);
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(parent).map_err(stage("create parent dir"))?;
     let mut tmp = tempfile::Builder::new()
         .prefix(".intendant-write-")
         .suffix(".tmp")
-        .tempfile_in(parent)?;
-    tmp.write_all(content)?;
-    tmp.as_file_mut().sync_all()?;
-    persist_tempfile(tmp, path)?;
+        .tempfile_in(parent)
+        .map_err(stage("create temp file"))?;
+    tmp.write_all(content).map_err(stage("write temp file"))?;
+    tmp.as_file_mut()
+        .sync_all()
+        .map_err(stage("sync temp file"))?;
+    persist_tempfile(tmp, path).map_err(stage("persist temp file"))?;
     Ok(())
 }
 

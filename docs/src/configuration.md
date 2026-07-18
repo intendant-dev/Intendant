@@ -330,14 +330,17 @@ and live voice (see [Computer Use & Live Audio](./computer-use-and-audio.md)).
 ### `[sandbox]`
 
 Filesystem write sandboxing for the runtime — Landlock on Linux, Seatbelt
-on macOS, restricted tokens on Windows. **On by default.** Resolution
+on macOS, restricted tokens on Windows. **On by default on macOS and
+Linux; opt-in on Windows**, where a write grant is an inheritable ACE and
+granting a large tree rewrites every descendant's DACL synchronously at
+startup — enabling it there accepts that first-stamp cost. Resolution
 order: `--sandbox` forces on, `--no-sandbox` forces off, otherwise an
-explicit `enabled` here decides, otherwise on.
+explicit `enabled` here decides, otherwise the platform default.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | unset (= on) | Explicitly enable/disable filesystem sandboxing; the CLI flags override it |
-| `extra_write_paths` | array | `[]` | Extra writable paths beyond the default grant set: project root (plus the session's own project root for dashboard-picked projects), the OS scratch dir (`TMPDIR` / `/tmp` / `%TEMP%`), the log dir, `~/.intendant`, and the toolchain caches (`~/.cargo`, `~/.rustup`, the user cache dir on Unix) |
+| `enabled` | bool | unset (= platform default) | Explicitly enable/disable filesystem sandboxing; the CLI flags override it |
+| `extra_write_paths` | array | `[]` | Extra writable paths beyond the default grant set: project root (plus the session's own project root for dashboard-picked projects), the OS scratch dir (`TMPDIR` / `/tmp` / `%TEMP%`), the log dir, `~/.intendant`, and — Unix only — the toolchain caches (`~/.cargo`, `~/.rustup`, the user cache dir); on Windows toolchain-cache writes are instead granted on demand through the denial-consent card |
 
 The dashboard's Settings → Security card edits both values live (new
 commands pick the change up without a restart; a `--sandbox`/`--no-sandbox`
