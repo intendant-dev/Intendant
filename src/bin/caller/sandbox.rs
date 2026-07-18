@@ -289,27 +289,46 @@ pub(crate) fn path_within_grants(path: &Path, grants: &[PathBuf]) -> bool {
 /// directories and the credential files the sandbox exists to protect.
 /// On Linux there is no deny layer under a grant (Landlock is
 /// allowlist-only), so a grant here would genuinely open the material —
-/// the consent card simply never proposes it.
+/// the consent card simply never proposes it. The edge resolves the live
+/// home/config dirs; the core is parameterized for hermetic tests.
 pub(crate) fn grant_offer_forbidden(path: &Path) -> bool {
+    grant_offer_forbidden_in(path, dirs::home_dir(), dirs::config_dir())
+}
+
+fn grant_offer_forbidden_in(path: &Path, home: Option<PathBuf>, config: Option<PathBuf>) -> bool {
     if path
         .file_name()
         .is_some_and(|name| name.to_str().is_some_and(|n| n == ".env"))
     {
         return true;
     }
+    // Both raw and canonicalized spellings of every protected root: the
+    // candidate may arrive in either form, and a protected dir that does
+    // not exist yet cannot be canonicalized — comparing one-sidedly
+    // misses (proven on a runner account with no ~/.ssh, where the
+    // canonicalized home diverged from the raw candidate spelling).
     let mut protected: Vec<PathBuf> = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        let home = std::fs::canonicalize(&home).unwrap_or(home);
-        protected.push(home.join(".ssh"));
-        protected.push(home.join(".gnupg"));
+    let mut push_both = |base: &Path, name: &str| {
+        protected.push(base.join(name));
+        protected.push(canonicalize_for_profile(&base.join(name)));
+        let canonical_base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+        protected.push(canonical_base.join(name));
+    };
+    if let Some(home) = home {
+        push_both(&home, ".ssh");
+        push_both(&home, ".gnupg");
     }
-    if let Some(config) = dirs::config_dir() {
-        protected.push(canonicalize_for_profile(&config.join("intendant")));
+    if let Some(config) = config {
+        push_both(&config, "intendant");
     }
-    let candidate = canonicalize_for_profile(path);
-    protected
-        .iter()
-        .any(|p| candidate.starts_with(p) || p.starts_with(&candidate))
+    let raw = path.to_path_buf();
+    let canonical = canonicalize_for_profile(path);
+    protected.iter().any(|p| {
+        raw.starts_with(p)
+            || canonical.starts_with(p)
+            || p.starts_with(&raw)
+            || p.starts_with(&canonical)
+    })
 }
 
 /// The path a consent grant would actually cover for `denied`: the path
@@ -692,20 +711,31 @@ mod tests {
 
     #[test]
     fn grant_offers_never_cover_credential_paths() {
-        if let Some(home) = dirs::home_dir() {
-            assert!(grant_offer_forbidden(&home.join(".ssh")));
-            assert!(grant_offer_forbidden(&home.join(".ssh").join("config")));
-            assert!(grant_offer_forbidden(&home.join(".gnupg")));
-        }
-        if let Some(config) = dirs::config_dir() {
-            assert!(grant_offer_forbidden(&config.join("intendant")));
-            assert!(grant_offer_forbidden(
-                &config.join("intendant").join(".env")
-            ));
-        }
-        assert!(grant_offer_forbidden(Path::new("/some/project/.env")));
+        // Hermetic: injected tempdir home/config, never the live machine.
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(!grant_offer_forbidden(tmp.path()));
+        let home = tmp.path().join("home");
+        let config = tmp.path().join("config");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let forbidden =
+            |p: &Path| grant_offer_forbidden_in(p, Some(home.clone()), Some(config.clone()));
+        // Existing protected dir, the dir itself and children.
+        assert!(forbidden(&home.join(".ssh")));
+        assert!(forbidden(&home.join(".ssh").join("config")));
+        // Protected dir that does NOT exist (no canonical form): still
+        // forbidden — the exact shape that regressed on a runner account
+        // without the dir.
+        assert!(forbidden(&home.join(".gnupg")));
+        assert!(forbidden(&home.join(".gnupg").join("private-keys")));
+        assert!(forbidden(&config.join("intendant")));
+        assert!(forbidden(&config.join("intendant").join("anything.txt")));
+        // .env anywhere by basename.
+        assert!(forbidden(Path::new("/some/project/.env")));
+        // Ordinary paths stay grantable.
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!forbidden(&plain));
+        assert!(!forbidden(&home.join("Downloads")));
     }
 
     #[test]
