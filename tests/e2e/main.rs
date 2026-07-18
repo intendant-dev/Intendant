@@ -3318,6 +3318,269 @@ async fn supervised_session_ask_human_reaches_the_question_rail() {
     let _ = child.kill().await;
 }
 
+/// The sandbox denial-consent loop, end to end against the real binaries
+/// with the write sandbox at its default (ON): a write outside the grant
+/// set is denied by the OS wall, the model sees the [intendant] sandbox
+/// note on the tool result, the user gets a "Sandbox" card on the question
+/// rail, answering "Always allow" persists the grant to intendant.toml and
+/// live-applies it, and the retried write then succeeds — no restart.
+#[tokio::test]
+async fn sandbox_denial_raises_consent_card_and_always_allow_unblocks_retry() {
+    use futures_util::SinkExt;
+
+    // A real directory outside every default grant: CARGO_TARGET_TMPDIR
+    // sits under the workspace target/, not under the daemon's temp dir,
+    // its HOME, or the session project.
+    let denied_zone = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("sandbox-consent-{}", std::process::id()));
+    std::fs::create_dir_all(&denied_zone).expect("create denied zone");
+    let target = denied_zone.join("probe.txt");
+    let _ = std::fs::remove_file(&target);
+    // Shell write (not a structured file tool): exercises the exec
+    // extraction lane of the denial classifier end to end. Quoting keeps
+    // Windows PowerShell and POSIX shells on the same one-liner.
+    let probe_cmd = if cfg!(windows) {
+        format!("Set-Content -Path \"{}\" -Value granted!", target.display())
+    } else {
+        format!("printf granted! > \"{}\"", target.display())
+    };
+
+    let rig = TestRig::new();
+    let script = rig.write_script(&serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Writing the probe file.",
+                  "tool_calls": [{ "name": "exec_command",
+                                   "arguments": { "nonce": 1,
+                                                  "command": probe_cmd } }] },
+                // The transcript gate proves the model saw the sandbox
+                // note (denial classified, consent offered) — not just a
+                // raw permission error.
+                { "content": "Waiting for the grant decision.",
+                  "expect_transcript_contains": "blocked by the runtime sandbox",
+                  "tool_calls": [{ "name": "ask_human",
+                                   "arguments": { "nonce": 2, "question": "Grant settled?" } }] },
+                // Gated on the ask answer so the retry only fires after
+                // the test observed the grant landing.
+                { "content": "Retrying the probe write.",
+                  "expect_transcript_contains": "settled-go",
+                  "tool_calls": [{ "name": "exec_command",
+                                   "arguments": { "nonce": 3,
+                                                  "command": probe_cmd } }] },
+                { "content": "Probe write done.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "sandbox consent loop complete" } }] }
+            ]
+        }]
+    }));
+    let session_project = tempfile::tempdir().expect("session project dir");
+
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script)
+        .args(["--no-tls", "--web", "18946"]);
+    let mut child = cmd.spawn().expect("spawn intendant daemon");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let _stderr_drain = drain_pipe_into(child.stderr.take().expect("stderr"), stderr_buf.clone());
+    let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
+
+    let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
+    let port: u16 = stderr_so_far
+        .lines()
+        .find_map(|line| {
+            let url = line.strip_prefix("Dashboard: http://")?;
+            url.rsplit(':').next()?.trim().parse().ok()
+        })
+        .expect("parse the dashboard port from the startup line");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Same startup race + retry shape as the askHuman e2e above, with one
+    // extra leg: the out-of-project write first trips the APPROVAL gate
+    // (fail-closed default), so approve every approval prompt as it
+    // arrives — the OS sandbox then denies the approved write, which is
+    // exactly the layering under test (approval = consent to try; the
+    // wall decides what can land). The consent card is the first Sandbox
+    // user_question after that.
+    let mut consent = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "write the probe file",
+                "project_root": session_project.path().to_string_lossy(),
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send create_session");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while consent.is_none() && std::time::Instant::now() < deadline {
+            let Some(event) = next_matching_ws_event(&mut ws, Duration::from_secs(10), |json| {
+                matches!(
+                    json.get("event").and_then(|v| v.as_str()),
+                    Some("approval_required") | Some("user_question")
+                )
+            })
+            .await
+            else {
+                break;
+            };
+            match event.get("event").and_then(|v| v.as_str()) {
+                Some("approval_required") => {
+                    let session = event
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let id = event.get("id").and_then(|v| v.as_u64()).unwrap_or_default();
+                    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                        serde_json::json!({
+                            "action": "approve",
+                            "session_id": session,
+                            "id": id,
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .expect("send approve");
+                }
+                Some("user_question")
+                    if event
+                        .pointer("/questions/0/header")
+                        .and_then(|v| v.as_str())
+                        == Some("Sandbox") =>
+                {
+                    consent = Some(event);
+                }
+                _ => {}
+            }
+        }
+        if consent.is_some() {
+            break;
+        }
+    }
+    let consent = consent.unwrap_or_else(|| {
+        panic!(
+            "no Sandbox consent card from the denied write; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let consent_session = consent
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("consent card carries its session id")
+        .to_string();
+    let consent_id = consent
+        .get("id")
+        .and_then(|v| v.as_u64())
+        .expect("consent card carries an id");
+    let consent_text = consent
+        .pointer("/questions/0/question")
+        .and_then(|v| v.as_str())
+        .expect("consent card carries the question text")
+        .to_string();
+    assert!(
+        consent_text.contains(&*denied_zone.to_string_lossy()),
+        "consent card must name the denied path, got: {consent_text}"
+    );
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "answer_question",
+            "session_id": consent_session,
+            "id": consent_id,
+            "answers": { consent_text: "Always allow" },
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send consent answer");
+
+    // Closed loop: the resolver live-applies the grant then persists it —
+    // the persisted intendant.toml entry is the observable that the env
+    // grant precedes.
+    let toml_path = session_project.path().join("intendant.toml");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let persisted = std::fs::read_to_string(&toml_path)
+            .map(|s| s.contains(&*denied_zone.to_string_lossy()))
+            .unwrap_or(false);
+        if persisted {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "grant never persisted to {}; daemon stderr:\n{}",
+            toml_path.display(),
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Now release the barrier ask — the retry batch spawns with the
+    // granted path in its write set.
+    let ask = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("user_question")
+            && json
+                .pointer("/questions/0/question")
+                .and_then(|v| v.as_str())
+                == Some("Grant settled?")
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "no barrier ask after the consent grant; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let ask_session = ask
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("ask carries its session id")
+        .to_string();
+    let ask_id = ask.get("id").and_then(|v| v.as_u64()).expect("ask id");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "answer_question",
+            "session_id": ask_session,
+            "id": ask_id,
+            "answers": { "Grant settled?": "settled-go" },
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send barrier answer");
+
+    let stderr_ctx = stderr_buf.clone();
+    complete_and_stop_session(&mut ws, &consent_session, move || {
+        stderr_ctx.lock().map(|b| b.clone()).unwrap_or_default()
+    })
+    .await;
+
+    // The retried write really landed on disk — the grant unblocked the
+    // exact operation the sandbox denied.
+    let written = std::fs::read_to_string(&target).unwrap_or_else(|e| {
+        panic!(
+            "granted probe write never landed at {} ({e}); daemon stderr:\n{}",
+            target.display(),
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    // trim: Windows Set-Content appends a newline; printf does not.
+    assert_eq!(written.trim_end(), "granted!");
+
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&denied_zone);
+}
+
 /// Shared assertions for the message-search wire contract (plan §4/§11):
 /// the intendant extractor consumes exactly these `session.jsonl` shapes,
 /// and its unit tests use fixtures of them — these helpers pin the shapes

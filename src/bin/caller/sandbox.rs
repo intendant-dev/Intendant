@@ -151,6 +151,284 @@ pub(crate) fn seatbelt_sensitive_only_profile() -> Result<String, String> {
     ))
 }
 
+/// What `configure_sandbox_env` resolved at startup, recorded so the
+/// dashboard settings surface and the denial-consent flow can recompute
+/// and live-apply the grant environment without re-plumbing `CliFlags`.
+pub(crate) struct SandboxRuntimeState {
+    /// The default grant set (project/projectless + toolchain caches),
+    /// BEFORE `extra_write_paths` — the stable base every recompute
+    /// starts from.
+    pub base_write_paths: Vec<PathBuf>,
+    /// Anchor for resolving relative `extra_write_paths` entries.
+    pub project_write_scope: Option<PathBuf>,
+    /// `Some(true)` = `--sandbox`, `Some(false)` = `--no-sandbox`: a CLI
+    /// flag pins the state for the daemon's lifetime and live settings
+    /// changes only persist intent for the next start.
+    pub flag_lock: Option<bool>,
+}
+
+static SANDBOX_RUNTIME_STATE: std::sync::OnceLock<SandboxRuntimeState> = std::sync::OnceLock::new();
+
+/// Record the startup resolution (idempotent; first call wins).
+pub(crate) fn record_sandbox_startup(state: SandboxRuntimeState) {
+    let _ = SANDBOX_RUNTIME_STATE.set(state);
+}
+
+pub(crate) fn sandbox_runtime_state() -> Option<&'static SandboxRuntimeState> {
+    SANDBOX_RUNTIME_STATE.get()
+}
+
+pub(crate) fn sandbox_flag_lock() -> Option<bool> {
+    SANDBOX_RUNTIME_STATE.get().and_then(|s| s.flag_lock)
+}
+
+/// True when the write sandbox is live for runtime spawns (the spawn wrap
+/// keys on the grant env var's presence).
+pub(crate) fn sandbox_active() -> bool {
+    std::env::var_os("INTENDANT_SANDBOX_WRITE_PATHS").is_some_and(|v| !v.is_empty())
+}
+
+/// The effective write-grant set as the next runtime spawn will see it.
+pub(crate) fn effective_write_paths() -> Vec<PathBuf> {
+    match std::env::var("INTENDANT_SANDBOX_WRITE_PATHS") {
+        Ok(raw) => std::env::split_paths(&raw)
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Resolve one `extra_write_paths` entry against the recorded project
+/// scope. Relative entries without a scope are dropped (fail-closed, same
+/// as startup).
+fn resolve_extra_write_path(entry: &str, scope: Option<&Path>) -> Option<PathBuf> {
+    let path = Path::new(entry);
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    scope.map(|root| root.join(path))
+}
+
+/// Recompute the grant set from the recorded base + `extra` and apply it
+/// to the live environment (set when enabled, removed when disabled), so
+/// the NEXT runtime spawn picks it up — no restart. Returns the effective
+/// set. Callers gate on [`sandbox_flag_lock`] first: a flag-pinned daemon
+/// only persists intent. Errors when startup never recorded a state
+/// (non-daemon shapes).
+pub(crate) fn apply_sandbox_state(enabled: bool, extra: &[String]) -> Result<Vec<PathBuf>, String> {
+    let state = sandbox_runtime_state()
+        .ok_or_else(|| "sandbox runtime state not recorded at startup".to_string())?;
+    if !enabled {
+        std::env::remove_var("INTENDANT_SANDBOX_WRITE_PATHS");
+        return Ok(Vec::new());
+    }
+    let mut paths = state.base_write_paths.clone();
+    for entry in extra {
+        if let Some(path) = resolve_extra_write_path(entry, state.project_write_scope.as_deref()) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    set_write_paths_env(&paths)?;
+    Ok(paths)
+}
+
+/// Append one grant to the live env var (the "always allow" consent
+/// resolution). No-op when the sandbox is off or the path is covered.
+pub(crate) fn add_live_write_grant(path: &Path) -> Result<(), String> {
+    if !sandbox_active() {
+        return Ok(());
+    }
+    let mut paths = effective_write_paths();
+    if path_within_grants(path, &paths) {
+        return Ok(());
+    }
+    paths.push(path.to_path_buf());
+    set_write_paths_env(&paths)
+}
+
+/// Platform-correct list encoding (':' on Unix, ';' on Windows) via
+/// `env::join_paths`. A path containing the list separator cannot be
+/// encoded; drop it loudly — the runtime then simply never allows writes
+/// there (fail-closed).
+pub(crate) fn set_write_paths_env(paths: &[PathBuf]) -> Result<(), String> {
+    let encodable: Vec<&PathBuf> = paths
+        .iter()
+        .filter(|p| {
+            let ok = std::env::join_paths([p]).is_ok();
+            if !ok {
+                eprintln!(
+                    "[sandbox] write path {} contains the PATH separator and cannot \
+                     be passed to the runtime; writes there will be denied",
+                    p.display()
+                );
+            }
+            ok
+        })
+        .collect();
+    match std::env::join_paths(encodable) {
+        Ok(joined) => {
+            std::env::set_var("INTENDANT_SANDBOX_WRITE_PATHS", joined);
+            Ok(())
+        }
+        Err(e) => Err(format!("failed to encode write paths: {e}")),
+    }
+}
+
+/// True when `path` equals or sits beneath any granted path.
+pub(crate) fn path_within_grants(path: &Path, grants: &[PathBuf]) -> bool {
+    grants.iter().any(|grant| path.starts_with(grant))
+}
+
+/// Paths the consent flow must never OFFER to grant: the user-secret
+/// directories and the credential files the sandbox exists to protect.
+/// On Linux there is no deny layer under a grant (Landlock is
+/// allowlist-only), so a grant here would genuinely open the material —
+/// the consent card simply never proposes it.
+pub(crate) fn grant_offer_forbidden(path: &Path) -> bool {
+    if path
+        .file_name()
+        .is_some_and(|name| name.to_str().is_some_and(|n| n == ".env"))
+    {
+        return true;
+    }
+    let mut protected: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        let home = std::fs::canonicalize(&home).unwrap_or(home);
+        protected.push(home.join(".ssh"));
+        protected.push(home.join(".gnupg"));
+    }
+    if let Some(config) = dirs::config_dir() {
+        protected.push(canonicalize_for_profile(&config.join("intendant")));
+    }
+    let candidate = canonicalize_for_profile(path);
+    protected
+        .iter()
+        .any(|p| candidate.starts_with(p) || p.starts_with(&candidate))
+}
+
+/// The path a consent grant would actually cover for `denied`: the path
+/// itself when it exists, else the nearest existing ancestor (grant
+/// mechanisms cannot cover a not-yet-existing path — Landlock needs an
+/// openable fd, Windows needs a stampable DACL). The card shows this
+/// grant target verbatim, so a wide ancestor is visible before approval.
+/// A filesystem root is never a target — granting it would be the sandbox
+/// off in disguise, so those denials stay note-only.
+pub(crate) fn grant_target_for(denied: &Path) -> Option<PathBuf> {
+    if !denied.is_absolute() {
+        return None;
+    }
+    let mut current = Some(denied);
+    while let Some(path) = current {
+        // Filesystem root ("/", "C:\") — never offered.
+        path.parent()?;
+        if path.exists() {
+            return Some(path.to_path_buf());
+        }
+        current = path.parent();
+    }
+    None
+}
+
+/// Signature strings a sandbox write denial produces in tool output
+/// across the three platforms (EACCES, Seatbelt's EPERM, Windows'
+/// ACCESS_DENIED). Best-effort by construction — callers additionally
+/// require an active sandbox and an out-of-grant path.
+pub(crate) fn permission_denied_signature(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("permission denied")
+        || lower.contains("operation not permitted")
+        || lower.contains("access is denied")
+}
+
+/// Classify one tool result as a sandbox write denial worth a consent
+/// offer. `file_path` is the structured target (`writeFile`/`editFile`);
+/// exec results fall back to extracting a `<path>: Permission denied`
+/// shape from the output. Returns the grant target. Pure given
+/// `grants`; `sandbox_active` + dedup are the caller's job.
+pub(crate) fn sandbox_denial_grant_offer(
+    function: &str,
+    file_path: Option<&str>,
+    result_text: &str,
+    grants: &[PathBuf],
+) -> Option<PathBuf> {
+    if !permission_denied_signature(result_text) {
+        return None;
+    }
+    let denied: PathBuf = match function {
+        "writeFile" | "editFile" => PathBuf::from(file_path?),
+        "execAsAgent" | "execPty" => extract_denied_path(result_text)?,
+        _ => return None,
+    };
+    if !denied.is_absolute() {
+        return None;
+    }
+    let target = grant_target_for(&denied)?;
+    if path_within_grants(&denied, grants) || path_within_grants(&target, grants) {
+        // Denied inside the grant set = plain filesystem permissions
+        // (root-owned file, read-only mount), not the sandbox.
+        return None;
+    }
+    if grant_offer_forbidden(&denied) || grant_offer_forbidden(&target) {
+        return None;
+    }
+    Some(target)
+}
+
+/// Extract the failing path from shell denial output like
+/// `sh: /Users/x/file: Permission denied`,
+/// `sh: 1: cannot create /target/f: Permission denied`, or
+/// `mkdir: /target: Permission denied`.
+fn extract_denied_path(text: &str) -> Option<PathBuf> {
+    for line in text.lines() {
+        if !permission_denied_signature(line) {
+            continue;
+        }
+        for segment in line.split(':') {
+            let trimmed = segment.trim().trim_matches(['\'', '"', '`']);
+            // Prose prefixes ("cannot create /x") keep the path at the
+            // first '/' of the segment.
+            let candidate = match trimmed.find('/') {
+                Some(idx) => &trimmed[idx..],
+                None => trimmed,
+            };
+            let candidate = candidate.trim_end_matches(['\'', '"', '`', '.', ',']);
+            let path = Path::new(candidate);
+            if path.is_absolute() && candidate.len() > 1 {
+                return Some(path.to_path_buf());
+            }
+        }
+        // Windows drive-letter paths survive the ':' split as
+        // "C" + "\path…" — rejoin heuristically, preferring the
+        // single-quoted form PowerShell emits ("Access to the path
+        // 'C:\x' is denied").
+        #[cfg(windows)]
+        {
+            if let Some(idx) = line.find(":\\") {
+                if idx >= 1 {
+                    let start = idx - 1;
+                    let tail = &line[start..];
+                    let end = tail
+                        .find('\'')
+                        .or_else(|| tail.find(": "))
+                        .or_else(|| tail.find(':').filter(|i| *i > 2))
+                        .unwrap_or(tail.len());
+                    let candidate = tail[..end].trim().trim_matches(['\'', '"']);
+                    let path = Path::new(candidate);
+                    if path.is_absolute() {
+                        return Some(path.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Configuration for Landlock filesystem sandboxing.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -374,6 +652,162 @@ impl SandboxConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_denied_signature_matches_all_three_platforms() {
+        assert!(permission_denied_signature(
+            "sh: /Users/x/file: Permission denied"
+        ));
+        assert!(permission_denied_signature(
+            "Operation not permitted (os error 1)"
+        ));
+        assert!(permission_denied_signature(
+            "Access is denied. (os error 5)"
+        ));
+        assert!(!permission_denied_signature("No such file or directory"));
+    }
+
+    #[test]
+    fn grant_target_resolves_to_nearest_existing_ancestor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let existing = tmp.path().join("present.txt");
+        std::fs::write(&existing, "x").unwrap();
+        // Existing file: the grant covers exactly it.
+        assert_eq!(grant_target_for(&existing), Some(existing.clone()));
+        // Not-yet-existing file: the nearest existing ancestor.
+        let fresh = tmp.path().join("newdir").join("new.txt");
+        assert_eq!(grant_target_for(&fresh), Some(tmp.path().to_path_buf()));
+        // Relative paths are never grant targets.
+        assert_eq!(grant_target_for(Path::new("relative/x")), None);
+        // A denial whose only existing ancestor is the filesystem root
+        // gets no offer — granting "/" would be the sandbox off.
+        #[cfg(unix)]
+        assert_eq!(
+            grant_target_for(Path::new("/intendant-nonexistent-zone/x.txt")),
+            None
+        );
+    }
+
+    #[test]
+    fn grant_offers_never_cover_credential_paths() {
+        if let Some(home) = dirs::home_dir() {
+            assert!(grant_offer_forbidden(&home.join(".ssh")));
+            assert!(grant_offer_forbidden(&home.join(".ssh").join("config")));
+            assert!(grant_offer_forbidden(&home.join(".gnupg")));
+        }
+        if let Some(config) = dirs::config_dir() {
+            assert!(grant_offer_forbidden(&config.join("intendant")));
+            assert!(grant_offer_forbidden(
+                &config.join("intendant").join(".env")
+            ));
+        }
+        assert!(grant_offer_forbidden(Path::new("/some/project/.env")));
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(!grant_offer_forbidden(tmp.path()));
+    }
+
+    #[test]
+    fn sandbox_denial_offer_classifies_structured_and_exec_results() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let granted = tmp.path().join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let grants = vec![granted.clone()];
+        let outside_file = outside.join("f.txt");
+        std::fs::write(&outside_file, "x").unwrap();
+
+        // Structured write denied outside the grant set → offer the path.
+        assert_eq!(
+            sandbox_denial_grant_offer(
+                "writeFile",
+                Some(outside_file.to_str().unwrap()),
+                "Permission denied (os error 13)",
+                &grants,
+            ),
+            Some(outside_file.clone())
+        );
+        // Same path denied but inside the grant set: plain filesystem
+        // permissions, not the sandbox — no offer.
+        assert_eq!(
+            sandbox_denial_grant_offer(
+                "writeFile",
+                Some(outside_file.to_str().unwrap()),
+                "Permission denied (os error 13)",
+                &[tmp.path().to_path_buf()],
+            ),
+            None
+        );
+        // Success output → no offer.
+        assert_eq!(
+            sandbox_denial_grant_offer(
+                "writeFile",
+                Some(outside_file.to_str().unwrap()),
+                "wrote 12 bytes",
+                &grants,
+            ),
+            None
+        );
+        // Credential paths never get an offer even when denied.
+        assert_eq!(
+            sandbox_denial_grant_offer(
+                "writeFile",
+                Some("/some/project/.env"),
+                "Permission denied (os error 13)",
+                &grants,
+            ),
+            None
+        );
+        // Exec output with the `<path>: Permission denied` shape.
+        let exec_text = format!("sh: {}: Permission denied", outside_file.display());
+        assert_eq!(
+            sandbox_denial_grant_offer("execAsAgent", None, &exec_text, &grants),
+            Some(outside_file.clone())
+        );
+        // Non-write tools never classify.
+        assert_eq!(
+            sandbox_denial_grant_offer(
+                "inspectPath",
+                Some(outside_file.to_str().unwrap()),
+                "Permission denied",
+                &grants,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_denied_path_reads_shell_error_shapes() {
+        assert_eq!(
+            extract_denied_path("bash: /Users/vm/.zshrc: Permission denied"),
+            Some(PathBuf::from("/Users/vm/.zshrc"))
+        );
+        assert_eq!(
+            extract_denied_path("mkdir: /denied-root: Permission denied"),
+            Some(PathBuf::from("/denied-root"))
+        );
+        // dash/POSIX-sh prose shape.
+        assert_eq!(
+            extract_denied_path("sh: 1: cannot create /denied/f.txt: Permission denied"),
+            Some(PathBuf::from("/denied/f.txt"))
+        );
+        // Seatbelt denials surface as EPERM.
+        assert_eq!(
+            extract_denied_path("sh: /denied/f.txt: Operation not permitted"),
+            Some(PathBuf::from("/denied/f.txt"))
+        );
+        assert_eq!(
+            extract_denied_path("some ordinary output\nno denial here"),
+            None
+        );
+        // Relative path in the message: not a grantable target.
+        assert_eq!(
+            extract_denied_path("cat: file.txt: Permission denied"),
+            None
+        );
+    }
+
     use super::*;
 
     #[cfg(target_os = "macos")]

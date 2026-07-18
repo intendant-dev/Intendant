@@ -2871,71 +2871,49 @@ fn configure_sandbox_env(
     project_write_scope: Option<&std::path::Path>,
 ) {
     let enabled = sandbox_enabled(flags, project.config.sandbox.enabled);
-    if !enabled {
-        env::remove_var("INTENDANT_SANDBOX_WRITE_PATHS");
-        return;
-    }
 
-    let mut sandbox_cfg = match project_write_scope {
+    // Record the startup resolution so the dashboard settings surface and
+    // the denial-consent flow can recompute the grant env live (the flag
+    // lock pins the state for this daemon's lifetime).
+    let base_cfg = match project_write_scope {
         Some(root) => sandbox::SandboxConfig::default_for_project(root, log_dir),
         None => sandbox::SandboxConfig::projectless(log_dir),
     };
-    for p in &project.config.sandbox.extra_write_paths {
-        let extra = if std::path::Path::new(p).is_absolute() {
-            PathBuf::from(p)
-        } else if let Some(root) = project_write_scope {
-            root.join(p)
+    sandbox::record_sandbox_startup(sandbox::SandboxRuntimeState {
+        base_write_paths: base_cfg.write_paths,
+        project_write_scope: project_write_scope.map(|p| p.to_path_buf()),
+        flag_lock: if flags.sandbox {
+            Some(true)
+        } else if flags.no_sandbox {
+            Some(false)
         } else {
-            // No project to anchor a relative grant to; resolving against
-            // the launch cwd would silently widen the projectless scope.
-            // (Unreachable in practice — projectless implies no
-            // intendant.toml, so this list is empty — kept fail-closed.)
-            eprintln!(
-                "[sandbox] relative extra write path {p} ignored: the daemon has no project root to resolve it against"
-            );
-            continue;
-        };
-        sandbox_cfg.write_paths.push(extra);
-    }
-    sandbox_cfg.write_paths.sort();
-    sandbox_cfg.write_paths.dedup();
+            None
+        },
+    });
 
-    // Platform-correct list encoding (':' on Unix, ';' on Windows — Windows
-    // paths contain ':') via env::join_paths. A path containing the list
-    // separator cannot be encoded; drop it loudly — the runtime then simply
-    // never allows writes there (fail-closed).
-    let encodable: Vec<&PathBuf> = sandbox_cfg
-        .write_paths
-        .iter()
-        .filter(|p| {
-            let ok = env::join_paths([p]).is_ok();
-            if !ok {
-                eprintln!(
-                    "[sandbox] write path {} contains the PATH separator and cannot                      be passed to the runtime; writes there will be denied",
-                    p.display()
-                );
+    let effective =
+        match sandbox::apply_sandbox_state(enabled, &project.config.sandbox.extra_write_paths) {
+            Ok(paths) => paths,
+            Err(e) => {
+                eprintln!("[sandbox] {e}; sandbox disabled");
+                env::remove_var("INTENDANT_SANDBOX_WRITE_PATHS");
+                return;
             }
-            ok
-        })
-        .collect();
-    match env::join_paths(encodable) {
-        Ok(joined) => env::set_var("INTENDANT_SANDBOX_WRITE_PATHS", joined),
-        Err(e) => {
-            eprintln!("[sandbox] failed to encode write paths ({e}); sandbox disabled");
-            env::remove_var("INTENDANT_SANDBOX_WRITE_PATHS");
-        }
+        };
+    if !enabled {
+        return;
     }
 
     // Windows: the runtime child enforces writes via a WRITE_RESTRICTED
     // token, which needs RESTRICTED-write ACEs on the allowed paths. Stamp
-    // them once for the daemon's lifetime (per-spawn stamping would race
-    // concurrent runtime spawns sharing these paths); the guard's Drop and
-    // the startup journal sweep handle removal.
+    // them once for the daemon's lifetime (paths granted live later are
+    // stamped per spawn through the refcounted table); the guard's Drop
+    // and the startup journal sweep handle removal.
     #[cfg(windows)]
     {
         static DAEMON_WRITE_GRANTS: std::sync::Mutex<Option<win_sandbox::AceGuard>> =
             std::sync::Mutex::new(None);
-        match win_sandbox::stamp_daemon_write_grants(&sandbox_cfg.write_paths) {
+        match win_sandbox::stamp_daemon_write_grants(&effective) {
             Ok(guard) => {
                 *DAEMON_WRITE_GRANTS
                     .lock()
@@ -2950,6 +2928,8 @@ fn configure_sandbox_env(
             }
         }
     }
+    #[cfg(not(windows))]
+    let _ = effective;
 }
 
 /// The `--scoped-shell-exec` wrapper (see terminal::scoped_shell_command):

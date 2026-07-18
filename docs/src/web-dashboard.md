@@ -1035,8 +1035,20 @@ system Chrome/Chromium apps require choosing `system_cdp` or setting
 
 The configuration panel for the current session: API keys, external-agent
 backend settings, computer-use/provider options, presence, transcription,
-recording, and live audio. Peer/network administration moved to **Access**.
-Old `#settings/network` deep links are redirected to `#access/overview`.
+recording, live audio, and the runtime sandbox. Peer/network administration
+moved to **Access**. Old `#settings/network` deep links are redirected to
+`#access/overview`.
+
+**Settings → Security** holds the runtime write sandbox card ("Runtime
+sandbox" — the confinement of the native agent's shell and file tools to
+granted paths, `[sandbox]` in intendant.toml): a live on/off toggle, the
+effective write-grant set, and an extra-grants editor (one path per line,
+absolute or project-relative). Saves ride the regular `/api/settings`
+flow and apply to new commands immediately — no restart; when
+`--sandbox`/`--no-sandbox` pinned the state for this daemon run, the
+toggle is disabled and saves only persist intent for the next start. This
+is a different layer from the Codex/Claude Code sandbox settings —
+external agents bring their own.
 
 ## Late-join and session replay
 

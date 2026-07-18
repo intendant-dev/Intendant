@@ -1553,6 +1553,28 @@ impl Project {
         Ok(())
     }
 
+    /// Append one grant to `[sandbox] extra_write_paths` in this
+    /// project's intendant.toml — the consent flow's "always allow"
+    /// persistence. Reloads from disk first so a concurrent settings save
+    /// is not clobbered wholesale; duplicate entries no-op.
+    pub fn append_sandbox_extra_write_path(root: &Path, entry: &str) -> Result<(), CallerError> {
+        let mut proj = Self::from_root(root.to_path_buf())?;
+        if proj
+            .config
+            .sandbox
+            .extra_write_paths
+            .iter()
+            .any(|p| p == entry)
+        {
+            return Ok(());
+        }
+        proj.config
+            .sandbox
+            .extra_write_paths
+            .push(entry.to_string());
+        proj.save_config()
+    }
+
     #[allow(dead_code)]
     pub fn agent_dir(&self) -> PathBuf {
         self.root.join(".intendant")

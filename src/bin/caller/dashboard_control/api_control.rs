@@ -2685,7 +2685,7 @@ mod tests {
                 &rt.bus,
             ));
         assert_eq!(status, 200);
-        assert_eq!(http_body, serde_json::json!({"ok": true}));
+        assert_eq!(http_body, serde_json::json!({"ok": true, "applied": true}));
         assert!(http_dir.path().join("intendant.toml").exists());
 
         let tunnel_dir = tempfile::tempdir().expect("temp tunnel root");

@@ -339,6 +339,12 @@ explicit `enabled` here decides, otherwise on.
 | `enabled` | bool | unset (= on) | Explicitly enable/disable filesystem sandboxing; the CLI flags override it |
 | `extra_write_paths` | array | `[]` | Extra writable paths beyond the default grant set: project root (plus the session's own project root for dashboard-picked projects), the OS scratch dir (`TMPDIR` / `/tmp` / `%TEMP%`), the log dir, `~/.intendant`, and the toolchain caches (`~/.cargo`, `~/.rustup`, the user cache dir on Unix) |
 
+The dashboard's Settings → Security card edits both values live (new
+commands pick the change up without a restart; a `--sandbox`/`--no-sandbox`
+flag pins the live state for that daemon run, so saves then only persist
+intent), and approving a sandbox write-denial consent prompt can append
+grants — for the session, or persisted here via "always allow".
+
 A sandbox that cannot apply fails the run rather than continuing
 unconfined, on all three platforms — on Linux kernels without Landlock
 support the runtime refuses to start until `--no-sandbox` (or

@@ -180,6 +180,38 @@ dodges the prompt, never the sandbox.
 [controller-dispatched tools](#controller-dispatched-tools) and
 external-agent approval routing through `external_approval_decision`.
 
+## Sandbox denial consent
+
+The runtime write sandbox (on by default — see
+[Configuration § `[sandbox]`](./configuration.md)) is a hard OS wall, but a
+denial is not a dead end: when a runtime batch result carries a write
+denied by the sandbox, the daemon classifies it
+(`sandbox_denial_grant_offer`) and raises a **"Sandbox" card on the
+question rail** offering three resolutions:
+
+- **Allow for this session** — the path joins that session's write set at
+  the next runtime spawn; gone on daemon restart.
+- **Always allow** — the grant is live-applied to the daemon's write set
+  immediately (no restart) and persisted to `[sandbox]
+  extra_write_paths` in the session project's `intendant.toml`.
+- **Keep denied** — nothing changes.
+
+The model simultaneously sees an `[intendant]` note on the denied tool
+result explaining that the sandbox (not the task) blocked the write and
+that a grant prompt was raised — so it retries after a grant instead of
+giving up. Approval and consent stay distinct layers: an approved command
+can still be denied by the wall, and the card is how the wall becomes
+negotiable without dropping it.
+
+Guardrails: the card shows the exact path a grant would cover (for a
+not-yet-existing target, the nearest existing ancestor — honestly wide
+when it is wide); a filesystem root is never offered; credential
+locations (`~/.ssh`, `~/.gnupg`, the intendant config home, any `.env`)
+are never offered — on Linux, Landlock has no deny layer under a grant,
+so offering those would genuinely open them. Denials inside the grant
+set (plain filesystem permissions) get no card. Each (session, path)
+offers once per daemon run; headless runs get the note only.
+
 ## DisplayControl session grant
 
 `DisplayControl` uses a **session-grant** model: approve once — the dashboard's

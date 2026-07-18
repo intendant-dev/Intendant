@@ -2676,6 +2676,25 @@ pub(crate) async fn run_agent_loop(
                 &batch.nonce_to_call_id,
                 &batch.call_id_names,
             );
+            // Sandbox write denials: offer the user a grant on the question
+            // rail and tell the model a prompt was raised (so it retries
+            // after a grant instead of giving up).
+            let (sandbox_offers, sandbox_notes) = sandbox_denials_in_results(
+                &json_str,
+                &tool_results,
+                &batch.nonce_to_call_id,
+                &project.root,
+                log_dir,
+            );
+            raise_sandbox_consent_cards(
+                sandbox_offers,
+                headless,
+                bus,
+                approval_registry,
+                &local_session_id,
+                log_dir,
+                &project.root,
+            );
             // The context-budget line is appended once per turn — on the
             // batch's final result — not on every result: N copies per turn
             // were pure token filler (~25 tokens each, re-billed with the
@@ -2687,11 +2706,14 @@ pub(crate) async fn run_agent_loop(
                 if handled_call_ids.contains(call_id) {
                     continue;
                 }
-                let text = if Some(i) == last_unhandled {
+                let mut text = if Some(i) == last_unhandled {
                     format!("{}\n\n{}", result_text, budget)
                 } else {
                     result_text.clone()
                 };
+                if let Some(note) = sandbox_notes.get(call_id) {
+                    text.push_str(note);
+                }
                 if tool_name == "capture_screen" {
                     if let Some(images) = encode_screenshot(result_text) {
                         conversation.add_tool_result_with_images(call_id, tool_name, &text, images);
@@ -3229,10 +3251,32 @@ Proceed with explicit assumptions and continue without additional questions."
                 item_id: None,
             });
 
+            // Sandbox write denials: same consent offer as the tool path,
+            // classified against the combined output.
+            let combined = format!("{}\n{}", output.stdout, output.stderr);
+            let (sandbox_offers, sandbox_note) = sandbox_denials_in_text(
+                &batch_facts.write_paths,
+                &combined,
+                &project.root,
+                log_dir,
+            );
+            raise_sandbox_consent_cards(
+                sandbox_offers,
+                headless,
+                bus,
+                approval_registry,
+                &local_session_id,
+                log_dir,
+                &project.root,
+            );
+
             // Format agent output as next user message, include budget summary
             let mut user_msg = format!("Agent output:\n{}", output.stdout);
             if !output.stderr.is_empty() {
                 user_msg.push_str(&format!("\nStderr:\n{}", output.stderr));
+            }
+            if let Some(note) = sandbox_note {
+                user_msg.push_str(&note);
             }
             user_msg.push_str(&format!("\n\n{}", conversation.budget_summary()));
             conversation.add_user(MessageProvenance::ToolOutput, user_msg);
@@ -3772,6 +3816,296 @@ fn messages_json_dump_enabled() -> bool {
             .unwrap_or(false)
     });
     *ENABLED
+}
+
+/// Distinct id space for sandbox-consent question prompts (turn ids count
+/// up from zero, live-audio consent uses 1<<41, controller-tool gates
+/// 1<<42).
+const SANDBOX_CONSENT_ID_BASE: u64 = 1 << 43;
+static SANDBOX_CONSENT_ID_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One sandbox write denial worth offering a grant for.
+struct SandboxDenial {
+    /// The path the runtime was refused on, as reported.
+    denied: PathBuf,
+    /// What a grant would actually cover (the denied path or its nearest
+    /// existing ancestor — shown verbatim on the card).
+    target: PathBuf,
+}
+
+/// Scan one runtime batch's results for sandbox write denials worth a
+/// consent offer. `commands_json` is the batch JSON (for structured
+/// `file_path` targets); `results` are the folded per-call results.
+/// Returns offers plus the per-call model-facing note map.
+fn sandbox_denials_in_results(
+    commands_json: &str,
+    results: &[(String, String, String)],
+    nonce_to_call_id: &std::collections::HashMap<u64, String>,
+    workdir: &Path,
+    log_dir: &Path,
+) -> (
+    Vec<SandboxDenial>,
+    std::collections::HashMap<String, String>,
+) {
+    let mut offers: Vec<SandboxDenial> = Vec::new();
+    let mut notes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if !crate::sandbox::sandbox_active()
+        || !results
+            .iter()
+            .any(|(_, _, text)| crate::sandbox::permission_denied_signature(text))
+    {
+        return (offers, notes);
+    }
+    // Effective grant view for this session's spawns: daemon env + the
+    // session's own workdir + prior consent grants.
+    let mut grants = crate::sandbox::effective_write_paths();
+    grants.push(workdir.to_path_buf());
+    grants.extend(crate::agent_runner::session_write_grants_for(log_dir));
+
+    // call_id → (runtime function, structured file_path).
+    let mut call_meta: std::collections::HashMap<String, (String, Option<String>)> =
+        std::collections::HashMap::new();
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(commands_json) {
+        if let Some(commands) = parsed.get("commands").and_then(|c| c.as_array()) {
+            for cmd in commands {
+                let (Some(nonce), Some(function)) = (
+                    cmd.get("nonce").and_then(|n| n.as_u64()),
+                    cmd.get("function").and_then(|f| f.as_str()),
+                ) else {
+                    continue;
+                };
+                if let Some(call_id) = nonce_to_call_id.get(&nonce) {
+                    call_meta.insert(
+                        call_id.clone(),
+                        (
+                            function.to_string(),
+                            cmd.get("file_path")
+                                .and_then(|p| p.as_str())
+                                .map(str::to_string),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    for (call_id, _tool_name, text) in results {
+        let Some((function, file_path)) = call_meta.get(call_id) else {
+            continue;
+        };
+        if let Some(target) = crate::sandbox::sandbox_denial_grant_offer(
+            function,
+            file_path.as_deref(),
+            text,
+            &grants,
+        ) {
+            let denied = file_path
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| target.clone());
+            notes.insert(call_id.clone(), sandbox_denial_note(&denied));
+            if !offers.iter().any(|o| o.target == target) {
+                offers.push(SandboxDenial { denied, target });
+            }
+        }
+    }
+    (offers, notes)
+}
+
+/// Text-path variant of [`sandbox_denials_in_results`]: the raw-JSON
+/// batch shape folds all output into one user message, so denials
+/// classify against the combined text using the batch's structured write
+/// paths plus the exec extraction lane. Returns offers and one combined
+/// note.
+fn sandbox_denials_in_text(
+    structured_write_paths: &[String],
+    combined_text: &str,
+    workdir: &Path,
+    log_dir: &Path,
+) -> (Vec<SandboxDenial>, Option<String>) {
+    let mut offers: Vec<SandboxDenial> = Vec::new();
+    if !crate::sandbox::sandbox_active()
+        || !crate::sandbox::permission_denied_signature(combined_text)
+    {
+        return (offers, None);
+    }
+    let mut grants = crate::sandbox::effective_write_paths();
+    grants.push(workdir.to_path_buf());
+    grants.extend(crate::agent_runner::session_write_grants_for(log_dir));
+
+    let mut denied_paths: Vec<PathBuf> = Vec::new();
+    for wp in structured_write_paths {
+        if let Some(target) = crate::sandbox::sandbox_denial_grant_offer(
+            "writeFile",
+            Some(wp),
+            combined_text,
+            &grants,
+        ) {
+            if !offers.iter().any(|o| o.target == target) {
+                denied_paths.push(PathBuf::from(wp));
+                offers.push(SandboxDenial {
+                    denied: PathBuf::from(wp),
+                    target,
+                });
+            }
+        }
+    }
+    if let Some(target) =
+        crate::sandbox::sandbox_denial_grant_offer("execAsAgent", None, combined_text, &grants)
+    {
+        if !offers.iter().any(|o| o.target == target) {
+            denied_paths.push(target.clone());
+            offers.push(SandboxDenial {
+                denied: target.clone(),
+                target,
+            });
+        }
+    }
+    let note = denied_paths.first().map(|p| sandbox_denial_note(p));
+    (offers, note)
+}
+
+/// The model-facing line appended to a denied result so the model knows
+/// the denial is the sandbox (not the task) and that retrying after a
+/// grant is the move.
+fn sandbox_denial_note(denied: &Path) -> String {
+    format!(
+        "\n\n[intendant] Write blocked by the runtime sandbox: {} is outside the granted \
+         write set. The user has been asked whether to grant it — if they allow, retry the \
+         same command; otherwise work within the project, or the user can add the path to \
+         [sandbox] extra_write_paths / run with --no-sandbox.",
+        denied.display()
+    )
+}
+
+/// Raise one consent card per new denial target and spawn its resolver.
+/// Dedup is daemon-lifetime per (log_dir, target) so a repeatedly denied
+/// path never spams the rail. No-op when headless (no rail to answer on —
+/// the model-facing note alone carries the guidance).
+#[allow(clippy::too_many_arguments)]
+fn raise_sandbox_consent_cards(
+    offers: Vec<SandboxDenial>,
+    headless: bool,
+    bus: &EventBus,
+    approval_registry: &event::ApprovalRegistry,
+    session_id: &Option<String>,
+    log_dir: &Path,
+    project_root: &Path,
+) {
+    if headless || offers.is_empty() {
+        return;
+    }
+    static RAISED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(PathBuf, PathBuf)>>,
+    > = std::sync::OnceLock::new();
+    let raised = RAISED.get_or_init(Default::default);
+    for offer in offers {
+        {
+            let mut seen = raised.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.insert((log_dir.to_path_buf(), offer.target.clone())) {
+                continue;
+            }
+        }
+        let id = SANDBOX_CONSENT_ID_BASE
+            + SANDBOX_CONSENT_ID_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        approval_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, tx);
+        let same_path = offer.target == offer.denied;
+        let question = if same_path {
+            format!(
+                "The agent tried to write outside its sandbox:\n{}\n\nGrant write access?",
+                offer.denied.display()
+            )
+        } else {
+            // The grant covers the nearest existing ancestor — show that
+            // width honestly before the user approves it.
+            format!(
+                "The agent tried to write outside its sandbox:\n{}\n\nGranting requires \
+                 write access to {} (the nearest existing directory). Grant it?",
+                offer.denied.display(),
+                offer.target.display()
+            )
+        };
+        bus.send(AppEvent::UserQuestionRequired {
+            session_id: session_id.clone(),
+            id,
+            questions: vec![crate::types::UserQuestion {
+                question,
+                header: "Sandbox".to_string(),
+                options: vec![
+                    crate::types::UserQuestionOption {
+                        label: "Allow for this session".to_string(),
+                        description: "Grants the path until this daemon restarts.".to_string(),
+                    },
+                    crate::types::UserQuestionOption {
+                        label: "Always allow".to_string(),
+                        description: "Adds the path to [sandbox] extra_write_paths in \
+                                      intendant.toml."
+                            .to_string(),
+                    },
+                    crate::types::UserQuestionOption {
+                        label: "Keep denied".to_string(),
+                        description: String::new(),
+                    },
+                ],
+                multi_select: false,
+            }],
+        });
+        let bus = bus.clone();
+        let session_id = session_id.clone();
+        let log_dir = log_dir.to_path_buf();
+        let project_root = project_root.to_path_buf();
+        let target = offer.target.clone();
+        tokio::spawn(async move {
+            let answer = match rx.await {
+                Ok(event::ApprovalResponse::Answer { answers }) => {
+                    answers.values().next().cloned().unwrap_or_default()
+                }
+                // Deny/skip/dismissal (or a torn-down session dropping the
+                // registry) all resolve to "keep denied".
+                Ok(_) | Err(_) => String::new(),
+            };
+            let resolution = if answer.starts_with("Always") {
+                match crate::sandbox::add_live_write_grant(&target) {
+                    Ok(()) => {
+                        // Persist after the live grant so a save failure
+                        // still leaves the running daemon granted.
+                        if let Err(e) = Project::append_sandbox_extra_write_path(
+                            &project_root,
+                            &target.to_string_lossy(),
+                        ) {
+                            format!(
+                                "granted for this daemon run, but persisting to \
+                                 intendant.toml failed: {e}"
+                            )
+                        } else {
+                            "granted and persisted to [sandbox] extra_write_paths".to_string()
+                        }
+                    }
+                    Err(e) => format!("grant failed: {e}"),
+                }
+            } else if answer.starts_with("Allow") {
+                crate::agent_runner::add_session_write_grant(&log_dir, &target);
+                "granted for this session".to_string()
+            } else {
+                "kept denied".to_string()
+            };
+            bus.send(AppEvent::LogEntry {
+                session_id,
+                level: "info".to_string(),
+                source: "sandbox".to_string(),
+                content: format!(
+                    "sandbox write grant for {}: {}",
+                    target.display(),
+                    resolution
+                ),
+                turn: None,
+            });
+        });
+    }
 }
 
 /// Index of the batch result that carries the per-turn context-budget line:

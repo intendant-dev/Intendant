@@ -31,6 +31,40 @@ fn human_response_token_key(log_dir: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf())
 }
 
+/// Per-session sandbox write grants from the denial-consent flow's
+/// "allow for this session" resolution, keyed like the token registry.
+/// Merged into the write set at every runtime spawn for that session;
+/// gone on daemon restart by design.
+fn session_write_grants(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<PathBuf>>> {
+    static GRANTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<PathBuf>>>,
+    > = std::sync::OnceLock::new();
+    GRANTS.get_or_init(Default::default)
+}
+
+/// Record a session-scoped write grant (consent card: "allow for this
+/// session").
+pub(crate) fn add_session_write_grant(log_dir: &std::path::Path, path: &std::path::Path) {
+    let mut grants = session_write_grants()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entry = grants.entry(human_response_token_key(log_dir)).or_default();
+    if !entry.iter().any(|p| p == path) {
+        entry.push(path.to_path_buf());
+    }
+}
+
+/// The session's consent-granted write paths.
+pub(crate) fn session_write_grants_for(log_dir: &std::path::Path) -> Vec<PathBuf> {
+    session_write_grants()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&human_response_token_key(log_dir))
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Removes the batch's token entry when the runtime spawn returns.
 struct HumanResponseTokenGuard {
     log_dir: PathBuf,
@@ -362,31 +396,38 @@ pub async fn run_agent(
             .filter(|p| !p.as_os_str().is_empty())
             .collect();
         if !write_paths.is_empty() {
-            // The env var carries the daemon-launch grant set; a session's
-            // project can differ from the daemon's launch project
-            // (dashboard-picked projects, projectless daemons), so the
-            // session's own root is granted per spawn — the per-session
-            // analog of `default_for_project`'s project grant.
-            let session_grant_needed = !write_paths.iter().any(|p| p == workdir);
-            if session_grant_needed {
-                write_paths.push(workdir.to_path_buf());
+            // Per-spawn additions beyond the daemon-launch grant set: the
+            // session's own project root (a session's project can differ
+            // from the daemon's launch project — dashboard-picked
+            // projects, projectless daemons) plus any consent-flow
+            // session grants.
+            let mut session_paths: Vec<PathBuf> = Vec::new();
+            if !write_paths.iter().any(|p| p == workdir) {
+                session_paths.push(workdir.to_path_buf());
             }
+            for grant in session_write_grants_for(log_dir) {
+                if !write_paths.iter().any(|p| p == &grant) {
+                    session_paths.push(grant);
+                }
+            }
+            write_paths.extend(session_paths.iter().cloned());
             // Windows write grants are ACE stamps on the target dirs; the
-            // daemon stamped the launch set at startup, so a per-session
-            // root needs its own refcounted stamp, held until the child
-            // exits (the GRANTS table dedups overlapping sessions).
+            // daemon stamped the launch set at startup, so per-session
+            // additions need their own refcounted stamp, held until the
+            // child exits (the GRANTS table dedups overlapping sessions,
+            // so only 0→1 transitions touch DACLs).
             #[cfg(windows)]
-            let _session_ace = if session_grant_needed {
-                Some(
-                    crate::win_sandbox::AceGuard::stamp(
-                        &[],
-                        std::slice::from_ref(&write_paths[write_paths.len() - 1]),
-                    )
-                    .map_err(|e| CallerError::Agent(format!("stamp session write grant: {e}")))?,
-                )
-            } else {
+            let _session_ace = if session_paths.is_empty() {
                 None
+            } else {
+                Some(
+                    crate::win_sandbox::AceGuard::stamp(&[], &session_paths).map_err(|e| {
+                        CallerError::Agent(format!("stamp session write grant: {e}"))
+                    })?,
+                )
             };
+            #[cfg(not(windows))]
+            let _ = &session_paths;
             let sandbox = SandboxConfig {
                 read_paths: vec![PathBuf::from("/")],
                 write_paths,
