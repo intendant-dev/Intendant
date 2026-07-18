@@ -135,6 +135,53 @@ function ui2RefreshMinimizeDoneControl() {
   btn.title = count === 1
     ? 'Minimize the finished sub-agent window'
     : `Minimize all ${count} finished sub-agent windows`;
+  // The collapse-all pill rides the same freshness passes (badge refresh,
+  // relationship render, every minimize state change routes here).
+  ui2RefreshCollapseAllControl();
+}
+
+// ── "Collapse all / Expand all" grid sweep pill ────────────────────────
+// Beside "Minimize done", acting on EVERY session window (41's
+// setAllSessionWindowsMinimized): one click drops the grid to a stack of
+// header bars for an all-sessions glance, the next restores it. The
+// label always names the direction one click will act — any expanded
+// window means Collapse all, an all-minimized grid means Expand all.
+// Grid-only surface: Focus hides the session windows the sweep acts on,
+// so the stylesheet layout-gates the pill (html[data-ui2-layout]).
+function ui2RefreshCollapseAllControl() {
+  const btn = document.getElementById('ui2-collapse-all-btn');
+  if (!btn) return;
+  const windows = typeof sessionWindows !== 'undefined' ? sessionWindows : null;
+  if (!windows || windows.size === 0) {
+    btn.hidden = true;
+    return;
+  }
+  let expanded = 0;
+  for (const win of windows.values()) {
+    if (win && !win.minimized) expanded += 1;
+  }
+  const collapse = expanded > 0;
+  btn.hidden = false;
+  btn.dataset.direction = collapse ? 'collapse' : 'expand';
+  btn.textContent = collapse ? 'Collapse all' : 'Expand all';
+  btn.title = collapse
+    ? (expanded === 1
+        ? 'Minimize the session window to its header bar'
+        : `Minimize all ${expanded} session windows to their header bars`)
+    : 'Restore every minimized session window';
+  btn.setAttribute('aria-label', btn.title);
+}
+
+function ui2WireCollapseAllControl() {
+  const btn = document.getElementById('ui2-collapse-all-btn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const collapse = btn.dataset.direction !== 'expand';
+    if (typeof setAllSessionWindowsMinimized === 'function') {
+      setAllSessionWindowsMinimized(collapse);
+    }
+    ui2RefreshMinimizeDoneControl();
+  });
 }
 
 let ui2MinimizeDoneRefreshQueued = false;
@@ -590,6 +637,7 @@ function ui2RailTick(force) {
     ui2AugmentApprovalPanel();
     ui2WireLayoutToggle();
     ui2WireMinimizeDoneControl();
+    ui2WireCollapseAllControl();
     ui2WireViewOptions();
     ui2DressComposer();
     ui2BuildVitalsRail();

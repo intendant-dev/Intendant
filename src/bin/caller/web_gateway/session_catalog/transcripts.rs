@@ -1297,7 +1297,13 @@ pub(crate) fn external_session_entries_from_home_arc(
     let source = crate::session_names::normalize_source(source);
     let path = match source.as_str() {
         "codex" => find_codex_session_file(home, session_id),
-        "claude-code" => find_claude_session_file_for_transcript(home, session_id),
+        // Task-tool sub-threads have no transcript keyed by their
+        // synthetic `task-*` id; after the ordinary lookup misses, fall
+        // back to the parent's persisted subagent artifacts (Codex
+        // sub-threads need no fallback — they get first-class rollouts
+        // under their own thread ids).
+        "claude-code" => find_claude_session_file_for_transcript(home, session_id)
+            .or_else(|| find_claude_task_subagent_transcript(home, session_id)),
         "gemini" => find_gemini_session_file_for_transcript(home, session_id),
         _ => None,
     }?;

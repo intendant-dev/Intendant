@@ -254,6 +254,23 @@ function chapterNavHighlightRow(node, mode) {
   setTimeout(clear, 1600);
 }
 
+// ── Jump landing ───────────────────────────────────────────────────────
+// Where a jumped-to row lands: vertically CENTERED in its scroller, so
+// the hit arrives with context on both sides instead of hugging the top
+// edge; a row taller than the viewport instead pins its first line just
+// below the top (CHAPTER_NAV_JUMP_PAD_PX) so the start of the message is
+// always visible. Manual scrollTop math on purpose: scrollIntoView can
+// scroll ancestor containers too, block:'center' buries the head of
+// taller-than-viewport rows, and the cursor bookkeeping needs the
+// resulting scrollTop synchronously.
+function chapterNavJumpScrollTop(scroller, node) {
+  const lead = Math.max(
+    CHAPTER_NAV_JUMP_PAD_PX,
+    Math.floor((scroller.clientHeight - node.offsetHeight) / 2)
+  );
+  return Math.max(0, node.offsetTop - lead);
+}
+
 // ── Pane jumps ─────────────────────────────────────────────────────────
 
 function chapterNavJumpPane(win, mode, dir) {
@@ -284,7 +301,7 @@ function chapterNavJumpPane(win, mode, dir) {
   const node = win.log.querySelector(`[data-history-index="${target}"]`);
   if (!node) return false;
   win.followOutput = false;
-  win.log.scrollTop = Math.max(0, node.offsetTop - CHAPTER_NAV_JUMP_PAD_PX);
+  win.log.scrollTop = chapterNavJumpScrollTop(win.log, node);
   ix.cursor = { mark: target, scrollTop: win.log.scrollTop };
   chapterNavHighlightRow(node, mode);
   const cluster = chapterNavClusterForPane(win);
@@ -321,7 +338,7 @@ function chapterNavPaneHistoryLoaded(win) {
   const node = win.log.querySelector(`[data-history-index="${target}"]`);
   if (!node) return;
   win.followOutput = false;
-  win.log.scrollTop = Math.max(0, node.offsetTop - CHAPTER_NAV_JUMP_PAD_PX);
+  win.log.scrollTop = chapterNavJumpScrollTop(win.log, node);
   ix.cursor = { mark: target, scrollTop: win.log.scrollTop };
   chapterNavHighlightRow(node, pending.mode);
   const cluster = chapterNavClusterForPane(win);
@@ -365,7 +382,7 @@ function chapterNavScrollDetailTo(view, ix, marks, target, mode) {
   }
   const node = view.scroller.querySelector(`[data-detail-row-index="${target}"]`);
   if (!node) return;
-  view.scroller.scrollTop = Math.max(0, node.offsetTop - CHAPTER_NAV_JUMP_PAD_PX);
+  view.scroller.scrollTop = chapterNavJumpScrollTop(view.scroller, node);
   ix.cursor = { mark: target, scrollTop: view.scroller.scrollTop };
   chapterNavHighlightRow(node, mode);
   chapterNavUpdateCount(chapterNavDetailCluster, mode, marks, target);

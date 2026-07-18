@@ -215,11 +215,12 @@ function ui2WireMirrors() {
   // focusSessionWindow() path as clicking a window. "All sessions" clears
   // the Focus filter back to the combined stream.
   //
-  // Wired strictly on DOMContentLoaded: this block reads `sessionWindows`,
-  // a `let` a later fragment declares in the shared module scope — at
-  // chrome-boot time it is in its TDZ, and even `typeof` on a TDZ binding
-  // THROWS (the module-boot rule's sharpest edge; a throw here kills
-  // every fragment after this one).
+  // Called directly below: ui2WireMirrors itself only runs from the
+  // module's DOMContentLoaded boot, so every fragment has executed and
+  // `sessionWindows` (a later fragment's shared-scope `let`) is out of
+  // its TDZ. The old nested readiness gate here re-registered a
+  // DOMContentLoaded listener DURING DCL dispatch — which per spec never
+  // fires — so the switcher was never wired at all.
   const ui2WireSwitcher = () => {
   const switcher = document.getElementById('ui2-session-switcher');
   const rebuildSwitcher = () => {
@@ -270,8 +271,7 @@ function ui2WireMirrors() {
     rebuildSwitcher();
   }
   };
-  if (document.readyState === 'complete') ui2WireSwitcher();
-  else document.addEventListener('DOMContentLoaded', ui2WireSwitcher, { once: true });
+  ui2WireSwitcher();
 
   // Prominent theme toggle: icon shows the current theme; click flips.
   const themeBtn = document.getElementById('ui2-theme-btn');

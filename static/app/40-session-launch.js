@@ -1046,7 +1046,10 @@ function buildSessionWindowLogEntry(c) {
   appendCopyLogEntryButton(entry, c.content ?? '');
   appendEditUserMessageButton(entry, c);
   if (c.collapsible || content.split('\n').length > 3 || content.length > 300) {
-    makeSessionWindowLogEntryCollapsible(entry, cnt);
+    // Conversational prose (user/steer/model text) starts expanded — only
+    // tool/system payloads keep the compact collapsed default (41's
+    // isConversationalProseLog, the chapter-nav vocabulary).
+    makeSessionWindowLogEntryCollapsible(entry, cnt, isConversationalProseLog(c));
   }
   return entry;
 }
