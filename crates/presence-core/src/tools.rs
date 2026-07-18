@@ -153,13 +153,13 @@ pub fn presence_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "set_autonomy".to_string(),
-            description: "Set the autonomy level: low asks for every category except file reads unless a Deny rule gates it; medium applies category rules and by default asks for writes, deletes, and destructive actions while network is auto; high auto-approves ordinary Ask/Auto categories but still gates Deny rules, first user-display access, human input, and live audio; full asks only for human input and live audio.".to_string(),
+            description: "Set the autonomy level below Full: low asks for every category except file reads unless a Deny rule gates it; medium applies category rules and by default asks for writes, deletes, and destructive actions while network is auto; high auto-approves ordinary Ask/Auto categories but still gates Deny rules, first user-display access, human input, and live audio. Full autonomy cannot be selected from the ambient/voice presence lane; direct the owner to dashboard Settings.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "level": {
                         "type": "string",
-                        "enum": ["low", "medium", "high", "full"],
+                        "enum": ["low", "medium", "high"],
                         "description": "The autonomy level."
                     }
                 },
@@ -243,5 +243,15 @@ mod tests {
         assert!(names.contains(&"send_message"));
         assert!(names.contains(&"inspect_frame"));
         assert!(names.contains(&"inspect_frames"));
+
+        let set_autonomy = tools
+            .iter()
+            .find(|tool| tool.name == "set_autonomy")
+            .expect("set_autonomy tool");
+        assert_eq!(
+            set_autonomy.parameters["properties"]["level"]["enum"],
+            serde_json::json!(["low", "medium", "high"]),
+            "presence must never offer the Full level that dispatch refuses"
+        );
     }
 }

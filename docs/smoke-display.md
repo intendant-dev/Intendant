@@ -154,7 +154,7 @@ Stuck-at-empty (`class="display-input-authority"`, hidden via
 `web_gateway::compute_bootstrap_authority_snapshots` and the deferred
 post-`log_replay` send.
 
-### 3.3 Server-side activity log (Intendant.app's Log tab)
+### 3.3 Server-side activity log (Activity → Timeline)
 
 ```
 User display access granted (display_id: 0)
@@ -204,7 +204,7 @@ Expect:
 
 | Symptom | Most likely culprit |
 |---|---|
-| Browser B's chip stuck `unknown` (hidden) on connect | `display_input_authority_state` sent before replay recreates the slot — see `src/bin/caller/web_gateway/ws_session.rs` and `input_authority.rs` |
+| Browser B's chip stuck `unknown` (hidden) on connect | `display_input_authority_state` sent before replay recreates the slot — see bootstrap ordering in `src/bin/caller/web_gateway/listener.rs` and authority state in `input_authority.rs` |
 | Chip flips to `you` but no `Display :0 in use` log | `_enterInteractive` not invoked — check `setAuthority('you')` promotion when `_takeControlPending` |
 | Chip stays `you` after another browser takes | `setAuthority` not handling `'you' → 'other'` exit-interactive transition |
 | `Display :0 released` fires on transient disconnect | `disconnect()` invoked with `userInitiated:true` from a non-user-close path — check capture_lost / ICE retry handlers |

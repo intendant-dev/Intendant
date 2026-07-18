@@ -1,12 +1,12 @@
 # CLAUDE.md
 
-> **Living document — reviewed 2026-07-18 in a source-first documentation audit, based on `main` @ `54da37c8`.**
+> **Living document — reviewed 2026-07-18 in a source-first documentation audit, based on `main` @ `3221b4d5`.**
 > This is a *tight orientation* for working in the repo. The deep reference lives in
 > the mdBook under `docs/src/` (mapped below). **Both this file and those docs lag the
 > code** — Intendant moves fast (~500 commits/month) and the docs are *not* updated on
 > every change. When this file, the docs, and the source disagree, **trust the source**,
 > then fix the doc. See what changed since this was written with
-> `git log --oneline 54da37c8..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
+> `git log --oneline 3221b4d5..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
 > file — when you edit CLAUDE.md, run `cp CLAUDE.md AGENTS.md` in the same commit; CI enforces they match.)
 
 ## What Intendant Is
@@ -17,7 +17,7 @@ Past the single box, daemons federate into a **network of agentic networks** —
 
 ## The Three Binaries (security boundary)
 
-- **intendant-runtime** (`src/main.rs`, `src/agent.rs`) — sandboxed executor. Reads one JSON `AgentInput` from stdin, runs commands sequentially, writes JSONL results. Landlock-restricted on Linux, Seatbelt-wrapped on macOS, restricted-token re-exec on Windows (`src/win_sandbox.rs`). **Never holds API keys.**
+- **intendant-runtime** (`src/main.rs`, `src/agent.rs`) — command executor. Reads one JSON `AgentInput` from stdin, runs commands sequentially, writes JSONL results. Its write sandbox uses Landlock on Linux, Seatbelt on macOS, and restricted-token re-exec on Windows (`src/win_sandbox.rs`); it defaults on for macOS/Linux and is opt-in on Windows. **Never holds API keys.**
 - **intendant** (`src/bin/caller/main.rs`) — controller. Drives the LLM loop, calls model APIs, dispatches tool calls to the runtime subprocess, supervises external agents, and runs every frontend.
 - **intendant-connect** (`src/bin/connect/main.rs`) — hosted rendezvous + account/metadata service (deployed to intendant.dev; self-hostable, see `docs/src/self-hosted-rendezvous.md`). Stores what daemons and browsers publish. Fleet records are self-signed: the current browser detects same-key alteration, but there is not yet an owner/device trust set, so a malicious store can substitute a newly self-signed record on another device. That metadata never grants daemon authority. Connect also serves browser code and installers, so malicious served code can alter or exfiltrate what the Connect page sees and a malicious installer can compromise what it installs. It holds no daemon API keys, cannot mint daemon-local IAM, and the default daemon refuses hosted-provenance control at immutable `role:none`.
 
@@ -102,7 +102,12 @@ Common invocations (full flag reference in `docs/src/getting-started.md`):
 ./target/release/intendant org init <handle>       # create an org root key on this daemon (trust model)
 ```
 
-Requires an API key in `.env` (searched: cwd + parents → project root → `~/.config/intendant/.env`). `.env` and `intendant.toml` are git-ignored.
+Native model sessions need provider authority from the process environment,
+an `.env` file (searched: cwd + parents → project root →
+`~/.config/intendant/.env`), or an active lease. Administrative subcommands are
+keyless; external-agent backends use their own auth, and MCP/web can start
+without a native provider until a native task needs one. `.env` and
+`intendant.toml` are git-ignored.
 
 **Operating vs. developing:** to drive a *running* daemon — sessions, approvals,
 displays, screenshots, computer use, federated peers — use `intendant ctl`
@@ -115,7 +120,7 @@ Read the source to change Intendant, not to operate it.
 
 ```
 src/
-├── main.rs, agent.rs           # intendant-runtime (sandboxed executor)
+├── main.rs, agent.rs           # intendant-runtime (write-sandboxed by platform policy)
 ├── models.rs, error.rs, utils.rs, win_sandbox.rs
 ├── bin/caller/                 # the intendant controller:
 │   ├── main.rs                 # entry: CLI flags/help, panic hook, startup prologue + mode dispatch
@@ -145,7 +150,7 @@ src/
 └── bin/connect/                # intendant-connect: hosted rendezvous (accounts, daemon claims, fleet sync, vault blobs, push, transparency log)
 crates/{presence-core, presence-web, station-web}   # WASM: shared presence types/tools/dispatch, browser presence client, Station renderer
 crates/intendant-platform   # OS integration leaf: platform probes/spawn (platform.rs), DisplayTarget, virtual-display mgmt (vision.rs)
-crates/intendant-core       # shared-vocabulary leaf: error, autonomy, frames, net, peer_id, usage, vitals, conversation, state paths, skills
+crates/intendant-core       # shared-vocabulary leaf: error, autonomy, env scrubbing, frames, net, peer_id, usage, vitals, conversation, state paths, skills
 crates/intendant-display    # the WebRTC display pipeline (encoder pool, tiles, capture backends, per-OS input)
 crates/{owner-plane-core, owner-plane-reducer}   # Gate-A-stamped D0-A writer + independent reader/corpus
 crates/rustc-governor       # machine-wide rustc/link concurrency governor used by dev and CI wrappers
@@ -173,7 +178,11 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   live box (worktree roots, `~/.intendant` session stores) and its outcome
   and duration become machine state. Functions under test take their roots
   as parameters (`home: &Path`, store dirs); the transport edge resolves
-  the real environment, tests inject `tempfile` dirs. A nextest lane or
+  the real environment, tests inject `tempfile` dirs. Avoid mutating
+  process-global environment; when a binary test cannot, hold the crate-wide
+  `crate::test_support::TEST_ENV_LOCK` for the full mutation/restore window
+  (`.lock().await` in async tests, `.blocking_lock()` in sync tests), and give
+  other workspace crates one equivalent shared lock rather than local locks. A nextest lane or
   widened timeout around an environment-dependent test is a smell, not a
   fix.
 - **File size budget:** keep a source file under ~3k lines of non-test code
@@ -222,7 +231,10 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   The v1 chrome, its Catppuccin palette, and the `?ui=v1` escape hatch were
   deleted post-soak; `html.ui-v2` remains as the permanent scoping namespace,
   and the tokens file's alias layer defines the Catppuccin-era var names the
-  base stylesheets still consume.
+  base stylesheets still consume. The current **Activity v3** experience lives
+  inside that permanent namespace (Timeline, Context, Managed, Changes, and
+  Control); “v3” names the Activity interaction revision, not a new global CSS
+  namespace.
 - Pure-safe Rust by default. The Unix (macOS / Linux) code paths keep `unsafe`
   confined to documented islands: small platform probes/signals and display or
   identity queries in `platform.rs` (now `crates/intendant-platform`); macOS Accessibility bindings in `ax.rs`

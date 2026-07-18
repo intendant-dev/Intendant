@@ -408,6 +408,10 @@ async fn cmd_request(args: PeerArgs) -> Result<(), CallerError> {
     println!(":: request id: {}", outgoing.request_id);
     println!(":: approval code: {}", outgoing.code);
     println!(
+        ":: pinned target cert fingerprint: {} (compare out-of-band with the target operator)",
+        outgoing.server_cert_fingerprint
+    );
+    println!(
         ":: approve on the target with: intendant peer approve {}",
         outgoing.code
     );

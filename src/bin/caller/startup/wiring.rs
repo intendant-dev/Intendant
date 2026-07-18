@@ -419,6 +419,10 @@ pub(crate) fn spawn_mode_web_gateway(
         web_tls_client_cert_required,
         web_tls_acceptor.clone(),
     );
+    // The runtime sandbox walls this port off from model-driven shells
+    // (see sandbox::seatbelt_loopback_guard_clause) — recorded here, the
+    // one place every gateway-bearing startup shape passes through.
+    crate::sandbox::record_gateway_loopback_port(web_port);
     Ok(GatewaySpawn {
         _handle: handle,
         shared_session,

@@ -403,10 +403,14 @@ A browser live model calls presence tools via tagged request/response:
 - **Video tools** (`inspect_frame`, `inspect_frames`) examine frames from the
   frame registry.
 
-On connect the server sends, in order: `state_snapshot`, the cached
-`usage_update`, the cached `status`, the cached `display_ready`, a
-`browser_workspace_snapshot`, and finally `log_replay` — so late-connecting
-browsers see complete state immediately.
+On connect the server queues a deterministic bootstrap before opening the live
+broadcast lane: `state_snapshot`; cached usage/status and per-session state;
+cached autonomy, backend, and user-display state; pending display requests; the
+`browser_workspace_snapshot`; live `display_ready` frames; session/external-log
+replay; and, last, the current per-display input-authority snapshots. Optional
+cached entries are omitted when absent. This ordering recreates display slots
+before replay and then lets the final authority snapshot win over historical
+transitions.
 
 ### HTTP endpoints
 

@@ -2,9 +2,11 @@
 
 ## Overview
 
-Every `intendant` invocation gets a structured session log directory. It is the
-single source of truth for what happened in a session: a line-per-event JSONL
-stream, full per-turn artifacts, the agent's stdout/stderr, file-history
+Every session-bearing/controller-loop `intendant` invocation gets a structured
+session log directory. Administrative commands such as `access`, `org`, `peer`,
+`setup`, `service`, `ctl`, and `hosted-verify` exit before session logging. For
+an actual session the directory is the single source of truth: a line-per-event
+JSONL stream, full per-turn artifacts, the agent's stdout/stderr, file-history
 snapshots, and (for a controller process's bootstrap session) the controller's
 own console output.
 It serves four audiences: a human debugging after the fact, the dashboard
@@ -347,8 +349,8 @@ otherwise the overlay is used.
 Every controller process attempts `daemon_log_tee::install` once after opening
 its bootstrap session log. On Unix it redirects the controller's own stderr and
 stdout into that directory's `daemon.log`, prefixing each line with a wallclock
-timestamp, while still mirroring everything to the original terminal.
-This captures controller-side `eprintln!`, panics, and tracing that would
+timestamp, while attempting to mirror the same lines to the original terminal.
+This is intended to capture controller-side `eprintln!`, panics, and tracing that would
 otherwise never reach `session.jsonl` (which only records *agent* events). The
 dashboard's "Download session report" zip includes `daemon.log` so a tester's
 bundle is temporally analyzable by a developer.
@@ -356,6 +358,11 @@ bundle is temporally analyzable by a developer.
 This is **Unix-only**: on Windows `install` is a no-op. The tee is
 process-scoped, not session-supervisor-scoped: child session directories created
 inside a long-lived daemon generally do not each get another `daemon.log`.
+It is also best-effort rather than a durable dual-sink guarantee: raw
+terminal/file write results are not checked, a newline-free tail remains
+buffered, and shutdown gives the drain a bounded window. A short/failed write or
+final partial line can therefore be absent even when the tee's byte counters
+look balanced.
 
 ## How the Dashboard Consumes the Logs
 

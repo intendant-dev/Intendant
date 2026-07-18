@@ -5,7 +5,8 @@ served by the controller's built-in HTTP/WebSocket gateway, running entirely in
 the browser with WASM-powered state management (the `presence-web` crate,
 mobile-responsive). Since the design-overhaul flip the default look is the
 **v2 chrome** (Iris accent: left navigation rail, oversight bar, ⌘K command
-palette, bottom composer). Dark is the default theme; a **light theme** ships
+palette, bottom composer); Activity uses its newer v3 presentation inside that
+permanent `html.ui-v2` namespace. Dark is the default theme; a **light theme** ships
 alongside it (Settings → Appearance, or the ⌘K theme toggle — browser-scoped,
 persisted per browser). The previous Catppuccin Mocha generation and its
 `?ui=v1` escape hatch were deleted after the soak period. The SPA is served as one
@@ -97,8 +98,9 @@ The v2 chrome groups thirteen destinations in the left navigation rail —
 and **Station** (Watch), **Terminal** and **Files** (Machine), **Usage**
 (Insight), **Access** and **Vault** (Trust), **Settings** and **Debug**
 (System). The oversight bar on top carries the phase pill, stop control,
-context meter, transport state, the Activity Focus/Grid layout toggle, and the
-⌘K command palette; the composer — the global task input — docks at the bottom
+context meter, transport state, and the ⌘K command palette. Activity's own
+header carries its five-view switch and Timeline-only session/layout controls;
+the composer — the global task input — docks at the bottom
 and reaches the daemon from any destination. New events arriving while you are
 elsewhere raise a badge on the rail item.
 
@@ -162,11 +164,12 @@ JSON-serializable snapshot. Current probes: `qa.sessionsHydration()`
 (sessions-tab relationship-hydration termination, `40-session-launch.js`),
 `qa.sessionsFuel()` (new-session credential preflight,
 `55b-session-launch.js`), `qa.newSessionAgentPrefs()` (last-used
-launch-option prefill state, same fragment),
-and `qa.station()` — a pointer to `window.stationProbe`, which predates the
-namespace and keeps its legacy name (the validator's `--station-*` probes
-and smoke skills depend on it). `window.__intendantPaneDiag` above is the
-other legacy surface.
+launch-option prefill state, same fragment), `qa.focusSurface()` (Activity
+Focus target/promotion state), `qa.minimizeDone()` (sub-agent auto-minimize
+and bulk-control state), and `qa.station()` — a pointer to
+`window.stationProbe`, which predates the namespace and keeps its legacy name
+(the validator's `--station-*` probes and smoke skills depend on it).
+`window.__intendantPaneDiag` above is the other legacy surface.
 
 `scripts/validate-dashboard.cjs` reads probes back without a bespoke sink
 via the repeatable `--probe-json EXPR` flag (optional `label=EXPR` form):
@@ -184,36 +187,43 @@ node scripts/validate-dashboard.cjs --url "http://127.0.0.1:<port>/#sessions" \
 
 ### Activity
 
-The default tab, and the classic DOM control surface. It remains fully
-supported as the legacy fallback (the accessibility floor, the low-GPU path,
-and the surface most automation drives today), but [Station](./station.md)
-is the designated canonical control surface going forward.
+The default tab and the dashboard's canonical DOM control surface. Activity v3
+re-presents the established behavior in a calmer card/timeline language while
+retaining the accessibility floor, low-GPU path, stable element ids, deep
+links, and automation hooks. [Station](./station.md) is the rendered-canvas
+alternative and immersive roadmap; both dispatch through the same control
+plane.
 
-Five subtabs:
+Five visible views (the first retains the internal `log` id for compatibility):
 
-- **Log** — a scrollable, color-coded event stream of everything in the system,
-  grouped by turn with visual separators, with a verbosity selector
-  (Normal/Verbose). Event sources are color-coded:
+- **Timeline** — a scrollable event stream of everything in the system,
+  grouped by centered turn separators. User prose, worker/command activity,
+  and system metadata have distinct reading tiers; the **Options** popover
+  carries Normal/Verbose/Debug density plus the host filter. Event sources
+  remain classified as:
   - **system** — session lifecycle, approvals, context management
   - **worker** — model responses, reasoning summaries, task completion
   - **agent** — command execution output (stdout/stderr, exit codes)
   - **live** — voice transcripts, presence lifecycle, tool requests
   - **server** — presence model internals (thinking, tool calls)
 
-  Under v2 the Log pane has two layouts, toggled from the oversight bar and
-  persisted per browser: **Focus** (the default) shows the combined stream as
-  one centered timeline with role eyebrows, and on wide viewports a vitals
-  rail for the foreground session (working tree, context budget, prompt
-  cache, rate limits, changes); **Grid** shows the classic per-session
-  window grid with relationship wires and the concurrent stream below.
+  The Activity header carries two layouts, persisted per browser. **Focus**
+  (the default) promotes the selected/prompt-target session's existing,
+  hydrated session window as the timeline; with no target it falls back to
+  the combined all-session stream. On wide viewports a vitals rail follows
+  the foreground session (working tree, context budget, prompt cache, rate
+  limits, changes). **Grid** shows the per-session window grid with
+  relationship wires and the concurrent stream below. The same header holds
+  the session switcher and context-sensitive **Minimize done** control.
 
-  The Log pane also carries the approval card. **Approve** clears the
+  Timeline also carries the approval card. **Approve** clears the
   pending command once; **Approve all like this** sets that approval
   category's rule to `auto` (the shipped per-category machinery, scoped and
   revocable in Settings) and then approves; **Switch to Full autonomy** is
-  the old approve-all — it lifts every gate, and is labeled for what it is.
-  Skip and Deny complete the set (`y` / `a` / `s` / `n`). A follow-up text
-  input sends a message after a round completes.
+  the old native approve-all and is labeled for its broader, daemon-wide
+  scope. Explicit native `deny` rules and hard human/live-audio gates still
+  remain. Skip and Deny complete the set (`y` / `a` / `s` / `n`). A follow-up
+  text input sends a message after a round completes.
 
   Pending requests also escalate beyond the open tab (the **attention
   center**, `static/app/57-attention-notifications.js`): every pending
@@ -528,11 +538,12 @@ canonical dashboard equivalent. View settings shape the scene: layout
 (`orbital` / `constellation`), mood (`calm` / `cockpit`), and fov, motion, ar,
 and density tuning.
 
-Station is the designated successor to the classic Activity surface as the
-canonical way to operate agents; the DOM Logs view remains the legacy
-fallback. Today the scene is a 3D constellation backdrop with the working UI
-painted as screen-space HUD panels; the destination is action panes living
-*in* the scene, and eventually WebXR spatial computing. The dedicated
+Station is the rendered-canvas counterpart to Activity, not a separate
+authority surface. Today the scene is a 3D constellation backdrop with the
+working UI painted as screen-space HUD panels; the destination is action panes
+living *in* the scene, and eventually WebXR spatial computing. Activity remains
+the default DOM control surface while Station carries that immersive roadmap.
+The dedicated
 [Station](./station.md) chapter carries the architecture, an honest
 current-state inventory, and the roadmap.
 
@@ -1103,8 +1114,20 @@ system Chrome/Chromium apps require choosing `system_cdp` or setting
 
 The configuration panel for the current session: API keys, external-agent
 backend settings, computer-use/provider options, presence, transcription,
-recording, and live audio. Peer/network administration moved to **Access**.
-Old `#settings/network` deep links are redirected to `#access/overview`.
+recording, live audio, and the runtime sandbox. Peer/network administration
+moved to **Access**. Old `#settings/network` deep links are redirected to
+`#access/overview`.
+
+**Settings → Security** holds the runtime write sandbox card ("Runtime
+sandbox" — the confinement of the native agent's shell and file tools to
+granted paths, `[sandbox]` in intendant.toml): a live on/off toggle, the
+effective write-grant set, and an extra-grants editor (one path per line,
+absolute or project-relative). Saves ride the regular `/api/settings`
+flow and apply to new commands immediately — no restart; when
+`--sandbox`/`--no-sandbox` pinned the state for this daemon run, the
+toggle is disabled and saves only persist intent for the next start. This
+is a different layer from the Codex/Claude Code sandbox settings —
+external agents bring their own.
 
 ## Late-join and session replay
 
@@ -1211,13 +1234,16 @@ and written to the session log. See
     [Getting Started](./getting-started.md#macos-app-bundle)). The bundle starts
     its daemon with native mTLS by default so remote browsers get a safe context
     over `https://` and must present an enrolled client identity.
-- **API key for voice:** Gemini or OpenAI, stored browser-side only.
+- **Voice credentials:** Gemini's long-lived key is held in the browser
+  (preferably in the unlocked client vault; `localStorage` is the legacy
+  fallback). OpenAI's long-lived credential stays with the daemon or a lease;
+  the browser receives only a short-lived Realtime client secret.
 
 ### HTTPS / TLS
 
 ```bash
 ./target/release/intendant                       # default: mTLS, requires access certs
-./target/release/intendant --tls                 # TLS-only; installed access certs when present, else self-signed
+./target/release/intendant --tls                 # TLS-only; installed server cert/key when present, else self-signed
 ./target/release/intendant --no-tls --bind 127.0.0.1 # explicit local plaintext/debug escape
 ./target/release/intendant --tls-cert c.pem --tls-key k.pem   # bring your own
 ```
@@ -1229,6 +1255,11 @@ override, TLS-only uses installed access server certs when present and falls bac
 to an auto self-signed certificate. Plain HTTP via `--no-tls` is intended for
 local/programmatic debugging; wildcard plaintext refuses startup when the host
 has a public interface unless `--allow-public-plaintext` is passed.
+TLS-only mode loads no client CA. It gives remote browsers HTTPS and a secure
+context, but certless remote requests to protected HTTP, WebSocket, and
+dashboard-control routes are still denied unless another authenticated
+peer/hosted-lease identity applies; use the default mTLS mode for browser client
+certificate authentication.
 The gateway demuxes per connection: a first byte of `0x16` (a TLS ClientHello)
 is wrapped in the rustls acceptor, while raw WebRTC ICE-TCP/UDP media is left
 untouched. The TLS stack is pure Rust (`rustls` + `rcgen`) and works on every
@@ -1720,7 +1751,8 @@ family (sub-routes elided where the family is uniform):
 | `GET /api/managed-context/{records,anchors,fission}` | Managed-context state: rewind records, anchors, fission groups |
 | `GET /recordings/*`, `GET /frames/*` | Current-session recording segments and captured frame assets |
 | `GET /api/fs/{stat,list,read}`, `POST /api/fs/{mkdir,write}` | Scoped filesystem browsing and editor writes (fs scope enforced per grant) |
-| `GET/POST /api/settings`, `POST /api/api-keys`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key management |
+| `GET/POST /api/settings`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key status |
+| `POST /api/api-keys` | Store provider API keys (credential custody: `CredentialsManage`, which no peer profile carries) |
 | `GET /api/external-agents` | External-agent backend availability (configured command, installed, auth posture, last used) plus passive zero-quota compatibility status (artifact fingerprint, in-band version, manifest digest, finding counts) — drives the fueling nudge and new-session picker |
 | `GET /api/displays`, `POST /api/diagnostics/visual-freshness` | Display inventory; visual-freshness probe marker |
 | `GET /api/hosted-control/{bootstrap,certificate-ledger}`, `POST /api/hosted-control/{requests,requests/poll,anchor-decisions,witness-reports}` | Public hosted doorbell and signed certificate-observation records: dark when disabled; the ledger is also readable over authenticated direct peer routes, request creation/poll proves the tab key, and signed-app inputs verify the enrolled anchor |
@@ -1833,7 +1865,7 @@ response omits the header.
 | GET | `/api/project-root` | Settings | own origin | none | Project root path this daemon serves |
 | POST | `/api/settings` | Settings | own origin | bounded | Update runtime settings |
 | GET | `/api/settings` | Settings | own origin | none | Current runtime settings |
-| POST | `/api/api-keys` | Settings | own origin | bounded | Store provider API keys in the project .env |
+| POST | `/api/api-keys` | CredentialsManage | own origin | bounded | Store provider API keys in the daemon-config .env |
 | GET | `/api/api-key-status` | Settings | own origin | none | Which provider keys are configured (presence only) |
 | POST | `/api/claude-auth/start` | CredentialsManage | own origin | ≤ 4 KiB | Start the Claude sign-in ceremony (`claude auth login` on a daemon-private PTY) |
 | GET | `/api/claude-auth/status` | CredentialsManage | own origin | none | Claude sign-in ceremony state (validated sign-in URL; account info on success) |

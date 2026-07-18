@@ -1,8 +1,11 @@
 use crate::types::truncate_str;
 use chrono::{Local, Utc};
+use intendant_core::state_paths::{
+    create_private_dir_all, private_file_options, write_private_file,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
@@ -505,8 +508,11 @@ impl SessionLog {
         dir: PathBuf,
         keep_all_context_snapshots: bool,
     ) -> std::io::Result<Self> {
-        fs::create_dir_all(&dir)?;
-        fs::create_dir_all(dir.join("turns"))?;
+        // Session logs hold conversation content (transcripts, tool I/O,
+        // context snapshots) — owner-only from creation: 0700 dirs, 0600
+        // files on Unix (Windows relies on the profile ACL).
+        create_private_dir_all(&dir)?;
+        create_private_dir_all(&dir.join("turns"))?;
         let log_dir = dir.clone();
 
         // Try to read existing session_id from meta, or derive from directory name
@@ -524,12 +530,10 @@ impl SessionLog {
                 .unwrap_or_else(|| Uuid::new_v4().to_string())
         };
 
-        let file = OpenOptions::new()
-            .create(true)
+        let file = private_file_options()
             .append(true)
             .open(dir.join("session.jsonl"))?;
-        let transcript_file = OpenOptions::new()
-            .create(true)
+        let transcript_file = private_file_options()
             .append(true)
             .open(dir.join("transcript.jsonl"))
             .ok()
@@ -1138,7 +1142,7 @@ impl SessionLog {
         };
         let path = self.dir.join("session_summary.json");
         if let Ok(json) = serde_json::to_string_pretty(&summary) {
-            if let Err(e) = fs::write(&path, &json) {
+            if let Err(e) = write_private_file(&path, &json) {
                 eprintln!("session_log: failed to write session_summary.json: {}", e);
             }
         }
@@ -1153,7 +1157,7 @@ impl SessionLog {
     fn write_turn_file(&self, suffix: &str, content: &str) -> Option<String> {
         let relative = format!("turns/turn_{:03}_{}", self.current_turn, suffix);
         let path = self.dir.join(&relative);
-        if fs::write(&path, content).is_ok() {
+        if write_private_file(&path, content).is_ok() {
             Some(relative)
         } else {
             None
@@ -1175,11 +1179,7 @@ impl SessionLog {
     fn append_turn_file_span(&self, suffix: &str, content: &str) -> Option<TurnFileSpan> {
         let relative = format!("turns/turn_{:03}_{}", self.current_turn, suffix);
         let path = self.dir.join(&relative);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .ok()?;
+        let mut file = private_file_options().append(true).open(&path).ok()?;
         // One post-open fstat serves both the has-content test and the
         // span offset (the pre-open stat was a wasted syscall on this
         // per-output-chunk path).
@@ -1492,7 +1492,7 @@ impl SessionLog {
         // Overwrite transcript.jsonl with clean aggregated version
         if !entries.is_empty() {
             let transcript_path = self.dir.join("transcript.jsonl");
-            if let Ok(f) = File::create(&transcript_path) {
+            if let Ok(f) = private_file_options().truncate(true).open(&transcript_path) {
                 let mut w = BufWriter::new(f);
                 for entry in &entries {
                     if let Ok(json) = serde_json::to_string(entry) {
@@ -1653,6 +1653,32 @@ mod tests {
                 .to_string();
             assert!(!id.starts_with('-'), "session id not flag-safe: {id}");
         }
+    }
+
+    /// Session log dirs and every file class written under them are
+    /// owner-only from creation (no chmod-after-write window).
+    #[cfg(unix)]
+    #[test]
+    fn session_log_artifacts_are_owner_only_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+
+        assert_eq!(mode_of(&log_dir), 0o700);
+        assert_eq!(mode_of(&log_dir.join("turns")), 0o700);
+        assert_eq!(mode_of(&log_dir.join("session.jsonl")), 0o600);
+        assert_eq!(mode_of(&log_dir.join("transcript.jsonl")), 0o600);
+
+        let rel = log.write_turn_file("out.txt", "content").unwrap();
+        assert_eq!(mode_of(&log_dir.join(&rel)), 0o600);
+        let rel = log.append_turn_file("stream.txt", "chunk").unwrap();
+        assert_eq!(mode_of(&log_dir.join(&rel)), 0o600);
+
+        log.write_summary("task", "done", 1);
+        assert_eq!(mode_of(&log_dir.join("summary.json")), 0o600);
     }
 
     #[test]

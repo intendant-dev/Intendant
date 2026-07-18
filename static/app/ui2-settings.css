@@ -413,6 +413,71 @@ html.ui-v2 .ui2-ro-value {
 }
 html.ui-v2 .ui2-ro-note { border-top: 1px solid var(--line); padding-top: 12px; }
 
+/* ══ Security: runtime-sandbox card ═════════════════════════════════ */
+/* One-per-line path textarea — the settings rows never carried a
+   textarea before, so mirror the text-input recipe (mono, surface;
+   wraps instead of ellipsizing — every line is a full path). */
+html.ui-v2 #tab-settings .settings-row textarea {
+  flex: none;
+  width: 280px;
+  max-width: 52%;
+  min-height: 64px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-ctl);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  padding: 8px 12px;
+  outline: none;
+  resize: vertical;
+  transition: border-color var(--t-med), box-shadow var(--t-med);
+}
+html.ui-v2 #tab-settings .settings-row textarea:focus-visible {
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+html.ui-v2 #tab-settings .settings-row textarea::placeholder { color: var(--text-3); }
+/* The flag-lock note shares the toggle's row — let it shrink and wrap
+   instead of shoving the toggle off the control edge. */
+html.ui-v2 #tab-settings #set-sandbox-flag-note {
+  flex: 0 1 auto;
+  min-width: 0;
+  text-align: right;
+  line-height: 1.4;
+}
+/* Multi-line value rows top-align the label against the control. */
+html.ui-v2 #tab-settings .sandbox-grants-row { align-items: flex-start; }
+html.ui-v2 #tab-settings .sandbox-grants-row > label { padding-top: 6px; }
+/* The effective write-grant set: read-only mono chips on the control
+   edge. Chips wrap and long paths break mid-path — the tail of a grant
+   is the part that distinguishes it, so nothing ellipsizes away. */
+html.ui-v2 #tab-settings .sandbox-grants {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 52%;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+html.ui-v2 #tab-settings .sandbox-grant {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--surface-3);
+  color: var(--text-2);
+  max-width: 100%;
+  word-break: break-all;
+}
+html.ui-v2 #tab-settings .sandbox-grants-empty {
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--text-3);
+}
+
 /* ══ notes, keys, env overrides, save row ═══════════════════════════ */
 html.ui-v2 #tab-settings .settings-note {
   margin: 0;

@@ -26,6 +26,7 @@
 
 const UI2_SET_SECTIONS = [
   { id: 'autonomy', label: 'Autonomy & approvals' },
+  { id: 'security', label: 'Security' },
   { id: 'providers', label: 'Providers & models' },
   { id: 'presence', label: 'Presence & voice' },
   { id: 'appearance', label: 'Appearance' },
@@ -384,6 +385,15 @@ function ui2SettingsBuild() {
       + 'except reads waits; at High, Ask behaves like Auto; at Full the rules are bypassed entirely.',
     ));
     panes.autonomy.appendChild(rules);
+  }
+
+  // ── Security (the runtime write sandbox card, re-parented whole:
+  //    ids + the loadSettings/saveSettings wiring in fragment 53 stay
+  //    live; distinct from the Codex sandbox picker under Activity →
+  //    Control) ──
+  {
+    const sandboxCard = cardOf('settings-sandbox-heading');
+    if (sandboxCard) panes.security.appendChild(sandboxCard);
   }
 
   // ── Providers & models ──

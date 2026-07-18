@@ -321,8 +321,9 @@ single definition lives in `project::root_has_project_marker`, which the
 boot-scan gate (`file_watcher::root_is_snapshot_worthy`) also uses — it runs
 *projectless* instead of adopting cwd as an implicit project. Concretely: no
 file-watcher baseline (nothing is watched at all), no cwd-derived sandbox
-write scope (scratch + log dir + `~/.intendant` + explicit absolute grants
-only), no project-root `.env` layer at startup, `GET /api/project-root`
+write scope (scratch + session logs + Unix toolchain caches + explicit
+absolute grants only; never the daemon state root wholesale), no project-root
+`.env` layer at startup, `GET /api/project-root`
 returns `project_root: null` (the dashboard's New Session pane requires a
 project before submitting), and there is **no default session project** —
 each `CreateSession`/resume carries its own `project_root`, and a create

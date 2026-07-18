@@ -1428,8 +1428,8 @@ impl ProtocolWatchStore {
             first_observed_secs: now_secs(),
         };
         if let Ok(bytes) = serde_json::to_vec_pretty(&record) {
-            if crate::file_watcher::atomic_write(&path, &bytes).is_err() {
-                note_storage_failure(&self.contract_dir());
+            if let Err(error) = crate::file_watcher::atomic_write(&path, &bytes) {
+                note_storage_failure_with(&self.contract_dir(), Some(&error));
             }
         } else {
             note_storage_failure(&self.contract_dir());
@@ -1461,8 +1461,8 @@ impl ProtocolWatchStore {
             reported_version,
         };
         if let Ok(bytes) = serde_json::to_vec_pretty(&record) {
-            if crate::file_watcher::atomic_write(&path, &bytes).is_err() {
-                note_storage_failure(&self.contract_dir());
+            if let Err(error) = crate::file_watcher::atomic_write(&path, &bytes) {
+                note_storage_failure_with(&self.contract_dir(), Some(&error));
             }
         } else {
             note_storage_failure(&self.contract_dir());
@@ -1551,11 +1551,22 @@ fn storage_failures() -> &'static StdMutex<HashMap<PathBuf, u64>> {
 }
 
 fn note_storage_failure(path: &Path) {
+    note_storage_failure_with(path, None);
+}
+
+/// The once-per-contract failure note, carrying the underlying error when
+/// the caller has one — a bare fixed line proved undiagnosable on CI.
+fn note_storage_failure_with(path: &Path, error: Option<&std::io::Error>) {
     let first = lock_unpoison(storage_failures())
         .insert(path.to_path_buf(), now_secs())
         .is_none();
     if first {
-        eprintln!("[external protocol watch] diagnostics persistence failed");
+        match error {
+            Some(error) => {
+                eprintln!("[external protocol watch] diagnostics persistence failed: {error}")
+            }
+            None => eprintln!("[external protocol watch] diagnostics persistence failed"),
+        }
     }
 }
 

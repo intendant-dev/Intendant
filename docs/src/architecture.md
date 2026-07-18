@@ -17,9 +17,9 @@ every session launched at runtime.
         │                     │                                               │
         ▼                     │   Frontends (display-only: render + emit       │
 ┌───────────────────┐         │   intents; never write shared state)           │
-│  (sandboxed exec) │  Agent  │     ├─ Web dashboard  ─┐ ControlMsg            │
+│  (command exec)   │  Agent  │     ├─ Web dashboard  ─┐ ControlMsg            │
 │                   │  Input  │     ├─ MCP server      ─┤  (intents)            │
-│  - OS sandbox     │  (JSON) │     └─ Control socket  ─┘     │                 │
+│  - write sandbox  │  (JSON) │     └─ Control socket  ─┘     │                 │
 │  - no API keys    │────────▶│                                ▼                 │
 │  - exec/edit/PTY  │ results │            ┌──────────────────────────────┐    │
 │  - screenshot     │         │            │          EventBus            │    │
@@ -88,10 +88,24 @@ The runtime/controller split is a deliberate security boundary:
   tokens on Windows) and **never holds API keys**. At the controller→runtime
   spawn boundary, provider credentials are removed case-insensitively (canonical
   names plus inherited `*_API_KEY` / `*_API_TOKEN` names, except the
-  `INTENDANT_*` control namespace); the runtime's shell handlers repeat the
-  canonical removals as defense in depth. It
+  `INTENDANT_*` control namespace), together with ambient host credentials such
+  as agent sockets, forge/cloud/registry tokens, and credential-store pointers.
+  Both runtime shell handlers independently repeat the provider and ambient
+  scrub as defense in depth. It
   reads JSON commands from stdin, executes them sequentially, and writes results
-  to stdout.
+  to stdout. The write sandbox is **on by default on macOS/Linux and opt-in
+  on Windows** (`--sandbox` forces it on, `--no-sandbox` forces it off, and
+  `[sandbox] enabled` overrides the platform default): reads stay open, writes
+  are confined to the project root, scratch/log dirs, the daemon state root's
+  `logs/` subtree, and — on Unix — the toolchain caches. On macOS the Seatbelt
+  wrap additionally denies reads on `~/.ssh`, `~/.gnupg`, the intendant config
+  home, and the `.env` files on the controller's key search path. Landlock and
+  the Windows token cannot subtract reads from the open filesystem, so on
+  Linux/Windows project and config `.env` files remain readable to sandboxed
+  commands — the honest residual; moving keys out of agent-readable files (the
+  credential-custody migration) is the tracked fix, and the destructive-command
+  classifier is best-effort UX on top of these boundaries, not a boundary
+  itself.
 - **intendant** (the controller) holds API keys and manages model conversations
   but **never executes user-requested shell commands directly** — it pipes them
   to the runtime subprocess.
@@ -104,8 +118,11 @@ The runtime/controller split is a deliberate security boundary:
   route, or unlocked vault/fleet state, while a malicious installer can
   compromise what it installs; neither is a path to a hosted control session.
 
-A compromised model conversation therefore cannot reach API keys, and the
-runtime process cannot exfiltrate data through a model API. See
+A compromised model conversation therefore cannot read keys out of the
+controller's memory, and the runtime process cannot exfiltrate data through a
+model API — but as long as keys live in `.env` files, the process split alone
+does not keep an injected command from reading them where the OS layer cannot
+express the denial (see the residual above). See
 [Runtime Protocol](./runtime-protocol.md) for the wire format and
 [Autonomy & Approvals](./autonomy.md) plus [Configuration](./configuration.md) for the
 layered approval system that gates what the runtime is even asked to do.

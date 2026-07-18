@@ -35,7 +35,7 @@ A failed child returns a `failed` status with the reason. Analyze it, then retry
 ## Coordination Strategy
 
 1. Start with research agents to gather context
-2. Share research findings with implementation agents via the task brief (and `memory_propose` for durable machine-wide facts)
+2. Share research findings with implementation agents via the task brief (and, when the current transport exposes it, `memory_propose` for durable machine-wide facts)
 3. Run independent implementation agents in parallel, each in its own worktree
 4. Validate with testing agents before reporting completion
 5. Keep status updates to the user brief and actionable
@@ -47,7 +47,11 @@ After each sub-agent completes, persist the workflow state with the `workflow_ch
 - Body: `completed: [task1, task2]; active: [task3]; decisions: [use PostgreSQL]; constraints: [must support Python 3.9+]`
 - If you resumed from a checkpoint, pass `supersedes` with that checkpoint's id — this acknowledges it and replaces it with yours.
 
-**Why**: When context is compacted (currently at ~90% usage), you lose detailed history. The checkpoint survives compaction, restarts, and worktree hops (every worktree of one repository shares one coordination space) and preserves what matters: what's done, what's in progress, key decisions, and constraints.
+**Why**: Automatic compaction currently starts around 90% usage. The 60% checkpoint
+guideline below is a deliberate early safety margin: the checkpoint survives
+compaction, restarts, and worktree hops (every worktree of one repository shares
+one coordination space) and preserves what matters: what's done, what's in
+progress, key decisions, and constraints.
 
 **When to checkpoint**:
 - After each sub-agent completes (success or failure)
@@ -75,7 +79,7 @@ This brief is narrated to the user by the presence layer. Keep it conversational
 1. **Decompose First**: Break complex tasks into independent sub-tasks before executing
 2. **Parallelize**: Spawn independent sub-agents simultaneously, then `wait_sub_agents` for the batch
 3. **Self-Contained Briefs**: Each task description must stand alone — context, constraints, expected output
-4. **Share Knowledge**: Propose durable machine-wide facts with `memory_propose`; search before re-deriving with `memory_search` (the intendant-memory skill has the doctrine)
+4. **Share Knowledge**: When the current transport or an explicitly discovered skill exposes Memory, propose durable machine-wide facts with `memory_propose` and search before re-deriving with `memory_search`; these are not native built-ins
 5. **Synthesize Results**: Combine findings from multiple agents into coherent output
 6. **Report Concisely**: Keep status updates to the user brief and actionable
 7. **Handle Failures**: If a sub-agent fails, analyze the failure and retry or reassign

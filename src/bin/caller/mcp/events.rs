@@ -315,6 +315,15 @@ pub fn spawn_event_listener(
                         ref backend_session_id,
                     } => {
                         s.link_session_aliases(session_id, backend_session_id);
+                        // Custody hook (live pump only — hydration replays
+                        // must not touch lease state): an external session
+                        // announcing itself while its source's oauth lease
+                        // is active runs on the materialized home, so its
+                        // expiry cleanup must wait for the session's end.
+                        crate::credential_leases::note_leased_session_running(
+                            source,
+                            &[session_id.as_str(), backend_session_id.as_str()],
+                        );
                         if !session_id.is_empty() {
                             s.session_sources.insert(session_id.clone(), source.clone());
                         }
@@ -625,6 +634,7 @@ pub fn spawn_event_listener(
                             id,
                             command_preview,
                             category: category.to_string(),
+                            session_id: session_id.clone(),
                         });
                         resource_changed = Some("intendant://pending-approval");
                     }
@@ -925,6 +935,14 @@ pub fn spawn_event_listener(
                         ref reason,
                         ..
                     } => {
+                        // Custody hook (live pump only): release the
+                        // session's leased-home registration under every
+                        // alias BEFORE note_session_ended may prune the
+                        // alias table; a deferred expired home is deleted
+                        // at this exit instead of the next timer sweep.
+                        let related = s.session_related_ids(session_id);
+                        let related: Vec<&str> = related.iter().map(String::as_str).collect();
+                        crate::credential_leases::note_session_ended_for_leases(&related);
                         s.note_session_ended(session_id);
                         s.push_log(
                             LogLevel::Info,

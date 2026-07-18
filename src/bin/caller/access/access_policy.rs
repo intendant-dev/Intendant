@@ -487,7 +487,11 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
         // user-lane-only. No peer profile — AdminPeer included — may
         // exercise them, because both must be attributable to an
         // identified person the target itself admitted, and a peer
-        // connection's principal is a daemon.
+        // connection's principal is a daemon. The exclusion holds
+        // end-to-end only while every credential-writing surface gates
+        // on CredentialsManage (POST /api/api-keys included): a
+        // key-writing route gated at Settings would hand AdminPeer
+        // custody through the side door.
         AdminPeer => !matches!(op, AccessManage | CredentialsManage),
     }
 }
@@ -806,11 +810,12 @@ pub const FRAME_LANES: &[FrameLaneSpec] = &[
     // ---- tunnel only ----
     FrameLaneSpec {
         frame: "presence_frame",
-        op: Some(PeerOperation::Message),
+        op: Some(PeerOperation::RuntimeControl),
         ws: false,
         tunnel: true,
         note: "the tunnel's envelope for the presence family /ws speaks raw (rows above); \
-               gated as messaging into the presence layer",
+               it injects into the live presence/voice session (connect, transcript/log \
+               entries), so it carries the family's runtime-control floor on this lane too",
     },
     FrameLaneSpec {
         frame: "upload_start",
@@ -1585,8 +1590,10 @@ mod tests {
             ("dashboard_control_offer",        None,                 None),
             ("dashboard_control_ice",          None,                 None),
             ("dashboard_control_close",        None,                 None),
-            // -- tunnel only: the presence wrapper envelope --
-            ("presence_frame",                 None,                 Some(Message)),
+            // -- tunnel only: the presence wrapper envelope (injects into
+            //    the live presence/voice session, so it carries the raw
+            //    family's runtime-control floor) --
+            ("presence_frame",                 None,                 Some(RuntimeControl)),
             // -- tunnel only: upload frames are authorized by the method
             //    they deliver, never by a blanket grant --
             ("upload_start",                   None,                 None),

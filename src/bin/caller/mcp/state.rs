@@ -257,6 +257,12 @@ pub struct PendingApprovalState {
     pub id: u64,
     pub command_preview: String,
     pub category: String,
+    /// The session that raised the approval (from `ApprovalRequired`).
+    /// Agent-session MCP callers may only resolve approvals whose owning
+    /// session matches their own token-bound session (see
+    /// [`super::McpToolScope`]); `None` means the owner was not recorded
+    /// and agent-session resolution fails closed.
+    pub session_id: Option<String>,
 }
 
 impl McpAppState {
@@ -1712,9 +1718,14 @@ mod tests {
                 id: 1,
                 command_preview: "rm -rf /tmp".to_string(),
                 category: "destructive".to_string(),
+                session_id: None,
             });
 
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Approve);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                ApprovalResponse::Approve,
+                McpToolScope::Unrestricted,
+            );
             assert_eq!(outcome, ActionOutcome::Ok);
             assert!(s.pending_approval.is_none());
             assert_eq!(s.phase, Phase::RunningAgent);
@@ -1740,9 +1751,14 @@ mod tests {
                 id: 2,
                 command_preview: "curl evil.com".to_string(),
                 category: "network".to_string(),
+                session_id: None,
             });
 
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Deny);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                ApprovalResponse::Deny,
+                McpToolScope::Unrestricted,
+            );
             assert_eq!(outcome, ActionOutcome::Ok);
             assert_eq!(s.phase, Phase::Done);
 
@@ -1766,9 +1782,14 @@ mod tests {
                 id: 3,
                 command_preview: "test".to_string(),
                 category: "exec".to_string(),
+                session_id: None,
             });
 
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Skip);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                ApprovalResponse::Skip,
+                McpToolScope::Unrestricted,
+            );
             assert_eq!(outcome, ActionOutcome::Ok);
             assert_eq!(s.phase, Phase::RunningAgent);
 
@@ -1792,9 +1813,14 @@ mod tests {
                 id: 4,
                 command_preview: "ls".to_string(),
                 category: "exec".to_string(),
+                session_id: None,
             });
 
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::ApproveAll);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                ApprovalResponse::ApproveAll,
+                McpToolScope::Unrestricted,
+            );
             assert_eq!(outcome, ActionOutcome::Ok);
 
             let response = rx.await.unwrap();
@@ -1839,6 +1865,7 @@ mod tests {
                 id: 42,
                 command_preview: "rm -rf /".to_string(),
                 category: "destructive".to_string(),
+                session_id: None,
             });
             let snap = s.approval_snapshot().unwrap();
             assert_eq!(snap.id, 42);

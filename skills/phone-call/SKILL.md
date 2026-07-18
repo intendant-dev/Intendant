@@ -43,7 +43,13 @@ Replace `DEV_IDX`, `PASSWORD` (from `~/lin`), and `TARGET` (SIP URI):
     --ec-tail=0 --no-vad \
     --use-srtp=2 --srtp-secure=0 \
     > /tmp/pjsua-call.log 2>&1 &
+PJSUA_CALL_PID=$!
+printf 'pjsua-call pid: %s\n' "$PJSUA_CALL_PID"
 ```
+
+Keep the printed PID with this call. It identifies the process started by this
+session; never use `pgrep` to select a global pjsua process because another
+agent or the user may have a concurrent call.
 
 ### 3. IMMEDIATELY call spawn_live_audio
 
@@ -75,8 +81,10 @@ and works before the call connects.
 ### 5. Clean up
 
 ```bash
-kill $(pgrep -f pjsua) 2>/dev/null
+kill 12345 2>/dev/null
 ```
+
+Replace `12345` with the exact PID printed by step 2.
 
 ## Response Schema — REQUIRED
 

@@ -1,6 +1,6 @@
 # Runtime Protocol
 
-`intendant-runtime` is the sandboxed half of the two-process split. It reads a
+`intendant-runtime` is the command-execution half of the two-process split. It reads a
 **single JSON object** from stdin, executes its commands **sequentially**, writes
 one result line per command to stdout, and exits. It never holds API keys and
 never talks to a model — it is a dumb, auditable command executor that the
@@ -9,7 +9,7 @@ controller (`intendant`) drives over pipes.
 ```
                  stdin: one AgentInput JSON
  intendant ───────────────────────────────────► intendant-runtime
- (controller, holds keys)                        (sandboxed executor)
+ (controller, holds keys)                        (command executor)
            ◄───────────────────────────────────
                  stdout: one JSON result line per command
 ```
@@ -135,19 +135,25 @@ component), checking both the raw and canonicalized forms.
 
 Command strings (`execAsAgent`, `execPty`) do **not** pass through
 `validate_path()` — no string inspection could do so honestly (shell
-expansion, variables, indirection). The secret-directory portion of that
-policy is instead enforced at the OS level where the platform can express
-it: on macOS the controller always wraps the runtime in a Seatbelt profile
-denying `~/.ssh` and `~/.gnupg` to the whole process tree (composed into
-the write-restriction profile when the sandbox is enabled), so shell
-commands hit `Operation not permitted` on those paths. On Linux, Landlock
-is allowlist-only and cannot subtract read access from a granted tree —
-there, command strings are bounded by autonomy/approvals plus the write
-sandbox (`INTENDANT_SANDBOX_WRITE_PATHS`), and the secret-directory
-denylist genuinely covers only the structured tools. Windows mirrors the
-Linux posture with a `WRITE_RESTRICTED` token (`win_sandbox.rs`): reads
-stay open (so, like Linux, the secret-directory denylist covers only the
-structured tools) while writes are confined to the granted roots.
+expansion, variables, indirection). The secret portion of that policy is
+instead enforced at the OS level where the platform can express it: on
+macOS the controller always wraps the runtime in a Seatbelt profile
+denying `~/.ssh`, `~/.gnupg`, the intendant config home
+(`dirs::config_dir()/intendant`, which holds the global `.env` fallback),
+and every `.env` on the controller's key search path (launch cwd +
+ancestors, covering the project root) to the whole process tree (composed
+into the write-restriction profile when the write sandbox is enabled), so
+shell commands hit `Operation not permitted` on those paths. On Linux,
+Landlock is allowlist-only and cannot subtract read access from a granted
+tree — there, command strings are bounded by autonomy/approvals plus the
+write sandbox (`INTENDANT_SANDBOX_WRITE_PATHS`), the secret-directory
+denylist genuinely covers only the structured tools, and project/config
+`.env` files remain readable to sandboxed commands (moving keys out of
+agent-readable files — the credential-custody migration — is the tracked
+fix). Windows mirrors the Linux posture with a `WRITE_RESTRICTED` token
+(`win_sandbox.rs`): reads stay open (so, like Linux, the secret and
+`.env` coverage applies only to the structured tools) while writes are
+confined to the granted roots.
 
 ### `editFile` Operations
 
@@ -170,13 +176,16 @@ one. `replace_lines` errors if `end_line < line_number`.
 - **stdout/stderr** are streamed to `<log_dir>/<nonce>_stdout.log` /
   `_stderr.log`; the result carries only the **last 10 KB** of each
   (`LOG_TAIL_BYTES`).
-- **Keys are stripped at the controller spawn boundary**: canonical provider
-  keys, `GOOGLE_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, the bare
-  `OPENAI`/`ANTHROPIC`/`GEMINI` names, and inherited names ending in
-  `*_API_KEY` or `*_API_TOKEN` are removed case-insensitively. The
-  `INTENDANT_*` namespace is reserved for controller→runtime control and is
-  exempt. `execAsAgent` repeats removal of the six canonical/bare names as
-  defense in depth; `execPty` inherits the already-scrubbed runtime environment.
+- **Credentials are stripped at two boundaries.** The controller removes
+  canonical provider names, inherited `*_API_KEY` / `*_API_TOKEN` names, and
+  ambient host-credential names (agent sockets, forge/cloud/registry tokens,
+  credential-store pointers) before spawning the runtime. The `INTENDANT_*`
+  namespace is reserved for controller→runtime control and is exempt. Both
+  `execAsAgent` and `execPty` independently repeat the provider and ambient
+  scrub before starting their model-driven shell; they do not merely trust the
+  runtime's inherited environment. See
+  [Configuration → Child-process environment](./configuration.md#child-process-environment)
+  for the current passthrough limitation.
 - **Display gating**: `DISPLAY` is set to the chosen display. Access to the user's
   session display (`:0` or below) is refused unless
   `INTENDANT_USER_DISPLAY_GRANTED` is set; otherwise a virtual display is used.
@@ -271,19 +280,33 @@ finished; an incomplete trailing line is discarded.
 
 The runtime's write boundary is driven by the `INTENDANT_SANDBOX_WRITE_PATHS`
 environment variable (a platform path-list: `:`-separated on Unix,
-`;`-separated on Windows; empty/unset → no sandbox). The controller
-(`agent_runner.rs`) populates it from its `SandboxConfig` when `--sandbox` is
-in effect; each platform then enforces the same posture — whole filesystem
-readable, only the listed paths writable — with its native primitive:
+`;`-separated on Windows; empty/unset → no sandbox). The platform default is
+**on for macOS/Linux and off for Windows**: the controller
+(`configure_sandbox_env` in the caller's `main.rs`) resolves `--sandbox`
+(force on), `--no-sandbox` (force off), then `[sandbox] enabled` in
+intendant.toml, then that platform default. The default write set is the
+project root (omitted for a projectless daemon), the scratch dirs (the live
+platform temp dir plus `/tmp` on Unix), the session log dir, the daemon
+state root's `logs/` subtree, and — on Unix — the toolchain caches a standard
+build writes even when warm (cargo home, rustup home, and the user cache dir;
+the state root itself is deliberately excluded because it holds authority;
+see `toolchain_cache_write_paths` in `sandbox.rs`); `[sandbox]
+extra_write_paths` extends it. When enabled, each platform enforces the same
+posture — whole filesystem readable, only the listed paths writable — with
+its native primitive:
 
 - **Linux** — a Landlock ruleset applied in-process **before running any
-  command** (`apply_sandbox_from_env` in `src/main.rs`, ABI v5). Nonexistent
-  paths are skipped. If the kernel does not enforce Landlock, the runtime fails
-  closed and refuses to run the requested sandbox unconfined.
+  command** (`apply_sandbox_from_env` in `src/main.rs`, ABI v5). `/dev` is
+  always write-granted (tty/PTY nodes, `/dev/null` — DAC still applies),
+  mirroring the macOS profile. Nonexistent paths are skipped. If the kernel
+  does not enforce Landlock, the runtime **fails closed** and refuses to run
+  unconfined — on a Landlock-less kernel the error names the explicit
+  opt-outs (`--no-sandbox` / `[sandbox] enabled = false`); it never degrades
+  silently.
 - **macOS** — the controller wraps the runtime child in `sandbox-exec` with a
   generated Seatbelt profile (write-restriction composed with the always-on
   secret-directory denial; see `sandbox.rs`).
-- **Windows** — the runtime re-execs itself under a `WRITE_RESTRICTED`
+- **Windows (opt-in)** — the runtime re-execs itself under a `WRITE_RESTRICTED`
   restricted token before reading stdin (`win_sandbox.rs`): an access check
   then requires both the user's normal grants *and* a restricting-SID grant
   for every write, and the controller holds temporary ACL entries granting
@@ -291,7 +314,9 @@ readable, only the listed paths writable — with its native primitive:
   journaled, crash-swept). The token also drops every privilege except
   `SeChangeNotifyPrivilege`, so backup/restore-intent opens from elevated
   parents cannot bypass the DACL. Failure to restrict is fail-closed: the
-  runtime refuses to run unconfined.
+  runtime refuses to run unconfined. Enabling this path accepts a potentially
+  expensive first stamp because Windows propagates each inheritable grant
+  through the existing descendants of a write root synchronously.
 
 This is the runtime's primary write-boundary; combined with the key-stripping
 and path validation above, it bounds what an agent command can touch even

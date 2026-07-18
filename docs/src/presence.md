@@ -216,7 +216,7 @@ format.
 | `deny_action`         | Deny a pending action by `id` (stops the command). |
 | `skip_action`         | Skip a pending action by `id` (continue with the next). |
 | `respond_to_question` | Answer an `askHuman` question (`text`). |
-| `set_autonomy`        | Change the autonomy level (`low`/`medium`/`high`/`full`). |
+| `set_autonomy`        | Change the autonomy level to `low`, `medium`, or `high`. The ambient/voice lane refuses Full; an owner must select it from dashboard Settings. |
 | `send_message`        | Mid-task interjection injected into the running worker's conversation at its next turn. Optional `frame_ids` to attach HQ images. |
 
 ### Query tools (read-only, server I/O)

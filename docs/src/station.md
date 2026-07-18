@@ -1,13 +1,12 @@
 # Station
 
 Station is the web dashboard's rendered control center — a single-canvas,
-WASM-drawn operational surface for everything the classic tabs do: watch
+WASM-drawn operational surface for the same work as the DOM dashboard: watch
 agents, approve, prompt, launch, steer, and administer sessions across every
-connected host. It is **the designated successor to the classic
-Activity → Logs DOM surface** as the canonical way to operate agents. The DOM
-surface stays as the legacy fallback — kept working and bug-fixed, but no
-longer the investment target: new operational UX lands Station-first, or in
-both when that is cheap.
+connected host. Activity → Timeline remains the default, accessible DOM control
+surface; Station is its canvas counterpart and the path toward immersive 3D/XR.
+Both are active product surfaces over the same control plane rather than a
+legacy/current authority split.
 
 This chapter records both the implementation as it exists and the roadmap,
 because Station is mid-flight: today it is a stylized 3D constellation
@@ -18,7 +17,7 @@ the scene — and, beyond that, real spatial computing on XR devices
 
 ## Architecture today
 
-*(surveyed 2026-07-18 @ `54da37c8` — trust the source when they disagree)*
+*(surveyed 2026-07-18 @ `3221b4d5` — trust the source when they disagree)*
 
 Two stacked canvases plus a deliberately tiny set of DOM elements:
 
@@ -194,12 +193,11 @@ remains fully supported — XR is an additional presentation of the same
 control plane, subject to the same trust model and approval routing as
 every other frontend.
 
-## Relationship to Activity → Logs
+## Relationship to Activity → Timeline
 
-The classic DOM surface (session windows, log stream, control pane) remains
-the legacy fallback: it must keep working — it is the accessibility floor,
-the low-GPU path, and the surface most automation drives today — but new
-operational UX should land Station-first, or in both when cheap. When
-behavior is added to either surface, prefer routing it through
-control-plane messages and universal events so the other surface (and the
-MCP and voice frontends) inherits it for free.
+Activity's DOM surface (session windows, Timeline, and control panes) is the
+accessibility floor, low-GPU path, and surface most automation drives. Station
+re-presents the same operational state in a rendered canvas and explores the
+immersive direction. When behavior is added to either surface, route it through
+control-plane messages and universal events so the other surface (and the MCP
+and voice frontends) inherits it wherever its presentation supports the action.

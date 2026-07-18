@@ -118,7 +118,7 @@ pub fn with_lock<T>(
     cert_dir: &Path,
     operation: impl FnOnce() -> AccessResult<T>,
 ) -> AccessResult<T> {
-    std::fs::create_dir_all(cert_dir)?;
+    intendant_core::state_paths::create_private_dir_all(cert_dir)?;
     let canonical = std::fs::canonicalize(cert_dir)
         .map_err(|error| AccessError(format!("resolve {}: {error}", cert_dir.display())))?;
     if let Some(held) = HELD_STORE.with(|current| current.borrow().clone()) {
@@ -148,7 +148,7 @@ pub fn atomic_write_private_locked(path: &Path, contents: &[u8]) -> AccessResult
             path.display()
         ))
     })?;
-    std::fs::create_dir_all(parent)?;
+    intendant_core::state_paths::create_private_dir_all(parent)?;
     let mut temporary = tempfile::Builder::new()
         .prefix(".intendant-authority-")
         .tempfile_in(parent)

@@ -1293,6 +1293,10 @@ impl ExternalAgent for CodexAgent {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         crate::platform::die_with_parent(&mut command);
+        // Reset to the external-child env allowlist FIRST: the deliberate
+        // `.env()` injections below survive the clear; inherited provider
+        // keys and ambient credentials do not.
+        super::apply_external_child_env_policy(&mut command);
         self.add_intendant_ctl_env(&mut command, effective_web_port);
         // An active oauth:codex lease materializes a synthesized
         // CODEX_HOME (auth.json + carried-over config.toml) that shadows

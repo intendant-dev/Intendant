@@ -193,6 +193,39 @@ The bootstrap set for both Codex and Claude Code includes the CU path
 regardless of managed context; managed-context/fission tools remain
 managed-only.
 
+### Environment at spawn
+
+A supervised CLI does **not** inherit the controller's environment. Every
+backend spawn starts from `env_clear()` plus an explicit allowlist
+(`external_agent::apply_external_child_env_policy`): system basics (`PATH`,
+`HOME`, `USER`, `SHELL`, `TERM`, `TMPDIR`, `TZ`, `LANG`/`LC_*`, …), the
+platform's process-bootstrap set (macOS `__CF_USER_TEXT_ENCODING`; Linux
+`DISPLAY`/`WAYLAND_DISPLAY`/`XDG_*`; Windows `SYSTEMROOT`, `COMSPEC`,
+`PATHEXT`, `APPDATA`, `USERPROFILE`, …), proxy vars
+(`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`, either case), the CLIs'
+own config-home pointers (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`), and the
+`INTENDANT`/`INTENDANT_*` control channel. Everything else is dropped —
+in particular the controller's provider API keys
+(`OPENAI`/`ANTHROPIC`/`GEMINI_API_KEY` and every `*_API_KEY`/`*_API_TOKEN`
+shape), ambient host credentials (`SSH_AUTH_SOCK`, `AWS_*` secrets,
+`GH_TOKEN`/`GITHUB_TOKEN`, `KUBECONFIG`, `DOCKER_CONFIG`, registry tokens),
+the Linux D-Bus session bus (`DBUS_SESSION_BUS_ADDRESS` — desktop-keyring
+reach), and `NODE_OPTIONS`. Backends authenticate with their own
+subscription auth under `HOME` (`~/.codex`, `~/.claude`) or a vault-leased
+home injected explicitly at spawn; they never see the controller's model
+keys.
+
+`INTENDANT_ENV_PASSTHROUGH` (comma-separated exact names,
+case-insensitive, set on the controller) deliberately extends the
+allowlist — e.g. `INTENDANT_ENV_PASSTHROUGH=SSH_AUTH_SOCK` for supervised
+sessions that must push over SSH. Provider API keys never pass, even if
+named there. The same variable exempts names from the ambient-credential
+scrub at the native runtime's spawn boundary. The runtime's own exec/PTY
+shells apply a second defense-in-depth scrub that currently does not consult
+this variable, so classified ambient credentials such as `SSH_AUTH_SOCK` do
+not survive into native shell commands even when the runtime process inherited
+them.
+
 ### Codex (the reference backend)
 
 Codex is the most fully wired backend; Claude Code falls back to defaults for
@@ -685,7 +718,7 @@ visible.
 
 ## Dashboard and Station parity: Codex vs Claude Code
 
-The per-session dashboard features (Activity → Logs agent windows and the
+The per-session dashboard features (Activity → Timeline agent windows and the
 [Station](./station.md) canvas) were built against Codex first. An audit
 (2026-07-04 @ `d590ad94`) found that the *rails* are almost all
 backend-neutral already — what is Codex-only is the *producers*. The

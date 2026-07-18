@@ -92,8 +92,10 @@ Key fields:
   against this list. The local Intendant card currently emits
   `computer-use` and `display`; the other variants are shipped wire vocabulary
   for peers that actually provide them.
-- **`auth`** — what the peer *requires* of inbound connections (see
+- **`auth`** — what the card *declares* a connecting peer should present (see
   [How auth maps to the Agent Card](#how-auth-maps-to-the-agent-card) below).
+  It is operator-configured rather than derived and can understate the live
+  gateway requirement if left at its compatibility default.
 
 A peer that advertises something an older build doesn't recognize (a future
 transport, capability, or auth scheme) deserializes that one position to an
@@ -263,7 +265,7 @@ The per-peer actor mirrors the fold into a watch-published displays view
 the `list_peers` MCP tool — seeds late joiners and every pushed snapshot
 replaces the row losslessly. On the dashboard each known peer display gets
 its own Station chip (`label · :id`) wired to the existing federated WebRTC
-view path, and the Activity → Log rail narrates transitions with the display
+view path, and the Activity → Timeline rail narrates transitions with the display
 id and geometry (`display :99 ready (1920x1080)`). An agent that brings up a
 display on a peer is therefore *discoverable* the moment the peer announces
 it — no display id needs to be guessed or typed.
@@ -560,6 +562,29 @@ The relay multiplexes onto the same HTTP port as the dashboard (the same accept-
 peek that distinguishes HTTP / WebSocket / local ICE-TCP grows a relay branch), so
 it needs no extra port-forwarding.
 
+Because that branch demuxes the STUN frame **before** any TLS/auth, the relay is
+bounded so a registration can never become a standing open relay or SSRF hook:
+
+- **Session-scoped registration.** An entry is created only for a forwarded
+  `Answer` that names a signaling session, and only ever dials the peer's own
+  known transport address (never an address taken from the incoming STUN frame or
+  a browser-supplied candidate) — the relay can reach only the peer this daemon
+  already federates with.
+- **TTL expiry + capacity cap.** Entries expire (`RELAY_ENTRY_TTL`) and the table
+  is capped (`MAX_RELAY_ENTRIES`); a re-`Answer` (peer reconnect / ICE restart)
+  refreshes the live entry. `unregister_session` removes every entry for that
+  signaling session on teardown.
+- **Bounded splice.** Each relayed connection is capped per ufrag
+  (`MAX_RELAY_CONNS_PER_UFRAG`) and torn down when **neither direction**
+  transfers bytes for `RELAY_IDLE_TIMEOUT`, or at an absolute
+  `RELAY_MAX_LIFETIME`.
+
+The gateway accept path itself is bounded the same way against a pre-auth
+slowloris: peek + TLS handshake + first request head must complete within one
+shared deadline (`PRE_AUTH_HANDSHAKE_TIMEOUT`), and connections still in that
+handshake phase are capped (`MAX_PRE_AUTH_CONNECTIONS`); established WebSocket,
+ICE-TCP, and keep-alive connections have already released their slot.
+
 ### Federation codec policy — `federation_allow_h264`
 
 H.264 over a lossy TURN-relayed path is fragile: a full-resolution 2.5 Mbps stream
@@ -616,7 +641,7 @@ stream to the existing HTTP/WebSocket handling.
 
 ```bash
 intendant                                      # default: mTLS with access certs
-intendant --tls                                # TLS-only; installed access certs when present, else self-signed
+intendant --tls                                # TLS-only; installed server cert/key when present, else self-signed
 intendant --no-tls --bind 127.0.0.1           # explicit local plaintext/debug escape
 intendant --tls-cert chain.pem --tls-key key.pem   # explicit PEM (implies --tls)
 ```
@@ -810,6 +835,27 @@ headless and should be approved from its own CLI/logs.
    access cert store, writes or updates the requester's outbound `[[peer]]`,
    pins the target server fingerprint, and starts the live peer registration
    when the dashboard daemon is running.
+
+**Transport authentication of the doorbell.** The doorbell is unauthenticated at
+the application layer (approval is the gate), so the requester side binds it to a
+transport identity rather than trusting whatever answers:
+
+- The requester **pins the target's server certificate on first contact** and
+  refuses any `http://` target that is not loopback — the blanket
+  "accept any certificate" client is gone. The status poll then pins that exact
+  certificate, so the whole ceremony rides one identity.
+- The `server_cert_fingerprint` the target reports must **equal the certificate it
+  actually presented**; a mismatch (or an approval that reports a different
+  fingerprint than the one pinned) refuses the pairing, so an on-path party cannot
+  substitute the permanent peer pin.
+- The request carries a signed **caller-ID** (the requesting daemon's Ed25519
+  identity over the dialed origin, enrolment key, and nonce); the target verifies
+  it and shows the caller as *verified* (with its daemon id) or *unverified* in
+  `intendant peer requests` and the approval card. There is no silent downgrade to
+  an unsigned "bare" request — a target that rejects the caller-ID fields fails
+  loudly. Compare the verified caller id (target side) and the pinned target
+  fingerprint (requester side) out of band before approving to close a first-
+  contact MITM.
 
 A granted profile can be changed later without re-pairing:
 

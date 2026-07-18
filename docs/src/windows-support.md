@@ -301,8 +301,12 @@ than a panic or silent no-op.
 - **No virtual-display equivalent.** There is no Windows analogue of Xvfb, so
   the lazily-launched virtual displays the Linux pipeline uses do not exist on
   Windows. Capture targets the real interactive desktop only.
-- **Filesystem sandboxing uses restricted tokens.** `--sandbox` and scoped
-  shells work on Windows, enforced by `CreateRestrictedToken` plus temporary
+- **Filesystem sandboxing uses restricted tokens and is opt-in.** Windows
+  defaults the runtime write sandbox off because stamping inheritable grant
+  ACEs through a large existing tree is synchronous and can make startup take
+  minutes; `--sandbox` or `[sandbox] enabled = true` accepts that first-stamp
+  cost. When enabled, `--sandbox` and scoped shells work on Windows, enforced
+  by `CreateRestrictedToken` plus temporary
   ACL entries for the `RESTRICTED` SID (S-1-5-12) on the granted roots
   (`win_sandbox.rs`) — the Windows twin of Landlock (Linux) and Seatbelt
   (macOS). The runtime re-execs itself under a `WRITE_RESTRICTED` token

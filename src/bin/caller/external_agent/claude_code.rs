@@ -3186,6 +3186,10 @@ impl ExternalAgent for ClaudeCodeAgent {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // Reset to the external-child env allowlist FIRST: the deliberate
+        // `.env()` injections below survive the clear; inherited provider
+        // keys and ambient credentials do not.
+        super::apply_external_child_env_policy(&mut command);
         // `"$INTENDANT" ctl ...` bootstrap env, so the lazy CLI surface works
         // from Claude Code's shell without any PATH or port assumptions.
         if let Some(port) = web_port {

@@ -2615,8 +2615,12 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
     );
     let peer_use =
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::PeerUse);
-    let message =
-        runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Message);
+    // The presence-envelope booleans follow the envelope's FRAME_LANES
+    // gate (runtime control: the envelope injects into the live
+    // presence/voice session) instead of a hand-kept operation copy.
+    let presence_frames = dashboard_control_frame_operation("presence_frame")
+        .map(|op| runtime_allows_operation(runtime, op))
+        .unwrap_or(true);
 
     // Every gated api_* method derives its `<method>_available` boolean from
     // the effective method table (route-row tunnel specs ∪ the
@@ -2660,12 +2664,12 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
             fs_write || session_manage || runtime_control,
         ),
         ("terminal_frames_available", terminal),
-        ("presence_frames_available", message),
+        ("presence_frames_available", presence_frames),
         (
             "presence_active_handoff_available",
-            runtime.presence.is_some() && message,
+            runtime.presence.is_some() && presence_frames,
         ),
-        ("presence_tool_request_available", message),
+        ("presence_tool_request_available", presence_frames),
         ("api_media_editor_available", runtime_control),
         ("api_managed_context_available", session_inspect),
         (

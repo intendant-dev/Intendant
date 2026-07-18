@@ -238,11 +238,14 @@ resource-owner portal; global Connect itself cannot be opted into authority.
 **Org identity.** An organization is an Ed25519 root keypair plus a handle.
 The root key lives on an org-designated daemon
 (`intendant org init <handle>` →
-`~/.intendant/access-certs/org/<handle>/root.pk8`, 0600), following the
+`<access-cert-dir>/org/<handle>/root.pk8`, 0600), following the
 existing daemon-identity custody pattern; it is exportable for offline
-custody. Day-to-day signing can move to delegated issuer keys certified by
-the root; root-signed documents carry no chain, and delegated documents
-carry the issuer certificate beside the signature it explains.
+custody. The access-cert directory is `<state-root>/access-certs` on
+macOS/Linux (default `~/.intendant/access-certs`) and the OS data directory's
+`intendant/access-certs` on Windows. Day-to-day signing can move to delegated
+issuer keys certified by the root; root-signed documents carry no chain, and
+delegated documents carry the issuer certificate beside the signature it
+explains.
 
 **Org grant document.** A self-contained, signed statement a member presents
 to any daemon that trusts the org key:
@@ -396,6 +399,14 @@ issue time. The org daemon persists the current list next to the root key
 (`org/<handle>/orl.json`), bumps `seq` on every change, and serves it at
 `GET /api/access/orgs/<handle>/revocations` (public — it is org-public
 data; an empty seq-0 list is signed lazily on first read).
+
+Subject entries use one canonical form at both ends: certificate
+fingerprints (peer daemons) fold to lowercase separator-free hex when the
+list is written **and** whenever it is compared — apply, materialization,
+and renewal all canonicalize both sides — so an uppercase or
+colon-separated spelling still revokes, including entries persisted by
+older builds. base64url client-key fingerprints are case-sensitive and
+only trimmed.
 
 **Delivery is carried, not discovered.** A consumer daemon has no
 address for "the org daemon" — there is no membership server to ask — so
@@ -558,7 +569,8 @@ verification value; documents stay self-contained.
 
 The pieces that implement the model, mapped to the codebase:
 
-- **Daemon-local IAM** (`~/.intendant/access-certs/iam.json`): principals
+- **Daemon-local IAM** (`<access-cert-dir>/iam.json`, with the platform
+  location described above): principals
   (browser certificate, client key, metadata-only Connect account records,
   human user, peer daemon, exact hosted lease), grants (principal → role on
   this daemon), roles over the daemon permission catalog defined in
@@ -716,6 +728,28 @@ The pattern is proven elsewhere; we are assembling, not inventing:
   a useful route diagnostic, not a substitute for an authority anchor.
 - **SPKI/SDSI and petnames** — authority bound to keys; human names are
   local, contextual labels.
+
+## Loopback trust vs. the runtime sandbox
+
+Local presence makes bare loopback a root-capable surface — deliberate, and
+documented above. Its sharp edge is that the *sandboxed runtime* is itself a
+local process: a prompt-injected shell running `curl 127.0.0.1:<port>/api/…`
+(or `intendant ctl`) would arrive as the trusted-local principal and escape
+the write sandbox entirely. On macOS the default (sandbox-on) runtime
+profile therefore denies network egress to the daemon's own gateway port —
+everything else stays reachable, and `--no-sandbox` lifts the guard with the
+rest of the confinement. Linux and Windows cannot express a single-port deny
+under their mechanisms (Landlock's network rules are allowlist-only;
+restricted tokens do not filter loopback), so on those platforms the
+loopback surface remains reachable from sandboxed shells — closing it
+properly means authenticating the loopback lane (per-boot secret or
+peer-credential checks) or binding its unauthenticated form to a read-only
+route subset, an open design decision. The same asymmetry applies to the
+state-root secrets: every platform's **default** grant set excludes the trust
+store (`access-certs/`), leased auth, and the custody trail from runtime writes,
+but a project root or operator-supplied `extra_write_paths` that overlaps those
+locations can reopen them. Only macOS can additionally deny reads of the
+credential locations at the OS-policy layer.
 
 ## Alpha implementation status
 

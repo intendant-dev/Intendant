@@ -53,8 +53,14 @@ for the headless `tests/e2e/` suite and demos) and requires
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, access certs, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves), and the current macOS durable Memory plane at `~/.intendant/memory-plane` (which does not yet honor `INTENDANT_HOME`). |
+| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. On macOS/Linux it also holds `access-certs/`; Windows keeps that store under the OS data directory instead. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), the Windows access-cert store, the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves), and the current macOS durable Memory plane at `~/.intendant/memory-plane` (which does not yet honor `INTENDANT_HOME`). |
 | `INTENDANT_MEMORY_EPHEMERAL` | unset | Set to `1` to force the owner-plane Memory service to use an in-memory plane. With the variable unset, macOS attempts durable storage at `~/.intendant/memory-plane` and falls back softly to an honestly labeled ephemeral plane if bootstrap fails; Linux and Windows currently use the ephemeral plane. |
+
+### Child-process environment
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INTENDANT_ENV_PASSTHROUGH` | unset | Comma-separated exact env-var names (case-insensitive) added to a supervised external CLI's cleared environment allowlist and exempted from the controller→runtime ambient-credential scrub. Provider API keys never pass. Native runtime exec/PTY shells apply a second scrub that currently does **not** honor this override, so classified ambient credentials such as `SSH_AUTH_SOCK` remain unavailable there; ordinary non-classified variables already inherit without naming them. |
 
 ### Model and behavior tuning
 
@@ -340,17 +346,42 @@ and live voice (see [Computer Use & Live Audio](./computer-use-and-audio.md)).
 
 ### `[sandbox]`
 
-Filesystem sandboxing for the runtime — Landlock on Linux, Seatbelt on
-macOS, restricted tokens on Windows. Also enabled by `--sandbox`.
+Filesystem write sandboxing for the runtime — Landlock on Linux, Seatbelt
+on macOS, restricted tokens on Windows. **On by default on macOS and
+Linux; opt-in on Windows**, where a write grant is an inheritable ACE and
+granting a large tree rewrites every descendant's DACL synchronously at
+startup — enabling it there accepts that first-stamp cost. Resolution
+order: `--sandbox` forces on, `--no-sandbox` forces off, otherwise an
+explicit `enabled` here decides, otherwise the platform default.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable filesystem sandboxing |
-| `extra_write_paths` | array | `[]` | Extra writable paths beyond project root, the OS scratch dir (`/tmp` / `%TEMP%`), the log dir, and `~/.intendant` |
+| `enabled` | bool | unset (= platform default) | Explicitly enable/disable filesystem sandboxing; the CLI flags override it |
+| `extra_write_paths` | array | `[]` | Extra writable paths beyond the default grant set: project root (plus the session's own project root for dashboard-picked projects), the OS scratch dir (`TMPDIR` / `/tmp` / `%TEMP%`), the session log dir and the state root's `logs/` subtree, and — Unix only — the toolchain caches (`~/.cargo`, `~/.rustup`, the user cache dir). The state root itself is deliberately **not** granted: it also holds access credentials, leased auth, and custody state. On Windows toolchain-cache writes are instead granted on demand through the denial-consent card |
 
-On Linux kernels without Landlock support, sandboxing is silently skipped;
-on macOS and Windows a sandbox that fails to apply fails the run rather
-than continuing unconfined.
+The dashboard's Settings → Security card edits both values live (new
+commands pick the change up without a restart; a `--sandbox`/`--no-sandbox`
+flag pins the live state for that daemon run, so saves then only persist
+intent), and approving a sandbox write-denial consent prompt can append
+grants — for the session, or persisted here via "always allow".
+On Windows, an extra-path-only Settings save currently resolves an omitted
+`enabled` value as `true`, not the Windows platform default, and does not perform
+startup's full ACE-stamping lifecycle. Treat that as a Settings defect: include
+the intended enabled state explicitly and restart after changing Windows
+sandbox grants.
+
+Once the sandbox reaches a runtime, an enforcement failure aborts that run
+rather than continuing unconfined: for example, a Linux kernel without
+Landlock support refuses the runtime until `--no-sandbox` (or `enabled =
+false`) makes the opt-out explicit, and Windows restricted-token re-exec fails
+closed. One controller-edge caveat remains: if startup cannot encode the
+write-grant environment, it currently logs the error, removes the sandbox
+variable, and continues; a Windows ACE-stamping failure instead leaves the
+restricted runtime unable to write. Reads stay open except the credential
+carve-outs (macOS denies `~/.ssh`, `~/.gnupg`, the intendant config home, and
+the `.env` search path at the OS layer; on Linux, Landlock cannot express read
+carve-outs under a broad read grant, so project/config `.env` files remain
+readable — credential custody is the tracked fix).
 
 ### `[webrtc]`
 
@@ -656,12 +687,14 @@ deployments only ever touch `[server.tls]`.
 `rustls` + `rcgen`, all platforms; ORed with the `--tls` flag). The dashboard
 defaults to mTLS. This section supplies HTTPS/WSS and a browser secure context,
 but it does not give a certless remote browser daemon authority: only loopback
-certless requests receive the local-root posture, and protected remote
-HTTP/WebSocket/control requests still require mTLS:
+certless requests receive the local-root posture. TLS-only mode does not load a
+client CA, so protected remote HTTP/WebSocket/control requests are denied unless
+they carry a separately authenticated peer or hosted-lease identity; use the
+default mTLS mode when client-certificate authentication is required:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable HTTPS/WSS; certless access is local-root only on loopback, while remote protected routes still require mTLS |
+| `enabled` | bool | `false` | Enable TLS-only HTTPS/WSS. Certless access is local-root only on loopback; remote protected routes require an authenticated peer/hosted-lease identity and ordinary client certificates cannot authenticate because this mode loads no client CA |
 | `cert` | string | installed access certs, then auto self-signed | PEM cert (chain) overriding the default cert selection; pair with `key` |
 | `key` | string | — | PEM private key (PKCS#8, PKCS#1, or SEC1) matching `cert` |
 | `hostname` | string | — | Extra SAN hostname for the self-signed cert (in addition to bind IP + `localhost`) |
@@ -677,7 +710,7 @@ certificate.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Explicitly require browser/client certificates during the TLS handshake; default behavior already does this unless `--tls` / `[server.tls]` or `--no-tls` is used |
+| `enabled` | bool | `false` | Enable client-certificate authentication (also the default dashboard transport unless `--tls` / `[server.tls]` or `--no-tls` is used). TLS accepts a certless handshake so public shell/discovery bytes remain reachable; protected HTTP routes and every ordinary WebSocket then require a CA-verified client certificate or another authenticated peer/hosted-lease identity |
 | `ca` | string | installed access CA | PEM CA bundle used to verify client certificates |
 
 Use `[server.tls]` for a secure context on loopback or for public/bootstrap
@@ -1013,8 +1046,9 @@ openai_model = "gpt-4o-realtime-preview"
 sample_rate = 24000
 
 [sandbox]
-enabled = false
-extra_write_paths = ["/var/log"]
+# Omit `enabled` for the platform default (on macOS/Linux, off Windows).
+# enabled = true
+extra_write_paths = []
 
 [webrtc]
 federation_allow_h264 = false
@@ -1085,10 +1119,15 @@ level or category rule.
 ## Skills
 
 Skills are named instruction sets stored as `SKILL.md` files with YAML
-frontmatter, discovered from two directories (project-scoped first):
+frontmatter. Discovery checks these locations in order; the first skill with a
+given name wins:
 
-1. `<project-root>/.intendant/skills/<name>/SKILL.md`
-2. `~/.intendant/skills/<name>/SKILL.md`
+1. `<project-root>/.agents/skills/<name>/SKILL.md` (Agent Skills standard)
+2. `<project-root>/.intendant/skills/<name>/SKILL.md` (legacy project path)
+3. `<project-root>/skills/<name>/SKILL.md` (visible repository path)
+4. `~/.agents/skills/<name>/SKILL.md` (personal standard path)
+5. `<state-root>/skills/<name>/SKILL.md` (legacy personal path; default
+   `~/.intendant/skills`)
 
 ```yaml
 ---

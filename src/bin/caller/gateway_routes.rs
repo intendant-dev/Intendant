@@ -1420,13 +1420,17 @@ pub(crate) static ROUTES: &[Route] = &[
         "Current runtime settings",
     )
     .with_tunnel(tunnel_method("api_settings")),
+    // Writing provider keys is credential custody, not a runtime
+    // preference: gate it like the sign-in ceremonies below, so no peer
+    // profile (peer-root included) and no scoped default can durably
+    // rewrite the daemon's provider credentials.
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/api-keys"),
-        PeerOperation::Settings,
+        PeerOperation::CredentialsManage,
         BodyPolicy::Default,
         RouteHandlerId::ApiKeysPost,
-        "Store provider API keys in the project .env",
+        "Store provider API keys in the daemon-config .env",
     )
     .with_tunnel(tunnel_method("api_api_keys_save")),
     op_route(
@@ -2998,11 +3002,13 @@ mod tests {
             classify("GET", "/api/transfers/j1/chunk"),
             TableClassification::NoMatch
         ));
-        // The sign-in ceremonies are credential custody: every leaf —
-        // the status reads included — classifies CredentialsManage, the
-        // operation no peer profile (peer-root included) and no scoped
-        // default carries. A widening here is a custody regression.
+        // The sign-in ceremonies and the provider-key write are
+        // credential custody: every leaf — the status reads included —
+        // classifies CredentialsManage, the operation no peer profile
+        // (peer-root included) and no scoped default carries. A widening
+        // here is a custody regression.
         for (method, path) in [
+            ("POST", "/api/api-keys"),
             ("POST", "/api/claude-auth/start"),
             ("GET", "/api/claude-auth/status"),
             ("POST", "/api/claude-auth/code"),

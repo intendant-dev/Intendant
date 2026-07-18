@@ -14,7 +14,7 @@ The name is the thesis. In a theater, performers play and conductors orchestrate
 
 Intendant is built around a few core ideas:
 
-**Security through process isolation.** The runtime and controller form the command-execution trust boundary. The *runtime* that executes arbitrary commands runs under OS filesystem restrictions (Landlock on Linux, Seatbelt on macOS, restricted tokens on Windows) and never holds API keys. The *controller* that manages model conversations never executes user-requested shell commands directly. See [Architecture](./architecture.md).
+**Security through process isolation.** The runtime and controller form the command-execution trust boundary. The *runtime* that executes arbitrary commands never holds API keys. Its write sandbox uses Landlock on Linux, Seatbelt on macOS, and restricted tokens on Windows; the platform default is on for macOS/Linux and off for Windows. The *controller* that manages model conversations never executes user-requested shell commands directly. See [Architecture](./architecture.md).
 
 **Authority is always local.** Every session's authority — human or agent, browser or peer daemon — is minted by the *target daemon's own IAM*. A Connect claim is account/route metadata and changes no IAM state. The default build additionally refuses all hosted-provenance daemon control with an immutable `role:none`, although Connect remains trusted for availability, metadata, and the browser code and installers it serves. Organizations are root keys whose signed grant documents materialize into local IAM under each owner's ceilings, never a central directory that could mint access. See [Trust Architecture](./trust-architecture.md).
 
@@ -51,7 +51,7 @@ Intendant is built around a few core ideas:
               │                    │                │
               ▼                    ▼                ▼
         Voice / Model APIs   intendant-runtime   external CLI subprocess
-        (live + streaming)   (sandboxed exec)    (wired to Intendant's
+        (live + streaming)   (command exec)      (wired to Intendant's
                                                    MCP server)
 
         ◄─── WebRTC display + peer federation ───►  browsers / peer daemons
@@ -72,7 +72,7 @@ See [Architecture](./architecture.md) for the full picture.
 - **Persistent daemon** — long-lived session supervision, a multi-session dashboard, and content-addressed file snapshots with rewind ([Control Plane & Daemon](./control-plane-and-daemon.md), [Web Dashboard](./web-dashboard.md))
 - **Agenda and Memory** — a daemon-wide append-only ledger for deferred intent, reminders, durable questions, and digest-approved scheduled sessions; plus a provenance-labeled claim plane over the stamped owner-plane D0-A writer/reducer format ([Agenda and Memory](./agenda-and-memory.md))
 - **MCP server and client** — expose Intendant's control surface as MCP tools, and connect to external MCP servers ([MCP Server](./mcp-server.md))
-- **Filesystem sandboxing** via Landlock (Linux), Seatbelt (macOS), and restricted tokens (Windows); session persistence with structured JSONL logging and resume ([Session Logging](./session-logging.md)), and a skills system for named instruction sets
+- **Filesystem sandboxing** via Landlock (Linux), Seatbelt (macOS), and restricted tokens (Windows), default-on for macOS/Linux and opt-in on Windows; session persistence with structured JSONL logging and resume ([Session Logging](./session-logging.md)), and a skills system for named instruction sets
 
 ## Where to Go Next
 

@@ -59,7 +59,7 @@ still supporting ordinary `.env` credentials:
 
 - **The vault** — Connect implements blind account-vault blob storage, and a separate daemon-store vault is available to trusted direct dashboards. The default Connect directory deliberately does not serve the dashboard vault client or `vault-kernel.js`, so account-vault storage is currently an API/backend rather than an operable hosted vault. The stores do not bridge.
 - **Leases and client egress** — the control-channel mechanisms are implemented for authorized sessions, but there is no shipped independently trusted client bridge from the Connect account-vault backend. Until such a client and bridge exist, those stored envelopes cannot fuel a daemon or relay its model calls; use a daemon-origin vault from loopback/direct mTLS or existing local credential configuration.
-- **Honest disk boundary** — API-key leases are memory-only, but `.env` remains supported, and full-credential OAuth leases temporarily materialize private auth homes under `~/.intendant/leased-auth` until expiry, revocation, shutdown, or startup cleanup.
+- **Honest disk boundary** — API-key leases are memory-only, but `.env` remains supported, and full-credential OAuth leases temporarily materialize private auth homes under `<state-root>/leased-auth` (`~/.intendant/leased-auth` by default) until expiry, revocation, shutdown, or startup cleanup.
 
 A deliberately keyless daemon outside an active full-credential OAuth lease can therefore avoid durable provider secrets on disk. That is a configuration property, not an unconditional product guarantee. [How custody works and what is not bridged yet →](https://intendant-dev.github.io/Intendant/credential-custody.html)
 
@@ -96,7 +96,7 @@ That is the shape of this system. Agents perform. Orchestrators conduct — the 
               │                    │                │
               ▼                    ▼                ▼
         Voice / Model APIs   intendant-runtime   external CLI subprocess
-        (live + streaming)   (sandboxed exec,    (wired to Intendant's
+        (live + streaming)   (command exec,      (wired to Intendant's
                               never holds keys)    MCP server)
 
         ◄─── WebRTC display + peer federation ───►  browsers / peer daemons
@@ -105,7 +105,7 @@ That is the shape of this system. Agents perform. Orchestrators conduct — the 
   fleet-metadata service (outside the controller/runtime execution boundary)
 ```
 
-**Three binaries; a two-sided execution boundary** — `intendant-runtime` executes commands under OS filesystem restrictions (Landlock on Linux, Seatbelt on macOS, restricted tokens on Windows) and never holds API keys. The `intendant` controller talks to model APIs and dispatches requested actions only through that runtime. `intendant-connect` is the separate hosted/self-hostable account, route, presence, push, and fleet-metadata service; it is not part of the privileged controller/runtime pair and exposes no hosted control authority in the default build.
+**Three binaries; a two-sided execution boundary** — `intendant-runtime` executes commands and never holds API keys. Its write sandbox uses Landlock on Linux, Seatbelt on macOS, and restricted tokens on Windows; it defaults on for macOS/Linux and is opt-in on Windows. The `intendant` controller talks to model APIs and dispatches requested actions only through that runtime. `intendant-connect` is the separate hosted/self-hostable account, route, presence, push, and fleet-metadata service; it is not part of the privileged controller/runtime pair and exposes no hosted control authority in the default build.
 
 **Presence layer** — a separate AI that mediates between user and agent. Handles conversation, dispatches tasks, narrates events, manages approval gates. Runs as server-side text or browser-side voice (Gemini Live / OpenAI Realtime via WASM).
 
@@ -169,7 +169,7 @@ The full flag reference (providers, models, sandboxing, resume) lives in [Gettin
 
 The web dashboard is the canonical frontend — on by default (port 8765; `--no-web` disables it), served to any authenticated browser, phone included — with thirteen destinations:
 
-- **Activity** — live event log with context/changes views, approval buttons, follow-up input
+- **Activity** — live Timeline with Focus/Grid session views, context/changes/control panes, approvals, and follow-up input
 - **Sessions** — browse, search, resume, and fork sessions across all backends
 - **Agenda** — park tasks, notes, and durable questions; manage reminders and review digest-bound scheduled-session proposals
 - **Memory** — explicitly search, inspect, and propose provenance-labeled claims, with effective durability shown on every view
@@ -185,7 +185,8 @@ The web dashboard is the canonical frontend — on by default (port 8765; `--no-
 
 Optional **live voice** via Gemini Live or OpenAI Realtime — the browser connects directly to the model's realtime API through WASM with presence tools for approving actions, submitting tasks, and querying status by voice.
 
-Late-connecting browsers receive the full session replay and cached state.
+Late-connecting browsers receive cached daemon/session state plus a bounded
+recent replay; the Activity hydration path loads older history on demand.
 
 ## Testing
 

@@ -581,7 +581,8 @@ voice model ──WebSocket──▶ Intendant ──audio bridge──▶ appli
    app, and inbound audio is also teed to Whisper for a transcript.
 4. When the model calls `submit_response`, the data is validated against the
    schema; the tool returns a `LiveAudioResult` with a `status` of `Completed`,
-   `TimedOut`, or `SchemaError`.
+   `TimedOut`, `Disconnected`, `SchemaError`, or `Failed` (the last two carry
+   an error string).
 
 The live path is bounded for real-time behavior. Vortex capture still polls its
 shared-memory ring every 5 ms, but aggregates samples into 20–40 ms WebSocket

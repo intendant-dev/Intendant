@@ -4,6 +4,15 @@
 
 use super::*;
 
+/// Client-visible upstream-failure text. Vendor error bodies and
+/// reqwest's error `Display` (which embeds the request URL — the Gemini
+/// auth-token URL carries the API key as a query parameter) must never
+/// reach a response body unmasked, so every upstream-derived error
+/// string in this module is formatted through here.
+fn masked_upstream_error(context: &str, detail: impl std::fmt::Display) -> String {
+    crate::provider::mask_api_keys(&format!("{context}: {detail}"))
+}
+
 /// Mint a short-lived vendor session token server-side so the browser
 /// never handles (or stores) a long-lived API key.
 pub(crate) async fn mint_session_token(provider: &str, model: &str) -> Result<String, String> {
@@ -20,21 +29,24 @@ pub(crate) async fn mint_session_token(provider: &str, model: &str) -> Result<St
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| format!("OpenAI request failed: {}", e))?;
+                .map_err(|e| masked_upstream_error("OpenAI request failed", e))?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                return Err(format!("OpenAI HTTP {}: {}", status, text));
+                return Err(masked_upstream_error(
+                    &format!("OpenAI HTTP {status}"),
+                    text,
+                ));
             }
             let data: serde_json::Value = resp
                 .json()
                 .await
-                .map_err(|e| format!("OpenAI parse failed: {}", e))?;
+                .map_err(|e| masked_upstream_error("OpenAI parse failed", e))?;
             // Response may have token at top level or nested under client_secret
             let token = data["client_secret"]["value"]
                 .as_str()
                 .or_else(|| data["value"].as_str())
-                .ok_or_else(|| format!("No token in OpenAI response: {}", data))?;
+                .ok_or_else(|| masked_upstream_error("No token in OpenAI response", &data))?;
             let expires_at = data["client_secret"]["expires_at"]
                 .as_i64()
                 .or_else(|| data["expires_at"].as_i64())
@@ -73,16 +85,19 @@ pub(crate) async fn mint_session_token(provider: &str, model: &str) -> Result<St
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| format!("Gemini request failed: {}", e))?;
+                .map_err(|e| masked_upstream_error("Gemini request failed", e))?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                return Err(format!("Gemini HTTP {}: {}", status, text));
+                return Err(masked_upstream_error(
+                    &format!("Gemini HTTP {status}"),
+                    text,
+                ));
             }
             let data: serde_json::Value = resp
                 .json()
                 .await
-                .map_err(|e| format!("Gemini parse failed: {}", e))?;
+                .map_err(|e| masked_upstream_error("Gemini parse failed", e))?;
             let token = data["name"]
                 .as_str()
                 .ok_or("No 'name' in Gemini response")?;
@@ -608,6 +623,35 @@ pub(crate) fn verify_bearer_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every upstream-derived error string in this module routes through
+    /// `masked_upstream_error` before it can reach a 502 body: reqwest's
+    /// error `Display` embeds the request URL (the Gemini auth-token URL
+    /// carries the key as a query parameter), and vendor error bodies can
+    /// echo bearer material.
+    #[test]
+    fn upstream_error_text_masks_api_keys() {
+        let masked = masked_upstream_error(
+            "Gemini request failed",
+            "error sending request for url (https://generativelanguage.googleapis.com/v1alpha/auth_tokens?key=AIzaSyFAKEfakeFAKEfakeFAKEfakeFAKEfake123)",
+        );
+        assert!(masked.starts_with("Gemini request failed: "));
+        assert!(masked.contains("key=AIzaSyFAKEfa***"));
+        assert!(!masked.contains("AIzaSyFAKEfakeFAKEfakeFAKEfakeFAKEfake123"));
+
+        let masked = masked_upstream_error(
+            "OpenAI HTTP 401",
+            r#"{"error":"invalid key sk-fakefakefake1234567890abcdef"}"#,
+        );
+        assert!(masked.contains("sk-fakefakefa***"));
+        assert!(!masked.contains("sk-fakefakefake1234567890abcdef"));
+
+        // Key-free detail passes through untouched.
+        assert_eq!(
+            masked_upstream_error("Gemini parse failed", "expected value at line 1"),
+            "Gemini parse failed: expected value at line 1"
+        );
+    }
 
     #[test]
     fn is_federation_path_uses_parsed_routes() {
