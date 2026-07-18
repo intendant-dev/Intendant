@@ -1139,7 +1139,11 @@ mod tests {
         note_supervised_mcp_serve(&bus, "serve-once-sess", McpServeMilestone::ToolsServed(7));
         note_supervised_mcp_serve(&bus, "serve-once-sess", McpServeMilestone::ToolsServed(9));
         // Never-registered callers (browser, ctl, peer lanes) emit nothing.
-        note_supervised_mcp_serve(&bus, "serve-once-unregistered", McpServeMilestone::Initialize);
+        note_supervised_mcp_serve(
+            &bus,
+            "serve-once-unregistered",
+            McpServeMilestone::Initialize,
+        );
 
         let lines = drain_mcp_serve_lines(&mut rx);
         assert_eq!(
@@ -1261,9 +1265,7 @@ mod tests {
         // the query-string sid is context selection, not actor identity)
         // emits nothing, even for a registered session's id.
         let dashboard_access = HttpAccessContext {
-            principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
-                "test", "https",
-            ),
+            principal: crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https"),
             iam_state: None,
         };
         handle_mcp_http_request(
