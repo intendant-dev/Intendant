@@ -93,8 +93,38 @@ pub(crate) struct DnsChallengeLease {
 
 enum ChallengeMutationResult {
     Applied(Option<String>),
-    FailedBeforeProvider(String),
+    SettledWithoutMutation(String),
     ProviderResultAmbiguous(String),
+}
+
+enum ProviderMutationError {
+    SettledWithoutMutation(String),
+    ResultAmbiguous(String),
+}
+
+impl ProviderMutationError {
+    fn settled(message: String) -> Self {
+        Self::SettledWithoutMutation(message)
+    }
+
+    fn ambiguous(message: String) -> Self {
+        Self::ResultAmbiguous(message)
+    }
+
+    fn into_challenge_result(self) -> ChallengeMutationResult {
+        match self {
+            Self::SettledWithoutMutation(error) => {
+                ChallengeMutationResult::SettledWithoutMutation(error)
+            }
+            Self::ResultAmbiguous(error) => ChallengeMutationResult::ProviderResultAmbiguous(error),
+        }
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::SettledWithoutMutation(error) | Self::ResultAmbiguous(error) => error,
+        }
+    }
 }
 
 pub(crate) async fn set_challenge_in(
@@ -135,9 +165,9 @@ pub(crate) async fn set_challenge_in(
             Ok(token) => match cloudflare_create(zone_id.trim(), &token, &record_name, value).await
             {
                 Ok(record_id) => ChallengeMutationResult::Applied(Some(record_id)),
-                Err(error) => ChallengeMutationResult::ProviderResultAmbiguous(error),
+                Err(error) => error.into_challenge_result(),
             },
-            Err(error) => ChallengeMutationResult::FailedBeforeProvider(error),
+            Err(error) => ChallengeMutationResult::SettledWithoutMutation(error),
         },
         CustomDomainDnsConfig::Rfc2136 {
             server,
@@ -167,15 +197,15 @@ pub(crate) async fn set_challenge_in(
             .await
             {
                 Ok(()) => ChallengeMutationResult::Applied(None),
-                Err(error) => ChallengeMutationResult::ProviderResultAmbiguous(error),
+                Err(error) => error.into_challenge_result(),
             },
-            Err(error) => ChallengeMutationResult::FailedBeforeProvider(error),
+            Err(error) => ChallengeMutationResult::SettledWithoutMutation(error),
         },
     };
     let (record_id, mutation_error, provider_result_settled, provider_mutation_possible) =
         match mutation {
             ChallengeMutationResult::Applied(record_id) => (record_id, None, true, true),
-            ChallengeMutationResult::FailedBeforeProvider(error) => {
+            ChallengeMutationResult::SettledWithoutMutation(error) => {
                 (None, Some(error), true, false)
             }
             ChallengeMutationResult::ProviderResultAmbiguous(error) => {
@@ -418,7 +448,8 @@ async fn cleanup_pending_challenge(pending: &PendingChallenge) -> Result<(), Str
                 *ttl_secs,
                 true,
             )
-            .await?;
+            .await
+            .map_err(ProviderMutationError::into_message)?;
         }
     }
     Ok(())
@@ -1488,11 +1519,14 @@ async fn cloudflare_create(
     token: &str,
     name: &str,
     value: &str,
-) -> Result<String, String> {
+) -> Result<String, ProviderMutationError> {
     if zone_id.is_empty() || !zone_id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-        return Err("Cloudflare zone_id is invalid".to_string());
+        return Err(ProviderMutationError::settled(
+            "Cloudflare zone_id is invalid".to_string(),
+        ));
     }
-    let response = cloudflare_client()?
+    let response = cloudflare_client()
+        .map_err(ProviderMutationError::settled)?
         .post(format!("{CLOUDFLARE_API_BASE}/zones/{zone_id}/dns_records"))
         .bearer_auth(token)
         .json(&serde_json::json!({
@@ -1504,22 +1538,60 @@ async fn cloudflare_create(
         }))
         .send()
         .await
-        .map_err(|error| format!("Cloudflare DNS create: {error}"))?;
+        .map_err(cloudflare_create_send_error)?;
     let status = response.status();
-    let body = cloudflare_response_body(response, "response").await?;
-    let envelope: CloudflareEnvelope<CloudflareRecord> = serde_json::from_slice(&body)
-        .map_err(|error| format!("parse Cloudflare DNS response ({status}): {error}"))?;
+    let body = cloudflare_response_body(response, "response")
+        .await
+        .map_err(|error| cloudflare_create_response_error(status, false, error))?;
+    let envelope: CloudflareEnvelope<CloudflareRecord> =
+        serde_json::from_slice(&body).map_err(|error| {
+            cloudflare_create_response_error(
+                status,
+                false,
+                format!("parse Cloudflare DNS response ({status}): {error}"),
+            )
+        })?;
     if !status.is_success() || !envelope.success {
-        return Err(format!(
-            "Cloudflare DNS create failed ({status}): {}",
-            cloudflare_error_text(&envelope.errors)
+        return Err(cloudflare_create_response_error(
+            status,
+            !envelope.success,
+            format!(
+                "Cloudflare DNS create failed ({status}): {}",
+                cloudflare_error_text(&envelope.errors)
+            ),
         ));
     }
     envelope
         .result
         .map(|record| record.id)
         .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
-        .ok_or_else(|| "Cloudflare DNS create returned no record id".to_string())
+        .ok_or_else(|| {
+            ProviderMutationError::ambiguous(
+                "Cloudflare DNS create returned no record id".to_string(),
+            )
+        })
+}
+
+fn cloudflare_create_send_error(error: reqwest::Error) -> ProviderMutationError {
+    let settled_without_mutation = error.is_builder() || error.is_connect();
+    let error = format!("Cloudflare DNS create: {error}");
+    if settled_without_mutation {
+        ProviderMutationError::settled(error)
+    } else {
+        ProviderMutationError::ambiguous(error)
+    }
+}
+
+fn cloudflare_create_response_error(
+    status: reqwest::StatusCode,
+    provider_rejected: bool,
+    error: String,
+) -> ProviderMutationError {
+    if status.is_client_error() || (status.is_success() && provider_rejected) {
+        ProviderMutationError::settled(error)
+    } else {
+        ProviderMutationError::ambiguous(error)
+    }
 }
 
 async fn cloudflare_delete(zone_id: &str, record_id: &str, token: &str) -> Result<(), String> {
@@ -1681,13 +1753,17 @@ async fn rfc2136_update(
     value: &str,
     ttl_secs: u32,
     delete: bool,
-) -> Result<(), String> {
-    let zone_name = absolute_name(zone, "RFC2136 zone")?;
-    let record_name = absolute_name(record_name, "RFC2136 record name")?;
+) -> Result<(), ProviderMutationError> {
+    let zone_name = absolute_name(zone, "RFC2136 zone").map_err(ProviderMutationError::settled)?;
+    let record_name = absolute_name(record_name, "RFC2136 record name")
+        .map_err(ProviderMutationError::settled)?;
     if !zone_name.zone_of(&record_name) {
-        return Err("RFC2136 challenge name is outside the configured zone".to_string());
+        return Err(ProviderMutationError::settled(
+            "RFC2136 challenge name is outside the configured zone".to_string(),
+        ));
     }
-    let key_name = absolute_name(key_name, "RFC2136 TSIG key name")?;
+    let key_name =
+        absolute_name(key_name, "RFC2136 TSIG key name").map_err(ProviderMutationError::settled)?;
     let record = Record::from_rdata(
         record_name,
         ttl_secs.max(1),
@@ -1700,59 +1776,80 @@ async fn rfc2136_update(
         update_message::append(rrset, zone_name, false, true)
     };
     let signer = TSigner::new(key.to_vec(), TsigAlgorithm::HmacSha256, key_name, 300)
-        .map_err(|error| format!("RFC2136 TSIG signer: {error}"))?;
+        .map_err(|error| ProviderMutationError::settled(format!("RFC2136 TSIG signer: {error}")))?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock before unix epoch: {error}"))?
+        .map_err(|error| {
+            ProviderMutationError::settled(format!("system clock before unix epoch: {error}"))
+        })?
         .as_secs();
     let mut verifier = message
         .finalize(&signer, now)
-        .map_err(|error| format!("sign RFC2136 update: {error}"))?
-        .ok_or_else(|| "RFC2136 update produced no TSIG verifier".to_string())?;
-    let wire = message
-        .to_bytes()
-        .map_err(|error| format!("encode RFC2136 update: {error}"))?;
+        .map_err(|error| ProviderMutationError::settled(format!("sign RFC2136 update: {error}")))?
+        .ok_or_else(|| {
+            ProviderMutationError::settled("RFC2136 update produced no TSIG verifier".to_string())
+        })?;
+    let wire = message.to_bytes().map_err(|error| {
+        ProviderMutationError::settled(format!("encode RFC2136 update: {error}"))
+    })?;
     if wire.len() > u16::MAX as usize {
-        return Err("RFC2136 update exceeds the TCP DNS message limit".to_string());
+        return Err(ProviderMutationError::settled(
+            "RFC2136 update exceeds the TCP DNS message limit".to_string(),
+        ));
     }
-    tokio::time::timeout(DNS_PROVIDER_TIMEOUT, async {
+    let request_may_reach_provider = std::sync::atomic::AtomicBool::new(false);
+    let result = tokio::time::timeout(DNS_PROVIDER_TIMEOUT, async {
         let mut stream = tokio::net::TcpStream::connect(server)
             .await
-            .map_err(|error| format!("connect RFC2136 server {server}: {error}"))?;
-        stream
-            .write_u16(wire.len() as u16)
-            .await
-            .map_err(|error| format!("write RFC2136 update length: {error}"))?;
-        stream
-            .write_all(&wire)
-            .await
-            .map_err(|error| format!("write RFC2136 update: {error}"))?;
-        let response_len = stream
-            .read_u16()
-            .await
-            .map_err(|error| format!("read RFC2136 response length: {error}"))?
-            as usize;
+            .map_err(|error| {
+                ProviderMutationError::settled(format!("connect RFC2136 server {server}: {error}"))
+            })?;
+        // From the first write onward an I/O error cannot prove whether the
+        // complete request reached the authoritative server.
+        request_may_reach_provider.store(true, std::sync::atomic::Ordering::Relaxed);
+        stream.write_u16(wire.len() as u16).await.map_err(|error| {
+            ProviderMutationError::ambiguous(format!("write RFC2136 update length: {error}"))
+        })?;
+        stream.write_all(&wire).await.map_err(|error| {
+            ProviderMutationError::ambiguous(format!("write RFC2136 update: {error}"))
+        })?;
+        let response_len = stream.read_u16().await.map_err(|error| {
+            ProviderMutationError::ambiguous(format!("read RFC2136 response length: {error}"))
+        })? as usize;
         if response_len == 0 || response_len > RFC2136_RESPONSE_MAX_BYTES {
-            return Err("RFC2136 response length is invalid".to_string());
-        }
-        let mut response = vec![0u8; response_len];
-        stream
-            .read_exact(&mut response)
-            .await
-            .map_err(|error| format!("read RFC2136 response: {error}"))?;
-        let response = verifier
-            .verify(&response)
-            .map_err(|error| format!("verify RFC2136 TSIG response: {error}"))?;
-        if response.response_code != ResponseCode::NoError {
-            return Err(format!(
-                "RFC2136 update returned {}",
-                response.response_code
+            return Err(ProviderMutationError::ambiguous(
+                "RFC2136 response length is invalid".to_string(),
             ));
         }
-        Ok(())
+        let mut response = vec![0u8; response_len];
+        stream.read_exact(&mut response).await.map_err(|error| {
+            ProviderMutationError::ambiguous(format!("read RFC2136 response: {error}"))
+        })?;
+        let response = verifier.verify(&response).map_err(|error| {
+            ProviderMutationError::ambiguous(format!("verify RFC2136 TSIG response: {error}"))
+        })?;
+        rfc2136_response_result(response.response_code)
     })
-    .await
-    .map_err(|_| "RFC2136 update timed out".to_string())?
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) if request_may_reach_provider.load(std::sync::atomic::Ordering::Relaxed) => Err(
+            ProviderMutationError::ambiguous("RFC2136 update timed out".to_string()),
+        ),
+        Err(_) => Err(ProviderMutationError::settled(
+            "RFC2136 update timed out before connecting to the provider".to_string(),
+        )),
+    }
+}
+
+fn rfc2136_response_result(response_code: ResponseCode) -> Result<(), ProviderMutationError> {
+    if response_code == ResponseCode::NoError {
+        Ok(())
+    } else {
+        Err(ProviderMutationError::settled(format!(
+            "RFC2136 update returned {response_code}"
+        )))
+    }
 }
 
 fn absolute_name(value: &str, field: &str) -> Result<Name, String> {
@@ -1766,6 +1863,51 @@ fn absolute_name(value: &str, field: &str) -> Result<Name, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn definitive_provider_rejections_are_settled_without_uncertainty() {
+        assert!(matches!(
+            cloudflare_create_response_error(
+                reqwest::StatusCode::UNAUTHORIZED,
+                false,
+                "unauthorized".to_string(),
+            ),
+            ProviderMutationError::SettledWithoutMutation(_)
+        ));
+        assert!(matches!(
+            cloudflare_create_response_error(
+                reqwest::StatusCode::OK,
+                true,
+                "provider rejected the request".to_string(),
+            ),
+            ProviderMutationError::SettledWithoutMutation(_)
+        ));
+        assert!(matches!(
+            rfc2136_response_result(ResponseCode::Refused),
+            Err(ProviderMutationError::SettledWithoutMutation(_))
+        ));
+        assert!(rfc2136_response_result(ResponseCode::NoError).is_ok());
+    }
+
+    #[test]
+    fn indeterminate_provider_results_remain_ambiguous() {
+        assert!(matches!(
+            cloudflare_create_response_error(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                true,
+                "provider response was not conclusive".to_string(),
+            ),
+            ProviderMutationError::ResultAmbiguous(_)
+        ));
+        assert!(matches!(
+            cloudflare_create_response_error(
+                reqwest::StatusCode::OK,
+                false,
+                "successful response omitted the mutation id".to_string(),
+            ),
+            ProviderMutationError::ResultAmbiguous(_)
+        ));
+    }
 
     fn expire_primary_mutation_uncertainty(cert_dir: &Path) {
         crate::access::authority_store::with_lock(cert_dir, || {
@@ -2090,7 +2232,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_before_provider_retires_without_provider_cleanup() {
+    fn settled_failure_retires_without_provider_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let lease = DnsChallengeLease {
             id: "flow-local-failure".to_string(),
