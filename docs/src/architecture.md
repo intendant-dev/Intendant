@@ -292,9 +292,11 @@ surface.
 
 ## askHuman Behavior
 
-- Under the **dashboard**, `askHuman` surfaces as a question card; the answer
-  is written to the session-scoped response file (`--json` accepts an `input`
-  command for the same file).
+- Under the **dashboard**, `askHuman` surfaces as a question card and the
+  question consumes the whole batch: the askHuman call returns the answer,
+  and any other commands in a mixed batch return a not-executed note asking
+  the model to re-issue them. (`--json` instead accepts an `input` command
+  answered through the session-scoped response file.)
 - In **headless mode** (no dashboard, non-interactive stdin), `askHuman` cannot
   be answered interactively, so the loop tells the model to continue with
   explicit assumptions rather than wait.

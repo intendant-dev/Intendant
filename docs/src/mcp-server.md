@@ -123,7 +123,13 @@ session) is refused `set_autonomy` and `approve_all` outright — both rewrite
 the daemon-global shared autonomy, which would let a supervised agent widen
 its own approval policy — and `approve`/`deny`/`skip` resolve only approvals
 raised by the caller's own session (cross-session resolution is denied;
-unknown ownership fails closed). This mirrors `grant_user_display`'s
+unknown ownership fails closed). The same containment covers daemon
+lifecycle: `quit`, `schedule_controller_restart`, and
+`cancel_controller_restart` are refused to agent-session callers (a
+supervised agent must not stop or bounce its supervisor), while
+`controller_turn_complete` (the session's own completion signal inside an
+owner-scheduled restart) and the controller-loop halt tools (the autonomous
+loop's self-stop verbs) stay open. This mirrors `grant_user_display`'s
 owner-surface rule: owner surfaces (dashboard, `intendant ctl` on loopback,
 enrolled root mTLS clients, the stdio transport) and deliberately granted
 non-agent principals keep the full surface. The point of the

@@ -1205,11 +1205,18 @@ pub(crate) async fn serve_http_request(
             }
             RouteHandlerId::SettingsPost => {
                 let settings_root = runtime_settings.settings_root.or(project_root);
+                // Executable-repointing fields escalate per-field to the
+                // /api/api-keys gate (credentials.manage); the route itself
+                // stays Settings-class.
+                let caller_may_manage_credentials = http_access_context
+                    .decision(crate::peer::access_policy::PeerOperation::CredentialsManage)
+                    .allowed;
                 return handle_settings_post(
                     stream,
                     route_body,
                     bus,
                     settings_root,
+                    caller_may_manage_credentials,
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )

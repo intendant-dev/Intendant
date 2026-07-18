@@ -564,7 +564,9 @@ impl IntendantServer {
                 let params = parse_params::<SetVerbosityParams>(args)?;
                 Ok(text_tool_result(self.set_verbosity(params).await))
             }
-            "quit" => Ok(text_tool_result(self.quit().await)),
+            "quit" => Ok(text_tool_result(
+                self.quit_scoped(McpToolScope::from_actor(&actor)).await,
+            )),
             "start_task" => {
                 let params =
                     parse_params::<StartTaskParams>(with_default_mcp_session_id(args, session_id))?;
@@ -614,9 +616,13 @@ impl IntendantServer {
                 Ok(text_tool_result(self.fission_control(params).await))
             }
             "schedule_controller_restart" => {
-                let params = parse_params::<ScheduleControllerRestartParams>(args)?;
+                let Parameters(params) = parse_params::<ScheduleControllerRestartParams>(args)?;
                 Ok(text_tool_result(
-                    self.schedule_controller_restart(params).await,
+                    self.schedule_controller_restart_scoped(
+                        params,
+                        McpToolScope::from_actor(&actor),
+                    )
+                    .await,
                 ))
             }
             "controller_turn_complete" => {
@@ -627,9 +633,10 @@ impl IntendantServer {
             }
             "get_restart_status" => Ok(text_tool_result(self.get_restart_status().await)),
             "cancel_controller_restart" => {
-                let params = parse_params::<CancelControllerRestartParams>(args)?;
+                let Parameters(params) = parse_params::<CancelControllerRestartParams>(args)?;
                 Ok(text_tool_result(
-                    self.cancel_controller_restart(params).await,
+                    self.cancel_controller_restart_scoped(params, McpToolScope::from_actor(&actor))
+                        .await,
                 ))
             }
             "request_controller_loop_halt" => {
@@ -923,6 +930,25 @@ fn scope_denies_pending_approval(state: &McpAppState, scope: McpToolScope<'_>) -
          dashboard or `intendant ctl`."
             .to_string(),
     )
+}
+
+/// Denial when `scope` may not drive daemon lifecycle (`quit`, scheduling
+/// or cancelling controller restarts): a supervised agent session must not
+/// stop or bounce the daemon that supervises it — the same H5 class as
+/// `set_autonomy`/`approve_all`. `controller_turn_complete` (the session's
+/// own completion signal inside an owner-scheduled restart) and the
+/// controller-loop halt tools (the autonomous loop's self-stop verbs) stay
+/// open.
+fn scope_denies_daemon_lifecycle(scope: McpToolScope<'_>, tool: &str) -> Option<String> {
+    if matches!(scope, McpToolScope::AgentSession { .. }) {
+        Some(format!(
+            "{tool} stops or restarts the daemon that supervises you (and every other \
+             session it runs) and is not available to supervised agent sessions; ask the \
+             user (ask_user) if you believe the daemon should stop or restart."
+        ))
+    } else {
+        None
+    }
 }
 
 /// Resolve the pending approval prompt with `response` — the single handler
@@ -1739,6 +1765,14 @@ impl IntendantServer {
 
     #[tool(description = "Shut down the Intendant agent.")]
     async fn quit(&self) -> String {
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.quit_scoped(McpToolScope::Unrestricted).await
+    }
+
+    pub(crate) async fn quit_scoped(&self, scope: McpToolScope<'_>) -> String {
+        if let Some(reason) = scope_denies_daemon_lifecycle(scope, "quit") {
+            return format_outcome(ActionOutcome::Denied { reason });
+        }
         let mut s = self.state.write().await;
         let outcome = request_quit(&mut s);
         format_outcome(outcome)
@@ -2830,6 +2864,86 @@ pub(crate) mod tests {
             .expect("dispatch");
         assert!(dispatch_result_text(&result).contains("Autonomy set to"));
         assert_eq!(autonomy.read().await.level, AutonomyLevel::Full);
+    }
+
+    /// H5 containment: daemon-lifecycle tools — a supervised agent session
+    /// cannot stop the daemon (`quit`) or schedule/cancel controller
+    /// restarts; the owner surface keeps the full surface.
+    #[tokio::test]
+    async fn agent_sessions_cannot_stop_or_restart_the_daemon() {
+        let bus = EventBus::new();
+        let state = test_state();
+        let server = IntendantServer::new(state.clone(), bus);
+
+        let result = server
+            .call_tool_by_name_as_caller(
+                "quit",
+                serde_json::json!({}),
+                Some("sess-a"),
+                None,
+                agent_session_caller("sess-a"),
+            )
+            .await
+            .expect("dispatch");
+        assert!(
+            dispatch_result_text(&result).contains("Denied"),
+            "quit must be denied to agent sessions"
+        );
+        assert!(
+            !state.read().await.should_quit,
+            "denied quit must not set the shutdown flag"
+        );
+
+        let result = server
+            .call_tool_by_name_as_caller(
+                "schedule_controller_restart",
+                serde_json::json!({ "controller_id": "loop-a", "north_star_goal": "goal" }),
+                Some("sess-a"),
+                None,
+                agent_session_caller("sess-a"),
+            )
+            .await
+            .expect("dispatch");
+        assert!(
+            dispatch_result_text(&result).contains("Denied"),
+            "schedule_controller_restart must be denied to agent sessions"
+        );
+        assert!(
+            state.read().await.controller_restart.is_none(),
+            "denied scheduling must not arm a restart"
+        );
+
+        let result = server
+            .call_tool_by_name_as_caller(
+                "cancel_controller_restart",
+                serde_json::json!({}),
+                Some("sess-a"),
+                None,
+                agent_session_caller("sess-a"),
+            )
+            .await
+            .expect("dispatch");
+        assert!(
+            dispatch_result_text(&result).contains("Denied"),
+            "cancel_controller_restart must be denied to agent sessions"
+        );
+
+        // The owner surface (stdio / dashboard lanes) still quits.
+        let result = server
+            .call_tool_by_name_as_caller(
+                "quit",
+                serde_json::json!({}),
+                None,
+                None,
+                ToolCaller::from_gate(
+                    &crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https"),
+                    None,
+                ),
+            )
+            .await
+            .expect("dispatch");
+        assert!(!dispatch_result_text(&result).contains("Denied"));
+        assert!(state.read().await.should_quit);
     }
 
     /// H5 containment: agent-session callers resolve only approvals raised

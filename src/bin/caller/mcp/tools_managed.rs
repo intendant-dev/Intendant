@@ -715,8 +715,21 @@ impl IntendantServer {
     )]
     pub(crate) async fn schedule_controller_restart(
         &self,
-        Parameters(mut params): Parameters<ScheduleControllerRestartParams>,
+        Parameters(params): Parameters<ScheduleControllerRestartParams>,
     ) -> String {
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.schedule_controller_restart_scoped(params, McpToolScope::Unrestricted)
+            .await
+    }
+
+    pub(crate) async fn schedule_controller_restart_scoped(
+        &self,
+        mut params: ScheduleControllerRestartParams,
+        scope: McpToolScope<'_>,
+    ) -> String {
+        if let Some(reason) = scope_denies_daemon_lifecycle(scope, "schedule_controller_restart") {
+            return schedule_error_response(format!("Denied: {reason}"), None, None);
+        }
         normalize_schedule_controller_restart_params(&mut params);
         if let Err(e) = validate_schedule_controller_restart_params(&params) {
             return schedule_error_response(e, None, None);
@@ -898,8 +911,21 @@ impl IntendantServer {
     #[tool(description = "Cancel a scheduled controller restart.")]
     pub(crate) async fn cancel_controller_restart(
         &self,
-        Parameters(mut params): Parameters<CancelControllerRestartParams>,
+        Parameters(params): Parameters<CancelControllerRestartParams>,
     ) -> String {
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.cancel_controller_restart_scoped(params, McpToolScope::Unrestricted)
+            .await
+    }
+
+    pub(crate) async fn cancel_controller_restart_scoped(
+        &self,
+        mut params: CancelControllerRestartParams,
+        scope: McpToolScope<'_>,
+    ) -> String {
+        if let Some(reason) = scope_denies_daemon_lifecycle(scope, "cancel_controller_restart") {
+            return schedule_error_response(format!("Denied: {reason}"), None, None);
+        }
         normalize_cancel_controller_restart_params(&mut params);
         let mut s = self.state.write().await;
         let log_dir = s.log_dir.clone();
