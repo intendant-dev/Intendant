@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::access::iam::{
@@ -106,12 +107,6 @@ pub struct HostedControlRuntime {
     pub(super) daemon_id: String,
     daemon_label: String,
     display_media_relay_configured: bool,
-    /// Replay window for authority-free doorbell creation and polling.
-    replay: Arc<Mutex<ReplayState>>,
-    /// Independent replay window for active lease proofs. Public polling must
-    /// never consume the capacity that protects authenticated control.
-    lease_replay: Arc<Mutex<ReplayState>>,
-    tickets: Arc<Mutex<HashMap<String, WsTicketRecord>>>,
     doorbell_rate: Arc<Mutex<DoorbellRateState>>,
     poll_rate: Arc<Mutex<PollRateState>>,
     pub(super) witness_rate: Arc<Mutex<WitnessRateState>>,
@@ -134,17 +129,51 @@ impl std::fmt::Debug for HostedControlRuntime {
     }
 }
 
-#[derive(Default)]
-struct ReplayState {
-    by_authority: HashMap<String, VecDeque<(String, i64)>>,
+const SHARED_TRANSIENT_FILE: &str = "hosted-control-transient.json";
+const SHARED_TRANSIENT_SCHEMA_VERSION: u32 = 1;
+const SHARED_TRANSIENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayRecord {
+    authority_digest: String,
+    nonce_digest: String,
+    timestamp_unix_ms: i64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WsTicketRecord {
     lease_id: String,
     grant_id: String,
     fleet_origin: String,
     expires_unix_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SharedTransientState {
+    schema_version: u32,
+    public_replay: Vec<ReplayRecord>,
+    lease_replay: Vec<ReplayRecord>,
+    tickets: HashMap<String, WsTicketRecord>,
+}
+
+impl Default for SharedTransientState {
+    fn default() -> Self {
+        Self {
+            schema_version: SHARED_TRANSIENT_SCHEMA_VERSION,
+            public_replay: Vec::new(),
+            lease_replay: Vec::new(),
+            tickets: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReplayLane {
+    Public,
+    Lease,
 }
 
 #[derive(Default)]
@@ -214,9 +243,6 @@ impl HostedControlRuntime {
             daemon_id,
             daemon_label,
             display_media_relay_configured,
-            replay: Arc::new(Mutex::new(ReplayState::default())),
-            lease_replay: Arc::new(Mutex::new(ReplayState::default())),
-            tickets: Arc::new(Mutex::new(HashMap::new())),
             doorbell_rate: Arc::new(Mutex::new(DoorbellRateState::default())),
             poll_rate: Arc::new(Mutex::new(PollRateState::default())),
             witness_rate: Arc::new(Mutex::new(WitnessRateState::default())),
@@ -669,16 +695,20 @@ impl HostedControlRuntime {
             fleet_origin: verified.document.fleet_origin.clone(),
             expires_unix_ms: expires,
         };
-        let mut tickets = self
-            .tickets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let now = now_ms() as u64;
-        tickets.retain(|_, record| record.expires_unix_ms > now);
-        if tickets.len() >= WS_TICKETS_GLOBAL_CAP {
-            return Err("too many outstanding hosted WebSocket tickets".to_string());
-        }
-        tickets.insert(ticket.clone(), record);
+        mutate_shared_transient(&self.cert_dir, |state| {
+            let now = now_ms().max(0) as u64;
+            state
+                .tickets
+                .retain(|_, record| record.expires_unix_ms > now);
+            if state.tickets.len() >= WS_TICKETS_GLOBAL_CAP {
+                return Err("too many outstanding hosted WebSocket tickets".to_string());
+            }
+            if state.tickets.contains_key(&ticket) {
+                return Err("generated a duplicate hosted WebSocket ticket".to_string());
+            }
+            state.tickets.insert(ticket.clone(), record);
+            Ok(())
+        })?;
         Ok(HostedWsTicket {
             ticket,
             expires_unix_ms: expires,
@@ -693,14 +723,14 @@ impl HostedControlRuntime {
     ) -> Result<VerifiedHostedLease, String> {
         self.ensure_enabled()?;
         let fleet_origin = validate_fleet_origin(fleet_origin)?;
-        let record = self
-            .tickets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(ticket)
-            .ok_or_else(|| {
+        if !valid_id_component(ticket) {
+            return Err("hosted WebSocket ticket is invalid".to_string());
+        }
+        let record = mutate_shared_transient(&self.cert_dir, |state| {
+            state.tickets.remove(ticket).ok_or_else(|| {
                 "hosted WebSocket ticket was not found or was already used".to_string()
-            })?;
+            })
+        })?;
         if record.expires_unix_ms <= now_ms() as u64 {
             return Err("hosted WebSocket ticket has expired".to_string());
         }
@@ -1095,7 +1125,13 @@ impl HostedControlRuntime {
         nonce: &str,
         timestamp_unix_ms: i64,
     ) -> Result<(), String> {
-        record_nonce_in(&self.replay, authority, nonce, timestamp_unix_ms)
+        record_nonce_in(
+            &self.cert_dir,
+            ReplayLane::Public,
+            authority,
+            nonce,
+            timestamp_unix_ms,
+        )
     }
 
     fn record_lease_nonce(
@@ -1104,7 +1140,13 @@ impl HostedControlRuntime {
         nonce: &str,
         timestamp_unix_ms: i64,
     ) -> Result<(), String> {
-        record_nonce_in(&self.lease_replay, authority, nonce, timestamp_unix_ms)
+        record_nonce_in(
+            &self.cert_dir,
+            ReplayLane::Lease,
+            authority,
+            nonce,
+            timestamp_unix_ms,
+        )
     }
 
     fn check_doorbell_rate(
@@ -1174,33 +1216,136 @@ impl HostedControlRuntime {
 }
 
 fn record_nonce_in(
-    replay: &Arc<Mutex<ReplayState>>,
+    cert_dir: &Path,
+    lane: ReplayLane,
     authority: &str,
     nonce: &str,
     timestamp_unix_ms: i64,
 ) -> Result<(), String> {
-    let cutoff = now_ms().saturating_sub(REQUEST_PROOF_MAX_SKEW_MS);
-    let mut replay = replay.lock().unwrap_or_else(|error| error.into_inner());
-    replay.by_authority.retain(|_, entries| {
-        entries.retain(|(_, timestamp)| *timestamp >= cutoff);
-        !entries.is_empty()
-    });
-    let total: usize = replay.by_authority.values().map(VecDeque::len).sum();
-    if total >= PROOF_NONCES_GLOBAL_CAP {
-        return Err("hosted proof replay window is full".to_string());
+    let authority_digest = stable_id_digest(authority);
+    let nonce_digest = stable_id_digest(nonce);
+    mutate_shared_transient(cert_dir, |state| {
+        let replay = match lane {
+            ReplayLane::Public => &mut state.public_replay,
+            ReplayLane::Lease => &mut state.lease_replay,
+        };
+        if replay.len() >= PROOF_NONCES_GLOBAL_CAP {
+            return Err("hosted proof replay window is full".to_string());
+        }
+        if replay.iter().any(|record| {
+            record.authority_digest == authority_digest && record.nonce_digest == nonce_digest
+        }) {
+            return Err("hosted proof nonce was already used".to_string());
+        }
+        if replay
+            .iter()
+            .filter(|record| record.authority_digest == authority_digest)
+            .count()
+            >= PROOF_NONCES_PER_LEASE_CAP
+        {
+            return Err("hosted proof nonce window is full for this authority".to_string());
+        }
+        replay.push(ReplayRecord {
+            authority_digest,
+            nonce_digest,
+            timestamp_unix_ms,
+        });
+        Ok(())
+    })
+}
+
+fn shared_transient_path(cert_dir: &Path) -> PathBuf {
+    cert_dir.join(SHARED_TRANSIENT_FILE)
+}
+
+fn load_shared_transient_locked(cert_dir: &Path) -> Result<SharedTransientState, String> {
+    use std::io::Read as _;
+
+    let path = shared_transient_path(cert_dir);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SharedTransientState::default());
+        }
+        Err(error) => return Err(format!("open {}: {error}", path.display())),
+    };
+    let mut bytes = Vec::new();
+    file.take(SHARED_TRANSIENT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > SHARED_TRANSIENT_MAX_BYTES {
+        return Err(format!(
+            "{} exceeds the hosted transient-state size cap",
+            path.display()
+        ));
     }
-    let entries = replay
-        .by_authority
-        .entry(authority.to_string())
-        .or_default();
-    if entries.iter().any(|(candidate, _)| candidate == nonce) {
-        return Err("hosted proof nonce was already used".to_string());
+    let mut state: SharedTransientState = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if state.schema_version != SHARED_TRANSIENT_SCHEMA_VERSION
+        || state.public_replay.len() > PROOF_NONCES_GLOBAL_CAP
+        || state.lease_replay.len() > PROOF_NONCES_GLOBAL_CAP
+        || state.tickets.len() > WS_TICKETS_GLOBAL_CAP
+        || state
+            .public_replay
+            .iter()
+            .chain(&state.lease_replay)
+            .any(|record| {
+                record.authority_digest.len() != 43
+                    || record.nonce_digest.len() != 43
+                    || !valid_id_component(&record.authority_digest)
+                    || !valid_id_component(&record.nonce_digest)
+            })
+        || state.tickets.iter().any(|(ticket, record)| {
+            !valid_id_component(ticket)
+                || !valid_id_component(&record.lease_id)
+                || !valid_id_component(&record.grant_id)
+                || validate_fleet_origin(&record.fleet_origin).is_err()
+        })
+    {
+        return Err(format!(
+            "{} contains invalid hosted transient state",
+            path.display()
+        ));
     }
-    if entries.len() >= PROOF_NONCES_PER_LEASE_CAP {
-        return Err("hosted proof nonce window is full for this authority".to_string());
+    let replay_cutoff = now_ms().saturating_sub(REQUEST_PROOF_MAX_SKEW_MS);
+    state
+        .public_replay
+        .retain(|record| record.timestamp_unix_ms >= replay_cutoff);
+    state
+        .lease_replay
+        .retain(|record| record.timestamp_unix_ms >= replay_cutoff);
+    Ok(state)
+}
+
+fn write_shared_transient_locked(
+    cert_dir: &Path,
+    state: &SharedTransientState,
+) -> AccessResult<()> {
+    let bytes = serde_json::to_vec(state)
+        .map_err(|error| AccessError(format!("serialize hosted transient state: {error}")))?;
+    if bytes.len() as u64 > SHARED_TRANSIENT_MAX_BYTES {
+        return Err(AccessError(
+            "hosted transient state exceeds its size cap".to_string(),
+        ));
     }
-    entries.push_back((nonce.to_string(), timestamp_unix_ms));
-    Ok(())
+    crate::access::authority_store::atomic_write_private_locked(
+        &shared_transient_path(cert_dir),
+        &bytes,
+    )
+}
+
+fn mutate_shared_transient<T>(
+    cert_dir: &Path,
+    update: impl FnOnce(&mut SharedTransientState) -> Result<T, String>,
+) -> Result<T, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let mut state =
+            load_shared_transient_locked(cert_dir).map_err(crate::access::AccessError)?;
+        let result = update(&mut state).map_err(crate::access::AccessError)?;
+        write_shared_transient_locked(cert_dir, &state)?;
+        Ok(result)
+    })
+    .map_err(|error| error.to_string())
 }
 
 fn project_request_status(mut request: HostedLeaseRequest, now_unix_ms: u64) -> HostedLeaseRequest {
@@ -1372,6 +1517,26 @@ mod tests {
         )
     }
 
+    fn shared_transient(runtime: &HostedControlRuntime) -> SharedTransientState {
+        crate::access::authority_store::with_lock(&runtime.cert_dir, || {
+            load_shared_transient_locked(&runtime.cert_dir).map_err(crate::access::AccessError)
+        })
+        .unwrap()
+    }
+
+    fn replace_shared_transient(
+        runtime: &HostedControlRuntime,
+        update: impl FnOnce(&mut SharedTransientState),
+    ) {
+        crate::access::authority_store::with_lock(&runtime.cert_dir, || {
+            let mut state = load_shared_transient_locked(&runtime.cert_dir)
+                .map_err(crate::access::AccessError)?;
+            update(&mut state);
+            write_shared_transient_locked(&runtime.cert_dir, &state)
+        })
+        .unwrap();
+    }
+
     fn owner() -> AccessPrincipal {
         AccessPrincipal::root_dashboard_session("test", "test")
     }
@@ -1490,6 +1655,42 @@ mod tests {
             .is_ok());
         assert!(runtime
             .verify_request_proof("GET", path, "https://laptop.example.test", &proof, "relay")
+            .unwrap_err()
+            .contains("already used"));
+    }
+
+    #[test]
+    fn hosted_request_proof_replay_is_shared_across_daemon_processes() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = runtime(&temp);
+        let second = runtime(&temp);
+        let key = browser_key();
+        let (_, document) = issue_lease(&first, &key, HostedPreset::Tasks, 3600);
+        let proof = request_proof(
+            &key,
+            &document,
+            "POST",
+            "/api/sessions",
+            "cross-process-replay",
+            now_ms(),
+        );
+        first
+            .verify_request_proof(
+                "POST",
+                "/api/sessions",
+                "https://laptop.example.test",
+                &proof,
+                "relay",
+            )
+            .unwrap();
+        assert!(second
+            .verify_request_proof(
+                "POST",
+                "/api/sessions",
+                "https://laptop.example.test",
+                &proof,
+                "relay",
+            )
             .unwrap_err()
             .contains("already used"));
     }
@@ -1725,7 +1926,7 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("rate limit"));
         assert!(
-            runtime.replay.lock().unwrap().by_authority.is_empty(),
+            shared_transient(&runtime).public_replay.is_empty(),
             "rate-limited doorbells must not consume the shared proof nonce window"
         );
     }
@@ -1750,7 +1951,7 @@ mod tests {
             .unwrap_err()
             .contains("key rate limit"));
         assert!(
-            runtime.replay.lock().unwrap().by_authority.is_empty(),
+            shared_transient(&runtime).public_replay.is_empty(),
             "invalid signatures must not enter the replay cache"
         );
     }
@@ -1762,15 +1963,15 @@ mod tests {
         let key = browser_key();
         let (_, document) = issue_lease(&runtime, &key, HostedPreset::Tasks, 3600);
         let now = now_ms();
-        let mut public_replay = runtime.replay.lock().unwrap();
-        public_replay.by_authority.clear();
-        public_replay.by_authority.insert(
-            "poll:public-capacity".to_string(),
-            (0..PROOF_NONCES_GLOBAL_CAP)
-                .map(|index| (format!("public-{index}"), now))
-                .collect(),
-        );
-        drop(public_replay);
+        replace_shared_transient(&runtime, |state| {
+            state.public_replay = (0..PROOF_NONCES_GLOBAL_CAP)
+                .map(|index| ReplayRecord {
+                    authority_digest: stable_id_digest(&format!("public-authority-{index}")),
+                    nonce_digest: stable_id_digest(&format!("public-nonce-{index}")),
+                    timestamp_unix_ms: now,
+                })
+                .collect();
+        });
 
         let proof = request_proof(
             &key,
@@ -1789,17 +1990,7 @@ mod tests {
                 "relay",
             )
             .is_ok());
-        assert_eq!(
-            runtime
-                .lease_replay
-                .lock()
-                .unwrap()
-                .by_authority
-                .values()
-                .map(VecDeque::len)
-                .sum::<usize>(),
-            1
-        );
+        assert_eq!(shared_transient(&runtime).lease_replay.len(), 1);
     }
 
     #[test]
@@ -1832,14 +2023,7 @@ mod tests {
             .unwrap_err()
             .contains("global rate limit"));
         assert_eq!(
-            runtime
-                .replay
-                .lock()
-                .unwrap()
-                .by_authority
-                .values()
-                .map(VecDeque::len)
-                .sum::<usize>(),
+            shared_transient(&runtime).public_replay.len(),
             1,
             "the rejected poll must not consume replay capacity"
         );
@@ -2454,13 +2638,13 @@ mod tests {
         );
 
         let expired = runtime.mint_ws_ticket(&verified).unwrap();
-        runtime
-            .tickets
-            .lock()
-            .unwrap()
-            .get_mut(&expired.ticket)
-            .unwrap()
-            .expires_unix_ms = now_ms().saturating_sub(1) as u64;
+        replace_shared_transient(&runtime, |state| {
+            state
+                .tickets
+                .get_mut(&expired.ticket)
+                .unwrap()
+                .expires_unix_ms = now_ms().saturating_sub(1) as u64;
+        });
         assert!(runtime
             .consume_ws_ticket(&expired.ticket, "https://laptop.example.test", "relay")
             .unwrap_err()
@@ -2474,6 +2658,26 @@ mod tests {
                 .is_err(),
             "ticket consumption must recheck the live lease and grant"
         );
+    }
+
+    #[test]
+    fn websocket_ticket_can_be_consumed_once_by_a_sibling_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = runtime(&temp);
+        let second = runtime(&temp);
+        let key = browser_key();
+        let (_, document) = issue_lease(&first, &key, HostedPreset::View, 3600);
+        let verified = first
+            .load_verified_lease(&document.lease_id, "https://laptop.example.test", "relay")
+            .unwrap();
+        let ticket = first.mint_ws_ticket(&verified).unwrap();
+        second
+            .consume_ws_ticket(&ticket.ticket, "https://laptop.example.test", "relay")
+            .unwrap();
+        assert!(first
+            .consume_ws_ticket(&ticket.ticket, "https://laptop.example.test", "relay")
+            .unwrap_err()
+            .contains("already used"));
     }
 
     #[test]

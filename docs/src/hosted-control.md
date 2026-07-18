@@ -58,11 +58,14 @@ compiled maximum of 24 hours. Request creation, anonymous polling, proof
 nonces, and outstanding tickets all have per-key or per-request and global
 bounds. Anonymous doorbell and poll proofs use replay capacity separate from
 active lease proofs, so public traffic cannot consume the authenticated
-request window. Pending requests are not displaced by newer requests; a full
-pending queue refuses another doorbell until an owner decides one or one
-expires. The relay's loopback last hop is not treated as a distinct
-remote-client address, so public availability is globally bounded rather than
-promised fairly among anonymous callers.
+request window. Both replay lanes and one-use tickets are stored under the
+cross-process authority lock, so independently load-balanced relay
+connections cannot replay one proof or spend one ticket once per daemon
+process. Pending requests are not displaced by newer requests; a full pending
+queue refuses another doorbell until an owner decides one or one expires. The
+relay's loopback last hop is not treated as a distinct remote-client address,
+so public availability is globally bounded rather than promised fairly among
+anonymous callers.
 
 ## Trust anchors
 

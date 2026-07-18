@@ -4,6 +4,7 @@ mod passkeys;
 
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::access::hosted_control::HostedControlRuntime;
@@ -86,6 +87,7 @@ pub(crate) struct CustomDomainRuntime {
     certificate: Arc<RwLock<CertificateStatus>>,
     passkeys: Option<passkeys::PasskeyRuntime>,
     initialization_error: Option<String>,
+    current_fleet_zone_observed: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for CustomDomainRuntime {
@@ -105,6 +107,7 @@ impl CustomDomainRuntime {
         config: &CustomDomainConfig,
         cert_dir: PathBuf,
         hosted: Arc<HostedControlRuntime>,
+        current_fleet_zone_observed: Option<Arc<AtomicBool>>,
     ) -> Self {
         if !config.enabled {
             return Self {
@@ -116,6 +119,7 @@ impl CustomDomainRuntime {
                 certificate: Arc::new(RwLock::new(CertificateStatus::default())),
                 passkeys: None,
                 initialization_error: None,
+                current_fleet_zone_observed,
             };
         }
 
@@ -123,7 +127,7 @@ impl CustomDomainRuntime {
             Ok(Some(domain)) => domain,
             Ok(None) => unreachable!("enabled custom-domain config validates to Some"),
             Err(error) => {
-                return Self::invalid(cert_dir, error);
+                return Self::invalid(cert_dir, error, current_fleet_zone_observed);
             }
         };
         match crate::fleet_cert::is_service_controlled_name_in(&cert_dir, &domain.name) {
@@ -132,12 +136,14 @@ impl CustomDomainRuntime {
                     cert_dir,
                     "custom-domain name overlaps a service-controlled fleet name or zone"
                         .to_string(),
+                    current_fleet_zone_observed,
                 );
             }
             Err(error) => {
                 return Self::invalid(
                     cert_dir,
                     format!("check custom-domain name provenance: {error}"),
+                    current_fleet_zone_observed,
                 );
             }
             Ok(false) => {}
@@ -174,10 +180,15 @@ impl CustomDomainRuntime {
             passkeys,
             initialization_error: (!initialization_errors.is_empty())
                 .then(|| initialization_errors.join("; ")),
+            current_fleet_zone_observed,
         }
     }
 
-    fn invalid(cert_dir: PathBuf, error: String) -> Self {
+    fn invalid(
+        cert_dir: PathBuf,
+        error: String,
+        current_fleet_zone_observed: Option<Arc<AtomicBool>>,
+    ) -> Self {
         Self {
             configured: true,
             domain: None,
@@ -191,6 +202,7 @@ impl CustomDomainRuntime {
             })),
             passkeys: None,
             initialization_error: Some(error),
+            current_fleet_zone_observed,
         }
     }
 
@@ -224,9 +236,6 @@ impl CustomDomainRuntime {
         // Cleanup survives disabling or invalidating the custom lane: a DNS
         // mutation journal from an earlier process still has to be retired.
         dns::spawn_cleanup_loop(self.cert_dir.clone());
-        if !self.enabled() {
-            return;
-        }
         let Some(domain) = self.domain.clone() else {
             return;
         };
@@ -236,6 +245,7 @@ impl CustomDomainRuntime {
             self.acme_issuance_enabled,
             self.cert_dir.clone(),
             Arc::clone(&self.certificate),
+            self.current_fleet_zone_observed.clone(),
         );
     }
 
@@ -339,6 +349,16 @@ impl CustomDomainRuntime {
 
     fn domain_control_error(&self) -> Option<String> {
         let domain = self.domain.as_ref()?;
+        if self
+            .current_fleet_zone_observed
+            .as_ref()
+            .is_some_and(|observed| !observed.load(Ordering::SeqCst))
+        {
+            return Some(
+                "custom-domain control is waiting for the current Connect fleet-zone observation"
+                    .to_string(),
+            );
+        }
         match crate::fleet_cert::is_service_controlled_name_in(&self.cert_dir, &domain.name) {
             Ok(false) => None,
             Ok(true) => Some(
@@ -364,8 +384,12 @@ mod tests {
             String::new(),
             false,
         ));
-        let runtime =
-            CustomDomainRuntime::new(&CustomDomainConfig::default(), dir.path().into(), hosted);
+        let runtime = CustomDomainRuntime::new(
+            &CustomDomainConfig::default(),
+            dir.path().into(),
+            hosted,
+            None,
+        );
         assert!(!runtime.configured());
         assert!(!runtime.enabled());
         assert_eq!(runtime.snapshot().certificate_state, "disabled");
@@ -387,7 +411,7 @@ mod tests {
             name: Some("box.fleet.example.test".to_string()),
             ..Default::default()
         };
-        let runtime = CustomDomainRuntime::new(&config, dir.path().into(), hosted);
+        let runtime = CustomDomainRuntime::new(&config, dir.path().into(), hosted, None);
         assert!(runtime.enabled());
         assert!(runtime.matches_origin("https://box.fleet.example.test"));
 
@@ -402,6 +426,75 @@ mod tests {
         let snapshot = runtime.snapshot();
         assert_eq!(snapshot.certificate_state, "error");
         assert!(snapshot
+            .initialization_error
+            .as_deref()
+            .is_some_and(|error| error.contains("service-controlled fleet name or zone")));
+    }
+
+    #[test]
+    fn enabled_connect_holds_an_existing_custom_lane_until_current_zone_is_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CustomDomainConfig {
+            enabled: true,
+            name: Some("box.fleet.example.test".to_string()),
+            ..Default::default()
+        };
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["box.fleet.example.test".to_string()]).unwrap();
+        std::fs::write(
+            dir.path().join("custom-domain-cert.pem"),
+            certificate.cert.pem(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("custom-domain-key.pem"),
+            certificate.signing_key.serialize_pem(),
+        )
+        .unwrap();
+        let hosted = || {
+            Arc::new(HostedControlRuntime::new(
+                false,
+                dir.path().to_path_buf(),
+                None,
+                None,
+                String::new(),
+                false,
+            ))
+        };
+        // Seed the durable passkey store as an existing installation.
+        let seeded = CustomDomainRuntime::new(&config, dir.path().into(), hosted(), None);
+        assert!(seeded.enabled());
+        assert!(dir.path().join("custom-domain-passkeys.json").is_file());
+        drop(seeded);
+
+        let observed = Arc::new(AtomicBool::new(false));
+        let runtime = CustomDomainRuntime::new(
+            &config,
+            dir.path().into(),
+            hosted(),
+            Some(Arc::clone(&observed)),
+        );
+        assert!(!runtime.enabled());
+        assert!(!runtime.matches_origin("https://box.fleet.example.test"));
+        assert!(runtime
+            .snapshot()
+            .initialization_error
+            .as_deref()
+            .is_some_and(|error| error.contains("waiting for the current Connect")));
+
+        crate::fleet_cert::remember_fleet_origin_for_test(
+            dir.path(),
+            Some("fleet.example.test"),
+            "d-1234567890abcdef1234.fleet.example.test",
+        )
+        .unwrap();
+        observed.store(true, Ordering::SeqCst);
+        assert!(
+            !runtime.enabled(),
+            "the delayed overlapping zone response keeps the lane closed"
+        );
+        assert!(runtime
+            .snapshot()
             .initialization_error
             .as_deref()
             .is_some_and(|error| error.contains("service-controlled fleet name or zone")));

@@ -606,10 +606,13 @@ The pieces that implement the model, mapped to the codebase:
   an exact fleet name the daemon learned previously. Fleet-name provenance is
   retained in `fleet-origin-provenance.json` beside the access certificates so
   offline or Connect-disabled startup cannot reclassify an old service-named
-  route as a direct anchor. On upgrade, an older `fleet-cert.pem` backfills its
-  exact DNS SANs before the gateway accepts requests. If that provenance is
-  malformed or cannot be recovered completely, unknown DNS browser-key origins
-  fail closed as fleet provenance until the local authority store is repaired.
+  route as a direct anchor. When Connect is enabled, custom-name control also
+  waits for the current registration's fleet-zone observation before opening.
+  On upgrade, an older `fleet-cert.pem` backfills both canonical exact DNS SANs
+  and their derived fleet zones before the gateway accepts requests. If that
+  provenance is malformed or cannot be recovered completely, unknown DNS
+  browser-key origins fail closed as fleet provenance until the local authority
+  store is repaired.
   A `human_user` label is not a bypass. A valid
   independently verified browser mTLS binding may carry that key as metadata.
   Legacy browser-key records are displayed as inactive bindings with

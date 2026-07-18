@@ -410,8 +410,9 @@ fn with_status(update: impl FnOnce(&mut FleetCertStatus)) {
 /// Called from the Connect client when a register response carries the
 /// fleet_dns hint. Also loads any existing on-disk certificate state the
 /// first time the name is learned.
-pub fn note_fleet_dns(zone: Option<String>, name: Option<String>) {
+pub fn note_fleet_dns(zone: Option<String>, name: Option<String>) -> bool {
     fleet_dns_observed_this_process().store(true, Ordering::SeqCst);
+    let mut provenance_accepted = true;
     if let Some(name) = name.as_deref() {
         // The rendezvous-assigned public name is never an authority anchor,
         // regardless of whether its WebPKI certificate has been issued or
@@ -429,6 +430,7 @@ pub fn note_fleet_dns(zone: Option<String>, name: Option<String>) {
                 // be unrecoverable after restart. Keep the conservative IAM
                 // guard sticky and surface the durability failure loudly.
                 mark_fleet_origin_provenance_incomplete();
+                provenance_accepted = false;
                 eprintln!("[fleet-cert] persist fleet-origin provenance failed: {error}");
             }
         }
@@ -443,6 +445,7 @@ pub fn note_fleet_dns(zone: Option<String>, name: Option<String>) {
     if newly_named {
         refresh_installed_state();
     }
+    provenance_accepted
 }
 
 fn cert_dir() -> PathBuf {
@@ -576,9 +579,22 @@ fn merge_recovered_fleet_names(
     if provenance.name.is_none() {
         provenance.name = recovered_names.first().cloned();
     }
-    provenance.known_names.extend(recovered_names);
+    for name in recovered_names {
+        if let Some(zone) = fleet_zone_from_exact_name(&name) {
+            provenance.known_zones.push(zone);
+        } else {
+            // A pre-provenance certificate proves an exact historical name,
+            // but only the canonical derived fleet-label form proves the
+            // service-controlled zone that contained it. Keep the recovered
+            // exact name and fail closed for owner-name classification.
+            provenance.provenance_incomplete = true;
+        }
+        provenance.known_names.push(name);
+    }
     provenance.known_names.sort();
     provenance.known_names.dedup();
+    provenance.known_zones.sort();
+    provenance.known_zones.dedup();
 }
 
 #[derive(Debug)]
@@ -1079,8 +1095,14 @@ fn load_issuance_store_locked_in(cert_dir: &Path) -> Result<InFlightIssuanceStor
     }
     let now = now_unix_ms();
     store.orders.retain(|order| {
-        now.saturating_sub(order.updated_unix_ms.max(order.started_unix_ms))
-            < FLEET_CERT_ISSUANCE_TTL_MS
+        // Once ACME has assigned an order URL, this is resumable authority
+        // state rather than a local liveness marker. Retain it until the
+        // order reaches an explicit terminal state (which calls `finish`) so
+        // a certificate finalized during a long outage can still have its
+        // serial recorded as our own before the CT guard evaluates it.
+        order.order_url.is_some()
+            || now.saturating_sub(order.updated_unix_ms.max(order.started_unix_ms))
+                < FLEET_CERT_ISSUANCE_TTL_MS
     });
     Ok(store)
 }
@@ -1577,14 +1599,14 @@ fn persist_certificate_pair_in(
 }
 
 /* ── Certificate Transparency tripwire ──
-A fleet-name hijack needs a certificate browsers accept, and public CAs log
-those certificates to CT. This monitor turns that evidence into an alarm —
-the daemon records the serials of every certificate IT obtained and
-periodically asks the public CT indexes whether its name carries any it
-didn't. A confirmed foreign serial suspends the dark hosted-lease lane while
-direct/mTLS/local management remains available. The public index is still a
-best-effort service: fetch failures preserve the last successful verdict
-instead of creating new evidence. */
+Browser acceptance for a fleet name requires a publicly logged certificate.
+This monitor compares that public evidence with the daemon's own certificate
+ledger: the daemon records every serial it obtained and periodically asks the
+public CT indexes whether its name carries any other serial. A confirmed
+foreign serial suspends the dark hosted-lease lane while direct/mTLS/local
+management remains available. The public index is still a best-effort service:
+fetch failures preserve the last successful verdict instead of creating new
+evidence. */
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct OwnCertRecord {
@@ -2227,8 +2249,8 @@ pub async fn ct_check_once() {
                     eprintln!(
                             "[fleet-cert] CT ALERT: {} certificate(s) for {name} in the public CT logs \
                              that this daemon never requested: {:?} — if you did not mint these through \
-                             another channel, treat the fleet route as compromised and reach this \
-                             daemon directly",
+                             another channel, stop trusting the fleet route and reach this daemon \
+                             directly",
                             summaries.len(),
                             summaries,
                         );
@@ -2456,7 +2478,7 @@ mod tests {
     #[test]
     fn existing_fleet_certificate_backfills_missing_provenance_before_registration() {
         let temp = tempfile::tempdir().unwrap();
-        let fleet_name = "legacy-backfill.fleet.example.test";
+        let fleet_name = "d-aaaaaaaaaaaaaaaaaaaa.fleet.example.test";
         write_legacy_fleet_certificate(temp.path(), &[fleet_name]);
         assert!(!fleet_origin_provenance_path_in(temp.path()).exists());
 
@@ -2465,11 +2487,32 @@ mod tests {
         assert!(!restored.provenance.provenance_incomplete);
         assert_eq!(restored.provenance.name.as_deref(), Some(fleet_name));
         assert_eq!(restored.provenance.known_names, vec![fleet_name]);
+        assert_eq!(
+            restored.provenance.known_zones,
+            vec!["fleet.example.test".to_string()]
+        );
+        assert!(is_service_controlled_name_in(temp.path(), "other.fleet.example.test").unwrap());
 
         let persisted = load_fleet_origin_provenance_in(temp.path()).unwrap();
         assert_eq!(persisted, restored.provenance);
         register_restored_fleet_origins(&restored.provenance);
         assert!(crate::web_tls::is_fleet_server_name(Some(fleet_name)));
+    }
+
+    #[test]
+    fn ambiguous_missing_file_certificate_recovery_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let ambiguous_name = "legacy-backfill.fleet.example.test";
+        write_legacy_fleet_certificate(temp.path(), &[ambiguous_name]);
+
+        let restored = restore_fleet_origin_provenance_in(temp.path());
+        assert!(restored.provenance.provenance_incomplete);
+        assert_eq!(
+            restored.provenance.known_names,
+            vec![ambiguous_name.to_string()]
+        );
+        assert!(restored.provenance.known_zones.is_empty());
+        assert!(is_service_controlled_name_in(temp.path(), "owner.example.test").is_err());
     }
 
     #[test]
@@ -2999,6 +3042,44 @@ mod tests {
         );
         resumed.finish().unwrap();
         assert!(!issuance_active_in(temp.path(), name).unwrap());
+    }
+
+    #[test]
+    fn resumable_acme_order_survives_the_legacy_local_ttl() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = "d-11111111111111111111.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
+        let mut issuance = IssuanceGuard::begin(temp.path(), name).unwrap();
+        issuance
+            .record_order_url("https://acme.example.test/order/finalized")
+            .unwrap();
+        issuance.finalization_material(name).unwrap();
+        let token = issuance.order.token.clone();
+        drop(issuance);
+
+        crate::access::authority_store::with_lock(temp.path(), || {
+            let mut store =
+                load_issuance_store_locked_in(temp.path()).map_err(crate::access::AccessError)?;
+            let order = store
+                .orders
+                .iter_mut()
+                .find(|order| order.token == token)
+                .unwrap();
+            order.started_unix_ms = 1;
+            order.updated_unix_ms = 1;
+            order.owner_token = None;
+            order.owner_lease_expires_unix_ms = 0;
+            write_issuance_store_locked_in(temp.path(), &store)
+        })
+        .unwrap();
+
+        let resumed = IssuanceGuard::begin(temp.path(), name).unwrap();
+        assert_eq!(resumed.order.token, token);
+        assert_eq!(
+            resumed.order_url(),
+            Some("https://acme.example.test/order/finalized")
+        );
+        resumed.finish().unwrap();
     }
 
     #[test]

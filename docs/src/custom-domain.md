@@ -41,12 +41,18 @@ a v1 poll may refresh and consume only fleet-label fallback work; it cannot
 extend or consume a v2 exact-name route. An explicit empty v2 registration
 clears that poller's names. Before every registration, the process reloads
 shared certificate generations into its process-local TLS resolver. Neither
-registration nor routing grants daemon authority.
+registration nor routing grants daemon authority. If exact-name proof
+construction or proof-specific validation fails, the client retains the
+independent v1 fleet-label route; daemon-authentication failures do not trigger
+that fallback.
 
 The custom name must also remain outside every current or previously recorded
 service fleet zone. The daemon re-evaluates that separation whenever the route
-is used, so learning a later overlapping fleet zone disables the custom lane
-instead of reclassifying a service-controlled name as owner-controlled.
+is used. While Connect is enabled, the lane stays closed until the current
+rendezvous registration has supplied a fleet-zone observation and that
+provenance has been accepted durably. Learning a later overlapping fleet zone
+therefore disables the custom lane instead of temporarily reclassifying a
+service-controlled name as owner-controlled during startup.
 
 ## Pin certificate issuance
 
@@ -85,6 +91,12 @@ cancellation, and transient provider failures. Store the credential as a
 daemon credential lease where possible; configuration names an
 environment-variable fallback but never embeds the secret.
 
+Certificate files are shared across daemon processes. Every renewal pass
+reloads and validates that shared pair before deciding to order, and a durable
+owner lease serializes order creation through pair commit. A sibling process
+therefore adopts a newly committed generation instead of consuming another CA
+order; a crashed owner lease expires and can be reclaimed.
+
 Cloudflare requires a narrowly scoped token with DNS edit access to the named
 zone. Generic RFC2136 is also supported:
 
@@ -117,9 +129,14 @@ rp_id check intact. Invitations expire after ten minutes and are consumed at
 ceremony start. Invitations, registration/authentication challenges, and the
 ceremony rate window are stored under the daemon's cross-process authority
 lock, so a relay request may move between service processes without duplicating
-or losing the flow. The empty passkey store, including its stable WebAuthn user
-id, is created atomically under that lock before any ceremony is exposed.
-Passkey records and counters stay in the same owner-only authority store.
+or losing the flow. Invitation consumption and registration-flow creation are
+one atomic transaction, so a failed durable write does not burn the
+invitation. Authentication starts have per-source and global windows, a
+per-source pending cap, and capacity reserved for a previously unseen source;
+relay clients whose ciphertext hides their individual address share one
+source bucket. The empty passkey store, including its stable WebAuthn user id,
+is created atomically under that lock before any ceremony is exposed. Passkey
+records and counters stay in the same owner-only authority store.
 
 Opening `https://box.example.com/` creates a non-extractable tab key. A
 successful user-verifying passkey assertion approves only the signed request

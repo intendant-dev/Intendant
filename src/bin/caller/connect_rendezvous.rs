@@ -398,6 +398,9 @@ struct ClientState {
     /// The web gateway's TCP port — combined with the rendezvous-observed
     /// IP to advertise an ICE-TCP candidate on Connect offers.
     gateway_tcp_port: Option<u16>,
+    /// Set only after the currently enabled rendezvous has returned a
+    /// registration response whose fleet-zone provenance was accepted.
+    fleet_zone_observed: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 fn client_state() -> &'static Mutex<ClientState> {
@@ -409,6 +412,7 @@ fn client_state() -> &'static Mutex<ClientState> {
             hosted_control: None,
             effective_config: None,
             gateway_tcp_port: None,
+            fleet_zone_observed: None,
         })
     })
 }
@@ -418,6 +422,7 @@ pub fn spawn_connect_rendezvous_client(
     dashboard_control: Arc<DashboardControlRegistry>,
     gateway_tcp_port: Option<u16>,
     hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
+    fleet_zone_observed: Arc<std::sync::atomic::AtomicBool>,
 ) {
     {
         let mut state = client_state()
@@ -426,21 +431,32 @@ pub fn spawn_connect_rendezvous_client(
         state.dashboard_control = Some(dashboard_control.clone());
         state.hosted_control = Some(Arc::clone(&hosted_control));
         state.gateway_tcp_port = gateway_tcp_port;
+        state.fleet_zone_observed = Some(Arc::clone(&fleet_zone_observed));
     }
-    start_client(config, dashboard_control, gateway_tcp_port, hosted_control);
+    start_client(
+        config,
+        dashboard_control,
+        gateway_tcp_port,
+        hosted_control,
+        fleet_zone_observed,
+    );
 }
 
 /// Stop the running client task, if any. All of the task's awaits are
 /// cancellation-safe HTTP calls, so an abort leaves no local state
 /// half-written.
 pub(crate) fn stop_client() {
-    let handle = client_state()
-        .lock()
-        .expect("connect client state poisoned")
-        .handle
-        .take();
+    let (handle, fleet_zone_observed) = {
+        let mut state = client_state()
+            .lock()
+            .expect("connect client state poisoned");
+        (state.handle.take(), state.fleet_zone_observed.clone())
+    };
     if let Some(handle) = handle {
         handle.abort();
+    }
+    if let Some(observed) = fleet_zone_observed {
+        observed.store(false, std::sync::atomic::Ordering::SeqCst);
     }
     with_status(|status| {
         status.running = false;
@@ -458,10 +474,16 @@ pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
     crate::credential_leases::configure_dns_credential_child_scrub(&config.custom_domain);
     stop_client();
     if !config.enabled {
-        client_state()
-            .lock()
-            .expect("connect client state poisoned")
-            .effective_config = Some(config.clone());
+        let fleet_zone_observed = {
+            let mut state = client_state()
+                .lock()
+                .expect("connect client state poisoned");
+            state.effective_config = Some(config.clone());
+            state.fleet_zone_observed.clone()
+        };
+        if let Some(observed) = fleet_zone_observed {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         with_status(|status| {
             status.configured = false;
             status.env_forced = ConnectConfig::env_forced();
@@ -473,7 +495,7 @@ pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
         crate::hosted_verify::note_connect_config(false, None);
         return Ok(false);
     }
-    let (dashboard_control, gateway_tcp_port, hosted_control) = {
+    let (dashboard_control, gateway_tcp_port, hosted_control, fleet_zone_observed) = {
         let state = client_state()
             .lock()
             .expect("connect client state poisoned");
@@ -481,6 +503,7 @@ pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
             state.dashboard_control.clone(),
             state.gateway_tcp_port,
             state.hosted_control.clone(),
+            state.fleet_zone_observed.clone(),
         )
     };
     let dashboard_control = dashboard_control
@@ -488,7 +511,16 @@ pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
     let hosted_control = hosted_control.ok_or_else(|| {
         "connect client cannot start before hosted control is initialized".to_string()
     })?;
-    start_client(config, dashboard_control, gateway_tcp_port, hosted_control);
+    let fleet_zone_observed = fleet_zone_observed.ok_or_else(|| {
+        "connect client cannot start before fleet-zone observation is initialized".to_string()
+    })?;
+    start_client(
+        config,
+        dashboard_control,
+        gateway_tcp_port,
+        hosted_control,
+        fleet_zone_observed,
+    );
     crate::hosted_verify::spawn_check_now();
     Ok(client_state()
         .lock()
@@ -504,6 +536,7 @@ fn start_client(
     dashboard_control: Arc<DashboardControlRegistry>,
     gateway_tcp_port: Option<u16>,
     hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
+    fleet_zone_observed: Arc<std::sync::atomic::AtomicBool>,
 ) {
     crate::credential_leases::configure_dns_credential_child_scrub(&config.custom_domain);
     client_state()
@@ -518,6 +551,7 @@ fn start_client(
         status.signed_claim = load_signed_claim_record();
     });
     crate::hosted_verify::note_connect_config(config.enabled, config.rendezvous_url.as_deref());
+    fleet_zone_observed.store(!config.enabled, std::sync::atomic::Ordering::SeqCst);
     if !config.enabled {
         // One line per gateway spawn: a daemon that silently never
         // registers is indistinguishable from a broken rendezvous — say
@@ -565,6 +599,7 @@ fn start_client(
             dashboard_control,
             gateway_tcp_port,
             hosted_control,
+            fleet_zone_observed,
         )
         .await;
         // Natural exit (identity or HTTP-client construction failure) —
@@ -586,6 +621,7 @@ async fn run_connect_rendezvous_client(
     dashboard_control: Arc<DashboardControlRegistry>,
     gateway_tcp_port: Option<u16>,
     hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
+    fleet_zone_observed: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let identity = match DaemonIdentity::load_or_create_default() {
         Ok(identity) => identity,
@@ -638,7 +674,7 @@ async fn run_connect_rendezvous_client(
         )
         .await
         {
-            Ok(response) => note_register_response(&response, &base_url),
+            Ok(response) => note_register_response(&response, &base_url, &fleet_zone_observed),
             Err(RegisterError::Rejected(e)) => {
                 eprintln!(
                     "[connect] register rejected: {e} — the rendezvous refused this daemon \
@@ -646,13 +682,13 @@ async fn run_connect_rendezvous_client(
                      registration); retrying every {}s",
                     REGISTER_REJECTED_RETRY.as_secs()
                 );
-                note_register_error(&e);
+                note_register_error(&e, &fleet_zone_observed);
                 tokio::time::sleep(REGISTER_REJECTED_RETRY).await;
                 continue;
             }
             Err(RegisterError::Transient(e)) => {
                 eprintln!("[connect] register failed: {e}");
-                note_register_error(&e);
+                note_register_error(&e, &fleet_zone_observed);
                 tokio::time::sleep(retry_delay).await;
                 continue;
             }
@@ -714,7 +750,7 @@ async fn run_connect_rendezvous_client(
                 .await
                 {
                     Ok(response) => {
-                        note_register_response(&response, &base_url);
+                        note_register_response(&response, &base_url, &fleet_zone_observed);
                         last_register = Instant::now();
                     }
                     Err(RegisterError::Rejected(e)) => {
@@ -723,13 +759,13 @@ async fn run_connect_rendezvous_client(
                              every {}s",
                             REGISTER_REJECTED_RETRY.as_secs()
                         );
-                        note_register_error(&e);
+                        note_register_error(&e, &fleet_zone_observed);
                         tokio::time::sleep(REGISTER_REJECTED_RETRY).await;
                         break;
                     }
                     Err(RegisterError::Transient(e)) => {
                         eprintln!("[connect] refresh register failed: {e}");
-                        note_register_error(&e);
+                        note_register_error(&e, &fleet_zone_observed);
                         tokio::time::sleep(retry_delay).await;
                         break;
                     }
@@ -739,7 +775,8 @@ async fn run_connect_rendezvous_client(
     }
 }
 
-fn note_register_error(error: &str) {
+fn note_register_error(error: &str, fleet_zone_observed: &std::sync::atomic::AtomicBool) {
+    fleet_zone_observed.store(false, std::sync::atomic::Ordering::SeqCst);
     with_status(|status| {
         status.registered = false;
         status.last_error = Some(error.to_string());
@@ -751,7 +788,11 @@ fn note_register_error(error: &str) {
 /// and print the claim line when the code actually changed (the old
 /// every-60s repeat was log noise; the current code is always visible in
 /// the Access card).
-fn note_register_response(response: &RegisterResponse, base_url: &Url) {
+fn note_register_response(
+    response: &RegisterResponse,
+    base_url: &Url,
+    fleet_zone_observed: &std::sync::atomic::AtomicBool,
+) {
     let now = crate::access::client_key::now_unix_ms();
     let mut print_claim: Option<String> = None;
     let daemon_session_token = response.daemon_session_token.clone().filter(|_| {
@@ -765,7 +806,7 @@ fn note_register_response(response: &RegisterResponse, base_url: &Url) {
     }
     // Fleet DNS: hand the name to the certificate machinery (it installs
     // any stored certificate the first time the name is learned).
-    crate::fleet_cert::note_fleet_dns(
+    let provenance_accepted = crate::fleet_cert::note_fleet_dns(
         response
             .fleet_dns
             .as_ref()
@@ -777,6 +818,7 @@ fn note_register_response(response: &RegisterResponse, base_url: &Url) {
             .map(|hint| hint.name.clone())
             .filter(|name| !name.is_empty()),
     );
+    fleet_zone_observed.store(provenance_accepted, std::sync::atomic::Ordering::SeqCst);
     with_status(|status| {
         status.registered = true;
         status.last_register_unix_ms = Some(now);
@@ -2221,6 +2263,7 @@ mod tests {
         });
 
         let base_url = Url::parse("https://connect.example").unwrap();
+        let fleet_zone_observed = std::sync::atomic::AtomicBool::new(false);
         note_register_response(
             &RegisterResponse {
                 claimed: true,
@@ -2235,11 +2278,15 @@ mod tests {
                 fleet_dns: None,
             },
             &base_url,
+            &fleet_zone_observed,
         );
         assert_eq!(
             status_snapshot().claim_binding,
             Some(ClaimBinding::DaemonSigned)
         );
+        assert!(fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
+        note_register_error("registration refresh unavailable", &fleet_zone_observed);
+        assert!(!fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
 
         note_register_response(
             &RegisterResponse {
@@ -2255,11 +2302,13 @@ mod tests {
                 fleet_dns: None,
             },
             &base_url,
+            &fleet_zone_observed,
         );
         assert_eq!(
             status_snapshot().claim_binding,
             Some(ClaimBinding::Mismatch)
         );
+        assert!(fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
 
         // During a mixed-version rollout an older service ignores the
         // daemon-minted hash and returns the different plaintext phrase it
@@ -2283,6 +2332,7 @@ mod tests {
                 fleet_dns: None,
             },
             &base_url,
+            &fleet_zone_observed,
         );
         let status = status_snapshot();
         assert_eq!(status.claimed, Some(false));
@@ -2311,6 +2361,7 @@ mod tests {
                 fleet_dns: None,
             },
             &base_url,
+            &fleet_zone_observed,
         );
         let status = status_snapshot();
         assert_eq!(status.claim_code.as_deref(), Some(local_code.as_str()));

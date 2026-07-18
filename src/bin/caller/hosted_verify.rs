@@ -37,6 +37,16 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use url::Url;
 
+const METADATA_RESPONSE_BYTE_CAP: usize = 2 * 1024 * 1024;
+const LOG_LEAF_BYTE_CAP: usize = 1024 * 1024;
+const LOG_PROOF_HASH_CAP: usize = 128;
+const MANIFEST_ARTIFACT_CAP: usize = 1024;
+const RELEASE_PLATFORM_CAP: usize = 64;
+const GITHUB_ASSET_CAP: usize = 4096;
+const ARTIFACT_PATH_BYTE_CAP: usize = 2048;
+const ARTIFACT_NAME_BYTE_CAP: usize = 512;
+const METADATA_STRING_BYTE_CAP: usize = 512;
+
 // ── Status registry (the tripwire's verdict; fleet_cert.rs pattern) ──
 
 #[derive(Clone, Debug)]
@@ -280,6 +290,24 @@ fn b64u_decode_hash(value: &str) -> Result<[u8; 32], String> {
     <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| "hash is not 32 bytes".to_string())
 }
 
+fn bounded_string(value: &str, label: &str, byte_cap: usize) -> Result<String, String> {
+    if value.len() > byte_cap || value.chars().any(char::is_control) {
+        return Err(format!("{label} exceeds its string bounds"));
+    }
+    Ok(value.to_string())
+}
+
+fn bounded_sha256(value: &str, label: &str) -> Result<String, String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(format!("{label} is not a hexadecimal sha256 digest"));
+    }
+    Ok(value.to_string())
+}
+
 // ── Wire shapes ──
 
 /// The service's signed tree head, as fetched.
@@ -300,26 +328,35 @@ impl Sth {
             .get("size")
             .and_then(|v| v.as_u64())
             .ok_or("sth missing size")?;
-        let root_b64u = value
-            .get("root")
-            .and_then(|v| v.as_str())
-            .ok_or("sth missing root")?
-            .to_string();
+        let root_b64u = bounded_string(
+            value
+                .get("root")
+                .and_then(|v| v.as_str())
+                .ok_or("sth missing root")?,
+            "sth root",
+            64,
+        )?;
         let unix_ms = value
             .get("unix_ms")
             .and_then(|v| v.as_u64())
             .ok_or("sth missing unix_ms")?;
-        let signature = b64u_decode(
+        let signature_text = bounded_string(
             value
                 .get("signature")
                 .and_then(|v| v.as_str())
                 .ok_or("sth missing signature")?,
+            "sth signature",
+            256,
         )?;
-        let public_key_b64u = value
-            .get("public_key")
-            .and_then(|v| v.as_str())
-            .ok_or("sth missing public_key")?
-            .to_string();
+        let signature = b64u_decode(&signature_text)?;
+        let public_key_b64u = bounded_string(
+            value
+                .get("public_key")
+                .and_then(|v| v.as_str())
+                .ok_or("sth missing public_key")?,
+            "sth public key",
+            256,
+        )?;
         Ok(Self {
             size,
             root: b64u_decode_hash(&root_b64u)?,
@@ -362,53 +399,70 @@ struct ManifestLeaf {
 }
 
 fn parse_manifest_leaf(leaf_json: &str) -> Result<ManifestLeaf, String> {
+    if leaf_json.len() > LOG_LEAF_BYTE_CAP {
+        return Err("manifest leaf exceeds its size cap".to_string());
+    }
     let leaf: serde_json::Value =
         serde_json::from_str(leaf_json).map_err(|e| format!("manifest leaf is not JSON: {e}"))?;
     if leaf.get("kind").and_then(|v| v.as_str()) != Some("artifact_manifest") {
         return Err("leaf is not an artifact_manifest entry".to_string());
     }
-    let artifacts: Vec<ManifestArtifact> = leaf
+    let artifact_values = leaf
         .get("artifacts")
         .and_then(|v| v.as_array())
-        .ok_or("manifest leaf missing artifacts")?
+        .ok_or("manifest leaf missing artifacts")?;
+    if artifact_values.len() > MANIFEST_ARTIFACT_CAP {
+        return Err("manifest leaf lists too many artifacts".to_string());
+    }
+    let artifacts: Vec<ManifestArtifact> = artifact_values
         .iter()
         .map(|entry| {
-            let path = entry
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or("artifact missing path")?
-                .to_string();
-            let sha256 = entry
-                .get("sha256")
-                .and_then(|v| v.as_str())
-                .ok_or("artifact missing sha256")?
-                .to_string();
+            let path = bounded_string(
+                entry
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("artifact missing path")?,
+                "artifact path",
+                ARTIFACT_PATH_BYTE_CAP,
+            )?;
+            let sha256 = bounded_sha256(
+                entry
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .ok_or("artifact missing sha256")?,
+                "artifact sha256",
+            )?;
             if !path.starts_with('/') {
                 return Err(format!("artifact path {path:?} is not absolute"));
             }
             Ok(ManifestArtifact { path, sha256 })
         })
         .collect::<Result<_, String>>()?;
-    let manifest_hash = leaf
-        .get("manifest_hash")
-        .and_then(|v| v.as_str())
-        .ok_or("manifest leaf missing manifest_hash")?
-        .to_string();
+    let manifest_hash = bounded_sha256(
+        leaf.get("manifest_hash")
+            .and_then(|v| v.as_str())
+            .ok_or("manifest leaf missing manifest_hash")?,
+        "manifest hash",
+    )?;
     if manifest_hash_hex(&artifacts) != manifest_hash {
         return Err("manifest_hash does not recompute from the carried artifact list".to_string());
     }
     Ok(ManifestLeaf {
         unix_ms: leaf.get("unix_ms").and_then(|v| v.as_u64()).unwrap_or(0),
-        bundle_version: leaf
-            .get("bundle_version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        git_sha: leaf
-            .get("git_sha")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
+        bundle_version: bounded_string(
+            leaf.get("bundle_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+            "bundle version",
+            METADATA_STRING_BYTE_CAP,
+        )?,
+        git_sha: bounded_string(
+            leaf.get("git_sha")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+            "git sha",
+            METADATA_STRING_BYTE_CAP,
+        )?,
         manifest_hash,
         artifacts,
     })
@@ -631,9 +685,25 @@ fn http_client() -> Result<reqwest::Client, String> {
     // and the body bytes hashed are the bytes the origin serves.
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        // Verification fetches never follow origin-controlled redirects.
+        // A redirect is a distinct response to verify, not permission to
+        // reach a different host (including loopback, link-local, or LAN).
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("intendant-hosted-verify")
         .build()
         .map_err(|e| e.to_string())
+}
+
+fn release_download_client() -> Result<reqwest::Client, String> {
+    // GitHub release assets normally redirect to its object store. This
+    // client is used only for a URL returned by the separately fetched
+    // GitHub release API, never for Connect-controlled metadata.
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent("intendant-hosted-verify")
+        .build()
+        .map_err(|error| error.to_string())
 }
 
 async fn fetch_json(client: &reqwest::Client, url: Url) -> Result<serde_json::Value, String> {
@@ -646,10 +716,37 @@ async fn fetch_json(client: &reqwest::Client, url: Url) -> Result<serde_json::Va
     if !status.is_success() {
         return Err(format!("GET {url}: HTTP {status}"));
     }
-    response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| format!("GET {url}: {e}"))
+    response_json_limited(response, &url).await
+}
+
+async fn response_json_limited(
+    response: reqwest::Response,
+    url: &Url,
+) -> Result<serde_json::Value, String> {
+    use futures_util::StreamExt as _;
+
+    if response
+        .content_length()
+        .is_some_and(|length| length > METADATA_RESPONSE_BYTE_CAP as u64)
+    {
+        return Err(format!(
+            "GET {url}: metadata response exceeds {} bytes",
+            METADATA_RESPONSE_BYTE_CAP
+        ));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("GET {url}: {error}"))?;
+        if body.len().saturating_add(chunk.len()) > METADATA_RESPONSE_BYTE_CAP {
+            return Err(format!(
+                "GET {url}: metadata response exceeds {} bytes",
+                METADATA_RESPONSE_BYTE_CAP
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|error| format!("GET {url}: {error}"))
 }
 
 async fn verify_consistency_extension(
@@ -668,10 +765,16 @@ async fn verify_consistency_extension(
             url
         })?;
     let consistency = fetch_json(client, url).await.map_err(Unavailable)?;
-    let consistency_proof: Vec<[u8; 32]> = consistency
+    let proof_values = consistency
         .get("proof")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| Unavailable("consistency response missing proof".to_string()))?
+        .ok_or_else(|| Unavailable("consistency response missing proof".to_string()))?;
+    if proof_values.len() > LOG_PROOF_HASH_CAP {
+        return Err(Unavailable(
+            "consistency response proof exceeds its element cap".to_string(),
+        ));
+    }
+    let consistency_proof: Vec<[u8; 32]> = proof_values
         .iter()
         .map(|hash| b64u_decode_hash(hash.as_str().unwrap_or_default()))
         .collect::<Result<_, String>>()
@@ -768,10 +871,21 @@ async fn verify_logged_entry(
         .get("leaf_json")
         .and_then(|v| v.as_str())
         .ok_or_else(|| Unavailable("response missing leaf_json".to_string()))?;
-    let proof: Vec<[u8; 32]> = response
+    if leaf_json.len() > LOG_LEAF_BYTE_CAP {
+        return Err(Unavailable(
+            "response leaf exceeds its size cap".to_string(),
+        ));
+    }
+    let proof_values = response
         .get("proof")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| Unavailable("response missing proof".to_string()))?
+        .ok_or_else(|| Unavailable("response missing proof".to_string()))?;
+    if proof_values.len() > LOG_PROOF_HASH_CAP {
+        return Err(Unavailable(
+            "response inclusion proof exceeds its element cap".to_string(),
+        ));
+    }
+    let proof: Vec<[u8; 32]> = proof_values
         .iter()
         .map(|hash| b64u_decode_hash(hash.as_str().unwrap_or_default()))
         .collect::<Result<_, String>>()
@@ -1072,34 +1186,48 @@ struct ReleaseLeaf {
 }
 
 fn parse_release_leaf(leaf_json: &str) -> Result<ReleaseLeaf, String> {
+    if leaf_json.len() > LOG_LEAF_BYTE_CAP {
+        return Err("release leaf exceeds its size cap".to_string());
+    }
     let leaf: serde_json::Value =
         serde_json::from_str(leaf_json).map_err(|e| format!("release leaf is not JSON: {e}"))?;
     if leaf.get("kind").and_then(|v| v.as_str()) != Some("release_manifest") {
         return Err("leaf is not a release_manifest entry".to_string());
     }
-    let tag = leaf
-        .get("tag")
-        .and_then(|v| v.as_str())
-        .filter(|t| !t.is_empty())
-        .ok_or("release leaf missing tag")?
-        .to_string();
-    let artifacts: Vec<ReleaseArtifact> = leaf
+    let tag = bounded_string(
+        leaf.get("tag")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+            .ok_or("release leaf missing tag")?,
+        "release tag",
+        METADATA_STRING_BYTE_CAP,
+    )?;
+    let artifact_values = leaf
         .get("artifacts")
         .and_then(|v| v.as_array())
-        .ok_or("release leaf missing artifacts")?
+        .ok_or("release leaf missing artifacts")?;
+    if artifact_values.len() > MANIFEST_ARTIFACT_CAP {
+        return Err("release leaf lists too many artifacts".to_string());
+    }
+    let artifacts: Vec<ReleaseArtifact> = artifact_values
         .iter()
         .map(|entry| {
-            let name = entry
-                .get("name")
-                .and_then(|v| v.as_str())
-                .filter(|n| !n.is_empty())
-                .ok_or("artifact missing name")?
-                .to_string();
-            let sha256 = entry
-                .get("sha256")
-                .and_then(|v| v.as_str())
-                .ok_or("artifact missing sha256")?
-                .to_string();
+            let name = bounded_string(
+                entry
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|n| !n.is_empty())
+                    .ok_or("artifact missing name")?,
+                "release artifact name",
+                ARTIFACT_NAME_BYTE_CAP,
+            )?;
+            let sha256 = bounded_sha256(
+                entry
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .ok_or("artifact missing sha256")?,
+                "release artifact sha256",
+            )?;
             let size = entry
                 .get("size")
                 .and_then(|v| v.as_u64())
@@ -1110,32 +1238,45 @@ fn parse_release_leaf(leaf_json: &str) -> Result<ReleaseLeaf, String> {
     if artifacts.is_empty() {
         return Err("release leaf lists no artifacts".to_string());
     }
-    let manifest_hash = leaf
-        .get("manifest_hash")
-        .and_then(|v| v.as_str())
-        .ok_or("release leaf missing manifest_hash")?
-        .to_string();
+    let manifest_hash = bounded_sha256(
+        leaf.get("manifest_hash")
+            .and_then(|v| v.as_str())
+            .ok_or("release leaf missing manifest_hash")?,
+        "release manifest hash",
+    )?;
     if release_manifest_hash_hex(&tag, &artifacts) != manifest_hash {
         return Err("manifest_hash does not recompute from the carried artifact list".to_string());
     }
     Ok(ReleaseLeaf {
         unix_ms: leaf.get("unix_ms").and_then(|v| v.as_u64()).unwrap_or(0),
         tag,
-        version: leaf
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        platforms: leaf
-            .get("platforms")
-            .and_then(|v| v.as_array())
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        version: bounded_string(
+            leaf.get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+            "release version",
+            METADATA_STRING_BYTE_CAP,
+        )?,
+        platforms: {
+            let values = leaf
+                .get("platforms")
+                .and_then(|v| v.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if values.len() > RELEASE_PLATFORM_CAP {
+                return Err("release leaf lists too many platforms".to_string());
+            }
+            values
+                .iter()
+                .map(|value| {
+                    bounded_string(
+                        value.as_str().ok_or("release platform is not a string")?,
+                        "release platform",
+                        METADATA_STRING_BYTE_CAP,
+                    )
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        },
         manifest_hash,
         artifacts,
     })
@@ -1153,18 +1294,25 @@ struct GithubAsset {
 }
 
 fn parse_github_assets(release: &serde_json::Value) -> Result<Vec<GithubAsset>, String> {
-    release
+    let values = release
         .get("assets")
         .and_then(|v| v.as_array())
-        .ok_or("GitHub release response missing assets")?
+        .ok_or("GitHub release response missing assets")?;
+    if values.len() > GITHUB_ASSET_CAP {
+        return Err("GitHub release response lists too many assets".to_string());
+    }
+    values
         .iter()
         .map(|asset| {
-            let name = asset
-                .get("name")
-                .and_then(|v| v.as_str())
-                .filter(|n| !n.is_empty())
-                .ok_or("GitHub asset missing name")?
-                .to_string();
+            let name = bounded_string(
+                asset
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|n| !n.is_empty())
+                    .ok_or("GitHub asset missing name")?,
+                "GitHub asset name",
+                ARTIFACT_NAME_BYTE_CAP,
+            )?;
             let size = asset
                 .get("size")
                 .and_then(|v| v.as_u64())
@@ -1173,11 +1321,13 @@ fn parse_github_assets(release: &serde_json::Value) -> Result<Vec<GithubAsset>, 
                 .get("digest")
                 .and_then(|v| v.as_str())
                 .and_then(|digest| digest.strip_prefix("sha256:"))
-                .map(str::to_string);
+                .map(|digest| bounded_sha256(digest, "GitHub asset digest"))
+                .transpose()?;
             let download_url = asset
                 .get("browser_download_url")
                 .and_then(|v| v.as_str())
-                .map(str::to_string);
+                .map(|url| bounded_string(url, "GitHub asset download URL", ARTIFACT_PATH_BYTE_CAP))
+                .transpose()?;
             Ok(GithubAsset {
                 name,
                 size,
@@ -1254,7 +1404,7 @@ async fn fetch_github_json(
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;
     let status = response.status().as_u16();
-    let body = response.json::<serde_json::Value>().await.ok();
+    let body = response_json_limited(response, &url).await.ok();
     Ok((status, body))
 }
 
@@ -1386,6 +1536,7 @@ pub(crate) async fn verify_hosted_release(
     mismatches.extend(unlogged_assets(&leaf.artifacts, &assets));
 
     if download {
+        let download_client = release_download_client().map_err(Unavailable)?;
         for artifact in &leaf.artifacts {
             let Some(asset) = assets.iter().find(|a| a.name == artifact.name) else {
                 continue; // already a mismatch above
@@ -1399,7 +1550,7 @@ pub(crate) async fn verify_hosted_release(
             };
             let url = Url::parse(download_url)
                 .map_err(|e| Unavailable(format!("asset URL {download_url}: {e}")))?;
-            match fetch_artifact(&client, url, RELEASE_DOWNLOAD_BYTE_CAP)
+            match fetch_artifact(&download_client, url, RELEASE_DOWNLOAD_BYTE_CAP)
                 .await
                 .map_err(Unavailable)?
             {
@@ -1519,9 +1670,9 @@ async fn check_once_inner() {
             if applied {
                 eprintln!(
                     "[hosted-verify] HOSTED BUNDLE ALERT: {} is serving Connect code/assets that do \
-                     not match its public transparency log ({summary}): {:?} — treat hosted tabs \
-                     against this rendezvous as compromised until the operator explains; direct \
-                     and fleet-name dashboards are unaffected",
+                     not match its public transparency log ({summary}): {:?} — stop trusting hosted \
+                     tabs against this rendezvous until the operator explains; direct and fleet-name \
+                     dashboards are unaffected",
                     base, mismatches,
                 );
             }
@@ -1692,8 +1843,8 @@ pub(crate) async fn run_cli(args: Vec<String>) -> i32 {
         }
         Err(failure) => print_failure(
             failure,
-            "If you did not expect a deploy just now, treat hosted tabs against this \
-             rendezvous as compromised and reach your daemons directly.",
+            "If you did not expect a deploy just now, stop trusting hosted tabs against this \
+             rendezvous and reach your daemons directly.",
         ),
     }
 }
@@ -1865,6 +2016,112 @@ mod tests {
         assert!(update_status_for_url(&mut status, &second, |status| {
             status.state = "ok".to_string();
         }));
+    }
+
+    #[tokio::test]
+    async fn metadata_fetch_does_not_follow_a_cross_origin_loopback_redirect() {
+        let target_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let target_hits_for_route = std::sync::Arc::clone(&target_hits);
+        let target_router = axum::Router::new().route(
+            "/private",
+            axum::routing::get(move || {
+                let target_hits = std::sync::Arc::clone(&target_hits_for_route);
+                async move {
+                    target_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"secret": true}))
+                }
+            }),
+        );
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/private", target_listener.local_addr().unwrap());
+        let target_server = tokio::spawn(async move {
+            axum::serve(target_listener, target_router).await.ok();
+        });
+
+        let source_router = axum::Router::new().route(
+            "/metadata",
+            axum::routing::get(move || {
+                let target_url = target_url.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, target_url)],
+                    )
+                }
+            }),
+        );
+        let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_url = Url::parse(&format!(
+            "http://{}/metadata",
+            source_listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let source_server = tokio::spawn(async move {
+            axum::serve(source_listener, source_router).await.ok();
+        });
+
+        let error = fetch_json(&http_client().unwrap(), source_url)
+            .await
+            .unwrap_err();
+        assert!(error.contains("302"), "error was {error}");
+        assert_eq!(target_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        source_server.abort();
+        target_server.abort();
+    }
+
+    #[tokio::test]
+    async fn metadata_fetch_and_manifest_structures_are_bounded() {
+        let oversized = vec![b'x'; METADATA_RESPONSE_BYTE_CAP + 1];
+        let router = axum::Router::new().route(
+            "/metadata",
+            axum::routing::get(move || {
+                let oversized = oversized.clone();
+                async move { oversized }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/metadata",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        assert!(fetch_json(&http_client().unwrap(), url)
+            .await
+            .unwrap_err()
+            .contains("exceeds"));
+        server.abort();
+
+        let artifacts = (0..=MANIFEST_ARTIFACT_CAP)
+            .map(|index| {
+                serde_json::json!({
+                    "path": format!("/artifact-{index}"),
+                    "sha256": "0".repeat(64),
+                })
+            })
+            .collect::<Vec<_>>();
+        let leaf = serde_json::json!({
+            "kind": "artifact_manifest",
+            "artifacts": artifacts,
+            "manifest_hash": "0".repeat(64),
+        })
+        .to_string();
+        assert!(parse_manifest_leaf(&leaf)
+            .unwrap_err()
+            .contains("too many artifacts"));
+
+        let overlong_path = format!("/{}", "a".repeat(ARTIFACT_PATH_BYTE_CAP));
+        let leaf = serde_json::json!({
+            "kind": "artifact_manifest",
+            "artifacts": [{"path": overlong_path, "sha256": "0".repeat(64)}],
+            "manifest_hash": "0".repeat(64),
+        })
+        .to_string();
+        assert!(parse_manifest_leaf(&leaf)
+            .unwrap_err()
+            .contains("string bounds"));
     }
 
     // ── Local producers (RFC 6962 §2.1) so the replicated verifiers are

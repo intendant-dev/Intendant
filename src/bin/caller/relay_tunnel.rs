@@ -22,6 +22,8 @@
 //! fleet SNI remains an independent second gate. The relay changes
 //! reachability, not trust.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::{net::SocketAddr, time::Duration};
 
 use reqwest::{Client, Url};
@@ -63,7 +65,11 @@ const SPLICE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// `gateway_ingress_addr` is the gateway's dedicated loopback-only relay
 /// listener. It serves the fleet-certificate handshake while preserving
 /// immutable relay provenance at the accept edge.
-pub fn spawn_relay_tunnel_client(config: ConnectConfig, gateway_ingress_addr: Option<SocketAddr>) {
+pub fn spawn_relay_tunnel_client(
+    config: ConnectConfig,
+    gateway_ingress_addr: Option<SocketAddr>,
+    current_fleet_zone_observed: Arc<AtomicBool>,
+) {
     if !(config.enabled && config.relay_enabled) {
         return;
     }
@@ -81,7 +87,11 @@ pub fn spawn_relay_tunnel_client(config: ConnectConfig, gateway_ingress_addr: Op
         eprintln!("[relay] tunnel enabled but its dedicated gateway ingress is unavailable");
         return;
     };
-    tokio::spawn(run_relay_tunnel(endpoint, gateway_ingress_addr));
+    tokio::spawn(run_relay_tunnel(
+        endpoint,
+        gateway_ingress_addr,
+        current_fleet_zone_observed,
+    ));
     tokio::spawn(relay_dns_reassert_loop());
 }
 
@@ -97,7 +107,11 @@ async fn relay_dns_reassert_loop() {
     }
 }
 
-async fn run_relay_tunnel(relay_endpoint: String, gateway_ingress_addr: SocketAddr) {
+async fn run_relay_tunnel(
+    relay_endpoint: String,
+    gateway_ingress_addr: SocketAddr,
+    current_fleet_zone_observed: Arc<AtomicBool>,
+) {
     let client = match Client::builder()
         .timeout(Duration::from_millis(CONTROL_POLL_TIMEOUT_MS + 10_000))
         .build()
@@ -127,25 +141,27 @@ async fn run_relay_tunnel(relay_endpoint: String, gateway_ingress_addr: SocketAd
                 continue;
             }
         };
-        let name_materials = match crate::custom_domain::relay_certificate_material(
-            &config.custom_domain,
-        ) {
-            Ok(Some(material)) => {
-                last_custom_error = None;
-                vec![material]
-            }
-            Ok(None) => {
-                last_custom_error = None;
-                Vec::new()
-            }
-            Err(error) => {
-                if last_custom_error.as_deref() != Some(error.as_str()) {
-                    eprintln!(
+        let name_materials = if !current_fleet_zone_observed.load(Ordering::SeqCst) {
+            Vec::new()
+        } else {
+            match crate::custom_domain::relay_certificate_material(&config.custom_domain) {
+                Ok(Some(material)) => {
+                    last_custom_error = None;
+                    vec![material]
+                }
+                Ok(None) => {
+                    last_custom_error = None;
+                    Vec::new()
+                }
+                Err(error) => {
+                    if last_custom_error.as_deref() != Some(error.as_str()) {
+                        eprintln!(
                             "[relay] custom-domain registration unavailable; fleet relay remains active: {error}"
                         );
-                    last_custom_error = Some(error);
+                        last_custom_error = Some(error);
+                    }
+                    Vec::new()
                 }
-                Vec::new()
             }
         };
         let poll = RelayPollContext {
@@ -199,30 +215,58 @@ async fn poll_relay_next(
     poll: &RelayPollContext<'_>,
     name_materials: &[crate::custom_domain::RelayCertificateMaterial],
 ) -> Result<Option<String>, String> {
-    let mut response = send_relay_poll(poll, RELAY_CONTROL_PROTOCOL, name_materials).await?;
-    if exact_name_registration_rejected(response.status()) {
+    let v2_body = match build_relay_poll_body(poll, RELAY_CONTROL_PROTOCOL, name_materials) {
+        Ok(body) => body,
+        Err(error) if !name_materials.is_empty() => {
+            eprintln!(
+                "[relay] exact-name proof unavailable ({error}); retaining fleet-label compatibility via control v1"
+            );
+            let v1_body = build_relay_poll_body(poll, RELAY_CONTROL_PROTOCOL_V1, &[])?;
+            return decode_relay_poll_response(send_relay_poll(poll, &v1_body).await?).await;
+        }
+        Err(error) => return Err(error),
+    };
+    let mut response = send_relay_poll(poll, &v2_body).await?;
+    if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        eprintln!(
-            "[relay] exact-name registration rejected ({status} {text}); retaining fleet-label compatibility via control v1"
-        );
-        response = send_relay_poll(poll, RELAY_CONTROL_PROTOCOL_V1, &[]).await?;
+        if exact_name_registration_rejected(status, &text) {
+            eprintln!(
+                "[relay] exact-name registration rejected ({status} {text}); retaining fleet-label compatibility via control v1"
+            );
+            let v1_body = build_relay_poll_body(poll, RELAY_CONTROL_PROTOCOL_V1, &[])?;
+            response = send_relay_poll(poll, &v1_body).await?;
+        } else {
+            return Err(format!("relay control poll rejected: HTTP {status} {text}"));
+        }
     }
     decode_relay_poll_response(response).await
 }
 
-fn exact_name_registration_rejected(status: reqwest::StatusCode) -> bool {
-    matches!(
-        status,
-        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::CONFLICT
-    )
+fn exact_name_registration_rejected(status: reqwest::StatusCode, body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    match status {
+        reqwest::StatusCode::CONFLICT => true,
+        reqwest::StatusCode::BAD_REQUEST => {
+            body.contains("unsupported protocol")
+                || body.contains("relay server name")
+                || body.contains("exact relay")
+                || body.contains("server names")
+        }
+        reqwest::StatusCode::FORBIDDEN => {
+            body.contains("relay certificate")
+                || body.contains("certificate ownership proof")
+                || body.contains("each exact relay name")
+        }
+        _ => false,
+    }
 }
 
-async fn send_relay_poll(
+fn build_relay_poll_body(
     poll: &RelayPollContext<'_>,
     protocol: &str,
     name_materials: &[crate::custom_domain::RelayCertificateMaterial],
-) -> Result<reqwest::Response, String> {
+) -> Result<serde_json::Value, String> {
     let daemon_public_key = poll.identity.public_key_b64u();
     let issued_at_unix_ms = crate::access::client_key::now_unix_ms().max(0) as u64;
     let server_names: Vec<String> = name_materials
@@ -264,11 +308,18 @@ async fn send_relay_poll(
         body["server_name_proofs"] = serde_json::to_value(proofs)
             .map_err(|error| format!("serialize relay server-name proofs: {error}"))?;
     }
+    Ok(body)
+}
+
+async fn send_relay_poll(
+    poll: &RelayPollContext<'_>,
+    body: &serde_json::Value,
+) -> Result<reqwest::Response, String> {
     authenticated(
         poll.config,
         poll.client.post(join_url(poll.base_url, "api/relay/next")?),
     )
-    .json(&body)
+    .json(body)
     .send()
     .await
     .map_err(|e| e.to_string())
@@ -439,8 +490,9 @@ mod tests {
         // No panic, no task: disabled config returns immediately. (A running
         // tokio runtime is not required because we never spawn.)
         let ingress = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 8765)));
-        spawn_relay_tunnel_client(relay_disabled(), ingress);
-        spawn_relay_tunnel_client(ConnectConfig::default(), ingress);
+        let observed = Arc::new(AtomicBool::new(true));
+        spawn_relay_tunnel_client(relay_disabled(), ingress, Arc::clone(&observed));
+        spawn_relay_tunnel_client(ConnectConfig::default(), ingress, observed);
     }
 
     #[test]
@@ -492,17 +544,153 @@ mod tests {
     #[test]
     fn exact_name_rejections_fall_back_without_disabling_fleet_routing() {
         assert!(exact_name_registration_rejected(
-            reqwest::StatusCode::BAD_REQUEST
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"unsupported protocol"}"#,
         ));
         assert!(exact_name_registration_rejected(
-            reqwest::StatusCode::CONFLICT
+            reqwest::StatusCode::CONFLICT,
+            "",
+        ));
+        assert!(exact_name_registration_rejected(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":"relay certificate ownership proof is invalid"}"#,
         ));
         assert!(!exact_name_registration_rejected(
-            reqwest::StatusCode::UNAUTHORIZED
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":"missing bearer token"}"#,
         ));
         assert!(!exact_name_registration_rejected(
-            reqwest::StatusCode::FORBIDDEN
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":"daemon authentication failed"}"#,
         ));
+        assert!(!exact_name_registration_rejected(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"relay control signature invalid"}"#,
+        ));
+    }
+
+    fn relay_poll_test_context() -> (
+        tempfile::TempDir,
+        Client,
+        ConnectConfig,
+        DaemonIdentity,
+        String,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::builder().build().unwrap();
+        let config = ConnectConfig {
+            enabled: true,
+            ..ConnectConfig::default()
+        };
+        let identity = DaemonIdentity::load_or_create(&dir.path().join("identity.pk8")).unwrap();
+        let daemon_id = "daemon-test".to_string();
+        (dir, client, config, identity, daemon_id)
+    }
+
+    #[tokio::test]
+    async fn local_exact_name_proof_failure_falls_back_to_v1() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_route = Arc::clone(&seen);
+        let router = axum::Router::new().route(
+            "/api/relay/next",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let seen = Arc::clone(&seen_for_route);
+                async move {
+                    seen.lock().unwrap().push(
+                        body.get("protocol")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        let (dir, client, config, identity, daemon_id) = relay_poll_test_context();
+        let poll = RelayPollContext {
+            client: &client,
+            config: &config,
+            base_url: &base_url,
+            identity: &identity,
+            daemon_id: &daemon_id,
+            poller_id: "11111111111111111111111111111111",
+        };
+        let material = crate::custom_domain::RelayCertificateMaterial {
+            server_name: "box.example.test".to_string(),
+            certificate_chain_pem: "not-used".to_string(),
+            private_key_pem: "not-a-private-key".to_string(),
+        };
+        assert_eq!(poll_relay_next(&poll, &[material]).await.unwrap(), None);
+        assert_eq!(seen.lock().unwrap().as_slice(), [RELAY_CONTROL_PROTOCOL_V1]);
+        drop(dir);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn proof_specific_forbidden_response_falls_back_to_v1() {
+        use axum::response::IntoResponse as _;
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_route = Arc::clone(&seen);
+        let router = axum::Router::new().route(
+            "/api/relay/next",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let seen = Arc::clone(&seen_for_route);
+                async move {
+                    let protocol = body
+                        .get("protocol")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    seen.lock().unwrap().push(protocol.clone());
+                    if protocol == RELAY_CONTROL_PROTOCOL {
+                        (
+                            axum::http::StatusCode::FORBIDDEN,
+                            axum::Json(serde_json::json!({
+                                "ok": false,
+                                "error": "relay certificate ownership proof is invalid",
+                            })),
+                        )
+                            .into_response()
+                    } else {
+                        axum::http::StatusCode::NO_CONTENT.into_response()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        let (dir, client, config, identity, daemon_id) = relay_poll_test_context();
+        let poll = RelayPollContext {
+            client: &client,
+            config: &config,
+            base_url: &base_url,
+            identity: &identity,
+            daemon_id: &daemon_id,
+            poller_id: "11111111111111111111111111111111",
+        };
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["box.example.test".to_string()]).unwrap();
+        let material = crate::custom_domain::RelayCertificateMaterial {
+            server_name: "box.example.test".to_string(),
+            certificate_chain_pem: certificate.cert.pem(),
+            private_key_pem: certificate.signing_key.serialize_pem(),
+        };
+        assert_eq!(poll_relay_next(&poll, &[material]).await.unwrap(), None);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [RELAY_CONTROL_PROTOCOL, RELAY_CONTROL_PROTOCOL_V1]
+        );
+        drop(dir);
+        server.abort();
     }
 
     /// The dial-back path splices the relay data connection to the dedicated

@@ -524,6 +524,10 @@ tree head pinned under the daemon state root
 (`~/.intendant/hosted-verify/<host>.json`, honoring `$INTENDANT_HOME`),
 then downloads every listed artifact exactly as a browser would and
 compares hashes — nonzero exit and a per-artifact diff on divergence.
+Metadata bodies, proof arrays, artifact lists, and their strings are all
+bounded before verification work. Verification fetches do not follow HTTP
+redirects, so a served log response cannot turn the monitor into a request to
+another origin, loopback, link-local, or LAN service.
 Every daemon with Connect enabled also runs this check on boot and then
 daily as an advisory tripwire (the CT tripwire's sibling): a divergence flips
 `hosted_bundle_state` to `alert` on the Connect status payload and

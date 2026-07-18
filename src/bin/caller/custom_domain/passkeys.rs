@@ -27,6 +27,12 @@ const MAX_PENDING_FLOWS: usize = 64;
 const MAX_PASSKEYS: usize = 32;
 const AUTH_START_WINDOW_MS: u64 = 60_000;
 const AUTH_STARTS_PER_WINDOW: usize = 60;
+/// One network-source bucket may consume only one eighth of the durable
+/// authentication-flow pool. The remaining slots stay available to other
+/// sources while the separate global ceiling bounds total work.
+const AUTH_STARTS_PER_SOURCE_WINDOW: usize = 8;
+const AUTH_PENDING_PER_SOURCE: usize = 8;
+const AUTH_NEW_SOURCE_RESERVED_SLOTS: usize = 8;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct PasskeyView {
@@ -150,6 +156,8 @@ struct CeremonyStore {
     registrations: HashMap<String, PendingRegistration>,
     authentications: HashMap<String, PendingAuthentication>,
     authentication_starts: VecDeque<u64>,
+    #[serde(default)]
+    authentication_starts_by_source: HashMap<String, VecDeque<u64>>,
 }
 
 pub(crate) struct PasskeyRuntime {
@@ -269,16 +277,18 @@ impl PasskeyRuntime {
         if input.token.len() > 64 {
             return Err("passkey enrollment invitation is invalid".to_string());
         }
-        let invitation = self.mutate_ceremonies(|ceremonies| {
+        let token = input.token.trim().to_string();
+        let invitation = self.read_ceremonies(|ceremonies| {
             ceremonies
                 .invitations
-                .remove(input.token.trim())
+                .get(&token)
+                .cloned()
                 .ok_or_else(|| "passkey enrollment invitation was not found".to_string())
         })?;
         if invitation.expires_unix_ms <= now_unix_ms() {
             return Err("passkey enrollment invitation expired".to_string());
         }
-        let label = invitation.label;
+        let label = invitation.label.clone();
         let (user_id, exclude) = self.with_fresh_store(|store| {
             if store.passkeys.len() >= MAX_PASSKEYS {
                 return Err("custom-domain passkey limit reached".to_string());
@@ -304,6 +314,19 @@ impl PasskeyRuntime {
             if ceremonies.registrations.len() >= MAX_PENDING_FLOWS {
                 return Err("too many pending custom-domain registration ceremonies".to_string());
             }
+            let current = ceremonies
+                .invitations
+                .get(&token)
+                .ok_or_else(|| "passkey enrollment invitation was not found".to_string())?;
+            if current.expires_unix_ms <= now {
+                return Err("passkey enrollment invitation expired".to_string());
+            }
+            if current.label != invitation.label
+                || current.expires_unix_ms != invitation.expires_unix_ms
+            {
+                return Err("passkey enrollment invitation changed".to_string());
+            }
+            ceremonies.invitations.remove(&token);
             ceremonies.registrations.insert(
                 flow_id.clone(),
                 PendingRegistration {
@@ -397,6 +420,7 @@ impl PasskeyRuntime {
             .webauthn
             .start_authentication_with_creds_for_user(user_id.as_bytes(), &credentials);
         let flow_id = Uuid::new_v4().to_string();
+        let source_rate_key = authentication_source_rate_key(source_bucket);
         self.mutate_ceremonies(|ceremonies| {
             if ceremonies.authentication_starts.len() >= AUTH_STARTS_PER_WINDOW {
                 return Err("custom-domain passkey ceremony rate limit reached".to_string());
@@ -404,7 +428,40 @@ impl PasskeyRuntime {
             if ceremonies.authentications.len() >= MAX_PENDING_FLOWS {
                 return Err("too many pending custom-domain authentication ceremonies".to_string());
             }
+            if ceremonies
+                .authentication_starts_by_source
+                .get(&source_rate_key)
+                .is_some_and(|starts| starts.len() >= AUTH_STARTS_PER_SOURCE_WINDOW)
+            {
+                return Err("custom-domain passkey ceremony source rate limit reached".to_string());
+            }
+            let source_pending = ceremonies
+                .authentications
+                .values()
+                .filter(|flow| {
+                    authentication_source_rate_key(flow.source_bucket.as_deref()) == source_rate_key
+                })
+                .count();
+            if source_pending >= AUTH_PENDING_PER_SOURCE {
+                return Err(
+                    "too many pending custom-domain authentication ceremonies for this source"
+                        .to_string(),
+                );
+            }
+            if ceremonies.authentications.len()
+                >= MAX_PENDING_FLOWS.saturating_sub(AUTH_NEW_SOURCE_RESERVED_SLOTS)
+                && source_pending > 0
+            {
+                return Err(
+                    "custom-domain passkey capacity is reserved for a new source".to_string(),
+                );
+            }
             ceremonies.authentication_starts.push_back(now);
+            ceremonies
+                .authentication_starts_by_source
+                .entry(source_rate_key)
+                .or_default()
+                .push_back(now);
             ceremonies.authentications.insert(
                 flow_id.clone(),
                 PendingAuthentication {
@@ -565,6 +622,19 @@ impl PasskeyRuntime {
         .map_err(|error| error.to_string())
     }
 
+    fn read_ceremonies<T>(
+        &self,
+        read: impl FnOnce(&CeremonyStore) -> Result<T, String>,
+    ) -> Result<T, String> {
+        crate::access::authority_store::with_lock(&self.cert_dir, || {
+            let mut ceremonies = load_ceremony_store_locked(&self.cert_dir, &self.domain)
+                .map_err(crate::access::AccessError)?;
+            prune_ceremonies(&mut ceremonies, now_unix_ms());
+            read(&ceremonies).map_err(crate::access::AccessError)
+        })
+        .map_err(|error| error.to_string())
+    }
+
     /// Order credential validation + lease issuance against revocation under
     /// the same process and cross-process authority lock. If issuance wins,
     /// revocation cannot return until that lease exists; if revocation wins,
@@ -606,6 +676,17 @@ fn validate_pending_request_shape(input: &HostedLeaseRequestInput) -> Result<(),
     Ok(())
 }
 
+fn authentication_source_rate_key(source_bucket: Option<&str>) -> String {
+    let source = source_bucket
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .unwrap_or("shared-relay-source");
+    let mut hasher = Sha256::new();
+    hasher.update(b"intendant-custom-domain-passkey-source-v1\n");
+    hasher.update(source.as_bytes());
+    crate::daemon_identity::b64u(&hasher.finalize())
+}
+
 fn now_unix_ms() -> u64 {
     crate::access::client_key::now_unix_ms().max(0) as u64
 }
@@ -627,6 +708,7 @@ fn empty_ceremony_store(domain: &ValidatedCustomDomain) -> CeremonyStore {
         registrations: HashMap::new(),
         authentications: HashMap::new(),
         authentication_starts: VecDeque::new(),
+        authentication_starts_by_source: HashMap::new(),
     }
 }
 
@@ -647,6 +729,15 @@ fn prune_ceremonies(store: &mut CeremonyStore, now: u64) {
     {
         store.authentication_starts.pop_front();
     }
+    store.authentication_starts_by_source.retain(|_, starts| {
+        while starts
+            .front()
+            .is_some_and(|started| now.saturating_sub(*started) >= AUTH_START_WINDOW_MS)
+        {
+            starts.pop_front();
+        }
+        !starts.is_empty()
+    });
 }
 
 fn load_ceremony_store_locked(
@@ -688,6 +779,17 @@ fn load_ceremony_store_locked(
         || store.registrations.len() > MAX_PENDING_FLOWS
         || store.authentications.len() > MAX_PENDING_FLOWS
         || store.authentication_starts.len() > AUTH_STARTS_PER_WINDOW
+        || store.authentication_starts_by_source.len() > AUTH_STARTS_PER_WINDOW
+        || store
+            .authentication_starts_by_source
+            .iter()
+            .any(|(source, starts)| {
+                source.len() != 43
+                    || !source
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                    || starts.len() > AUTH_STARTS_PER_SOURCE_WINDOW
+            })
         || store
             .invitations
             .keys()
@@ -938,6 +1040,106 @@ mod tests {
             ceremonies.registrations.contains_key(&start.flow_id),
             "the finish request may land on any process"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_registration_flow_commit_does_not_consume_the_invitation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let domain = domain();
+        let runtime = PasskeyRuntime::new(
+            domain.clone(),
+            dir.path().to_path_buf(),
+            hosted_runtime(dir.path()),
+        )
+        .unwrap();
+        let invite = runtime
+            .registration_invite(RegistrationInviteInput {
+                label: "Phone".to_string(),
+            })
+            .unwrap();
+        let token = invite
+            .enrollment_url
+            .split_once("#passkey_enroll=")
+            .unwrap()
+            .1
+            .to_string();
+
+        let original = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = runtime.registration_start(
+            RegistrationStartInput {
+                token: token.clone(),
+            },
+            &domain.origin,
+        );
+        std::fs::set_permissions(dir.path(), original).unwrap();
+        assert!(failed.is_err(), "the durable commit was expected to fail");
+
+        runtime
+            .registration_start(RegistrationStartInput { token }, &domain.origin)
+            .expect("the invitation survives a failed atomic flow commit");
+    }
+
+    #[test]
+    fn one_authentication_source_cannot_starve_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = domain();
+        persist_store(
+            dir.path(),
+            &PasskeyStore {
+                schema_version: STORE_SCHEMA_VERSION,
+                name: domain.name.clone(),
+                rp_id: domain.rp_id.clone(),
+                user_id: Uuid::new_v4(),
+                passkeys: vec![stored_passkey(1, "one")],
+            },
+        )
+        .unwrap();
+        let runtime = PasskeyRuntime::new(
+            domain.clone(),
+            dir.path().to_path_buf(),
+            hosted_runtime(dir.path()),
+        )
+        .unwrap();
+        let input = || AuthenticationStartInput {
+            request: HostedLeaseRequestInput {
+                browser_public_key: "browser-key".to_string(),
+                requested_preset: Default::default(),
+                requested_ttl_secs: 60,
+                requester_label: "Browser".to_string(),
+                nonce: String::new(),
+                timestamp_unix_ms: 0,
+                signature: String::new(),
+            },
+        };
+        for _ in 0..AUTH_PENDING_PER_SOURCE {
+            runtime
+                .authentication_start(input(), &domain.origin, None)
+                .unwrap();
+        }
+        assert!(runtime
+            .authentication_start(input(), &domain.origin, None)
+            .unwrap_err()
+            .contains("source"));
+        runtime
+            .authentication_start(input(), &domain.origin, Some("198.51.100.7"))
+            .expect("a distinct source retains admission below the global safety ceiling");
+        for index in 0..47 {
+            let source = format!("203.0.113.{index}:443");
+            runtime
+                .authentication_start(input(), &domain.origin, Some(&source))
+                .unwrap();
+        }
+        assert!(runtime
+            .authentication_start(input(), &domain.origin, Some("198.51.100.7"))
+            .unwrap_err()
+            .contains("reserved"));
+        runtime
+            .authentication_start(input(), &domain.origin, Some("198.51.100.8"))
+            .expect("the global tail remains reserved for a previously unseen source");
     }
 
     #[test]

@@ -308,6 +308,13 @@ pub(crate) struct RelayState {
     name_proof_roots: Arc<rustls::RootCertStore>,
 }
 
+enum PendingPoll {
+    Nonce(String),
+    Woken,
+    TimedOut,
+    RegistrationRejected,
+}
+
 impl RelayState {
     pub(crate) fn new(listen: SocketAddr, advertise_addrs: Vec<IpAddr>) -> Self {
         let mut roots = rustls::RootCertStore::empty();
@@ -415,6 +422,31 @@ impl RelayState {
             }
         }
         entry.fallback_pending.pop_front()
+    }
+
+    async fn pop_pending_or_wait(
+        &self,
+        label: &str,
+        poller_id: Option<&str>,
+        remaining: Duration,
+        before_park: impl FnOnce() -> bool,
+    ) -> PendingPoll {
+        // `notify_waiters` carries no stored permit. Enable the waiter before
+        // observing the queue and before refreshing registration so an
+        // enqueue at either boundary cannot strand this poll.
+        let notified = self.control_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(nonce) = self.pop_pending(label, poller_id) {
+            return PendingPoll::Nonce(nonce);
+        }
+        if !before_park() {
+            return PendingPoll::RegistrationRejected;
+        }
+        match tokio::time::timeout(remaining, notified).await {
+            Ok(()) => PendingPoll::Woken,
+            Err(_) => PendingPoll::TimedOut,
+        }
     }
 
     /// Whether a tunnel has an active (recently polled) control channel.
@@ -993,34 +1025,37 @@ pub(crate) async fn relay_next(
     );
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Some(nonce) = relay.pop_pending(&label, poller_id.as_deref()) {
-            return Ok(Json(json!({
-                "ok": true,
-                "dialback": { "nonce": nonce },
-            }))
-            .into_response());
-        }
         let now = tokio::time::Instant::now();
         if now >= deadline {
             return Ok(StatusCode::NO_CONTENT.into_response());
         }
         let remaining = deadline.saturating_duration_since(now);
-        // Re-touch keeps the tunnel live across a full parked poll.
-        if !relay.touch_tunnel(
-            &label,
-            now_unix_ms(),
-            poller_id.as_deref(),
-            server_names.as_deref(),
-        ) {
-            return Err(ApiError::conflict(
-                "relay exact-name registration conflicts with live ownership or exceeds its poller bound",
-            ));
-        }
-        if tokio::time::timeout(remaining, relay.control_notify.notified())
+        match relay
+            .pop_pending_or_wait(&label, poller_id.as_deref(), remaining, || {
+                // Re-touch keeps the tunnel live across a full parked poll.
+                relay.touch_tunnel(
+                    &label,
+                    now_unix_ms(),
+                    poller_id.as_deref(),
+                    server_names.as_deref(),
+                )
+            })
             .await
-            .is_err()
         {
-            return Ok(StatusCode::NO_CONTENT.into_response());
+            PendingPoll::Nonce(nonce) => {
+                return Ok(Json(json!({
+                    "ok": true,
+                    "dialback": { "nonce": nonce },
+                }))
+                .into_response());
+            }
+            PendingPoll::Woken => {}
+            PendingPoll::TimedOut => return Ok(StatusCode::NO_CONTENT.into_response()),
+            PendingPoll::RegistrationRejected => {
+                return Err(ApiError::conflict(
+                    "relay exact-name registration conflicts with live ownership or exceeds its poller bound",
+                ));
+            }
         }
     }
 }
@@ -1763,6 +1798,28 @@ mod tests {
         assert_eq!(
             resolved_label(relay.resolve_tunnel("d-rolling.fleet.example.test", now)).as_deref(),
             Some("d-rolling")
+        );
+    }
+
+    #[tokio::test]
+    async fn control_waiter_cannot_lose_an_enqueue_after_the_empty_pop() {
+        let relay = relay_state();
+        let label = "d-11111111111111111111";
+        let now = now_unix_ms();
+        assert!(relay.touch_tunnel(label, now, None, None));
+        let route = TunnelRoute::Fallback {
+            label: label.to_string(),
+        };
+        let outcome = relay
+            .pop_pending_or_wait(label, None, Duration::from_millis(20), || {
+                assert!(relay.enqueue_dialback(&route, "nonce-after-pop".to_string(), now));
+                true
+            })
+            .await;
+        assert!(matches!(outcome, PendingPoll::Woken));
+        assert_eq!(
+            relay.pop_pending(label, None).as_deref(),
+            Some("nonce-after-pop")
         );
     }
 

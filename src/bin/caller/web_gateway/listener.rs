@@ -1004,11 +1004,17 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
         Arc::clone(&tcp_peer_registry),
         dashboard_tabs.clone(),
     ));
+    // A custom owner-name lane must not become authoritative from stale
+    // provenance while the currently enabled rendezvous is still unknown.
+    // The Connect registration response flips this shared gate only after
+    // its fleet-zone observation has been accepted durably.
+    let fleet_zone_observed = Arc::new(std::sync::atomic::AtomicBool::new(!config.connect.enabled));
     crate::connect_rendezvous::spawn_connect_rendezvous_client(
         config.connect.clone(),
         dashboard_control.clone(),
         tcp_advertised_port,
         Arc::clone(&hosted_control),
+        Arc::clone(&fleet_zone_observed),
     );
     // Reachability relay tunnel: hold a control channel to Connect and splice
     // relayed browser connections into the dedicated loopback-only ingress
@@ -1019,7 +1025,11 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     let relay_ingress_addr = relay_ingress_listener
         .as_ref()
         .and_then(|listener| listener.local_addr().ok());
-    crate::relay_tunnel::spawn_relay_tunnel_client(config.connect.clone(), relay_ingress_addr);
+    crate::relay_tunnel::spawn_relay_tunnel_client(
+        config.connect.clone(),
+        relay_ingress_addr,
+        Arc::clone(&fleet_zone_observed),
+    );
     // Pending-request attention nudges: watch approvals/questions on the bus
     // and ping the Connect rendezvous when they age with no dashboard around.
     crate::attention_nudge::spawn_attention_nudge_monitor(bus.clone());
@@ -1035,6 +1045,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
         &config.connect.custom_domain,
         access_cert_dir.clone(),
         Arc::clone(&hosted_control),
+        Some(fleet_zone_observed),
     ));
     custom_domain.spawn_certificate_loop();
     // Hosted-bundle code transparency: when Connect is enabled,
