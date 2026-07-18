@@ -21,10 +21,11 @@ pub(crate) fn seatbelt_path_literal(path: &Path) -> Result<String, String> {
     ))
 }
 
-/// Best-effort canonicalization for a profile path that may not exist yet:
-/// Seatbelt rules match REAL paths, so resolve through symlinked parents
-/// (`/tmp`, `/var`, `/etc`) even when the leaf itself is absent.
-#[cfg(target_os = "macos")]
+/// Best-effort canonicalization for a policy path that may not exist yet:
+/// Seatbelt rules and the consent-flow forbidden-path checks match REAL
+/// paths, so resolve through symlinked parents (`/tmp`, `/var`, `/etc`)
+/// even when the leaf itself is absent. Cross-platform — the consent
+/// classifier uses it on every OS.
 fn canonicalize_for_profile(path: &Path) -> PathBuf {
     if let Ok(real) = std::fs::canonicalize(path) {
         return real;
