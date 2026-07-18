@@ -142,12 +142,12 @@ order; a stopped owner's lease can be reclaimed without changing the order key.
 The active worker renews and rechecks its owner lease throughout DNS and ACME
 waits and before certificate side effects. The final pair write, process-local
 TLS install, and issuance-record removal run under the same authority lock and
-owner-token check, so a superseded worker cannot install after takeover. CT
-comparison is deferred only
-while that live owner is inside the pre-ledger issuance window; a dormant or
-expired resumable order remains recoverable but cannot suppress CT evidence.
+owner-token check, so a superseded worker cannot install after takeover.
 Normal ownership replacement or a sibling-completed generation is treated as
-worker handoff, not as authority-store corruption.
+worker handoff, not as authority-store corruption. The built-in fleet-name CT
+comparator does not track this owner-controlled name. The sovereign-lane
+boundary instead relies on control of the exact name and the owner-published
+CAA account URI plus DNS-01 pin described above.
 
 Custom-domain, relay, and credential wiring is restart-only. The live Connect
 toggle may change enablement or the rendezvous destination, but the running

@@ -1684,6 +1684,70 @@ fn issuance_claim_state_in(
     .map_err(|error| error.to_string())
 }
 
+fn commit_claimed_certificate_in(
+    cert_dir: &Path,
+    token: &str,
+    owner_token: &str,
+    expected_name: &str,
+    cert_chain_pem: &str,
+    private_key_pem: &str,
+    install: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let expected_name = normalized_dns_name(expected_name)
+        .ok_or_else(|| "cannot commit a certificate for an empty fleet name".to_string())?;
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let mut store =
+            load_issuance_store_locked_in(cert_dir).map_err(crate::access::AccessError)?;
+        {
+            let order = store
+                .orders
+                .iter()
+                .find(|order| order.token == token)
+                .ok_or_else(|| {
+                    crate::access::AccessError(
+                        "durable certificate issuance state disappeared".to_string(),
+                    )
+                })?;
+            if order.owner_token.as_deref() != Some(owner_token) {
+                return Err(crate::access::AccessError(
+                    "durable certificate issuance ownership changed".to_string(),
+                ));
+            }
+            if order.name != expected_name {
+                return Err(crate::access::AccessError(format!(
+                    "durable certificate issuance name changed before commit for {expected_name}"
+                )));
+            }
+        }
+        let provenance =
+            load_fleet_origin_provenance_in(cert_dir).map_err(crate::access::AccessError)?;
+        if provenance.name.as_deref() != Some(expected_name.as_str()) {
+            return Err(crate::access::AccessError(format!(
+                "fleet name changed before certificate commit for {expected_name}; no certificate pair was written"
+            )));
+        }
+        require_fleet_certificate_dns_name(cert_chain_pem, &expected_name)
+            .map_err(crate::access::AccessError)?;
+        crate::web_tls::validate_fleet_certificate_key_pair(cert_chain_pem, private_key_pem)
+            .map_err(crate::access::AccessError)?;
+
+        crate::access::authority_store::atomic_write_private_locked(
+            &key_path_in(cert_dir),
+            private_key_pem.as_bytes(),
+        )?;
+        crate::access::authority_store::atomic_write_private_locked(
+            &cert_path_in(cert_dir),
+            cert_chain_pem.as_bytes(),
+        )?;
+        install().map_err(|error| {
+            crate::access::AccessError(format!("install fleet certificate: {error}"))
+        })?;
+        store.orders.retain(|order| order.token != token);
+        write_issuance_store_locked_in(cert_dir, &store)
+    })
+    .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 fn begin_issuance_in(cert_dir: &Path, name: &str) -> Result<String, String> {
     let (order, owner_token) = claim_issuance_in(cert_dir, name)?;
@@ -1856,6 +1920,46 @@ impl IssuanceGuard {
         self.order.private_key_pem.clone().ok_or_else(|| {
             "ACME order reached processing without durable certificate key material".to_string()
         })
+    }
+
+    fn commit_certificate(
+        self,
+        expected_name: &str,
+        cert_chain_pem: &str,
+        private_key_pem: &str,
+    ) -> Result<(), String> {
+        self.commit_certificate_with_installer(
+            expected_name,
+            cert_chain_pem,
+            private_key_pem,
+            || {
+                crate::web_tls::install_fleet_certificate(
+                    expected_name,
+                    cert_chain_pem,
+                    private_key_pem,
+                )
+            },
+        )
+    }
+
+    fn commit_certificate_with_installer(
+        mut self,
+        expected_name: &str,
+        cert_chain_pem: &str,
+        private_key_pem: &str,
+        install: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        commit_claimed_certificate_in(
+            &self.cert_dir,
+            &self.order.token,
+            &self.owner_token,
+            expected_name,
+            cert_chain_pem,
+            private_key_pem,
+            install,
+        )?;
+        self.claimed = false;
+        Ok(())
     }
 
     fn finish(mut self) -> Result<(), String> {
@@ -2126,15 +2230,14 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
         .await?;
     let _ = cleanup;
 
-    // 3. Persist + install live. The per-file replacements are atomic and
-    // the shared authority lock prevents two daemon processes from
-    // interleaving different pairs. A crash between the two replacements is
-    // detected at restore and retried by the renewal loop.
+    // 3. Persist + install live, then retire this exact issuance generation.
+    // One authority lock and owner-token check fence all three side effects
+    // from a worker whose lease was reclaimed by another process. The
+    // per-file replacements are atomic; a crash between them is detected at
+    // restore and retried by the renewal loop.
     issuance.renew()?;
-    persist_certificate_pair_in(&certificate_dir, &name, &cert_chain_pem, &private_key_pem)?;
     ensure_current_fleet_name(&name)?;
-    issuance.renew()?;
-    crate::web_tls::install_fleet_certificate(&name, &cert_chain_pem, &private_key_pem)?;
+    issuance.commit_certificate(&name, &cert_chain_pem, &private_key_pem)?;
     let mut name_changed = false;
     with_status(|status| {
         if fleet_name_matches(status.name.as_deref(), &name) {
@@ -2150,11 +2253,10 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
             "fleet name changed after certificate issuance completed for {name}; retry against the current name"
         ));
     }
-    issuance.renew()?;
-    issuance.finish()?;
     Ok(())
 }
 
+#[cfg(test)]
 fn persist_certificate_pair_in(
     cert_dir: &Path,
     expected_name: &str,
@@ -3468,14 +3570,14 @@ mod tests {
         remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
         let sibling = IssuanceGuard::begin(temp.path(), name).unwrap();
         let certificate = rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
-        persist_certificate_pair_in(
-            temp.path(),
-            name,
-            &certificate.cert.pem(),
-            &certificate.signing_key.serialize_pem(),
-        )
-        .unwrap();
-        sibling.finish().unwrap();
+        sibling
+            .commit_certificate_with_installer(
+                name,
+                &certificate.cert.pem(),
+                &certificate.signing_key.serialize_pem(),
+                || Ok(()),
+            )
+            .unwrap();
 
         assert!(matches!(
             claim_issuance_request_in(temp.path(), name).unwrap(),
@@ -3897,6 +3999,52 @@ mod tests {
             IssuanceClaimState::Superseded
         );
         drop(superseded);
+    }
+
+    #[test]
+    fn superseded_issuance_owner_cannot_commit_or_install_certificate() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = "d-11111111111111111111.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
+        let stale = IssuanceGuard::begin(temp.path(), name).unwrap();
+        crate::access::authority_store::with_lock(temp.path(), || {
+            let mut store =
+                load_issuance_store_locked_in(temp.path()).map_err(crate::access::AccessError)?;
+            let order = store
+                .orders
+                .iter_mut()
+                .find(|order| order.token == stale.order.token)
+                .unwrap();
+            order.owner_token = Some("11111111111111111111111111111111".to_string());
+            write_issuance_store_locked_in(temp.path(), &store)
+        })
+        .unwrap();
+
+        let certificate = rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
+        let installed = std::cell::Cell::new(false);
+        let error = stale
+            .commit_certificate_with_installer(
+                name,
+                &certificate.cert.pem(),
+                &certificate.signing_key.serialize_pem(),
+                || {
+                    installed.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(error.contains("ownership changed"), "{error}");
+        assert!(!installed.get(), "a superseded worker cannot install");
+        assert!(
+            read_stored_certificate_pair_in(temp.path())
+                .unwrap()
+                .is_none(),
+            "a superseded worker cannot persist a certificate pair"
+        );
+        assert!(
+            issuance_active_in(temp.path(), name).unwrap(),
+            "the replacement owner's durable issuance must remain active"
+        );
     }
 
     #[test]
