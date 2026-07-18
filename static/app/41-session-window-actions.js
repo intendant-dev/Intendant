@@ -1697,6 +1697,24 @@ function createLogScaffold(c, extraClass) {
   return { entry, hostId };
 }
 
+// Conversational prose vs tool/system payload, for collapse DEFAULTS:
+// prose rows (what someone SAID) start expanded wherever the length/flag
+// collapse rules fire; payload rows keep the compact collapsed default.
+// The classification derives from the same stamped vocabulary the
+// renderers and the chapter-nav classifier key on (57c-chapter-nav.js) —
+// user and steer sources, plus model-level non-reasoning rows — never a
+// parallel kind list. User rows drop tool-shaped payloads riding the
+// user role (external backends' tool results; sessionDetailToolResultShape
+// is the shared predicate — native user rows virtually never match it,
+// and a false positive merely keeps today's collapsed default).
+function isConversationalProseLog(c) {
+  if (!c) return false;
+  const source = String(c.source || '').toLowerCase();
+  if (source === 'steer') return true;
+  if (source === 'user') return !sessionDetailToolResultShape(c);
+  return c.level === 'model' && c.kind !== 'reasoning';
+}
+
 // rAF-coalesced follow for the MAIN stream (finding: interleaved layout
 // read/write per appended entry). Reading scrollHeight right after each
 // append forces a synchronous layout of the 10k-node scroller — N entries
@@ -2883,6 +2901,10 @@ function renderLogEntry(c) {
   if (c.collapsible || hasImages) {
     entry.classList.add('collapsible');
     if (hasImages) _logImageStore.set(entry, c.images);
+    // Flagged long prose stays readable: collapsible (the "less" toggle
+    // remains) but expanded from the start. Image rows keep the collapsed
+    // default — expanding is what materializes the deferred gallery.
+    if (!hasImages && isConversationalProseLog(c)) entry.classList.add('expanded');
     const toggle = document.createElement('span');
     toggle.className = 'collapse-toggle';
     toggle.innerHTML = '<span class="arrow">\u25B8 more</span><span class="arrow-up">\u25BE less</span>';
