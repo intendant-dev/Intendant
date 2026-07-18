@@ -162,6 +162,10 @@ pub(crate) fn record_gateway_loopback_port(port: u16) {
     let _ = GATEWAY_LOOPBACK_PORT.set(port);
 }
 
+/// Consumed by the macOS Seatbelt loopback-guard clause today; recorded
+/// on every platform so the Linux/Windows guards can adopt it when their
+/// mechanisms allow a per-port deny.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn gateway_loopback_port() -> Option<u16> {
     GATEWAY_LOOPBACK_PORT.get().copied()
 }
