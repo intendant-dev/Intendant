@@ -269,16 +269,6 @@ impl CustomDomainRuntime {
         self.enabled() && self.origin() == Some(origin)
     }
 
-    pub(crate) fn passkey_available(&self) -> bool {
-        if !self.enabled() {
-            return false;
-        }
-        self.passkeys
-            .as_ref()
-            .and_then(|runtime| runtime.views().ok())
-            .is_some_and(|passkeys| !passkeys.is_empty())
-    }
-
     pub(crate) fn spawn_certificate_loop(&self) {
         // Cleanup survives disabling or invalidating the custom lane: a DNS
         // mutation journal from an earlier process still has to be retired.

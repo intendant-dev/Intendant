@@ -94,6 +94,27 @@ fn json_value<T: serde::Serialize>(value: T) -> ApiResponse {
     }
 }
 
+const HOSTED_AUTHORITY_BUSY_ERROR: &str =
+    "hosted-control authority work is busy; retry the request";
+static HOSTED_AUTHORITY_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+async fn run_hosted_authority_io<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let permit = HOSTED_AUTHORITY_WORKERS
+        .try_acquire()
+        .map_err(|_| HOSTED_AUTHORITY_BUSY_ERROR.to_string())?;
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("hosted-control authority worker stopped unexpectedly".to_string()),
+    }
+}
+
 pub(crate) fn fleet_origin_from_request(header_text: &str, is_tls: bool) -> Result<String, String> {
     if !is_tls {
         return Err("hosted control requires daemon-terminated HTTPS".to_string());
@@ -161,22 +182,29 @@ pub(crate) async fn handle_hosted_control_bootstrap(
     tls_custom_domain: Option<&str>,
     cors: crate::gateway_routes::CorsPosture,
 ) {
-    let response = match public_origin_from_request(header_text, is_tls, tls_custom_domain)
-        .and_then(|origin| {
-            runtime
-                .bootstrap(&origin)
-                .map(|bootstrap| (origin, bootstrap))
-        }) {
-        Ok((origin, mut bootstrap)) => {
-            if custom_domain.matches_origin(&origin) {
-                bootstrap.custom_domain = true;
-                bootstrap.rp_id = custom_domain.snapshot().rp_id;
-                bootstrap.passkey_available = custom_domain.passkey_available();
-            }
-            json_value(bootstrap)
+    let result = match public_origin_from_request(header_text, is_tls, tls_custom_domain) {
+        Ok(origin) => {
+            let runtime = Arc::clone(&runtime);
+            let custom_domain = Arc::clone(&custom_domain);
+            run_hosted_authority_io(move || {
+                let mut bootstrap = runtime.bootstrap(&origin)?;
+                if custom_domain.matches_origin(&origin) {
+                    let snapshot = custom_domain.snapshot();
+                    bootstrap.custom_domain = true;
+                    bootstrap.rp_id = snapshot.rp_id;
+                    bootstrap.passkey_available = !snapshot.passkeys.is_empty();
+                }
+                Ok(bootstrap)
+            })
+            .await
         }
+        Err(error) => Err(error),
+    };
+    let response = match result {
+        Ok(bootstrap) => json_value(bootstrap),
         Err(error) if !runtime.configured() => ApiResponse::json_error(404, error),
         Err(error) if !runtime.enabled() => ApiResponse::json_error(503, error),
+        Err(error) if error == HOSTED_AUTHORITY_BUSY_ERROR => ApiResponse::json_error(429, error),
         Err(error) => ApiResponse::json_error(400, error),
     };
     write_api_response(stream, response, cors, None).await;
@@ -224,67 +252,102 @@ pub(crate) async fn handle_custom_domain_passkey(
     source_bucket: Option<&str>,
     cors: crate::gateway_routes::CorsPosture,
 ) {
-    let result =
-        public_origin_from_request(header_text, is_tls, tls_custom_domain).and_then(|origin| {
-            if !custom_domain.matches_origin(&origin) {
-                return Err("custom-domain passkey endpoint is unavailable on this origin".into());
-            }
-            match path {
-                "/api/hosted-control/passkey/register/start" => {
-                    let input =
-                        serde_json::from_str::<crate::custom_domain::RegistrationStartInput>(&body)
-                            .map_err(|error| {
-                                format!("invalid passkey registration start: {error}")
-                            })?;
-                    custom_domain
-                        .registration_start(input, &origin)
-                        .and_then(|value| {
-                            serde_json::to_value(value).map_err(|error| error.to_string())
-                        })
-                }
-                "/api/hosted-control/passkey/register/finish" => {
-                    let input =
-                        serde_json::from_str::<crate::custom_domain::RegistrationFinishInput>(
-                            &body,
-                        )
-                        .map_err(|error| format!("invalid passkey registration finish: {error}"))?;
-                    custom_domain.registration_finish(input).map(|value| {
-                        serde_json::json!({
-                            "ok": true,
-                            "passkey": value,
-                        })
-                    })
-                }
-                "/api/hosted-control/passkey/start" => {
-                    let input = serde_json::from_str::<
-                        crate::custom_domain::AuthenticationStartInput,
-                    >(&body)
-                    .map_err(|error| format!("invalid passkey start request: {error}"))?;
-                    custom_domain
-                        .authentication_start(input, &origin, source_bucket)
-                        .and_then(|value| {
-                            serde_json::to_value(value).map_err(|error| error.to_string())
-                        })
-                }
-                "/api/hosted-control/passkey/finish" => {
-                    let input = serde_json::from_str::<
-                        crate::custom_domain::AuthenticationFinishInput,
-                    >(&body)
-                    .map_err(|error| format!("invalid passkey finish request: {error}"))?;
-                    custom_domain
-                        .authentication_finish(input, &origin)
-                        .and_then(|value| {
-                            serde_json::to_value(value).map_err(|error| error.to_string())
-                        })
-                }
-                _ => Err("custom-domain passkey endpoint was not found".to_string()),
-            }
-        });
+    let result = match public_origin_from_request(header_text, is_tls, tls_custom_domain) {
+        Ok(origin) => {
+            let custom_domain = Arc::clone(&custom_domain);
+            let path = path.to_string();
+            let source_bucket = source_bucket.map(str::to_string);
+            run_hosted_authority_io(move || {
+                let configured = custom_domain.configured();
+                let enabled = custom_domain.enabled();
+                let result = if !enabled || custom_domain.origin() != Some(origin.as_str()) {
+                    Err("custom-domain passkey endpoint is unavailable on this origin".into())
+                } else {
+                    (|| -> Result<serde_json::Value, String> {
+                        match path.as_str() {
+                            "/api/hosted-control/passkey/register/start" => {
+                                let input = serde_json::from_str::<
+                                    crate::custom_domain::RegistrationStartInput,
+                                >(&body)
+                                .map_err(|error| {
+                                    format!("invalid passkey registration start: {error}")
+                                })?;
+                                custom_domain
+                                    .registration_start(input, &origin)
+                                    .and_then(|value| {
+                                        serde_json::to_value(value)
+                                            .map_err(|error| error.to_string())
+                                    })
+                            }
+                            "/api/hosted-control/passkey/register/finish" => {
+                                let input = serde_json::from_str::<
+                                    crate::custom_domain::RegistrationFinishInput,
+                                >(&body)
+                                .map_err(|error| {
+                                    format!("invalid passkey registration finish: {error}")
+                                })?;
+                                custom_domain.registration_finish(input).map(|value| {
+                                    serde_json::json!({
+                                        "ok": true,
+                                        "passkey": value,
+                                    })
+                                })
+                            }
+                            "/api/hosted-control/passkey/start" => {
+                                let input = serde_json::from_str::<
+                                    crate::custom_domain::AuthenticationStartInput,
+                                >(&body)
+                                .map_err(|error| {
+                                    format!("invalid passkey start request: {error}")
+                                })?;
+                                custom_domain
+                                    .authentication_start(input, &origin, source_bucket.as_deref())
+                                    .and_then(|value| {
+                                        serde_json::to_value(value)
+                                            .map_err(|error| error.to_string())
+                                    })
+                            }
+                            "/api/hosted-control/passkey/finish" => {
+                                let input = serde_json::from_str::<
+                                    crate::custom_domain::AuthenticationFinishInput,
+                                >(&body)
+                                .map_err(|error| {
+                                    format!("invalid passkey finish request: {error}")
+                                })?;
+                                custom_domain
+                                    .authentication_finish(input, &origin)
+                                    .and_then(|value| {
+                                        serde_json::to_value(value)
+                                            .map_err(|error| error.to_string())
+                                    })
+                            }
+                            _ => Err("custom-domain passkey endpoint was not found".to_string()),
+                        }
+                    })()
+                };
+                Ok((result, configured, enabled))
+            })
+            .await
+        }
+        Err(error) => {
+            let custom_domain = Arc::clone(&custom_domain);
+            run_hosted_authority_io(move || {
+                Ok((
+                    Err(error),
+                    custom_domain.configured(),
+                    custom_domain.enabled(),
+                ))
+            })
+            .await
+        }
+    };
     let response = match result {
-        Ok(value) => ApiResponse::json(200, JsonBody::Value(value)),
-        Err(error) if !custom_domain.configured() => ApiResponse::json_error(404, error),
-        Err(error) if !custom_domain.enabled() => ApiResponse::json_error(503, error),
-        Err(error) => ApiResponse::json_error(400, error),
+        Ok((Ok(value), _, _)) => ApiResponse::json(200, JsonBody::Value(value)),
+        Ok((Err(error), false, _)) => ApiResponse::json_error(404, error),
+        Ok((Err(error), _, false)) => ApiResponse::json_error(503, error),
+        Ok((Err(error), _, _)) => ApiResponse::json_error(400, error),
+        Err(error) if error == HOSTED_AUTHORITY_BUSY_ERROR => ApiResponse::json_error(429, error),
+        Err(error) => ApiResponse::json_error(500, error),
     };
     write_api_response(stream, response, cors, None).await;
 }
@@ -607,6 +670,30 @@ pub(crate) async fn handle_hosted_control_management(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hosted_authority_io_is_offloaded_and_admission_bounded() {
+        let runtime_thread = std::thread::current().id();
+        let authority_thread = run_hosted_authority_io(|| Ok(std::thread::current().id()))
+            .await
+            .unwrap();
+        assert_ne!(authority_thread, runtime_thread);
+
+        let permits = (0..HOSTED_AUTHORITY_WORKERS.available_permits())
+            .map(|_| HOSTED_AUTHORITY_WORKERS.try_acquire().unwrap())
+            .collect::<Vec<_>>();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_in_work = Arc::clone(&ran);
+        let error = run_hosted_authority_io(move || {
+            ran_in_work.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error, HOSTED_AUTHORITY_BUSY_ERROR);
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        drop(permits);
+    }
 
     #[test]
     fn public_hosted_paths_are_method_and_path_exact() {

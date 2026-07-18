@@ -427,6 +427,18 @@ fn client_state() -> &'static Mutex<ClientState> {
     })
 }
 
+fn client_reconfiguration_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn with_client_reconfiguration<T>(operation: impl FnOnce() -> T) -> T {
+    let _guard = client_reconfiguration_lock()
+        .lock()
+        .expect("connect client reconfiguration poisoned");
+    operation()
+}
+
 fn client_epoch_is_current(epoch: u64) -> bool {
     client_state()
         .lock()
@@ -471,23 +483,25 @@ pub fn spawn_connect_rendezvous_client(
     fleet_zone_observed: Arc<std::sync::atomic::AtomicBool>,
     relay_lifecycle: tokio::sync::watch::Sender<bool>,
 ) {
-    {
-        let mut state = client_state()
-            .lock()
-            .expect("connect client state poisoned");
-        state.dashboard_control = Some(dashboard_control.clone());
-        state.hosted_control = Some(Arc::clone(&hosted_control));
-        state.gateway_tcp_port = gateway_tcp_port;
-        state.fleet_zone_observed = Some(Arc::clone(&fleet_zone_observed));
-        state.relay_lifecycle = Some(relay_lifecycle);
-    }
-    start_client(
-        config,
-        dashboard_control,
-        gateway_tcp_port,
-        hosted_control,
-        fleet_zone_observed,
-    );
+    with_client_reconfiguration(|| {
+        {
+            let mut state = client_state()
+                .lock()
+                .expect("connect client state poisoned");
+            state.dashboard_control = Some(dashboard_control.clone());
+            state.hosted_control = Some(Arc::clone(&hosted_control));
+            state.gateway_tcp_port = gateway_tcp_port;
+            state.fleet_zone_observed = Some(Arc::clone(&fleet_zone_observed));
+            state.relay_lifecycle = Some(relay_lifecycle);
+        }
+        start_client(
+            config,
+            dashboard_control,
+            gateway_tcp_port,
+            hosted_control,
+            fleet_zone_observed,
+        );
+    });
 }
 
 /// Stop the running client task, if any. All of the task's awaits are
@@ -527,6 +541,10 @@ pub(crate) fn stop_client() {
 /// provided the dashboard-control registry (the gateway calling this
 /// implies it already exists).
 pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
+    with_client_reconfiguration(|| apply_config_locked(config))
+}
+
+fn apply_config_locked(config: ConnectConfig) -> Result<bool, String> {
     let config = {
         let state = client_state()
             .lock()
@@ -687,13 +705,20 @@ fn start_client(
         });
     });
     let mut handle = Some(handle);
-    {
+    let replaced = {
         let mut state = client_state()
             .lock()
             .expect("connect client state poisoned");
         if state.epoch == epoch {
-            state.handle = handle.take();
+            state
+                .handle
+                .replace(handle.take().expect("fresh connect client handle"))
+        } else {
+            None
         }
+    };
+    if let Some(stale) = replaced {
+        stale.abort();
     }
     if let Some(stale) = handle {
         stale.abort();
@@ -2603,6 +2628,37 @@ mod tests {
                 .as_deref(),
             Some("BOOT_DNS_API_TOKEN")
         );
+    }
+
+    #[test]
+    fn connect_reconfiguration_transitions_are_serialized() {
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            with_client_reconfiguration(|| {
+                first_entered_tx.send(()).unwrap();
+                release_first_rx.recv().unwrap();
+            });
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            with_client_reconfiguration(|| second_entered_tx.send(()).unwrap());
+        });
+        assert!(matches!(
+            second_entered_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_first_tx.send(()).unwrap();
+        second_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
     }
 
     #[test]

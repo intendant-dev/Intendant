@@ -622,9 +622,21 @@ impl PasskeyRuntime {
             let mut ceremonies = load_ceremony_store_locked(&self.cert_dir, &self.domain)
                 .map_err(crate::access::AccessError)?;
             prune_ceremonies(&mut ceremonies, now_unix_ms());
-            let result = update(&mut ceremonies);
-            save_ceremony_store_locked(&self.cert_dir, &ceremonies)?;
-            result.map_err(crate::access::AccessError)
+            let before = serde_json::to_vec(&ceremonies).map_err(|error| {
+                crate::access::AccessError(format!(
+                    "serialize custom-domain passkey ceremonies: {error}"
+                ))
+            })?;
+            let result = update(&mut ceremonies).map_err(crate::access::AccessError)?;
+            let changed = serde_json::to_vec(&ceremonies).map_err(|error| {
+                crate::access::AccessError(format!(
+                    "serialize custom-domain passkey ceremonies: {error}"
+                ))
+            })? != before;
+            if changed {
+                save_ceremony_store_locked(&self.cert_dir, &ceremonies)?;
+            }
+            Ok(result)
         })
         .map_err(|error| error.to_string())
     }
@@ -1142,6 +1154,39 @@ mod tests {
         runtime
             .registration_start(RegistrationStartInput { token }, &domain.origin)
             .expect("the invitation survives a failed atomic flow commit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_or_rejected_ceremony_transactions_do_not_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = PasskeyRuntime::new(
+            domain(),
+            dir.path().to_path_buf(),
+            hosted_runtime(dir.path()),
+        )
+        .unwrap();
+        runtime
+            .registration_invite(RegistrationInviteInput {
+                label: "Phone".to_string(),
+            })
+            .unwrap();
+
+        let original = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let unchanged = runtime.mutate_ceremonies(|_| Ok(()));
+        let rejected =
+            runtime.mutate_ceremonies::<()>(|_| Err("ceremony request rejected".to_string()));
+        std::fs::set_permissions(dir.path(), original).unwrap();
+
+        unchanged.expect("an unchanged transaction performs no durable write");
+        assert_eq!(
+            rejected.unwrap_err(),
+            "ceremony request rejected",
+            "a rejected transaction returns its decision without attempting a write"
+        );
     }
 
     #[test]

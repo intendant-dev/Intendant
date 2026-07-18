@@ -261,9 +261,12 @@ struct ExactTunnelSession {
     server_names: Vec<String>,
 }
 
-/// A daemon label's fallback presence plus independently proved v2 pollers.
+/// A daemon label's legacy-v1 fallback presence plus independently proved v2
+/// pollers. Exact pollers can also serve the daemon-label fallback, but their
+/// liveness must not overwrite the legacy timestamp: a signed v2 disconnect
+/// removes only that exact session while a rolling v1 sibling remains live.
 struct TunnelEntry {
-    fallback_last_seen_unix_ms: u64,
+    legacy_fallback_last_seen_unix_ms: Option<u64>,
     fallback_pending: VecDeque<PendingDialback>,
     fallback_notify: Arc<Notify>,
     exact_sessions: HashMap<String, ExactTunnelSession>,
@@ -357,6 +360,15 @@ impl RelayState {
         self.listen
     }
 
+    fn fallback_is_live(entry: &TunnelEntry, now: u64) -> bool {
+        entry
+            .legacy_fallback_last_seen_unix_ms
+            .is_some_and(|last_seen| now.saturating_sub(last_seen) <= RELAY_TUNNEL_LIVENESS_MS)
+            || entry.exact_sessions.values().any(|session| {
+                now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+            })
+    }
+
     /// Refresh a tunnel's control-channel presence on each poll. Exact names
     /// have one live incumbent: a second daemon is rejected at admission so
     /// the incumbent retains one unambiguous route. Resolution still retains
@@ -385,7 +397,7 @@ impl RelayState {
         let entry = tunnels
             .entry(label.to_string())
             .or_insert_with(|| TunnelEntry {
-                fallback_last_seen_unix_ms: now,
+                legacy_fallback_last_seen_unix_ms: None,
                 fallback_pending: VecDeque::new(),
                 fallback_notify: Arc::new(Notify::new()),
                 exact_sessions: HashMap::new(),
@@ -400,7 +412,6 @@ impl RelayState {
                 return false;
             }
         }
-        entry.fallback_last_seen_unix_ms = now;
         // Exact-name ownership and its nonce queue belong to the v2 poller
         // that supplied the certificate proof. A v1 sibling may refresh only
         // the fleet-label fallback and can never keep or consume this state.
@@ -416,17 +427,21 @@ impl RelayState {
                 });
             session.last_seen_unix_ms = now;
             session.server_names = server_names.to_vec();
+        } else {
+            entry.legacy_fallback_last_seen_unix_ms = Some(now);
         }
         true
     }
 
-    fn remove_tunnel(&self, label: &str, poller_id: &str) {
+    fn remove_tunnel(&self, label: &str, poller_id: &str, now: u64) {
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
         let mut remove_entry = false;
         if let Some(entry) = tunnels.get_mut(label) {
+            entry.exact_sessions.retain(|_, session| {
+                now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+            });
             entry.exact_sessions.remove(poller_id);
-            if entry.exact_sessions.is_empty() {
-                entry.fallback_last_seen_unix_ms = 0;
+            if !Self::fallback_is_live(entry, now) {
                 entry.fallback_pending.clear();
                 entry.fallback_notify.notify_waiters();
                 remove_entry = true;
@@ -498,12 +513,9 @@ impl RelayState {
     #[cfg(test)]
     fn tunnel_active(&self, label: &str, now: u64) -> bool {
         let tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
-        tunnels.get(label).is_some_and(|entry| {
-            now.saturating_sub(entry.fallback_last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
-                || entry.exact_sessions.values().any(|session| {
-                    now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
-                })
-        })
+        tunnels
+            .get(label)
+            .is_some_and(|entry| Self::fallback_is_live(entry, now))
     }
 
     /// Resolve an SNI to one active daemon tunnel. Exact v2 registrations take
@@ -556,8 +568,7 @@ impl RelayState {
         }
         let label = sni_route_label(&normalized)?;
         tunnels.get(&label).and_then(|entry| {
-            (now.saturating_sub(entry.fallback_last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS)
-                .then_some(TunnelRoute::Fallback { label })
+            Self::fallback_is_live(entry, now).then_some(TunnelRoute::Fallback { label })
         })
     }
 
@@ -581,7 +592,7 @@ impl RelayState {
         };
         let notifies = match route {
             TunnelRoute::Fallback { .. } => {
-                if now.saturating_sub(entry.fallback_last_seen_unix_ms) > RELAY_TUNNEL_LIVENESS_MS
+                if !Self::fallback_is_live(entry, now)
                     || entry.fallback_pending.len() >= RELAY_MAX_PENDING_PER_TUNNEL
                 {
                     None
@@ -647,8 +658,7 @@ impl RelayState {
                 entry.exact_sessions.retain(|_, session| {
                     now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
                 });
-                now.saturating_sub(entry.fallback_last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
-                    || !entry.exact_sessions.is_empty()
+                Self::fallback_is_live(entry, now)
             });
     }
 
@@ -1110,6 +1120,7 @@ pub(crate) async fn relay_next(
             poller_id
                 .as_deref()
                 .expect("disconnect requires a canonical poller id"),
+            now_unix_ms(),
         );
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
@@ -2117,12 +2128,46 @@ mod tests {
             .resolve_tunnel("d-disconnect.fleet.example.test", now)
             .is_some());
 
-        relay.remove_tunnel("d-disconnect", poller);
+        relay.remove_tunnel("d-disconnect", poller, now);
 
         assert!(relay.resolve_tunnel("box.example.test", now).is_none());
         assert!(relay
             .resolve_tunnel("d-disconnect.fleet.example.test", now)
             .is_none());
+    }
+
+    #[test]
+    fn v2_disconnect_preserves_a_live_v1_fallback_and_its_queue() {
+        let relay = relay_state();
+        let label = "d-rolling";
+        let poller = "11111111111111111111111111111111";
+        let names = vec!["box.example.test".to_string()];
+        let now = now_unix_ms();
+        assert!(relay.touch_tunnel(label, now, None, None));
+        assert!(relay.touch_tunnel(label, now + 1, Some(poller), Some(&names)));
+        let fallback = TunnelRoute::Fallback {
+            label: label.to_string(),
+        };
+        assert!(relay.enqueue_dialback(
+            &fallback,
+            "legacy-fallback-nonce".to_string(),
+            "198.51.100.10".parse().unwrap(),
+            now + 1,
+        ));
+
+        relay.remove_tunnel(label, poller, now + 2);
+
+        assert!(relay.resolve_tunnel("box.example.test", now + 2).is_none());
+        assert_eq!(
+            relay.resolve_tunnel("d-rolling.fleet.example.test", now + 2),
+            Some(fallback)
+        );
+        assert_eq!(
+            relay
+                .pop_pending(label, None)
+                .map(|dialback| dialback.nonce),
+            Some("legacy-fallback-nonce".to_string())
+        );
     }
 
     // ── Dial-back framing ───────────────────────────────────────────────────

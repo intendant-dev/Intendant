@@ -1241,6 +1241,11 @@ fn claim_issuance_locked_in(
         order.updated_unix_ms = now;
         order.clone()
     } else {
+        if store.orders.len() >= FLEET_CERT_ISSUANCE_MAX_ACTIVE {
+            return Err(crate::access::AccessError(
+                "fleet certificate issuance state is at capacity".to_string(),
+            ));
+        }
         let order = InFlightIssuance {
             token: uuid::Uuid::new_v4().simple().to_string(),
             name,
@@ -3091,6 +3096,49 @@ mod tests {
             !issuance_active_in(temp.path(), name).unwrap(),
             "the committed pair is terminal authority and leaves no duplicate order"
         );
+    }
+
+    #[test]
+    fn issuance_store_cap_refuses_a_new_name_without_corrupting_the_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = now_unix_ms();
+        let orders = (0..FLEET_CERT_ISSUANCE_MAX_ACTIVE)
+            .map(|index| InFlightIssuance {
+                token: format!("order-{index}"),
+                name: format!("d-{index:020x}.fleet.example.test"),
+                started_unix_ms: now,
+                updated_unix_ms: now,
+                owner_token: None,
+                owner_lease_expires_unix_ms: 0,
+                order_url: None,
+                private_key_pem: None,
+                csr_der_b64: None,
+            })
+            .collect();
+        crate::access::authority_store::with_lock(temp.path(), || {
+            write_issuance_store_locked_in(
+                temp.path(),
+                &InFlightIssuanceStore {
+                    schema_version: FLEET_CERT_ISSUANCE_SCHEMA_VERSION,
+                    orders,
+                },
+            )
+        })
+        .unwrap();
+        let next = "d-ffffffffffffffffffff.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), next).unwrap();
+
+        let error = match claim_issuance_request_in(temp.path(), next) {
+            Ok(_) => panic!("a full issuance store must refuse a new name"),
+            Err(error) => error,
+        };
+        assert!(error.contains("at capacity"), "{error}");
+        let retained = crate::access::authority_store::with_lock(temp.path(), || {
+            load_issuance_store_locked_in(temp.path()).map_err(crate::access::AccessError)
+        })
+        .unwrap();
+        assert_eq!(retained.orders.len(), FLEET_CERT_ISSUANCE_MAX_ACTIVE);
+        assert!(retained.orders.iter().all(|order| order.name != next));
     }
 
     #[test]
