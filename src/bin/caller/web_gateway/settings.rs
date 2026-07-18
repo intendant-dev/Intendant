@@ -643,13 +643,55 @@ pub(crate) fn settings_post_result(
     body_text: &str,
     project_root: Option<&Path>,
     bus: &EventBus,
+    caller_may_manage_credentials: bool,
 ) -> (u16, String) {
     settings_post_result_with_sandbox_apply(
         body_text,
         project_root,
         bus,
+        caller_may_manage_credentials,
         live_apply_sandbox_settings,
     )
+}
+
+/// The executable-repointing fields whose CHANGE `payload` would apply
+/// against the currently persisted `config` — the credential-adjacent
+/// subset of the settings surface (which binary external-agent sessions
+/// spawn with the owner's credentials and workspace). Values compare
+/// post-normalization, so a full-payload round trip that echoes the
+/// current values (the dashboard's save shape) never trips the gate; only
+/// an actual repoint does. The ControlMsg lane enforces the same rule via
+/// `control_msg_operation` (SetCodexCommand / SetCodexManagedCommand
+/// classify as credentials.manage).
+fn executable_repoint_denials(
+    payload: &SettingsPayload,
+    config: &crate::project::ProjectConfig,
+) -> Vec<&'static str> {
+    let mut denied = Vec::new();
+    if payload.codex_command.is_some() {
+        let next = normalize_settings_codex_command(payload.codex_command.as_deref());
+        if next != config.agent.codex.command {
+            denied.push("codex_command");
+        }
+    }
+    if payload.codex_managed_command.is_some() {
+        let next = payload
+            .codex_managed_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|cmd| !cmd.is_empty())
+            .map(str::to_string);
+        if next != config.agent.codex.managed_command {
+            denied.push("codex_managed_command");
+        }
+    }
+    if payload.claude_command.is_some() {
+        let next = normalize_settings_agent_command(payload.claude_command.as_deref(), "claude");
+        if next != config.agent.claude_code.command {
+            denied.push("claude_command");
+        }
+    }
+    denied
 }
 
 /// The write-sandbox live-apply seam `settings_post_result` runs after a
@@ -675,6 +717,7 @@ pub(crate) fn settings_post_result_with_sandbox_apply(
     body_text: &str,
     project_root: Option<&Path>,
     bus: &EventBus,
+    caller_may_manage_credentials: bool,
     sandbox_live_apply: impl FnOnce(&crate::project::SandboxProjectConfig) -> Result<(), String>,
 ) -> (u16, String) {
     let Some(root) = project_root else {
@@ -698,6 +741,25 @@ pub(crate) fn settings_post_result_with_sandbox_apply(
             return (500, serde_json::json!({"error": e.to_string()}).to_string());
         }
     };
+    if !caller_may_manage_credentials {
+        let denied = executable_repoint_denials(&payload, &proj.config);
+        if !denied.is_empty() {
+            return (
+                403,
+                serde_json::json!({
+                    "error": format!(
+                        "changing {} requires credential-management authority \
+                         (credentials.manage, the /api/api-keys gate): the command \
+                         path decides which executable runs with this machine's \
+                         credentials. Save it from an owner surface.",
+                        denied.join(", ")
+                    ),
+                    "denied_fields": denied,
+                })
+                .to_string(),
+            );
+        }
+    }
     apply_settings_payload(&mut proj.config, &payload);
     match proj.save_config() {
         Ok(()) => {
@@ -1036,8 +1098,10 @@ pub(crate) fn settings_post_api_response(
     body_text: &str,
     project_root: Option<&Path>,
     bus: &EventBus,
+    caller_may_manage_credentials: bool,
 ) -> ApiResponse {
-    let (status, body) = settings_post_result(body_text, project_root, bus);
+    let (status, body) =
+        settings_post_result(body_text, project_root, bus, caller_may_manage_credentials);
     ApiResponse::json(status, JsonBody::PreSerialized(body))
 }
 
@@ -1108,10 +1172,16 @@ pub(crate) async fn handle_settings_post(
     body_text: String,
     bus: EventBus,
     project_root: Option<PathBuf>,
+    caller_may_manage_credentials: bool,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = settings_post_api_response(&body_text, project_root.as_deref(), &bus);
+    let response = settings_post_api_response(
+        &body_text,
+        project_root.as_deref(),
+        &bus,
+        caller_may_manage_credentials,
+    );
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -1427,6 +1497,7 @@ mod tests {
             "{\"external_agent\":",
             Some(Path::new(".")),
             &EventBus::new(),
+            true,
         );
 
         assert_eq!(status, 400);
@@ -1435,7 +1506,7 @@ mod tests {
 
     #[test]
     fn settings_post_result_rejects_missing_project_root_with_bad_request() {
-        let (status, body) = settings_post_result("{}", None, &EventBus::new());
+        let (status, body) = settings_post_result("{}", None, &EventBus::new(), true);
 
         assert_eq!(status, 400);
         assert!(body.contains("No project root"));
@@ -1487,7 +1558,7 @@ mod tests {
         })
         .to_string();
 
-        let (status, _) = settings_post_result(&body, Some(dir.path()), &bus);
+        let (status, _) = settings_post_result(&body, Some(dir.path()), &bus, true);
         assert_eq!(status, 200);
 
         let mut saw_command = false;
@@ -1714,7 +1785,15 @@ mod tests {
         let cors = settings_route_cors("POST", "/api/settings");
         // Missing project root: 400 under the canonical tail.
         let response = collect_settings_handler_response(|stream| {
-            handle_settings_post(stream, "{}".to_string(), EventBus::new(), None, cors, None)
+            handle_settings_post(
+                stream,
+                "{}".to_string(),
+                EventBus::new(),
+                None,
+                true,
+                cors,
+                None,
+            )
         })
         .await;
         assert_eq!(
@@ -1736,6 +1815,7 @@ mod tests {
                 invalid.to_string(),
                 EventBus::new(),
                 Some(parse_dir.path().to_path_buf()),
+                true,
                 cors,
                 None,
             )
@@ -1777,6 +1857,7 @@ mod tests {
                 body,
                 EventBus::new(),
                 Some(root.clone()),
+                true,
                 cors,
                 None,
             )
@@ -1960,7 +2041,7 @@ mod tests {
         })
         .to_string();
 
-        let (status, _) = settings_post_result(&body, Some(dir.path()), &bus);
+        let (status, _) = settings_post_result(&body, Some(dir.path()), &bus, true);
         assert_eq!(status, 200);
 
         while let Ok(event) = rx.try_recv() {
@@ -2066,6 +2147,7 @@ mod tests {
             &body.to_string(),
             Some(dir.path()),
             &EventBus::new(),
+            true,
             |sandbox| {
                 *seen.borrow_mut() = Some((sandbox.enabled, sandbox.extra_write_paths.clone()));
                 Ok(())
@@ -2110,6 +2192,7 @@ mod tests {
             &minimal_settings_body().to_string(),
             Some(dir.path()),
             &EventBus::new(),
+            true,
             |_| panic!("live apply must not run for a payload without sandbox fields"),
         );
 
@@ -2130,6 +2213,7 @@ mod tests {
             &body.to_string(),
             Some(dir.path()),
             &EventBus::new(),
+            true,
             |_| Err("no runtime state".to_string()),
         );
 
@@ -2141,5 +2225,80 @@ mod tests {
             r#"{"applied":false,"apply_error":"no runtime state","ok":true}"#
         );
         assert!(dir.path().join("intendant.toml").exists());
+    }
+
+    #[test]
+    fn executable_repoint_requires_credentials_manage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = minimal_settings_body();
+        body["codex_command"] = serde_json::json!("/tmp/evil-codex");
+        body["claude_command"] = serde_json::json!("/tmp/evil-claude");
+
+        let (status, response) = settings_post_result_with_sandbox_apply(
+            &body.to_string(),
+            Some(dir.path()),
+            &EventBus::new(),
+            false,
+            |_| Ok(()),
+        );
+        assert_eq!(status, 403, "{response}");
+        assert!(response.contains("codex_command"), "{response}");
+        assert!(response.contains("claude_command"), "{response}");
+        assert!(
+            !dir.path().join("intendant.toml").exists(),
+            "denied save must not persist config"
+        );
+
+        // The same save succeeds with credential-management authority.
+        let (status, response) = settings_post_result_with_sandbox_apply(
+            &body.to_string(),
+            Some(dir.path()),
+            &EventBus::new(),
+            true,
+            |_| Ok(()),
+        );
+        assert_eq!(status, 200, "{response}");
+        let reloaded = crate::project::Project::from_root(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.config.agent.codex.command, "/tmp/evil-codex");
+        assert_eq!(
+            reloaded.config.agent.claude_code.command,
+            "/tmp/evil-claude"
+        );
+    }
+
+    #[test]
+    fn executable_echo_saves_without_credentials_manage() {
+        let dir = tempfile::tempdir().unwrap();
+        // Persist a non-default command first (an owner action).
+        let mut project = crate::project::Project::from_root(dir.path().to_path_buf()).unwrap();
+        project.config.agent.codex.command = "my-codex".to_string();
+        project.save_config().unwrap();
+
+        // A Settings-only caller echoing the current value (the dashboard's
+        // full-payload round trip) is not repointing anything — normalized
+        // comparison, so whitespace never trips the gate.
+        let mut body = minimal_settings_body();
+        body["codex_command"] = serde_json::json!(" my-codex ");
+        let (status, response) = settings_post_result_with_sandbox_apply(
+            &body.to_string(),
+            Some(dir.path()),
+            &EventBus::new(),
+            false,
+            |_| Ok(()),
+        );
+        assert_eq!(status, 200, "{response}");
+
+        // Changing it without the authority is refused and nothing persists.
+        body["codex_command"] = serde_json::json!("other-codex");
+        let (status, response) = settings_post_result_with_sandbox_apply(
+            &body.to_string(),
+            Some(dir.path()),
+            &EventBus::new(),
+            false,
+            |_| Ok(()),
+        );
+        assert_eq!(status, 403, "{response}");
+        let reloaded = crate::project::Project::from_root(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.config.agent.codex.command, "my-codex");
     }
 }

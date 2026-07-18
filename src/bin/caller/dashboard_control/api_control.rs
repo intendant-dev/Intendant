@@ -1331,12 +1331,20 @@ pub(crate) async fn api_settings_save_response(
         session.runtime_settings.settings_root.clone()
     }
     .or_else(|| runtime.project_root.clone());
+    // Same per-field escalation as the HTTP twin: executable repointing
+    // requires credentials.manage; everything else rides the row's
+    // Settings authorization.
+    let caller_may_manage_credentials = runtime
+        .grant
+        .access_decision(crate::peer::access_policy::PeerOperation::CredentialsManage)
+        .allowed;
     frame_api_response(
         id,
         crate::web_gateway::settings_post_api_response(
             &body_text,
             settings_root.as_deref(),
             &runtime.bus,
+            caller_may_manage_credentials,
         ),
         "settings save",
     )
@@ -2663,7 +2671,7 @@ mod tests {
         let payload = parity_settings_payload();
         let body_text = params_body_text(Some(&payload));
         let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::settings_post_api_response(&body_text, None, &rt.bus),
+            crate::web_gateway::settings_post_api_response(&body_text, None, &rt.bus, true),
         );
         assert_eq!(status, 400);
         let frame =
@@ -2683,6 +2691,7 @@ mod tests {
                 &body_text,
                 Some(http_dir.path()),
                 &rt.bus,
+                true,
             ));
         assert_eq!(status, 200);
         assert_eq!(http_body, serde_json::json!({"ok": true, "applied": true}));
@@ -3805,6 +3814,36 @@ mod tests {
             crate::access::access_policy::control_msg_operation(&msg),
             crate::peer::access_policy::PeerOperation::SessionManage,
         );
+    }
+
+    /// Executable repointing rides the settings carry allowlist but
+    /// classifies as credentials.manage: the command path decides which
+    /// binary runs with the owner's credentials, so a Settings-only caller
+    /// (peer profiles; scoped humans without the grant) cannot repoint it
+    /// through the ControlMsg lane any more than through POST /api/settings.
+    #[test]
+    fn executable_repoint_control_msgs_classify_as_credentials_manage() {
+        for (probe, action) in [
+            (
+                serde_json::json!({ "action": "set_codex_command", "command": "x" }),
+                "set_codex_command",
+            ),
+            (
+                serde_json::json!({ "action": "set_codex_managed_command", "command": "x" }),
+                "set_codex_managed_command",
+            ),
+        ] {
+            let msg: ControlMsg = serde_json::from_value(probe).expect("parses");
+            assert_eq!(dashboard_control_msg_action(&msg), action);
+            assert!(
+                dashboard_control_msg_allowed(&msg),
+                "stays on the carry allowlist (root dashboard still saves)"
+            );
+            assert_eq!(
+                crate::access::access_policy::control_msg_operation(&msg),
+                crate::peer::access_policy::PeerOperation::CredentialsManage,
+            );
+        }
     }
 
     /// Every allowlisted action name must be a real `ControlMsg` wire name —

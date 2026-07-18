@@ -618,8 +618,11 @@ impl IntendantServer {
             "schedule_controller_restart" => {
                 let Parameters(params) = parse_params::<ScheduleControllerRestartParams>(args)?;
                 Ok(text_tool_result(
-                    self.schedule_controller_restart_scoped(params, McpToolScope::from_actor(&actor))
-                        .await,
+                    self.schedule_controller_restart_scoped(
+                        params,
+                        McpToolScope::from_actor(&actor),
+                    )
+                    .await,
                 ))
             }
             "controller_turn_complete" => {

@@ -273,6 +273,17 @@ operation; granting requires a session whose principal holds a new
 `credentials.manage` gate (IAM v2 catalog), so a scoped guest session
 cannot fuel or drain a daemon.
 
+The same gate covers **executable repointing**: the external-agent
+command paths (`codex_command`, `codex_managed_command`,
+`claude_command`) decide which binary runs with the machine's
+credentials and workspace, so changing them — via POST `/api/settings`
+(per-field: everything else on the settings surface stays
+Settings-class, and a full-payload round trip that merely echoes the
+current values saves fine) or via the `SetCodexCommand` /
+`SetCodexManagedCommand` ControlMsg twins — requires
+`credentials.manage`. A federated peer or scoped session holding only
+Settings cannot repoint what the daemon executes.
+
 **Lifetime.** Two knobs, both user-visible:
 
 - **Connected renewal**: while any granting browser session is attached,
