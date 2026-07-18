@@ -513,6 +513,24 @@ pub(crate) async fn serve_http_request(
         return;
     }
 
+    // Lease verification runs on the authority-store worker and can outlive
+    // the custom-domain lane decision above. Do not convert a valid proof
+    // into request authority if the live owner-name gate closed meanwhile.
+    if custom_domain_hosted_authority_revoked(
+        custom_domain_selected,
+        hosted_verified.is_some(),
+        || custom_domain.enabled(),
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let response = json_error(
+            "403 Forbidden",
+            "custom-domain control became unavailable while request authority was being verified",
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        finalize_http_stream(&mut stream).await;
+        return;
+    }
+
     let hosted_verified_for_handler = hosted_verified.clone();
     let http_access_context = if let Some(verified) = hosted_verified.as_ref() {
         HttpAccessContext {

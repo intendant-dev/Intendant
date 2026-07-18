@@ -2164,6 +2164,25 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                             return;
                         }
                     }
+                    // Ticket consumption crosses the same authority-store
+                    // worker boundary as HTTP proof verification. Recheck
+                    // owner-name eligibility before converting the ticket
+                    // into a live dashboard grant.
+                    if custom_domain_hosted_authority_revoked(
+                        custom_domain_selected,
+                        hosted_ws_authority.is_some(),
+                        || custom_domain.enabled(),
+                    ) {
+                        use tokio::io::AsyncWriteExt;
+                        let response = json_error(
+                            "403 Forbidden",
+                            "custom-domain control became unavailable while WebSocket authority was being verified",
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
+                        return;
+                    }
+
                     let dashboard_control_grant_for_ws = match hosted_ws_authority {
                         Some(verified) => {
                             crate::dashboard_control::DashboardControlGrant::UserClient {

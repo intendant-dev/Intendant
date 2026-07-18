@@ -85,6 +85,17 @@ pub(crate) fn classify_public_control_lane<'a>(
     }
 }
 
+/// A proof or ticket can cross an authority-store await after the TLS lane was
+/// classified. Recheck the mutable owner-name gate before converting that
+/// result into HTTP or WebSocket authority.
+pub(crate) fn custom_domain_hosted_authority_revoked(
+    custom_domain_selected: bool,
+    hosted_authority_present: bool,
+    custom_domain_enabled: impl FnOnce() -> bool,
+) -> bool {
+    custom_domain_selected && hosted_authority_present && !custom_domain_enabled()
+}
+
 fn json_value<T: serde::Serialize>(value: T) -> ApiResponse {
     match serde_json::to_value(value) {
         Ok(value) => ApiResponse::json(200, JsonBody::Value(value)),
@@ -878,6 +889,25 @@ mod tests {
         assert!(!lane.configured);
         assert_eq!(lane.live_custom_domain, None);
         assert!(lane.custom_domain_revoked);
+    }
+
+    #[test]
+    fn verified_custom_domain_authority_requires_a_fresh_live_gate() {
+        assert!(custom_domain_hosted_authority_revoked(true, true, || false));
+        assert!(!custom_domain_hosted_authority_revoked(true, true, || true));
+
+        let checked = std::cell::Cell::new(false);
+        assert!(!custom_domain_hosted_authority_revoked(false, true, || {
+            checked.set(true);
+            false
+        }));
+        assert!(
+            !checked.get(),
+            "fleet requests must not consult custom-domain state"
+        );
+        assert!(!custom_domain_hosted_authority_revoked(true, false, || {
+            false
+        }));
     }
 
     #[test]
