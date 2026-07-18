@@ -78,7 +78,8 @@ pub(crate) async fn serve_http_request(
     peer_addr: std::net::SocketAddr,
     source_hint: String,
     is_tls: bool,
-    tls_fleet_origin: bool,
+    tls_server_name: Option<String>,
+    tls_fleet_origin: Option<String>,
     tls_custom_domain: Option<String>,
     tls_client_cert_present: bool,
     tls_client_cert_fingerprint: Option<String>,
@@ -307,7 +308,7 @@ pub(crate) async fn serve_http_request(
     // is resolved. SNI provenance comes from rustls certificate selection,
     // never this request's mutable Host header.
     let base_discovery_only_ingress = gateway_ingress.is_reachability_relay()
-        || tls_fleet_origin
+        || tls_fleet_origin.is_some()
         || request_names_known_fleet_origin(header_text);
     let custom_domain_selected = tls_custom_domain.is_some();
     let public_lane = classify_public_control_lane(
@@ -358,7 +359,13 @@ pub(crate) async fn serve_http_request(
         && http_header_value(header_text, "x-intendant-hosted-lease").is_some()
     {
         let proof = hosted_request_proof_from_headers(header_text).and_then(|proof| {
-            let fleet_origin = public_origin_from_request(header_text, is_tls, tls_custom_domain)?;
+            let fleet_origin = public_origin_from_request(
+                header_text,
+                is_tls,
+                tls_server_name.as_deref(),
+                tls_fleet_origin.as_deref(),
+                tls_custom_domain,
+            )?;
             Ok((proof, fleet_origin))
         });
         let result = match proof {
@@ -1560,6 +1567,8 @@ pub(crate) async fn serve_http_request(
                     custom_domain,
                     header_text,
                     is_tls,
+                    tls_server_name.as_deref(),
+                    tls_fleet_origin.as_deref(),
                     tls_custom_domain,
                     route.cors,
                 )
@@ -1574,7 +1583,13 @@ pub(crate) async fn serve_http_request(
                     stream,
                     route_body,
                     hosted_control,
-                    public_origin_from_request(header_text, is_tls, tls_custom_domain),
+                    public_origin_from_request(
+                        header_text,
+                        is_tls,
+                        tls_server_name.as_deref(),
+                        tls_fleet_origin.as_deref(),
+                        tls_custom_domain,
+                    ),
                     source_bucket,
                     route.cors,
                 )
@@ -1621,6 +1636,8 @@ pub(crate) async fn serve_http_request(
                     custom_domain,
                     header_text,
                     is_tls,
+                    tls_server_name.as_deref(),
+                    tls_fleet_origin.as_deref(),
                     tls_custom_domain,
                     source_bucket,
                     route.cors,

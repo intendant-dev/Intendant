@@ -1714,7 +1714,8 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
 
                 let buf_owned: Vec<u8>;
                 let mut stream: DemuxStream;
-                let tls_fleet_origin: bool;
+                let tls_server_name: Option<String>;
+                let tls_fleet_origin: Option<String>;
                 let tls_custom_domain: Option<String>;
                 let tls_client_cert_present: bool;
                 let tls_client_cert_fingerprint: Option<String>;
@@ -1754,15 +1755,20 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // endpoint, never an authority anchor; HTTP Host alone is
                     // mutable and cannot establish the stronger direct-mTLS
                     // ceremony.
-                    let tls_server_name = tls_stream.get_ref().1.server_name();
+                    tls_server_name = tls_stream
+                        .get_ref()
+                        .1
+                        .server_name()
+                        .map(|name| name.trim_end_matches('.').to_ascii_lowercase());
                     let selected_custom =
-                        crate::web_tls::custom_domain_server_name(tls_server_name);
+                        crate::web_tls::custom_domain_server_name(tls_server_name.as_deref());
                     // Preserve the selected custom-name provenance for every
                     // request on this TLS connection. Its live eligibility is
                     // rechecked per HTTP request / WS upgrade; erasing it here
                     // would let an ineligible owner-name lane fall through to
                     // the independently configured fleet-name switch.
-                    tls_fleet_origin = crate::web_tls::is_fleet_server_name(tls_server_name);
+                    tls_fleet_origin =
+                        crate::web_tls::fleet_server_name(tls_server_name.as_deref());
                     tls_custom_domain = selected_custom;
                     let peer_certs = tls_stream
                         .get_ref()
@@ -1807,7 +1813,8 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // replay prefix — a zero-overhead pass-through that
                     // reads the request straight from the socket.
                     buf_owned = buf[..peeked].to_vec();
-                    tls_fleet_origin = false;
+                    tls_server_name = None;
+                    tls_fleet_origin = None;
                     tls_custom_domain = None;
                     tls_client_cert_present = false;
                     tls_client_cert_fingerprint = None;
@@ -1956,7 +1963,8 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         peer_addr,
                         source_hint.clone(),
                         is_tls,
-                        tls_fleet_origin,
+                        tls_server_name.clone(),
+                        tls_fleet_origin.clone(),
                         tls_custom_domain.clone(),
                         tls_client_cert_present,
                         tls_client_cert_fingerprint.clone(),
@@ -1997,7 +2005,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                 //    follow-up whose head asked to upgrade. ──
                 {
                     let base_discovery_only_ws = gateway_ingress.is_reachability_relay()
-                        || tls_fleet_origin
+                        || tls_fleet_origin.is_some()
                         || request_names_known_fleet_origin(&header_text);
                     let custom_domain_selected = tls_custom_domain.is_some();
                     let public_lane = classify_public_control_lane(
@@ -2017,6 +2025,8 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                                 let origin = public_origin_from_request(
                                     &header_text,
                                     is_tls,
+                                    tls_server_name.as_deref(),
+                                    tls_fleet_origin.as_deref(),
                                     live_tls_custom_domain,
                                 );
                                 let result = match origin {

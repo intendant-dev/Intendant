@@ -230,16 +230,26 @@ pub(crate) fn fleet_origin_from_request(header_text: &str, is_tls: bool) -> Resu
 pub(crate) fn public_origin_from_request(
     header_text: &str,
     is_tls: bool,
+    tls_server_name: Option<&str>,
+    tls_fleet_domain: Option<&str>,
     tls_custom_domain: Option<&str>,
 ) -> Result<String, String> {
     let origin = fleet_origin_from_request(header_text, is_tls)?;
-    if let Some(custom_name) = tls_custom_domain {
-        let expected = format!("https://{custom_name}");
-        if origin != expected {
-            return Err(
-                "request Host must equal the exact custom-domain TLS server name".to_string(),
-            );
+    let classified_name = match (tls_fleet_domain, tls_custom_domain) {
+        (Some(name), None) | (None, Some(name)) => Some(name),
+        (Some(_), Some(_)) => {
+            return Err("public TLS server-name provenance is ambiguous".to_string())
         }
+        (None, None) => None,
+    };
+    let selected_name = tls_server_name
+        .ok_or_else(|| "hosted control requires an exact public TLS server name".to_string())?;
+    if classified_name.is_some_and(|classified| classified != selected_name) {
+        return Err("public TLS server-name provenance does not match its lane".to_string());
+    }
+    let expected = format!("https://{selected_name}");
+    if origin != expected {
+        return Err("request Host must equal the exact public TLS server name".to_string());
     }
     Ok(origin)
 }
@@ -264,16 +274,25 @@ pub(crate) fn hosted_request_proof_from_headers(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // request-edge dependencies and distinct TLS provenance, not one mutable bundle
 pub(crate) async fn handle_hosted_control_bootstrap(
     stream: DemuxStream,
     runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
     custom_domain: Arc<crate::custom_domain::CustomDomainRuntime>,
     header_text: &str,
     is_tls: bool,
+    tls_server_name: Option<&str>,
+    tls_fleet_domain: Option<&str>,
     tls_custom_domain: Option<&str>,
     cors: crate::gateway_routes::CorsPosture,
 ) {
-    let result = match public_origin_from_request(header_text, is_tls, tls_custom_domain) {
+    let result = match public_origin_from_request(
+        header_text,
+        is_tls,
+        tls_server_name,
+        tls_fleet_domain,
+        tls_custom_domain,
+    ) {
         Ok(origin) => {
             let runtime = Arc::clone(&runtime);
             let custom_domain = Arc::clone(&custom_domain);
@@ -343,7 +362,7 @@ pub(crate) async fn handle_hosted_control_request_create(
     write_api_response(stream, response, cors, None).await;
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // request-edge dependencies and distinct TLS provenance, not one mutable bundle
 pub(crate) async fn handle_custom_domain_passkey(
     stream: DemuxStream,
     path: &str,
@@ -351,11 +370,19 @@ pub(crate) async fn handle_custom_domain_passkey(
     custom_domain: Arc<crate::custom_domain::CustomDomainRuntime>,
     header_text: &str,
     is_tls: bool,
+    tls_server_name: Option<&str>,
+    tls_fleet_domain: Option<&str>,
     tls_custom_domain: Option<&str>,
     source_bucket: Option<&str>,
     cors: crate::gateway_routes::CorsPosture,
 ) {
-    let result = match public_origin_from_request(header_text, is_tls, tls_custom_domain) {
+    let result = match public_origin_from_request(
+        header_text,
+        is_tls,
+        tls_server_name,
+        tls_fleet_domain,
+        tls_custom_domain,
+    ) {
         Ok(origin) => {
             let custom_domain = Arc::clone(&custom_domain);
             let path = path.to_string();
@@ -939,11 +966,94 @@ mod tests {
     fn custom_origin_requires_exact_tls_sni_and_host_agreement() {
         let request = "GET / HTTP/1.1\r\nHost: box.example.test\r\n\r\n";
         assert_eq!(
-            public_origin_from_request(request, true, Some("box.example.test")).unwrap(),
+            public_origin_from_request(
+                request,
+                true,
+                Some("box.example.test"),
+                None,
+                Some("box.example.test"),
+            )
+            .unwrap(),
             "https://box.example.test"
         );
-        assert!(public_origin_from_request(request, true, Some("other.example.test")).is_err());
-        assert!(public_origin_from_request(request, false, Some("box.example.test")).is_err());
+        assert!(public_origin_from_request(
+            request,
+            true,
+            Some("box.example.test"),
+            None,
+            Some("other.example.test"),
+        )
+        .is_err());
+        assert!(public_origin_from_request(
+            request,
+            false,
+            Some("box.example.test"),
+            None,
+            Some("box.example.test"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn public_origin_cannot_cross_or_omit_the_selected_tls_lane() {
+        let custom_request = "GET / HTTP/1.1\r\nHost: box.owner.example\r\n\r\n";
+        let fleet_request = "GET / HTTP/1.1\r\nHost: d-1.fleet.example\r\n\r\n";
+        assert_eq!(
+            public_origin_from_request(
+                fleet_request,
+                true,
+                Some("d-1.fleet.example"),
+                Some("d-1.fleet.example"),
+                None,
+            )
+            .unwrap(),
+            "https://d-1.fleet.example"
+        );
+        assert!(public_origin_from_request(
+            custom_request,
+            true,
+            Some("d-1.fleet.example"),
+            Some("d-1.fleet.example"),
+            None,
+        )
+        .is_err());
+        assert!(public_origin_from_request(
+            fleet_request,
+            true,
+            Some("box.owner.example"),
+            None,
+            Some("box.owner.example"),
+        )
+        .is_err());
+        assert!(public_origin_from_request(custom_request, true, None, None, None,).is_err());
+        assert!(public_origin_from_request(
+            custom_request,
+            true,
+            Some("box.owner.example"),
+            Some("d-1.fleet.example"),
+            Some("box.owner.example"),
+        )
+        .is_err());
+        assert!(public_origin_from_request(
+            fleet_request,
+            true,
+            Some("other.example"),
+            Some("d-1.fleet.example"),
+            None,
+        )
+        .is_err());
+        assert_eq!(
+            public_origin_from_request(
+                custom_request,
+                true,
+                Some("box.owner.example"),
+                None,
+                None,
+            )
+            .unwrap(),
+            "https://box.owner.example",
+            "relay provenance may supply an exact public SNI before fleet classification",
+        );
     }
 
     #[test]

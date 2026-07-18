@@ -346,11 +346,16 @@ impl FleetSniResolver {
     }
 
     fn is_fleet_name(&self, name: &str) -> bool {
+        self.fleet_name(name).is_some()
+    }
+
+    fn fleet_name(&self, name: &str) -> Option<String> {
         let normalized = name.trim().trim_end_matches('.').to_ascii_lowercase();
         self.fleet_names
             .read()
             .expect("tls resolver poisoned")
             .contains(&normalized)
+            .then_some(normalized)
     }
 
     fn set_custom(&self, name: String, key: Arc<rustls::sign::CertifiedKey>) {
@@ -420,6 +425,13 @@ fn fleet_sni_resolver() -> Arc<FleetSniResolver> {
 /// when the browser also holds a daemon-issued client certificate.
 pub fn is_fleet_server_name(name: Option<&str>) -> bool {
     name.is_some_and(|name| fleet_sni_resolver().is_fleet_name(name))
+}
+
+/// Return the exact normalized public fleet/WebPKI SNI captured at the TLS
+/// boundary. HTTP authority checks retain the name, not just its class, so a
+/// mutable `Host` header cannot move a lease between public-origin lanes.
+pub fn fleet_server_name(name: Option<&str>) -> Option<String> {
+    name.and_then(|name| fleet_sni_resolver().fleet_name(name))
 }
 
 /// Remember a rendezvous-assigned fleet route before certificate issuance.
@@ -753,6 +765,11 @@ mod tests {
         assert!(is_fleet_server_name(Some(second_name)));
         assert!(is_fleet_server_name(Some("OLD-FLEET-ORIGIN.TEST.")));
         assert!(!is_fleet_server_name(Some("direct-daemon.test")));
+        assert_eq!(
+            fleet_server_name(Some("OLD-FLEET-ORIGIN.TEST.")),
+            Some(first_name.to_string())
+        );
+        assert_eq!(fleet_server_name(Some("direct-daemon.test")), None);
     }
 
     #[test]
