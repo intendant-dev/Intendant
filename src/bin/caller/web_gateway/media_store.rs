@@ -12,6 +12,52 @@
 
 use std::sync::Arc;
 
+pub(crate) const DASHBOARD_MEDIA_CLIP_MAX_FRAMES: usize = 1000;
+
+/// Validate one required browser/client media identifier at a transport edge.
+/// The frame registry repeats this check before every filesystem access; clip
+/// ids use the same grammar so they are safe in maps, logs, and context labels.
+pub(crate) fn validate_dashboard_media_id(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("missing {field}"));
+    }
+    crate::frames::validate_media_id(value).map_err(|err| format!("invalid {field}: {err}"))
+}
+
+/// Reject an invalid legacy `/ws` media identifier before it reaches a map,
+/// log, context label, or the frame registry. The binary dashboard-control
+/// lane returns the same validation error in its ordinary HTTP-shaped result.
+pub(crate) fn reject_invalid_dashboard_media_id(
+    direct_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    field: &str,
+    value: &str,
+) -> bool {
+    let Err(error) = validate_dashboard_media_id(field, value) else {
+        return false;
+    };
+    let _ = direct_tx.send(
+        serde_json::json!({
+            "t": "media_error",
+            "ok": false,
+            "error": error,
+        })
+        .to_string(),
+    );
+    true
+}
+
+/// Apply the same bounded allocation policy to the legacy `/ws` clip lane as
+/// the binary dashboard-control lane.
+pub(crate) fn validate_dashboard_clip_frame_count(total: u64) -> Result<usize, String> {
+    if total > DASHBOARD_MEDIA_CLIP_MAX_FRAMES as u64 {
+        return Err(format!(
+            "clip has {total} frames; cap is {DASHBOARD_MEDIA_CLIP_MAX_FRAMES}"
+        ));
+    }
+    usize::try_from(total)
+        .map_err(|_| "clip frame count is too large for this platform".to_string())
+}
+
 /// One in-flight clip operation: `clip_start` metadata plus the
 /// accumulated `(frame_id, base64_jpeg)` frames, injected into the agent
 /// context at `clip_end` when requested. The tunnel keeps these in the
@@ -198,4 +244,48 @@ pub(crate) fn inject_clip_context(
         steer_id: None,
     });
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_websocket_rejects_unsafe_media_identifiers() {
+        let (direct_tx, mut direct_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(reject_invalid_dashboard_media_id(
+            &direct_tx,
+            "frame_id",
+            "../escape"
+        ));
+        let response: serde_json::Value =
+            serde_json::from_str(&direct_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(response["t"], "media_error");
+        assert_eq!(response["ok"], false);
+        assert_eq!(
+            response["error"],
+            "invalid frame_id: must contain only ASCII letters, digits, '_' or '-'"
+        );
+
+        assert!(!reject_invalid_dashboard_media_id(
+            &direct_tx,
+            "clip_id",
+            "clip-display_0-1"
+        ));
+        assert!(direct_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn legacy_clip_count_is_bounded_before_allocation() {
+        assert_eq!(validate_dashboard_clip_frame_count(1000), Ok(1000));
+        assert_eq!(
+            validate_dashboard_clip_frame_count(u64::MAX),
+            Err(format!(
+                "clip has {} frames; cap is {}",
+                u64::MAX,
+                DASHBOARD_MEDIA_CLIP_MAX_FRAMES
+            ))
+        );
+    }
 }

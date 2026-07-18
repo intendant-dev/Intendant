@@ -1059,6 +1059,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_frame_group_titles_are_rendered_as_text() {
+        let source = include_str!("../../../../../static/app/57-sessions-replay.js");
+        let make_group = source
+            .split_once("function makeGroup(title, badge, fileList, collapsed)")
+            .map(|(_, tail)| tail)
+            .expect("session frame group renderer");
+        let make_group = make_group
+            .split_once("// Annotations")
+            .map(|(body, _)| body)
+            .expect("bounded session frame group renderer");
+
+        assert!(make_group.contains("document.createTextNode(title + ' ')"));
+        assert!(make_group.contains("badgeText.textContent = badge"));
+        assert!(
+            !make_group.contains("innerHTML"),
+            "stored frame filenames must never enter an HTML parser"
+        );
+    }
+
+    #[test]
     fn session_log_search_finds_intendant_log_content_not_summary() {
         let home = tempfile::tempdir().unwrap();
         let session_id = "intendant-search-session";
