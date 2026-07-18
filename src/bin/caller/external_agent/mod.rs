@@ -212,16 +212,16 @@ const EXTERNAL_CHILD_BASE_ENV: &[&str] = &[
 /// user extension of the allowlist that can never re-admit provider keys.
 fn external_child_env_allowed(name: &str, passthrough: &HashSet<String>) -> bool {
     let upper = name.to_ascii_uppercase();
+    // Credential names always lose to the control-channel allowlist. This
+    // includes explicitly catalogued `INTENDANT_*` DNS credentials: the
+    // namespace alone must never make authority inheritable by a child.
+    if crate::agent_runner::is_provider_credential_env(&upper) {
+        return false;
+    }
     // Controller→child control channel: `INTENDANT` + `INTENDANT_*`
     // bootstrap vars and the mock-provider rig's `PROVIDER` always ride.
     if upper == "INTENDANT" || upper.starts_with("INTENDANT_") || upper == "PROVIDER" {
         return true;
-    }
-    // Provider/model-API keys never pass, passthrough or not: a supervised
-    // CLI authenticates with its own auth under HOME (or an explicitly
-    // injected leased home), never with the controller's keys.
-    if crate::agent_runner::is_provider_credential_env(&upper) {
-        return false;
     }
     if passthrough.contains(&upper) {
         return true;
@@ -1970,6 +1970,8 @@ mod tests {
             "anthropic_api_key",
             "ANTHROPIC_AUTH_TOKEN",
             "SOME_SERVICE_API_TOKEN",
+            "INTENDANT_RFC2136_TSIG_SECRET",
+            "intendant_rfc2136_tsig_secret",
             // Ambient host credentials.
             "SSH_AUTH_SOCK",
             "AWS_ACCESS_KEY_ID",
@@ -2004,6 +2006,10 @@ mod tests {
         assert!(
             !external_child_env_allowed("ANTHROPIC_API_KEY", &passthrough),
             "provider keys must not pass even when named in the passthrough"
+        );
+        assert!(
+            !external_child_env_allowed("INTENDANT_RFC2136_TSIG_SECRET", &passthrough),
+            "DNS credentials must not pass even when named in the passthrough"
         );
         assert!(
             !external_child_env_allowed("GH_TOKEN", &passthrough),

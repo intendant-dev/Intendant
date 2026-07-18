@@ -1058,6 +1058,7 @@ pub(crate) fn status_reason(status: u16) -> &'static str {
         403 => "403 Forbidden",
         404 => "404 Not Found",
         405 => "405 Method Not Allowed",
+        408 => "408 Request Timeout",
         409 => "409 Conflict",
         413 => "413 Payload Too Large",
         416 => "416 Range Not Satisfiable",
@@ -1292,6 +1293,11 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.0, 408);
+        let response = HttpResponse::json(status_reason(error.0), error.1).into_bytes();
+        assert!(
+            response.starts_with(b"HTTP/1.1 408 Request Timeout\r\n"),
+            "the rendered response must preserve the body-timeout status"
+        );
     }
 
     #[test]

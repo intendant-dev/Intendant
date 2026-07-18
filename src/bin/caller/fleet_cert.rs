@@ -1123,14 +1123,37 @@ fn ensure_current_fleet_name(expected: &str) -> Result<(), String> {
 
 fn read_stored_certificate_pair_in(cert_dir: &Path) -> Result<Option<(String, String)>, String> {
     crate::access::authority_store::with_lock(cert_dir, || {
-        read_stored_certificate_pair_locked_in(cert_dir).map_err(crate::access::AccessError)
+        read_stored_certificate_pair_locked_in(cert_dir)
+            .map_err(|error| crate::access::AccessError(error.to_string()))
     })
     .map_err(|error| error.to_string())
 }
 
+#[derive(Debug)]
+enum StoredCertificatePairReadError {
+    Incomplete(PathBuf),
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for StoredCertificatePairReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Incomplete(path) => write!(
+                formatter,
+                "stored fleet certificate pair is incomplete: {} is missing",
+                path.display()
+            ),
+            Self::Read { path, source } => write!(formatter, "read {}: {source}", path.display()),
+        }
+    }
+}
+
 fn read_stored_certificate_pair_locked_in(
     cert_dir: &Path,
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<(String, String)>, StoredCertificatePairReadError> {
     let cert_path = cert_path_in(cert_dir);
     let key_path = key_path_in(cert_dir);
     match (
@@ -1144,21 +1167,33 @@ fn read_stored_certificate_pair_locked_in(
         {
             Ok(None)
         }
-        (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
-            "stored fleet certificate pair is incomplete: {} is missing",
-            cert_path.display()
-        )),
-        (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
-            "stored fleet certificate pair is incomplete: {} is missing",
-            key_path.display()
-        )),
-        (Err(error), _) => Err(format!("read {}: {error}", cert_path.display())),
-        (_, Err(error)) => Err(format!("read {}: {error}", key_path.display())),
+        (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(StoredCertificatePairReadError::Incomplete(cert_path))
+        }
+        (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(StoredCertificatePairReadError::Incomplete(key_path))
+        }
+        (Err(source), _) => Err(StoredCertificatePairReadError::Read {
+            path: cert_path,
+            source,
+        }),
+        (_, Err(source)) => Err(StoredCertificatePairReadError::Read {
+            path: key_path,
+            source,
+        }),
     }
 }
 
 fn stored_certificate_is_current_locked_in(cert_dir: &Path, name: &str) -> Result<bool, String> {
-    let Some((cert_pem, key_pem)) = read_stored_certificate_pair_locked_in(cert_dir)? else {
+    let pair = match read_stored_certificate_pair_locked_in(cert_dir) {
+        Ok(pair) => pair,
+        // A crash between the two private-file replacements leaves a
+        // recoverable partial pair. It is not current, so the issuance claim
+        // must proceed and replace both files on a successful commit.
+        Err(StoredCertificatePairReadError::Incomplete(_)) => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    let Some((cert_pem, key_pem)) = pair else {
         return Ok(false);
     };
     if require_fleet_certificate_dns_name(&cert_pem, name).is_err()
@@ -3363,6 +3398,22 @@ mod tests {
             ..Default::default()
         };
         assert!(should_request_certificate(&installed, now_unix_ms(), true));
+    }
+
+    #[test]
+    fn partial_stored_pair_does_not_block_a_repair_issuance_claim() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = "d-11111111111111111111.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
+        persist_certificate_pair_in(temp.path(), name, "certificate", "private key").unwrap();
+        std::fs::remove_file(cert_path_in(temp.path())).unwrap();
+
+        let claim = claim_issuance_request_in(temp.path(), name)
+            .expect("a partial stored pair must remain repairable");
+        let IssuanceRequestClaim::Acquired(guard) = claim else {
+            panic!("a partial pair cannot be treated as a current certificate");
+        };
+        assert_eq!(guard.order.name, name);
     }
 
     #[test]

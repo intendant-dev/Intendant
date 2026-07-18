@@ -288,8 +288,14 @@ struct PendingDialback {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TunnelRoute {
-    Fallback { label: String },
-    Exact { label: String, poller_id: String },
+    Fallback {
+        label: String,
+    },
+    Exact {
+        label: String,
+        poller_id: String,
+        server_name: String,
+    },
 }
 
 impl TunnelRoute {
@@ -434,11 +440,28 @@ impl RelayState {
                     server_names: Vec::new(),
                 });
             session.last_seen_unix_ms = now;
+            let cancelled = if session.server_names != server_names {
+                session.pending.drain(..).collect()
+            } else {
+                Vec::new()
+            };
             session.server_names = server_names.to_vec();
+            drop(tunnels);
+            self.cancel_browser_waiters(cancelled);
         } else {
             entry.legacy_fallback_last_seen_unix_ms = Some(now);
         }
         true
+    }
+
+    fn cancel_browser_waiters(&self, dialbacks: impl IntoIterator<Item = PendingDialback>) {
+        let mut pending = self
+            .pending_dialbacks
+            .lock()
+            .expect("relay dialbacks poisoned");
+        for dialback in dialbacks {
+            pending.remove(&dialback.nonce);
+        }
     }
 
     fn remove_tunnel(&self, label: &str, poller_id: &str, now: u64) {
@@ -572,6 +595,7 @@ impl RelayState {
             return Some(TunnelRoute::Exact {
                 label: label.to_string(),
                 poller_id: poller_id.to_string(),
+                server_name: normalized.clone(),
             });
         }
         let label = sni_route_label(&normalized)?;
@@ -621,11 +645,16 @@ impl RelayState {
                     Some(notifies)
                 }
             }
-            TunnelRoute::Exact { poller_id, .. } => {
+            TunnelRoute::Exact {
+                poller_id,
+                server_name,
+                ..
+            } => {
                 let Some(session) = entry.exact_sessions.get_mut(poller_id) else {
                     return false;
                 };
                 if now.saturating_sub(session.last_seen_unix_ms) > RELAY_TUNNEL_LIVENESS_MS
+                    || !session.server_names.iter().any(|name| name == server_name)
                     || session.pending.len() >= RELAY_MAX_PENDING_PER_TUNNEL
                 {
                     None
@@ -643,6 +672,32 @@ impl RelayState {
             notify.notify_one();
         }
         true
+    }
+
+    /// Reclaim a browser request from both the route queue and the global
+    /// nonce waiter. The route lookup is exact to the registration selected
+    /// for that browser, so a timeout cannot consume capacity in another
+    /// poller's queue.
+    fn cancel_queued_dialback(&self, route: &TunnelRoute, nonce: &str) {
+        {
+            let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+            if let Some(entry) = tunnels.get_mut(route.label()) {
+                let queue = match route {
+                    TunnelRoute::Fallback { .. } => Some(&mut entry.fallback_pending),
+                    TunnelRoute::Exact { poller_id, .. } => entry
+                        .exact_sessions
+                        .get_mut(poller_id)
+                        .map(|session| &mut session.pending),
+                };
+                if let Some(queue) = queue {
+                    queue.retain(|dialback| dialback.nonce != nonce);
+                }
+            }
+        }
+        self.pending_dialbacks
+            .lock()
+            .expect("relay dialbacks poisoned")
+            .remove(nonce);
     }
 
     fn source_bucket(&self, label: &str, source_ip: IpAddr) -> String {
@@ -1416,11 +1471,7 @@ async fn handle_browser_connection(
         pending.insert(nonce.clone(), tx);
     }
     if !relay.enqueue_dialback(&route, nonce.clone(), connection_guard.ip, now) {
-        relay
-            .pending_dialbacks
-            .lock()
-            .expect("relay dialbacks poisoned")
-            .remove(&nonce);
+        relay.cancel_queued_dialback(&route, &nonce);
         return;
     }
 
@@ -1428,12 +1479,9 @@ async fn handle_browser_connection(
         match tokio::time::timeout(RELAY_DIALBACK_TIMEOUT, rx).await {
             Ok(Ok(data_stream)) => data_stream,
             _ => {
-                // Timed out or the waiter was dropped: reclaim the nonce slot.
-                relay
-                    .pending_dialbacks
-                    .lock()
-                    .expect("relay dialbacks poisoned")
-                    .remove(&nonce);
+                // Timed out or the waiter was dropped: reclaim both the
+                // browser waiter and its bounded per-route queue slot.
+                relay.cancel_queued_dialback(&route, &nonce);
                 return;
             }
         };
@@ -2103,6 +2151,98 @@ mod tests {
         ));
         assert!(relay.touch_tunnel("d-rolling", now + 1, Some(TEST_POLLER_ID), Some(&[])));
         assert_eq!(relay.resolve_tunnel(&name, now + 1), None);
+    }
+
+    #[tokio::test]
+    async fn exact_name_change_cancels_queued_waiters_and_stale_routes() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        let label = "d-rolling";
+        let old_name = "old.example.test".to_string();
+        let new_name = "new.example.test".to_string();
+        assert!(relay.touch_tunnel(
+            label,
+            now,
+            Some(TEST_POLLER_ID),
+            Some(std::slice::from_ref(&old_name))
+        ));
+        let old_route = relay.resolve_tunnel(&old_name, now).unwrap();
+        let nonce = "withdrawn-name-nonce".to_string();
+        let (sender, receiver) = oneshot::channel();
+        relay
+            .pending_dialbacks
+            .lock()
+            .unwrap()
+            .insert(nonce.clone(), sender);
+        assert!(relay.enqueue_dialback(
+            &old_route,
+            nonce.clone(),
+            "198.51.100.10".parse().unwrap(),
+            now,
+        ));
+
+        assert!(relay.touch_tunnel(
+            label,
+            now + 1,
+            Some(TEST_POLLER_ID),
+            Some(std::slice::from_ref(&new_name))
+        ));
+
+        assert!(relay.resolve_tunnel(&old_name, now + 1).is_none());
+        assert!(relay.resolve_tunnel(&new_name, now + 1).is_some());
+        assert!(relay
+            .pending_dialbacks
+            .lock()
+            .unwrap()
+            .get(&nonce)
+            .is_none());
+        assert!(
+            receiver.await.is_err(),
+            "withdrawing the name must close its queued browser waiter"
+        );
+        assert!(
+            !relay.enqueue_dialback(
+                &old_route,
+                "stale-route-nonce".to_string(),
+                "198.51.100.10".parse().unwrap(),
+                now + 1,
+            ),
+            "a route resolved before the name change must not enqueue afterward"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_timeout_cleanup_releases_exact_queue_capacity() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        let label = "d-timeout";
+        let name = "box.example.test".to_string();
+        assert!(relay.touch_tunnel(
+            label,
+            now,
+            Some(TEST_POLLER_ID),
+            Some(std::slice::from_ref(&name))
+        ));
+        let route = relay.resolve_tunnel(&name, now).unwrap();
+        let source_ip = "198.51.100.10".parse().unwrap();
+        let (sender, receiver) = oneshot::channel();
+        relay
+            .pending_dialbacks
+            .lock()
+            .unwrap()
+            .insert("n0".to_string(), sender);
+        for index in 0..RELAY_MAX_PENDING_PER_TUNNEL {
+            assert!(relay.enqueue_dialback(&route, format!("n{index}"), source_ip, now));
+        }
+        assert!(!relay.enqueue_dialback(&route, "before-cleanup".to_string(), source_ip, now));
+
+        relay.cancel_queued_dialback(&route, "n0");
+
+        assert!(
+            receiver.await.is_err(),
+            "timeout cleanup must close the browser waiter"
+        );
+        assert!(relay.enqueue_dialback(&route, "after-cleanup".to_string(), source_ip, now));
     }
 
     #[test]
