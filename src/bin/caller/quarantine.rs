@@ -63,7 +63,9 @@ pub fn store_payload_in(
     content: &str,
 ) -> Result<QuarantinePayload, CallerError> {
     let dir = quarantine_dir_in(state_root, live_audio_id)?;
-    std::fs::create_dir_all(&dir)?;
+    // Quarantined payloads are untrusted model output held for human
+    // review — owner-only from creation (0700 dir / 0600 files on Unix).
+    intendant_core::state_paths::create_private_dir_all(&dir)?;
 
     let payload_id = Uuid::new_v4().to_string();
     let timestamp = chrono::Utc::now().to_rfc3339();
@@ -98,7 +100,10 @@ pub fn store_payload_in(
     });
 
     let file_path = dir.join(format!("{}.json", payload_id));
-    std::fs::write(&file_path, serde_json::to_string_pretty(&on_disk)?)?;
+    intendant_core::state_paths::write_private_file(
+        &file_path,
+        serde_json::to_string_pretty(&on_disk)?,
+    )?;
 
     // Return the reference WITHOUT content
     Ok(QuarantinePayload {
@@ -390,6 +395,24 @@ mod tests {
         assert_eq!(p3.summary, "quarantined: weird_thing");
 
         cleanup_quarantine_in(state.path(), live_id).unwrap();
+    }
+
+    /// Quarantine dirs and payload files are owner-only from creation.
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_payloads_are_owner_only_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = tempfile::tempdir().unwrap();
+        let live_id = "perm-check";
+        let payload = store_payload_in(state.path(), live_id, "test_type", "content").unwrap();
+
+        let dir = quarantine_dir_in(state.path(), live_id).unwrap();
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+
+        let file = dir.join(format!("{}.json", payload.payload_id));
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

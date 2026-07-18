@@ -62,6 +62,16 @@ impl McpClientManager {
         // Windows and need the cmd.exe /C wrapping it provides.
         let mut cmd = crate::platform::spawn_command(&config.command);
         cmd.args(&config.args);
+        // The runtime/controller key boundary extends to MCP server
+        // children: the controller's provider keys never ride along.
+        // Ambient env is deliberately NOT scrubbed here — configured MCP
+        // servers are user-trusted tools that may legitimately use the
+        // user's own credentials (e.g. a forge server reading GH_TOKEN),
+        // and the per-server `env` table below stays authoritative either
+        // way (explicit sets survive the removes).
+        for name in crate::provider::PROVIDER_KEY_ENV_VARS {
+            cmd.env_remove(name);
+        }
         for (k, v) in &config.env {
             cmd.env(k, v);
         }
@@ -119,6 +129,12 @@ impl McpClientManager {
 
     /// Call a tool on the appropriate server.
     /// Tool names are expected in `mcp__<server>_<tool>` format.
+    ///
+    /// This is transport only — it performs no policy checks. Dispatch
+    /// sites must consult the controller-tool approval gate (the agent
+    /// loop's `gate_controller_tool_call`) before calling, so the
+    /// `[approval] tool_call` rule and autonomy level hold for outbound
+    /// MCP side effects.
     pub async fn call_tool(
         &self,
         tool_name: &str,

@@ -542,6 +542,27 @@ The relay multiplexes onto the same HTTP port as the dashboard (the same accept-
 peek that distinguishes HTTP / WebSocket / local ICE-TCP grows a relay branch), so
 it needs no extra port-forwarding.
 
+Because that branch demuxes the STUN frame **before** any TLS/auth, the relay is
+bounded so a registration can never become a standing open relay or SSRF hook:
+
+- **Session-scoped registration.** An entry is created only for a forwarded
+  `Answer` that names a signaling session, and only ever dials the peer's own
+  known transport address (never an address taken from the incoming STUN frame or
+  a browser-supplied candidate) — the relay can reach only the peer this daemon
+  already federates with.
+- **TTL expiry + capacity cap.** Entries expire (`RELAY_ENTRY_TTL`) and the table
+  is capped (`MAX_RELAY_ENTRIES`); a re-`Answer` (peer reconnect / ICE restart)
+  refreshes the live entry. `unregister` removes an entry on session teardown.
+- **Bounded splice.** Each relayed connection is capped per ufrag
+  (`MAX_RELAY_CONNS_PER_UFRAG`) and torn down on an idle gap in **either**
+  direction (`RELAY_IDLE_TIMEOUT`) or at an absolute `RELAY_MAX_LIFETIME`.
+
+The gateway accept path itself is bounded the same way against a pre-auth
+slowloris: peek + TLS handshake + first request head must complete within one
+shared deadline (`PRE_AUTH_HANDSHAKE_TIMEOUT`), and connections still in that
+handshake phase are capped (`MAX_PRE_AUTH_CONNECTIONS`); established WebSocket,
+ICE-TCP, and keep-alive connections have already released their slot.
+
 ### Federation codec policy — `federation_allow_h264`
 
 H.264 over a lossy TURN-relayed path is fragile: a full-resolution 2.5 Mbps stream
@@ -792,6 +813,27 @@ headless and should be approved from its own CLI/logs.
    access cert store, writes or updates the requester's outbound `[[peer]]`,
    pins the target server fingerprint, and starts the live peer registration
    when the dashboard daemon is running.
+
+**Transport authentication of the doorbell.** The doorbell is unauthenticated at
+the application layer (approval is the gate), so the requester side binds it to a
+transport identity rather than trusting whatever answers:
+
+- The requester **pins the target's server certificate on first contact** and
+  refuses any `http://` target that is not loopback — the blanket
+  "accept any certificate" client is gone. The status poll then pins that exact
+  certificate, so the whole ceremony rides one identity.
+- The `server_cert_fingerprint` the target reports must **equal the certificate it
+  actually presented**; a mismatch (or an approval that reports a different
+  fingerprint than the one pinned) refuses the pairing, so an on-path party cannot
+  substitute the permanent peer pin.
+- The request carries a signed **caller-ID** (the requesting daemon's Ed25519
+  identity over the dialed origin, enrolment key, and nonce); the target verifies
+  it and shows the caller as *verified* (with its daemon id) or *unverified* in
+  `intendant peer requests` and the approval card. There is no silent downgrade to
+  an unsigned "bare" request — a target that rejects the caller-ID fields fails
+  loudly. Compare the verified caller id (target side) and the pinned target
+  fingerprint (requester side) out of band before approving to close a first-
+  contact MITM.
 
 A granted profile can be changed later without re-pairing:
 

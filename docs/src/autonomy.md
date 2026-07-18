@@ -29,7 +29,9 @@ Set with `--autonomy`, from the dashboard, or with
 
 The `[approval]` section of `intendant.toml` sets a per-category rule that
 overrides the global level: `auto` (always approve), `ask` (require approval),
-`deny` (always deny — surfaced as an approval that will be denied).
+`deny` (refuse without prompting). A `deny` rule on a runtime batch ends the
+task (`Denied by policy`); on a controller-dispatched tool call (below) it
+refuses that one call with an error tool result and lets the session continue.
 
 ## Layer 3 — per-action approval
 
@@ -90,7 +92,58 @@ The precise logic (`Autonomy::needs_approval`) has nuances worth knowing:
 - **Low** — asks for everything except `FileRead` (a `deny` rule still blocks).
 - **Medium / High** — start from the per-category rule. For an `ask` rule,
   Medium asks only for `FileWrite` / `FileDelete` / `Destructive` /
-  `NetworkRequest`; High asks for none of them.
+  `NetworkRequest` / `ToolCall` (the last only under an explicit
+  `tool_call = "ask"` — its default rule is `auto`); High asks for none of
+  them.
+
+## Approval dedup (what "remembered" means)
+
+Approving an action records its **dedup source** so an identical retry does
+not re-prompt. Two properties bound that memory:
+
+- **Per session.** One autonomy state backs every native session of a daemon,
+  but remembered approvals are bucketed by session id — an approval in one
+  session never silences a prompt in another. (The approve-all **level**
+  escalation stays daemon-wide by design; see the table below.)
+- **Content-aware.** The dedup source is not the display preview. For
+  `writeFile`/`editFile` it includes a digest of the full command (minus the
+  per-call `nonce`), so approving one edit of a path never covers different
+  content aimed at the same path; controller-dispatched tool calls digest
+  their full arguments the same way. Exec commands keep exact-string matching
+  (with the display/nonce normalization that recognizes benign retries).
+
+## Controller-dispatched tools
+
+Tools the controller executes itself never reach the runtime, so
+`classify_command` never sees them. They consult the same approval flow
+through a dedicated chokepoint (`gate_controller_tool_call` in the agent
+loop), **before any side effect**, honoring the `[approval] tool_call` rule
+and the autonomy level, with the same prompt, session-log rows
+(`waiting` / `approved` / `denied` / `denied-policy` / `dedup-auto-approved`),
+and bus events (`ApprovalRequired` / `ApprovalResolved` / `AutoApproved`)
+that runtime batches get:
+
+| Tool | Gate |
+|------|------|
+| Outbound MCP calls (`mcp__*`) | `tool_call` gate, per call, before dispatch |
+| `invoke_skill` | `tool_call` gate before the skill body loads |
+| `spawn_sub_agent` | `tool_call` gate before the child session exists |
+| `workflow_checkpoint` | `tool_call` gate before the coordination write |
+| `wait_sub_agents` | ungated — a pure join on children whose spawn already passed the gate |
+| `peer` | dedicated gate peer-side: the profile the peer issued this daemon plus the peer's own approval flow |
+| `shared_view` | dedicated `user_display_granted` opt-in for user-display show/capture |
+| `spawn_live_audio` | dedicated always-ask consent gate (never auto-approved) |
+
+Semantics at the gate: the default `tool_call = "auto"` dispatches without a
+prompt at Medium/High (orchestration and MCP stay usable at default
+autonomy) while still emitting `AutoApproved`; **Low always prompts**; an
+explicit `ask` rule prompts at Medium; `deny` refuses the call at every
+level — absolute, like a runtime-batch deny rule — returning an error tool
+result with no dispatch. At the prompt, skip refuses just that call and the
+session continues; deny stops the task, exactly like a runtime-command deny.
+Headless with no approver surface fails closed. Calls are gated and
+dispatched strictly in order, so a later call never runs while an earlier
+prompt in the batch is unresolved.
 
 ## Action classification
 
@@ -111,13 +164,53 @@ Commands are classified into categories by inspecting the command JSON
 | ToolCall | external-agent MCP/tool approval category |
 
 For shell commands (`execAsAgent`/`execPty`), the command string is further
-inspected for destructive patterns, network tools, and file writes (redirects,
-`tee`, `mv`, `cp`). A `sudo` prefix is flagged Destructive *and* the command
-after `sudo` is classified too. When multiple categories apply, the highest-
-severity one drives the prompt label.
+inspected for destructive patterns (including long-form flags, absolute
+binary paths like `/bin/rm`, and `find … -delete`/`-exec rm`), network
+tools, and file writes (redirects, `tee`, `mv`, `cp`). A `sudo` prefix is
+flagged Destructive *and* the command after `sudo` is classified too. When
+multiple categories apply, the highest-severity one drives the prompt label.
 
-`ToolCall` is not produced by ordinary runtime `classify_command`; it is used by
+The shell classifier is **best-effort keyword matching for approval
+prompting — UX, not a security boundary**: string matching cannot see
+through variable indirection, subshells, or novel spellings. The runtime's
+filesystem/exec sandbox is what actually confines commands; an evasion
+dodges the prompt, never the sandbox.
+
+`ToolCall` is not produced by ordinary runtime `classify_command`; it governs
+[controller-dispatched tools](#controller-dispatched-tools) and
 external-agent approval routing through `external_approval_decision`.
+
+## Sandbox denial consent
+
+The runtime write sandbox (on by default — see
+[Configuration § `[sandbox]`](./configuration.md)) is a hard OS wall, but a
+denial is not a dead end: when a runtime batch result carries a write
+denied by the sandbox, the daemon classifies it
+(`sandbox_denial_grant_offer`) and raises a **"Sandbox" card on the
+question rail** offering three resolutions:
+
+- **Allow for this session** — the path joins that session's write set at
+  the next runtime spawn; gone on daemon restart.
+- **Always allow** — the grant is live-applied to the daemon's write set
+  immediately (no restart) and persisted to `[sandbox]
+  extra_write_paths` in the session project's `intendant.toml`.
+- **Keep denied** — nothing changes.
+
+The model simultaneously sees an `[intendant]` note on the denied tool
+result explaining that the sandbox (not the task) blocked the write and
+that a grant prompt was raised — so it retries after a grant instead of
+giving up. Approval and consent stay distinct layers: an approved command
+can still be denied by the wall, and the card is how the wall becomes
+negotiable without dropping it.
+
+Guardrails: the card shows the exact path a grant would cover (for a
+not-yet-existing target, the nearest existing ancestor — honestly wide
+when it is wide); a filesystem root is never offered; credential
+locations (`~/.ssh`, `~/.gnupg`, the intendant config home, any `.env`)
+are never offered — on Linux, Landlock has no deny layer under a grant,
+so offering those would genuinely open them. Denials inside the grant
+set (plain filesystem permissions) get no card. Each (session, path)
+offers once per daemon run; headless runs get the note only.
 
 ## DisplayControl session grant
 

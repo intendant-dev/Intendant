@@ -5909,7 +5909,10 @@ mod tests {
             ("api_settings", Row, Some(Op::Settings)),
             ("api_settings_save", Row, Some(Op::Settings)),
             ("api_key_status", Row, Some(Op::Settings)),
-            ("api_api_keys_save", Row, Some(Op::Settings)),
+            // Key writes are credential custody: the row is gated
+            // CredentialsManage so no peer profile can rewrite the
+            // daemon's provider keys.
+            ("api_api_keys_save", Row, Some(Op::CredentialsManage)),
             ("api_project_root", Row, Some(Op::Settings)),
             ("api_voice_session", Residue, Some(Op::RuntimeControl)),
             (

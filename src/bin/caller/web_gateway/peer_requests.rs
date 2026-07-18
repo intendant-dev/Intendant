@@ -257,6 +257,17 @@ pub(crate) async fn maybe_rewrite_federated_answer(
             session_id,
             signal: crate::peer::WebRtcSignal::Answer { sdp, .. },
         } => (*display_id, session_id.clone(), sdp.clone()),
+        // Session teardown: drop the session's relay entries promptly
+        // instead of waiting out the TTL (which stays the guaranteed
+        // bound when no Close arrives).
+        crate::peer::PeerEvent::WebRtcSignal {
+            session_id,
+            signal: crate::peer::WebRtcSignal::Close,
+            ..
+        } => {
+            relay_registry.unregister_session(&session_id.0);
+            return event;
+        }
         _ => return event,
     };
 
@@ -325,7 +336,26 @@ pub(crate) async fn maybe_rewrite_federated_answer(
             return event;
         }
     };
-    relay_registry.register(ufrag.clone(), outbound_addr);
+    // Only register a relay hop for an Answer that names a signaling
+    // session: the entry is scoped to that session (and TTL-expired by
+    // the registry), so it can never become a standing, session-less
+    // open-relay hook. The dial target is always the peer's own known
+    // transport address resolved above — never an address taken from the
+    // incoming STUN frame — so the relay can only ever reach the peer
+    // this daemon already federates with.
+    if session_id.0.trim().is_empty() {
+        bus.send(AppEvent::LogEntry {
+            session_id: None,
+            level: "warn".to_string(),
+            source: LOG_SOURCE.to_string(),
+            content: format!(
+                "skipping relay registration for peer={peer}: forwarded Answer carries no session id"
+            ),
+            turn: None,
+        });
+        return event;
+    }
+    relay_registry.register(ufrag.clone(), outbound_addr, session_id.0.clone());
 
     // Resolve the primary's own relay URL into a SocketAddr we can
     // put in an SDP candidate line. When the primary has no

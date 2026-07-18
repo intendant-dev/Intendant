@@ -289,6 +289,14 @@ with a distinct "lease expired — reconnect a fueling session" error, and
 the presence layer can push an E2E-encrypted notification (the Web Push
 lane) telling the user which daemon went dry.
 
+Honest boundary on "start failing": the store refuses to serve **new**
+copies the moment a lease lapses (`leased_secret`/`provider_api_key` sweep
+on every call), but a native session constructed while the lease was
+active captured the key into its provider instance and keeps using that
+copy until the session ends — expiry and revocation cannot claw back
+copies already served. Ending the session is the lever that cuts a
+running consumer off today.
+
 **The OAuth split (Codex, Claude Code).** Subscription OAuth is *better*
 suited to leasing than raw keys, because the protocol already separates
 durable from ephemeral authority:
@@ -335,6 +343,19 @@ active lease those bytes are on disk; the ledger says so plainly.
 Mitigations: the materialization root is outside worktrees and is never
 seen by rewind/snapshot machinery, the file exists only while leased,
 and crash recovery deletes stale materializations at startup.
+
+One deliberate exception on the expiry leg: if a leased CLI session is
+**still running** when its lease expires, the home's deletion is deferred
+until that session ends (the daemon's session-lifecycle observer releases
+it, and the custody trail's `lease_expired` entry says "home cleanup
+deferred"). Deleting the private home under a running CLI does not end its
+authority — the process holds the home *path* and re-creates a fresh
+credential file there on its next token refresh, outside custody and
+outside any further sweep, which is strictly worse than the bounded
+deferral. The lease itself still dies on time (no new spawn or resume sees
+the home), and **revocation and shutdown are not deferred** — a deliberate
+revoke, the shutdown guard, and the startup crash sweep all delete
+immediately, live session or not.
 
 **Transcript staging at cleanup.** The materialized home also holds the
 agent's session transcripts (Codex `sessions/`, Claude `projects/`), and

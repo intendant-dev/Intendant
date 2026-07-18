@@ -136,7 +136,9 @@ pub struct ToolBatchResult {
     /// All tool call IDs and their names (for result routing).
     pub call_id_names: Vec<(String, String)>,
     /// MCP tool calls that should be routed through the MCP client manager.
-    /// Vec of (call_id, tool_name, arguments_json).
+    /// Vec of (call_id, tool_name, arguments_json). The agent loop
+    /// dispatches these behind the controller-tool approval gate
+    /// (`[approval] tool_call`), never directly.
     pub mcp_calls: Vec<(String, String, String)>,
     /// Tool-level validation errors generated before runtime execution.
     pub precomputed_results: Vec<(String, String, String)>,

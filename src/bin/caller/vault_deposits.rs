@@ -221,8 +221,9 @@ pub fn store_deposit_in(dir: &Path, record: &DepositRecord) -> Result<PathBuf, S
     let path = dir.join(format!("{}.json", record.id));
     let tmp = dir.join(format!("{}.json.tmp", record.id));
     let text = serde_json::to_string_pretty(record).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    restrict_file(&tmp);
+    // Created 0600 — sealed deposits never pass through a wider-mode window.
+    intendant_core::state_paths::write_private_file(&tmp, text)
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("finalize {}: {e}", path.display()))?;
     Ok(path)
 }
@@ -269,18 +270,6 @@ pub fn consume_deposits_in(dir: &Path, ids: &[String]) -> usize {
         }
     }
     removed
-}
-
-fn restrict_file(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
-        }
-    }
 }
 
 // ── CLI: `intendant vault deposit <label>` ──

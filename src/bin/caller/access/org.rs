@@ -500,16 +500,40 @@ pub struct MaterializedOrgGrant {
     pub changed: bool,
 }
 
+/// The one canonical ORL-subject form, applied at BOTH the produce seam
+/// ([`orl_revoke`]) and every consume seam (revocation-list apply, the
+/// document materialization/renewal gates): certificate fingerprints —
+/// hex digits, optionally `:`/space-separated, any case — fold to the
+/// peer identity store's canonical lowercase separator-free form, while
+/// base64url client-key fingerprints (case-sensitive by design) are only
+/// trimmed. Without one shared form an uppercase or colon-separated
+/// subject entry revokes on paper but never matches the stored records —
+/// revocation silently fails open. Both sides of every comparison go
+/// through this, so lists persisted before canonicalization still match.
+pub(crate) fn canonical_orl_subject(value: &str) -> String {
+    let trimmed = value.trim();
+    let stripped: String = trimmed
+        .chars()
+        .filter(|ch| !matches!(ch, ':' | ' '))
+        .collect();
+    // SHA-256 certificate fingerprints are exactly 64 hex chars once
+    // separators are stripped; anything else (base64url client keys) must
+    // keep its case.
+    if stripped.len() == 64 && stripped.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return stripped.to_ascii_lowercase();
+    }
+    trimmed.to_string()
+}
+
 /// Verify trust and write the local grant. `daemon_ids` are the names this
 /// daemon answers to when matching the document's `targets`.
-/// The subject fingerprint in its kind's normalized form — what ORL
+/// The subject fingerprint in the canonical ORL-subject form — what ORL
 /// `revoked_subjects` entries are matched against.
 fn subject_fingerprint(doc: &OrgGrantDocument) -> String {
     if doc.subject.is_peer() {
-        crate::access::access_policy::normalize_fingerprint(&doc.subject.peer_fingerprint)
-            .unwrap_or_else(|_| doc.subject.peer_fingerprint.trim().to_string())
+        canonical_orl_subject(&doc.subject.peer_fingerprint)
     } else {
-        normalize_client_key_fingerprint(&doc.subject.client_key_fingerprint)
+        canonical_orl_subject(&doc.subject.client_key_fingerprint)
     }
 }
 
@@ -547,10 +571,12 @@ fn trusted_org_for_doc<'a>(
             "org grant {doc_grant_id} is revoked by org {handle}'s revocation list"
         )));
     }
+    // Canonicalize the stored side too: lists persisted before subject
+    // canonicalization may still carry uppercase/colon-separated entries.
     if trusted
         .orl_revoked_subjects
         .iter()
-        .any(|subject| subject == &fingerprint)
+        .any(|subject| canonical_orl_subject(subject) == fingerprint)
     {
         return Err(AccessError(format!(
             "the subject key is revoked by org {handle}'s revocation list"
@@ -1299,7 +1325,10 @@ fn orl_revoke_locked(
         }
     }
     for subject in subjects {
-        let subject = normalize_client_key_fingerprint(subject);
+        // Canonical form at the produce seam: an uppercase or
+        // colon-separated certificate fingerprint must enter the signed
+        // list in the same form every consume seam compares against.
+        let subject = canonical_orl_subject(subject);
         if subject.contains(',') {
             return Err(format!("invalid subject fingerprint {subject:?}"));
         }
@@ -1406,7 +1435,7 @@ pub fn apply_orl(
     let revoked_subjects: Vec<String> = orl
         .revoked_subjects
         .iter()
-        .map(|subject| normalize_client_key_fingerprint(subject))
+        .map(|subject| canonical_orl_subject(subject))
         .filter(|subject| !subject.is_empty())
         .collect();
     let revoked_issuer_keys: Vec<String> = orl
@@ -1426,7 +1455,7 @@ pub fn apply_orl(
                     && authn
                         .get("fingerprint")
                         .and_then(|v| v.as_str())
-                        .map(normalize_client_key_fingerprint)
+                        .map(canonical_orl_subject)
                         .map(|fingerprint| revoked_subjects.contains(&fingerprint))
                         .unwrap_or(false)
             })
@@ -1449,7 +1478,10 @@ pub fn apply_orl(
     let mut failed_peer_writes: Vec<String> = Vec::new();
     for mut record in identities {
         let from_org = record.source.as_deref() == Some(&format!("org:{handle}") as &str);
-        let listed = revoked_subjects.iter().any(|s| s == &record.fingerprint)
+        // Peer identity records store canonical lowercase hex; compare in
+        // canonical form so a differently-written subject still revokes.
+        let record_fingerprint = canonical_orl_subject(&record.fingerprint);
+        let listed = revoked_subjects.iter().any(|s| s == &record_fingerprint)
             || record
                 .org_grant_id
                 .as_deref()
@@ -1563,10 +1595,12 @@ pub fn renew_org_grant(
         ));
     }
     let fingerprint = subject_fingerprint(doc);
+    // Canonicalize the list side too (lists persisted before subject
+    // canonicalization may carry non-canonical entries).
     if orl
         .revoked_subjects
         .iter()
-        .any(|subject| subject == &fingerprint)
+        .any(|subject| canonical_orl_subject(subject) == fingerprint)
     {
         return Err("the subject key is revoked; the document cannot be renewed".to_string());
     }
@@ -2372,6 +2406,129 @@ mod tests {
         let err =
             materialize_org_peer_grant(&mut state, dir.path(), &doc, &ids, test_now()).unwrap_err();
         assert!(err.to_string().contains("revocation list"), "{err}");
+    }
+
+    #[test]
+    fn canonical_orl_subject_folds_certificate_forms_and_preserves_client_keys() {
+        let canonical = "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66";
+        let uppercase = canonical.to_ascii_uppercase();
+        let colon_separated = uppercase
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| std::str::from_utf8(pair).unwrap())
+            .collect::<Vec<_>>()
+            .join(":");
+        assert_eq!(canonical_orl_subject(canonical), canonical);
+        assert_eq!(canonical_orl_subject(&uppercase), canonical);
+        assert_eq!(canonical_orl_subject(&colon_separated), canonical);
+        assert_eq!(
+            canonical_orl_subject(&format!("  {colon_separated}  ")),
+            canonical
+        );
+        // base64url client-key fingerprints stay case-sensitive, trim-only.
+        assert_eq!(canonical_orl_subject(" member-KEY_1 "), "member-KEY_1");
+        // Short hex-looking strings are not certificate fingerprints.
+        assert_eq!(canonical_orl_subject("AB12"), "AB12");
+        assert_eq!(canonical_orl_subject(""), "");
+    }
+
+    /// M-ORL regression: a subject revocation written in a non-canonical
+    /// fingerprint form (uppercase, colon-separated) must still revoke the
+    /// stored peer identity and keep blocking documents — before subject
+    /// canonicalization it silently no-oped and the daemon stayed
+    /// revoked-on-paper only.
+    #[test]
+    fn orl_subject_revocation_matches_non_canonical_fingerprint_forms() {
+        let (dir, identity) = org_identity_with_dir();
+        let mut state = LocalIamState::default();
+        trust_org(
+            &mut state,
+            "acme",
+            &identity.public_key_b64u(),
+            None,
+            Some("session-reader"),
+            test_now(),
+        )
+        .unwrap();
+        let peer_fp = "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66";
+        let colon_uppercase = peer_fp
+            .to_ascii_uppercase()
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| std::str::from_utf8(pair).unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join(":");
+        let doc = issue_org_grant(
+            &identity,
+            &state,
+            IssueOrgGrantRequest {
+                handle: "acme",
+                client_key_fingerprint: "",
+                peer_fingerprint: peer_fp,
+                subject_label: "Build daemon",
+                role_id: "peer:session-reader",
+                targets: vec!["*".to_string()],
+                ttl_ms: None,
+            },
+            test_now(),
+        )
+        .unwrap();
+        let ids = ["*".to_string()];
+        materialize_org_peer_grant(&mut state, dir.path(), &doc, &ids, test_now()).unwrap();
+
+        // The produce seam canonicalizes: the signed list carries the
+        // store's form…
+        let orl = orl_revoke(
+            &identity,
+            dir.path(),
+            "acme",
+            &[],
+            &[colon_uppercase.clone()],
+            &[],
+            test_now(),
+        )
+        .unwrap();
+        assert_eq!(orl.revoked_subjects, vec![peer_fp.to_string()]);
+        // …and re-revoking under yet another spelling dedups against the
+        // canonical entry ("nothing new"), instead of growing the list.
+        let err = orl_revoke(
+            &identity,
+            dir.path(),
+            "acme",
+            &[],
+            &[peer_fp.to_ascii_uppercase()],
+            &[],
+            test_now(),
+        )
+        .unwrap_err();
+        assert!(err.contains("nothing new to revoke"), "{err}");
+
+        // Applying revokes the materialized peer identity even though the
+        // operator typed a non-canonical form.
+        let applied = apply_orl(&mut state, dir.path(), &orl, test_now()).unwrap();
+        assert_eq!(applied.revoked_peer_identities, 1);
+        let record = crate::access::access_policy::lookup_identity(dir.path(), peer_fp)
+            .unwrap()
+            .unwrap();
+        assert!(!record.is_active((test_now() / 1000) as i64));
+
+        // Re-presenting the still-signed document is refused…
+        let err =
+            materialize_org_peer_grant(&mut state, dir.path(), &doc, &ids, test_now()).unwrap_err();
+        assert!(err.to_string().contains("revocation list"), "{err}");
+
+        // …and a legacy persisted list entry in a non-canonical form (from
+        // before produce-side canonicalization) is matched at compare time.
+        state.trusted_orgs[0].orl_revoked_subjects = vec![colon_uppercase.clone()];
+        let err =
+            materialize_org_peer_grant(&mut state, dir.path(), &doc, &ids, test_now()).unwrap_err();
+        assert!(err.to_string().contains("revocation list"), "{err}");
+
+        // The renewal gate matches non-canonical list entries the same way.
+        let mut legacy_orl = orl.clone();
+        legacy_orl.revoked_subjects = vec![colon_uppercase];
+        let err = renew_org_grant(&identity, &legacy_orl, &doc, test_now() + 1000).unwrap_err();
+        assert!(err.contains("subject key is revoked"), "{err}");
     }
 
     #[test]

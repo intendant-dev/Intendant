@@ -55,6 +55,12 @@ for the headless `tests/e2e/` suite and demos) and requires
 |----------|---------|-------------|
 | `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, access certs, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), and the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves). |
 
+### Child-process environment
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INTENDANT_ENV_PASSTHROUGH` | unset | Comma-separated exact env-var names (case-insensitive) exempted from the ambient-credential scrub at model-driven child boundaries: the runtime spawn, its shells, and supervised external CLIs (which otherwise start from a cleared, allowlisted environment). For sessions that deliberately need e.g. `SSH_AUTH_SOCK` or `CARGO_TARGET_DIR` in agent shells. Provider API keys never pass regardless of this list. |
+
 ### Model and behavior tuning
 
 | Variable | Default | Description |
@@ -323,17 +329,34 @@ and live voice (see [Computer Use & Live Audio](./computer-use-and-audio.md)).
 
 ### `[sandbox]`
 
-Filesystem sandboxing for the runtime — Landlock on Linux, Seatbelt on
-macOS, restricted tokens on Windows. Also enabled by `--sandbox`.
+Filesystem write sandboxing for the runtime — Landlock on Linux, Seatbelt
+on macOS, restricted tokens on Windows. **On by default on macOS and
+Linux; opt-in on Windows**, where a write grant is an inheritable ACE and
+granting a large tree rewrites every descendant's DACL synchronously at
+startup — enabling it there accepts that first-stamp cost. Resolution
+order: `--sandbox` forces on, `--no-sandbox` forces off, otherwise an
+explicit `enabled` here decides, otherwise the platform default.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable filesystem sandboxing |
-| `extra_write_paths` | array | `[]` | Extra writable paths beyond project root, the OS scratch dir (`/tmp` / `%TEMP%`), the log dir, and `~/.intendant` |
+| `enabled` | bool | unset (= platform default) | Explicitly enable/disable filesystem sandboxing; the CLI flags override it |
+| `extra_write_paths` | array | `[]` | Extra writable paths beyond the default grant set: project root (plus the session's own project root for dashboard-picked projects), the OS scratch dir (`TMPDIR` / `/tmp` / `%TEMP%`), the log dir, `~/.intendant`, and — Unix only — the toolchain caches (`~/.cargo`, `~/.rustup`, the user cache dir); on Windows toolchain-cache writes are instead granted on demand through the denial-consent card |
 
-On Linux kernels without Landlock support, sandboxing is silently skipped;
-on macOS and Windows a sandbox that fails to apply fails the run rather
-than continuing unconfined.
+The dashboard's Settings → Security card edits both values live (new
+commands pick the change up without a restart; a `--sandbox`/`--no-sandbox`
+flag pins the live state for that daemon run, so saves then only persist
+intent), and approving a sandbox write-denial consent prompt can append
+grants — for the session, or persisted here via "always allow".
+
+A sandbox that cannot apply fails the run rather than continuing
+unconfined, on all three platforms — on Linux kernels without Landlock
+support the runtime refuses to start until `--no-sandbox` (or
+`enabled = false`) makes the unconfined run explicit. Reads stay open
+except the credential carve-outs (macOS denies `~/.ssh`, `~/.gnupg`, the
+intendant config home, and the `.env` search path at the OS layer; on
+Linux, Landlock cannot express read carve-outs under a broad read grant,
+so project/config `.env` files remain readable — credential custody is
+the tracked fix).
 
 ### `[webrtc]`
 

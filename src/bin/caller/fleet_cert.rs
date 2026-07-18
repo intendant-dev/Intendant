@@ -621,17 +621,9 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
-        }
-    }
-    Ok(())
+    // Created 0600 — never write-then-chmod for key material.
+    intendant_core::state_paths::write_private_file(path, bytes)
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// The default addresses to publish: every routable local address (LAN

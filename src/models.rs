@@ -28,6 +28,15 @@ pub struct Command {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentInput {
     pub commands: Vec<Command>,
+    /// Controller-minted per-batch secret for the askHuman answer file:
+    /// the runtime accepts a `human_response` whose first line matches,
+    /// and discards anything else. The controller overwrites any
+    /// model-supplied value before spawn, and the token never touches
+    /// shell-readable disk — so a model-driven shell (which can write the
+    /// answer path) cannot forge an answer. Absent = legacy caller,
+    /// answers accepted unauthenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_response_token: Option<String>,
 }
 
 #[allow(dead_code)]

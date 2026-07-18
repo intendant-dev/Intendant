@@ -1352,7 +1352,7 @@ impl SessionLog {
         } else {
             format!("turns/context_{}.json", snapshot_id)
         };
-        let file = if fs::write(self.dir.join(&relative), &rendered).is_ok() {
+        let file = if write_private_file(&self.dir.join(&relative), &rendered).is_ok() {
             Some(relative)
         } else {
             None
@@ -1977,7 +1977,7 @@ impl SessionLog {
         }
         let path = self.dir.join("summary.json");
         if let Ok(pretty) = serde_json::to_string_pretty(&summary) {
-            if let Err(e) = fs::write(&path, &pretty) {
+            if let Err(e) = write_private_file(&path, &pretty) {
                 eprintln!("session_log: failed to write summary.json: {}", e);
             }
         }

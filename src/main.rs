@@ -43,10 +43,28 @@ fn apply_sandbox_from_env() -> Result<(), AgentError> {
         .create()
         .map_err(|e| AgentError::Process(format!("Landlock ruleset create failed: {}", e)))?;
 
+    // Reads are granted on `/` wholesale, and Landlock cannot subtract
+    // from a grant — so project and config `.env` files (where provider
+    // keys live) remain readable to sandboxed commands on Linux, unlike
+    // the macOS Seatbelt deny clause. Moving keys out of agent-readable
+    // files (the credential-custody migration) is the tracked fix; do not
+    // mistake this write sandbox for a read boundary.
     if let Ok(root_fd) = PathFd::new("/") {
         ruleset_created = ruleset_created
             .add_rule(PathBeneath::new(root_fd, read_access))
             .map_err(|e| AgentError::Process(format!("Landlock add read rule failed: {}", e)))?;
+    }
+
+    // /dev is always write-granted: every Unix process assumes a writable
+    // /dev/null and the runtime allocates PTYs (/dev/ptmx, /dev/pts) for
+    // command execution — Landlock checks device-file opens like any
+    // other, so without this grant even `echo > /dev/null` fails. DAC
+    // still applies; this mirrors the macOS Seatbelt profile's
+    // unconditional `(allow file-write* (subpath "/dev"))`.
+    if let Ok(dev_fd) = PathFd::new("/dev") {
+        ruleset_created = ruleset_created
+            .add_rule(PathBeneath::new(dev_fd, write_access))
+            .map_err(|e| AgentError::Process(format!("Landlock add /dev rule failed: {}", e)))?;
     }
 
     for path in write_paths {
@@ -66,11 +84,16 @@ fn apply_sandbox_from_env() -> Result<(), AgentError> {
         .restrict_self()
         .map_err(|e| AgentError::Process(format!("Landlock restrict_self failed: {}", e)))?;
     if status.ruleset == landlock::RulesetStatus::NotEnforced {
-        // Fail closed: a requested sandbox must never silently degrade to
+        // Fail closed: a configured sandbox must never silently degrade to
         // unrestricted execution (scoped shells and the Windows runtime
-        // already refuse in this situation).
+        // already refuse in this situation). The sandbox is on by default,
+        // so on a Landlock-less kernel this is the error operators see —
+        // name the explicit opt-outs rather than degrading silently.
         return Err(AgentError::Process(
-            "Sandbox requested but Landlock is not enforced by this kernel; refusing to run unsandboxed".to_string(),
+            "Filesystem sandbox is enabled (the default) but Landlock is not enforced by this \
+             kernel; refusing to run unsandboxed. Pass --no-sandbox or set [sandbox] \
+             enabled = false in intendant.toml to explicitly opt out."
+                .to_string(),
         ));
     }
     Ok(())
@@ -154,7 +177,7 @@ async fn main() -> Result<(), AgentError> {
     apply_sandbox_from_env()?;
 
     // Create agent instance
-    let agent = Agent::new()?;
+    let agent = Agent::new()?.with_human_response_token(input.human_response_token.clone());
 
     // Process commands sequentially, streaming each JSONL result line as its
     // command completes — the caller consumes partial output when the

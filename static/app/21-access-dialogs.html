@@ -625,6 +625,32 @@
                 <input id="set-live-audio-timeout" type="number" min="30" max="3600" placeholder="300">
               </div>
             </section>
+
+            <!-- Runtime write sandbox ([sandbox] in intendant.toml + the live
+                 grant env). NOT the Codex sandbox picker in Activity → Control
+                 — that one configures an external agent's own sandbox. The
+                 ui-v2 build re-parents this card into Settings → Security. -->
+            <section class="ui-card" aria-labelledby="settings-sandbox-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-sandbox-heading">Runtime sandbox</h3>
+                <div class="ui-section-sub">Confines the agent&rsquo;s shell and file tools to granted paths.</div>
+              </div>
+              <div class="settings-row">
+                <label for="set-sandbox-enabled">Enabled</label>
+                <span id="set-sandbox-flag-note" class="hidden settings-row-warning">pinned by a CLI flag for this daemon run (--sandbox/--no-sandbox); changes apply next start</span>
+                <input id="set-sandbox-enabled" type="checkbox">
+              </div>
+              <div class="settings-row sandbox-grants-row">
+                <label>Where it can write</label>
+                <div id="set-sandbox-grants" class="sandbox-grants"></div>
+              </div>
+              <div class="settings-row sandbox-grants-row">
+                <label for="set-sandbox-extra-paths">Extra grants</label>
+                <textarea id="set-sandbox-extra-paths" rows="3" placeholder="/absolute/path/one&#10;or/relative/to/the/project" spellcheck="false"></textarea>
+              </div>
+              <p class="settings-note">One path per line — absolute, or relative to the project root. Applies to new commands immediately.</p>
+              <p class="settings-note">External agents (Codex, Claude Code) use their own sandbox settings — see the session config.</p>
+            </section>
           </div>
         </div>
 

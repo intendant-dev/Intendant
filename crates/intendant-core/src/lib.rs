@@ -7,6 +7,7 @@
 
 pub mod autonomy;
 pub mod conversation;
+pub mod env_scrub;
 pub mod error;
 pub mod frames;
 pub mod net;

@@ -397,6 +397,14 @@ issue time. The org daemon persists the current list next to the root key
 `GET /api/access/orgs/<handle>/revocations` (public — it is org-public
 data; an empty seq-0 list is signed lazily on first read).
 
+Subject entries use one canonical form at both ends: certificate
+fingerprints (peer daemons) fold to lowercase separator-free hex when the
+list is written **and** whenever it is compared — apply, materialization,
+and renewal all canonicalize both sides — so an uppercase or
+colon-separated spelling still revokes, including entries persisted by
+older builds. base64url client-key fingerprints are case-sensitive and
+only trimmed.
+
 **Delivery is carried, not discovered.** A consumer daemon has no
 address for "the org daemon" — there is no membership server to ask — so
 the list travels the same way grant documents do: anyone may push it to

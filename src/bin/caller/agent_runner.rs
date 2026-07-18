@@ -10,6 +10,123 @@ use tokio::time::{timeout, Duration};
 /// Maximum bytes to read from agent stdout/stderr (64 MB).
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Per-batch askHuman answer tokens, keyed by the batch's log dir. The
+/// runtime only accepts a `human_response` file whose first line matches
+/// the batch's token (see `models::AgentInput::human_response_token`), so
+/// a model-driven shell — which can write the answer path — cannot forge
+/// an answer. The token lives only here and in the spawned runtime's
+/// memory; frontends prepend it via [`write_human_response`].
+fn human_response_tokens() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, String>>
+{
+    static TOKENS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, String>>,
+    > = std::sync::OnceLock::new();
+    TOKENS.get_or_init(Default::default)
+}
+
+/// The registry key for a batch's log dir: canonicalized so the arm site
+/// (agent loop) and the answer writers (frontends) agree even when one of
+/// them holds a symlinked spelling (macOS `/var` vs `/private/var`).
+fn human_response_token_key(log_dir: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf())
+}
+
+/// Per-session sandbox write grants from the denial-consent flow's
+/// "allow for this session" resolution, keyed like the token registry.
+/// Merged into the write set at every runtime spawn for that session;
+/// gone on daemon restart by design.
+fn session_write_grants(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<PathBuf>>> {
+    static GRANTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<PathBuf>>>,
+    > = std::sync::OnceLock::new();
+    GRANTS.get_or_init(Default::default)
+}
+
+/// Record a session-scoped write grant (consent card: "allow for this
+/// session").
+pub(crate) fn add_session_write_grant(log_dir: &std::path::Path, path: &std::path::Path) {
+    let mut grants = session_write_grants()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entry = grants.entry(human_response_token_key(log_dir)).or_default();
+    if !entry.iter().any(|p| p == path) {
+        entry.push(path.to_path_buf());
+    }
+}
+
+/// The session's consent-granted write paths.
+pub(crate) fn session_write_grants_for(log_dir: &std::path::Path) -> Vec<PathBuf> {
+    session_write_grants()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&human_response_token_key(log_dir))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Removes the batch's token entry when the runtime spawn returns.
+struct HumanResponseTokenGuard {
+    log_dir: PathBuf,
+}
+
+impl Drop for HumanResponseTokenGuard {
+    fn drop(&mut self) {
+        human_response_tokens()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.log_dir);
+    }
+}
+
+/// Mint and register this batch's askHuman token, returning the batch
+/// JSON with the token field set (any model-supplied value is
+/// overwritten — the model must never know the accepted token) plus the
+/// registry guard. Unparseable JSON passes through untouched: the runtime
+/// will reject it with its own parse diagnostics.
+fn arm_human_response_token(
+    json_input: &str,
+    log_dir: &std::path::Path,
+) -> (Option<String>, Option<HumanResponseTokenGuard>) {
+    let mut parsed: serde_json::Value = match serde_json::from_str(json_input) {
+        Ok(value) => value,
+        Err(_) => return (None, None),
+    };
+    let Some(map) = parsed.as_object_mut() else {
+        return (None, None);
+    };
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    map.insert(
+        "human_response_token".to_string(),
+        serde_json::Value::String(token.clone()),
+    );
+    let key = human_response_token_key(log_dir);
+    human_response_tokens()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.clone(), token);
+    (
+        Some(parsed.to_string()),
+        Some(HumanResponseTokenGuard { log_dir: key }),
+    )
+}
+
+/// Write an askHuman answer the runtime will accept: the batch token (when
+/// one is armed for `log_dir`) on the first line, then the answer text.
+/// The single writer helper for every frontend answer path.
+pub(crate) fn write_human_response(log_dir: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let token = human_response_tokens()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&human_response_token_key(log_dir))
+        .cloned();
+    let payload = match token {
+        Some(token) => format!("{token}\n{text}"),
+        None => text.to_string(),
+    };
+    std::fs::write(log_dir.join("human_response"), payload.as_bytes())
+}
+
 /// Read up to `cap` bytes from `reader` into `buf`, then, if the cap was
 /// reached, keep reading and DISCARDING the remainder until EOF so the
 /// writer never blocks on a full pipe. Returns how many bytes were
@@ -99,7 +216,11 @@ const EXTRA_PROVIDER_CREDENTIAL_ENV_VARS: &[&str] = &[
 /// resolve identically inside the runtime's shells), and dotenvy preserves
 /// whatever casing the `.env` file used — a lowercase spelling must not
 /// slip past the scrub.
-fn is_provider_credential_env(name: &str) -> bool {
+///
+/// `pub(crate)` because the external-agent spawn boundary
+/// (`external_agent::external_child_env_allowed`) enforces the same
+/// never-pass rule for supervised CLIs.
+pub(crate) fn is_provider_credential_env(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
     if name.starts_with("INTENDANT_") {
         return false;
@@ -137,6 +258,38 @@ fn scrub_provider_credential_env<'a>(
     }
     for name in inherited_names {
         if is_provider_credential_env(name) {
+            cmd.env_remove(name);
+        }
+    }
+}
+
+/// Scrub ambient host credentials — agent sockets, cloud/forge tokens,
+/// credential-store pointers, the D-Bus session bus — from the runtime
+/// child's environment. The provider-key scrub protects the model API keys;
+/// this one removes the *rest* of the launching shell's ambient authority,
+/// which the model-driven shells the runtime spawns must not inherit.
+/// Mirrors the provider scrub's shape: the canonical names are removed
+/// unconditionally, then every inherited name the classifier matches.
+///
+/// `passthrough` holds ASCII-uppercased exact names the user deliberately
+/// exempted via `INTENDANT_ENV_PASSTHROUGH` (comma-separated,
+/// case-insensitive) — e.g. `SSH_AUTH_SOCK` for sessions that must push
+/// over SSH. It exempts names from THIS scrub only; provider credentials
+/// are removed by `scrub_provider_credential_env` regardless.
+fn scrub_ambient_credential_env<'a>(
+    cmd: &mut Command,
+    inherited_names: impl IntoIterator<Item = &'a str>,
+    passthrough: &std::collections::HashSet<String>,
+) {
+    for name in intendant_core::env_scrub::AMBIENT_CREDENTIAL_ENV_VARS {
+        if !passthrough.contains(*name) {
+            cmd.env_remove(name);
+        }
+    }
+    for name in inherited_names {
+        if intendant_core::env_scrub::is_ambient_credential_env(name)
+            && !passthrough.contains(&name.to_ascii_uppercase())
+        {
             cmd.env_remove(name);
         }
     }
@@ -226,14 +379,54 @@ pub async fn run_agent(
     user_display_granted: bool,
     has_ask_human: bool,
 ) -> Result<AgentOutput, CallerError> {
+    // Arm the per-batch askHuman answer token before spawn so frontends'
+    // answers authenticate against a secret the batch's shells never see.
+    let (tokened_input, _token_guard) = if has_ask_human {
+        arm_human_response_token(json_input, log_dir)
+    } else {
+        (None, None)
+    };
+    let json_input = tokened_input.as_deref().unwrap_or(json_input);
+
     // Linux enforces this via Landlock inside the runtime; macOS wraps the
     // runtime in sandbox-exec; Windows re-execs inside the runtime under a
     // write-restricted token (win_sandbox.rs) — see run_agent_inner.
     if let Ok(raw_paths) = std::env::var("INTENDANT_SANDBOX_WRITE_PATHS") {
-        let write_paths: Vec<PathBuf> = std::env::split_paths(&raw_paths)
+        let mut write_paths: Vec<PathBuf> = std::env::split_paths(&raw_paths)
             .filter(|p| !p.as_os_str().is_empty())
             .collect();
         if !write_paths.is_empty() {
+            // Per-spawn additions beyond the daemon-launch grant set: the
+            // session's own project root (a session's project can differ
+            // from the daemon's launch project — dashboard-picked
+            // projects, projectless daemons) plus any consent-flow
+            // session grants.
+            let mut session_paths: Vec<PathBuf> = Vec::new();
+            if !write_paths.iter().any(|p| p == workdir) {
+                session_paths.push(workdir.to_path_buf());
+            }
+            for grant in session_write_grants_for(log_dir) {
+                if !write_paths.iter().any(|p| p == &grant) {
+                    session_paths.push(grant);
+                }
+            }
+            write_paths.extend(session_paths.iter().cloned());
+            // Windows write grants are ACE stamps on the target dirs.
+            // Stamp the WHOLE effective set per spawn, not just the
+            // session additions: paths granted live after startup (the
+            // consent flow's "always allow", a settings save) arrive via
+            // the env var and would otherwise never get an ACE. The
+            // refcounted GRANTS table makes this cheap — startup-held
+            // paths just bump their count (no DACL write); only genuinely
+            // new paths pay the 0→1 stamp, and the guard's Drop returns
+            // them to 0 when the child exits.
+            #[cfg(windows)]
+            let _session_ace = Some(
+                crate::win_sandbox::AceGuard::stamp(&[], &write_paths)
+                    .map_err(|e| CallerError::Agent(format!("stamp session write grant: {e}")))?,
+            );
+            #[cfg(not(windows))]
+            let _ = &session_paths;
             let sandbox = SandboxConfig {
                 read_paths: vec![PathBuf::from("/")],
                 write_paths,
@@ -364,11 +557,26 @@ async fn run_agent_inner(
     crate::linux_display_env::apply_to_tokio_command(&mut cmd);
 
     // The runtime never holds API keys (see the scrub's doc): strip provider
-    // credentials from the child env as the last step before spawn.
+    // credentials from the child env as the last step before spawn. Ambient
+    // host credentials (SSH agent socket, cloud/forge tokens,
+    // credential-store pointers, the session bus) are scrubbed in the same
+    // breath — running after `linux_display_env::apply_to_tokio_command` so
+    // nothing it set rides through. `INTENDANT_ENV_PASSTHROUGH` exempts
+    // deliberately named vars from the ambient scrub only.
     let inherited_env_names: Vec<String> = std::env::vars_os()
         .filter_map(|(name, _)| name.into_string().ok())
         .collect();
     scrub_provider_credential_env(&mut cmd, inherited_env_names.iter().map(String::as_str));
+    let passthrough = intendant_core::env_scrub::env_passthrough_set(
+        std::env::var(intendant_core::env_scrub::ENV_PASSTHROUGH_VAR)
+            .ok()
+            .as_deref(),
+    );
+    scrub_ambient_credential_env(
+        &mut cmd,
+        inherited_env_names.iter().map(String::as_str),
+        &passthrough,
+    );
 
     let mut child = cmd.spawn().map_err(|e| {
         CallerError::Agent(format!("Failed to spawn agent at {:?}: {}", agent_path, e))
@@ -489,6 +697,29 @@ fn salvage_partial_stdout(mut stdout_buf: Vec<u8>) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The armed token overwrites any model-supplied value, the writer
+    /// helper prefixes it, and dropping the guard reverts the writer to
+    /// bare (legacy) answers.
+    #[test]
+    fn human_response_token_arms_writes_and_disarms() {
+        let dir = tempfile::tempdir().unwrap();
+        let forged = r#"{"commands":[],"human_response_token":"model-chosen"}"#;
+        let (tokened, guard) = arm_human_response_token(forged, dir.path());
+        let tokened = tokened.expect("valid batch JSON must re-serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&tokened).unwrap();
+        let token = parsed["human_response_token"].as_str().unwrap().to_string();
+        assert_ne!(token, "model-chosen");
+
+        write_human_response(dir.path(), "the answer").unwrap();
+        let written = std::fs::read_to_string(dir.path().join("human_response")).unwrap();
+        assert_eq!(written, format!("{token}\nthe answer"));
+
+        drop(guard);
+        write_human_response(dir.path(), "late answer").unwrap();
+        let written = std::fs::read_to_string(dir.path().join("human_response")).unwrap();
+        assert_eq!(written, "late answer");
+    }
 
     /// Valid UTF-8 moves through without a copy; invalid UTF-8 falls back
     /// to lossy replacement (the pre-move behavior for both cases).
@@ -627,6 +858,124 @@ mod tests {
                 .any(|(k, v)| k == OsStr::new("INTENDANT_LOG_DIR")
                     && v.as_deref() == Some(OsStr::new("/tmp/logs"))),
             "runtime control vars set at the spawn boundary must survive the scrub"
+        );
+    }
+
+    /// Ambient host credentials — the launching shell's agent sockets,
+    /// cloud/forge tokens, credential-store pointers, and the session bus —
+    /// are removed from the runtime child alongside the provider keys, while
+    /// the mock-provider control vars and ordinary env survive. Hermetic —
+    /// the inherited-env view and the passthrough set are injected.
+    #[test]
+    fn runtime_child_env_scrubs_ambient_credentials() {
+        use std::ffi::OsString;
+
+        let mut cmd = Command::new("true");
+        scrub_ambient_credential_env(
+            &mut cmd,
+            [
+                "SSH_AUTH_SOCK",
+                "AWS_SECRET_ACCESS_KEY",
+                "GH_TOKEN",
+                "KUBECONFIG",
+                "DOCKER_CONFIG",
+                "DBUS_SESSION_BUS_ADDRESS",
+                "aws_session_token",
+                "MY_SERVICE_TOKEN",
+                "PATH",
+                "HOME",
+                "DISPLAY",
+                "PROVIDER",
+                "INTENDANT_MOCK_SCRIPT",
+            ],
+            &std::collections::HashSet::new(),
+        );
+        let envs: Vec<(OsString, Option<OsString>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        let removal_entry_for = |name: &str| {
+            envs.iter()
+                .any(|(k, v)| v.is_none() && k.to_string_lossy().eq_ignore_ascii_case(name))
+        };
+        let any_entry_for = |name: &str| {
+            envs.iter()
+                .any(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(name))
+        };
+
+        for name in [
+            "SSH_AUTH_SOCK",
+            "AWS_SECRET_ACCESS_KEY",
+            "GH_TOKEN",
+            "KUBECONFIG",
+            "DOCKER_CONFIG",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "aws_session_token",
+            "MY_SERVICE_TOKEN",
+        ] {
+            assert!(
+                removal_entry_for(name),
+                "{name} must be removed from the child env"
+            );
+        }
+        for name in [
+            "PATH",
+            "HOME",
+            "DISPLAY",
+            "PROVIDER",
+            "INTENDANT_MOCK_SCRIPT",
+        ] {
+            assert!(
+                !any_entry_for(name),
+                "{name} must inherit untouched (no explicit entry)"
+            );
+        }
+    }
+
+    /// `INTENDANT_ENV_PASSTHROUGH` exempts exactly the named vars from the
+    /// ambient scrub — and only from the ambient scrub: a provider key named
+    /// in the passthrough is still removed by the provider-credential scrub.
+    #[test]
+    fn ambient_scrub_honors_passthrough_but_provider_scrub_ignores_it() {
+        use std::ffi::OsString;
+
+        let passthrough = intendant_core::env_scrub::env_passthrough_set(Some(
+            "ssh_auth_sock, DBUS_SESSION_BUS_ADDRESS, ANTHROPIC_API_KEY",
+        ));
+        let inherited = [
+            "SSH_AUTH_SOCK",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "GH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ];
+        let mut cmd = Command::new("true");
+        scrub_provider_credential_env(&mut cmd, inherited);
+        scrub_ambient_credential_env(&mut cmd, inherited, &passthrough);
+
+        let envs: Vec<(OsString, Option<OsString>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        let removal_entry_for = |name: &str| {
+            envs.iter()
+                .any(|(k, v)| v.is_none() && k.to_string_lossy().eq_ignore_ascii_case(name))
+        };
+
+        for name in ["SSH_AUTH_SOCK", "DBUS_SESSION_BUS_ADDRESS"] {
+            assert!(
+                !removal_entry_for(name),
+                "{name} is passthrough-exempt and must inherit"
+            );
+        }
+        assert!(
+            removal_entry_for("GH_TOKEN"),
+            "non-exempt ambient credentials are still removed"
+        );
+        assert!(
+            removal_entry_for("ANTHROPIC_API_KEY"),
+            "provider keys are removed regardless of the passthrough"
         );
     }
 
