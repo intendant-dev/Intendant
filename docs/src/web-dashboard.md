@@ -1646,7 +1646,8 @@ family (sub-routes elided where the family is uniform):
 | `GET /api/managed-context/{records,anchors,fission}` | Managed-context state: rewind records, anchors, fission groups |
 | `GET /recordings/*`, `GET /frames/*` | Current-session recording segments and captured frame assets |
 | `GET /api/fs/{stat,list,read}`, `POST /api/fs/{mkdir,write}` | Scoped filesystem browsing and editor writes (fs scope enforced per grant) |
-| `GET/POST /api/settings`, `POST /api/api-keys`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key management |
+| `GET/POST /api/settings`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key status |
+| `POST /api/api-keys` | Store provider API keys (credential custody: `CredentialsManage`, which no peer profile carries) |
 | `GET /api/external-agents` | External-agent backend availability (configured command, installed, auth posture, last used) plus passive zero-quota compatibility status (artifact fingerprint, in-band version, manifest digest, finding counts) — drives the fueling nudge and new-session picker |
 | `GET /api/displays`, `POST /api/diagnostics/visual-freshness` | Display inventory; visual-freshness probe marker |
 | `GET /api/hosted-control/{bootstrap,certificate-ledger}`, `POST /api/hosted-control/{requests,requests/poll,anchor-decisions,witness-reports}` | Public hosted doorbell and signed certificate-observation records: dark when disabled; the ledger is also readable over authenticated direct peer routes, request creation/poll proves the tab key, and signed-app inputs verify the enrolled anchor |
@@ -1759,7 +1760,7 @@ response omits the header.
 | GET | `/api/project-root` | Settings | own origin | none | Project root path this daemon serves |
 | POST | `/api/settings` | Settings | own origin | bounded | Update runtime settings |
 | GET | `/api/settings` | Settings | own origin | none | Current runtime settings |
-| POST | `/api/api-keys` | Settings | own origin | bounded | Store provider API keys in the project .env |
+| POST | `/api/api-keys` | CredentialsManage | own origin | bounded | Store provider API keys in the daemon-config .env |
 | GET | `/api/api-key-status` | Settings | own origin | none | Which provider keys are configured (presence only) |
 | POST | `/api/claude-auth/start` | CredentialsManage | own origin | ≤ 4 KiB | Start the Claude sign-in ceremony (`claude auth login` on a daemon-private PTY) |
 | GET | `/api/claude-auth/status` | CredentialsManage | own origin | none | Claude sign-in ceremony state (validated sign-in URL; account info on success) |

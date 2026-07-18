@@ -75,8 +75,13 @@ impl CredentialLease {
 
 impl Drop for CredentialLease {
     fn drop(&mut self) {
-        // Best-effort zeroization of the long-lived copy. Transient
-        // copies handed to provider clients live only per request.
+        // Zeroize the store's own long-lived copy. Copies already served
+        // out of the store are NOT reclaimed here: `leased_secret` returns
+        // plain Strings, and the native providers capture the key at
+        // provider construction — a session started under this lease keeps
+        // (and keeps using) its captured copy until that session ends.
+        // Expiry and revocation stop the store from serving new copies;
+        // they cannot claw back served ones.
         self.material.fill(0);
     }
 }
@@ -99,6 +104,102 @@ fn tombstones() -> &'static RwLock<HashMap<String, u64>> {
 fn pending_materialization_cleanup() -> &'static RwLock<HashSet<String>> {
     static PENDING: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
     PENDING.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+/// Supervised sessions currently running against a kind's materialized
+/// home: session id (managed id and backend alias) → lease kind. Fed by
+/// the daemon's session-lifecycle observer (`mcp::events`) so the expiry
+/// sweep knows a leased CLI is still running — deleting the private auth
+/// home under it makes the CLI's next token refresh write a fresh
+/// credential OUTSIDE custody (unswept, since the lease is already gone).
+/// Entries removed by `SessionEnded` never survive a restart, matching
+/// the lease store; a lost end event is bounded by the shutdown
+/// revocation and the startup sweep, both of which delete regardless.
+fn leased_home_sessions() -> &'static RwLock<HashMap<String, String>> {
+    static SESSIONS: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// The lease kind whose materialized home a session of `source` runs on
+/// ("codex" → `oauth:codex`), derived from the materialization plans.
+fn lease_kind_for_source(source: &str) -> Option<&'static str> {
+    let source = source.trim();
+    ["oauth:codex", "oauth:claude-code"]
+        .into_iter()
+        .find(|kind| {
+            materialization_plan(kind).is_some_and(|plan| plan.source.eq_ignore_ascii_case(source))
+        })
+}
+
+/// Record that a supervised session of `source` (external-agent backend
+/// label) is running. Registers only while the matching oauth lease is
+/// active — exactly the window in which spawns consume the materialized
+/// home — under every id the session is known by, so `SessionEnded`
+/// under either id releases it.
+pub fn note_leased_session_running(source: &str, session_ids: &[&str]) {
+    let Some(kind) = lease_kind_for_source(source) else {
+        return;
+    };
+    if !kind_is_active(kind) {
+        return;
+    }
+    let mut sessions = leased_home_sessions()
+        .write()
+        .expect("leased home sessions poisoned");
+    for id in session_ids {
+        let id = id.trim();
+        if !id.is_empty() {
+            sessions.insert(id.to_string(), kind.to_string());
+        }
+    }
+}
+
+/// Session-end half: drop the ids and report whether some kind now has a
+/// deferred cleanup AND no remaining live session — i.e. a sweep would
+/// reclaim its home now. Split from [`note_session_ended_for_leases`] so
+/// tests can drive it against injected roots without touching the real
+/// materialization root.
+fn end_leased_sessions(session_ids: &[&str]) -> bool {
+    let ended_kinds: HashSet<String> = {
+        let mut sessions = leased_home_sessions()
+            .write()
+            .expect("leased home sessions poisoned");
+        let mut ended = HashSet::new();
+        for id in session_ids {
+            if let Some(kind) = sessions.remove(id.trim()) {
+                ended.insert(kind);
+            }
+        }
+        ended.retain(|kind| !sessions.values().any(|k| k == kind));
+        ended
+    };
+    if ended_kinds.is_empty() {
+        return false;
+    }
+    let pending = pending_materialization_cleanup()
+        .read()
+        .expect("pending materialization cleanup poisoned");
+    ended_kinds.iter().any(|kind| pending.contains(kind))
+}
+
+/// Session-lifecycle hook: a supervised session ended (any of its ids).
+/// If that releases a kind whose expired home was deferred, sweep now so
+/// the home is deleted at session exit instead of lingering to the next
+/// timer tick.
+pub fn note_session_ended_for_leases(session_ids: &[&str]) {
+    if end_leased_sessions(session_ids) {
+        sweep_now();
+    }
+}
+
+/// Whether any registered supervised session still runs against `kind`'s
+/// materialized home.
+fn kind_has_live_leased_session(kind: &str) -> bool {
+    leased_home_sessions()
+        .read()
+        .expect("leased home sessions poisoned")
+        .values()
+        .any(|k| k == kind)
 }
 
 fn now_unix_ms() -> u64 {
@@ -168,6 +269,12 @@ fn sweep_locked(
         if active_oauth.contains(&kind) {
             continue;
         }
+        // A deferred expired home stays parked while its leased CLI
+        // session is still running (see the expiry arm below); the
+        // session-end hook re-sweeps the moment the last session exits.
+        if kind_has_live_leased_session(&kind) {
+            continue;
+        }
         match reap_materialization(root, &kind) {
             Ok(reaped) => {
                 clear_materialization_cleanup(&kind);
@@ -189,6 +296,14 @@ fn sweep_locked(
     }
     let mut graves = tombstones().write().expect("lease tombstones poisoned");
     for kind in expired {
+        // An expired oauth home is not deleted under a still-running
+        // leased CLI: the CLI holds the home PATH and re-creates a fresh
+        // credential there on its next token refresh — outside custody
+        // and outside any further sweep. The lease itself still dies here
+        // (no new spawn sees the home); deletion is deferred to session
+        // exit via the pending-cleanup queue.
+        let defer_home_cleanup =
+            materialization_plan(&kind).is_some() && kind_has_live_leased_session(&kind);
         if let Some(lease) = leases.remove(&kind) {
             graves.insert(kind.clone(), lease.expires_at_unix_ms());
             queue_dry_notice(&kind, &lease.label);
@@ -198,14 +313,23 @@ fn sweep_locked(
                 &lease.label,
                 &lease.granted_by,
                 format!(
-                    "ran out {}s ago · ttl {}m · offline {}h",
+                    "ran out {}s ago · ttl {}m · offline {}h{}",
                     now.saturating_sub(lease.expires_at_unix_ms()) / 1_000,
                     lease.ttl_ms / 60_000,
                     lease.offline_ms / 3_600_000,
+                    if defer_home_cleanup {
+                        " · home cleanup deferred: leased session still running"
+                    } else {
+                        ""
+                    },
                 ),
             );
         }
         if materialization_plan(&kind).is_none() {
+            continue;
+        }
+        if defer_home_cleanup {
+            queue_materialization_cleanup(&kind);
             continue;
         }
         match reap_materialization(root, &kind) {
@@ -577,6 +701,44 @@ fn queue_materialization_cleanup(kind: &str) {
     }
 }
 
+/// Deliberate revocation (including the shutdown guard's revoke-all) also
+/// reclaims homes whose cleanup was parked — an expired lease's home
+/// deferred for a live session, or an earlier failed reap. Custody's
+/// revocation promise is immediate deletion; the live-session deferral
+/// only ever softens the expiry timer. Runs under the store write lock
+/// (rename-only, like every other under-lock reap); kinds holding a live
+/// lease in `leases` are skipped — their home belongs to the active lease.
+fn reap_parked_kinds(
+    leases: &HashMap<String, CredentialLease>,
+    root: &Path,
+    selector: Option<&str>,
+) -> Vec<MaterializationCleanup> {
+    let parked: Vec<String> = pending_materialization_cleanup()
+        .read()
+        .expect("pending materialization cleanup poisoned")
+        .iter()
+        .filter(|kind| match selector {
+            None => true,
+            Some(selector) => kind.as_str() == selector,
+        })
+        .filter(|kind| !leases.contains_key(kind.as_str()))
+        .cloned()
+        .collect();
+    let mut cleanup = Vec::new();
+    for kind in parked {
+        match reap_materialization(root, &kind) {
+            Ok(reaped) => {
+                clear_materialization_cleanup(&kind);
+                cleanup.push(MaterializationCleanup { kind, reaped });
+            }
+            Err(err) => {
+                eprintln!("[credential-leases] revoked parked cleanup for {kind} failed: {err}");
+            }
+        }
+    }
+    cleanup
+}
+
 fn clear_materialization_cleanup(kind: &str) {
     pending_materialization_cleanup()
         .write()
@@ -935,6 +1097,7 @@ pub fn revoke(selector: Option<&str>, actor: &str, via: &str) -> usize {
                 }
             }
         }
+        cleanup.extend(reap_parked_kinds(&leases, &root, selector));
         (before - leases.len(), cleanup)
     };
     // Delete synchronously but with no lock held: shutdown revocation
@@ -1069,6 +1232,7 @@ mod tests {
         store().write().unwrap().clear();
         tombstones().write().unwrap().clear();
         pending_materialization_cleanup().write().unwrap().clear();
+        leased_home_sessions().write().unwrap().clear();
     }
 
     /// Build a lease whose expiry anchor the test controls directly.
@@ -1613,6 +1777,156 @@ mod tests {
             "api_key"
         );
         revoke(None, "test", "local");
+        reset();
+    }
+
+    #[test]
+    fn leased_session_registry_maps_sources_and_gates_on_active_leases() {
+        let _guard = lock();
+        reset();
+        assert_eq!(lease_kind_for_source("codex"), Some("oauth:codex"));
+        assert_eq!(
+            lease_kind_for_source("CLAUDE-CODE"),
+            Some("oauth:claude-code")
+        );
+        assert_eq!(lease_kind_for_source("native"), None);
+
+        // Without an active lease the spawn never used a materialized
+        // home, so nothing registers.
+        note_leased_session_running("codex", &["sess-1", "backend-1"]);
+        assert!(!kind_has_live_leased_session("oauth:codex"));
+
+        // With an active lease, both ids register and either releases.
+        let now = now_unix_ms();
+        store().write().unwrap().insert(
+            "oauth:codex".to_string(),
+            test_lease("oauth:codex", now, MAX_TTL_MS),
+        );
+        note_leased_session_running("codex", &["sess-1", "backend-1", ""]);
+        assert!(kind_has_live_leased_session("oauth:codex"));
+        // Nothing is pending, so a session end triggers no sweep.
+        assert!(!end_leased_sessions(&["backend-1"]));
+        assert!(
+            kind_has_live_leased_session("oauth:codex"),
+            "sess-1 remains"
+        );
+        assert!(!end_leased_sessions(&["sess-1"]));
+        assert!(!kind_has_live_leased_session("oauth:codex"));
+        reset();
+    }
+
+    /// M-leases part 2: an expired oauth lease whose CLI session is still
+    /// running keeps its materialized home on disk (deleting it would make
+    /// the CLI's next token refresh mint a fresh credential outside
+    /// custody); the lease itself still dies, and the home is reclaimed by
+    /// the sweep that follows the session's end.
+    #[test]
+    fn expired_home_cleanup_defers_while_leased_session_runs() {
+        let _guard = lock();
+        reset();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("auth.json"), "SECRET").unwrap();
+        leased_home_sessions()
+            .write()
+            .unwrap()
+            .insert("sess-live".to_string(), "oauth:codex".to_string());
+
+        let now = now_unix_ms();
+        let mut leases: HashMap<String, CredentialLease> = HashMap::new();
+        leases.insert(
+            "oauth:codex".to_string(),
+            test_lease("oauth:codex", now.saturating_sub(10_000), 1),
+        );
+
+        // Expiry: the lease dies (tombstoned, removed) but the home stays
+        // and the cleanup parks in the pending queue.
+        let cleanup = sweep_locked(&mut leases, now, tmp.path());
+        assert!(cleanup.is_empty(), "no reap while the session runs");
+        assert!(leases.is_empty(), "the lease itself still expires");
+        assert!(tombstones().read().unwrap().contains_key("oauth:codex"));
+        assert!(
+            home.join("auth.json").exists(),
+            "home deferred, not deleted"
+        );
+        assert!(pending_materialization_cleanup()
+            .read()
+            .unwrap()
+            .contains("oauth:codex"));
+
+        // Later sweeps keep deferring while the session lives.
+        let cleanup = sweep_locked(&mut leases, now, tmp.path());
+        assert!(cleanup.is_empty());
+        assert!(home.join("auth.json").exists());
+
+        // Session end releases the deferral; the next sweep reclaims.
+        assert!(
+            end_leased_sessions(&["sess-live"]),
+            "a parked kind with no remaining session wants a sweep"
+        );
+        let cleanup = sweep_locked(&mut leases, now, tmp.path());
+        assert_eq!(cleanup.len(), 1);
+        assert!(!home.exists(), "canonical path freed after session exit");
+        assert!(pending_materialization_cleanup().read().unwrap().is_empty());
+        let staging = crate::lease_transcript_staging::StagingPaths {
+            staging: tmp.path().join("staging"),
+            active: tmp.path().join("active"),
+        };
+        run_cleanup_item(&staging, &cleanup[0]);
+        assert!(cleanup[0].reaped.as_ref().is_some_and(|p| !p.exists()));
+        let _ = take_dry_notices();
+        reset();
+    }
+
+    /// Deliberate revocation overrides the live-session deferral: parked
+    /// homes are reaped immediately (the shutdown guard's revoke-all rides
+    /// the same path, so deferred homes never outlive the daemon).
+    #[test]
+    fn revocation_reclaims_parked_homes_immediately() {
+        let _guard = lock();
+        reset();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("auth.json"), "SECRET").unwrap();
+        leased_home_sessions()
+            .write()
+            .unwrap()
+            .insert("sess-live".to_string(), "oauth:codex".to_string());
+        queue_materialization_cleanup("oauth:codex");
+
+        // A selector for a different kind leaves the parked home alone.
+        let leases: HashMap<String, CredentialLease> = HashMap::new();
+        let cleanup = reap_parked_kinds(&leases, tmp.path(), Some("oauth:claude-code"));
+        assert!(cleanup.is_empty());
+        assert!(home.exists());
+
+        // Revoking the kind (or everything) reaps despite the live session.
+        let cleanup = reap_parked_kinds(&leases, tmp.path(), Some("oauth:codex"));
+        assert_eq!(cleanup.len(), 1);
+        assert!(!home.exists(), "revocation deletes immediately");
+        assert!(pending_materialization_cleanup().read().unwrap().is_empty());
+        let staging = crate::lease_transcript_staging::StagingPaths {
+            staging: tmp.path().join("staging"),
+            active: tmp.path().join("active"),
+        };
+        run_cleanup_item(&staging, &cleanup[0]);
+
+        // A kind whose lease is ACTIVE again is skipped — the canonical
+        // home belongs to the new lease.
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("auth.json"), "FRESH").unwrap();
+        queue_materialization_cleanup("oauth:codex");
+        let now = now_unix_ms();
+        let mut active: HashMap<String, CredentialLease> = HashMap::new();
+        active.insert(
+            "oauth:codex".to_string(),
+            test_lease("oauth:codex", now, MAX_TTL_MS),
+        );
+        let cleanup = reap_parked_kinds(&active, tmp.path(), None);
+        assert!(cleanup.is_empty());
+        assert!(home.join("auth.json").exists(), "active lease home kept");
         reset();
     }
 

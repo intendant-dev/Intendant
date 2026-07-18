@@ -931,7 +931,7 @@ fn state_has_browser_mtls_root_history(state: &LocalIamState) -> bool {
 }
 
 fn write_browser_mtls_initialized_marker(cert_dir: &Path) -> AccessResult<()> {
-    std::fs::create_dir_all(cert_dir)?;
+    intendant_core::state_paths::create_private_dir_all(cert_dir)?;
     let path = browser_mtls_initialized_path(cert_dir);
     let mut file = match std::fs::OpenOptions::new()
         .write(true)

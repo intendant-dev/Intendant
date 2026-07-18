@@ -834,6 +834,234 @@ pub(crate) async fn handle_peer_tool_call(
     }
 }
 
+/// Approval ids for controller-tool gates (outbound MCP calls,
+/// `invoke_skill`, `spawn_sub_agent`, `workflow_checkpoint`). Own base keeps
+/// them disjoint from the turn-numbered runtime approval ids and the
+/// live-audio consent range (`1 << 41`).
+const CONTROLLER_TOOL_APPROVAL_ID_BASE: u64 = 1 << 42;
+static CONTROLLER_TOOL_APPROVAL_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(CONTROLLER_TOOL_APPROVAL_ID_BASE);
+fn next_controller_tool_approval_id() -> u64 {
+    CONTROLLER_TOOL_APPROVAL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Outcome of the controller-tool approval gate.
+enum ControllerToolGate {
+    /// Dispatch the call.
+    Dispatch,
+    /// Do not dispatch; hand this text to the model as the tool result.
+    Refuse(String),
+    /// User denied: the loop exits `Denied`, like a runtime-command deny.
+    StopDenied,
+    /// Interrupt arrived while the prompt was pending.
+    StopInterrupted,
+    /// Headless with no approver surface: fail closed like the runtime path.
+    StopNoApprover,
+}
+
+/// Consult autonomy for a controller-dispatched tool call and, when needed,
+/// hold the SAME approval prompt runtime commands get (`ApprovalRequired`
+/// on the bus, resolved through the JSON stdin slot or the approval
+/// registry) BEFORE any side effect. Controller tools never pass through
+/// the runtime batch classifier, so without this gate
+/// `[approval] tool_call = "deny"` and Low autonomy would not apply to
+/// them at all, and their dispatch would leave no approval audit trail.
+#[allow(clippy::too_many_arguments)] // mirrors the loop's approval plumbing, not a bundle
+async fn gate_controller_tool_call(
+    tool_label: &str,
+    preview: &str,
+    dedup_source: &str,
+    autonomy: &SharedAutonomy,
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    json_approval: Option<&JsonApprovalSlot>,
+    approval_registry: &event::ApprovalRegistry,
+    headless: bool,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    local_session_id: &Option<String>,
+) -> ControllerToolGate {
+    let category = autonomy::ActionCategory::ToolCall;
+    let decision = autonomy.read().await.controller_tool_decision();
+    match decision {
+        autonomy::ControllerToolDecision::AutoApprove => {
+            // Same visibility signal the runtime path emits for
+            // auto-approved batches.
+            bus.send(AppEvent::AutoApproved {
+                preview: preview.to_string(),
+            });
+            return ControllerToolGate::Dispatch;
+        }
+        autonomy::ControllerToolDecision::Deny => {
+            slog(session_log, |l| {
+                l.approval(&category.to_string(), preview, "denied-policy")
+            });
+            return ControllerToolGate::Refuse(format!(
+                "Denied by approval policy: [approval] tool_call = \"deny\" refuses \
+                 controller-dispatched tool calls ({tool_label}). Not dispatched."
+            ));
+        }
+        autonomy::ControllerToolDecision::Ask => {}
+    }
+
+    // Dedup: an identical call already approved in this session skips the
+    // prompt (content-aware — the dedup source digests the arguments).
+    if autonomy
+        .read()
+        .await
+        .was_command_approved(local_session_id.as_deref(), dedup_source)
+    {
+        slog(session_log, |l| {
+            l.approval(&category.to_string(), preview, "dedup-auto-approved")
+        });
+        return ControllerToolGate::Dispatch;
+    }
+
+    slog(session_log, |l| {
+        l.approval(&category.to_string(), preview, "waiting")
+    });
+    let id = next_controller_tool_approval_id();
+
+    // (response, via_json): on the JSON stdin lane this waiter emits
+    // ApprovalResolved itself; on the registry lane the resolver
+    // (session supervisor / MCP state) emits it when popping the
+    // responder — matching the runtime approval path on both lanes.
+    let (response, via_json) = if let Some(slot) = json_approval {
+        // JSON mode: arm the stdin slot before announcing so an instant
+        // response cannot miss it.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut guard = slot.lock().unwrap();
+            *guard = Some((id, tx));
+        }
+        bus.send(AppEvent::ApprovalRequired {
+            session_id: local_session_id.clone(),
+            id,
+            command_preview: preview.to_string(),
+            category,
+        });
+        (rx.await, true)
+    } else if headless {
+        slog(session_log, |l| {
+            l.approval(&category.to_string(), preview, "denied-no-approver")
+        });
+        return ControllerToolGate::StopNoApprover;
+    } else {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        approval_registry.lock().unwrap().insert(id, tx);
+        bus.send(AppEvent::ApprovalRequired {
+            session_id: local_session_id.clone(),
+            id,
+            command_preview: preview.to_string(),
+            category,
+        });
+        (rx.await, false)
+    };
+
+    let resolve = |action: &str| {
+        if via_json {
+            bus.send(AppEvent::ApprovalResolved {
+                session_id: local_session_id.clone(),
+                id,
+                action: action.to_string(),
+            });
+        }
+    };
+    match response {
+        Ok(event::ApprovalResponse::Approve) => {
+            slog(session_log, |l| {
+                l.approval(&category.to_string(), preview, "approved")
+            });
+            resolve("approve");
+            apply_user_approval(
+                event::ApprovalResponse::Approve,
+                category,
+                local_session_id.as_deref(),
+                dedup_source,
+                autonomy,
+                bus,
+            )
+            .await;
+            ControllerToolGate::Dispatch
+        }
+        Ok(event::ApprovalResponse::ApproveAll) => {
+            slog(session_log, |l| {
+                l.approval(&category.to_string(), preview, "approve-all")
+            });
+            resolve("approve_all");
+            apply_user_approval(
+                event::ApprovalResponse::ApproveAll,
+                category,
+                local_session_id.as_deref(),
+                dedup_source,
+                autonomy,
+                bus,
+            )
+            .await;
+            ControllerToolGate::Dispatch
+        }
+        Ok(event::ApprovalResponse::Skip) => {
+            slog(session_log, |l| {
+                l.approval(&category.to_string(), preview, "skipped")
+            });
+            resolve("skip");
+            ControllerToolGate::Refuse(format!("Skipped by user: {tool_label} was not dispatched."))
+        }
+        // Answer targets question prompts; a tool-call approval receiving
+        // one fails closed, matching the runtime path.
+        Ok(event::ApprovalResponse::Deny | event::ApprovalResponse::Answer { .. }) | Err(_) => {
+            // Distinguish a real user deny from an interrupt draining the
+            // registry with synthetic Deny responses.
+            if cancel_token.is_cancelled() {
+                return ControllerToolGate::StopInterrupted;
+            }
+            slog(session_log, |l| {
+                l.approval(&category.to_string(), preview, "denied")
+            });
+            resolve("deny");
+            ControllerToolGate::StopDenied
+        }
+    }
+}
+
+/// Emit the terminal events for a `Stop*` gate outcome and name the loop
+/// exit reason; callers return it alongside their loop stats.
+fn controller_gate_stop_exit(
+    outcome: &ControllerToolGate,
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    local_session_id: &Option<String>,
+) -> LoopExitReason {
+    match outcome {
+        ControllerToolGate::StopInterrupted => {
+            bus.send(AppEvent::Interrupted {
+                session_id: local_session_id.clone(),
+                reason: "user requested".into(),
+            });
+            slog(session_log, |l| {
+                l.info("Agent loop interrupted during approval wait")
+            });
+            LoopExitReason::Interrupted
+        }
+        ControllerToolGate::StopNoApprover => {
+            bus.send(AppEvent::TaskComplete {
+                session_id: local_session_id.clone(),
+                reason: "Approval required in headless mode (tool_call)".to_string(),
+                summary: None,
+            });
+            LoopExitReason::Denied
+        }
+        // StopDenied (and, defensively, any non-stop variant routed here).
+        _ => {
+            bus.send(AppEvent::TaskComplete {
+                session_id: local_session_id.clone(),
+                reason: "Denied by user".to_string(),
+                summary: None,
+            });
+            LoopExitReason::Denied
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn run_agent_loop(
     provider: &dyn provider::ChatProvider,
@@ -1581,18 +1809,58 @@ pub(crate) async fn run_agent_loop(
                 break;
             }
 
-            // Process MCP tool calls (if any)
+            // Process MCP tool calls (if any). Controller-dispatched — the
+            // runtime batch classifier never sees them — so each call
+            // consults the approval gate here, BEFORE dispatch: the
+            // `tool_call` rule (including deny) and Low autonomy hold for
+            // outbound MCP exactly as for runtime commands, with the same
+            // prompt, log rows, and events. Calls are gated and dispatched
+            // strictly in order, so a later call never runs while an
+            // earlier prompt is unresolved.
             if !batch.mcp_calls.is_empty() {
                 if let Some(mgr) = mcp_mgr {
                     for (call_id, tool_name, args_json) in &batch.mcp_calls {
                         let args: serde_json::Value =
                             serde_json::from_str(args_json).unwrap_or_default();
-                        let result = mgr.call_tool(tool_name, args).await;
-                        let output = match result {
-                            Ok(text) => text,
-                            Err(e) => format!("MCP tool error: {}", e),
-                        };
-                        conversation.add_tool_result(call_id, tool_name, &output);
+                        let preview =
+                            format!("mcp: {} {}", tool_name, types::truncate_str(args_json, 160));
+                        let dedup_source = autonomy::controller_tool_dedup_source(tool_name, &args);
+                        match gate_controller_tool_call(
+                            tool_name,
+                            &preview,
+                            &dedup_source,
+                            &autonomy,
+                            bus,
+                            &session_log,
+                            json_approval,
+                            approval_registry,
+                            headless,
+                            &cancel_token,
+                            &local_session_id,
+                        )
+                        .await
+                        {
+                            ControllerToolGate::Dispatch => {
+                                let result = mgr.call_tool(tool_name, args).await;
+                                let output = match result {
+                                    Ok(text) => text,
+                                    Err(e) => format!("MCP tool error: {}", e),
+                                };
+                                conversation.add_tool_result(call_id, tool_name, &output);
+                            }
+                            ControllerToolGate::Refuse(text) => {
+                                conversation.add_tool_result(call_id, tool_name, &text);
+                            }
+                            stop => {
+                                let reason = controller_gate_stop_exit(
+                                    &stop,
+                                    bus,
+                                    &session_log,
+                                    &local_session_id,
+                                );
+                                return Ok((loop_stats, reason));
+                            }
+                        }
                         handled_call_ids.insert(call_id.clone());
                     }
                 } else {
@@ -1607,9 +1875,40 @@ pub(crate) async fn run_agent_loop(
                 }
             }
 
-            // Process invoke_skill tool calls (if any)
+            // Process invoke_skill tool calls (if any). Controller-side:
+            // same approval gate as MCP calls, before the skill body loads.
             for (call_id, skill_name, arguments) in &batch.skill_invocations {
                 handled_call_ids.insert(call_id.clone());
+                let gate_args = serde_json::json!({
+                    "skill_name": skill_name,
+                    "arguments": arguments,
+                });
+                match gate_controller_tool_call(
+                    "invoke_skill",
+                    &format!("invoke_skill: {}", skill_name),
+                    &autonomy::controller_tool_dedup_source("invoke_skill", &gate_args),
+                    &autonomy,
+                    bus,
+                    &session_log,
+                    json_approval,
+                    approval_registry,
+                    headless,
+                    &cancel_token,
+                    &local_session_id,
+                )
+                .await
+                {
+                    ControllerToolGate::Dispatch => {}
+                    ControllerToolGate::Refuse(text) => {
+                        conversation.add_tool_result(call_id, "invoke_skill", &text);
+                        continue;
+                    }
+                    stop => {
+                        let reason =
+                            controller_gate_stop_exit(&stop, bus, &session_log, &local_session_id);
+                        return Ok((loop_stats, reason));
+                    }
+                }
                 let discovered = skills::discover_skills(Some(&project.root));
                 match discovered.iter().find(|s| s.config.name == *skill_name) {
                     Some(skill) => {
@@ -1659,6 +1958,10 @@ pub(crate) async fn run_agent_loop(
             // `crate::peer::ops` bodies — the same implementations
             // behind the MCP tools and `intendant ctl peer`. Peer
             // screenshots attach as images so the model sees them.
+            // Deliberately NOT behind the controller-tool gate: every
+            // effectful peer op is gated peer-side by the profile the peer
+            // issued this daemon plus the peer's own autonomy/approval
+            // flow (see `peer::ops`) — a dedicated gate, not a bypass.
             for (call_id, args) in &batch.peer_calls {
                 handled_call_ids.insert(call_id.clone());
                 let response = handle_peer_tool_call(args, peer_registry).await;
@@ -1671,15 +1974,78 @@ pub(crate) async fn run_agent_loop(
             }
 
             // Workflow checkpoints (coordination files §9 v0).
+            // Controller-side file writes: same approval gate as MCP calls.
             for (call_id, args) in &batch.workflow_checkpoints {
                 handled_call_ids.insert(call_id.clone());
+                match gate_controller_tool_call(
+                    "workflow_checkpoint",
+                    &format!(
+                        "workflow_checkpoint: {}",
+                        args.get("action")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("write")
+                    ),
+                    &autonomy::controller_tool_dedup_source("workflow_checkpoint", args),
+                    &autonomy,
+                    bus,
+                    &session_log,
+                    json_approval,
+                    approval_registry,
+                    headless,
+                    &cancel_token,
+                    &local_session_id,
+                )
+                .await
+                {
+                    ControllerToolGate::Dispatch => {}
+                    ControllerToolGate::Refuse(text) => {
+                        conversation.add_tool_result(call_id, "workflow_checkpoint", &text);
+                        continue;
+                    }
+                    stop => {
+                        let reason =
+                            controller_gate_stop_exit(&stop, bus, &session_log, &local_session_id);
+                        return Ok((loop_stats, reason));
+                    }
+                }
                 let response = handle_workflow_checkpoint_call(args, project, &local_session_id);
                 conversation.add_tool_result(call_id, "workflow_checkpoint", &response);
             }
 
             // Spawn supervised sub-agent sessions (spawn_sub_agent).
+            // Controller-side: same approval gate as MCP calls, before the
+            // child session exists. The default `tool_call = auto` rule
+            // keeps orchestration usable at normal autonomy; Low prompts
+            // and an explicit deny refuses.
             for (call_id, args) in &batch.sub_agent_spawns {
                 handled_call_ids.insert(call_id.clone());
+                let task_line = args.get("task").and_then(|t| t.as_str()).unwrap_or("");
+                match gate_controller_tool_call(
+                    "spawn_sub_agent",
+                    &format!("spawn_sub_agent: {}", types::truncate_str(task_line, 120)),
+                    &autonomy::controller_tool_dedup_source("spawn_sub_agent", args),
+                    &autonomy,
+                    bus,
+                    &session_log,
+                    json_approval,
+                    approval_registry,
+                    headless,
+                    &cancel_token,
+                    &local_session_id,
+                )
+                .await
+                {
+                    ControllerToolGate::Dispatch => {}
+                    ControllerToolGate::Refuse(text) => {
+                        conversation.add_tool_result(call_id, "spawn_sub_agent", &text);
+                        continue;
+                    }
+                    stop => {
+                        let reason =
+                            controller_gate_stop_exit(&stop, bus, &session_log, &local_session_id);
+                        return Ok((loop_stats, reason));
+                    }
+                }
                 let response =
                     handle_spawn_sub_agent_call(args, orchestration, project, &session_log).await;
                 conversation.add_tool_result(call_id, "spawn_sub_agent", &response);
@@ -1687,6 +2053,9 @@ pub(crate) async fn run_agent_loop(
 
             // Await sub-agent completions (wait_sub_agents). Blocking:
             // resolves inside this tool call, honoring interrupt/stop.
+            // Not behind the controller-tool gate: waiting is a pure join
+            // on children whose spawn already passed it — prompting again
+            // here would gate no side effect.
             for (call_id, args) in &batch.sub_agent_waits {
                 handled_call_ids.insert(call_id.clone());
                 let response = handle_wait_sub_agents_call(
@@ -1700,7 +2069,10 @@ pub(crate) async fn run_agent_loop(
                 conversation.add_tool_result(call_id, "wait_sub_agents", &response);
             }
 
-            // Handle shared_view tool calls (dashboard coordination layer)
+            // Handle shared_view tool calls (dashboard coordination layer).
+            // Not behind the controller-tool gate: user-display show/capture
+            // is gated inside `handle_shared_view_calls` by the dedicated
+            // `user_display_granted` opt-in (agent-owned views need none).
             if !batch.shared_view_calls.is_empty() {
                 for (call_id, _) in &batch.shared_view_calls {
                     handled_call_ids.insert(call_id.clone());
@@ -2020,9 +2392,19 @@ pub(crate) async fn run_agent_loop(
             let mut should_skip = false;
             if let Some((cat, denied_by_policy)) = needs_approval {
                 let preview = format_command_preview(&json_str);
+                // Approval identity is deliberately separate from the
+                // display preview: content-bearing mutations digest their
+                // content (a preview names only the path), and remembered
+                // approvals are scoped to this session.
+                let dedup_source = autonomy::batch_dedup_source(&json_str);
 
                 // Dedup: skip approval for retries of already-approved commands
-                if !denied_by_policy && autonomy.read().await.was_command_approved(&preview) {
+                if !denied_by_policy
+                    && autonomy
+                        .read()
+                        .await
+                        .was_command_approved(local_session_id.as_deref(), &dedup_source)
+                {
                     slog(&session_log, |l| {
                         l.approval(&cat.to_string(), &preview, "dedup-auto-approved")
                     });
@@ -2069,7 +2451,8 @@ pub(crate) async fn run_agent_loop(
                                 apply_user_approval(
                                     event::ApprovalResponse::Approve,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2087,7 +2470,8 @@ pub(crate) async fn run_agent_loop(
                                 apply_user_approval(
                                     event::ApprovalResponse::ApproveAll,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2155,7 +2539,8 @@ pub(crate) async fn run_agent_loop(
                                 apply_user_approval(
                                     event::ApprovalResponse::Approve,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2168,7 +2553,8 @@ pub(crate) async fn run_agent_loop(
                                 apply_user_approval(
                                     event::ApprovalResponse::ApproveAll,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2567,9 +2953,19 @@ Proceed with explicit assumptions and continue without additional questions."
             let mut should_skip = false;
             if let Some((cat, denied_by_policy)) = needs_approval {
                 let preview = format_command_preview(&json_str);
+                // Approval identity is deliberately separate from the
+                // display preview: content-bearing mutations digest their
+                // content (a preview names only the path), and remembered
+                // approvals are scoped to this session.
+                let dedup_source = autonomy::batch_dedup_source(&json_str);
 
                 // Dedup: skip approval for retries of already-approved commands
-                if !denied_by_policy && autonomy.read().await.was_command_approved(&preview) {
+                if !denied_by_policy
+                    && autonomy
+                        .read()
+                        .await
+                        .was_command_approved(local_session_id.as_deref(), &dedup_source)
+                {
                     slog(&session_log, |l| {
                         l.approval(&cat.to_string(), &preview, "dedup-auto-approved")
                     });
@@ -2616,7 +3012,8 @@ Proceed with explicit assumptions and continue without additional questions."
                                 apply_user_approval(
                                     event::ApprovalResponse::Approve,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2634,7 +3031,8 @@ Proceed with explicit assumptions and continue without additional questions."
                                 apply_user_approval(
                                     event::ApprovalResponse::ApproveAll,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2702,7 +3100,8 @@ Proceed with explicit assumptions and continue without additional questions."
                                 apply_user_approval(
                                     event::ApprovalResponse::Approve,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2715,7 +3114,8 @@ Proceed with explicit assumptions and continue without additional questions."
                                 apply_user_approval(
                                     event::ApprovalResponse::ApproveAll,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -3467,6 +3867,279 @@ mod steer_dedup {
         );
         assert_eq!(kept.len(), 3, "same-text/new-id and id-less steers stay");
         assert!(dropped.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod controller_tool_gate {
+    //! The controller-tool approval gate: the chokepoint every
+    //! controller-dispatched tool (outbound MCP, invoke_skill,
+    //! spawn_sub_agent, workflow_checkpoint) consults BEFORE any side
+    //! effect. Hermetic: bus + registry only, no daemon.
+
+    use super::*;
+
+    fn test_log() -> (tempfile::TempDir, SharedSessionLog) {
+        let dir = tempfile::tempdir().expect("session log dir");
+        let log = session_log::SessionLog::open(dir.path().join("log")).expect("open session log");
+        (dir, std::sync::Arc::new(std::sync::Mutex::new(log)))
+    }
+
+    fn state_with_tool_rule(level: AutonomyLevel, rule: autonomy::ApprovalRule) -> SharedAutonomy {
+        let mut rules = autonomy::ApprovalConfig::default();
+        rules.tool_call = rule;
+        autonomy::shared_autonomy(autonomy::AutonomyState::new(level, rules))
+    }
+
+    #[tokio::test]
+    async fn policy_deny_refuses_without_prompt_or_dispatch() {
+        let (_dir, log) = test_log();
+        let autonomy = state_with_tool_rule(AutonomyLevel::Medium, autonomy::ApprovalRule::Deny);
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let registry = event::ApprovalRegistry::default();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let outcome = gate_controller_tool_call(
+            "mcp__gh_create_issue",
+            "mcp: mcp__gh_create_issue {}",
+            "tool: mcp__gh_create_issue #0",
+            &autonomy,
+            &bus,
+            &log,
+            None,
+            &registry,
+            false,
+            &token,
+            &Some("sess".to_string()),
+        )
+        .await;
+        let ControllerToolGate::Refuse(text) = outcome else {
+            panic!("tool_call = deny must refuse without dispatching");
+        };
+        assert!(text.contains("deny"), "{text}");
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, AppEvent::ApprovalRequired { .. }),
+                "a policy deny must not raise a prompt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_rule_dispatches_with_audit_event() {
+        let (_dir, log) = test_log();
+        // Default: Medium + tool_call = auto.
+        let autonomy = autonomy::shared_autonomy(autonomy::AutonomyState::default());
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let registry = event::ApprovalRegistry::default();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let outcome = gate_controller_tool_call(
+            "mcp__gh_list_issues",
+            "mcp: mcp__gh_list_issues {}",
+            "tool: mcp__gh_list_issues #0",
+            &autonomy,
+            &bus,
+            &log,
+            None,
+            &registry,
+            false,
+            &token,
+            &None,
+        )
+        .await;
+        assert!(matches!(outcome, ControllerToolGate::Dispatch));
+        let mut saw_auto = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, AppEvent::AutoApproved { .. }) {
+                saw_auto = true;
+            }
+        }
+        assert!(saw_auto, "auto dispatch must leave an AutoApproved trail");
+    }
+
+    #[tokio::test]
+    async fn headless_without_approver_fails_closed() {
+        let (_dir, log) = test_log();
+        // Low autonomy: the gate must prompt — and with no approver
+        // surface it must stop, never dispatch.
+        let autonomy = state_with_tool_rule(AutonomyLevel::Low, autonomy::ApprovalRule::Auto);
+        let bus = EventBus::new();
+        let registry = event::ApprovalRegistry::default();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let outcome = gate_controller_tool_call(
+            "mcp__gh_create_issue",
+            "mcp: mcp__gh_create_issue {}",
+            "tool: mcp__gh_create_issue #0",
+            &autonomy,
+            &bus,
+            &log,
+            None,
+            &registry,
+            true,
+            &token,
+            &None,
+        )
+        .await;
+        assert!(matches!(outcome, ControllerToolGate::StopNoApprover));
+    }
+
+    async fn prompt_id(events: &mut tokio::sync::broadcast::Receiver<AppEvent>) -> u64 {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("prompt within 5s")
+                .expect("bus open")
+            {
+                AppEvent::ApprovalRequired { id, category, .. } => {
+                    assert_eq!(category, autonomy::ActionCategory::ToolCall);
+                    return id;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Registry lane end to end: prompt → user approves → dispatch, and
+    /// the approval is remembered for the session so the identical call
+    /// dedups without a second prompt.
+    #[tokio::test]
+    async fn registry_approve_dispatches_and_dedups_identical_call() {
+        let (_dir, log) = test_log();
+        let autonomy = state_with_tool_rule(AutonomyLevel::Low, autonomy::ApprovalRule::Auto);
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let registry = event::ApprovalRegistry::default();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let gate = {
+            let autonomy = autonomy.clone();
+            let bus = bus.clone();
+            let log = log.clone();
+            let registry = registry.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                gate_controller_tool_call(
+                    "mcp__gh_create_issue",
+                    "mcp: mcp__gh_create_issue {\"title\":\"x\"}",
+                    "tool: mcp__gh_create_issue #abc",
+                    &autonomy,
+                    &bus,
+                    &log,
+                    None,
+                    &registry,
+                    false,
+                    &token,
+                    &Some("sess-gate".to_string()),
+                )
+                .await
+            })
+        };
+
+        let id = prompt_id(&mut events).await;
+        // The user's click: a direct resolver pops the registry responder.
+        let responder = registry
+            .lock()
+            .unwrap()
+            .remove(&id)
+            .expect("responder armed before the prompt event");
+        responder
+            .send(event::ApprovalResponse::Approve)
+            .expect("gate listening");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), gate)
+            .await
+            .expect("gate returns")
+            .expect("gate task");
+        assert!(matches!(outcome, ControllerToolGate::Dispatch));
+
+        // Session-scoped memory: the identical call dedups...
+        assert!(autonomy
+            .read()
+            .await
+            .was_command_approved(Some("sess-gate"), "tool: mcp__gh_create_issue #abc"));
+        // ...different arguments or another session still prompt.
+        let state = autonomy.read().await;
+        assert!(!state.was_command_approved(Some("sess-gate"), "tool: mcp__gh_create_issue #def"));
+        assert!(!state.was_command_approved(Some("other"), "tool: mcp__gh_create_issue #abc"));
+        drop(state);
+
+        // The dedup hit resolves without arming a new prompt.
+        let outcome = gate_controller_tool_call(
+            "mcp__gh_create_issue",
+            "mcp: mcp__gh_create_issue {\"title\":\"x\"}",
+            "tool: mcp__gh_create_issue #abc",
+            &autonomy,
+            &bus,
+            &log,
+            None,
+            &registry,
+            false,
+            &token,
+            &Some("sess-gate".to_string()),
+        )
+        .await;
+        assert!(matches!(outcome, ControllerToolGate::Dispatch));
+        assert!(
+            registry.lock().unwrap().is_empty(),
+            "dedup hit must not arm a prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_deny_stops_without_dispatch() {
+        let (_dir, log) = test_log();
+        let autonomy = state_with_tool_rule(AutonomyLevel::Low, autonomy::ApprovalRule::Auto);
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let registry = event::ApprovalRegistry::default();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let gate = {
+            let autonomy = autonomy.clone();
+            let bus = bus.clone();
+            let log = log.clone();
+            let registry = registry.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                gate_controller_tool_call(
+                    "spawn_sub_agent",
+                    "spawn_sub_agent: risky task",
+                    "tool: spawn_sub_agent #1",
+                    &autonomy,
+                    &bus,
+                    &log,
+                    None,
+                    &registry,
+                    false,
+                    &token,
+                    &None,
+                )
+                .await
+            })
+        };
+
+        let id = prompt_id(&mut events).await;
+        let responder = registry.lock().unwrap().remove(&id).expect("responder");
+        responder
+            .send(event::ApprovalResponse::Deny)
+            .expect("gate listening");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), gate)
+            .await
+            .expect("gate returns")
+            .expect("gate task");
+        assert!(matches!(outcome, ControllerToolGate::StopDenied));
+        assert!(
+            !autonomy
+                .read()
+                .await
+                .was_command_approved(None, "tool: spawn_sub_agent #1"),
+            "a deny must record nothing"
+        );
     }
 }
 

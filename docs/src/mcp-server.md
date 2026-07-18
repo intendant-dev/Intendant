@@ -115,7 +115,18 @@ auditable, rather than by timer or revocation side effect.
 
 By default the supervised-agent, token-holder, and local-loopback principals
 are root-compatible, so bare `intendant ctl` on the daemon host and existing
-supervised backends keep working with zero ceremony. The point of the
+supervised backends keep working with zero ceremony. Root-compatible does
+**not** mean unconstrained, though: independent of IAM, agent-session
+provenance is contained on the approval/settings surface. A caller bound as
+an agent session (session-scoped token, or the process token naming a
+session) is refused `set_autonomy` and `approve_all` outright — both rewrite
+the daemon-global shared autonomy, which would let a supervised agent widen
+its own approval policy — and `approve`/`deny`/`skip` resolve only approvals
+raised by the caller's own session (cross-session resolution is denied;
+unknown ownership fails closed). This mirrors `grant_user_display`'s
+owner-surface rule: owner surfaces (dashboard, `intendant ctl` on loopback,
+enrolled root mTLS clients, the stdio transport) and deliberately granted
+non-agent principals keep the full surface. The point of the
 binding is that the owner can now *scope* them: an
 `agent_session` grant (exact `session_id`, or `"*"` for every supervised
 agent) or a `local_process` grant against
@@ -181,15 +192,15 @@ Full MCP tool groups:
 
 | Tool            | Description | Params |
 |-----------------|-------------|--------|
-| `approve`       | Approve a pending command. | `id` |
-| `deny`          | Deny and stop. | `id` |
-| `skip`          | Skip, continue with the next command. | `id` |
-| `approve_all`   | Approve and set autonomy to Full. | `id` |
+| `approve`       | Approve a pending command. Agent-session callers may only resolve their own session's approvals. | `id` |
+| `deny`          | Deny and stop. Agent-session callers may only resolve their own session's approvals. | `id` |
+| `skip`          | Skip, continue with the next command. Agent-session callers may only resolve their own session's approvals. | `id` |
+| `approve_all`   | Approve and set autonomy to Full. Denied to agent-session callers (daemon-global autonomy escalation). | `id` |
 | `respond`       | Answer an `askHuman` question. | `text` |
 | `post_session_note` | Post a **display-only note** into the session transcript — rendered live in the dashboard and persisted for replay, never added to any model's context. Optional base64 images are committed to the session upload store and rendered as clickable thumbnails. Caps: 16 KB text, 6 images, 4 MB per image, 8 MB total; raster types only (`image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/bmp`). Session-scoped callers post into their own session by default. | `text`, `images?` (`[{media_type, data, name?}]`), `session_id?`, `source?` |
 | `ask_user`      | Ask the user one **structured question** on the dashboard question rail and **block** until answered or the wait expires. A question requests *input*, never permission: it is never auto-approved and answering it never widens autonomy. 0–4 options; free-text answers are always accepted (zero options = free-text only). Returns `{status, answer, answers}` — `answered` carries the choice(s); `timeout`/`dismissed`/`pass` carry best-judgment guidance; shapes with no answerable frontend auto-answer immediately with the same guidance. Session-scoped callers ask as their own session. Also `intendant ctl ask`. | `question`, `options?` (`[{label, description?}]`), `header?`, `multi_select?`, `wait_seconds?` (default 300, max 900), `session_id?` |
 | `notify_user`   | Fire-and-forget **notification** to the user; returns immediately, renders as a dashboard toast plus a transcript row (persisted for replay), never enters model context. `urgency` escalates delivery: `info` (default) dashboard-only; `attention` + tab badge and hidden-tab browser notification; `urgent` + an immediate content-free push nudge to the owner's opted-in browsers. Cap: 4 KB text. Also `intendant ctl notify`. | `text`, `title?`, `urgency?` (`info`/`attention`/`urgent`), `session_id?` |
-| `set_autonomy`  | Set autonomy. | `level`: `low`/`medium`/`high`/`full` |
+| `set_autonomy`  | Set autonomy. Denied to agent-session callers — the setting is daemon-global. | `level`: `low`/`medium`/`high`/`full` |
 | `set_verbosity` | Set log verbosity. | `level`: `quiet`/`normal`/`verbose`/`debug` |
 | `start_task`    | Start a new agent task (also used as follow-up when waiting). | `task` |
 | `quit`          | Shut down the agent. | — |

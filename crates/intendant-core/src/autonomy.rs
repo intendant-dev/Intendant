@@ -256,10 +256,15 @@ pub struct AutonomyState {
     /// Session-level grant for the user's session display.
     /// Once true, `DisplayControl` actions skip the approval prompt.
     pub user_display_granted: bool,
-    /// Command signatures that have been approved this session.
-    /// Retries of the same command (e.g. with different display param)
-    /// skip the approval prompt.
-    pub approved_commands: std::collections::HashSet<String>,
+    /// Approved action signatures, bucketed per session id (`None` session
+    /// ids share the `""` bucket used by the single-session shapes). One
+    /// autonomy state backs every native session of a daemon, so without
+    /// the bucket an approval in one session would silence prompts in every
+    /// other. Retries of the same action (e.g. with a different display
+    /// param) skip the approval prompt; content-bearing signatures (see
+    /// [`batch_dedup_source`]) carry a digest so changed content never
+    /// rides an old approval.
+    pub approved_commands: std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
 impl Default for AutonomyState {
@@ -268,7 +273,7 @@ impl Default for AutonomyState {
             level: AutonomyLevel::Medium,
             rules: ApprovalConfig::default(),
             user_display_granted: false,
-            approved_commands: std::collections::HashSet::new(),
+            approved_commands: std::collections::HashMap::new(),
         }
     }
 }
@@ -279,7 +284,7 @@ impl AutonomyState {
             level,
             rules,
             user_display_granted: false,
-            approved_commands: std::collections::HashSet::new(),
+            approved_commands: std::collections::HashMap::new(),
         }
     }
 
@@ -328,16 +333,21 @@ impl AutonomyState {
         key
     }
 
-    /// Check if a command was already approved this session.
-    pub fn was_command_approved(&self, command: &str) -> bool {
+    /// Check if this action signature was already approved in this session.
+    /// `session` is the local session id (`None` in the single-session
+    /// shapes); approvals never carry across sessions.
+    pub fn was_command_approved(&self, session: Option<&str>, dedup_source: &str) -> bool {
         self.approved_commands
-            .contains(&Self::command_dedup_key(command))
+            .get(session.unwrap_or(""))
+            .is_some_and(|set| set.contains(&Self::command_dedup_key(dedup_source)))
     }
 
-    /// Record a command as approved.
-    pub fn record_approved_command(&mut self, command: &str) {
+    /// Record an approved action signature for this session.
+    pub fn record_approved_command(&mut self, session: Option<&str>, dedup_source: &str) {
         self.approved_commands
-            .insert(Self::command_dedup_key(command));
+            .entry(session.unwrap_or("").to_string())
+            .or_default()
+            .insert(Self::command_dedup_key(dedup_source));
     }
 
     /// Determine whether approval is needed for a given action category.
@@ -376,13 +386,17 @@ impl AutonomyState {
                 // Apply global autonomy level
                 match self.level {
                     AutonomyLevel::Medium => {
-                        // Ask for writes, deletes, destructive, network
+                        // Ask for writes, deletes, destructive, network.
+                        // ToolCall is here too, but its default rule is
+                        // Auto — this arm is reached only under an
+                        // explicit `tool_call = "ask"`.
                         matches!(
                             category,
                             ActionCategory::FileWrite
                                 | ActionCategory::FileDelete
                                 | ActionCategory::Destructive
                                 | ActionCategory::NetworkRequest
+                                | ActionCategory::ToolCall
                         )
                     }
                     AutonomyLevel::High => false,
@@ -432,6 +446,40 @@ impl AutonomyState {
         // The external agent asked: let the human decide.
         ExternalApprovalDecision::Ask
     }
+
+    /// Decide how to handle a tool call the controller dispatches itself —
+    /// outbound MCP client tools (`mcp__*`), `invoke_skill`,
+    /// `spawn_sub_agent`, `workflow_checkpoint`. These never reach the
+    /// runtime, so [`classify_command`] never sees them; the
+    /// `[approval] tool_call` rule governs them here:
+    /// - an explicit `Deny` rule refuses at every level, matching the
+    ///   runtime batch consult (where a Deny rule is absolute);
+    /// - otherwise [`Self::needs_approval`] for [`ActionCategory::ToolCall`]
+    ///   decides: Low always prompts, the default `Auto` rule dispatches
+    ///   without a prompt at Medium/High (orchestration and MCP stay usable
+    ///   at default autonomy), an explicit `Ask` rule prompts at Medium,
+    ///   and Full never asks.
+    pub fn controller_tool_decision(&self) -> ControllerToolDecision {
+        let rule = self.rules.rule_for(ActionCategory::ToolCall);
+        if rule == ApprovalRule::Deny {
+            return ControllerToolDecision::Deny;
+        }
+        if self.needs_approval(ActionCategory::ToolCall) {
+            return ControllerToolDecision::Ask;
+        }
+        ControllerToolDecision::AutoApprove
+    }
+}
+
+/// Outcome of consulting autonomy for a controller-dispatched tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerToolDecision {
+    /// Dispatch without prompting.
+    AutoApprove,
+    /// Refuse without prompting (explicit `tool_call = "deny"` rule).
+    Deny,
+    /// Surface an approval prompt before dispatch.
+    Ask,
 }
 
 /// Outcome of routing an external-agent approval request through autonomy.
@@ -450,6 +498,106 @@ pub type SharedAutonomy = Arc<RwLock<AutonomyState>>;
 
 pub fn shared_autonomy(state: AutonomyState) -> SharedAutonomy {
     Arc::new(RwLock::new(state))
+}
+
+/// Hash a JSON value into `hasher`, order-independently for object keys,
+/// so the same arguments produce the same digest regardless of field order.
+fn hash_json_into(value: &serde_json::Value, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    match value {
+        serde_json::Value::Object(map) => {
+            "obj".hash(hasher);
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            for key in keys {
+                key.hash(hasher);
+                hash_json_into(&map[key.as_str()], hasher);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            "arr".hash(hasher);
+            for item in items {
+                hash_json_into(item, hasher);
+            }
+        }
+        other => other.to_string().hash(hasher),
+    }
+}
+
+/// Digest of one runtime command minus its volatile `nonce`, so a retry of
+/// the identical command dedups while any content change re-prompts.
+fn command_content_digest(cmd: &serde_json::Value) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match cmd {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            for key in keys {
+                if key == "nonce" {
+                    continue;
+                }
+                std::hash::Hash::hash(key, &mut hasher);
+                hash_json_into(&map[key.as_str()], &mut hasher);
+            }
+        }
+        other => hash_json_into(other, &mut hasher),
+    }
+    hasher.finish()
+}
+
+/// Build the approval-dedup identity for a runtime command batch.
+///
+/// Distinct from the display preview on purpose: the preview for a
+/// `writeFile`/`editFile` names only the path, and using it as the dedup
+/// key made one approval cover *any* later content aimed at that path.
+/// Here content-bearing mutations carry a digest of the full command
+/// (minus the per-call `nonce`), while exec and the other commands keep
+/// their exact-string semantics (with the display/nonce normalization
+/// [`AutonomyState::command_dedup_key`] applies at record/consult time).
+pub fn batch_dedup_source(json_str: &str) -> String {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return json_str.to_string();
+    };
+    let Some(commands) = parsed.get("commands").and_then(|c| c.as_array()) else {
+        return json_str.to_string();
+    };
+    let parts: Vec<String> = commands
+        .iter()
+        .map(|cmd| {
+            let func = cmd.get("function").and_then(|f| f.as_str()).unwrap_or("?");
+            match func {
+                "writeFile" | "editFile" => {
+                    let path = cmd.get("file_path").and_then(|p| p.as_str()).unwrap_or("?");
+                    format!("{}: {} #{:016x}", func, path, command_content_digest(cmd))
+                }
+                "execAsAgent" | "execPty" => {
+                    let command = cmd.get("command").and_then(|c| c.as_str()).unwrap_or("?");
+                    format!("exec: {}", command)
+                }
+                "inspectPath" => {
+                    let path = cmd.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                    format!("inspect: {}", path)
+                }
+                "browse" => {
+                    let url = cmd.get("url").and_then(|u| u.as_str()).unwrap_or("?");
+                    format!("browse: {}", url)
+                }
+                _ => func.to_string(),
+            }
+        })
+        .collect();
+    parts.join(" | ")
+}
+
+/// Approval-dedup identity for a controller-dispatched tool call: the tool
+/// name plus a digest of the full arguments, so a remembered approval
+/// covers only the identical call.
+pub fn controller_tool_dedup_source(tool_name: &str, args: &serde_json::Value) -> String {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_json_into(args, &mut hasher);
+    format!("tool: {} #{:016x}", tool_name, hasher.finish())
 }
 
 /// Classify an agent command JSON into action categories.
@@ -523,19 +671,33 @@ fn split_shell_commands(cmd: &str) -> Vec<&str> {
 }
 
 /// Classify a single shell sub-command into action categories.
+///
+/// Best-effort keyword matching for approval prompting — UX, not a security
+/// boundary. String matching cannot see through variable indirection,
+/// subshells, or novel spellings; the runtime's filesystem/exec sandbox is
+/// what actually confines commands. Keep the common spellings covered
+/// (long-form flags, absolute binary paths, `find -delete`) and accept that
+/// a determined evasion only dodges the prompt, never the sandbox.
 fn classify_single_command(cmd: &str, categories: &mut Vec<ActionCategory>) {
     let lower = cmd.to_lowercase();
     let tokens: Vec<&str> = lower.split_whitespace().collect();
 
+    // Compare binaries by basename so `/bin/rm` classifies like `rm`.
+    fn base(token: &str) -> &str {
+        token.rsplit('/').next().unwrap_or(token)
+    }
+
+    let first_token = tokens.first().copied().unwrap_or("");
+    let is_sudo = base(first_token) == "sudo";
     // Skip leading `sudo` to classify the actual command
-    let first = if tokens.first().copied() == Some("sudo") {
-        tokens.get(1).copied().unwrap_or("")
+    let first = if is_sudo {
+        tokens.get(1).copied().map(base).unwrap_or("")
     } else {
-        tokens.first().copied().unwrap_or("")
+        base(first_token)
     };
 
     // Detect sudo usage as destructive (privilege escalation)
-    if tokens.first().copied() == Some("sudo") {
+    if is_sudo {
         categories.push(ActionCategory::Destructive);
     }
 
@@ -543,7 +705,27 @@ fn classify_single_command(cmd: &str, categories: &mut Vec<ActionCategory>) {
     let destructive_commands = [
         "rm", "rmdir", "kill", "killall", "pkill", "shutdown", "reboot", "mkfs", "dd",
     ];
-    if destructive_commands.contains(&first) || lower.contains("rm -rf") || lower.contains("rm -r")
+    if destructive_commands.contains(&first)
+        || lower.contains("rm -rf")
+        || lower.contains("rm -r")
+        || lower.contains("rm --recursive")
+        || lower.contains("rm --force")
+    {
+        categories.push(ActionCategory::Destructive);
+    }
+
+    // `find` deletes without spelling `rm` as a command: `-delete`, or
+    // `-exec`/`-execdir` handing matched paths to a destructive binary.
+    if first == "find"
+        && tokens.iter().enumerate().any(|(i, token)| {
+            *token == "-delete"
+                || ((*token == "-exec" || *token == "-execdir")
+                    && tokens
+                        .get(i + 1)
+                        .copied()
+                        .map(base)
+                        .is_some_and(|next| destructive_commands.contains(&next)))
+        })
     {
         categories.push(ActionCategory::Destructive);
     }
@@ -764,11 +946,211 @@ destructive = "deny"
     #[test]
     fn approved_command_dedups_display_param_variants() {
         let mut state = AutonomyState::default();
-        state.record_approved_command("xdotool --display=1 key Return");
-        assert!(state.was_command_approved("xdotool --display=99 key Return"));
+        state.record_approved_command(None, "xdotool --display=1 key Return");
+        assert!(state.was_command_approved(None, "xdotool --display=99 key Return"));
 
-        state.record_approved_command("xdotool display:1 key Escape");
-        assert!(state.was_command_approved("xdotool display:99 key Escape"));
+        state.record_approved_command(None, "xdotool display:1 key Escape");
+        assert!(state.was_command_approved(None, "xdotool display:99 key Escape"));
+    }
+
+    #[test]
+    fn approvals_are_scoped_per_session() {
+        // One autonomy state backs every native session of a daemon; an
+        // approval recorded in one session must not silence prompts in
+        // another (or in the anonymous single-session bucket).
+        let mut state = AutonomyState::default();
+        state.record_approved_command(Some("sess-a"), "exec: cargo test");
+        assert!(state.was_command_approved(Some("sess-a"), "exec: cargo test"));
+        assert!(!state.was_command_approved(Some("sess-b"), "exec: cargo test"));
+        assert!(!state.was_command_approved(None, "exec: cargo test"));
+
+        state.record_approved_command(None, "exec: ls");
+        assert!(state.was_command_approved(None, "exec: ls"));
+        assert!(!state.was_command_approved(Some("sess-a"), "exec: ls"));
+    }
+
+    #[test]
+    fn batch_dedup_source_tracks_write_content() {
+        let write_v1 = r#"{"commands":[{"function":"editFile","nonce":1,"file_path":"/tmp/a.rs","content":"fn a() {}"}]}"#;
+        let write_v1_retry = r#"{"commands":[{"function":"editFile","nonce":7,"file_path":"/tmp/a.rs","content":"fn a() {}"}]}"#;
+        let write_v2 = r#"{"commands":[{"function":"editFile","nonce":1,"file_path":"/tmp/a.rs","content":"fn a() { std::process::exit(1) }"}]}"#;
+
+        // Identical mutation with a fresh nonce dedups; changed content
+        // at the same path re-prompts.
+        assert_eq!(
+            batch_dedup_source(write_v1),
+            batch_dedup_source(write_v1_retry)
+        );
+        assert_ne!(batch_dedup_source(write_v1), batch_dedup_source(write_v2));
+
+        // End to end through the session bucket: approving v1 never
+        // covers v2.
+        let mut state = AutonomyState::default();
+        state.record_approved_command(Some("s"), &batch_dedup_source(write_v1));
+        assert!(state.was_command_approved(Some("s"), &batch_dedup_source(write_v1_retry)));
+        assert!(!state.was_command_approved(Some("s"), &batch_dedup_source(write_v2)));
+    }
+
+    #[test]
+    fn batch_dedup_source_keeps_exec_exact_string_semantics() {
+        let exec = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"cargo build"},{"function":"inspectPath","nonce":2,"path":"/tmp"}]}"#;
+        assert_eq!(
+            batch_dedup_source(exec),
+            "exec: cargo build | inspect: /tmp"
+        );
+        // Unparseable input falls back to the raw string, like the preview.
+        assert_eq!(batch_dedup_source("not json"), "not json");
+    }
+
+    #[test]
+    fn controller_tool_dedup_source_tracks_args() {
+        let a1: serde_json::Value = serde_json::from_str(r#"{"title":"x","body":"y"}"#).unwrap();
+        // Same fields in a different order digest identically.
+        let a1_reordered: serde_json::Value =
+            serde_json::from_str(r#"{"body":"y","title":"x"}"#).unwrap();
+        let a2: serde_json::Value =
+            serde_json::from_str(r#"{"title":"x","body":"CHANGED"}"#).unwrap();
+
+        let k1 = controller_tool_dedup_source("mcp__gh_create_issue", &a1);
+        assert_eq!(
+            k1,
+            controller_tool_dedup_source("mcp__gh_create_issue", &a1_reordered)
+        );
+        assert_ne!(
+            k1,
+            controller_tool_dedup_source("mcp__gh_create_issue", &a2)
+        );
+        assert_ne!(k1, controller_tool_dedup_source("mcp__gh_close_issue", &a1));
+    }
+
+    #[test]
+    fn controller_tool_decision_honors_rules_and_levels() {
+        // Default (Medium + tool_call = auto): dispatch without prompting,
+        // so MCP and orchestration stay usable at default autonomy.
+        let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
+        assert_eq!(
+            state.controller_tool_decision(),
+            ControllerToolDecision::AutoApprove
+        );
+
+        // Low always prompts.
+        let state = AutonomyState::new(AutonomyLevel::Low, ApprovalConfig::default());
+        assert_eq!(
+            state.controller_tool_decision(),
+            ControllerToolDecision::Ask
+        );
+
+        // Full never asks.
+        let state = AutonomyState::new(AutonomyLevel::Full, ApprovalConfig::default());
+        assert_eq!(
+            state.controller_tool_decision(),
+            ControllerToolDecision::AutoApprove
+        );
+
+        // An explicit ask rule prompts at Medium, not at High (High
+        // auto-approves ordinary Ask rules).
+        let mut rules = ApprovalConfig::default();
+        rules.tool_call = ApprovalRule::Ask;
+        let state = AutonomyState::new(AutonomyLevel::Medium, rules.clone());
+        assert_eq!(
+            state.controller_tool_decision(),
+            ControllerToolDecision::Ask
+        );
+        let state = AutonomyState::new(AutonomyLevel::High, rules);
+        assert_eq!(
+            state.controller_tool_decision(),
+            ControllerToolDecision::AutoApprove
+        );
+
+        // Deny refuses at every level — absolute, like the runtime batch
+        // consult.
+        let mut rules = ApprovalConfig::default();
+        rules.tool_call = ApprovalRule::Deny;
+        for level in [
+            AutonomyLevel::Low,
+            AutonomyLevel::Medium,
+            AutonomyLevel::High,
+            AutonomyLevel::Full,
+        ] {
+            let state = AutonomyState::new(level, rules.clone());
+            assert_eq!(
+                state.controller_tool_decision(),
+                ControllerToolDecision::Deny,
+                "tool_call = deny must refuse at {:?}",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_catches_cheap_evasions() {
+        // Absolute-path binary names.
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "execAsAgent",
+            "nonce": 1,
+            "command": "/bin/rm --recursive /tmp/x"
+        });
+        assert!(classify_command(&cmd).contains(&ActionCategory::Destructive));
+
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "execAsAgent",
+            "nonce": 1,
+            "command": "/usr/bin/curl https://example.com"
+        });
+        assert!(classify_command(&cmd).contains(&ActionCategory::NetworkRequest));
+
+        // Long-form flags on a non-leading rm.
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "execAsAgent",
+            "nonce": 1,
+            "command": "echo /tmp/x | xargs rm --recursive"
+        });
+        assert!(classify_command(&cmd).contains(&ActionCategory::Destructive));
+
+        // find-based deletion.
+        for command in [
+            "find /tmp -name '*.log' -delete",
+            "find . -type f -exec rm {} ;",
+            "/usr/bin/find . -execdir rm -f {} ;",
+        ] {
+            let cmd: serde_json::Value = serde_json::json!({
+                "function": "execAsAgent",
+                "nonce": 1,
+                "command": command
+            });
+            assert!(
+                classify_command(&cmd).contains(&ActionCategory::Destructive),
+                "{command:?} must classify destructive"
+            );
+        }
+
+        // A plain find without deletion stays non-destructive.
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "execAsAgent",
+            "nonce": 1,
+            "command": "find . -name '*.rs'"
+        });
+        assert!(!classify_command(&cmd).contains(&ActionCategory::Destructive));
+
+        // sudo via absolute path counts as privilege escalation.
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "execAsAgent",
+            "nonce": 1,
+            "command": "/usr/bin/sudo systemctl stop nginx"
+        });
+        assert!(classify_command(&cmd).contains(&ActionCategory::Destructive));
+    }
+
+    #[test]
+    fn medium_asks_for_tool_call_only_under_explicit_ask_rule() {
+        // Default Auto: no prompt at Medium.
+        let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
+        assert!(!state.needs_approval(ActionCategory::ToolCall));
+        // Explicit ask rule: prompt at Medium.
+        let mut rules = ApprovalConfig::default();
+        rules.tool_call = ApprovalRule::Ask;
+        let state = AutonomyState::new(AutonomyLevel::Medium, rules);
+        assert!(state.needs_approval(ActionCategory::ToolCall));
     }
 
     #[test]

@@ -51,6 +51,13 @@ pub(crate) const DNS_RELAY_PROTOCOL: &str = "intendant-connect-dns-relay-v1";
 const DIALBACK_MAGIC: &str = "ITRLY1";
 /// Bytes read while looking for the dial-back hello's terminating newline.
 const DIALBACK_HELLO_MAX_BYTES: usize = 160;
+/// Overall budget for reading the entire hello line, equal to the browser
+/// waiter's dial-back window: past it the waiting splicer has already given
+/// up, so a slower hello could never produce a usable handoff. This must be
+/// one deadline for the whole read — a per-read timeout resets on every
+/// byte, so a byte-at-a-time writer could otherwise hold the connection for
+/// timeout × byte cap.
+const DIALBACK_HELLO_DEADLINE: Duration = RELAY_DIALBACK_TIMEOUT;
 
 /// Max concurrent relay connections accepted from one source IP (browser
 /// side). Bounds a single abusive client; daemon dial-back connections are
@@ -803,12 +810,16 @@ async fn handle_dialback_connection(relay: Arc<RelayState>, mut stream: TcpStrea
     let _ = sender.send(stream);
 }
 
-/// Read a bounded dial-back hello line and extract the nonce.
-async fn read_dialback_nonce(stream: &mut TcpStream) -> Option<String> {
+/// Read a bounded dial-back hello line and extract the nonce. Bounded in
+/// bytes by `DIALBACK_HELLO_MAX_BYTES` and in time by one overall
+/// `DIALBACK_HELLO_DEADLINE` across every read (dial-back connections are
+/// exempt from the per-IP cap, so the hello read must not be holdable).
+async fn read_dialback_nonce<S: AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + DIALBACK_HELLO_DEADLINE;
     let mut buf = Vec::with_capacity(64);
     let mut byte = [0u8; 1];
     loop {
-        match tokio::time::timeout(RELAY_DIALBACK_TIMEOUT, stream.read(&mut byte)).await {
+        match tokio::time::timeout_at(deadline, stream.read(&mut byte)).await {
             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return None,
             Ok(Ok(_)) => {}
         }
@@ -1139,6 +1150,31 @@ mod tests {
         let (mut client, mut server) = connected_pair().await;
         client.write_all(b"NOPE abc\n").await.unwrap();
         assert_eq!(read_dialback_nonce(&mut server).await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dialback_hello_slow_drip_ends_at_the_overall_deadline() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let drip = tokio::spawn(async move {
+            // One byte per second: every read completes well inside any
+            // per-read timeout and the total stays under the byte cap, so
+            // only the overall deadline can end this exchange.
+            loop {
+                if writer.write_all(b"I").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        let started = tokio::time::Instant::now();
+        assert_eq!(read_dialback_nonce(&mut reader).await, None);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= DIALBACK_HELLO_DEADLINE
+                && elapsed < DIALBACK_HELLO_DEADLINE + Duration::from_secs(2),
+            "the read must end at the deadline, not at cap x per-read timeout (elapsed {elapsed:?})"
+        );
+        drip.abort();
     }
 
     #[tokio::test]

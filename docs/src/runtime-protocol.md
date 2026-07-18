@@ -133,19 +133,25 @@ component), checking both the raw and canonicalized forms.
 
 Command strings (`execAsAgent`, `execPty`) do **not** pass through
 `validate_path()` — no string inspection could do so honestly (shell
-expansion, variables, indirection). The secret-directory portion of that
-policy is instead enforced at the OS level where the platform can express
-it: on macOS the controller always wraps the runtime in a Seatbelt profile
-denying `~/.ssh` and `~/.gnupg` to the whole process tree (composed into
-the write-restriction profile when the sandbox is enabled), so shell
-commands hit `Operation not permitted` on those paths. On Linux, Landlock
-is allowlist-only and cannot subtract read access from a granted tree —
-there, command strings are bounded by autonomy/approvals plus the write
-sandbox (`INTENDANT_SANDBOX_WRITE_PATHS`), and the secret-directory
-denylist genuinely covers only the structured tools. Windows mirrors the
-Linux posture with a `WRITE_RESTRICTED` token (`win_sandbox.rs`): reads
-stay open (so, like Linux, the secret-directory denylist covers only the
-structured tools) while writes are confined to the granted roots.
+expansion, variables, indirection). The secret portion of that policy is
+instead enforced at the OS level where the platform can express it: on
+macOS the controller always wraps the runtime in a Seatbelt profile
+denying `~/.ssh`, `~/.gnupg`, the intendant config home
+(`dirs::config_dir()/intendant`, which holds the global `.env` fallback),
+and every `.env` on the controller's key search path (launch cwd +
+ancestors, covering the project root) to the whole process tree (composed
+into the write-restriction profile when the write sandbox is enabled), so
+shell commands hit `Operation not permitted` on those paths. On Linux,
+Landlock is allowlist-only and cannot subtract read access from a granted
+tree — there, command strings are bounded by autonomy/approvals plus the
+write sandbox (`INTENDANT_SANDBOX_WRITE_PATHS`), the secret-directory
+denylist genuinely covers only the structured tools, and project/config
+`.env` files remain readable to sandboxed commands (moving keys out of
+agent-readable files — the credential-custody migration — is the tracked
+fix). Windows mirrors the Linux posture with a `WRITE_RESTRICTED` token
+(`win_sandbox.rs`): reads stay open (so, like Linux, the secret and
+`.env` coverage applies only to the structured tools) while writes are
+confined to the granted roots.
 
 ### `editFile` Operations
 
@@ -253,15 +259,28 @@ Linux/X11) the merged `session.Xauthority` cookie file.
 
 The runtime's write boundary is driven by the `INTENDANT_SANDBOX_WRITE_PATHS`
 environment variable (a platform path-list: `:`-separated on Unix,
-`;`-separated on Windows; empty/unset → no sandbox). The controller
-(`agent_runner.rs`) populates it from its `SandboxConfig` when `--sandbox` is
-in effect; each platform then enforces the same posture — whole filesystem
-readable, only the listed paths writable — with its native primitive:
+`;`-separated on Windows; empty/unset → no sandbox). The write sandbox is
+**on by default**: the controller (`configure_sandbox_env` in the caller's
+`main.rs`) populates the variable unless explicitly opted out —
+`--no-sandbox` or `[sandbox] enabled = false` in intendant.toml disable it,
+and `--sandbox` forces it on over both. The default write set is the
+project root (omitted for a projectless daemon), the scratch dirs (the live
+platform temp dir plus `/tmp` on Unix), the session log dir, the daemon
+state root (`~/.intendant`), and the toolchain caches a standard build
+writes even when warm (cargo home, rustup home, and the user cache dir on
+Unix — see `toolchain_cache_write_paths` in `sandbox.rs`);
+`[sandbox] extra_write_paths` extends it. Each platform then enforces the
+same posture — whole filesystem readable, only the listed paths writable —
+with its native primitive:
 
 - **Linux** — a Landlock ruleset applied in-process **before running any
-  command** (`apply_sandbox_from_env` in `src/main.rs`, ABI v5). Nonexistent
-  paths are skipped. If the kernel does not enforce Landlock, the runtime fails
-  closed and refuses to run the requested sandbox unconfined.
+  command** (`apply_sandbox_from_env` in `src/main.rs`, ABI v5). `/dev` is
+  always write-granted (tty/PTY nodes, `/dev/null` — DAC still applies),
+  mirroring the macOS profile. Nonexistent paths are skipped. If the kernel
+  does not enforce Landlock, the runtime **fails closed** and refuses to run
+  unconfined — on a Landlock-less kernel the error names the explicit
+  opt-outs (`--no-sandbox` / `[sandbox] enabled = false`); it never degrades
+  silently.
 - **macOS** — the controller wraps the runtime child in `sandbox-exec` with a
   generated Seatbelt profile (write-restriction composed with the always-on
   secret-directory denial; see `sandbox.rs`).

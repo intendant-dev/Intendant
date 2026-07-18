@@ -10,8 +10,6 @@
 //! Callers must only invoke [`install`] once per process.
 
 #[cfg(unix)]
-use std::fs::OpenOptions;
-#[cfg(unix)]
 use std::io;
 #[cfg(unix)]
 use std::os::fd::{IntoRawFd, RawFd};
@@ -39,7 +37,11 @@ static TEE_DRAIN_HOOK: Once = Once::new();
 
 #[cfg(unix)]
 pub fn install(path: &Path) -> io::Result<()> {
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    // daemon.log carries everything the controller prints (eprintln!,
+    // panics, tracing) — owner-only from creation.
+    let file = intendant_core::state_paths::private_file_options()
+        .append(true)
+        .open(path)?;
     let file_fd_stderr = file.into_raw_fd();
     // SAFETY: `file_fd_stderr` is a freshly opened, owned fd; dup only
     // duplicates it and reports failure via the return value.

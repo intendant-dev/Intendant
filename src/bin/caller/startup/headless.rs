@@ -246,14 +246,17 @@ pub(crate) async fn run_headless_mode(
                                 }
                             }
                             event::ControlMsg::Input { text } => {
-                                // Write human_response file for askHuman IPC.
+                                // Write human_response file for askHuman IPC
+                                // (token-prefixed via the shared helper).
                                 // The agent polls for this file; a swallowed
                                 // failure leaves it waiting forever.
-                                let resp_path = log_dir_for_stdin.join("human_response");
-                                if let Err(e) = std::fs::write(&resp_path, text.as_bytes()) {
+                                if let Err(e) = crate::agent_runner::write_human_response(
+                                    &log_dir_for_stdin,
+                                    &text,
+                                ) {
                                     eprintln!(
-                                        "Failed to write askHuman response {}: {}",
-                                        resp_path.display(),
+                                        "Failed to write askHuman response under {}: {}",
+                                        log_dir_for_stdin.display(),
                                         e
                                     );
                                 }
@@ -323,11 +326,12 @@ pub(crate) async fn run_headless_mode(
             loop {
                 match input_rx.recv().await {
                     Ok(AppEvent::ControlCommand(event::ControlMsg::Input { text })) => {
-                        let resp_path = log_dir_for_input.join("human_response");
-                        if let Err(e) = std::fs::write(&resp_path, text.as_bytes()) {
+                        if let Err(e) =
+                            crate::agent_runner::write_human_response(&log_dir_for_input, &text)
+                        {
                             eprintln!(
-                                "Failed to write askHuman response {}: {}",
-                                resp_path.display(),
+                                "Failed to write askHuman response under {}: {}",
+                                log_dir_for_input.display(),
                                 e
                             );
                         }

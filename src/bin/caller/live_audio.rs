@@ -1160,6 +1160,38 @@ const OFF_IN_READ_POS: usize = 48;
 const OFF_OUT_BUFFER: usize = 56;
 const OFF_IN_BUFFER: usize = OFF_OUT_BUFFER + VORTEX_RING_SAMPLES * 4;
 
+/// Pre-`mmap` validation of the Vortex shm object's `fstat` results,
+/// factored out of [`start_vortex_shm_bridge`] so the checks are unit
+/// testable without a live shm object.
+///
+/// A foreign-owned object means the well-known name was squatted by
+/// another user — refuse it. An undersized object would SIGBUS on the
+/// first ring access past EOF — refuse it before mapping. Same-uid
+/// writers remain inside the trust boundary: POSIX shm offers no OS
+/// boundary between same-user processes, so shm audio is necessarily
+/// trusted once these checks pass.
+#[cfg(unix)]
+fn validate_vortex_shm_object(
+    st_size: i64,
+    st_uid: libc::uid_t,
+    required_size: usize,
+    euid: libc::uid_t,
+) -> Result<(), String> {
+    if st_uid != euid {
+        return Err(format!(
+            "vortex shm object is owned by uid {st_uid}, not the current user (uid {euid}); \
+             refusing to attach"
+        ));
+    }
+    if st_size < 0 || (st_size as u64) < required_size as u64 {
+        return Err(format!(
+            "vortex shm object is {st_size} bytes, smaller than the required {required_size}; \
+             refusing to map a truncated object"
+        ));
+    }
+    Ok(())
+}
+
 /// Direct shared memory bridge: reads/writes the Vortex HAL plugin's ring
 /// buffers without the daemon. No sockets, no IPC, no deadlocks.
 ///
@@ -1192,8 +1224,33 @@ async fn start_vortex_shm_bridge(
     }
 
     let shm_size = OFF_IN_BUFFER + VORTEX_RING_SAMPLES * 4;
-    // SAFETY: fd is a live descriptor from shm_open; shm_size covers the
-    // VortexSharedAudioState header and both f32 ring buffers.
+
+    // Validate the object before mapping (see validate_vortex_shm_object).
+    // SAFETY: `st` is a zeroed stat buffer owned by this frame; fstat only
+    // writes into it and reports failure via the return value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is a live descriptor from shm_open; `st` is a valid,
+    // writable stat buffer.
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: fd was returned by shm_open above and is closed exactly once.
+        unsafe { libc::close(fd) };
+        return Err(CallerError::Agent(format!(
+            "vortex shm fstat failed: {err}"
+        )));
+    }
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if let Err(reason) = validate_vortex_shm_object(st.st_size, st.st_uid, shm_size, euid) {
+        // SAFETY: fd was returned by shm_open above and is closed exactly once.
+        unsafe { libc::close(fd) };
+        return Err(CallerError::Agent(reason));
+    }
+
+    // SAFETY: fd is a live descriptor from shm_open, fstat-verified above to
+    // be at least shm_size bytes; shm_size covers the VortexSharedAudioState
+    // header and both f32 ring buffers.
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -1769,6 +1826,19 @@ fn extract_json_object(text: &str) -> Option<String> {
 // Transcript logger
 // ---------------------------------------------------------------------------
 
+/// Open options for live-audio artifacts (transcripts, call results):
+/// they hold conversation content, so files are owner-only (0600) from
+/// creation on Unix; Windows relies on the profile ACL.
+fn private_audio_file_options() -> tokio::fs::OpenOptions {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    options
+}
+
 pub struct TranscriptLogger {
     file: tokio::fs::File,
     path: PathBuf,
@@ -1777,10 +1847,15 @@ pub struct TranscriptLogger {
 impl TranscriptLogger {
     pub async fn new(dir: &Path, live_audio_id: &str) -> Result<Self, CallerError> {
         let transcript_dir = dir.join(format!("live_audio_{}", live_audio_id));
-        tokio::fs::create_dir_all(&transcript_dir).await?;
+        let mut dir_builder = tokio::fs::DirBuilder::new();
+        dir_builder.recursive(true);
+        #[cfg(unix)]
+        {
+            dir_builder.mode(0o700);
+        }
+        dir_builder.create(&transcript_dir).await?;
         let path = transcript_dir.join("transcript.jsonl");
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
+        let file = private_audio_file_options()
             .append(true)
             .open(&path)
             .await?;
@@ -1859,8 +1934,7 @@ async fn whisper_inbound_loop<T>(
     let mut intake_open = true;
 
     // Open transcript file for appending
-    let mut transcript_file = match tokio::fs::OpenOptions::new()
-        .create(true)
+    let mut transcript_file = match private_audio_file_options()
         .append(true)
         .open(transcript_path)
         .await
@@ -2674,7 +2748,16 @@ pub async fn run_session(
     // to the transcript ensures it survives crashes.
     let result_path = transcript.path().with_file_name("result.json");
     if let Ok(json) = serde_json::to_string_pretty(&result) {
-        if let Err(err) = tokio::fs::write(&result_path, json).await {
+        let write_result = async {
+            let mut file = private_audio_file_options()
+                .truncate(true)
+                .open(&result_path)
+                .await?;
+            file.write_all(json.as_bytes()).await?;
+            file.flush().await
+        }
+        .await;
+        if let Err(err) = write_result {
             let message = format!(
                 "live_audio: CRITICAL: failed to persist call result {}: {}",
                 result_path.display(),
@@ -2696,6 +2779,35 @@ pub async fn run_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Vortex shm object validation (pure logic; never touches a live object)
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn vortex_shm_validation_refuses_foreign_and_short_objects() {
+        let required = OFF_IN_BUFFER + VORTEX_RING_SAMPLES * 4;
+
+        // Exact-size and oversized same-uid objects are fine.
+        assert!(validate_vortex_shm_object(required as i64, 501, required, 501).is_ok());
+        assert!(validate_vortex_shm_object((required + 4096) as i64, 501, required, 501).is_ok());
+
+        // Foreign owner: the well-known name was squatted by another user.
+        let err = validate_vortex_shm_object(required as i64, 0, required, 501).unwrap_err();
+        assert!(err.contains("owned by uid 0"), "{err}");
+
+        // Undersized (or nonsense-sized) object: mapping it would SIGBUS.
+        let err = validate_vortex_shm_object(required as i64 - 1, 501, required, 501).unwrap_err();
+        assert!(err.contains("smaller than the required"), "{err}");
+        assert!(validate_vortex_shm_object(0, 501, required, 501).is_err());
+        assert!(validate_vortex_shm_object(-1, 501, required, 501).is_err());
+
+        // Ownership is checked before size: a foreign object is reported as
+        // foreign even when also undersized.
+        let err = validate_vortex_shm_object(0, 0, required, 501).unwrap_err();
+        assert!(err.contains("owned by uid 0"), "{err}");
+    }
 
     // -----------------------------------------------------------------------
     // Vortex format conversion tests

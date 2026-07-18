@@ -333,7 +333,15 @@ pub(crate) async fn control_request_frame(
             ),
             "external agents",
         ),
-        "api_api_keys_save" => api_api_keys_save_response(id, params.as_ref()).await,
+        "api_api_keys_save" => {
+            api_api_keys_save_response(
+                id,
+                params.as_ref(),
+                runtime.grant.access_principal().id,
+                runtime.grant.custody_origin_class(),
+            )
+            .await
+        }
         "api_voice_session" => api_voice_session_response(id, &runtime).await,
         "api_project_root" => frame_api_json_body_response(
             id,

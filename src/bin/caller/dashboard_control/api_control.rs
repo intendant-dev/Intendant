@@ -1840,6 +1840,8 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
 pub(crate) async fn api_api_keys_save_response(
     id: String,
     params: Option<&serde_json::Value>,
+    audit_actor: String,
+    audit_origin: &'static str,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
     // The transport edge resolves the ambient env path; the persist
@@ -1849,6 +1851,8 @@ pub(crate) async fn api_api_keys_save_response(
         crate::web_gateway::api_keys_save_api_response(
             crate::web_gateway::api_keys_env_path().as_deref(),
             &body_text,
+            &audit_actor,
+            audit_origin,
         ),
         "api keys save",
     )
@@ -2704,15 +2708,25 @@ mod tests {
         // and still 200 (difference #3), so the tunnel's failure body
         // carries _httpOk true.
         let payload = serde_json::json!({"keys": {"NOT_A_KNOWN_KEY": "x"}});
-        let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::api_keys_save_api_response(None, &params_body_text(Some(&payload))),
-        );
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::api_keys_save_api_response(
+                None,
+                &params_body_text(Some(&payload)),
+                "parity-actor",
+                "local",
+            ));
         assert_eq!(status, 200);
         assert_eq!(
             http_body,
             serde_json::json!({"error": "Unknown key: NOT_A_KNOWN_KEY"})
         );
-        let frame = api_api_keys_save_response("parity-api-keys".to_string(), Some(&payload)).await;
+        let frame = api_api_keys_save_response(
+            "parity-api-keys".to_string(),
+            Some(&payload),
+            "parity-actor".to_string(),
+            "local",
+        )
+        .await;
         let mut result = frame["result"].clone();
         let map = result.as_object_mut().expect("result object");
         assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(200)));

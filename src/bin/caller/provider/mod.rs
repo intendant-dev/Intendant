@@ -184,9 +184,10 @@ fn provider_auth_for(env_name: &str, egress_kind: &'static str) -> Option<Provid
 }
 
 /// The provider API-key environment variables — the single authoritative
-/// list. The Settings save endpoint (`POST /api/api-keys`), the key-status
-/// endpoint, the `fueled` aggregate, and the per-session project `.env`
-/// overlay all derive from it.
+/// list. The credential-custody save endpoint (`POST /api/api-keys`,
+/// CredentialsManage-gated), the key-status endpoint, the `fueled`
+/// aggregate, and the per-session project `.env` overlay all derive from
+/// it.
 pub const PROVIDER_KEY_ENV_VARS: &[&str] =
     &["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"];
 

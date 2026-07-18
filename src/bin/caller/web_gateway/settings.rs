@@ -779,8 +779,16 @@ pub(crate) fn api_keys_env_path() -> Option<PathBuf> {
 /// authoritative provider key list, persist to `env_path`, and set the
 /// keys in the current process so future provider instantiations pick
 /// them up without a restart. Failures report in the body — the
-/// endpoint's historical contract answers 200 either way.
-pub(crate) fn set_api_keys_result(env_path: Option<&Path>, body: &str) -> String {
+/// endpoint's historical contract answers 200 either way. A successful
+/// write lands in the custody-audit trail (key names only) attributed to
+/// `audit_actor`/`audit_origin`, which the transport edge derives from
+/// the gate-bound principal.
+pub(crate) fn set_api_keys_result(
+    env_path: Option<&Path>,
+    body: &str,
+    audit_actor: &str,
+    audit_origin: &str,
+) -> String {
     let payload: SetApiKeysPayload = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(e) => {
@@ -847,6 +855,22 @@ pub(crate) fn set_api_keys_result(env_path: Option<&Path>, body: &str) -> String
         std::env::set_var(key, val);
     }
 
+    if !payload.keys.is_empty() {
+        let mut names: Vec<&str> = payload.keys.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        crate::credential_audit::record_with_origin(
+            crate::credential_audit::EVENT_PROVIDER_KEYS_WRITTEN,
+            "provider_env",
+            &names.join(", "),
+            audit_actor,
+            audit_origin,
+            format!(
+                "{} provider key(s) replaced in the daemon .env",
+                payload.keys.len()
+            ),
+        );
+    }
+
     serde_json::json!({"ok": true}).to_string()
 }
 
@@ -894,8 +918,16 @@ pub(crate) fn settings_post_api_response(
 /// the historical lane reports failures in the body — under the bare
 /// tail. `env_path` arrives from the transport edge
 /// ([`api_keys_env_path`]).
-pub(crate) fn api_keys_save_api_response(env_path: Option<&Path>, body_text: &str) -> ApiResponse {
-    bare_json_response(200, set_api_keys_result(env_path, body_text))
+pub(crate) fn api_keys_save_api_response(
+    env_path: Option<&Path>,
+    body_text: &str,
+    audit_actor: &str,
+    audit_origin: &str,
+) -> ApiResponse {
+    bare_json_response(
+        200,
+        set_api_keys_result(env_path, body_text, audit_actor, audit_origin),
+    )
 }
 
 /// GET /api/api-key-status + the tunnel's `api_key_status`.
@@ -970,12 +1002,19 @@ pub(crate) async fn handle_settings_get(
 pub(crate) async fn handle_api_keys_post(
     stream: DemuxStream,
     body_text: String,
+    audit_actor: String,
+    audit_origin: &'static str,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
     // The transport edge resolves the ambient env path; the neutral core
     // below it is path-parameterized (hermeticity convention).
-    let response = api_keys_save_api_response(api_keys_env_path().as_deref(), &body_text);
+    let response = api_keys_save_api_response(
+        api_keys_env_path().as_deref(),
+        &body_text,
+        &audit_actor,
+        audit_origin,
+    );
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -1625,6 +1664,8 @@ mod tests {
             handle_api_keys_post(
                 stream,
                 r#"{"keys":{"NOT_A_KNOWN_KEY":"x"}}"#.to_string(),
+                "test-actor".to_string(),
+                "local",
                 cors,
                 None,
             )
@@ -1648,7 +1689,14 @@ mod tests {
         let expected_body =
             serde_json::json!({"error": format!("Invalid payload: {}", serde_error)}).to_string();
         let response = collect_settings_handler_response(|stream| {
-            handle_api_keys_post(stream, invalid.to_string(), cors, None)
+            handle_api_keys_post(
+                stream,
+                invalid.to_string(),
+                "test-actor".to_string(),
+                "local",
+                cors,
+                None,
+            )
         })
         .await;
         assert_eq!(
@@ -1666,7 +1714,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let env_path = dir.path().join("intendant").join(".env");
         let body = serde_json::json!({"keys": {}}).to_string();
-        let result = set_api_keys_result(Some(&env_path), &body);
+        let result = set_api_keys_result(Some(&env_path), &body, "test-actor", "local");
         assert_eq!(result, r#"{"ok":true}"#);
         assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "\n");
     }
@@ -1677,7 +1725,7 @@ mod tests {
     fn set_api_keys_without_config_dir_reports_error_body() {
         let body = serde_json::json!({"keys": {}}).to_string();
         assert_eq!(
-            set_api_keys_result(None, &body),
+            set_api_keys_result(None, &body, "test-actor", "local"),
             r#"{"error":"Cannot determine config directory"}"#
         );
     }

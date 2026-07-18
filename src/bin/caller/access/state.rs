@@ -26,15 +26,8 @@ pub fn read_host_label(cert_dir: &Path) -> AccessResult<String> {
 
 pub fn write_p12_password(cert_dir: &Path, password: &str) -> AccessResult<()> {
     let path = cert_dir.join(P12_PASSWORD_FILE);
-    std::fs::write(&path, password.as_bytes())?;
-    // .p12 password is mildly sensitive — 0600.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&path, perms)?;
-    }
+    // .p12 password is sensitive — created 0600, never write-then-chmod.
+    intendant_core::state_paths::write_private_file(&path, password.as_bytes())?;
     Ok(())
 }
 

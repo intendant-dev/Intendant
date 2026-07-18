@@ -455,20 +455,32 @@ impl IntendantServer {
             "get_pending_approval" => Ok(text_tool_result(self.get_pending_approval().await)),
             "get_pending_input" => Ok(text_tool_result(self.get_pending_input().await)),
             "approve" => {
-                let params = parse_params::<ApproveParams>(args)?;
-                Ok(text_tool_result(self.approve(params).await))
+                let Parameters(params) = parse_params::<ApproveParams>(args)?;
+                Ok(text_tool_result(
+                    self.approve_scoped(params, McpToolScope::from_actor(&actor))
+                        .await,
+                ))
             }
             "deny" => {
-                let params = parse_params::<DenyParams>(args)?;
-                Ok(text_tool_result(self.deny(params).await))
+                let Parameters(params) = parse_params::<DenyParams>(args)?;
+                Ok(text_tool_result(
+                    self.deny_scoped(params, McpToolScope::from_actor(&actor))
+                        .await,
+                ))
             }
             "skip" => {
-                let params = parse_params::<SkipParams>(args)?;
-                Ok(text_tool_result(self.skip(params).await))
+                let Parameters(params) = parse_params::<SkipParams>(args)?;
+                Ok(text_tool_result(
+                    self.skip_scoped(params, McpToolScope::from_actor(&actor))
+                        .await,
+                ))
             }
             "approve_all" => {
-                let params = parse_params::<ApproveAllParams>(args)?;
-                Ok(text_tool_result(self.approve_all(params).await))
+                let Parameters(params) = parse_params::<ApproveAllParams>(args)?;
+                Ok(text_tool_result(
+                    self.approve_all_scoped(params, McpToolScope::from_actor(&actor))
+                        .await,
+                ))
             }
             "respond" => {
                 let params = parse_params::<RespondParams>(args)?;
@@ -542,8 +554,11 @@ impl IntendantServer {
                 })
             }
             "set_autonomy" => {
-                let params = parse_params::<SetAutonomyParams>(args)?;
-                Ok(text_tool_result(self.set_autonomy(params).await))
+                let Parameters(params) = parse_params::<SetAutonomyParams>(args)?;
+                Ok(text_tool_result(
+                    self.set_autonomy_scoped(params, McpToolScope::from_actor(&actor))
+                        .await,
+                ))
             }
             "set_verbosity" => {
                 let params = parse_params::<SetVerbosityParams>(args)?;
@@ -820,6 +835,44 @@ enum ActionOutcome {
     Ok,
     /// Action was not applicable (e.g. no pending approval when approving).
     NoOp { reason: String },
+    /// Action was refused for this caller (containment, not applicability).
+    Denied { reason: String },
+}
+
+/// How much daemon-global authority the caller of an approval/settings MCP
+/// tool carries. Owner surfaces, the stdio transport (the owner's own
+/// client config), and non-agent principals keep the full historical
+/// behavior; a supervised agent session — bound by MCP token possession —
+/// is contained even though its transport-default principal is
+/// root-compatible for IAM: it may not rewrite the daemon-global shared
+/// autonomy (`set_autonomy`, `approve_all`) and may only resolve approvals
+/// raised by its own session. The same idea as `grant_user_display`'s
+/// owner-surface gate, keyed on actor provenance instead of trust posture
+/// so deliberately granted scoped humans and federated peers are not
+/// caught by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpToolScope<'a> {
+    /// Full historical behavior.
+    Unrestricted,
+    /// A supervised agent session; `session_id` is the id the gate bound
+    /// by token possession (None fails closed).
+    AgentSession { session_id: Option<&'a str> },
+}
+
+impl<'a> McpToolScope<'a> {
+    /// Derive the scope from the actor a gate bound. Agent-session
+    /// provenance (session-scoped token, or the shared process token
+    /// naming a session, or an `agent_session` IAM binding) is contained;
+    /// every other actor class keeps the historical behavior.
+    pub(crate) fn from_actor(actor: &'a crate::access::actor::ActorBinding) -> Self {
+        if actor.kind == crate::access::actor::ActorKind::AgentSession {
+            McpToolScope::AgentSession {
+                session_id: actor.session_id.as_deref(),
+            }
+        } else {
+            McpToolScope::Unrestricted
+        }
+    }
 }
 
 /// Send `response` to the registry waiter registered under `id`.
@@ -831,10 +884,71 @@ fn resolve_approval(registry: &ApprovalRegistry, id: u64, response: ApprovalResp
     }
 }
 
+/// Denial message when `scope` may not resolve the currently pending
+/// approval, or None when resolution may proceed. Own-session resolution
+/// compares the approval's recorded owning session against the caller's
+/// token-bound session id (alias-aware); unknown ownership on either side
+/// fails closed. Must run under the same state borrow as the resolution so
+/// the decision and the `take()` cannot interleave with a pending swap.
+fn scope_denies_pending_approval(state: &McpAppState, scope: McpToolScope<'_>) -> Option<String> {
+    let McpToolScope::AgentSession { session_id } = scope else {
+        return None;
+    };
+    let Some(pending) = state.pending_approval.as_ref() else {
+        // Nothing pending: fall through to the ordinary no-op.
+        return None;
+    };
+    let owner = pending
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let own = session_id.map(str::trim).filter(|id| !id.is_empty());
+    let owned = match (owner, own) {
+        (Some(owner), Some(own)) => {
+            owner == own
+                || state
+                    .session_related_ids(own)
+                    .iter()
+                    .any(|related| related == owner)
+        }
+        _ => false,
+    };
+    if owned {
+        return None;
+    }
+    Some(
+        "the pending approval was not raised by your session. A supervised agent session may \
+         only resolve its own session's approvals; the daemon owner resolves others from the \
+         dashboard or `intendant ctl`."
+            .to_string(),
+    )
+}
+
 /// Resolve the pending approval prompt with `response` — the single handler
 /// behind the approve/deny/skip/approve_all tools and their `ControlMsg`
 /// twins. Phase transition and log line derive from the response kind.
-fn resolve_pending_approval(state: &mut McpAppState, response: ApprovalResponse) -> ActionOutcome {
+/// `scope` contains agent-session callers to their own session's approvals
+/// (and refuses ApproveAll outright — it widens daemon-global autonomy);
+/// the check and the `take()` share one `&mut state`, so they are atomic.
+fn resolve_pending_approval(
+    state: &mut McpAppState,
+    response: ApprovalResponse,
+    scope: McpToolScope<'_>,
+) -> ActionOutcome {
+    if matches!(scope, McpToolScope::AgentSession { .. })
+        && matches!(response, ApprovalResponse::ApproveAll)
+    {
+        return ActionOutcome::Denied {
+            reason: "approve_all raises daemon-wide autonomy to Full and is not available to \
+                     supervised agent sessions; approve your own session's approvals one at a \
+                     time, or ask the user (ask_user)"
+                .to_string(),
+        };
+    }
+    if let Some(reason) = scope_denies_pending_approval(state, scope) {
+        return ActionOutcome::Denied { reason };
+    }
     let Some(pending) = state.pending_approval.take() else {
         return ActionOutcome::NoOp {
             reason: "No pending approval".to_string(),
@@ -864,8 +978,7 @@ fn respond_to_human_question(state: &mut McpAppState, text: &str) -> ActionOutco
             reason: "No pending human question".to_string(),
         };
     }
-    let response_path = state.log_dir.join("human_response");
-    if std::fs::write(&response_path, text).is_ok() {
+    if crate::agent_runner::write_human_response(&state.log_dir, text).is_ok() {
         state.human_question = None;
         state.set_phase(Phase::RunningAgent);
         state.push_log(LogLevel::Info, format!("Human response (MCP): {}", text));
@@ -1474,8 +1587,18 @@ impl IntendantServer {
 
     #[tool(description = "Approve a pending command execution.")]
     async fn approve(&self, Parameters(params): Parameters<ApproveParams>) -> String {
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.approve_scoped(params, McpToolScope::Unrestricted)
+            .await
+    }
+
+    pub(crate) async fn approve_scoped(
+        &self,
+        params: ApproveParams,
+        scope: McpToolScope<'_>,
+    ) -> String {
         let mut s = self.state.write().await;
-        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Approve);
+        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Approve, scope);
         if outcome == ActionOutcome::Ok {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
@@ -1488,8 +1611,13 @@ impl IntendantServer {
 
     #[tool(description = "Deny a pending command execution. Stops the agent loop.")]
     async fn deny(&self, Parameters(params): Parameters<DenyParams>) -> String {
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.deny_scoped(params, McpToolScope::Unrestricted).await
+    }
+
+    pub(crate) async fn deny_scoped(&self, params: DenyParams, scope: McpToolScope<'_>) -> String {
         let mut s = self.state.write().await;
-        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Deny);
+        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Deny, scope);
         if outcome == ActionOutcome::Ok {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
@@ -1504,8 +1632,13 @@ impl IntendantServer {
         description = "Skip a pending command execution. The agent continues with the next command."
     )]
     async fn skip(&self, Parameters(params): Parameters<SkipParams>) -> String {
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.skip_scoped(params, McpToolScope::Unrestricted).await
+    }
+
+    pub(crate) async fn skip_scoped(&self, params: SkipParams, scope: McpToolScope<'_>) -> String {
         let mut s = self.state.write().await;
-        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Skip);
+        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Skip, scope);
         if outcome == ActionOutcome::Ok {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
@@ -1518,8 +1651,18 @@ impl IntendantServer {
 
     #[tool(description = "Approve this and all future commands (sets autonomy to Full).")]
     async fn approve_all(&self, Parameters(params): Parameters<ApproveAllParams>) -> String {
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.approve_all_scoped(params, McpToolScope::Unrestricted)
+            .await
+    }
+
+    pub(crate) async fn approve_all_scoped(
+        &self,
+        params: ApproveAllParams,
+        scope: McpToolScope<'_>,
+    ) -> String {
         let mut s = self.state.write().await;
-        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::ApproveAll);
+        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::ApproveAll, scope);
         if outcome == ActionOutcome::Ok {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
@@ -1543,6 +1686,26 @@ impl IntendantServer {
 
     #[tool(description = "Set the autonomy level. Controls how much approval is required.")]
     async fn set_autonomy(&self, Parameters(params): Parameters<SetAutonomyParams>) -> String {
+        // Stdio MCP transport: owner surface (the owner's own client config).
+        self.set_autonomy_scoped(params, McpToolScope::Unrestricted)
+            .await
+    }
+
+    pub(crate) async fn set_autonomy_scoped(
+        &self,
+        params: SetAutonomyParams,
+        scope: McpToolScope<'_>,
+    ) -> String {
+        // The shared autonomy is daemon-global: one write changes the
+        // approval policy of every session. Supervised agent sessions must
+        // not adjust it — that is self-escalation, not supervision.
+        if matches!(scope, McpToolScope::AgentSession { .. }) {
+            return "Denied: set_autonomy rewrites this daemon's shared autonomy for every \
+                    session and is not available to supervised agent sessions. Ask the user \
+                    (ask_user), or let the owner change it from the dashboard or \
+                    `intendant ctl settings`."
+                .to_string();
+        }
         let level = AutonomyLevel::from_str_loose(&params.level);
         let s = self.state.read().await;
         let autonomy = s.autonomy.clone();
@@ -2034,6 +2197,7 @@ fn format_outcome(outcome: ActionOutcome) -> String {
     match outcome {
         ActionOutcome::Ok => "ok".to_string(),
         ActionOutcome::NoOp { reason } => format!("no-op: {}", reason),
+        ActionOutcome::Denied { reason } => format!("Denied: {}", reason),
     }
 }
 
@@ -2559,6 +2723,225 @@ pub(crate) mod tests {
             )),
             ToolCallerTrust::Scoped
         );
+    }
+
+    fn dispatch_result_text(result: &CallToolResult) -> String {
+        let rendered = serde_json::to_value(result).expect("serializable tool result");
+        rendered["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected text content, got {rendered}"))
+            .to_string()
+    }
+
+    fn agent_session_caller(session_id: &str) -> ToolCaller {
+        ToolCaller::from_gate(
+            &crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+                session_id, "http", true,
+            ),
+            Some(session_id.to_string()),
+        )
+    }
+
+    fn arm_pending_approval(
+        state: &mut McpAppState,
+        id: u64,
+        session_id: Option<&str>,
+    ) -> tokio::sync::oneshot::Receiver<ApprovalResponse> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.approval_registry.lock().unwrap().insert(id, tx);
+        state.pending_approval = Some(PendingApprovalState {
+            id,
+            command_preview: "echo hi".to_string(),
+            category: "exec".to_string(),
+            session_id: session_id.map(str::to_string),
+        });
+        rx
+    }
+
+    /// H5 containment: an agent-session-provenance caller — despite its
+    /// root-compatible transport-default principal — cannot rewrite the
+    /// daemon-global shared autonomy through `set_autonomy` or
+    /// `approve_all`.
+    #[tokio::test]
+    async fn agent_sessions_cannot_rewrite_daemon_global_autonomy() {
+        let bus = EventBus::new();
+        let state = test_state();
+        let autonomy = state.read().await.autonomy.clone();
+        let server = IntendantServer::new(state.clone(), bus);
+        let initial_level = autonomy.read().await.level;
+
+        let result = server
+            .call_tool_by_name_as_caller(
+                "set_autonomy",
+                serde_json::json!({ "level": "full" }),
+                Some("sess-a"),
+                None,
+                agent_session_caller("sess-a"),
+            )
+            .await
+            .expect("dispatch");
+        assert!(
+            dispatch_result_text(&result).contains("Denied"),
+            "set_autonomy must be denied to agent sessions"
+        );
+        assert_eq!(
+            autonomy.read().await.level,
+            initial_level,
+            "denied set_autonomy must not change the shared autonomy"
+        );
+
+        // approve_all is denied outright — even for the caller's OWN
+        // pending approval — because it flips daemon-wide autonomy.
+        let mut rx = {
+            let mut s = state.write().await;
+            arm_pending_approval(&mut s, 7, Some("sess-a"))
+        };
+        let result = server
+            .call_tool_by_name_as_caller(
+                "approve_all",
+                serde_json::json!({ "id": 7 }),
+                Some("sess-a"),
+                None,
+                agent_session_caller("sess-a"),
+            )
+            .await
+            .expect("dispatch");
+        assert!(dispatch_result_text(&result).contains("Denied"));
+        assert_eq!(autonomy.read().await.level, initial_level);
+        assert!(
+            state.read().await.pending_approval.is_some(),
+            "denied approve_all must leave the approval pending"
+        );
+        assert!(rx.try_recv().is_err(), "no response reached the waiter");
+
+        // The owner surface (stdio / dashboard lanes) keeps full capability.
+        let result = server
+            .call_tool_by_name_as_caller(
+                "set_autonomy",
+                serde_json::json!({ "level": "full" }),
+                None,
+                None,
+                ToolCaller::from_gate(
+                    &crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https"),
+                    None,
+                ),
+            )
+            .await
+            .expect("dispatch");
+        assert!(dispatch_result_text(&result).contains("Autonomy set to"));
+        assert_eq!(autonomy.read().await.level, AutonomyLevel::Full);
+    }
+
+    /// H5 containment: agent-session callers resolve only approvals raised
+    /// by their own session; the owner surface still resolves anything.
+    #[tokio::test]
+    async fn agent_sessions_resolve_only_their_own_approvals() {
+        let bus = EventBus::new();
+        let state = test_state();
+        let server = IntendantServer::new(state.clone(), bus);
+
+        // Cross-session: the pending approval belongs to another session.
+        let mut other_rx = {
+            let mut s = state.write().await;
+            arm_pending_approval(&mut s, 11, Some("sess-other"))
+        };
+        let result = server
+            .call_tool_by_name_as_caller(
+                "approve",
+                serde_json::json!({ "id": 11 }),
+                Some("sess-a"),
+                None,
+                agent_session_caller("sess-a"),
+            )
+            .await
+            .expect("dispatch");
+        assert!(
+            dispatch_result_text(&result).contains("Denied"),
+            "cross-session approval resolution must be denied"
+        );
+        assert!(state.read().await.pending_approval.is_some());
+        assert!(other_rx.try_recv().is_err());
+
+        // deny/skip are contained the same way (they also resolve).
+        for tool in ["deny", "skip"] {
+            let result = server
+                .call_tool_by_name_as_caller(
+                    tool,
+                    serde_json::json!({ "id": 11 }),
+                    Some("sess-a"),
+                    None,
+                    agent_session_caller("sess-a"),
+                )
+                .await
+                .expect("dispatch");
+            assert!(
+                dispatch_result_text(&result).contains("Denied"),
+                "{tool} must be denied cross-session"
+            );
+            assert!(state.read().await.pending_approval.is_some());
+        }
+
+        // An approval whose owning session was never recorded fails closed
+        // for agent callers.
+        state.write().await.pending_approval = Some(PendingApprovalState {
+            id: 12,
+            command_preview: "echo hi".to_string(),
+            category: "exec".to_string(),
+            session_id: None,
+        });
+        let result = server
+            .call_tool_by_name_as_caller(
+                "approve",
+                serde_json::json!({ "id": 12 }),
+                Some("sess-a"),
+                None,
+                agent_session_caller("sess-a"),
+            )
+            .await
+            .expect("dispatch");
+        assert!(dispatch_result_text(&result).contains("Denied"));
+
+        // Own-session resolution works — including through a linked
+        // backend alias.
+        let own_rx = {
+            let mut s = state.write().await;
+            s.link_session_aliases("sess-a", "backend-a");
+            arm_pending_approval(&mut s, 13, Some("backend-a"))
+        };
+        let result = server
+            .call_tool_by_name_as_caller(
+                "approve",
+                serde_json::json!({ "id": 13 }),
+                Some("sess-a"),
+                None,
+                agent_session_caller("sess-a"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(dispatch_result_text(&result), "ok");
+        assert!(state.read().await.pending_approval.is_none());
+        assert_eq!(own_rx.await.unwrap(), ApprovalResponse::Approve);
+
+        // The owner surface still resolves another session's approval.
+        let owner_rx = {
+            let mut s = state.write().await;
+            arm_pending_approval(&mut s, 14, Some("sess-other"))
+        };
+        let result = server
+            .call_tool_by_name_as_caller(
+                "approve",
+                serde_json::json!({ "id": 14 }),
+                None,
+                None,
+                ToolCaller::from_gate(
+                    &crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https"),
+                    None,
+                ),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(dispatch_result_text(&result), "ok");
+        assert_eq!(owner_rx.await.unwrap(), ApprovalResponse::Approve);
     }
 
     #[test]
@@ -3969,7 +4352,11 @@ pub(crate) mod tests {
         rt.block_on(async {
             let state = test_state();
             let mut s = state.write().await;
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Approve);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                ApprovalResponse::Approve,
+                McpToolScope::Unrestricted,
+            );
             match outcome {
                 ActionOutcome::NoOp { reason } => {
                     assert!(reason.contains("No pending approval"));

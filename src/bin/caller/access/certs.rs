@@ -201,7 +201,9 @@ pub fn ensure_certs(
     let password = random_password(12);
     let p12_bytes =
         build_apple_compatible_p12(&client_key, &client_cert, &[ca_cert], label, &password)?;
-    std::fs::write(cert_dir.join(CLIENT_P12), &p12_bytes)?;
+    // The .p12 bundles the client private key — same owner-only-from-creation
+    // treatment as the bare key files.
+    intendant_core::state_paths::write_private_file(&cert_dir.join(CLIENT_P12), &p12_bytes)?;
     state::write_p12_password(cert_dir, &password)?;
 
     println!(":: certificates generated in {}", cert_dir.display());
@@ -586,15 +588,10 @@ fn write_pem_cert(path: &Path, cert: &Certificate) -> AccessResult<()> {
     Ok(())
 }
 
+/// Private keys are 0600 on Unix from the moment the file exists — never
+/// write-then-chmod (Windows relies on the profile ACL).
 fn write_pem_private_key(path: &Path, key: &KeyPair) -> AccessResult<()> {
-    std::fs::write(path, key.serialize_pem())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
-    }
+    intendant_core::state_paths::write_private_file(path, key.serialize_pem())?;
     Ok(())
 }
 
@@ -978,6 +975,24 @@ mod tests {
         assert!(!chain.key().is_empty(), "client key missing from p12");
         // Leaf (client) + CA.
         assert_eq!(chain.chain().len(), 2, "expected client + CA in the chain");
+    }
+
+    /// Every key-bearing artifact (bare keys and the .p12 bundle) is
+    /// owner-only from creation.
+    #[cfg(unix)]
+    #[test]
+    fn key_material_is_owner_only_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        ensure_certs(tmp.path(), &names("10.0.0.1"), "label", false).unwrap();
+        for name in [CA_KEY, SERVER_KEY, CLIENT_KEY, CLIENT_P12] {
+            let mode = std::fs::metadata(tmp.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{name} must be 0600");
+        }
     }
 
     #[test]
