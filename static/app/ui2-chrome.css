@@ -344,76 +344,11 @@ html.ui-v2 .ui2-palette-empty {
 @keyframes ui2-rise { from { opacity: 0; transform: translateY(8px) scale(.99); } to { opacity: 1; transform: none; } }
 @keyframes ui2-fade { from { opacity: 0; } to { opacity: 1; } }
 
-/* ── activity layout toggle (Focus / Grid) ─────────────────────────────
-   Visible only while the Activity tab is active (html[data-ui2-tab],
-   stamped by the pane observer). Active side follows html[data-ui2-layout]
-   (absent = focus, the default) so CSS has one source of truth. */
-html.ui-v2 .ui2-layout-toggle { display: none; }
-html.ui-v2[data-ui2-tab="activity"] .ui2-layout-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-pill);
-  background: var(--surface);
-}
-html.ui-v2 .ui2-layout-toggle button {
-  appearance: none;
-  border: 0;
-  background: transparent;
-  color: var(--text-3);
-  font-family: inherit;
-  font-size: 11.5px;
-  font-weight: 650;
-  padding: 4px 12px;
-  border-radius: var(--r-pill);
-  cursor: pointer;
-  transition: background var(--t-fast), color var(--t-fast);
-}
-html.ui-v2 .ui2-layout-toggle button:hover { color: var(--text); }
-html.ui-v2:not([data-ui2-layout="grid"]) #ui2-layout-focus-btn,
-html.ui-v2[data-ui2-layout="grid"] #ui2-layout-grid-btn {
-  background: var(--surface-2);
-  color: var(--text);
-  box-shadow: inset 0 0 0 1px var(--line);
-}
-
-/* ── "Minimize done" bulk pill: one click collapses every finished
-   sub-agent window. Activity-tab-scoped like the layout toggle it sits
-   beside; JS keeps the `hidden` attribute on until the count is > 0, and
-   `:not([hidden])` keeps this display rule from overriding it. ── */
-html.ui-v2 .ui2-minimize-done { display: none; }
-html.ui-v2[data-ui2-tab="activity"] .ui2-minimize-done:not([hidden]) {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-pill);
-  background: var(--surface);
-  color: var(--text-3);
-  font-family: inherit;
-  font-size: 11.5px;
-  font-weight: 650;
-  cursor: pointer;
-  transition: background var(--t-fast), color var(--t-fast);
-}
-html.ui-v2 .ui2-minimize-done:hover {
-  color: var(--text);
-  background: var(--surface-2);
-}
-html.ui-v2 .ui2-minimize-done-count {
-  min-width: 16px;
-  padding: 1px 5px;
-  border-radius: var(--r-pill);
-  background: var(--surface-2);
-  box-shadow: inset 0 0 0 1px var(--line);
-  color: var(--text);
-  font-size: 10.5px;
-  line-height: 1.4;
-  text-align: center;
-}
+/* The activity layout toggle (Focus / Grid), the "Minimize done" pill,
+   and the session switcher moved out of the oversight bar into the
+   Activity view header in the v3 redesign — their styling (and the
+   log-sub-tab visibility gate) now lives WHOLLY in ui2-activity.css
+   ("Timeline tools"). Do not re-introduce style for them here. */
 
 /* ── v1 strips absorbed (post-flip): the status bar and token ticker
    duplicated the oversight bar; their unique facts (provider·model,
@@ -435,26 +370,6 @@ html.ui-v2 .ui2-fact { overflow: hidden; text-overflow: ellipsis; max-width: 220
 html.ui-v2 #ui2-fact-model { color: var(--sky); }
 /* the 3-char turn counter never truncates while its giant neighbors ellipsize */
 html.ui-v2 #ui2-fact-turn { flex-shrink: 0; }
-
-html.ui-v2 .ui2-session-switcher {
-  display: none;
-  appearance: none;
-  -webkit-appearance: none;
-  max-width: 190px;
-  height: 29px; /* the inline-pill height class (matches the layout toggle) */
-  padding: 5px 26px 5px 11px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-pill);
-  background: var(--surface)
-    url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="%236C7482" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>')
-    no-repeat right 9px center;
-  color: var(--text-2);
-  font-family: var(--mono);
-  font-size: 10.5px;
-  cursor: pointer;
-}
-html.ui-v2[data-ui2-tab="activity"] .ui2-session-switcher { display: inline-block; }
-html.ui-v2 .ui2-session-switcher:hover { border-color: var(--line-2); color: var(--text); }
 
 html.ui-v2 .ui2-theme-btn {
   display: inline-flex;
@@ -725,26 +640,11 @@ html.ui-v2 .ui2-nav-bottom { flex-shrink: 0; background: var(--bg); }
   }
 }
 
-/* ── Activity subtab strip: phones scroll horizontally, never wrap ──
-   Supersedes 14-styles-displays-voice.css's ≤600px flex-wrap rule (this
-   file loads later and the html.ui-v2 prefix outweighs it): the strip
-   scrolls sideways; buttons and the verbosity/host controls keep their
-   natural width. */
-@media (max-width: 600px) {
-  html.ui-v2 #activity-subtabs {
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    overflow-y: hidden;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-  }
-  html.ui-v2 #activity-subtabs::-webkit-scrollbar { display: none; }
-  html.ui-v2 #activity-subtabs .subtab-btn { flex: 0 0 auto; white-space: nowrap; }
-  html.ui-v2 #activity-subtabs .activity-subtab-controls {
-    flex: 0 0 auto;
-    margin-left: auto;
-  }
-}
+/* The Activity view header (#activity-subtabs) is styled wholly by
+   ui2-activity.css in v3 — its base rule is a single-row sideways
+   scroller at every width (flex-wrap:nowrap outweighs 14-styles'
+   ≤600px wrap rule by specificity), so the old phone-only counter
+   block here is gone. */
 
 /* ── fuel/lease chip (oversight bar, display-only) ── */
 html.ui-v2 .ui2-fuel-chip {
