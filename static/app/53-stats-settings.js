@@ -158,6 +158,48 @@ function settingsCodexModelValue() {
   return select.value || '';
 }
 
+// ── Runtime write sandbox card (Settings → Security) ──
+// Live state (effective on/off, flag lock, grant set) arrives with the
+// settings payload; a save that touches the sandbox fields live-applies
+// on the daemon unless a --sandbox/--no-sandbox flag pins the state.
+// `loaded` gates the save payload: until a GET has populated the card,
+// saves send null so the daemon leaves [sandbox] untouched.
+let settingsSandboxState = { loaded: false, locked: false };
+
+function renderSettingsSandboxCard(d) {
+  const toggle = document.getElementById('set-sandbox-enabled');
+  if (!toggle) return;
+  const locked = !!d.sandbox_locked_by_flag;
+  settingsSandboxState = { loaded: true, locked };
+  toggle.checked = !!d.sandbox_enabled;
+  toggle.disabled = locked;
+  document.getElementById('set-sandbox-flag-note')?.classList.toggle('hidden', !locked);
+  const grants = document.getElementById('set-sandbox-grants');
+  if (grants) {
+    grants.textContent = '';
+    const paths = Array.isArray(d.sandbox_write_paths) ? d.sandbox_write_paths : [];
+    if (!paths.length) {
+      const empty = document.createElement('span');
+      empty.className = 'sandbox-grants-empty';
+      empty.textContent = d.sandbox_enabled
+        ? 'No write grants.'
+        : 'Sandbox is off — writes are not confined.';
+      grants.appendChild(empty);
+    }
+    for (const path of paths) {
+      const chip = document.createElement('span');
+      chip.className = 'sandbox-grant';
+      chip.textContent = path;
+      chip.title = path;
+      grants.appendChild(chip);
+    }
+  }
+  const extras = document.getElementById('set-sandbox-extra-paths');
+  if (extras) {
+    extras.value = (Array.isArray(d.sandbox_extra_write_paths) ? d.sandbox_extra_write_paths : []).join('\n');
+  }
+}
+
 function settingsCodexCatalogEntry() {
   const model = settingsCodexModelValue();
   if (!model) return null;
@@ -275,6 +317,7 @@ async function loadSettings() {
     document.getElementById('set-recording-quality').value = d.recording_quality || 'medium';
     document.getElementById('set-live-audio-enabled').checked = d.live_audio_enabled;
     document.getElementById('set-live-audio-timeout').value = d.live_audio_timeout_secs || 300;
+    renderSettingsSandboxCard(d);
     document.getElementById('set-codex-command').value = d.codex_command || 'codex';
     document.getElementById('set-codex-managed-command').value = d.codex_managed_command || '';
     document.getElementById('set-claude-command').value = d.claude_command || 'claude';
@@ -367,6 +410,17 @@ async function saveSettings() {
     recording_quality: g('set-recording-quality').value,
     live_audio_enabled: g('set-live-audio-enabled').checked,
     live_audio_timeout_secs: parseInt(g('set-live-audio-timeout').value) || 300,
+    // Runtime write sandbox: null until a load has populated the card
+    // (the daemon then leaves [sandbox] untouched). While a CLI flag
+    // pins the live state the toggle is disabled, so only the extra
+    // grants carry intent — echoing the pinned state back would silently
+    // persist it as next-start config.
+    sandbox_enabled: settingsSandboxState.loaded && !settingsSandboxState.locked
+      ? g('set-sandbox-enabled').checked
+      : null,
+    sandbox_extra_write_paths: settingsSandboxState.loaded
+      ? (g('set-sandbox-extra-paths')?.value || '').split('\n').map(s => s.trim()).filter(Boolean)
+      : null,
     // Persisted to intendant.toml so it survives daemon restart.
     external_agent: g('set-external-agent').value || null,
     codex_command: (g('set-codex-command').value || '').trim() || 'codex',
@@ -405,8 +459,15 @@ async function saveSettings() {
     const status = g('settings-status');
     if (data.ok) {
       settingsSaved = true;
-      status.textContent = 'Saved';
-      status.style.color = 'var(--green)';
+      if (data.applied === false) {
+        // Persisted, but the daemon could not live-apply the sandbox
+        // change (it still lands on the next start).
+        status.textContent = 'Saved; live apply failed: ' + (data.apply_error || 'unknown');
+        status.style.color = 'var(--peach)';
+      } else {
+        status.textContent = 'Saved';
+        status.style.color = 'var(--green)';
+      }
     } else {
       status.textContent = 'Error: ' + (data.error || 'Unknown');
       status.style.color = 'var(--red)';
@@ -483,6 +544,14 @@ async function saveSettings() {
     action: 'set_claude_allowed_tools',
     tools: Array.isArray(controlClaudeConfig.allowed_tools) ? controlClaudeConfig.allowed_tools : [],
   });
+  // The save may have recomputed the live write-grant set (extra grants
+  // resolve and dedup daemon-side) — re-pull just this card's view so
+  // "where it can write" stays truthful.
+  if (settingsSandboxState.loaded) {
+    fetchDashboardSettings()
+      .then((d) => { if (!d.error) renderSettingsSandboxCard(d); })
+      .catch(() => {});
+  }
 }
 
 document.getElementById('settings-save-btn').addEventListener('click', saveSettings);

@@ -164,6 +164,38 @@ fn pty_harness_line_patterns(flavor: crate::utils::PtyShellFlavor, nonce: u64) -
     patterns
 }
 
+/// True when `name` must be scrubbed from a model-driven shell's
+/// environment: the provider-key names the controller strips at its own
+/// spawn boundary (the runtime should never hold them — this is defense
+/// in depth), plus ambient host credentials (SSH agent socket,
+/// cloud/forge tokens, credential-store pointers) per
+/// `intendant_core::env_scrub`. `INTENDANT_*` control vars are exempt
+/// inside the classifier — the mock e2e rig rides them into children.
+fn is_scrubbed_shell_env(name: &str) -> bool {
+    const PROVIDER_ENV_VARS: &[&str] = &[
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GEMINI",
+        "OPENAI",
+        "ANTHROPIC",
+    ];
+    PROVIDER_ENV_VARS.contains(&name.to_ascii_uppercase().as_str())
+        || intendant_core::env_scrub::is_ambient_credential_env(name)
+}
+
+/// The subset of `env` names `is_scrubbed_shell_env` classifies for
+/// removal. Takes the environment as an iterator so the selection is
+/// testable without reading the process environment; spawn sites pass
+/// `std::env::vars_os()` keys.
+fn shell_env_scrub_list<I>(env: I) -> Vec<std::ffi::OsString>
+where
+    I: Iterator<Item = std::ffi::OsString>,
+{
+    env.filter(|name| name.to_str().is_some_and(is_scrubbed_shell_env))
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct Agent {
     process_state: Arc<RwLock<HashMap<u64, ProcessInfo>>>,
@@ -171,6 +203,8 @@ pub struct Agent {
     pty_sessions: Arc<tokio::sync::Mutex<HashMap<String, PtySession>>>,
     available_displays: Vec<i32>,
     session_xauthority: Option<PathBuf>,
+    /// See [`crate::models::AgentInput::human_response_token`].
+    human_response_token: Option<String>,
 }
 
 impl Agent {
@@ -187,6 +221,7 @@ impl Agent {
             pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             available_displays: vec![],
             session_xauthority: None,
+            human_response_token: None,
         })
     }
 
@@ -206,7 +241,15 @@ impl Agent {
             pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             available_displays,
             session_xauthority,
+            human_response_token: None,
         })
+    }
+
+    /// Adopt the batch's controller-minted askHuman answer token (see
+    /// [`crate::models::AgentInput::human_response_token`]).
+    pub fn with_human_response_token(mut self, token: Option<String>) -> Self {
+        self.human_response_token = token;
+        self
     }
 
     fn resolve_log_dir() -> Result<PathBuf, AgentError> {
@@ -629,6 +672,12 @@ impl Agent {
             .env_remove("ANTHROPIC")
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
+        // Ambient host credentials (agent sockets, cloud/forge tokens,
+        // credential-store pointers) must not ride into model-driven shells
+        // either; `INTENDANT_*` control vars survive.
+        for name in shell_env_scrub_list(std::env::vars_os().map(|(k, _)| k)) {
+            cmd_builder.env_remove(&name);
+        }
         if let Some(ref xauth) = self.session_xauthority {
             cmd_builder.env("XAUTHORITY", xauth);
         }
@@ -895,9 +944,17 @@ impl Agent {
             // Platform PTY shell: `bash --norc --noprofile` on Unix
             // (unchanged), `powershell.exe -NoLogo -NoProfile` on Windows with
             // a `cmd.exe` fallback if PowerShell can't be spawned.
+            //
+            // Same env scrub as exec_as_agent: provider keys and ambient
+            // host credentials never reach the model-driven shell
+            // (PtyCommandBuilder otherwise inherits the full runtime env).
+            let scrub_names = shell_env_scrub_list(std::env::vars_os().map(|(k, _)| k));
             let build_pty_cmd = |program: &str, args: &[String]| {
                 let mut c = PtyCommandBuilder::new(program);
                 c.args(args);
+                for name in &scrub_names {
+                    c.env_remove(name);
+                }
                 // Unit-test builds point the shell's HOME at a per-process
                 // scratch: even with --norc, an interactive bash writes
                 // ~/.bash_history on exit, and tests must never mutate the
@@ -1175,6 +1232,20 @@ impl Agent {
             .as_ref()
             .ok_or_else(|| AgentError::Process("question is required for askHuman".to_string()))?;
 
+        // The response file is the controller→runtime answer channel: the
+        // runtime's stdin is fully consumed before commands run, so a
+        // mid-run answer can only arrive via the filesystem. The path sits
+        // inside the sandbox's writable set (shells can create it too), so
+        // discard anything already present before the question is posted —
+        // a pre-staged file can only be a stale answer to an earlier
+        // question or a forgery, never a real answer to this one (every
+        // controller frontend writes the response only after it has seen
+        // the question). Forgery *while* polling is closed by the batch
+        // token below: the controller mints a per-batch secret the
+        // runtime's shells never see, and only token-prefixed answers are
+        // accepted when one is configured.
+        let _ = fs::remove_file(response_path);
+
         // Write question to file
         fs::write(question_path, question)?;
         // Also write to stderr so caller/user sees it
@@ -1185,16 +1256,41 @@ impl Agent {
 
         loop {
             if response_path.exists() {
-                let response = fs::read_to_string(response_path)?;
-                // Cleanup
-                let _ = fs::remove_file(question_path);
-                let _ = fs::remove_file(response_path);
-                return Ok(serde_json::json!({
-                    "success": true,
-                    "question": question,
-                    "response": response
-                })
-                .to_string());
+                let raw = fs::read_to_string(response_path)?;
+                // With a batch token configured, the first line must be
+                // the token (controller frontends prepend it); the answer
+                // is the remainder. Anything else is a forgery or a stale
+                // stray — discard it and keep waiting for the real answer.
+                let accepted = match &self.human_response_token {
+                    Some(token) => {
+                        let (first, rest) = match raw.split_once('\n') {
+                            Some((first, rest)) => (first, rest),
+                            None => (raw.as_str(), ""),
+                        };
+                        if first.trim_end_matches('\r') == token {
+                            Some(rest.to_string())
+                        } else {
+                            None
+                        }
+                    }
+                    None => Some(raw),
+                };
+                match accepted {
+                    Some(response) => {
+                        // Cleanup
+                        let _ = fs::remove_file(question_path);
+                        let _ = fs::remove_file(response_path);
+                        return Ok(serde_json::json!({
+                            "success": true,
+                            "question": question,
+                            "response": response
+                        })
+                        .to_string());
+                    }
+                    None => {
+                        let _ = fs::remove_file(response_path);
+                    }
+                }
             }
 
             tokio::time::sleep(poll_interval).await;
@@ -1244,18 +1340,60 @@ impl Agent {
             ));
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .user_agent("Agent/1.0")
-            .build()
-            .map_err(|e| AgentError::Process(format!("Failed to create HTTP client: {}", e)))?;
+        let mut current: reqwest::Url = url
+            .parse()
+            .map_err(|e| AgentError::Process(format!("Invalid url: {}", e)))?;
 
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| AgentError::Process(format!("HTTP request failed: {}", e)))?;
+        // Redirects are followed manually so every hop — not just the first
+        // URL — passes `browse_validate_url` (a redirect into a metadata
+        // endpoint is the classic SSRF laundering step).
+        let mut hops = 0usize;
+        let response = loop {
+            let pinned = browse_validate_url(&current).await?;
+            let mut builder = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
+                .user_agent("Agent/1.0");
+            if !pinned.is_empty() {
+                if let Some(host) = current.host_str() {
+                    // Pin the connection to the addresses just validated, so
+                    // the request cannot re-resolve to something else (DNS
+                    // rebinding between check and connect).
+                    builder = builder.resolve_to_addrs(host, &pinned);
+                }
+            }
+            let client = builder
+                .build()
+                .map_err(|e| AgentError::Process(format!("Failed to create HTTP client: {}", e)))?;
+            let resp = client
+                .get(current.clone())
+                .send()
+                .await
+                .map_err(|e| AgentError::Process(format!("HTTP request failed: {}", e)))?;
+            if resp.status().is_redirection() {
+                // 3xx without a usable Location (e.g. 304) is a final
+                // response, not a hop.
+                let location = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                if let Some(location) = location {
+                    hops += 1;
+                    if hops > BROWSE_MAX_REDIRECTS {
+                        return Err(AgentError::Process(format!(
+                            "Too many redirects (more than {})",
+                            BROWSE_MAX_REDIRECTS
+                        )));
+                    }
+                    current = current.join(&location).map_err(|e| {
+                        AgentError::Process(format!("Invalid redirect location: {}", e))
+                    })?;
+                    continue;
+                }
+            }
+            break resp;
+        };
 
         let status = response.status().as_u16();
         let content_type = response
@@ -1659,6 +1797,108 @@ fn cap_pty_output(final_output: String, full_log_path: &Path) -> (String, bool) 
     (capped, true)
 }
 
+/// Redirect-hop budget for `browse` (formerly `redirect::Policy::limited(5)`;
+/// hops are now followed manually so each target is validated).
+const BROWSE_MAX_REDIRECTS: usize = 5;
+
+/// True when `ip` must not be reachable through `browse`: link-local
+/// ranges (where cloud metadata services live) plus the metadata-service
+/// addresses that sit outside them. Loopback and RFC1918 stay reachable
+/// on purpose — agents legitimately browse localhost dev servers and LAN
+/// dashboards.
+fn browse_blocked_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::{IpAddr, Ipv6Addr};
+    match ip {
+        // 169.254.0.0/16 (includes 169.254.169.254 — AWS/GCP/Azure/
+        // OpenStack metadata) plus Alibaba Cloud's 100.100.100.200.
+        IpAddr::V4(v4) => v4.is_link_local() || v4.octets() == [100, 100, 100, 200],
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return browse_blocked_ip(IpAddr::V4(mapped));
+            }
+            // fe80::/10 link-local, plus the AWS IMDS IPv6 endpoint.
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)
+        }
+    }
+}
+
+/// True when `host` names a cloud metadata service by name.
+fn browse_blocked_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "metadata.google.internal"
+        || host == "metadata.goog"
+        || host.ends_with(".metadata.goog")
+}
+
+/// Validate one `browse` target: scheme, host classification, and — for
+/// domain hosts — DNS resolution with every resolved address checked
+/// (fail-closed on a mixed answer). Returns the resolved addresses for
+/// domain hosts so the request can be pinned to exactly the addresses
+/// that were checked; IP-literal hosts return an empty list (no DNS step
+/// to pin).
+async fn browse_validate_url(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>, AgentError> {
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(AgentError::Process(
+            "url must start with http:// or https://".to_string(),
+        ));
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    match url.host() {
+        None => Err(AgentError::Process("url has no host".to_string())),
+        Some(url::Host::Ipv4(v4)) => {
+            if browse_blocked_ip(v4.into()) {
+                Err(AgentError::Process(format!(
+                    "Blocked address for browse: {} (link-local/metadata range)",
+                    v4
+                )))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            if browse_blocked_ip(v6.into()) {
+                Err(AgentError::Process(format!(
+                    "Blocked address for browse: {} (link-local/metadata range)",
+                    v6
+                )))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        Some(url::Host::Domain(domain)) => {
+            if browse_blocked_host(domain) {
+                return Err(AgentError::Process(format!(
+                    "Blocked host for browse: {} (metadata service)",
+                    domain
+                )));
+            }
+            let addrs: Vec<std::net::SocketAddr> = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::net::lookup_host((domain, port)),
+            )
+            .await
+            .map_err(|_| AgentError::Process(format!("DNS lookup timed out for {}", domain)))?
+            .map_err(|e| AgentError::Process(format!("DNS lookup failed for {}: {}", domain, e)))?
+            .collect();
+            if addrs.is_empty() {
+                return Err(AgentError::Process(format!(
+                    "DNS lookup returned no addresses for {}",
+                    domain
+                )));
+            }
+            if let Some(bad) = addrs.iter().find(|a| browse_blocked_ip(a.ip())) {
+                return Err(AgentError::Process(format!(
+                    "Blocked host for browse: {} resolves to {} (link-local/metadata range)",
+                    domain,
+                    bad.ip()
+                )));
+            }
+            Ok(addrs)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1876,6 +2116,7 @@ mod tests {
     async fn process_input_exec_returns_result() {
         let (agent, _log) = create_test_agent();
         let input = AgentInput {
+            human_response_token: None,
             commands: vec![AgentCommand {
                 function: "execAsAgent".to_string(),
                 command: Some("echo hello".to_string()),
@@ -1899,6 +2140,7 @@ mod tests {
     async fn process_input_unknown_function() {
         let (agent, _log) = create_test_agent();
         let input = AgentInput {
+            human_response_token: None,
             commands: vec![AgentCommand {
                 function: "unknownFunc".to_string(),
                 nonce: 1,
@@ -1915,6 +2157,7 @@ mod tests {
         let dir = tmp.path().to_str().unwrap().to_string();
         let (agent, _log) = create_test_agent();
         let input = AgentInput {
+            human_response_token: None,
             commands: vec![AgentCommand {
                 function: "inspectPath".to_string(),
                 nonce: 1,
@@ -1940,6 +2183,7 @@ mod tests {
         let dir = tmp.path().to_str().unwrap().to_string();
         let (agent, _log) = create_test_agent();
         let input = AgentInput {
+            human_response_token: None,
             commands: vec![
                 AgentCommand {
                     function: "inspectPath".to_string(),
@@ -2233,6 +2477,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let fp = tmp.path().join("integration.txt");
         let input = AgentInput {
+            human_response_token: None,
             commands: vec![AgentCommand {
                 function: "editFile".to_string(),
                 nonce: 1,
@@ -2270,6 +2515,189 @@ mod tests {
             ..Default::default()
         };
         assert!(agent.browse(&cmd).await.is_err());
+    }
+
+    #[test]
+    fn browse_ip_classifier_blocks_link_local_and_metadata() {
+        use std::net::IpAddr;
+        for ip in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "100.100.100.200",
+            "fe80::1",
+            "fd00:ec2::254",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(
+                browse_blocked_ip(ip.parse::<IpAddr>().unwrap()),
+                "{ip} must be blocked"
+            );
+        }
+        // Loopback and RFC1918 are deliberately reachable (localhost dev
+        // servers, LAN dashboards).
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.10",
+            "100.100.100.199",
+            "8.8.8.8",
+            "::1",
+            "fd00::1",
+            "2606:4700:4700::1111",
+        ] {
+            assert!(
+                !browse_blocked_ip(ip.parse::<IpAddr>().unwrap()),
+                "{ip} must stay reachable"
+            );
+        }
+    }
+
+    #[test]
+    fn browse_host_classifier_blocks_metadata_names() {
+        for host in [
+            "metadata.google.internal",
+            "METADATA.GOOGLE.INTERNAL",
+            "metadata.google.internal.",
+            "metadata.goog",
+            "instance.metadata.goog",
+        ] {
+            assert!(browse_blocked_host(host), "{host} must be blocked");
+        }
+        for host in [
+            "example.com",
+            "metadata.google.com",
+            "mymetadata.goog",
+            "google.internal",
+            "localhost",
+        ] {
+            assert!(!browse_blocked_host(host), "{host} must stay reachable");
+        }
+    }
+
+    #[tokio::test]
+    async fn browse_rejects_metadata_targets_before_any_request() {
+        let (agent, _log) = create_test_agent();
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[fe80::1]/",
+            "http://[fd00:ec2::254]/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://100.100.100.200/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://metadata.goog/",
+            // Non-dotted IPv4 literal forms normalize in URL parsing.
+            "http://0xA9FEA9FE/",
+        ] {
+            let cmd = AgentCommand {
+                function: "browse".to_string(),
+                nonce: 1,
+                url: Some(url.to_string()),
+                ..Default::default()
+            };
+            assert!(agent.browse(&cmd).await.is_err(), "{url} must be blocked");
+        }
+    }
+
+    #[tokio::test]
+    async fn browse_redirect_to_metadata_blocked() {
+        let (agent, _log) = create_test_agent();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("unexpected bind error: {}", e),
+        };
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\n\
+                          Location: http://169.254.169.254/latest/meta-data/\r\n\
+                          Content-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+        // Loopback itself is allowed (the first hop succeeds); the redirect
+        // into the metadata range must fail.
+        let cmd = AgentCommand {
+            function: "browse".to_string(),
+            nonce: 1,
+            url: Some(format!("http://127.0.0.1:{}/", port)),
+            ..Default::default()
+        };
+        let err = agent.browse(&cmd).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("Blocked address"),
+            "expected blocked-address error, got: {}",
+            msg
+        );
+    }
+
+    // --- shell env scrub tests ---
+
+    #[test]
+    fn shell_env_scrub_classifies_credentials() {
+        for name in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GEMINI",
+            "OPENAI",
+            "ANTHROPIC",
+            "SSH_AUTH_SOCK",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "KUBECONFIG",
+            "DOCKER_CONFIG",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "MY_SERVICE_TOKEN",
+            "DB_PASSWORD",
+        ] {
+            assert!(is_scrubbed_shell_env(name), "{name} must be scrubbed");
+        }
+        for name in [
+            "PATH",
+            "HOME",
+            "DISPLAY",
+            "TERM",
+            "LANG",
+            "AWS_REGION",
+            "INTENDANT_LOG_DIR",
+            "INTENDANT_MOCK_SCRIPT",
+            "INTENDANT_USER_DISPLAY_GRANTED",
+        ] {
+            assert!(!is_scrubbed_shell_env(name), "{name} must survive");
+        }
+    }
+
+    #[test]
+    fn shell_env_scrub_list_filters_injected_env() {
+        use std::ffi::OsString;
+        let env = [
+            "PATH",
+            "SSH_AUTH_SOCK",
+            "INTENDANT_MOCK_DISPLAY",
+            "GH_TOKEN",
+            "OPENAI_API_KEY",
+        ]
+        .into_iter()
+        .map(OsString::from);
+        assert_eq!(
+            shell_env_scrub_list(env),
+            vec![
+                OsString::from("SSH_AUTH_SOCK"),
+                OsString::from("GH_TOKEN"),
+                OsString::from("OPENAI_API_KEY"),
+            ]
+        );
     }
 
     // --- wait_for_port tests ---
@@ -2318,22 +2746,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_human_response_already_available() {
+    async fn ask_human_prestaged_response_discarded() {
         let (agent, _log) = create_test_agent();
         let tmp = TempDir::new().unwrap();
         let q = tmp.path().join("q");
         let r = tmp.path().join("r");
-        fs::write(&r, "yes").unwrap();
+        // A response file that exists before the question is posted (stale
+        // answer to an earlier question, or forged from a shell) must not
+        // answer this question.
+        fs::write(&r, "forged").unwrap();
         let cmd = AgentCommand {
             function: "askHuman".to_string(),
             nonce: 1,
             question: Some("proceed?".to_string()),
             ..Default::default()
         };
-        let result = agent.ask_human_with_paths(&cmd, &q, &r, 100).await.unwrap();
+        let ask = {
+            let agent = agent.clone();
+            let (q, r) = (q.clone(), r.clone());
+            tokio::spawn(async move { agent.ask_human_with_paths(&cmd, &q, &r, 20).await })
+        };
+        // The question file appearing means the pre-staged response was
+        // already discarded; only then post the legitimate answer.
+        let mut waited = 0u64;
+        while !q.exists() {
+            assert!(waited < 5_000, "question file never appeared");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 10;
+        }
+        fs::write(&r, "real answer").unwrap();
+        let result = ask.await.unwrap().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], true);
-        assert_eq!(parsed["response"], "yes");
+        assert_eq!(parsed["response"], "real answer");
+    }
+
+    #[tokio::test]
+    async fn ask_human_token_gates_forged_responses() {
+        let (agent, _log) = create_test_agent();
+        let agent = agent.with_human_response_token(Some("batch-secret".to_string()));
+        let tmp = TempDir::new().unwrap();
+        let q = tmp.path().join("q");
+        let r = tmp.path().join("r");
+        let cmd = AgentCommand {
+            function: "askHuman".to_string(),
+            nonce: 1,
+            question: Some("proceed?".to_string()),
+            ..Default::default()
+        };
+        let ask = {
+            let agent = agent.clone();
+            let (q, r) = (q.clone(), r.clone());
+            tokio::spawn(async move { agent.ask_human_with_paths(&cmd, &q, &r, 20).await })
+        };
+        let mut waited = 0u64;
+        while !q.exists() {
+            assert!(waited < 5_000, "question file never appeared");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 10;
+        }
+        // A bare (untokened) answer — what a forging shell can write
+        // without knowing the batch secret — must be discarded...
+        fs::write(&r, "forged answer").unwrap();
+        let mut waited = 0u64;
+        while r.exists() {
+            assert!(waited < 5_000, "forged response was never discarded");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 10;
+        }
+        // ...while the controller's token-prefixed answer is accepted,
+        // with the token stripped from what the model sees.
+        fs::write(&r, "batch-secret\nreal answer").unwrap();
+        let result = ask.await.unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["response"], "real answer");
     }
 
     // --- execPty tests ---

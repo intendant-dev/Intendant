@@ -1035,8 +1035,20 @@ system Chrome/Chromium apps require choosing `system_cdp` or setting
 
 The configuration panel for the current session: API keys, external-agent
 backend settings, computer-use/provider options, presence, transcription,
-recording, and live audio. Peer/network administration moved to **Access**.
-Old `#settings/network` deep links are redirected to `#access/overview`.
+recording, live audio, and the runtime sandbox. Peer/network administration
+moved to **Access**. Old `#settings/network` deep links are redirected to
+`#access/overview`.
+
+**Settings → Security** holds the runtime write sandbox card ("Runtime
+sandbox" — the confinement of the native agent's shell and file tools to
+granted paths, `[sandbox]` in intendant.toml): a live on/off toggle, the
+effective write-grant set, and an extra-grants editor (one path per line,
+absolute or project-relative). Saves ride the regular `/api/settings`
+flow and apply to new commands immediately — no restart; when
+`--sandbox`/`--no-sandbox` pinned the state for this daemon run, the
+toggle is disabled and saves only persist intent for the next start. This
+is a different layer from the Codex/Claude Code sandbox settings —
+external agents bring their own.
 
 ## Late-join and session replay
 
@@ -1646,7 +1658,8 @@ family (sub-routes elided where the family is uniform):
 | `GET /api/managed-context/{records,anchors,fission}` | Managed-context state: rewind records, anchors, fission groups |
 | `GET /recordings/*`, `GET /frames/*` | Current-session recording segments and captured frame assets |
 | `GET /api/fs/{stat,list,read}`, `POST /api/fs/{mkdir,write}` | Scoped filesystem browsing and editor writes (fs scope enforced per grant) |
-| `GET/POST /api/settings`, `POST /api/api-keys`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key management |
+| `GET/POST /api/settings`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key status |
+| `POST /api/api-keys` | Store provider API keys (credential custody: `CredentialsManage`, which no peer profile carries) |
 | `GET /api/external-agents` | External-agent backend availability (configured command, installed, auth posture, last used) plus passive zero-quota compatibility status (artifact fingerprint, in-band version, manifest digest, finding counts) — drives the fueling nudge and new-session picker |
 | `GET /api/displays`, `POST /api/diagnostics/visual-freshness` | Display inventory; visual-freshness probe marker |
 | `GET /api/hosted-control/{bootstrap,certificate-ledger}`, `POST /api/hosted-control/{requests,requests/poll,anchor-decisions,witness-reports}` | Public hosted doorbell and signed certificate-observation records: dark when disabled; the ledger is also readable over authenticated direct peer routes, request creation/poll proves the tab key, and signed-app inputs verify the enrolled anchor |
@@ -1760,7 +1773,7 @@ response omits the header.
 | GET | `/api/project-root` | Settings | own origin | none | Project root path this daemon serves |
 | POST | `/api/settings` | Settings | own origin | bounded | Update runtime settings |
 | GET | `/api/settings` | Settings | own origin | none | Current runtime settings |
-| POST | `/api/api-keys` | Settings | own origin | bounded | Store provider API keys in the project .env |
+| POST | `/api/api-keys` | CredentialsManage | own origin | bounded | Store provider API keys in the daemon-config .env |
 | GET | `/api/api-key-status` | Settings | own origin | none | Which provider keys are configured (presence only) |
 | POST | `/api/claude-auth/start` | CredentialsManage | own origin | ≤ 4 KiB | Start the Claude sign-in ceremony (`claude auth login` on a daemon-private PTY) |
 | GET | `/api/claude-auth/status` | CredentialsManage | own origin | none | Claude sign-in ceremony state (validated sign-in URL; account info on success) |

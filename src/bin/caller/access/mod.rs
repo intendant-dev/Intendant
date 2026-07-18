@@ -160,7 +160,7 @@ pub fn provision_virgin_access_certs() -> AccessResult<Option<PathBuf>> {
     };
     let server_names =
         certs::ServerNames::new(primary_ip, routable_local_addrs(false), Vec::new())?;
-    std::fs::create_dir_all(&cert_dir)
+    intendant_core::state_paths::create_private_dir_all(&cert_dir)
         .map_err(|e| AccessError(format!("create {}: {e}", cert_dir.display())))?;
     certs::ensure_certs(&cert_dir, &server_names, &resolve_host_label(), false)?;
     iam::seed_generated_browser_mtls_owner_root(&cert_dir)?;
@@ -386,7 +386,7 @@ async fn cmd_setup(args: AccessArgs) -> AccessResult<()> {
     let dashboard_host = url_host_for_ip(server_names.primary_ip);
 
     let cert_dir = be.cert_dir();
-    std::fs::create_dir_all(&cert_dir)?;
+    intendant_core::state_paths::create_private_dir_all(&cert_dir)?;
 
     let label = args.name.clone().unwrap_or_else(|| {
         hostname()

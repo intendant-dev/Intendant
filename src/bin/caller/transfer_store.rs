@@ -864,8 +864,18 @@ pub fn append_upload_tempfile(
     // (15 minutes). Truncating restores the exact resume-offset contract
     // on the very next chunk. A failed truncate leaves the historical
     // wedge (crash reconciliation still recovers it on re-admission).
-    let rollback = |output: &fs::File| {
-        if let Err(e) = output.set_len(job.completed_bytes) {
+    // The truncate must NOT go through the append handle: on Windows,
+    // `.append(true)` opens with FILE_APPEND_DATA but without
+    // FILE_WRITE_DATA, and SetEndOfFile then fails ACCESS_DENIED — the
+    // rollback silently never happened there (proven on the fleet rig,
+    // on main and branch alike). Reopen the partial with plain write
+    // access for the shrink.
+    let rollback = |_output: &fs::File| {
+        let result = fs::OpenOptions::new()
+            .write(true)
+            .open(&temp_path)
+            .and_then(|file| file.set_len(job.completed_bytes));
+        if let Err(e) = result {
             eprintln!(
                 "[transfer-store] failed to roll back upload partial {} to {} bytes: {e}",
                 temp_path.display(),

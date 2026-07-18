@@ -153,7 +153,11 @@ pub(crate) async fn handle_control_command_mcp(
         }
         ControlMsg::Approve { id, .. } => {
             let mut s = state.write().await;
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Approve);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                ApprovalResponse::Approve,
+                McpToolScope::Unrestricted,
+            );
             if matches!(outcome, ActionOutcome::Ok) {
                 bus.send(AppEvent::ApprovalResolved {
                     session_id: None,
@@ -172,7 +176,11 @@ pub(crate) async fn handle_control_command_mcp(
         }
         ControlMsg::Deny { id, .. } => {
             let mut s = state.write().await;
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Deny);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                ApprovalResponse::Deny,
+                McpToolScope::Unrestricted,
+            );
             if matches!(outcome, ActionOutcome::Ok) {
                 bus.send(AppEvent::ApprovalResolved {
                     session_id: None,
@@ -229,7 +237,11 @@ pub(crate) async fn handle_control_command_mcp(
         }
         ControlMsg::Skip { id, .. } => {
             let mut s = state.write().await;
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Skip);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                ApprovalResponse::Skip,
+                McpToolScope::Unrestricted,
+            );
             if matches!(outcome, ActionOutcome::Ok) {
                 bus.send(AppEvent::ApprovalResolved {
                     session_id: None,
@@ -248,7 +260,11 @@ pub(crate) async fn handle_control_command_mcp(
         }
         ControlMsg::ApproveAll { id, .. } => {
             let mut s = state.write().await;
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::ApproveAll);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                ApprovalResponse::ApproveAll,
+                McpToolScope::Unrestricted,
+            );
             if matches!(outcome, ActionOutcome::Ok) {
                 bus.send(AppEvent::ApprovalResolved {
                     session_id: None,

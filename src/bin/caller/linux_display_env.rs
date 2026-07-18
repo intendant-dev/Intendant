@@ -141,10 +141,26 @@ pub fn ensure_gui_session_env(_context: &str) -> GuiEnvAdoption {
     GuiEnvAdoption::default()
 }
 
+/// The GUI env keys propagated onto child processes: the managed set minus
+/// any key the ambient-credential classifier holds back — the session bus,
+/// over which an unlocked desktop keyring answers. Adoption
+/// (`ensure_gui_session_env`) still manages the full set on the
+/// controller's own env; only child propagation is filtered, and the spawn
+/// boundaries' scrubs enforce the same line. A user who deliberately wants
+/// the bus in agent shells names it in `INTENDANT_ENV_PASSTHROUGH`, which
+/// exempts it from the runtime spawn scrub so plain inheritance carries it.
+#[cfg(target_os = "linux")]
+fn propagated_gui_env_keys() -> impl Iterator<Item = &'static str> {
+    GUI_ENV_KEYS
+        .iter()
+        .copied()
+        .filter(|key| !intendant_core::env_scrub::is_ambient_credential_env(key))
+}
+
 #[cfg(target_os = "linux")]
 pub fn apply_to_tokio_command(command: &mut tokio::process::Command) {
     ensure_gui_session_env("child process spawn");
-    for key in GUI_ENV_KEYS {
+    for key in propagated_gui_env_keys() {
         if let Ok(value) = std::env::var(key) {
             command.env(key, value);
         }
@@ -347,6 +363,30 @@ mod tests {
         assert!(!gui_env_complete_with(|key| key != "INTENDANT_USER_DISPLAY"));
         // Full set: complete.
         assert!(gui_env_complete_with(|_| true));
+    }
+
+    /// Child propagation must hold back the session bus (ambient credential
+    /// surface — the desktop keyring answers over it) while still carrying
+    /// the display/session vars children need for portals, X11 auth, and
+    /// input tools.
+    #[test]
+    fn child_propagation_excludes_ambient_credential_keys() {
+        let keys: Vec<&str> = propagated_gui_env_keys().collect();
+        assert!(
+            !keys.contains(&"DBUS_SESSION_BUS_ADDRESS"),
+            "the session bus must not be propagated to children: {keys:?}"
+        );
+        for key in [
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+            "XDG_RUNTIME_DIR",
+            "XDG_SESSION_TYPE",
+            "XDG_CURRENT_DESKTOP",
+            "DESKTOP_SESSION",
+        ] {
+            assert!(keys.contains(&key), "{key} must still be propagated");
+        }
     }
 
     #[test]

@@ -1286,9 +1286,23 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::ApiKeysPost => {
+                // Custody-audit attribution: the pre-dispatch IAM gate
+                // bound this principal (CredentialsManage), and the
+                // origin class mirrors the tunnel grant's
+                // `custody_origin_class`.
+                let cert_dir = crate::access::backend::select_backend().cert_dir();
+                let hosted_origins = crate::access::iam::load_state_cached_arc(&cert_dir)
+                    .map(|state| state.hosted_origins.clone())
+                    .unwrap_or_else(|_| crate::access::iam::default_hosted_origins());
+                let audit_origin = crate::access::iam::session_origin_class(
+                    &hosted_origins,
+                    &http_access_context.principal,
+                );
                 return handle_api_keys_post(
                     stream,
                     route_body,
+                    http_access_context.principal.id.clone(),
+                    audit_origin,
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )

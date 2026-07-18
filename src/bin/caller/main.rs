@@ -274,9 +274,13 @@ struct CliFlags {
     control_socket: bool,
     /// --json: Emit JSONL events to stdout (headless stdio; implies --no-web).
     json_output: bool,
-    /// --sandbox: Enable Landlock filesystem sandboxing for the runtime.
-    #[allow(dead_code)]
+    /// --sandbox: Force the runtime filesystem write sandbox ON. The
+    /// sandbox is on by default; this overrides both a config-file opt-out
+    /// and --no-sandbox.
     sandbox: bool,
+    /// --no-sandbox: Disable the runtime filesystem write sandbox for this
+    /// run (an explicit escape hatch — unset config defaults to on).
+    no_sandbox: bool,
     /// --direct: Force single-agent mode (skip orchestrator/sub-agent delegation).
     /// Does NOT disable the UI — use --no-web for headless output.
     direct: bool,
@@ -351,7 +355,8 @@ fn print_help() {
     println!("    --verbose, -v         Enable verbose output");
     println!("    --control-socket      Enable Unix control socket");
     println!("    --json                Emit JSONL events to stdout (headless stdio)");
-    println!("    --sandbox             Enable Landlock filesystem sandboxing for the runtime");
+    println!("    --sandbox             Force the runtime write sandbox on (default: on; overrides config and --no-sandbox)");
+    println!("    --no-sandbox          Disable the runtime write sandbox (Landlock/Seatbelt/restricted token)");
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle start runs the daemon)");
@@ -460,6 +465,7 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
         control_socket: false,
         json_output: false,
         sandbox: false,
+        no_sandbox: false,
         direct: false,
         no_presence: false,
         web: false,
@@ -584,6 +590,10 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
             }
             "--sandbox" => {
                 flags.sandbox = true;
+                i += 1;
+            }
+            "--no-sandbox" => {
+                flags.no_sandbox = true;
                 i += 1;
             }
             "--control-socket" => {
@@ -1261,10 +1271,12 @@ async fn start_external_display_recordings(
 /// access session-wide. Every approval surface (JSON stdin, dashboard/MCP
 /// registry) must apply these identically, or an approval "succeeds" and
 /// the action still fails its grant check afterwards.
-/// Shared side effects for NATIVE runtime approvals, applied identically
-/// by every surface (JSON stdin, web, MCP): Approve records the command
-/// for dedup, ApproveAll raises global autonomy to Full, DisplayControl
-/// grants user display access.
+/// Shared side effects for NATIVE approvals (runtime batches and
+/// controller-dispatched tool calls), applied identically by every surface
+/// (JSON stdin, web, MCP): Approve records the action's dedup source —
+/// scoped to `session_id` and content-aware for content-bearing actions
+/// (see `autonomy::batch_dedup_source`) — ApproveAll raises global
+/// autonomy to Full, DisplayControl grants user display access.
 ///
 /// External-agent approvals deliberately do NOT route here: their
 /// "Approve all" is Intendant-enforced per external session
@@ -1274,13 +1286,14 @@ async fn start_external_display_recordings(
 async fn apply_user_approval(
     response: event::ApprovalResponse,
     cat: autonomy::ActionCategory,
-    preview: &str,
+    session_id: Option<&str>,
+    dedup_source: &str,
     autonomy: &SharedAutonomy,
     bus: &EventBus,
 ) {
     let mut state = autonomy.write().await;
     match response {
-        event::ApprovalResponse::Approve => state.record_approved_command(preview),
+        event::ApprovalResponse::Approve => state.record_approved_command(session_id, dedup_source),
         event::ApprovalResponse::ApproveAll => state.level = AutonomyLevel::Full,
         // Answer resolves question prompts; it grants nothing.
         event::ApprovalResponse::Skip
@@ -1727,6 +1740,7 @@ Also: {"source": "bare"}"#;
             control_socket: false,
             json_output: false,
             sandbox: false,
+            no_sandbox: false,
             direct: false,
             no_presence: false,
             web: false,
@@ -1888,6 +1902,42 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
+    fn parse_cli_flags_sandbox_flags() {
+        let flags = parse_cli_flags_from(cli(&["--sandbox"])).unwrap();
+        assert!(flags.sandbox);
+        assert!(!flags.no_sandbox);
+
+        let flags = parse_cli_flags_from(cli(&["--no-sandbox"])).unwrap();
+        assert!(flags.no_sandbox);
+        assert!(!flags.sandbox);
+    }
+
+    #[test]
+    fn sandbox_enabled_defaults_on_with_explicit_escape_hatches() {
+        let mut flags = cli_flags_for_tests();
+
+        // Nothing set anywhere: the write sandbox is ON — except Windows,
+        // where whole-tree ACE propagation makes default-on a boot hang
+        // and the sandbox stays opt-in (rationale on sandbox_enabled).
+        assert_eq!(sandbox_enabled(&flags, None), !cfg!(windows));
+        // Explicit config decides when no flag is given…
+        assert!(sandbox_enabled(&flags, Some(true)));
+        assert!(!sandbox_enabled(&flags, Some(false)));
+
+        // --no-sandbox forces off, over default and config alike.
+        flags.no_sandbox = true;
+        assert!(!sandbox_enabled(&flags, None));
+        assert!(!sandbox_enabled(&flags, Some(true)));
+
+        // --sandbox forces on, winning over config opt-out and --no-sandbox.
+        flags.sandbox = true;
+        assert!(sandbox_enabled(&flags, Some(false)));
+        assert!(sandbox_enabled(&flags, None));
+        flags.no_sandbox = false;
+        assert!(sandbox_enabled(&flags, Some(false)));
+    }
+
+    #[test]
     fn parse_cli_flags_retired_owner_fails_with_mtls_migration_guidance() {
         let fingerprint = "-vyeJaE3hyqm4J45K5j_sVTXAAAABBBBCCCCDDDDEEE";
         assert_eq!(fingerprint.len(), 43);
@@ -1923,6 +1973,7 @@ Also: {"source": "bare"}"#;
             control_socket: false,
             json_output: false,
             sandbox: false,
+            no_sandbox: false,
             direct: false,
             no_presence: false,
             web: false,
@@ -1950,6 +2001,7 @@ Also: {"source": "bare"}"#;
         assert!(!flags.continue_last);
         assert!(flags.resume_id.is_none());
         assert!(!flags.sandbox);
+        assert!(!flags.no_sandbox);
         assert!(!flags.json_output);
         assert!(!flags.direct);
         assert!(!flags.no_presence);
@@ -1977,6 +2029,7 @@ Also: {"source": "bare"}"#;
             control_socket: false,
             json_output: false,
             sandbox: false,
+            no_sandbox: false,
             direct: false,
             no_presence: false,
             web: true,
@@ -2019,6 +2072,7 @@ Also: {"source": "bare"}"#;
             control_socket: false,
             json_output: false,
             sandbox: false,
+            no_sandbox: false,
             direct: false,
             no_presence: false,
             web: true,
@@ -2155,13 +2209,14 @@ Also: {"source": "bare"}"#;
         let bus = EventBus::new();
         let mut events = bus.subscribe();
 
-        // Plain approval records the command for dedup; a DisplayControl
-        // approval grants the user display session-wide. The dashboard/MCP
-        // registry path used to skip both, so approving there left the
-        // action failing its grant check afterwards.
+        // Plain approval records the dedup source — for its session only;
+        // a DisplayControl approval grants the user display session-wide.
+        // The dashboard/MCP registry path used to skip both, so approving
+        // there left the action failing its grant check afterwards.
         apply_user_approval(
             event::ApprovalResponse::Approve,
             autonomy::ActionCategory::DisplayControl,
+            Some("sess-1"),
             "cu: click",
             &autonomy,
             &bus,
@@ -2169,7 +2224,11 @@ Also: {"source": "bare"}"#;
         .await;
         {
             let state = autonomy.read().await;
-            assert!(state.was_command_approved("cu: click"));
+            assert!(state.was_command_approved(Some("sess-1"), "cu: click"));
+            assert!(
+                !state.was_command_approved(Some("sess-2"), "cu: click"),
+                "an approval must not carry across sessions"
+            );
             assert!(state.user_display_granted);
         }
         let mut saw_grant = false;
@@ -2184,6 +2243,7 @@ Also: {"source": "bare"}"#;
         apply_user_approval(
             event::ApprovalResponse::ApproveAll,
             autonomy::ActionCategory::CommandExec,
+            Some("sess-1"),
             "rm -rf target",
             &autonomy,
             &bus,
@@ -2195,12 +2255,16 @@ Also: {"source": "bare"}"#;
         apply_user_approval(
             event::ApprovalResponse::Deny,
             autonomy::ActionCategory::CommandExec,
+            Some("sess-1"),
             "never ran",
             &autonomy,
             &bus,
         )
         .await;
-        assert!(!autonomy.read().await.was_command_approved("never ran"));
+        assert!(!autonomy
+            .read()
+            .await
+            .was_command_approved(Some("sess-1"), "never ran"));
     }
 
     #[test]
@@ -2792,6 +2856,25 @@ fn is_simple_task(task: &str) -> bool {
     task.len() < 100
 }
 
+/// Effective write-sandbox enablement: ON by default. `--sandbox` forces
+/// it on (winning over `--no-sandbox` — when both are given, keep the
+/// confinement), `--no-sandbox` forces it off, otherwise an explicit
+/// `[sandbox] enabled` in intendant.toml decides.
+fn sandbox_enabled(flags: &CliFlags, config_enabled: Option<bool>) -> bool {
+    // Default ON everywhere except Windows: a Windows write grant is an
+    // inheritable ACE, and `SetNamedSecurityInfoW` propagates it through
+    // the whole granted subtree synchronously — on a real project tree
+    // (or a shared toolchain cache) that turns daemon startup into a
+    // minutes-long DACL rewrite (proven live: every e2e daemon hit its
+    // boot timeout on the CI runner). Until the Windows mechanism is
+    // redesigned (scoped per-spawn stamping like the scoped shells, not
+    // whole-tree startup grants), the Windows sandbox stays opt-in via
+    // `--sandbox` / `[sandbox] enabled = true`, and enabling it accepts
+    // the first-stamp propagation cost on large trees.
+    let platform_default = !cfg!(windows);
+    flags.sandbox || (!flags.no_sandbox && config_enabled.unwrap_or(platform_default))
+}
+
 fn configure_sandbox_env(
     flags: &CliFlags,
     project: &Project,
@@ -2801,72 +2884,50 @@ fn configure_sandbox_env(
     // becomes writable by accident. Every other path passes the project root.
     project_write_scope: Option<&std::path::Path>,
 ) {
-    let enabled = flags.sandbox || project.config.sandbox.enabled;
-    if !enabled {
-        env::remove_var("INTENDANT_SANDBOX_WRITE_PATHS");
-        return;
-    }
+    let enabled = sandbox_enabled(flags, project.config.sandbox.enabled);
 
-    let mut sandbox_cfg = match project_write_scope {
+    // Record the startup resolution so the dashboard settings surface and
+    // the denial-consent flow can recompute the grant env live (the flag
+    // lock pins the state for this daemon's lifetime).
+    let base_cfg = match project_write_scope {
         Some(root) => sandbox::SandboxConfig::default_for_project(root, log_dir),
         None => sandbox::SandboxConfig::projectless(log_dir),
     };
-    for p in &project.config.sandbox.extra_write_paths {
-        let extra = if std::path::Path::new(p).is_absolute() {
-            PathBuf::from(p)
-        } else if let Some(root) = project_write_scope {
-            root.join(p)
+    sandbox::record_sandbox_startup(sandbox::SandboxRuntimeState {
+        base_write_paths: base_cfg.write_paths,
+        project_write_scope: project_write_scope.map(|p| p.to_path_buf()),
+        flag_lock: if flags.sandbox {
+            Some(true)
+        } else if flags.no_sandbox {
+            Some(false)
         } else {
-            // No project to anchor a relative grant to; resolving against
-            // the launch cwd would silently widen the projectless scope.
-            // (Unreachable in practice — projectless implies no
-            // intendant.toml, so this list is empty — kept fail-closed.)
-            eprintln!(
-                "[sandbox] relative extra write path {p} ignored: the daemon has no project root to resolve it against"
-            );
-            continue;
-        };
-        sandbox_cfg.write_paths.push(extra);
-    }
-    sandbox_cfg.write_paths.sort();
-    sandbox_cfg.write_paths.dedup();
+            None
+        },
+    });
 
-    // Platform-correct list encoding (':' on Unix, ';' on Windows — Windows
-    // paths contain ':') via env::join_paths. A path containing the list
-    // separator cannot be encoded; drop it loudly — the runtime then simply
-    // never allows writes there (fail-closed).
-    let encodable: Vec<&PathBuf> = sandbox_cfg
-        .write_paths
-        .iter()
-        .filter(|p| {
-            let ok = env::join_paths([p]).is_ok();
-            if !ok {
-                eprintln!(
-                    "[sandbox] write path {} contains the PATH separator and cannot                      be passed to the runtime; writes there will be denied",
-                    p.display()
-                );
+    let effective =
+        match sandbox::apply_sandbox_state(enabled, &project.config.sandbox.extra_write_paths) {
+            Ok(paths) => paths,
+            Err(e) => {
+                eprintln!("[sandbox] {e}; sandbox disabled");
+                env::remove_var("INTENDANT_SANDBOX_WRITE_PATHS");
+                return;
             }
-            ok
-        })
-        .collect();
-    match env::join_paths(encodable) {
-        Ok(joined) => env::set_var("INTENDANT_SANDBOX_WRITE_PATHS", joined),
-        Err(e) => {
-            eprintln!("[sandbox] failed to encode write paths ({e}); sandbox disabled");
-            env::remove_var("INTENDANT_SANDBOX_WRITE_PATHS");
-        }
+        };
+    if !enabled {
+        return;
     }
 
     // Windows: the runtime child enforces writes via a WRITE_RESTRICTED
     // token, which needs RESTRICTED-write ACEs on the allowed paths. Stamp
-    // them once for the daemon's lifetime (per-spawn stamping would race
-    // concurrent runtime spawns sharing these paths); the guard's Drop and
-    // the startup journal sweep handle removal.
+    // them once for the daemon's lifetime (paths granted live later are
+    // stamped per spawn through the refcounted table); the guard's Drop
+    // and the startup journal sweep handle removal.
     #[cfg(windows)]
     {
         static DAEMON_WRITE_GRANTS: std::sync::Mutex<Option<win_sandbox::AceGuard>> =
             std::sync::Mutex::new(None);
-        match win_sandbox::stamp_daemon_write_grants(&sandbox_cfg.write_paths) {
+        match win_sandbox::stamp_daemon_write_grants(&effective) {
             Ok(guard) => {
                 *DAEMON_WRITE_GRANTS
                     .lock()
@@ -2881,6 +2942,8 @@ fn configure_sandbox_env(
             }
         }
     }
+    #[cfg(not(windows))]
+    let _ = effective;
 }
 
 /// The `--scoped-shell-exec` wrapper (see terminal::scoped_shell_command):

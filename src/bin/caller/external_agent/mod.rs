@@ -139,6 +139,163 @@ pub(super) fn add_intendant_bootstrap_env(
     }
 }
 
+/// Exact names (ASCII-uppercase) a supervised external CLI keeps from the
+/// controller's environment: system basics, each platform's
+/// process-bootstrap set, proxy configuration, and the CLIs' own
+/// config-home pointers. One flat cross-platform union — a name absent
+/// from the parent env is simply not copied, so foreign-platform entries
+/// are inert. Deliberately absent: `DBUS_SESSION_BUS_ADDRESS` (session-bus
+/// reach into the desktop keyring; the Linux display-env injection holds
+/// it back too) and `NODE_OPTIONS` (code injection into node-based CLIs).
+const EXTERNAL_CHILD_BASE_ENV: &[&str] = &[
+    // System basics (all platforms).
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TERM",
+    "COLORTERM",
+    "TZ",
+    "LANG",
+    // macOS.
+    "__CF_USER_TEXT_ENCODING",
+    // Linux display/session vars a child's GUI tooling needs. XAUTHORITY
+    // and the XDG session-type vars are injected explicitly after the
+    // clear by `linux_display_env::apply_to_tokio_command`.
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "XDG_DATA_DIRS",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    // Windows: an env-cleared child needs these to load DLLs, resolve
+    // programs, and find its profile/temp directories.
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "TEMP",
+    "TMP",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    // Proxy configuration (matched case-insensitively, so the
+    // conventional lowercase forms ride too).
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    // The supervised CLIs' own config-home pointers. Not secrets — path
+    // redirects to the auth the CLI already owns — and the controller
+    // honors an inherited `CODEX_HOME` when probing local login
+    // (`codex_local_login`), so the child must resolve the same home.
+    // Vault leases override these with explicit `.env()` injections.
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+];
+
+/// True when a controller env var named `name` may be copied onto a
+/// supervised external CLI's cleared environment. Matching is on the
+/// ASCII-uppercased name (Windows env names are case-insensitive, and the
+/// proxy vars conventionally appear in both cases). `passthrough` holds
+/// the ASCII-uppercased `INTENDANT_ENV_PASSTHROUGH` names — a deliberate
+/// user extension of the allowlist that can never re-admit provider keys.
+fn external_child_env_allowed(name: &str, passthrough: &HashSet<String>) -> bool {
+    let upper = name.to_ascii_uppercase();
+    // Controller→child control channel: `INTENDANT` + `INTENDANT_*`
+    // bootstrap vars and the mock-provider rig's `PROVIDER` always ride.
+    if upper == "INTENDANT" || upper.starts_with("INTENDANT_") || upper == "PROVIDER" {
+        return true;
+    }
+    // Provider/model-API keys never pass, passthrough or not: a supervised
+    // CLI authenticates with its own auth under HOME (or an explicitly
+    // injected leased home), never with the controller's keys.
+    if crate::agent_runner::is_provider_credential_env(&upper) {
+        return false;
+    }
+    if passthrough.contains(&upper) {
+        return true;
+    }
+    if intendant_core::env_scrub::is_ambient_credential_env(&upper) {
+        return false;
+    }
+    EXTERNAL_CHILD_BASE_ENV.contains(&upper.as_str()) || upper.starts_with("LC_")
+}
+
+/// Reset a supervised external CLI's environment to the explicit
+/// allowlist: `env_clear()` plus the allowed names copied from the
+/// controller's own environment. The controller's process env carries the
+/// provider API keys (loaded from `.env` at startup) and whatever ambient
+/// credentials the launching shell had — a supervised backend must not
+/// inherit either.
+///
+/// Call this BEFORE a spawn site's deliberate `.env()` injections:
+/// explicit sets made after `env_clear()` survive it (the `INTENDANT_*`
+/// bootstrap env, leased `CODEX_HOME`/`CLAUDE_CONFIG_DIR`, the Linux GUI
+/// env, trace roots).
+pub(super) fn apply_external_child_env_policy(command: &mut tokio::process::Command) {
+    let passthrough = intendant_core::env_scrub::env_passthrough_set(
+        std::env::var(intendant_core::env_scrub::ENV_PASSTHROUGH_VAR)
+            .ok()
+            .as_deref(),
+    );
+    apply_external_child_env_policy_from(command, std::env::vars_os(), &passthrough);
+}
+
+/// Testable core of [`apply_external_child_env_policy`]: the parent env
+/// view and the passthrough set are injected so tests stay hermetic. Names
+/// that are not valid UTF-8 cannot be classified and are dropped.
+fn apply_external_child_env_policy_from(
+    command: &mut tokio::process::Command,
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    passthrough: &HashSet<String>,
+) {
+    command.env_clear();
+    for (name, value) in external_child_env_pairs(inherited, passthrough) {
+        command.env(&name, &value);
+    }
+}
+
+/// The subset of `inherited` pairs [`external_child_env_allowed`] admits.
+fn external_child_env_pairs(
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    passthrough: &HashSet<String>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    inherited
+        .into_iter()
+        .filter(|(name, _)| {
+            name.to_str()
+                .is_some_and(|name| external_child_env_allowed(name, passthrough))
+        })
+        .collect()
+}
+
+/// [`apply_external_child_env_policy`] for PTY children
+/// (`portable_pty::CommandBuilder`): the login-ceremony spawns run the same
+/// supervised CLIs and must not inherit provider keys or ambient
+/// credentials either. Call before the site's deliberate `.env()` sets.
+pub(crate) fn apply_external_child_env_policy_pty(command: &mut portable_pty::CommandBuilder) {
+    let passthrough = intendant_core::env_scrub::env_passthrough_set(
+        std::env::var(intendant_core::env_scrub::ENV_PASSTHROUGH_VAR)
+            .ok()
+            .as_deref(),
+    );
+    command.env_clear();
+    for (name, value) in external_child_env_pairs(std::env::vars_os(), &passthrough) {
+        command.env(&name, &value);
+    }
+}
+
 /// Drop ANSI SGR/CSI escape sequences from a tracing-formatted stderr
 /// line so activity-log rows don't render `[31m` noise.
 pub(crate) fn strip_ansi_escapes(input: &str) -> String {
@@ -1739,6 +1896,184 @@ pub trait ExternalAgent: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_child_env_admits_system_and_control_vars() {
+        let none = HashSet::new();
+        for name in [
+            // System basics + locale, either case.
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "TMPDIR",
+            "TERM",
+            "COLORTERM",
+            "TZ",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "__CF_USER_TEXT_ENCODING",
+            // Linux display/session set.
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR",
+            "XDG_DATA_DIRS",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            // Windows bootstrap set.
+            "SYSTEMROOT",
+            "SystemRoot",
+            "COMSPEC",
+            "PATHEXT",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "PROGRAMFILES(X86)",
+            "USERPROFILE",
+            "TEMP",
+            "TMP",
+            // Proxies, both conventional cases.
+            "HTTP_PROXY",
+            "https_proxy",
+            "all_proxy",
+            "NO_PROXY",
+            // CLI config-home pointers.
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            // Controller→child control channel (the mock-provider e2e rig
+            // rides PROVIDER + INTENDANT_MOCK_* into children).
+            "PROVIDER",
+            "INTENDANT",
+            "INTENDANT_MCP_URL",
+            "INTENDANT_SESSION_ID",
+            "INTENDANT_MOCK_SCRIPT",
+            "INTENDANT_MOCK_DISPLAY",
+            "INTENDANT_ENV_PASSTHROUGH",
+        ] {
+            assert!(
+                external_child_env_allowed(name, &none),
+                "{name} must be allowed onto the external child env"
+            );
+        }
+    }
+
+    #[test]
+    fn external_child_env_refuses_credentials_and_unknowns() {
+        let none = HashSet::new();
+        for name in [
+            // Provider/model-API keys, any casing.
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "anthropic_api_key",
+            "ANTHROPIC_AUTH_TOKEN",
+            "SOME_SERVICE_API_TOKEN",
+            // Ambient host credentials.
+            "SSH_AUTH_SOCK",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "NPM_TOKEN",
+            "KUBECONFIG",
+            "DOCKER_CONFIG",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "MY_APP_SECRET",
+            // Injection vectors and plain unknowns default-deny.
+            "NODE_OPTIONS",
+            "LD_PRELOAD",
+            "CARGO_TARGET_DIR",
+            "SOME_RANDOM_VAR",
+        ] {
+            assert!(
+                !external_child_env_allowed(name, &none),
+                "{name} must be dropped from the external child env"
+            );
+        }
+    }
+
+    #[test]
+    fn external_child_env_passthrough_extends_but_never_admits_provider_keys() {
+        let passthrough = intendant_core::env_scrub::env_passthrough_set(Some(
+            "ssh_auth_sock, CARGO_TARGET_DIR, ANTHROPIC_API_KEY",
+        ));
+        assert!(external_child_env_allowed("SSH_AUTH_SOCK", &passthrough));
+        assert!(external_child_env_allowed("CARGO_TARGET_DIR", &passthrough));
+        assert!(
+            !external_child_env_allowed("ANTHROPIC_API_KEY", &passthrough),
+            "provider keys must not pass even when named in the passthrough"
+        );
+        assert!(
+            !external_child_env_allowed("GH_TOKEN", &passthrough),
+            "non-named ambient credentials stay dropped"
+        );
+    }
+
+    /// The applier copies exactly the allowed inherited names onto the
+    /// cleared child env, and deliberate `.env()` injections made after it
+    /// (the bootstrap env, leased homes) survive. Hermetic — the parent
+    /// env view is injected.
+    #[test]
+    fn external_child_env_policy_copies_allowed_and_keeps_later_injections() {
+        use std::ffi::{OsStr, OsString};
+
+        let inherited: Vec<(OsString, OsString)> = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/u"),
+            ("ANTHROPIC_API_KEY", "sk-x"),
+            ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+            ("PROVIDER", "mock"),
+            ("INTENDANT_MOCK_SCRIPT", "/tmp/script.json"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+        .collect();
+
+        let mut command = tokio::process::Command::new("true");
+        apply_external_child_env_policy_from(&mut command, inherited, &HashSet::new());
+        add_intendant_bootstrap_env(&mut command, "http://localhost:1/mcp?x", Some("sess-1"));
+
+        let envs: Vec<(OsString, Option<OsString>)> = command
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        let set_value_for = |name: &str| {
+            envs.iter()
+                .find(|(k, _)| k == OsStr::new(name))
+                .and_then(|(_, v)| v.clone())
+        };
+
+        assert_eq!(set_value_for("PATH"), Some(OsString::from("/usr/bin")));
+        assert_eq!(set_value_for("HOME"), Some(OsString::from("/home/u")));
+        assert_eq!(set_value_for("PROVIDER"), Some(OsString::from("mock")));
+        assert_eq!(
+            set_value_for("INTENDANT_MOCK_SCRIPT"),
+            Some(OsString::from("/tmp/script.json"))
+        );
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "SSH_AUTH_SOCK",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ] {
+            assert!(
+                set_value_for(name).is_none(),
+                "{name} must not be copied onto the cleared child env"
+            );
+        }
+        // Deliberate injections made after the policy survive the clear.
+        assert_eq!(
+            set_value_for("INTENDANT_MCP_URL"),
+            Some(OsString::from("http://localhost:1/mcp?x"))
+        );
+        assert_eq!(
+            set_value_for("INTENDANT_SESSION_ID"),
+            Some(OsString::from("sess-1"))
+        );
+    }
 
     #[test]
     fn goal_engine_dispatch_outcomes_cover_report_clear_update() {

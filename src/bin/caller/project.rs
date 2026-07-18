@@ -1066,21 +1066,30 @@ pub fn save_daemon_connect_config_in(path: &Path, config: &ConnectConfig) -> Res
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    restrict_connect_file(&tmp);
+    write_owner_only(&tmp, &text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("finalize {}: {e}", path.display()))
 }
 
-fn restrict_connect_file(path: &Path) {
+/// Write `contents` to `path` with owner-only permissions from the first
+/// byte: the file is *created* 0600 on Unix, so there is no window where a
+/// default-umask file briefly exposes the secret before a follow-up chmod
+/// (the old write-then-chmod shape). A leftover file at `path` is removed
+/// first — `OpenOptions::mode` only applies at creation, so truncating an
+/// existing wider-mode leftover would keep its old permissions. On Windows
+/// the file inherits the profile directory's default ACLs, which are
+/// already private to the user.
+fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let _ = std::fs::remove_file(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
-        }
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())
 }
 
 /// Which store a Connect config round-trips through — resolved once from
@@ -1665,8 +1674,12 @@ impl Default for LiveAudioConfig {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct SandboxProjectConfig {
-    #[serde(default)]
-    pub enabled: bool,
+    /// Explicit write-sandbox opt-in/opt-out. Unset (`None`) means the
+    /// default applies: the runtime write sandbox is ON. The effective
+    /// resolution (CLI flags override this value) lives in
+    /// `configure_sandbox_env` / `sandbox_enabled` in the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     #[serde(default)]
     pub extra_write_paths: Vec<String>,
 }
@@ -1752,6 +1765,28 @@ impl Project {
         crate::file_watcher::atomic_write(&config_path, content.as_bytes())
             .map_err(|e| CallerError::Config(format!("Failed to write intendant.toml: {}", e)))?;
         Ok(())
+    }
+
+    /// Append one grant to `[sandbox] extra_write_paths` in this
+    /// project's intendant.toml — the consent flow's "always allow"
+    /// persistence. Reloads from disk first so a concurrent settings save
+    /// is not clobbered wholesale; duplicate entries no-op.
+    pub fn append_sandbox_extra_write_path(root: &Path, entry: &str) -> Result<(), CallerError> {
+        let mut proj = Self::from_root(root.to_path_buf())?;
+        if proj
+            .config
+            .sandbox
+            .extra_write_paths
+            .iter()
+            .any(|p| p == entry)
+        {
+            return Ok(());
+        }
+        proj.config
+            .sandbox
+            .extra_write_paths
+            .push(entry.to_string());
+        proj.save_config()
     }
 
     #[allow(dead_code)]
@@ -2598,6 +2633,30 @@ context_recovery = "managed"
         config.enabled = false;
         save_daemon_connect_config_in(&path, &config).unwrap();
         assert!(!load_daemon_connect_config_in(&path).unwrap().enabled);
+    }
+
+    /// The connect config can carry `auth_token`; it must be created with
+    /// owner-only permissions from the first byte — including when it
+    /// replaces a leftover wider-mode file (the chmod-after-write shape
+    /// this guards against).
+    #[cfg(unix)]
+    #[test]
+    fn daemon_connect_config_is_owner_only_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("connect.toml");
+
+        // A stale world-readable tmp leftover must not donate its mode.
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, "leftover").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut config = ConnectConfig::default();
+        config.auth_token = Some("secret-token".to_string());
+        save_daemon_connect_config_in(&path, &config).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "connect.toml mode {mode:o}");
     }
 
     #[test]

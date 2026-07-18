@@ -15,7 +15,7 @@ Design constraints, matching docs/src/credential-custody.md:
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,10 @@ pub const EVENT_LEASE_EXPIRED: &str = "lease_expired";
 pub const EVENT_EGRESS_REGISTERED: &str = "egress_registered";
 pub const EVENT_EGRESS_UNREGISTERED: &str = "egress_unregistered";
 pub const EVENT_CUSTODY_RESET: &str = "custody_reset";
+/// The daemon's provider API keys were replaced through the
+/// CredentialsManage-gated save surface (`POST /api/api-keys` or its
+/// tunnel twin). The label carries key *names* only.
+pub const EVENT_PROVIDER_KEYS_WRITTEN: &str = "provider_keys_written";
 
 /// How many events the in-memory tail keeps (and the file is trimmed
 /// to on rewrite).
@@ -143,16 +147,13 @@ impl Trail {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let created = !self.path.exists();
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
+        // Created 0600 — the mode applies at creation, so there is no
+        // window where the trail is world-readable.
+        let mut file = intendant_core::state_paths::private_file_options()
             .append(true)
             .open(&self.path)
             .map_err(|e| e.to_string())?;
         writeln!(file, "{line}").map_err(|e| e.to_string())?;
-        if created {
-            restrict_file(&self.path);
-        }
         self.file_lines += 1;
         Ok(())
     }
@@ -164,23 +165,10 @@ impl Trail {
             body.push('\n');
         }
         let tmp = self.path.with_extension("jsonl.tmp");
-        std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
-        restrict_file(&tmp);
+        intendant_core::state_paths::write_private_file(&tmp, body).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
         self.file_lines = self.events.len();
         Ok(())
-    }
-}
-
-fn restrict_file(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
-        }
     }
 }
 

@@ -10,6 +10,23 @@ use super::*;
 
 pub(crate) const TLS_FAILURE_LOG_INTERVAL_SECS: u64 = 30;
 
+/// Wall-clock budget for a connection to get through the pre-auth
+/// handshake phase — the initial peek, the TLS handshake, and the first
+/// request head (or the first ICE-TCP frame). One shared deadline spans
+/// all of them, so a peer that connects and then dribbles (or sends
+/// nothing) is dropped instead of pinning an accept task forever. It
+/// does not apply once the connection is established: WebSocket
+/// sessions, the ICE-TCP media tunnel, and HTTP keep-alive follow-ups
+/// (which carry their own idle timeout) all run past it.
+const PRE_AUTH_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Ceiling on connections still in that pre-auth handshake phase at
+/// once. Beyond it, new connections are dropped (with a debug log)
+/// rather than queued, bounding a slowloris-style flood of half-open
+/// connections. Established connections have already released their
+/// slot, so this never throttles live dashboards, peers, or media.
+const MAX_PRE_AUTH_CONNECTIONS: usize = 256;
+
 /// Transport edge that accepted a gateway connection.
 ///
 /// A loopback socket address is only proof of local presence on the public
@@ -47,10 +64,16 @@ async fn accept_gateway_connection(
     }
 }
 
-async fn read_relay_source_bucket(stream: &mut tokio::net::TcpStream) -> Option<String> {
+async fn read_relay_source_bucket(
+    stream: &mut tokio::net::TcpStream,
+    handshake_deadline: tokio::time::Instant,
+) -> Option<String> {
     use tokio::io::AsyncReadExt as _;
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::cmp::min(
+        handshake_deadline,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+    );
     let mut line = Vec::with_capacity(52);
     let mut byte = [0u8; 1];
     loop {
@@ -1293,6 +1316,11 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
 
         let mut fatal_accept_streak: u32 = 0;
         let mut relay_fatal_accept_streak: u32 = 0;
+        // Bounds concurrent connections still in the pre-auth handshake
+        // phase (see `MAX_PRE_AUTH_CONNECTIONS`). Each accepted connection
+        // takes a permit at the top of its task and releases it once it is
+        // established (or on any early return).
+        let preauth_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PRE_AUTH_CONNECTIONS));
         loop {
             let (gateway_ingress, accepted) =
                 accept_gateway_connection(&listener, relay_ingress_listener.as_ref()).await;
@@ -1445,8 +1473,25 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
             // `TlsAcceptor` wraps an `Arc<ServerConfig>`, so cloning is cheap
             // (one Arc bump). `None` when TLS is disabled.
             let tls_acceptor = tls_acceptor.clone();
+            let preauth_slots = Arc::clone(&preauth_slots);
 
             tokio::spawn(async move {
+                // Take a pre-auth slot for the duration of the handshake
+                // phase. A full table means too many half-open connections
+                // already in flight — drop this one rather than pile on.
+                let preauth_permit = match preauth_slots.try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        eprintln!(
+                            "[web_gateway] dropping connection from {peer_addr}: \
+                             pre-auth handshake slots exhausted ({MAX_PRE_AUTH_CONNECTIONS})"
+                        );
+                        return;
+                    }
+                };
+                // One shared budget across peek + TLS accept + first head
+                // read; consumed via `timeout_at` on each pre-auth await.
+                let handshake_deadline = tokio::time::Instant::now() + PRE_AUTH_HANDSHAKE_TIMEOUT;
                 // Snapshot session state at connection time
                 let session_snap = shared_session.read().await;
                 let daemon_session_id = session_snap.daemon_session_id.clone();
@@ -1496,17 +1541,22 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                 let mut buf = [0u8; 2048];
                 let mut raw_stream = stream;
                 let source_hint = if gateway_ingress.is_reachability_relay() {
-                    let Some(bucket) = read_relay_source_bucket(&mut raw_stream).await else {
+                    let Some(bucket) =
+                        read_relay_source_bucket(&mut raw_stream, handshake_deadline).await
+                    else {
                         return;
                     };
                     bucket
                 } else {
                     direct_source_hint
                 };
-                let peeked = match raw_stream.peek(&mut buf).await {
-                    Ok(n) if n > 0 => n,
-                    _ => return,
-                };
+                let peeked =
+                    match tokio::time::timeout_at(handshake_deadline, raw_stream.peek(&mut buf))
+                        .await
+                    {
+                        Ok(Ok(n)) if n > 0 => n,
+                        _ => return,
+                    };
 
                 // The hosted reachability relay is a TLS-SNI passthrough, not
                 // another entrance to this port's raw ICE-TCP or cleartext MCP
@@ -1542,15 +1592,19 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // (peek leaves it in the kernel buffer; we have to
                     // read it through to hand a clean stream to the peer
                     // reader task).
-                    let first_frame =
-                        match crate::display::webrtc::read_rfc4571_frame_pub(&mut raw_stream).await
-                        {
-                            Ok(f) => f,
-                            Err(e) => {
-                                eprintln!("[web_gateway] ICE-TCP first-frame read failed: {e}");
-                                return;
-                            }
-                        };
+                    let first_frame = match tokio::time::timeout_at(
+                        handshake_deadline,
+                        crate::display::webrtc::read_rfc4571_frame_pub(&mut raw_stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(f)) => f,
+                        Ok(Err(e)) => {
+                            eprintln!("[web_gateway] ICE-TCP first-frame read failed: {e}");
+                            return;
+                        }
+                        Err(_) => return,
+                    };
                     let remote_addr = match raw_stream.peer_addr() {
                         Ok(a) => a,
                         Err(_) => return,
@@ -1669,14 +1723,28 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         .as_ref()
                         .expect("is_tls implies acceptor present")
                         .clone();
-                    let mut tls_stream = match acceptor.accept(raw_stream).await {
-                        Ok(s) => s,
-                        Err(e) => {
+                    let mut tls_stream = match tokio::time::timeout_at(
+                        handshake_deadline,
+                        acceptor.accept(raw_stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
                             log_tls_failure_rate_limited(
                                 &tls_failure_log_state,
                                 &source_hint,
                                 "TLS handshake failed",
                                 &e.to_string(),
+                            );
+                            return;
+                        }
+                        Err(_) => {
+                            log_tls_failure_rate_limited(
+                                &tls_failure_log_state,
+                                &source_hint,
+                                "TLS handshake timed out",
+                                "pre-auth handshake deadline elapsed",
                             );
                             return;
                         }
@@ -1711,13 +1779,19 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // This is the TLS analogue of the plain-path peek.
                     use tokio::io::AsyncReadExt;
                     let mut decrypted = vec![0u8; 8192];
-                    let read_n = match tls_stream.read(&mut decrypted).await {
-                        Ok(0) => return, // client closed right after handshake
-                        Ok(r) => r,
-                        Err(e) => {
+                    let read_n = match tokio::time::timeout_at(
+                        handshake_deadline,
+                        tls_stream.read(&mut decrypted),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) => return, // client closed right after handshake
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => {
                             eprintln!("[web_gateway] TLS first decrypted read failed: {e}");
                             return;
                         }
+                        Err(_) => return, // pre-auth deadline: no request head in time
                     };
                     decrypted.truncate(read_n);
                     buf_owned = decrypted.clone();
@@ -1757,6 +1831,12 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                 // table), when the idle timeout / request budget runs
                 // out, or when a WebSocket upgrade hands the whole
                 // connection off below.
+                // The pre-auth handshake phase is over: TLS is up and the
+                // first request head is in hand. Release the slot so
+                // long-lived keep-alive / WebSocket connections below never
+                // count against the pre-auth cap. Follow-up request reads
+                // carry their own idle timeout (`read_next_request_head`).
+                drop(preauth_permit);
                 let parked = DemuxStream::new_parked_slot();
                 stream.arm_keep_alive(&parked);
                 let mut served: u32 = 0;

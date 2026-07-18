@@ -311,7 +311,9 @@ Connect ever terminating TLS or seeing plaintext:
   `/api/dns/publish`). When a browser connects, the relay mints a
   single-use nonce, hands it to the daemon over the control channel, and
   the daemon **dials back** a data connection carrying that nonce. The
-  relay correlates the two and splices them 1:1. On the daemon side the
+  relay correlates the two and splices them 1:1 (the dial-back hello is
+  read under one overall deadline and a small byte cap, so a slow writer
+  cannot hold the slot). On the daemon side the
   tunnel opens a second connection to a dedicated, ephemeral,
   loopback-only gateway ingress instead of the public gateway listener. Each
   fallback or exact-name queue has its own wake signal, so activity for one
@@ -453,6 +455,14 @@ already applied sequence `N` accept an older sequence. It can withhold the
 latest list—or serve a still-valid older list to a fresh daemon with no local
 sequence history—so availability and first-sync freshness still depend on the
 courier. The list contains only org-public revocation data.
+
+Publication is bounded: a list is capped at 64 KiB, the handle must be
+shaped like an org handle, per-source rate limits apply (with a separate,
+much tighter hourly budget for never-before-seen `(handle, root_key)`
+pairs), and the board holds at most 1024 distinct records — new pairs are
+refused once it is full, while an org already on the board can always
+publish an updated list. Republishing the currently stored sequence is
+acknowledged without a store write.
 
 ## Notifications
 
