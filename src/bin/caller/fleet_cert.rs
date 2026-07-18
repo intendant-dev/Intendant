@@ -43,6 +43,10 @@ const FLEET_CT_STATUS_FILE: &str = "fleet-cert-ct-status.json";
 const FLEET_CT_STATUS_MAX_BYTES: u64 = 1024 * 1024;
 const FLEET_CT_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const FLEET_CT_FOREIGN_SERIALS_MAX: usize = 256;
+const FLEET_CT_SERIAL_MAX_BYTES: usize = 128;
+const FLEET_CT_SUMMARY_MAX_BYTES: usize = 1024;
+const FLEET_CT_ISSUER_MAX_BYTES: usize = 768;
+const FLEET_CT_NOT_BEFORE_MAX_BYTES: usize = 128;
 const FLEET_CERT_ISSUANCE_FILE: &str = "fleet-cert-issuance.json";
 const FLEET_CERT_ISSUANCE_SCHEMA_VERSION: u32 = 2;
 const FLEET_CERT_ISSUANCE_MAX_BYTES: u64 = 64 * 1024;
@@ -2611,7 +2615,7 @@ fn load_ct_status_locked_in(cert_dir: &Path) -> Result<Option<DurableCtStatus>, 
         || durable
             .unknown_summaries
             .iter()
-            .any(|summary| summary.len() > 1024)
+            .any(|summary| summary.len() > FLEET_CT_SUMMARY_MAX_BYTES)
     {
         return Err(format!(
             "{} exceeds the durable CT evidence bounds",
@@ -2624,7 +2628,7 @@ fn load_ct_status_locked_in(cert_dir: &Path) -> Result<Option<DurableCtStatus>, 
         .map(|serial| {
             let normalized = normalize_serial_hex(serial);
             (!normalized.is_empty()
-                && normalized.len() <= 128
+                && normalized.len() <= FLEET_CT_SERIAL_MAX_BYTES
                 && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()))
             .then_some(normalized)
         })
@@ -2752,30 +2756,65 @@ fn parse_crt_sh_entries(json_text: &str) -> Result<Vec<CtEntry>, String> {
         serde_json::from_str(json_text).map_err(|e| format!("crt.sh response: {e}"))?;
     let mut seen = std::collections::HashSet::new();
     let mut entries = Vec::new();
-    for row in rows {
-        let serial = row
+    for (index, row) in rows.into_iter().enumerate() {
+        let raw_serial = row
             .get("serial_number")
             .and_then(|v| v.as_str())
-            .map(normalize_serial_hex)
-            .unwrap_or_default();
-        if serial.is_empty() || !seen.insert(serial.clone()) {
+            .ok_or_else(|| format!("crt.sh row {index} has no string serial_number"))?;
+        if raw_serial.trim().is_empty() {
+            return Err(format!("crt.sh row {index} has an empty serial_number"));
+        }
+        let serial = normalize_serial_hex(raw_serial);
+        if serial.len() > FLEET_CT_SERIAL_MAX_BYTES
+            || !serial.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(format!(
+                "crt.sh row {index} has an invalid certificate serial"
+            ));
+        }
+        let issuer = bounded_crt_sh_text(
+            &row,
+            "issuer_name",
+            "unknown issuer",
+            FLEET_CT_ISSUER_MAX_BYTES,
+            index,
+        )?;
+        let not_before =
+            bounded_crt_sh_text(&row, "not_before", "", FLEET_CT_NOT_BEFORE_MAX_BYTES, index)?;
+        let entry = CtEntry {
+            serial_hex: serial.clone(),
+            issuer,
+            not_before,
+        };
+        if ct_entry_summary(&entry).len() > FLEET_CT_SUMMARY_MAX_BYTES {
+            return Err(format!(
+                "crt.sh row {index} exceeds the durable summary limit"
+            ));
+        }
+        if !seen.insert(serial) {
             continue;
         }
-        entries.push(CtEntry {
-            serial_hex: serial,
-            issuer: row
-                .get("issuer_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown issuer")
-                .to_string(),
-            not_before: row
-                .get("not_before")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        });
+        entries.push(entry);
     }
     Ok(entries)
+}
+
+fn bounded_crt_sh_text(
+    row: &serde_json::Value,
+    field: &str,
+    default: &str,
+    max_bytes: usize,
+    index: usize,
+) -> Result<String, String> {
+    let value = match row.get(field) {
+        None | Some(serde_json::Value::Null) => default,
+        Some(serde_json::Value::String(value)) => value,
+        Some(_) => return Err(format!("crt.sh row {index} has a non-string {field}")),
+    };
+    if value.len() > max_bytes || value.chars().any(|character| character.is_control()) {
+        return Err(format!("crt.sh row {index} has an invalid {field}"));
+    }
+    Ok(value.to_string())
 }
 
 /// The foreign entries: publicly logged certificates for our name whose
@@ -2829,7 +2868,7 @@ fn commit_ct_entries_in(
             .filter_map(|record| {
                 let serial = normalize_serial_hex(&record.serial_hex);
                 (!serial.is_empty()
-                    && serial.len() <= 128
+                    && serial.len() <= FLEET_CT_SERIAL_MAX_BYTES
                     && serial.bytes().all(|byte| byte.is_ascii_hexdigit()))
                 .then_some(serial)
             })
@@ -4217,6 +4256,46 @@ mod tests {
 
         assert!(parse_crt_sh_entries("<html>rate limited</html>").is_err());
         assert_eq!(parse_crt_sh_entries("[]").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn crt_sh_parsing_rejects_fields_the_durable_verdict_cannot_represent() {
+        let cases = [
+            serde_json::json!([{
+                "issuer_name": "issuer",
+                "serial_number": "not-hex",
+                "not_before": "2026-07-09T00:00:00"
+            }]),
+            serde_json::json!([{
+                "issuer_name": "issuer",
+                "serial_number": "a".repeat(FLEET_CT_SERIAL_MAX_BYTES + 1),
+                "not_before": "2026-07-09T00:00:00"
+            }]),
+            serde_json::json!([{
+                "issuer_name": "i".repeat(FLEET_CT_ISSUER_MAX_BYTES + 1),
+                "serial_number": "1",
+                "not_before": "2026-07-09T00:00:00"
+            }]),
+            serde_json::json!([{
+                "issuer_name": "issuer\ninjected",
+                "serial_number": "1",
+                "not_before": "2026-07-09T00:00:00"
+            }]),
+            serde_json::json!([{
+                "issuer_name": "issuer",
+                "serial_number": "1",
+                "not_before": "t".repeat(FLEET_CT_NOT_BEFORE_MAX_BYTES + 1)
+            }]),
+            serde_json::json!([{
+                "issuer_name": "issuer",
+                "serial_number": 1,
+                "not_before": "2026-07-09T00:00:00"
+            }]),
+        ];
+        for case in cases {
+            let json = serde_json::to_string(&case).unwrap();
+            assert!(parse_crt_sh_entries(&json).is_err(), "{json}");
+        }
     }
 
     #[test]
