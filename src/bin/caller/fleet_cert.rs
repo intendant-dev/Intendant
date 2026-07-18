@@ -2792,15 +2792,66 @@ fn apply_loaded_ct_status(
     }
 }
 
-fn extend_ct_response(bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<(), String> {
-    if bytes.len().saturating_add(chunk.len()) > FLEET_CT_RESPONSE_MAX_BYTES {
+fn extend_ct_response(
+    bytes: &mut Vec<u8>,
+    total_bytes: &mut usize,
+    chunk: &[u8],
+) -> Result<(), String> {
+    if total_bytes.saturating_add(chunk.len()) > FLEET_CT_RESPONSE_MAX_BYTES {
         return Err(format!(
-            "crt.sh response exceeds the {} byte limit",
+            "crt.sh responses exceed the shared {} byte limit",
             FLEET_CT_RESPONSE_MAX_BYTES
         ));
     }
     bytes.extend_from_slice(chunk);
+    *total_bytes += chunk.len();
     Ok(())
+}
+
+fn crt_sh_query_identities(expected_name: &str) -> Result<[String; 2], String> {
+    let expected_name = normalized_dns_name(expected_name)
+        .ok_or_else(|| "cannot query CT evidence for an invalid fleet name".to_string())?;
+    let (_, parent) = expected_name.split_once('.').ok_or_else(|| {
+        "cannot query covering wildcard CT evidence for a single-label name".to_string()
+    })?;
+    let wildcard = format!("*.{parent}");
+    Ok([expected_name, wildcard])
+}
+
+fn crt_sh_query_url(identity: &str) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse("https://crt.sh/")
+        .map_err(|error| format!("construct crt.sh URL: {error}"))?;
+    url.query_pairs_mut()
+        .append_pair("q", identity)
+        .append_pair("output", "json");
+    Ok(url)
+}
+
+async fn fetch_crt_sh_entries(
+    client: &reqwest::Client,
+    query_identity: &str,
+    expected_name: &str,
+    total_bytes: &mut usize,
+) -> Result<Vec<CtEntry>, String> {
+    use futures_util::StreamExt as _;
+
+    let response = client
+        .get(crt_sh_query_url(query_identity)?)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("crt.sh HTTP {}", response.status()));
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        extend_ct_response(&mut bytes, total_bytes, &chunk)?;
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("crt.sh response is not UTF-8: {error}"))?;
+    parse_crt_sh_entries(text, expected_name)
 }
 
 /// Parse a crt.sh `output=json` response, deduplicating the
@@ -3051,8 +3102,6 @@ fn commit_ct_entries_in(
 /// One CT check against the public index. Fetch/parse failures set
 /// `ct_last_error` and leave the last successful verdict standing.
 pub async fn ct_check_once() {
-    use futures_util::StreamExt as _;
-
     let Some(name) = status_snapshot().name else {
         return;
     };
@@ -3063,23 +3112,18 @@ pub async fn ct_check_once() {
             .user_agent("intendant-fleet-cert-monitor")
             .build()
             .map_err(|e| e.to_string())?;
-        let response = client
-            .get(format!("https://crt.sh/?q={name}&output=json"))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !response.status().is_success() {
-            return Err(format!("crt.sh HTTP {}", response.status()));
+        let mut total_bytes = 0usize;
+        let mut serials = std::collections::HashSet::new();
+        let mut logged = Vec::new();
+        for identity in crt_sh_query_identities(&name)? {
+            let entries = fetch_crt_sh_entries(&client, &identity, &name, &mut total_bytes).await?;
+            for entry in entries {
+                if serials.insert(entry.serial_hex.clone()) {
+                    logged.push(entry);
+                }
+            }
         }
-        let mut bytes = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| error.to_string())?;
-            extend_ct_response(&mut bytes, &chunk)?;
-        }
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|error| format!("crt.sh response is not UTF-8: {error}"))?;
-        parse_crt_sh_entries(text, &name)
+        Ok(logged)
     }
     .await;
     let now = now_unix_ms();
@@ -4429,6 +4473,36 @@ mod tests {
     }
 
     #[test]
+    fn crt_sh_queries_exact_and_covering_wildcard_identities() {
+        let queries = crt_sh_query_identities("D-1.FLEET.EXAMPLE.").unwrap();
+        assert_eq!(
+            queries,
+            [
+                "d-1.fleet.example".to_string(),
+                "*.fleet.example".to_string()
+            ]
+        );
+
+        let urls = queries
+            .iter()
+            .map(|identity| crt_sh_query_url(identity).unwrap())
+            .collect::<Vec<_>>();
+        let query_values = urls
+            .iter()
+            .map(|url| {
+                url.query_pairs()
+                    .find_map(|(key, value)| (key == "q").then(|| value.into_owned()))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(query_values, queries);
+        assert!(urls.iter().all(|url| {
+            url.query_pairs()
+                .any(|(key, value)| key == "output" && value == "json")
+        }));
+    }
+
+    #[test]
     fn crt_sh_parsing_rejects_fields_the_durable_verdict_cannot_represent() {
         let cases = [
             serde_json::json!([{
@@ -4498,10 +4572,21 @@ mod tests {
 
     #[test]
     fn crt_sh_response_accumulation_is_bounded() {
-        let mut bytes = vec![0; FLEET_CT_RESPONSE_MAX_BYTES];
-        assert!(extend_ct_response(&mut bytes, &[1])
+        let mut total_bytes = FLEET_CT_RESPONSE_MAX_BYTES;
+        let mut bytes = Vec::new();
+        assert!(extend_ct_response(&mut bytes, &mut total_bytes, &[1])
             .unwrap_err()
             .contains("byte limit"));
-        assert_eq!(bytes.len(), FLEET_CT_RESPONSE_MAX_BYTES);
+        assert!(bytes.is_empty());
+        assert_eq!(total_bytes, FLEET_CT_RESPONSE_MAX_BYTES);
+
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        let mut total_bytes = 0;
+        extend_ct_response(&mut first, &mut total_bytes, &[1, 2]).unwrap();
+        extend_ct_response(&mut second, &mut total_bytes, &[3]).unwrap();
+        assert_eq!(first, vec![1, 2]);
+        assert_eq!(second, vec![3]);
+        assert_eq!(total_bytes, 3);
     }
 }
