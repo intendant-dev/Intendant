@@ -57,7 +57,7 @@ fn domain_control_error_in(
                 .to_string(),
         );
     }
-    match crate::fleet_cert::is_service_controlled_name_in(cert_dir, &domain.name) {
+    match crate::fleet_cert::is_service_controlled_name_live_in(cert_dir, &domain.name) {
         Ok(false) => None,
         Ok(true) => {
             Some("custom-domain name overlaps a service-controlled fleet name or zone".to_string())
@@ -292,15 +292,18 @@ impl CustomDomainRuntime {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        let passkeys = self
-            .passkeys
-            .as_ref()
-            .and_then(|runtime| runtime.views().ok())
-            .unwrap_or_default();
         let domain_control_error = self.domain_control_error();
+        let passkeys = if domain_control_error.is_none() {
+            self.passkeys
+                .as_ref()
+                .and_then(|runtime| runtime.views().ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         CustomDomainSnapshot {
             configured: self.configured,
-            enabled: self.enabled(),
+            enabled: self.domain.is_some() && domain_control_error.is_none(),
             name: self.domain.as_ref().map(|domain| domain.name.clone()),
             rp_id: self.domain.as_ref().map(|domain| domain.rp_id.clone()),
             origin: self.domain.as_ref().map(|domain| domain.origin.clone()),
@@ -458,6 +461,51 @@ mod tests {
             .initialization_error
             .as_deref()
             .is_some_and(|error| error.contains("service-controlled fleet name or zone")));
+    }
+
+    #[test]
+    fn runtime_live_guard_rejects_authority_store_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosted = Arc::new(HostedControlRuntime::new(
+            false,
+            dir.path().to_path_buf(),
+            None,
+            None,
+            String::new(),
+            false,
+        ));
+        let config = CustomDomainConfig {
+            enabled: true,
+            name: Some("owner.example.test".to_string()),
+            ..Default::default()
+        };
+        let runtime = CustomDomainRuntime::new(&config, dir.path().into(), hosted, None);
+        assert!(runtime.enabled());
+
+        let worker_dir = dir.path().to_path_buf();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            crate::access::authority_store::with_lock(&worker_dir, || {
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        let enabled_during_contention = runtime.enabled();
+        let snapshot_during_contention = runtime.snapshot();
+
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(!enabled_during_contention);
+        assert!(snapshot_during_contention
+            .initialization_error
+            .as_deref()
+            .is_some_and(|error| error.contains("authority-store lock") && error.contains("busy")));
+        assert!(runtime.enabled());
     }
 
     #[test]

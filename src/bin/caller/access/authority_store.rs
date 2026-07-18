@@ -76,6 +76,13 @@ fn lock_timeout_error(path: &Path) -> AccessError {
     ))
 }
 
+fn lock_busy_error(path: &Path) -> AccessError {
+    AccessError(format!(
+        "authority-store lock {} is busy; no state was changed",
+        path.display()
+    ))
+}
+
 fn acquire_process_lock(cert_dir: &Path, started: Instant) -> AccessResult<ProcessStoreLock> {
     loop {
         let mut locks = process_locks().lock().map_err(|_| {
@@ -95,6 +102,26 @@ fn acquire_process_lock(cert_dir: &Path, started: Instant) -> AccessResult<Proce
         }
         std::thread::sleep(LOCK_RETRY);
     }
+}
+
+fn try_acquire_process_lock(cert_dir: &Path) -> AccessResult<ProcessStoreLock> {
+    let lock_path = cert_dir.join(LOCK_FILE);
+    let mut locks = match process_locks().try_lock() {
+        Ok(locks) => locks,
+        Err(std::sync::TryLockError::WouldBlock) => return Err(lock_busy_error(&lock_path)),
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Err(AccessError(
+                "authority-store process locks were poisoned; refusing to mutate authority state"
+                    .to_string(),
+            ));
+        }
+    };
+    if !locks.insert(cert_dir.to_path_buf()) {
+        return Err(lock_busy_error(&lock_path));
+    }
+    Ok(ProcessStoreLock {
+        path: cert_dir.to_path_buf(),
+    })
 }
 
 fn acquire_lock(cert_dir: &Path, started: Instant) -> AccessResult<AuthorityStoreLock> {
@@ -133,6 +160,30 @@ fn acquire_lock(cert_dir: &Path, started: Instant) -> AccessResult<AuthorityStor
     }
 }
 
+fn try_acquire_lock(cert_dir: &Path) -> AccessResult<AuthorityStoreLock> {
+    let process = try_acquire_process_lock(cert_dir)?;
+    let lock_path = cert_dir.join(LOCK_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| AccessError(format!("open {}: {error}", lock_path.display())))?;
+    set_private_perms(&lock_path)?;
+    match File::try_lock(&file) {
+        Ok(()) => Ok(AuthorityStoreLock {
+            file,
+            _process: process,
+        }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(lock_busy_error(&lock_path)),
+        Err(std::fs::TryLockError::Error(error)) => Err(AccessError(format!(
+            "lock authority store {}: {error}",
+            lock_path.display()
+        ))),
+    }
+}
+
 /// Run one authority-store operation under the process and cross-process
 /// locks. Calls may nest only for the same canonical certificate directory.
 pub fn with_lock<T>(
@@ -154,6 +205,35 @@ pub fn with_lock<T>(
     }
 
     let lock = acquire_lock(&canonical, Instant::now())?;
+    HELD_STORE.with(|held| *held.borrow_mut() = Some(canonical));
+    let _reset = HeldStoreReset;
+    let _lock = lock;
+    operation()
+}
+
+/// Run one authority-store operation only when both locks are immediately
+/// available. This preserves the same cross-process fence as [`with_lock`]
+/// without its retry sleeps, so synchronous live guards can reject contention
+/// closed instead of parking an async runtime worker.
+pub fn try_with_lock<T>(
+    cert_dir: &Path,
+    operation: impl FnOnce() -> AccessResult<T>,
+) -> AccessResult<T> {
+    intendant_core::state_paths::create_private_dir_all(cert_dir)?;
+    let canonical = std::fs::canonicalize(cert_dir)
+        .map_err(|error| AccessError(format!("resolve {}: {error}", cert_dir.display())))?;
+    if let Some(held) = HELD_STORE.with(|current| current.borrow().clone()) {
+        if held == canonical {
+            return operation();
+        }
+        return Err(AccessError(format!(
+            "authority-store mutation for {} attempted while {} is locked; refusing cross-store nesting",
+            canonical.display(),
+            held.display()
+        )));
+    }
+
+    let lock = try_acquire_lock(&canonical)?;
     HELD_STORE.with(|held| *held.borrow_mut() = Some(canonical));
     let _reset = HeldStoreReset;
     let _lock = lock;
@@ -251,7 +331,9 @@ mod tests {
         let path = directory.path().join("nested").join("state.json");
         with_lock(directory.path(), || {
             with_lock(directory.path(), || {
-                atomic_write_private_locked(&path, b"one\n")
+                try_with_lock(directory.path(), || {
+                    atomic_write_private_locked(&path, b"one\n")
+                })
             })
         })
         .unwrap();
@@ -272,6 +354,36 @@ mod tests {
         let second = tempfile::tempdir().unwrap();
         let error = with_lock(first.path(), || with_lock(second.path(), || Ok(()))).unwrap_err();
         assert!(error.to_string().contains("refusing cross-store nesting"));
+    }
+
+    #[test]
+    fn immediate_lock_rejects_contention_without_running_the_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let worker_dir = directory.path().to_path_buf();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            with_lock(&worker_dir, || {
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        let mut operation_ran = false;
+        let error = try_with_lock(directory.path(), || {
+            operation_ran = true;
+            Ok(())
+        });
+
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let error = error.unwrap_err();
+        assert!(!operation_ran);
+        assert!(error.to_string().contains("is busy"));
+        try_with_lock(directory.path(), || Ok(())).unwrap();
     }
 
     #[test]

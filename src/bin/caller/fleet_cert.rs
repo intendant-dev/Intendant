@@ -385,8 +385,9 @@ fn load_fleet_origin_provenance_uncached_in(
     Ok(provenance)
 }
 
-fn load_fleet_origin_provenance_cached_arc_in(
+fn load_fleet_origin_provenance_cached_arc_with_absence_fence_in(
     cert_dir: &Path,
+    immediate: bool,
 ) -> Result<Arc<FleetOriginProvenance>, String> {
     let path = fleet_origin_provenance_path_in(cert_dir);
     let metadata = match std::fs::metadata(&path) {
@@ -402,11 +403,16 @@ fn load_fleet_origin_provenance_cached_arc_in(
             // with the same lock used by first creation so another process
             // cannot create provenance between the missing metadata result
             // and an empty classification.
-            return crate::access::authority_store::with_lock(cert_dir, || {
+            let load = || {
                 load_fleet_origin_provenance_uncached_in(cert_dir)
                     .map(Arc::new)
                     .map_err(crate::access::AccessError)
-            })
+            };
+            return if immediate {
+                crate::access::authority_store::try_with_lock(cert_dir, load)
+            } else {
+                crate::access::authority_store::with_lock(cert_dir, load)
+            }
             .map_err(|error| error.to_string());
         }
         Err(_) => {
@@ -446,6 +452,12 @@ fn load_fleet_origin_provenance_cached_arc_in(
     Ok(provenance)
 }
 
+fn load_fleet_origin_provenance_cached_arc_in(
+    cert_dir: &Path,
+) -> Result<Arc<FleetOriginProvenance>, String> {
+    load_fleet_origin_provenance_cached_arc_with_absence_fence_in(cert_dir, false)
+}
+
 fn load_fleet_origin_provenance_in(cert_dir: &Path) -> Result<FleetOriginProvenance, String> {
     load_fleet_origin_provenance_cached_arc_in(cert_dir).map(|provenance| (*provenance).clone())
 }
@@ -454,11 +466,13 @@ pub(crate) fn current_fleet_name_in(cert_dir: &Path) -> Result<Option<String>, S
     load_fleet_origin_provenance_in(cert_dir).map(|provenance| provenance.name)
 }
 
-pub(crate) fn is_service_controlled_name_in(cert_dir: &Path, name: &str) -> Result<bool, String> {
+fn provenance_controls_name(
+    provenance: &FleetOriginProvenance,
+    name: &str,
+) -> Result<bool, String> {
     let Some(name) = normalized_dns_name(name) else {
         return Ok(false);
     };
-    let provenance = load_fleet_origin_provenance_cached_arc_in(cert_dir)?;
     if provenance.provenance_incomplete {
         return Err(
             "fleet-origin provenance is incomplete; custom-domain separation cannot be proven"
@@ -472,6 +486,23 @@ pub(crate) fn is_service_controlled_name_in(cert_dir: &Path, name: &str) -> Resu
                     .strip_suffix(zone)
                     .is_some_and(|prefix| prefix.ends_with('.'))
         }))
+}
+
+pub(crate) fn is_service_controlled_name_in(cert_dir: &Path, name: &str) -> Result<bool, String> {
+    let provenance = load_fleet_origin_provenance_cached_arc_in(cert_dir)?;
+    provenance_controls_name(&provenance, name)
+}
+
+/// Classify a synchronous request-serving path without waiting for an
+/// authority-store lock. Lock contention rejects the custom-domain lane
+/// closed; a successful immediate lock preserves the cross-process fence on
+/// an absent provenance record.
+pub(crate) fn is_service_controlled_name_live_in(
+    cert_dir: &Path,
+    name: &str,
+) -> Result<bool, String> {
+    let provenance = load_fleet_origin_provenance_cached_arc_with_absence_fence_in(cert_dir, true)?;
+    provenance_controls_name(&provenance, name)
 }
 
 fn remember_fleet_origin_in(
