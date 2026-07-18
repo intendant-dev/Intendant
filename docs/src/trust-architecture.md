@@ -725,6 +725,26 @@ The pattern is proven elsewhere; we are assembling, not inventing:
 - **SPKI/SDSI and petnames** — authority bound to keys; human names are
   local, contextual labels.
 
+## Loopback trust vs. the runtime sandbox
+
+Local presence makes bare loopback a root-capable surface — deliberate, and
+documented above. Its sharp edge is that the *sandboxed runtime* is itself a
+local process: a prompt-injected shell running `curl 127.0.0.1:<port>/api/…`
+(or `intendant ctl`) would arrive as the trusted-local principal and escape
+the write sandbox entirely. On macOS the default (sandbox-on) runtime
+profile therefore denies network egress to the daemon's own gateway port —
+everything else stays reachable, and `--no-sandbox` lifts the guard with the
+rest of the confinement. Linux and Windows cannot express a single-port deny
+under their mechanisms (Landlock's network rules are allowlist-only;
+restricted tokens do not filter loopback), so on those platforms the
+loopback surface remains reachable from sandboxed shells — closing it
+properly means authenticating the loopback lane (per-boot secret or
+peer-credential checks) or binding its unauthenticated form to a read-only
+route subset, an open design decision. The same asymmetry applies to the
+state-root secrets: every platform now excludes the trust store
+(`access-certs/`), leased auth, and the custody trail from the runtime's
+*write* grants, but only macOS can additionally deny *reads* of them.
+
 ## Alpha implementation status
 
 The alpha keeps loopback and direct mTLS first-class while separating shipped

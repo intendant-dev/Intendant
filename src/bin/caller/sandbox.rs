@@ -128,13 +128,61 @@ pub(crate) fn seatbelt_credential_deny_clause() -> Result<String, String> {
     if let Some(config) = dirs::config_dir() {
         deny_dirs.push(canonicalize_for_profile(&config.join("intendant")));
     }
+    // The daemon state root's credential-bearing subtrees: the trust
+    // store (CA/client keys, IAM state), materialized leased auth homes,
+    // and the login-custody store. The write sandbox already excludes
+    // them (the grant covers only `logs/`); this closes READS, which
+    // `(allow default)` would otherwise leave open — `cat
+    // ~/.intendant/access-certs/ca.key` mints root client certs.
+    let state_root = canonicalize_for_profile(&crate::platform::intendant_home());
+    deny_dirs.push(state_root.join("access-certs"));
+    deny_dirs.push(state_root.join("leased-auth"));
+    deny_dirs.push(state_root.join("claude-auth"));
+    let mut deny_files: Vec<PathBuf> = vec![
+        state_root.join("custody-audit.jsonl"),
+        state_root.join("connect.toml"),
+    ];
     let env_files: Vec<PathBuf> = std::env::current_dir()
         .map(|cwd| env_file_candidates(&canonicalize_for_profile(&cwd)))
         .unwrap_or_default()
         .iter()
         .map(|candidate| canonicalize_for_profile(candidate))
         .collect();
-    seatbelt_deny_clause_for(&deny_dirs, &env_files)
+    deny_files.extend(env_files);
+    seatbelt_deny_clause_for(&deny_dirs, &deny_files)
+}
+
+/// The daemon's own gateway port, recorded at listener bind so the
+/// runtime profile can wall off the loopback control surface.
+static GATEWAY_LOOPBACK_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+
+/// Record the bound web-gateway port (first bind wins; rebinds on the
+/// same daemon keep the original guard — the port is stable per run).
+pub(crate) fn record_gateway_loopback_port(port: u16) {
+    let _ = GATEWAY_LOOPBACK_PORT.set(port);
+}
+
+/// Consumed by the macOS Seatbelt loopback-guard clause today; recorded
+/// on every platform so the Linux/Windows guards can adopt it when their
+/// mechanisms allow a per-port deny.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn gateway_loopback_port() -> Option<u16> {
+    GATEWAY_LOOPBACK_PORT.get().copied()
+}
+
+/// Seatbelt deny rule cutting the sandboxed runtime off from the
+/// daemon's own loopback control surface: a prompt-injected shell running
+/// `curl 127.0.0.1:<port>/api/…` (or `intendant ctl`) would otherwise
+/// arrive as the trusted-local root principal — a full sandbox escape.
+/// Scoped to the daemon's own port; every other network destination
+/// stays open. Rides only the write-restricted (sandbox-on) profile:
+/// `--no-sandbox` keeps its whole-escape-hatch contract.
+#[cfg(target_os = "macos")]
+fn seatbelt_loopback_guard_clause() -> String {
+    match gateway_loopback_port() {
+        Some(port) => format!("(deny network-outbound (remote ip \"localhost:{port}\"))\n"),
+        None => String::new(),
+    }
 }
 
 /// The always-on macOS profile for the agent runtime when no write
@@ -532,9 +580,15 @@ impl SandboxConfig {
         write_paths.push(PathBuf::from("/tmp"));
         write_paths.push(log_dir.to_path_buf());
 
-        // Allow writes to the daemon state root (~/.intendant by default,
-        // $INTENDANT_HOME when overridden).
-        write_paths.push(crate::platform::intendant_home());
+        // Session logs under the daemon state root (~/.intendant by
+        // default, $INTENDANT_HOME when overridden). Deliberately NOT the
+        // state root wholesale: it holds the trust store (access-certs —
+        // ca.key, IAM state), materialized leased auth, and the custody
+        // audit trail, and a write grant there would let a model-driven
+        // shell tamper with the daemon's own authority. The runtime's
+        // only state-root writes are its session log dir (askHuman
+        // channel, xauthority merge, shell logs).
+        write_paths.push(crate::platform::intendant_home().join("logs"));
 
         // Toolchain caches (rationale on toolchain_cache_write_paths) —
         // Unix only. On Windows a write grant is an INHERITABLE ACE, and
@@ -542,8 +596,8 @@ impl SandboxConfig {
         // whole subtree: stamping a multi-gigabyte `%CARGO_HOME%` takes
         // minutes and rewrites every descendant's DACL (proven live —
         // daemon boots hit the e2e 180s timeout on the CI cache). Windows
-        // defaults therefore stay small (project, temp, logs, state
-        // root); a sandboxed toolchain write there is denied loudly and
+        // defaults therefore stay small (project, temp, the state
+        // root's logs/); a sandboxed toolchain write is denied loudly and
         // the denial-consent card is the recovery path — one grant,
         // scoped to the path that actually needs it, persisted.
         #[cfg(not(windows))]
@@ -612,9 +666,10 @@ impl SandboxConfig {
              (allow default)\n\
              (deny file-write*)\n\
              (allow file-write* {subpaths})\n\
-             {sensitive}{credential}",
+             {sensitive}{credential}{loopback}",
             sensitive = seatbelt_sensitive_deny_clause()?,
             credential = seatbelt_credential_deny_clause()?,
+            loopback = seatbelt_loopback_guard_clause(),
         ))
     }
 
@@ -1218,6 +1273,95 @@ mod tests {
             .retain(|p| p != Path::new("/home/user/project"));
         assert_eq!(projectless.write_paths, with_project.write_paths);
         assert!(projectless.enabled);
+    }
+
+    /// The write set grants the state root's `logs/` subtree only — never
+    /// the state root itself, whose siblings are the daemon's own
+    /// authority (trust store, leased auth, custody trail). A write grant
+    /// there would let a model-driven shell tamper with IAM state.
+    #[test]
+    fn write_set_excludes_the_state_root_trust_store() {
+        let config = SandboxConfig::projectless(Path::new("/tmp/logs"));
+        let state_root = crate::platform::intendant_home();
+        assert!(
+            config.write_paths.contains(&state_root.join("logs")),
+            "{:?}",
+            config.write_paths
+        );
+        assert!(
+            !config.write_paths.contains(&state_root),
+            "state root must never be granted wholesale: {:?}",
+            config.write_paths
+        );
+        for secret in ["access-certs", "leased-auth", "claude-auth"] {
+            assert!(
+                !path_within_grants(&state_root.join(secret), &config.write_paths),
+                "{secret} must sit outside every write grant"
+            );
+        }
+    }
+
+    /// The credential deny clause walls off the state root's secret
+    /// subtrees for READS too (macOS; reads are otherwise open under
+    /// `(allow default)`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn credential_deny_clause_covers_the_state_root_secrets() {
+        let clause = seatbelt_credential_deny_clause().unwrap();
+        let state_root = canonicalize_for_profile(&crate::platform::intendant_home());
+        for secret in ["access-certs", "leased-auth", "claude-auth"] {
+            assert!(
+                clause.contains(&format!(
+                    "(subpath \"{}\")",
+                    state_root.join(secret).display()
+                )),
+                "missing {secret} in {clause}"
+            );
+        }
+        assert!(clause.contains("custody-audit.jsonl"), "{clause}");
+    }
+
+    /// The loopback guard rule is enforced by the real Seatbelt kernel:
+    /// with `(deny network-outbound (remote ip "localhost:P"))` a connect
+    /// to 127.0.0.1:P fails while a connect to a second, unlisted local
+    /// port still succeeds. Hermetic — both listeners are in-test
+    /// ephemerals; the profile string is built directly so the test never
+    /// touches the process-global recorded port (shared-process cargo
+    /// test runs would leak it into other tests' profiles).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_loopback_guard_blocks_only_the_daemon_port() {
+        use std::io::Read as _;
+        let denied_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let denied_port = denied_listener.local_addr().unwrap().port();
+        let allowed_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let allowed_port = allowed_listener.local_addr().unwrap().port();
+        // Accept loop stand-ins: leave listeners open; connects complete
+        // at the kernel accept queue without an explicit accept.
+        let profile = format!(
+            "(version 1)\n(allow default)\n(deny network-outbound (remote ip \"localhost:{denied_port}\"))\n"
+        );
+        let script = format!(
+            "(echo x > /dev/tcp/127.0.0.1/{denied_port}) 2>/dev/null && echo DENIED_CONNECTED || echo DENIED_BLOCKED; \
+             (echo x > /dev/tcp/127.0.0.1/{allowed_port}) 2>/dev/null && echo ALLOWED_CONNECTED || echo ALLOWED_BLOCKED"
+        );
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("/bin/bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("sandbox-exec runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("DENIED_BLOCKED"), "{stdout}");
+        assert!(stdout.contains("ALLOWED_CONNECTED"), "{stdout}");
+        // Silence unused-read warnings; keep listeners alive to here.
+        let mut _buf = [0u8; 1];
+        let _ = denied_listener.set_nonblocking(true);
+        if let Ok((mut sock, _)) = denied_listener.accept() {
+            let _ = sock.read(&mut _buf);
+        }
     }
 
     #[test]
