@@ -179,7 +179,6 @@ impl DirectErrorBudget {
 const CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT: usize = 16;
 const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
 const CONTROL_BINDING_TTL_MS: i64 = 5 * 60 * 1000;
-const DASHBOARD_MEDIA_CLIP_MAX_FRAMES: usize = 1000;
 /// One dashboard-control method's declared surface. The effective method
 /// table (`all_control_methods`) is the single source the method authorizer
 /// (`authorize_dashboard_control_method`), the advertised feature list

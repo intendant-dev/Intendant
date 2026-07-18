@@ -1735,7 +1735,14 @@ function renderSessionFrames(sessionId, frames) {
     group.className = 'sd-frame-group' + (collapsed ? ' collapsed' : '');
     const header = document.createElement('div');
     header.className = 'sd-frame-group-header';
-    header.innerHTML = `<span class="sd-frame-group-chevron">&#x25BE;</span>${title} <span class="sd-frame-group-badge">${badge}</span>`;
+    const chevron = document.createElement('span');
+    chevron.className = 'sd-frame-group-chevron';
+    chevron.textContent = '\u25BE';
+    const titleText = document.createTextNode(title + ' ');
+    const badgeText = document.createElement('span');
+    badgeText.className = 'sd-frame-group-badge';
+    badgeText.textContent = badge;
+    header.append(chevron, titleText, badgeText);
     header.addEventListener('click', () => group.classList.toggle('collapsed'));
     group.appendChild(header);
     const gallery = document.createElement('div');
@@ -2601,4 +2608,3 @@ function loadNewerSessionDetailRows(view) {
   }
   return true;
 }
-

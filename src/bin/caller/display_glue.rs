@@ -121,7 +121,9 @@ pub(crate) async fn resolve_frame_attachments(
         let Ok(data) = reg.read_hq(fid) else { continue };
         use base64::Engine;
         let base64 = base64::engine::general_purpose::STANDARD.encode(&data);
-        let path = reg.path_for(fid);
+        let Ok(path) = reg.path_for(fid) else {
+            continue;
+        };
         atts.push(external_agent::AgentImageAttachment::from_frame_path(
             path,
             base64,
@@ -222,7 +224,10 @@ pub(crate) async fn resolve_attachments_with_scopes(
             let Ok(data) = reg.read_hq(fid) else {
                 continue;
             };
-            (data, reg.path_for(fid))
+            let Ok(path) = reg.path_for(fid) else {
+                continue;
+            };
+            (data, path)
         };
         use base64::Engine;
         let base64 = base64::engine::general_purpose::STANDARD.encode(&data);
