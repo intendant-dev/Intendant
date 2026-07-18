@@ -291,10 +291,10 @@ impl TcpRelayRegistry {
 /// which is a malformed SDP per RFC 5245 — callers treat it as
 /// "this Answer isn't relay-able, skip the rewrite."
 ///
-/// Exposed publicly so the `OutboundEvent` translator in
-/// `web_gateway.rs` can extract the ufrag from an incoming federated
-/// `WebRtcSignal::Answer` and register it in [`TcpRelayRegistry`]
-/// keyed to the outbound peer address.
+/// Exposed publicly so the gateway's federated-answer translator in
+/// `web_gateway/peer_requests.rs` can extract the ufrag from an incoming
+/// `WebRtcSignal::Answer` and register it in [`TcpRelayRegistry`] keyed to
+/// the outbound peer address.
 pub fn parse_sdp_ice_ufrag(sdp: &str) -> Option<String> {
     for line in sdp.lines() {
         let line = line.trim_end_matches('\r');

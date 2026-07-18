@@ -57,7 +57,8 @@ The test compares:
 ## Run
 
 The feature is on `main` in both repos. Build the patched Codex fork, then
-build and run from the Intendant repo root:
+build and run from your isolated Intendant worktree (never the shared repo
+root):
 
 ```bash
 # 1. Patched Codex (minimal-lineage fork)
@@ -65,8 +66,8 @@ cd /Users/vm/projects/codex-minimal-lineage/codex-rs
 cargo build -p codex-cli --bin codex
 
 # 2. Intendant (debug build matches the harness's --intendant-bin default)
-cd /Users/vm/projects/intendant
-cargo build --bin intendant
+cd /path/to/your/intendant/worktree
+cargo build --bin intendant --bin intendant-runtime
 
 # 3. Harness
 scripts/codex_context_stress_e2e.py \

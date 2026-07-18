@@ -15,49 +15,77 @@ disable-model-invocation: true
 
 - **No terminal emulator needed**: `--web` serves the dashboard SPA; sessions render in the browser.
   Intendant runs as a plain background process, not inside a terminal emulator.
-- **Firefox renders `/app`**: The tabbed web UI with Activity, Usage, Terminal,
-  Displays tabs. All logic runs in WASM (presence-web), JS is a thin rendering layer.
+- **Firefox renders `/app`**: the ui-v2 dashboard with Activity, Sessions,
+  Agenda, Memory, Live display, Station, Terminal, Files, Usage, Access,
+  Vault, Settings, and Debug destinations. State handling is split between
+  `presence-web` WASM and the generated JavaScript application.
 - **Live mode available**: `/app` has a mic button for connecting Gemini Live or
-  OpenAI Realtime. Set API key in localStorage first.
+  OpenAI Realtime. Gemini uses a browser-held key; OpenAI uses a short-lived
+  client secret minted by the daemon from its server-side credential.
 - **Approval via browser**: Approval buttons in the Activity tab, or keyboard
   shortcuts (y/s/a/n). No `--control-socket` or socat needed.
-- **Display streaming**: The Displays tab shows live VNC via noVNC. Agent's
-  display :99 is streamed in real-time.
+- **Display streaming**: Live display and Station receive the agent's
+  display through the WebRTC display pipeline. The observer VNC server in
+  this runbook is only for watching the Firefox test desktop on `:50`.
 
 ## Launch
 
-**IMPORTANT:** Always use display **:50** (intendant reserves :99+ for its own Xvfb).
-Always start `x11vnc` so the human can follow along via VNC on port 5950.
+The example uses display **:50**, VNC port **5950**, and dashboard port
+**18765**. Check all three first; if any is occupied, pick unused values and
+update the variables. Never stop another agent's processes or use the shared
+default dashboard port 8765.
 
 ```bash
-# 1. Kill stale processes from prior runs (use -9 for firefox — it ignores SIGTERM)
-# NEVER use pkill — Claude Code blocks it (exit 144).
-# First check what's running, then kill specific PIDs:
-pgrep -fa 'Xvfb :50|x11vnc.*:50|firefox|intendant'
-# Then kill the relevant PIDs from the output above:
-# kill <pid1> <pid2> ...
-# kill -9 <firefox_pid>  (firefox ignores SIGTERM)
-sleep 0.5
+# 1. Pin this worktree and reserve isolated endpoints.
+REPO=$(git rev-parse --show-toplevel)
+(
+  cd "$REPO"
+  cargo build --release --bin intendant --bin intendant-runtime
+)
+BIN="$REPO/target/release/intendant"
+PORT=18765
+BASE="http://127.0.0.1:$PORT"
+RUN_DIR=$(mktemp -d /tmp/intendant-web-e2e.XXXXXX)
+if pgrep -fa '^Xvfb :50([[:space:]]|$)|^x11vnc .*:50'; then
+  echo "Display :50 is already owned; choose an unused display"; exit 1
+fi
+ss -ltn 2>/dev/null | grep -E ':(5950|6000|18765)\b' && {
+  echo "Choose unused display/VNC/debug/dashboard values before continuing"; exit 1;
+}
 
-# 2. Start Xvfb + x11vnc (MANDATORY — human needs VNC to observe)
+# 2. Start Xvfb + x11vnc (human observation only); retain owned PIDs.
 nohup Xvfb :50 -screen 0 1280x720x24 > /dev/null 2>&1 &
+XVFB_PID=$!
 sleep 0.5
 nohup x11vnc -display :50 -rfbport 5950 -passwd intendant -forever -quiet > /dev/null 2>&1 &
+VNC_PID=$!
 sleep 0.5
 
-# 3. Launch intendant --web as background process (no xterm needed)
-> /tmp/intendant-web-stderr.log
-cd /home/user/projects/intendant && source .env && \
-  nohup ./target/release/intendant --direct --autonomy low --web \
-  "your task here" > /dev/null 2>/tmp/intendant-web-stderr.log &
+# 3. Launch this worktree's controller on loopback plaintext for the test.
+(
+  cd "$REPO"
+  [ ! -f .env ] || source .env
+  exec "$BIN" --direct --autonomy low --web "$PORT" --no-tls \
+    --bind 127.0.0.1 "your task here"
+) \
+  >"$RUN_DIR/intendant.log" 2>&1 &
+INTENDANT_PID=$!
 
 # 4. Wait for web gateway to start
 sleep 3
-cat /tmp/intendant-web-stderr.log  # Should show "Dashboard: http://0.0.0.0:8765"
+cat "$RUN_DIR/intendant.log"
 
-# 5. Launch Firefox on display :50 pointing to /app
-rm -f ~/.mozilla/firefox/*/.parentlock ~/.mozilla/firefox/*/lock 2>/dev/null
-DISPLAY=:50 nohup firefox -P default --new-window http://localhost:8765/app > /dev/null 2>&1 &
+# 5. Launch an isolated Firefox profile on display :50.
+mkdir -p "$RUN_DIR/firefox-profile"
+cat > "$RUN_DIR/firefox-profile/user.js" << 'EOF'
+user_pref("devtools.debugger.remote-enabled", true);
+user_pref("devtools.chrome.enabled", true);
+user_pref("devtools.debugger.prompt-connection", false);
+user_pref("devtools.debugger.force-local", false);
+EOF
+DISPLAY=:50 nohup firefox --no-remote --profile "$RUN_DIR/firefox-profile" \
+  --start-debugger-server 6000 --new-window "$BASE/app" > /dev/null 2>&1 &
+FIREFOX_PID=$!
 sleep 8
 ```
 
@@ -69,10 +97,10 @@ The `/debug` endpoint returns the full agent state as JSON. Use it for all asser
 
 ```bash
 # Full state dump
-curl -s http://localhost:8765/debug | python3 -m json.tool
+curl -s "$BASE/debug" | python3 -m json.tool
 
 # Assert on specific fields
-curl -s http://localhost:8765/debug | python3 -c "
+curl -s "$BASE/debug" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 state = d.get('agent_state', d)
@@ -89,7 +117,7 @@ print(f'Voice logs: {voice.get(\"voice_log_count\", 0)}')
 ```bash
 # Poll until approval is pending (up to 30s)
 for i in $(seq 1 30); do
-  PENDING=$(curl -s http://localhost:8765/debug | python3 -c "
+  PENDING=$(curl -s "$BASE/debug" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 pa = d.get('agent_state', d).get('pending_approval')
@@ -104,7 +132,7 @@ echo "Approval pending: $PENDING"
 ### Wait for task completion
 ```bash
 for i in $(seq 1 60); do
-  PHASE=$(curl -s http://localhost:8765/debug | python3 -c "
+  PHASE=$(curl -s "$BASE/debug" | python3 -c "
 import sys, json; print(json.load(sys.stdin).get('agent_state', {}).get('phase', ''))" 2>/dev/null)
   [ "$PHASE" = "Done" ] || [ "$PHASE" = "Idle" ] && break
   sleep 1
@@ -117,7 +145,7 @@ echo "Final phase: $PHASE"
 python3 -c "
 import asyncio, json, websockets
 async def approve():
-    async with websockets.connect('ws://localhost:8765') as ws:
+    async with websockets.connect('ws://127.0.0.1:$PORT') as ws:
         await asyncio.wait_for(ws.recv(), timeout=3)  # bootstrap
         await ws.send(json.dumps({'action': 'approve', 'id': 1}))
         print('Approved')
@@ -127,7 +155,7 @@ asyncio.run(approve())
 
 ### Check voice/live connection
 ```bash
-curl -s http://localhost:8765/debug | python3 -c "
+curl -s "$BASE/debug" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 v = d.get('voice', {})
@@ -140,10 +168,10 @@ print(f'Last voice log: {v.get(\"last_voice_log\", \"(none)\")}')
 ### Other endpoints
 ```bash
 # Config: provider, model, sample rates (no secrets)
-curl -s http://localhost:8765/config
+curl -s "$BASE/config"
 
 # Session: mint ephemeral token (called by browser on mic click)
-curl -s -X POST http://localhost:8765/session
+curl -s -X POST "$BASE/session"
 ```
 
 ## Simulating Live Input
@@ -159,7 +187,7 @@ python3 scripts/ff-eval.py "app.send_text('Hello, what is happening?')"
 
 **Setting API key in localStorage** (required for tool calling):
 ```bash
-source .env && python3 scripts/ff-eval.py "localStorage.setItem('gemini_api_key', '$GEMINI_API_KEY'); 'stored'"
+source "$REPO/.env" && python3 scripts/ff-eval.py "localStorage.setItem('gemini_api_key', '$GEMINI_API_KEY'); 'stored'"
 # Then reload the page:
 python3 scripts/ff-eval.py "location.reload(); 'reloading'"
 ```
@@ -183,15 +211,15 @@ DISPLAY=:50 xdotool key y
 **Gotcha**: If the follow-up text input panel is active, keyboard shortcuts
 go into the text input. Press Escape first to dismiss it.
 
-## Displays Tab
+## Live display
 
-When the agent runs commands that trigger Xvfb (display :99), the Displays tab
-shows a live VNC stream via noVNC. Features:
+When the agent runs commands that trigger a virtual display (commonly
+`display_99`), the Live display destination shows the WebRTC stream. Features:
 
 - **View-only** by default — watch what the agent does
 - **Take Control** button — switch to interactive mode (mouse/keyboard forwarded)
 - **Release** button — return to view-only, optional note for the agent
-- Auto-connects when `display_ready` event arrives
+- Auto-connects when `display_ready` arrives and the display grant permits it
 
 ## Screenshot (optional — for human VNC verification only)
 
@@ -206,16 +234,19 @@ This is **not needed for assertions** — use `/debug` instead.
 - **WASM cache**: Content-hash versioning (`?v=<hash>`) on WASM/JS URLs means
   browsers automatically fetch new assets after rebuilds. No manual cache
   clearing needed.
-- **WASM rebuild**: From `crates/presence-web/`:
-  `wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web`
-  Then `cargo build --release -p intendant` (use `-p intendant` to skip WASM-only crate).
+- **WASM rebuild**: use the pinned canonical builder from the repo root:
+  `bash scripts/build-wasm.sh`, then rebuild only the controller if needed
+  (`cargo build --release --bin intendant --bin intendant-runtime`).
+  Regenerate committed WASM
+  artifacts on macOS only.
 - **AudioContext warning** on headless displays is expected and harmless.
 - **Follow-up panel** captures keystrokes — Escape first before sending shortcuts.
-- **Firefox profile lock**: If Firefox won't start, remove lock files:
-  `rm -f ~/.mozilla/firefox/*/.parentlock ~/.mozilla/firefox/*/lock`
-- **Late-connect**: If you reload the browser mid-session, the Activity tab
-  replays the full session log. Usage tab gets cached data. Displays tab
-  auto-reconnects to VNC.
+- **Firefox profile lock**: use the run-scoped `--no-remote --profile
+  "$RUN_DIR/firefox-profile"` invocation above; do not remove another
+  browser's profile lock.
+- **Late-connect**: If you reload the browser mid-session, Activity replays
+  the session log, Usage gets cached data, and Live display reconnects through
+  WebRTC.
 - **Two Gemini endpoints, different capabilities**:
   | | `BidiGenerateContent` | `BidiGenerateContentConstrained` |
   |---|---|---|
@@ -226,23 +257,15 @@ This is **not needed for assertions** — use `/debug` instead.
 
 **For browser-side JS debugging** (only needed for WASM/JS errors):
 
-Firefox `--start-debugger-server` requires `devtools.debugger.remote-enabled=true`
-in the Firefox profile's `user.js`. Set up once per environment:
-```bash
-PROFILE=$(ls -d ~/.mozilla/firefox/*.default* | head -1)
-cat >> "$PROFILE/user.js" << 'EOF'
-user_pref("devtools.debugger.remote-enabled", true);
-user_pref("devtools.chrome.enabled", true);
-user_pref("devtools.debugger.prompt-connection", false);
-user_pref("devtools.debugger.force-local", false);
-EOF
-```
-Then launch Firefox with `--start-debugger-server 6000` and use `scripts/ff-eval.py`.
+The launch recipe already configures the run-scoped profile and starts the
+debugger on port 6000. Use `scripts/ff-eval.py`; do not modify a user's
+normal Firefox profile.
 
 ## Cleanup
 
 ```bash
-# NEVER use pkill. Check what's running, then kill specific PIDs:
-pgrep -fa 'intendant|firefox|Xvfb :50|x11vnc.*:50'
-# kill <pid1> <pid2> ...
+# Stop only processes whose PIDs this run captured.
+kill "$INTENDANT_PID" "$VNC_PID" "$XVFB_PID" 2>/dev/null || true
+kill -9 "$FIREFOX_PID" 2>/dev/null || true
+rm -rf "$RUN_DIR"
 ```

@@ -50,14 +50,16 @@ Replace `DEV_IDX`, `PASSWORD` (from `~/lin`), and `TARGET` (SIP URI):
 Do NOT sleep or verify the call first. The audio bridge polls shared memory
 and works before the call connects.
 
-**ALL of these parameters are REQUIRED — the call will fail without them:**
+**Required parameters:**
 - `id`: unique session identifier
 - `provider`: `openai`
 - `playbook`: the conversation script
 - `response_schema`: MANDATORY. Without this the call is rejected.
   Build it from the user's request — every piece of data to extract
   needs a field. See the example below.
-- `timeout_secs`: max call duration (default 120)
+
+**Optional parameters:**
+- `timeout_secs`: max call duration (default 300)
 - `voice`: e.g. `alloy`, `shimmer`
 - Do NOT set `initial_message` — the model starts when it hears the caller
 
@@ -66,7 +68,9 @@ and works before the call connects.
 `spawn_live_audio` returns `LiveAudioResult` with `status`:
 - **Completed**: valid JSON matching the schema
 - **TimedOut**: exceeded timeout
+- **Disconnected**: the live connection ended before completion
 - **SchemaError**: output didn't match schema
+- **Failed**: setup or provider/audio processing failed
 
 ### 5. Clean up
 

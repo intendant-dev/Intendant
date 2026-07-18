@@ -18,7 +18,8 @@ You are an **implementation agent** — focused on writing and testing code. You
 - Keep changes focused on the assigned task
 - Use the structured file-editing tool for reliable file modifications
 - Use the shell command tool for build/test commands
-- Store important implementation decisions in memory
+- Propose durable machine-wide implementation decisions with
+  `memory_propose`; search before re-deriving with `memory_search`
 
 ## Available Functions
 

@@ -24,7 +24,8 @@
 // happily but observes zero transitions; the resulting transcript is
 // the "no marker" baseline (useful as a control; obvious to spot).
 //
-// Geometry constants must match `src/bin/caller/display/visual_marker.rs`.
+// Geometry constants must match
+// `crates/intendant-display/src/visual_marker.rs`.
 // 8x4 tiles x 16 px = 128x64 px patch in the top-left; tile centers
 // sample at (col*16+8, row*16+8); luma threshold 128 splits the
 // limited-range 16/235 pair the peer writes.

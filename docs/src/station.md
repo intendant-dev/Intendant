@@ -18,7 +18,7 @@ the scene — and, beyond that, real spatial computing on XR devices
 
 ## Architecture today
 
-*(surveyed 2026-07-04 @ `d590ad94` — trust the source when they disagree)*
+*(surveyed 2026-07-18 @ `54da37c8` — trust the source when they disagree)*
 
 Two stacked canvases plus a deliberately tiny set of DOM elements:
 
@@ -58,6 +58,16 @@ tabs** — approving, prompting, launching, stopping, or reconfiguring from
 Station behaves exactly like doing it from Activity. This is a design
 invariant: Station is a *renderer* over the one control plane, never a
 second brain.
+
+One persistent `requestAnimationFrame` callback is armed while Station is
+active and has work to animate. Explicit state changes and the 150 ms window
+after real input paint at display rate; ambient presentation is capped at
+about 30 fps. Full HUD raster work for breathing chrome and slow orbit drift
+is throttled further to about 10 fps, while live display thumbnails refresh
+with small `drawImage` calls between full HUD paints. With motion set to zero,
+a static WebGPU scene re-presents its persistent buffers without rebuilding or
+uploading them — a required canvas-surface keepalive — while the Canvas-2D
+fallback can park completely when idle.
 
 QA lives in `scripts/validate-dashboard.cjs`: render-health probes
 (fps / frame pacing / webgpu / debug-json), composer workflow and

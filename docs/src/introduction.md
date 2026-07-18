@@ -1,6 +1,6 @@
 # Introduction
 
-Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop to work in — shell access, file editing, a graphical display it can see and control, voice interaction, and the ability to make phone calls — all wrapped in a layered human oversight system. Beyond running its own agent loop, Intendant also **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines** for multi-host display and task routing.
+Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop to work in — shell access, file editing, a graphical display it can see and control, voice interaction, and the ability to make phone calls — all wrapped in a layered human oversight system. A durable Agenda carries parked intent across session and context boundaries, while a provenance-labeled Memory plane carries machine-wide claims through explicit, bounded retrieval. Beyond running its own agent loop, Intendant also **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines** for multi-host display and task routing.
 
 It runs on **macOS, Linux, and Windows** and is **provider-agnostic** (OpenAI, Anthropic, Gemini). Its shipped trust anchors are local presence and an independently reached direct-mTLS dashboard; CLI and MCP provide automation, and the dashboard provides visual and voice control. The packaged macOS app contains a local mTLS bridge, but no Developer ID-signed/notarized release has been published for this alpha, and an `-unsigned-dev` artifact is not a distribution trust anchor. Hosted Connect gives any browser zero-install route linking and discovery, but the default build fixes every hosted-provenance session at `role:none`; it is not a daemon-control interface.
 
@@ -25,6 +25,8 @@ Intendant is built around a few core ideas:
 **Provider agnosticism.** OpenAI, Anthropic, and Gemini are all first-class providers with native tool calling, streaming, prompt caching, and computer use. The system is not locked to any single vendor — and through [external-agent orchestration](./external-agent-orchestration.md) it can also drive whole third-party coding CLIs.
 
 **A single-writer control plane.** Shared mutable state (autonomy level, the active agent backend, runtime config) has exactly one writer: the control plane. Frontends are *display-only* — they render state and emit intents, but never mutate state directly. See [Control Plane & Daemon](./control-plane-and-daemon.md).
+
+**Durable state is data, not ambient authority.** Agenda items can preserve deferred intent, and Memory claims can preserve knowledge, but neither is injected as an instruction or grants authority. Scheduled Agenda work requires owner approval of an exact manifest digest; Memory is searched explicitly and returns bounded, provenance-labeled data. See [Agenda and Memory](./agenda-and-memory.md).
 
 **Shared frontend vocabulary.** Frontends exchange state and intents through `AppEvent` and `ControlMsg`: the web dashboard, MCP server, and control socket render events and submit control messages to the single-writer control plane. See [Architecture](./architecture.md) and [Autonomy & Approvals](./autonomy.md).
 
@@ -61,19 +63,21 @@ See [Architecture](./architecture.md) for the full picture.
 
 - **Multi-provider LLM integration** — native tool calling, streaming, prompt caching, and computer use across OpenAI, Anthropic, and Gemini ([Runtime Protocol](./runtime-protocol.md), [Multi-Agent Orchestration](./multi-agent.md))
 - **External-agent orchestration** — supervise Codex or Claude Code as managed backends with steering, approvals, rollback, and cost accounting ([External-Agent Orchestration](./external-agent-orchestration.md))
-- **WebRTC display pipeline** — a shared encoder pool (VP8 baseline + on-demand hardware H.264), tile-based dirty-region streaming, multi-monitor, and bidirectional clipboard ([Display Pipeline](./display-pipeline.md))
+- **WebRTC display pipeline** — a shared encoder pool (VP8 baseline plus on-demand H.264 on macOS/Linux; one always-on software Media Foundation H.264 layer on Windows), tile-based dirty-region streaming, multi-monitor, and bidirectional clipboard ([Display Pipeline](./display-pipeline.md))
 - **Peer federation** — Agent Cards, capability-based task routing, and cross-machine display sharing *with granted input* over mTLS, so an agent can use a computer on a peer machine when IAM allows ([Peer Federation](./peer-federation.md))
 - **Trust architecture** — daemon-local IAM (principals, grants, roles, ceilings), shipped local/direct-mTLS authentication, a packaged macOS local bridge whose current artifact is unsigned development-only, staged browser identity-key records for fleet signing and future identity work, passkey-protected envelope formats, org root keys signing grant documents and revocation lists, and an append-only transparency log for hosted metadata. No Developer ID-signed/notarized app release exists for this alpha. ([Trust Architecture](./trust-architecture.md), [Self-Hosted Rendezvous](./self-hosted-rendezvous.md))
 - **Credential custody** — a daemon-backed passkey-sealed vault plus authorized time-boxed leases and client-egress relay are operable from trusted local/direct-mTLS sessions. Connect's account-vault API is storage-only in this build: no hosted vault client or delivery bridge ships, so zero-install claiming does not bootstrap credentials. ([Credential Custody](./credential-custody.md))
 - **Computer use** — a provider-agnostic abstraction over X11, Wayland, macOS, and Windows backends ([Computer Use & Live Audio](./computer-use-and-audio.md))
 - **Live voice & phone calls** — Gemini Live / OpenAI Realtime via a WASM browser client, and outbound SIP calls ([Presence Layer](./presence.md), [Computer Use & Live Audio](./computer-use-and-audio.md))
 - **Persistent daemon** — long-lived session supervision, a multi-session dashboard, and content-addressed file snapshots with rewind ([Control Plane & Daemon](./control-plane-and-daemon.md), [Web Dashboard](./web-dashboard.md))
+- **Agenda and Memory** — a daemon-wide append-only ledger for deferred intent, reminders, durable questions, and digest-approved scheduled sessions; plus a provenance-labeled claim plane over the stamped owner-plane D0-A writer/reducer format ([Agenda and Memory](./agenda-and-memory.md))
 - **MCP server and client** — expose Intendant's control surface as MCP tools, and connect to external MCP servers ([MCP Server](./mcp-server.md))
 - **Filesystem sandboxing** via Landlock (Linux), Seatbelt (macOS), and restricted tokens (Windows); session persistence with structured JSONL logging and resume ([Session Logging](./session-logging.md)), and a skills system for named instruction sets
 
 ## Where to Go Next
 
 - New here? Start with [Getting Started](./getting-started.md), then [Architecture](./architecture.md).
+- Working with state across sessions? Read [Agenda and Memory](./agenda-and-memory.md).
 - Running a fleet, a team, or an organization? Read [Trust Architecture](./trust-architecture.md) and [Credential Custody](./credential-custody.md).
 - Deploying or tuning? See [Configuration](./configuration.md) and [Windows Support](./windows-support.md).
 - Building on a specific subsystem? Jump to its chapter via the sidebar.

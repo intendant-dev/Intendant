@@ -1604,7 +1604,7 @@ function accessFallbackPermissions() {
     'agenda.read': ['Agenda read', 'agenda', 'Read the daemon\'s agenda ledger (parked items and counts).'],
     'agenda.write': ['Agenda write', 'agenda', 'Park, edit, complete, reopen, and retire agenda items.'],
     'memory.read': ['Memory read', 'memory', 'Search and read Memory claims (bounded, provenance-labeled).'],
-    'memory.write': ['Memory propose', 'memory', 'Propose Memory claims (the candidate lane; ephemeral in P1.1).'],
+    'memory.write': ['Memory propose', 'memory', 'Propose Memory claims (the candidate lane).'],
   };
   return Object.entries(summaries).map(([id, [label, domain, summary]]) => ({
     id,

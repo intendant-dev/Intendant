@@ -4,8 +4,8 @@ This chapter covers the machinery that turned Intendant's controller from a
 single agent loop into a multi-session orchestration host: the single-writer
 **control plane**, the long-lived **session supervisor**, the **task
 dispatcher**, the **file-watcher** that powers rewind/redo, the **headless
-daemon** that an idle `--web` launch becomes, and **cost accounting**. It closes
-with an explicit note on what is *not* built yet.
+daemon** that an idle `--web` launch becomes, **Agenda scheduling**, and **cost
+accounting**.
 
 For the system-wide picture and the EventBus that ties these together, start
 with [Architecture](./architecture.md).
@@ -59,15 +59,16 @@ state:
 |-------|------|-------|
 | `autonomy` | `SharedAutonomy` | Global autonomy level + the user-display grant flag |
 | `external_agent` | `Arc<RwLock<Option<AgentBackend>>>` | Active backend: Codex / Claude Code, or `None` (internal) |
-| `codex_config` | `SharedCodexConfig` | Runtime Codex config (command, sandbox, approval policy, model, reasoning effort, web search, network access, writable roots) |
+| `codex_config` | `SharedCodexConfig` | Runtime Codex config, including ordinary/managed commands, sandbox, approval policy, model/reasoning/service tier, web/network/write access, and managed-context/archive modes |
 | `claude_config` | `SharedClaudeConfig` | Runtime Claude Code config (model, permission mode, allowed tools) |
 | `project_root` | `Option<PathBuf>` | When set, state changes also persist to `intendant.toml` |
 
-It is spawned once, early in `main.rs`, from its own bus subscription:
+It is spawned once during each controller startup path
+(`startup/daemon.rs` or `startup/headless.rs`). `spawn` takes the state and
+opens the bus's lossless intent subscription internally:
 
 ```rust
 let _control_plane_handle = control_plane::spawn(
-    bus.subscribe(),
     control_plane::ControlPlaneState {
         autonomy, external_agent, codex_config, claude_config, bus, project_root
     },
@@ -88,9 +89,11 @@ for changes that cannot be applied mid-session, tears down the persistent agent
 so the next launch picks them up. Each `ControlMsg::SetCodex*` and
 `ControlMsg::SetClaude*` variant documents this in its doc comment.
 
-Two exceptions apply *immediately* rather than next-task, because the backend
-accepts them as live RPCs: `CodexThreadAction` (the `/new`, `/compact`, `/fast`, `/fork`,
-`/undo`, `/review`, … slash-command surface). The control plane does not own the
+Thread actions apply *immediately* rather than next-task when the selected
+backend supports them: `/new`, `/compact`, `/fast`, `/fork`, `/undo`,
+`/review`, goals, and the backend-neutral subset exposed by Claude Code. The
+wire variant retains its historical name `CodexThreadAction`, but the
+advertised operation catalog is universal. The control plane does not own the
 persistent agent, so it merely *re-broadcasts* these as
 `CodexThreadActionRequested` for the daemon-side watcher that does own it.
 
@@ -144,17 +147,25 @@ SupervisorState {
     session_aliases:  HashMap<String, String>,           // alias id → canonical id
     related_sessions: HashMap<String, RelatedSession>,   // child id → {parent, relationship}
     active_session_id: Option<String>,                   // the "current" session for un-targeted commands
+    next_session_instance: u64,                          // rejects stale task completions
+    restart_dedupe / external_attach_dedupe: …,
+    known_external_sessions / advertised_thread_actions: …,
+    delegation_receipts: …,                             // at-least-once peer-task dedup
+    unmanaged_user_halts: …,                            // stop-vs-auto-attach race guard
 }
 ```
 
 Each `ManagedSession` carries its `session_id`, `source` (`intendant` or the
 external backend's short name), optional display `name`, `phase`, `project_root`,
-`session_dir`, a `follow_up_tx` channel, and its own `ApprovalRegistry`.
+`session_dir`, a `follow_up_tx` channel, its own `ApprovalRegistry`, an instance
+id and finish receiver for lifecycle races, delegation depth, and (for native
+sessions) the child registry shared with `wait_sub_agents`.
 
 When `start_new_session` runs, it:
 
 1. resolves a fresh session log directory (`SessionLog::resolve_path(None)` →
-   `~/.intendant/logs/<uuid>/`) and opens the `SessionLog`;
+   `<state-root>/logs/<uuid>/`, honoring `INTENDANT_HOME`) and opens the
+   `SessionLog`;
 2. resolves the project root (per-session override or the daemon's default) and
    loads the `Project`. On a **projectless daemon** (see below) there is no
    default: a `CreateSession` without an explicit `project_root` fails with
@@ -169,15 +180,18 @@ When `start_new_session` runs, it:
 
 ### The session graph
 
-The supervisor tracks *relationships* between sessions, not just a flat list. A
-child session is linked to a parent with a relationship of `side` or `subagent`
-(`apply_related_session`); the alias map lets a follow-up addressed to a child id
-resolve to its canonical parent session, and removing a parent prunes its
-children. This is what lets the dashboard render a tree of related sessions (a
-Codex `/fork` or `/side` thread, an orchestrator's sub-agents) rather than a
-disconnected pile. Identity and relationship updates also arrive over the bus as
-`SessionIdentity` and `SessionRelationship` events, which the supervisor folds
-into the same maps.
+The supervisor tracks *relationships* between sessions, not just a flat list.
+The live supervisor's alias graph accepts `side` and `subagent`
+(`apply_session_relationship` folds those through `apply_related_session`).
+That map lets a follow-up addressed to such a child id resolve to its canonical
+parent session, and removing a parent prunes those children. Forks are
+independent sessions rather than supervisor aliases: their `fork` edge is
+emitted and persisted for the log/catalog/lineage views, alongside specialized
+edges such as `anchor-fork`, `rewind-restore`/`rewind-backout`, and
+`fission-branch`/`fission-detached`/`fission-imported`. This lets the dashboard
+render related work without redirecting a fork's messages to its parent.
+Identity and relationship updates arrive over the bus as `SessionIdentity` and
+`SessionRelationship` events and are also persisted to session logs.
 
 `active_session_id` is the fallback target: an un-targeted `FollowUp` or
 `Interrupt` resolves to it, which is how single-session frontends keep working
@@ -224,8 +238,10 @@ external CLI's edits show up the same as Intendant's own. It does two jobs:
 2. **Per-round content-addressed history** for rewind / redo / branching.
 
 On every `AppEvent::RoundComplete` that belongs to its root, the watcher
-records a `HistoryRound` capturing the *full* project state as a
-`path → sha256` map, plus the subset of paths that changed. Rounds are
+records a `HistoryRound` capturing the full **restorable** state — supported,
+non-ignored text files no larger than 1 MB — as a `path → sha256` map, plus the
+subset of paths that changed. A broader display/count mirror can include
+inspected files that are not restorable. Rounds are
 routed by the event's `project_root`: a round emitted by a session working
 a *different* root (a worktree sub-agent, an external session supervised
 elsewhere) is skipped, while a round with no resolvable root fails open
@@ -237,11 +253,14 @@ conversation rollback uses to truncate the native conversation correctly.
 The snapshot store lives **inside the session log dir**:
 
 ```
-~/.intendant/logs/<uuid>/file_snapshots/
+<state-root>/logs/<uuid>/file_snapshots/
 ├── baseline/            # initial text-file snapshot at session start
+├── baseline_manifest.json # baseline metadata/fingerprints
 ├── objects/             # content-addressed blobs (sha256-named)
-├── rounds/              # per-round artifacts
-└── history.json         # current_head_id, rounds[], abandoned_branches[], next_id
+├── rounds/round_<id>/
+│   └── manifest.json    # full round maps or a maps_from_round backreference
+├── history.json         # slim format-2 index, heads/rounds/branches
+└── store.lock           # advisory snapshot-store lock
 ```
 
 The public API on `FileWatcher`:
@@ -317,7 +336,8 @@ Ctrl+C in this mode is handled by the global signal handler installed in `main`
 does not also listen for it, to avoid racing two handlers.
 
 > **Controller stdout/stderr tee.** `daemon_log_tee::install` tees the
-> controller's stderr and stdout into `~/.intendant/logs/<uuid>/daemon.log`
+> controller process's stderr and stdout into its bootstrap session's
+> `<state-root>/logs/<uuid>/daemon.log`
 > (with per-line timestamps) while still mirroring to the original terminal.
 > This is Unix-only; on Windows `install` is a no-op. It is what lets the
 > dashboard's "Download session report" bundle carry controller-side
@@ -332,17 +352,40 @@ cached, and output tokens; `estimate_session_cost(...)` combines those with a
 session's token usage, and `estimate_live_usage_cost(...)` covers live-audio
 usage. The dashboard surfaces these as the running session cost.
 
-## What Is Not Built Yet
+## Agenda Reminders and One-Shot Scheduled Sessions
 
-Be precise about this: **Intendant has no recurring / scheduled-task facility.**
-There is no cron, no "run every N minutes", no calendar of future tasks.
+One `AgendaHandle` lives under the daemon state root (`<state-root>/agenda/`),
+not under a project. Its append-only JSONL operation log is the durable ledger
+for parked notes, tasks, questions, due reminders, and scheduled-session
+effects. Frontends and agents submit commands; the daemon serializes,
+validates, appends, folds, and broadcasts the resulting state.
 
-The *only* scheduling primitive is the one-shot `ScheduleControllerRestart`
-(`event.rs` / `mcp/`): it schedules a single controller restart after an
-optional delay, carrying a north-star goal and handoff summary across the
-restart boundary. It is a continuity mechanism for long-running work, not a task
-scheduler. Treat any documentation or assumption that implies recurring jobs as
-incorrect.
+Due agenda items feed an owner-controlled reminder policy. The scheduler
+honors enablement, quiet hours, per-item urgency ceilings, and a staleness
+window; fresh reminders travel the existing `UserNotification` ladder, while
+older missed reminders collapse into a digest. Reminder delivery does not
+execute the item's body as instructions.
+
+Scheduled sessions are deliberately narrower than cron:
+
+- An effect manifest binds a goal and one `fire_at_ms` instant (plus execution
+  shape intent). Any agenda writer may propose or revise it, but only a
+  dashboard or local-process owner surface may approve/revoke the exact
+  manifest digest; editing it invalidates the approval.
+- At the due instant the scheduler fsyncs a `prepared` occurrence, then
+  dispatches a normal supervised session through `StartTask`. The spawned
+  session still has its ordinary agent-session principal, sandbox, autonomy,
+  and approval gates — schedule approval is not permission to bypass them.
+- Occurrence identity and the delegation-receipt ledger make launch
+  idempotent. A session missed while the daemon was down is marked `missed`;
+  one prepared without launch confirmation or one that crossed a daemon
+  restart resolves `unknown`. These states are terminal and never auto-retry;
+  the owner must revise/re-approve to schedule another occurrence.
+
+There is still **no recurring cadence or cron vocabulary**. The separate
+one-shot `ScheduleControllerRestart` (`event.rs` / `mcp/`) carries a goal and
+handoff across a controller restart; it is a continuity mechanism, not an
+Agenda session occurrence.
 
 ## Where to Go Next
 

@@ -190,17 +190,11 @@ pub(crate) fn format_ws_url(host: &str, port: u16, tls_enabled: bool) -> String 
 /// used for `/config`.
 ///
 /// Capabilities:
-/// - `ComputerUse`, `Knowledge`, `Display` are always-on subsystems
-///   compiled into every build and always able to service a federation
-///   request (for `Display`, that's `DisplaySession::handle_offer`
-///   against whatever the local dashboard has activated — returns
-///   "no such display" if nothing is active, which is the correct
-///   semantics for a peer trying to view a display the operator
-///   hasn't opened yet).
-/// - `Voice` / `Phone` / `Recording` are gated on runtime configuration
-///   that isn't plumbed through here yet. Those become additive as
-///   each subsystem teaches itself to advertise, likely via dynamic
-///   `PeerEvent::CapabilityEngaged` once slice 3a.2 lands.
+/// - `ComputerUse` and `Display` are advertised by every build. `Display`
+///   offers are handled against whatever the local dashboard has activated;
+///   an unopened display returns "no such display".
+/// - Additional capabilities are not advertised here; doing so requires
+///   runtime capability plumbing that does not yet exist.
 ///
 /// `advertise_urls` is the preference-ordered list of WebSocket URLs
 /// peers should try when dialing this daemon. Each becomes a
@@ -590,10 +584,9 @@ mod tests {
         assert!(!config.provider.is_empty());
     }
 
-    /// With one connected peer that advertises both ComputerUse and
-    /// Knowledge (the test fixture's defaults), `?capability=computer-use`
-    /// returns the peer; `?capability=display` returns an empty list
-    /// (the fixture doesn't advertise Display).
+    /// With one connected stock peer (which advertises ComputerUse and
+    /// Display), `?capability=computer-use` returns the peer while an
+    /// unadvertised capability returns an empty list.
     #[tokio::test]
     async fn test_api_peers_eligible_returns_matching_peers() {
         let (dash_port, peer_id, target_handle, dash_handle) = setup_peer_op_test().await;
@@ -611,10 +604,8 @@ mod tests {
         assert_eq!(peers.len(), 1, "expected one matching peer");
         assert_eq!(peers[0]["id"].as_str().unwrap(), peer_id);
 
-        // Misses: the fixture doesn't advertise Voice (build_local_agent_card
-        // advertises ComputerUse + Knowledge + Display; Voice / Phone /
-        // Recording are gated on runtime configuration that isn't plumbed
-        // through yet).
+        // Misses: the fixture doesn't advertise Voice. The local card likewise
+        // advertises only ComputerUse + Display.
         let resp = http_request(
             dash_port,
             "GET /api/peers/eligible?capability=voice HTTP/1.1\r\nHost: localhost\r\n\r\n",

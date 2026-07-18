@@ -84,13 +84,11 @@ devices. The backend is chosen per platform (`audio_routing.rs`):
 ```
                 live audio / phone-call session
                               │
-        ┌─────────────────────┼─────────────────────┐
-  Unix with Vortex       Linux fallback        macOS fallback
-        │                     │                     │
-  Vortex Audio HAL      PulseAudio null sinks  BlackHole 2ch/16ch
-  direct POSIX shm      (pactl module-null-    via SwitchAudioSource
-  rings, no daemon      sink for mic + speaker, and sox
-  or socket             defaults restored)
+       ┌──────────────┬──────────────┬──────────────┬─────────────────┐
+  Unix + Vortex   Linux fallback  macOS fallback   Windows fallback
+       │               │               │                 │
+  Vortex HAL shm  PulseAudio       BlackHole       ffmpeg DirectShow
+  rings            null sinks       + sox           + ffplay/VB-CABLE
 ```
 
 - **Unix preferred: Vortex Audio.** The Vortex HAL plugin shipped in
@@ -105,6 +103,11 @@ devices. The backend is chosen per platform (`audio_routing.rs`):
   restoring them on teardown. (`pulseaudio-utils` provides `pactl`.)
 - **macOS fallback: BlackHole.** When Vortex is not present, `BlackHole 2ch` /
   `16ch` virtual devices are driven with `SwitchAudioSource` and `sox`.
+- **Windows fallback: ffmpeg + VB-CABLE.** `ffmpeg` captures the cable's
+  `CABLE Output` recording endpoint through DirectShow; `ffplay` plays model
+  PCM through the system default output. The user must install VB-CABLE and
+  route the default output to `CABLE Input`; there is no automatic per-app
+  route or default-device save/restore.
 
 The phone-call skill places outbound SIP calls via `pjsua`, with the live voice
 model conducting the conversation and returning structured data. The live audio
@@ -168,9 +171,12 @@ X11 displays are auto-launched via Xvfb when the agent first needs one. See
 `intendant setup browsers` can also be run directly to install or repair the
 managed browser cache used by CDP browser workspaces.
 
-There is no `scripts/intendant-ctl.sh` wrapper. The supported command-line
-client is the binary itself: `intendant ctl --help` discovers the HTTP MCP
-control surface, and each command group has focused help.
+A legacy `scripts/intendant-ctl.sh` helper exists for the raw Unix control
+socket. It selects the first `/tmp/intendant-*.sock`, so it is not
+multi-instance safe and should be limited to one-instance protocol debugging.
+The supported command-line client is the binary itself:
+`intendant ctl --help` discovers the HTTP MCP control surface, and each command
+group has focused help.
 
 > **When you add a new `-sys` crate dependency, update both
 > `scripts/setup-linux.sh` (`APT_PACKAGES`) and `scripts/setup-macos.sh` in the
@@ -190,7 +196,7 @@ paths-filtered push triggers; the heavy cross-platform workflow has no push
 trigger because the merge group just validated the same tree.
 
 Trusted refs (pushes, merge-queue refs, same-repo PRs) run on a
-**self-hosted fleet** (`dell-206` / `intendant-linux`, `macbook-vm` /
+**self-hosted fleet** (`dell-206` / `intendant-linux`, `macbook-a` /
 `intendant-macos`, `samsung-win` / `intendant-windows`). Its incremental build
 state lives in external, per-listener `CARGO_TARGET_DIR` caches keyed by the
 Rust version; checkout cleanup wipes any in-workspace `target/`. **Fork PRs
@@ -212,7 +218,9 @@ registered per-repo, and the default `GITHUB_TOKEN` is read-only.
 | `agents-md-sync.yml` | every PR + merge group; push touching `CLAUDE.md`/`AGENTS.md`; manual dispatch | **Required.** Fails when tracked `AGENTS.md` differs byte-for-byte from `CLAUDE.md` |
 | `wasm-drift.yml` | every PR + merge group; a GitHub-hosted relevance job gates the Mac leg (irrelevant diffs skip it without occupying a fleet slot; in-job check kept as fail-open backstop) | **Required.** On the canonical macOS host, rebuilds both browser WASM crates with the pinned Rust/wasm-pack versions and byte-compares the committed artifacts |
 | `audit.yml` | push/PR (Cargo paths) + weekly cron (Mon 08:00 UTC) | Advisory: `cargo audit` against the RustSec advisory DB — new upstream advisories must not block unrelated landings |
+| `codeql.yml` | relevant pushes to `main` + weekly cron (Mon 09:00 UTC) | Advisory, GitHub-hosted build-free CodeQL analysis for Rust and Actions; never a merge-queue requirement |
 | `docs.yml` | docs changes on `main` | Build and deploy this mdBook to GitHub Pages |
+| `release.yml` | `v*` tags + manual dispatch | Build/sign/notarize and publish the macOS app, then submit release hashes to the transparency log. Manual runs without signing secrets produce an explicitly `-unsigned-dev` dry-run artifact; tag releases fail closed. Never a merge-queue requirement |
 
 `tests/e2e/main.rs` contains hermetic `#[tokio::test]` cases. They
 spawn the real binaries against the scripted mock provider, use the synthetic
@@ -221,9 +229,11 @@ run in CI on all three supported operating systems. The `tests/skills/`
 scenarios that make real API calls or need a native display (the live
 claude-code-e2e battery, browser/Station probes, voice/audio scenarios) stay
 outside CI and run on operator hardware.
-Run `cargo test --bins` and `cargo clippy` locally before committing. The TLS
-stack is pure-Rust `ring` / `rustls` / `rcgen` (no OpenSSL), which is why the
-Windows CI job installs NASM (for `ring`'s assembly) but no `libssl`.
+Run the full keyless battery from [Getting Started](./getting-started.md#testing)
+before committing: the three package binaries, workspace library gates,
+scripted-provider E2E suite, and `cargo clippy --workspace -- -D warnings`.
+The TLS stack is pure-Rust `ring` / `rustls` / `rcgen` (no OpenSSL), which is
+why the Windows CI job installs NASM (for `ring`'s assembly) but no `libssl`.
 
 ## Control socket
 
@@ -237,7 +247,7 @@ external scripts and tools. It is opt-in.
   input, autonomy change, quit, controller-restart workflow, and (in MCP mode)
   controller-loop intervention.
 
-### Inbound commands (JSON-line)
+### Representative inbound commands (JSON-line)
 
 ```json
 {"action": "status"}
@@ -335,7 +345,10 @@ The gateway has two layers:
 
 ### WebSocket protocol
 
-#### Inbound (browser → server)
+The tables below show the principal messages, not every dashboard-control,
+annotation, clip, and transport-maintenance variant.
+
+#### Representative inbound (browser → server)
 
 | Message | Description |
 |---------|-------------|
@@ -349,12 +362,11 @@ The gateway has two layers:
 | `{"t":"tool_request","id":"...","tool":"...","args":{}}` | Presence tool call |
 | `{"t":"async_query","id":"...","tool":"...","args":{}}` | Async query (result returned as text) |
 | `{"t":"display_offer","display_id":"...","sdp":"..."}` | WebRTC SDP offer for display streaming |
-| `{"t":"display_answer","display_id":"...","sdp":"..."}` | WebRTC SDP answer |
 | `{"t":"display_ice","display_id":"...","candidate":"..."}` | WebRTC ICE candidate |
-| `{"t":"frame","stream":"...","data":"<base64>"}` | Display/camera frame for the frame registry |
+| `{"t":"video_frame","frame_id":"...","stream":"...","data":"<base64>"}` | Display/camera frame for the frame registry |
 | `{"action":"..."}` | ControlMsg (same as the Unix control socket) |
 
-#### Outbound (server → browser)
+#### Representative outbound (server → browser)
 
 | Message | Description |
 |---------|-------------|
@@ -385,14 +397,16 @@ A browser live model calls presence tools via tagged request/response:
   `skip_action`, `respond_to_question`, `set_autonomy`, `send_message`) dispatch
   through the EventBus — the same path as control-socket commands.
 - **Query tools** (`check_status`, `query_detail`, `search_transcripts`) are handled
-  asynchronously server-side, reading the shared `AgentStateSnapshot`, project
-  files, and knowledge store.
+  asynchronously server-side, reading the shared `AgentStateSnapshot`,
+  project-confined files, and the current session's voice transcript/event-log
+  history.
 - **Video tools** (`inspect_frame`, `inspect_frames`) examine frames from the
   frame registry.
 
 On connect the server sends, in order: `state_snapshot`, the cached
-`usage_update`, the cached `status`, the cached `display_ready`, and finally
-`log_replay` — so late-connecting browsers see complete state immediately.
+`usage_update`, the cached `status`, the cached `display_ready`, a
+`browser_workspace_snapshot`, and finally `log_replay` — so late-connecting
+browsers see complete state immediately.
 
 ### HTTP endpoints
 
@@ -404,9 +418,12 @@ endpoint table.
 - **Microphone access requires a secure context** — `localhost` (e.g.
   `ssh -L 8765:localhost:8765 host`), default HTTPS/mTLS, `--tls` with a trusted
   certificate, or the macOS app's `intendant://` scheme. See
-  [Web Dashboard → Secure context](./web-dashboard.md#secure-context-and-lan-access).
-- **API key for voice** — Gemini or OpenAI, used browser-side only. Voice is
-  optional.
+  [Web Dashboard → Secure browser contexts and LAN access](./web-dashboard.md#secure-browser-contexts-and-lan-access).
+- **Voice credential (optional)** — Gemini's long-lived key stays in the
+  unlocked client vault or legacy per-origin `localStorage` and goes directly
+  from browser to Gemini. For OpenAI, the daemon holds or leases the long-lived
+  key and mints the browser a short-lived Realtime client secret through
+  `api_voice_session` / `POST /session`.
 
 ### Supported tools (browser live model)
 

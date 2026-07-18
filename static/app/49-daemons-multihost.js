@@ -89,7 +89,7 @@ function wsUrlToBaseUrl(wsUrl) {
 // from that server. This helper keeps the gating in one place.
 //
 // Canonical Rust mirror: `ice_servers_to_rtc_peer_connection_config` in
-// `src/bin/caller/display/forward.rs` carries the unit tests for the
+// `crates/intendant-display/src/forward.rs` carries the unit tests for the
 // corner cases this function must also handle (empty list, empty creds,
 // multiple URLs, multiple servers, JSON-shape contract).
 function buildIceServersFromGatewayConfig(config) {

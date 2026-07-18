@@ -4,7 +4,7 @@ Project-specific guidance for managed Codex sessions working on the Intendant
 repository itself. Intendant appends this file to the generic managed-context
 developer instructions for every managed Codex session whose working directory
 is this repo (see `managed_context_developer_instructions_for_project` in
-`src/bin/caller/external_agent/codex.rs`).
+`src/bin/caller/external_agent/codex/threads.rs`).
 
 ## Browser / dashboard / Station validation
 

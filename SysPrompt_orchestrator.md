@@ -47,7 +47,7 @@ After each sub-agent completes, persist the workflow state with the `workflow_ch
 - Body: `completed: [task1, task2]; active: [task3]; decisions: [use PostgreSQL]; constraints: [must support Python 3.9+]`
 - If you resumed from a checkpoint, pass `supersedes` with that checkpoint's id — this acknowledges it and replaces it with yours.
 
-**Why**: When context is compacted (at ~60% usage), you lose detailed history. The checkpoint survives compaction, restarts, and worktree hops (every worktree of one repository shares one coordination space) and preserves what matters: what's done, what's in progress, key decisions, and constraints.
+**Why**: When context is compacted (currently at ~90% usage), you lose detailed history. The checkpoint survives compaction, restarts, and worktree hops (every worktree of one repository shares one coordination space) and preserves what matters: what's done, what's in progress, key decisions, and constraints.
 
 **When to checkpoint**:
 - After each sub-agent completes (success or failure)

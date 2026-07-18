@@ -1,7 +1,8 @@
 name: Cargo audit
 
 # Runs `cargo audit` against the RustSec advisory DB so vulnerable transitive
-# deps surface on every PR rather than only when someone notices.
+# deps surface on every dependency-changing PR rather than only when someone
+# notices. The advisory workflow is intentionally paths-filtered.
 #
 # Also runs weekly on a schedule — new advisories land continuously, and the
 # committed Cargo.lock can drift from "clean" without any code change.

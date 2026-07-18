@@ -1,6 +1,6 @@
 //! Agenda: the daemon-resident ledger where agents and the owner park
 //! intent — deferred items, tasks, notes, later questions, reminders, and
-//! (eventually) approved scheduled work.
+//! owner-approved scheduled work.
 //!
 //! ## Shape (v1, ratified)
 //!
@@ -16,16 +16,18 @@
 //!   validates, mints ids, appends, and folds.
 //! - **Item bodies are data, never instructions** to any agent or surface
 //!   that reads them (ratified doctrine; see `types::AgendaItem::body`).
-//! - **Effects are a reserved seam.** Reminders/scheduled sessions arrive in
-//!   later slices as *separate objects referencing items* (umbrella RFC §7.3),
-//!   never as item fields. Nothing effectful exists in v1, and nothing here
-//!   should grow effect fields on [`types::AgendaItem`].
+//! - **Delivery and execution remain distinct.** `due_ms` schedules a
+//!   reminder under owner-controlled delivery policy. A scheduled session
+//!   is a separate effect object referencing an item (umbrella RFC §7.3),
+//!   and runs only after an owner surface approves the exact manifest
+//!   digest. Agents and peers may propose manifests but cannot approve or
+//!   revoke them.
 //!
-//! The op vocabulary (`add`, `patch`, `complete`, `reopen`, `retire`) tracks
-//! §7.2 of the owner-plane umbrella RFC so a later D0-Agenda-Data gate can
-//! migrate this local log into the owner plane without a vocabulary break.
-//! The `question` kind and effect/occurrence operations are reserved there
-//! and deliberately absent here.
+//! The op vocabulary (`add`, `patch`, `complete`, `reopen`, `retire`,
+//! `answer`, effect proposal/approval/revocation, and daemon-authored
+//! occurrence records) tracks §7.2 of the owner-plane umbrella RFC so a
+//! later D0-Agenda-Data gate can migrate this local log into the owner
+//! plane without a vocabulary break.
 
 mod handle;
 mod reminders;

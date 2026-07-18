@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 pub const HISTORY_K: usize = 8;
 
 /// Enter video mode when the rolling average dirties at least 25% of
-/// the screen. Whole-frame VP8-q is the proven fallback for this case.
+/// the screen. Whole-frame baseline video (VP8-q on macOS/Linux, H.264 on
+/// Windows) is the proven fallback for this case.
 pub const ENTER_VIDEO_THRESHOLD: f32 = 0.25;
 
 /// Return to tile mode only after the rolling average drops to 15%.

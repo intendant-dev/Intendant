@@ -10,7 +10,8 @@ known limitations of the Windows port.
 > host: GDI `BitBlt` capture, Media Foundation H.264 encode, `SendInput`
 > keyboard/mouse injection, and the encrypted WebRTC transport all work with
 > real remote clients (display and input, over WebRTC). The voice **audio
-> bridge** (VB-CABLE / WASAPI) is the one runtime path still pending end-to-end
+> bridge** (ffmpeg/DirectShow + ffplay/VB-CABLE) is the one runtime path still
+> pending end-to-end
 > validation. Remaining gaps are called out under
 > [Known Limitations](#known-limitations) — the port never panics or silently
 > no-ops; unsupported paths return a clear error.
@@ -144,7 +145,7 @@ One step the script **cannot** automate is the **VB-CABLE** virtual audio cable
 (the vendor ships a manual installer, not a package). The script prints
 instructions and flags it in the final summary, but voice remains optional and
 the Windows voice bridge is still pending end-to-end validation. See
-[Audio](#audio-ffmpeg--vb-cable-wasapi-bridge) below.
+[Audio](#audio--ffmpeg--vb-cable-bridge) below.
 
 Manual build, if you already have the toolchain:
 
@@ -169,10 +170,10 @@ Wayland, and macOS backends use. The Windows-specific backends are:
 
 ### Capture — GDI `BitBlt` (default) + DXGI Desktop Duplication (opt-in)
 
-`display/windows.rs` ships two capture paths behind the same `DisplayBackend`
-seam, selected at runtime by the `INTENDANT_WINDOWS_CAPTURE` environment
-variable (`gdi` | `dxgi`, case-insensitive; anything unset or unrecognized uses
-the GDI default).
+`crates/intendant-display/src/windows.rs` ships two capture paths behind the
+same `DisplayBackend` seam, selected at runtime by the
+`INTENDANT_WINDOWS_CAPTURE` environment variable (`gdi` | `dxgi`,
+case-insensitive; anything unset or unrecognized uses the GDI default).
 
 **GDI `BitBlt` — the default.** `BitBlt` from the screen device context reads
 the **DWM-composed** desktop — the same pixels a user sees. Crucially it works
@@ -204,7 +205,8 @@ duplication on the next iteration.
 ### Input — SendInput
 
 Keyboard and mouse injection uses the Win32 **`SendInput`** API. Keyboard events
-carry a Win32 virtual-key code (mapped in `display/windows_keymap.rs`) plus the
+carry a Win32 virtual-key code (mapped in
+`crates/intendant-display/src/windows_keymap.rs`) plus the
 `KEYEVENTF_EXTENDEDKEY` flag for keys in the extended block. Mouse moves use
 `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`, scaling the browser's
 normalized `0.0..1.0` coordinates into the `0..65535` absolute coordinate space
@@ -219,9 +221,10 @@ Linux arms shell out to `pbcopy` / `wl-copy` / `xclip`.
 
 ### Encode — Media Foundation H264
 
-Windows video encode targets **Media Foundation H264** (with NVENC as a hardware
-path where available) rather than VP8/libvpx, and is live-validated over the
-encrypted WebRTC transport with real clients. The libvpx-backed VP8 encoder is
+Windows video encode targets the synchronous **software Media Foundation H264
+MFT** rather than VP8/libvpx; the backend deliberately does not enumerate
+hardware MFTs or NVENC. It is live-validated over the encrypted WebRTC
+transport with real clients. The libvpx-backed VP8 encoder is
 gated **off** Windows in `Cargo.toml` (`cfg(not(target_os = "windows"))`), so the
 MSVC build never tries to compile the `env-libvpx-sys` C-FFI crate (which needs a
 C toolchain plus the vpx headers); the VP8 code paths are themselves `cfg`'d off
@@ -238,19 +241,21 @@ stays up) instead of panicking, because the pool is built eagerly at `--web`
 startup. See [Display Pipeline](./display-pipeline.md#the-encoder-pool) for the
 pool architecture.
 
-### Audio — ffmpeg + VB-CABLE WASAPI bridge
+### Audio — ffmpeg + VB-CABLE bridge
 
 There is no PulseAudio (Linux) or CoreAudio/BlackHole (macOS) on Windows. The
 voice audio bridge instead routes through **VB-CABLE**, a virtual audio cable,
-over WASAPI, shelling out to **`ffmpeg`/`ffplay`** to move audio in and out. VB-
-CABLE is the Windows analogue of BlackHole on macOS / a PulseAudio null sink on
-Linux: install it, then set **`CABLE Input (VB-Audio Virtual Cable)`** as the
-default playback device so the bridge can play synthesized speech into the cable
-and capture microphone audio from it.
+shelling out to **`ffmpeg`/`ffplay`** to move audio in and out. `ffmpeg`
+captures the `CABLE Output (VB-Audio Virtual Cable)` recording endpoint through
+DirectShow; `ffplay` consumes raw model PCM on stdin and plays through the
+system default output. VB-CABLE is the Windows analogue of BlackHole on macOS /
+a PulseAudio null sink on Linux: install it, then set
+**`CABLE Input (VB-Audio Virtual Cable)`** as the default playback device.
+Per-app routing and automatic default-device save/restore are not available.
 
 ### Process and Network Introspection
 
-`platform.rs` (in the `intendant-platform` crate) provides the Windows
+`crates/intendant-platform/src/platform.rs` provides the Windows
 implementations of the cross-platform process and network helpers:
 
 - **Process liveness** — `OpenProcess` (query-only) + `GetExitCodeProcess`,
@@ -270,16 +275,16 @@ These are tracked deferrals, not bugs. Each degrades with a clear error rather
 than a panic or silent no-op.
 
 - **Interactive desktop session required.** Capture (`BitBlt` and DXGI),
-  `SendInput`, and the WASAPI audio bridge all need an interactive desktop
+  `SendInput`, and the ffmpeg/VB-CABLE audio bridge all need an interactive desktop
   session. They do **not** work on the headless / service / disconnected-RDP
   "Session 0" desktop. Within an interactive session, frame delivery, H.264
   encode, input injection, and the encrypted WebRTC transport are
   live-validated; only the **voice audio bridge** is still pending end-to-end
   validation (see below).
-- **Voice audio bridge pending validation.** The `ffmpeg` + VB-CABLE / WASAPI
-  bridge is wired up but has not yet been validated end-to-end on a Windows
+- **Voice audio bridge pending validation.** The ffmpeg/DirectShow +
+  ffplay/VB-CABLE bridge is wired up but has not yet been validated end-to-end on a Windows
   host. It also requires the manual VB-CABLE install (see
-  [Audio](#audio-ffmpeg--vb-cable-wasapi-bridge)).
+  [Audio](#audio--ffmpeg--vb-cable-bridge)).
 - **Remote `serve-certs` enrollment remains Unix-only.** `intendant access
   setup`, `recert`, `list`, and `remove` are supported on Windows. Setup uses
   the same pure-Rust CA/server/client generation and owner-IAM seeding as Unix,

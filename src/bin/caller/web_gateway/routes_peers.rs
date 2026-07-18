@@ -2038,7 +2038,7 @@ pub(crate) async fn handle_federated_webrtc_signal(
             // stub with a registry lookup keyed on this peer's
             // `(federation_connection_id, session_id)`. Symmetric in
             // shape to the local 5c authorizer above — the closure is
-            // the entire boundary, `display/mod.rs` doesn't see the
+            // the entire boundary; `intendant-display` doesn't see the
             // registry. Strict deny-by-default for unclaimed (no
             // holder); only a still-authorized session with the matching
             // federated holder identity returns true. The display queue

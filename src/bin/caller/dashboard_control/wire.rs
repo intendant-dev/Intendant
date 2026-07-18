@@ -1442,7 +1442,7 @@ mod tests {
 
         let mut queue = OutboundControlQueue::new();
         assert!(queue.enqueue_chunked(plan("a", 1024)));
-        queue.enqueue_immediate("b".into(), "{\"t\":\"response\"}".into());
+        assert!(queue.enqueue_immediate("b".into(), "{\"t\":\"response\"}".into()));
         assert!(queue.queued_bytes > 1024);
 
         // Cancel debits exactly what was credited.
@@ -1460,7 +1460,7 @@ mod tests {
 
         // Draining to empty returns the accounting to zero.
         assert!(queue.enqueue_chunked(plan("d", 4096)));
-        queue.enqueue_immediate("e".into(), "{}".into());
+        assert!(queue.enqueue_immediate("e".into(), "{}".into()));
         while queue.pop_front().is_some() {}
         assert_eq!(queue.queued_bytes, 0);
     }

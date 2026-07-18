@@ -68,8 +68,9 @@ has exactly one field:
 There is no top-level `context` field at the runtime layer — conversation/context
 management is handled entirely on the controller side (see
 [Caller-Handled Functions](#caller-handled-functions)). stdin is bounded to 64 MB
-(`MAX_INPUT_BYTES`); a parse failure prints the offending input to stderr and
-exits non-zero.
+(`MAX_INPUT_BYTES`); a parse failure prints a UTF-8-safe preview capped at 2,048
+bytes (plus the omitted-byte count) to stderr and exits non-zero. It never dumps
+an arbitrarily large malformed payload.
 
 ### The `Command` object
 
@@ -105,9 +106,10 @@ its timeout); `askHuman` polls indefinitely for a human response. This determini
 is deliberate — the controller can reason about ordering and the human-oversight
 layer can gate each action.
 
-A handler error for the filesystem/knowledge functions is captured and returned as
-`data: "Error: <message>"` for that nonce rather than aborting the whole batch.
-An **unknown `function`**, however, aborts the run with a hard error.
+Errors from `inspectPath`, `editFile`/`writeFile`, `browse`, `askHuman`, and
+`execPty` are captured as `data: "Error: <message>"` for that nonce and the
+batch continues. `execAsAgent` and `captureScreen` errors abort the batch, as
+does an **unknown `function`**.
 
 ## Functions
 
@@ -168,9 +170,13 @@ one. `replace_lines` errors if `end_line < line_number`.
 - **stdout/stderr** are streamed to `<log_dir>/<nonce>_stdout.log` /
   `_stderr.log`; the result carries only the **last 10 KB** of each
   (`LOG_TAIL_BYTES`).
-- **Keys are stripped**: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`
-  (and the bare `OPENAI`/`ANTHROPIC`/`GEMINI` names) are removed from the child's
-  environment, so commands the agent runs can never read provider credentials.
+- **Keys are stripped at the controller spawn boundary**: canonical provider
+  keys, `GOOGLE_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, the bare
+  `OPENAI`/`ANTHROPIC`/`GEMINI` names, and inherited names ending in
+  `*_API_KEY` or `*_API_TOKEN` are removed case-insensitively. The
+  `INTENDANT_*` namespace is reserved for controller→runtime control and is
+  exempt. `execAsAgent` repeats removal of the six canonical/bare names as
+  defense in depth; `execPty` inherits the already-scrubbed runtime environment.
 - **Display gating**: `DISPLAY` is set to the chosen display. Access to the user's
   session display (`:0` or below) is refused unless
   `INTENDANT_USER_DISPLAY_GRANTED` is set; otherwise a virtual display is used.
@@ -189,7 +195,10 @@ fallback on Windows) keyed by `shell_id`, so state (cwd, shell vars) persists
 reader thread, ANSI-stripped, and trimmed of the echoed command and prompt lines.
 A 30 s per-command deadline guarantees a quiet shell can't wedge the loop. (The
 reader thread also answers ConPTY's startup cursor-position query so Windows
-shells don't hang at launch.)
+shells don't hang at launch.) The result carries at most the last 10 KiB and a
+`truncated` boolean. When output is larger, the runtime attempts to preserve the
+full transcript as `<nonce>_pty.log`; the returned truncation marker says where
+it was written or reports that preservation failed.
 
 ### `askHuman`
 
@@ -243,11 +252,20 @@ The runtime resolves its working/log directory in `resolve_log_dir()`:
 
 1. `INTENDANT_LOG_DIR` if set by the controller (created if missing) — the normal
    case; the controller passes the session log dir here.
-2. Otherwise a fresh timestamped dir under `$HOME/.intendant/logs/<YYYYMMDD_HHMMSS>`.
+2. Otherwise a fresh timestamped dir under
+   `$INTENDANT_HOME/logs/<YYYYMMDD_HHMMSS>` when `INTENDANT_HOME` is non-empty,
+   or `$HOME/.intendant/logs/<YYYYMMDD_HHMMSS>` by default.
 
-This directory holds per-command stdout/stderr logs, screenshots
+This directory holds per-command stdout/stderr and over-cap PTY logs, screenshots
 (`screenshot_<nonce>.png`), the `askHuman` question/response files, and (on
 Linux/X11) the merged `session.Xauthority` cookie file.
+
+On the controller side, stdout and stderr from the runtime process are each
+buffer-capped at 64 MiB while excess bytes are still drained to avoid pipe
+deadlock. An honest truncation note is appended when bytes were discarded. If
+the 120-second batch hard timeout fires, the controller kills the runtime but
+salvages every complete JSONL protocol line already flushed by commands that
+finished; an incomplete trailing line is discarded.
 
 ## Filesystem Sandboxing
 
@@ -287,6 +305,7 @@ Durable, machine-wide facts ride the daemon's Memory service
 (`memory_propose`/`memory_search`/`memory_read`); orchestration state
 rides the `workflow_checkpoint` coordination files. Leftover
 `memory.json` files are inert: nothing reads, ingests, or deletes them.
+
 ## JSON Output Mode (controller, not runtime)
 
 `--json` is a **controller** flag (headless JSONL stdio), not part of the runtime

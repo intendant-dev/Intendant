@@ -1,19 +1,28 @@
-# Display smoke recipe
+# Display regression lab notebook
+
+> **Status:** cumulative, checkpoint-specific smoke record. Sections were
+> appended as local display, federation, input authority, freshness, and tile
+> streaming landed; exact log strings and topology assumptions belong to
+> their named checkpoints. For the maintained architecture and current QA
+> entry points, start with [`docs/src/display-pipeline.md`](src/display-pipeline.md)
+> and `skills/station-e2e-qa/SKILL.md`.
 
 Canonical end-to-end smoke for the display paths:
 
 - **Local DisplaySlot** (§1–5): macOS Mac viewing its own display via
   the in-process WebRTC pipe. H.264 by default (WKWebView's hardware
   VideoToolbox path); single-RID. Run this after any change to
-  `src/bin/caller/display/`, `src/bin/caller/web_gateway.rs`'s
-  display/authority code, or `static/app.html`'s `DisplaySlot` /
-  `pendingAuthorityStates` / `set_on_display_input_authority_change`.
+  `crates/intendant-display/src/`,
+  `src/bin/caller/web_gateway/input_authority.rs`, or the display
+  fragments under `static/app/` (the assembled `static/app.html` is
+  generated).
 - **Federated path** (§6–§8): browser → host coturn TURN → peer
   daemon → peer's encoder. VP8 single-RID floor (§6); F-1 visibility
   + Take/Release chip (§7); F-2 input wiring + F-3 cross-primary
   arbitration (§8). Run §6 after any change to `src/bin/caller/peer/`,
   `static/app.html`'s `PeerDisplayConnection`, or peer-side encoder
-  pool / layer policy. Run §7–§8 after any change to the
+  pool / layer policy. Run §7–§8 after any change to
+  `static/app/52-peer-display.js` or the
   `display_input_authority` / `control` / `pointer` data-channel
   wiring or the federated input authorizer predicate.
 
@@ -181,28 +190,26 @@ Expect:
   during burst is fine; `peer:N` is back-pressure).
 - `latency_avg ≤ 50ms` for an idle desktop on macOS / VideoToolbox.
 
-## 4. Out of scope
+## 4. Out of scope for the local-display phase
 
-- **Federated display** (peer-to-peer): separate operational path
-  with its own smoke coverage.
+- **Federated display** (peer-to-peer): covered separately in §6.
 - **Loss shaping / TWCC capacity adaptation**: covered by separate
   baseline tasks #50 (4d.3a) and #48 (4d.3b). Re-running those needs
   netem on Linux or Network Link Conditioner on macOS, deliberately
   excluded from this smoke to keep it fast.
-- **Authority across federation**: deny-by-default per
-  `build_federated_input_authorizer() → || false`. Federated authority
-  is a future slice on top of phase 5c local authority.
+- **Authority across federation**: covered separately in §7–§8; it is
+  implemented and no longer uses the former deny-all authorizer.
 
 ## 5. Failure triage cheatsheet
 
 | Symptom | Most likely culprit |
 |---|---|
-| Browser B's chip stuck `unknown` (hidden) on connect | `display_input_authority_state` sent before `log_replay` recreates the slot — see `web_gateway.rs` deferred-snapshot logic |
+| Browser B's chip stuck `unknown` (hidden) on connect | `display_input_authority_state` sent before replay recreates the slot — see `src/bin/caller/web_gateway/ws_session.rs` and `input_authority.rs` |
 | Chip flips to `you` but no `Display :0 in use` log | `_enterInteractive` not invoked — check `setAuthority('you')` promotion when `_takeControlPending` |
 | Chip stays `you` after another browser takes | `setAuthority` not handling `'you' → 'other'` exit-interactive transition |
 | `Display :0 released` fires on transient disconnect | `disconnect()` invoked with `userInitiated:true` from a non-user-close path — check capture_lost / ICE retry handlers |
 | `a=simulcast:send` missing from answer | Per-peer Rtc codec negotiation broken (phase 2 / 3), or rtc 0.9 SDP-sanitizer regression |
-| `peers=N` doesn't match browser count | Encoder lifecycle leak — see `display/encode/pool.rs` refcounting |
+| `peers=N` doesn't match browser count | Encoder lifecycle leak — see `crates/intendant-display/src/encode/pool/` refcounting |
 
 ## 6. Federated path baseline
 

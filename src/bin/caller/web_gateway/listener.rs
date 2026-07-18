@@ -698,7 +698,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     // exclusive ownership by that one `connection_id`.
     //
     // Synchronous `StdRwLock` (5a.1): the WebRTC data-channel input
-    // handler in `display/mod.rs::handle_offer_pool_mode` is an
+    // handler in `intendant-display`'s `handle_offer_pool_mode` is an
     // `Arc<dyn Fn(InputEvent) + Send + Sync>` invoked from rtc's sync
     // receive context, and reads this map through the per-peer
     // `input_authorized` closure each time an event arrives.  Tokio's

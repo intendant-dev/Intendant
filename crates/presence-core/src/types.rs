@@ -11,7 +11,7 @@ pub struct PresenceConfig {
     /// Default: auto-detect (prefers gemini when GEMINI_API_KEY is set).
     #[serde(default)]
     pub provider: Option<String>,
-    /// Model for text mode. Default: "gemini-2.5-flash".
+    /// Model for text mode. Default: "gemini-3-flash-preview".
     #[serde(default)]
     pub model: Option<String>,
     /// Context window size for the text-mode presence conversation.

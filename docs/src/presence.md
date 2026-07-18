@@ -74,6 +74,15 @@ calls through `presence-core`, feeds results back, and repeats up to 10 tool
 rounds before returning text. Token usage is accumulated and emitted as
 `PresenceUsageUpdate` events so the dashboard can show presence's own cost.
 
+Because a long-lived daemon re-sends this transcript for every narration,
+presence compacts proactively at 10% of its configured context window rather
+than waiting for the worker conversation's general 90% threshold. Compaction
+keeps the one leading system message and the latest 32 messages verbatim, and
+replaces the intervening span with a generic marker. It deliberately does not
+ask an LLM to summarize the removed middle: old presence narration and chat can
+therefore be lost, while the worker session remains authoritative and presence
+tools re-query live state.
+
 ### Model and Configuration
 
 The text model is chosen by `provider::select_presence_provider()`. Default
@@ -88,9 +97,7 @@ present. Per-provider defaults:
 
 > **Note:** `DEFAULT_TEXT_PROVIDER` is `"gemini"`. The default text model is
 > `gemini-3-flash-preview` — earlier docs that said `gemini-3.0-flash` or
-> `gemini-2.5-flash` were stale (the `gemini-2.5-flash` string still appears in
-> a doc-comment on `PresenceConfig::model` in `crates/presence-core/src/types.rs`
-> but is not the value actually used).
+> `gemini-2.5-flash` were stale.
 
 ```toml
 [presence]
@@ -112,11 +119,18 @@ without narration, and dashboard chat / tasks dispatch directly to the worker.
 ## Browser-Side Live Presence
 
 When the dashboard is open with voice enabled, the browser connects directly to
-Gemini Live or OpenAI Realtime. Voice keys are read from the encrypted client
-vault when it is unlocked, with browser `localStorage` used only as legacy
-fallback storage and as a migration source. The browser's voice model becomes
-presence, calling the exact same tools over the WebSocket tool request/response
-protocol.
+Gemini Live or OpenAI Realtime, but the long-lived credential path differs:
+
+- **Gemini** reads its API key from the unlocked client vault, falling back to
+  per-origin browser `localStorage` as a legacy store and migration source,
+  then sends that key directly from the browser to Gemini Live.
+- **OpenAI** asks the daemon for a short-lived Realtime client secret through
+  `api_voice_session`, falling back to `POST /session` when the control tunnel
+  is down. The daemon mints it from its configured or leased
+  `OPENAI_API_KEY`; the browser never receives that long-lived credential.
+
+After either flow, the browser's voice model becomes presence and calls the
+same tools over the dashboard WebSocket request/response protocol.
 
 The default live models (browser-side, in `crates/presence-web/src/lib.rs`):
 

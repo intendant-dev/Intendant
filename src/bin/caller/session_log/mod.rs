@@ -336,7 +336,8 @@ pub fn mark_registered_session_logs_interrupted_now() -> Vec<PathBuf> {
 /// - `turns/turn_NNN_agent_in.json` — JSON commands sent to agent for turn N
 /// - `turns/turn_NNN_stdout.txt`    — agent stdout for turn N
 /// - `turns/turn_NNN_stderr.txt`    — agent stderr for turn N (if non-empty)
-/// - `summary.json`     — written at session end
+/// - `summary.json`                 — task/outcome/turn summary at session end
+/// - `session_summary.json`         — rich usage/voice/CU statistics
 ///
 /// AI agents can: read session.jsonl for an overview, grep by event/turn/level,
 /// then drill into specific turn files for full content.
@@ -661,7 +662,8 @@ impl SessionLog {
 
     /// Resolve the session log directory.
     /// If `override_path` is set (via --log-file), use that as the directory.
-    /// Otherwise, pick a fresh UUID-named directory under `~/.intendant/logs`.
+    /// Otherwise, pick a fresh UUID-named directory under
+    /// `<INTENDANT_HOME or ~/.intendant>/logs`.
     ///
     /// Pure path computation — nothing is created on disk until `open()`,
     /// so a caller that bails before opening can't strand an empty session
@@ -694,8 +696,8 @@ impl SessionLog {
     }
 
     /// Find the most recent session for a given project root.
-    /// Scans `~/.intendant/logs/*/session_meta.json`, filters by project_root,
-    /// and returns the most recently created session.
+    /// Scans the ambient state root's `logs/*/session_meta.json`, filters by
+    /// project_root, and returns the most recently created session.
     pub fn find_latest_session(project_root: &Path) -> Option<(String, PathBuf)> {
         let logs_dir = crate::platform::intendant_home().join("logs");
         if !logs_dir.is_dir() {
@@ -740,7 +742,8 @@ impl SessionLog {
     }
 
     /// Find a session by its ID (UUID prefix or full UUID).
-    /// Checks `~/.intendant/logs/{id}/` directly, then scans for prefix matches.
+    /// Checks the ambient state root's `logs/{id}/` directly, then scans for
+    /// prefix matches.
     pub fn find_session_by_id(session_id: &str) -> Option<PathBuf> {
         Self::find_session_by_id_in_home(&crate::platform::home_dir(), session_id)
     }

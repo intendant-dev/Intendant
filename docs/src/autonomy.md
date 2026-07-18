@@ -1,8 +1,8 @@
 # Autonomy & Approvals
 
-Autonomy controls which actions require human approval (`autonomy.rs`). It
-layers three mechanisms, enforced in the agent loop and surfaced identically
-by every frontend.
+Autonomy controls which actions require human approval
+(`crates/intendant-core/src/autonomy.rs`). It layers three mechanisms, enforced
+in the agent loop and surfaced identically by every frontend.
 
 > **Frontends are display-only clients of the control plane.** They render
 > state and emit [`ControlMsg`](./integrations.md) values onto the `EventBus`;
@@ -21,15 +21,19 @@ Set with `--autonomy`, from the dashboard, or with
 | Level | Behavior |
 |-------|----------|
 | Low | Ask before every category except `FileRead` |
-| Medium (default) | Ask for writes, deletes, destructive, and network |
-| High | Don't ask for the above (only the always-ask categories below) |
-| Full | Ask only for the always-ask categories: `HumanInput` and `LiveAudioSpawn` |
+| Medium (default) | Apply category rules; defaults ask for writes, deletes, and destructive actions (`network` defaults to auto) |
+| High | Auto-approve ordinary `ask` rules; explicit denies and hard gates remain |
+| Full | Native actions auto-approve except explicit denies and the `HumanInput` / `LiveAudioSpawn` hard gates; see the external-agent caveat below |
 
 ## Layer 2 — per-category rules
 
-The `[approval]` section of `intendant.toml` sets a per-category rule that
-overrides the global level: `auto` (always approve), `ask` (require approval),
-`deny` (always deny — surfaced as an approval that will be denied).
+The `[approval]` section of `intendant.toml` sets a per-category rule:
+`auto`, `ask`, or `deny`. On the native path, `deny` is enforced before
+prompting and stops the batch; it is not a question the user can override from
+an approval card. Rules do not bypass the hard human-input/live-audio gates or
+the separate first-use display grant. Low intentionally asks for ordinary
+categories even when their rule is `auto`; Full auto-approves ordinary `ask`
+rules.
 
 ## Layer 3 — per-action approval
 
@@ -78,19 +82,42 @@ escalation ("ring the owner"): the `UserNotification` event carries the
 urgency on the bus, so a future voice leg (see [Presence](./presence.md))
 can subscribe to it without a new wire shape. No such leg exists yet.
 
+## Scheduled Sessions Do Not Bypass Autonomy
+
+Agenda schedule approval is a separate owner decision over an exact one-shot
+manifest (goal and fire time). It authorizes the daemon to create the session at
+that instant; it does **not** pre-approve the actions the session later proposes.
+The scheduled task is dispatched as a normal supervised session with its own
+agent-session principal, sandbox, and the same autonomy/approval machinery
+described here. Missed or uncertain occurrences are terminal and never
+auto-retried.
+
 ## How `needs_approval` actually resolves
 
-The precise logic (`Autonomy::needs_approval`) has nuances worth knowing:
+The precise logic (`AutonomyState::needs_approval`) has nuances worth knowing:
 
 - **Always ask, regardless of level:** `HumanInput` and `LiveAudioSpawn` — these
   always require a human even at Full.
+- **Explicit deny is checked first by the agent loop:** a category whose rule is
+  `deny` is rejected without presenting an approval.
 - **`DisplayControl`** — asks on *first* use, then the session grant takes over
   (`return !user_display_granted`).
-- **Full** — auto-approves everything else.
+- **Full** — auto-approves everything else that survived the explicit-deny
+  check.
 - **Low** — asks for everything except `FileRead` (a `deny` rule still blocks).
 - **Medium / High** — start from the per-category rule. For an `ask` rule,
   Medium asks only for `FileWrite` / `FileDelete` / `Destructive` /
   `NetworkRequest`; High asks for none of them.
+
+External-agent approval requests use the deliberately separate
+`external_approval_decision` path. Below Full, an explicit `deny` rejects,
+`ToolCall` plus an explicit/default `auto` auto-approves, and every other
+request is shown to the human even when the native category default is `auto`.
+At Full, the current implementation returns `AutoApprove` **before** reading
+the category rule, so an external approval request also bypasses an explicit
+`deny`. That ordering differs from the native path and from the function's own
+documented decision table; treat it as a current implementation caveat, not as
+an authority guarantee.
 
 ## Action classification
 

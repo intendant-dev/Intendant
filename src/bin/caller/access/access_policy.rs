@@ -277,7 +277,7 @@ pub enum PeerOperation {
     AgendaWrite,
     /// Search and read Memory claims (bounded, provenance-labeled).
     MemoryRead,
-    /// Propose Memory claims (the candidate lane; ephemeral in P1.1).
+    /// Propose Memory claims (the candidate lane).
     MemoryWrite,
 }
 

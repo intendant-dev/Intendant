@@ -214,9 +214,10 @@ pub struct AgendaItem {
     /// diary material, not instructions to whoever reads them).
     pub(crate) body: String,
     pub(crate) tags: Vec<String>,
-    /// Display-only due instant (ms since epoch). Presentation state: it is
-    /// patchable and fires nothing. A time that *delivers* arrives in a
-    /// later slice as a separate approved effect, never this field.
+    /// Reminder due instant (ms since epoch). It is patchable presentation
+    /// state: the reminder scheduler delivers a notification under the
+    /// owner's reminder policy, but it never authorizes work. Scheduled
+    /// work is a separately approved effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) due_ms: Option<u64>,
     pub(crate) provenance: AgendaProvenance,
@@ -306,7 +307,8 @@ pub enum AgendaCommand {
         body: String,
         #[serde(default)]
         tags: Vec<String>,
-        /// Display-only due instant (ms since epoch); fires nothing.
+        /// Reminder due instant (ms since epoch). It may deliver a
+        /// policy-controlled notification but never authorizes work.
         #[serde(default)]
         due_ms: Option<u64>,
     },

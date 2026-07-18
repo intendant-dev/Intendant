@@ -20,10 +20,11 @@
 //! ## Transport selection
 //!
 //! `add_peer` fetches a peer's Agent Card from its
-//! `/.well-known/agent-card.json` URL, picks the first
-//! [`TransportSpec`] in the card's `transports` list that this
-//! build supports, constructs the corresponding transport, and
-//! hands it to `spawn_peer`. Phase 1 only supports
+//! `/.well-known/agent-card.json` URL, keeps every supported
+//! [`TransportSpec`] in preference order, wraps the concrete
+//! transports in `MultiTransport`, and hands that wrapper to
+//! `spawn_peer`. `MultiTransport` probes the candidates top-down on
+//! every connect until one succeeds. This build supports
 //! [`IntendantWsTransport`]; non-Intendant transports in a card
 //! are filtered out via `TransportSpec::Unknown` fallback (the
 //! forward-compat discipline from the earlier pass) or skipped

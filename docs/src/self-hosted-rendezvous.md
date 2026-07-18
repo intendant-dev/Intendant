@@ -47,12 +47,14 @@ cargo build --release --bin intendant-connect
 | `--static-root` | `INTENDANT_CONNECT_STATIC_ROOT` | Deprecated compatibility input; accepted but ignored. Connect serves only embedded discovery pages/assets. `/app` and `/app.html` redirect to `/connect`; every other unknown path is `404` |
 | `--data-file` | `INTENDANT_CONNECT_DATA_FILE` | JSON state (accounts, claims, fleet records) |
 | `--daemon-token` | `INTENDANT_CONNECT_TOKEN` | Shared deployment bearer required at registration unless open registration is enabled; also the admin-API credential. It is not the per-daemon polling credential |
+| `--release-token` | `INTENDANT_CONNECT_RELEASE_TOKEN` | Dedicated bearer for release-manifest submissions; deliberately separate from the operator/admin daemon token. Without it, the submission endpoint returns 503 while reads remain public |
+| `--invite-required` | `INTENDANT_CONNECT_INVITE_REQUIRED` | Require a valid invite code for new-account registration; existing accounts are unaffected |
 | `--open-registration` | `INTENDANT_CONNECT_OPEN_REGISTRATION` | Skip only the shared deployment bearer on registration (rate-limited; stale unlinked records expire). Registration still requires a fresh daemon-key signature; each success rotates a short-lived daemon-session credential required for poll/answer/error/dry/claim-proof. The token keeps guarding the admin API |
 | `--dns-zone` | `INTENDANT_CONNECT_DNS_ZONE` | Fleet DNS: the delegated subzone this service answers for authoritatively (see below). All three `--dns-*` values or none |
 | `--dns-ns-name` | `INTENDANT_CONNECT_DNS_NS_NAME` | The NS host the parent zone delegates to (served in the apex SOA/NS) |
 | `--dns-listen` | `INTENDANT_CONNECT_DNS_LISTEN` | UDP+TCP bind for the DNS server, e.g. `0.0.0.0:53` |
 | `--relay-listen` | `INTENDANT_CONNECT_RELAY_LISTEN` | Raw TLS/SNI passthrough listener. Requires at least one relay address |
-| `--relay-address` | `INTENDANT_CONNECT_RELAY_ADDRESS` | Repeatable public IP published for relay-mode fleet DNS |
+| `--relay-address` | `INTENDANT_CONNECT_RELAY_ADDRESS` | Comma-separated public IP list published for relay-mode fleet DNS |
 
 The service speaks plain HTTP; terminate TLS in front of it (nginx,
 Caddy, a cloud load balancer). WebAuthn requires the public origin to be

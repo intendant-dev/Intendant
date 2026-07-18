@@ -396,13 +396,13 @@ fn print_help() {
     println!("    setup                 Install or verify host-level Intendant dependencies");
     println!();
     println!("SESSION LOGS:");
-    println!(
-        "    Logs are always written to ~/.intendant/logs/<uuid>/ (override with --log-file)."
-    );
+    println!("    Default: $INTENDANT_HOME/logs/<uuid>/ when INTENDANT_HOME is non-empty;");
+    println!("             otherwise ~/.intendant/logs/<uuid>/ (override with --log-file).");
     println!("    The log directory contains:");
     println!("      session.jsonl           Structured JSONL event log (one JSON object per line)");
     println!("      turns/turn_NNN_*.txt    Full model responses, agent I/O per turn");
-    println!("      summary.json            Post-session summary");
+    println!("      summary.json            Terminal task/outcome/turn summary");
+    println!("      session_summary.json    Rich post-session statistics");
     println!();
     println!("    AI agents can grep session.jsonl by event type, turn number, or level,");
     println!("    then read specific turn files for full content.");
@@ -960,12 +960,8 @@ fn apply_context_directives(json_str: &str, conversation: &mut Conversation) -> 
     )
 }
 
-/// Finalize a command batch before dispatch: inject project context
-/// normalize command aliases
-/// (`writeFile` → `editFile`) in ONE parse + serialize. These were two
-/// separate helpers (`inject_project_context`, `normalize_command_batch`)
-/// chained on every batch, each paying its own full parse and re-serialize
-/// of a payload that can embed megabytes of editFile content.
+/// Finalize a command batch before dispatch by normalizing legacy command
+/// aliases (`writeFile` → `editFile`) in one parse and serialize.
 pub(crate) fn finalize_command_batch(json_str: &str) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
@@ -2598,7 +2594,8 @@ Also: {"source": "bare"}"#;
     }
 }
 
-/// Set up a fresh conversation with project context, memory, and skills (without a task).
+/// Set up a fresh conversation with the working directory, project instructions,
+/// and skills (without a task).
 /// Used by both `setup_fresh_conversation` and the persistent presence conversation.
 fn setup_fresh_conversation_no_task(conv: &mut Conversation, project: &Project) {
     // Inject project root so the model knows which directory to work in
@@ -2629,16 +2626,18 @@ All relative paths and commands execute from this directory.",
     }
 }
 
-/// Set up a fresh conversation with project context, memory, skills, and task.
+/// Set up a fresh conversation with the working directory, project instructions,
+/// skills, and a task.
 #[allow(dead_code)]
 fn setup_fresh_conversation(conv: &mut Conversation, project: &Project, task: &str) -> u64 {
     setup_fresh_conversation_no_task(conv, project);
     conv.add_user(MessageProvenance::Task, task.to_string())
 }
 
-/// Set up a fresh conversation with project context, memory, skills, task, and
-/// optional user-attached images.  When images are present, they are added to
-/// the same user message as the task so the model sees them as inline context.
+/// Set up a fresh conversation with the working directory, project instructions,
+/// skills, a task, and optional user-attached images. When images are present,
+/// they are added to the same user message as the task so the model sees them
+/// as inline context.
 /// Returns the seq of the task message, so callers can emit its canonical
 /// `conversation_message` record (this helper has no session-log handle).
 fn setup_fresh_conversation_with_attachments(

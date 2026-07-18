@@ -6,7 +6,8 @@ external tool does the actual coding; Intendant wraps it in its own oversight,
 display, and computer-use surface by pointing the tool's MCP client at Intendant's
 own [MCP server](./mcp-server.md).
 
-This is the fourth execution mode (alongside Direct, User, and Sub-Agent — see
+This is one of the four current execution shapes — Direct, Orchestrate,
+Sub-Agent, and External-Agent (see
 [Agent Execution & Multi-Agent Orchestration](./multi-agent.md)). It is selected
 by `--agent <backend>` or the `[agent] default_backend` config key.
 
@@ -73,9 +74,10 @@ pub trait ExternalAgent: Send + Sync {
 ```
 
 `initialize()` spawns the backend process and returns a channel of normalized
-**`AgentEvent`**s; everything the backend emits (deltas, messages, reasoning, plan
-updates, tool start/output/complete, approval requests, diffs, usage, termination)
-is translated into that enum so the controller's display and oversight code is
+**`AgentEvent`**s; everything the backend emits (deltas, messages, reasoning,
+plan updates, tool start/output/complete, approval and structured-question
+requests, diffs, usage/vitals facts, limit-rejected turns, and termination) is
+translated into that enum so the controller's display and oversight code is
 backend-agnostic. `AgentEvent::Scoped { thread_id, turn_id, .. }` wraps inner
 events when a backend (Codex) multiplexes several threads through one process.
 
@@ -96,9 +98,9 @@ persisted sessions from it remain readable but cannot be resumed.
 
 ## Per-Backend Reference
 
-`create_external_agent()` (`main.rs`) constructs the right adapter from
-`[agent.<backend>]` config, then `run_external_agent_mode()` drives the supervise
-loop.
+`create_external_agent()` (`external_supervision.rs`) constructs the right
+adapter from `[agent.<backend>]` config, then `run_external_agent_mode()`
+(`external_mode.rs`) drives the supervise loop.
 
 | | **Codex** (reference impl) | **Claude Code** |
 |---|---|---|
@@ -406,9 +408,9 @@ Managed Codex sessions can fork themselves. Alongside the rewind tools, the
 managed-context gate exposes a fission surface (`fission_tool()` in `mcp/tool_gate.rs`)
 that lets the model split separable work into parallel **full-context sibling
 branches** and join the results back deliberately. The spawn/import mechanics
-live in `main.rs` (`apply_fission_spawn_action` / `apply_fission_import_action`),
-the runtime contract in `fission_lifecycle.rs`, and the durable state in
-`fission_ledger.rs`.
+live in `thread_actions.rs` (`apply_fission_spawn_action` /
+`apply_fission_import_action`), the runtime contract in
+`fission_lifecycle.rs`, and the durable state in `fission_ledger.rs`.
 
 The tools:
 
@@ -433,7 +435,7 @@ completed turn** and do not see the spawning turn — the in-flight tool call
 (including the `fission_spawn` arguments) is invisible to the children — so
 every `objective` must be self-contained: each fact, path, and constraint the
 branch needs. The supervisor injects a `<fission_charter>` developer message
-into each fork (`fission_charter_message`, `main.rs`) carrying identity
+into each fork (`fission_charter_message`, `thread_actions.rs`) carrying identity
 (group id + branch session id), the objective, the **owned write scope** (or
 "read-only"), the worktree if any, and the report-back contract: work only
 within your write scope; end the final turn with a concise outcome summary
@@ -532,7 +534,8 @@ Spawned in non-interactive stream-json mode (`-p --input-format stream-json
 `--permission-prompt-tool stdio`, so permission prompts arrive as
 `control_request`/`can_use_tool` messages on the JSON stream and become
 `AgentEvent::ApprovalRequest` (file tools carry the `FileChange` category).
-Protocol details that are load-bearing (verified against Claude Code 2.1.200):
+Protocol details that are load-bearing (compatibility vocabulary verified
+through Claude Code 2.1.210):
 
 - **Approvals**: the allow response **must echo the original tool input as
   `updatedInput`** — a bare `{"behavior":"allow"}` fails the CLI's schema
@@ -652,6 +655,34 @@ recorded in the session's launch config. The reader reconciles the
 warning on divergence (once per distinct echoed value).
 `--allowedTools` is added from config when set.
 
+## Rate-limit Parking
+
+Claude Code's `rate_limit_event` with status `rejected`, correlated with the
+turn's terminal result, becomes `AgentEvent::TurnLimitRejected` rather than an
+ordinary completed round. The backend process remains usable, but the rejected
+round did no work and consumes no round budget. Both the foreground
+external-mode lane and persistent-daemon lane apply the same
+`external_supervision.rs` policy:
+
+- The rejected message remains pending. If the wire supplied `resetsAt`, it is
+  resent after that instant plus 30–90 seconds of jitter; any one sleep is
+  capped at six hours so long windows are rechecked. Without a reset time,
+  consecutive rejections back off from 5 to 30 minutes.
+- Follow-ups arriving while parked queue FIFO behind the pending resend instead
+  of being burned against the exhausted backend. A cancelled follow-up is
+  skipped when the queue drains.
+- An interrupt cancels the park and drops its pending resend (other queued
+  follow-ups remain queued). Backend termination also cancels the resend; in
+  the persistent lane, queued user messages can run against the next agent
+  build. `/new` is an explicit reset and drops both the park and that lane's
+  queued messages.
+- An out-of-band `compact` action is refused with the reset-time explanation
+  while a park is armed; request it again after the reset.
+
+The park is an in-memory session-lane state, not a durable scheduler. Activity
+and session-log rows make the pause, queued messages, cancellation, and resend
+visible.
+
 ## Dashboard and Station parity: Codex vs Claude Code
 
 The per-session dashboard features (Activity → Logs agent windows and the
@@ -720,7 +751,7 @@ supervisor-spawned native sessions, plus the Station work tracked in
 
 When a supervised agent asks to run a command or change a file, the backend emits
 `AgentEvent::ApprovalRequest` / `FileApprovalRequest`. `drain_external_agent_events()`
-(`main.rs`) routes the decision through **the same autonomy policy and approval
+(`external_events.rs`) routes the decision through **the same autonomy policy and approval
 registry as the native agent**:
 
 ```

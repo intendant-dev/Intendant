@@ -178,7 +178,7 @@ rows explicitly marked future remain design constraints:
 | TURN relay | Denial of service; traffic analysis | Media remains separate from the Connect SNI relay; any deployment must use short-lived credentials and preserve authenticated, end-to-end encrypted daemon channels |
 | Fleet metadata store | Denial of service; false labels/routes or a substituted self-signed record on a new device | Private fields are encrypted; the current browser detects same-key alteration; records carry no daemon authority. An owner/device signer trust set is not shipped yet. |
 | Name directory | Handle confusion at first introduction | Key-first identity; handles are labels; org keys sign membership; append-only transparency log over all name bindings (STH pinned + consistency-verified by browsers; inclusion proofs on claims), optional DNS/GitHub attestation badges, invite-gated registration + reserved handles + dormant-handle reclamation |
-| Fleet DNS zone + WebPKI (fleet-name route) | Controls the endpoint and origin-scoped code reached through the fleet name | With hosted control off, the route is discovery-only. With it on, unproved traffic is still anonymous `role:none`; protected routes require a short-lived daemon-minted lease bound to a tab key and exact compiled preset. The immutable floor and trusted confirmation cap same-origin authority. CT is the current slower fallback; planned peer/app witnesses shorten the detection window. Neither detection path mints authority. |
+| Fleet DNS zone + WebPKI (fleet-name route) | Controls the endpoint and origin-scoped code reached through the fleet name | With hosted control off, the route is discovery-only. With it on, unproved traffic is still anonymous `role:none`; protected routes require a short-lived daemon-minted lease bound to a tab key and exact compiled preset. The immutable floor and trusted confirmation cap same-origin authority. Shipped peer witnesses shorten the detection window; the signed-application protocol is present but no current unsigned development artifact qualifies, and CT remains the slower fallback. No detection path mints authority. |
 | Hosted Connect origin (directory lane) | Controls account/route/presence metadata, page-visible or unlocked state, navigation, and served installers | Claims, passkeys, and account assertions grant nothing, and raw hosted provenance remains immutable `role:none`. The optional navigation hint is daemon-signed and leads only to the daemon's lease doorbell. Served artifacts are transparency-logged (evidence, not prevention); installers remain a real software-supply-chain trust boundary. |
 | Foreign browser origin / DNS rebinding | Drive a browser-held mTLS certificate or loopback root fallback cross-site | Every non-public HTTP route, direct dashboard signaling, and `/ws` reject foreign browser Origins before resolving transport authority; cross-/same-site Fetch Metadata closes navigation and subresource requests that omit `Origin`. Explicit authority-free shell/assets/discovery/signed-document doorbells run as anonymous `role:none`. Cleartext "own origin" is limited to `localhost` or a literal loopback address, so matching attacker-controlled Origin and Host values do not bypass the gate; non-loopback browser administration uses HTTPS/mTLS. |
 
@@ -744,6 +744,8 @@ authentication from staged identity vocabulary:
    are implemented** — every daemon still makes its own trust and
    authorization decision.
 5. **General browser-key login remains future work** — it cannot reactivate the
-   retired Connect path or broaden the dedicated hosted-lease principal.
-   Signed-application confirmation becomes available only after a qualifying
-   signed/notarized distribution and platform-keystore enrollment ship.
+   retired Connect path or broaden the dedicated hosted-lease principal. The
+   signed-application witness/anchor protocol is implemented, but the current
+   `-unsigned-dev` artifact is deliberately ineligible; operational
+   signed-application confirmation still requires a qualifying
+   signed/notarized distribution and platform-keystore enrollment.

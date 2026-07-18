@@ -39,10 +39,10 @@ espeak-ng "text"
 ffmpeg (resample to 48kHz mono s16le)      <-- match browser's native AudioContext rate
     |
     v
-paplay --device=virtual_mic (PulseAudio)
+paplay --device=$VIRTUAL_MIC (PulseAudio)
     |
     v
-virtual_mic.monitor (PulseAudio source)     <-- Firefox sees this as default mic
+$VIRTUAL_MIC.monitor (PulseAudio source)   <-- Firefox sees this as default mic
     |
     v
 Firefox getUserMedia({audio: true})
@@ -82,41 +82,47 @@ the VM Firefox is passive and its audio is ignored by the presence layer.
 
 ## Setup
 
-### 1. Clean up stale processes
+### 1. Reserve isolated test resources
 
-NEVER use `pkill` — Claude Code blocks it entirely (exit code 144), killing the whole
-command. Use `kill $(pgrep -f 'pattern')` instead. Always verify kills with `pgrep` after.
-
-Use `-9` for Firefox (it ignores SIGTERM). Firefox may be named `firefox` or
-`firefox-esr` depending on the system — kill both.
+Never stop another agent's Intendant, browser, Xvfb, or VNC process. This
+example uses display `:50`, VNC port `5950`, debugger port `6000`, and
+dashboard port `18767`; if any is occupied, choose unused values and update
+the variables.
 
 ```bash
-for p in $(pgrep -x Xvfb 2>/dev/null); do kill "$p" 2>/dev/null; done
-for p in $(pgrep -x x11vnc 2>/dev/null); do kill "$p" 2>/dev/null; done
-for p in $(pgrep -x firefox -x firefox-esr 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
-for p in $(pgrep -x intendant 2>/dev/null); do kill "$p" 2>/dev/null; done
-sleep 0.5
-# Verify all dead
-pgrep -x 'Xvfb|x11vnc|firefox|firefox-esr|intendant' && echo "WARN: stale processes remain" || echo "All clean"
+REPO=$(git rev-parse --show-toplevel)
+(
+  cd "$REPO"
+  cargo build --release --bin intendant --bin intendant-runtime
+)
+BIN="$REPO/target/release/intendant"
+PORT=18767
+BASE="http://127.0.0.1:$PORT"
+RUN_DIR=$(mktemp -d /tmp/intendant-voice-e2e.XXXXXX)
+if pgrep -fa '^Xvfb :50([[:space:]]|$)|^x11vnc .*:50'; then
+  echo "Display :50 is already owned; choose an unused display"; exit 1
+fi
+ss -ltn 2>/dev/null | grep -E ':(5950|6000|18767)\b' && {
+  echo "Choose unused display/VNC/debug/dashboard values before continuing"; exit 1;
+}
 ```
 
 ### 2. Create PulseAudio virtual microphone
 
 ```bash
-# Unload any prior virtual_mic module
-pactl unload-module $(pactl list short modules | grep 'sink_name=virtual_mic' | awk '{print $1}') 2>/dev/null
-
-# Create null sink — its .monitor becomes the virtual mic source
-pactl load-module module-null-sink sink_name=virtual_mic \
+# Create a run-unique null sink — its .monitor becomes the virtual mic source.
+VIRTUAL_MIC="intendant_voice_$$"
+PREV_SOURCE=$(pactl get-default-source)
+PULSE_MODULE_ID=$(pactl load-module module-null-sink sink_name="$VIRTUAL_MIC" \
   sink_properties=device.description="VirtualMic" \
-  rate=48000 channels=1 format=s16le
+  rate=48000 channels=1 format=s16le)
 
 # Set the virtual mic monitor as the default recording source
-pactl set-default-source virtual_mic.monitor
+pactl set-default-source "$VIRTUAL_MIC.monitor"
 
 # Verify
-pactl list short sources | grep virtual_mic
-# Should show: virtual_mic.monitor
+pactl list short sources | grep "$VIRTUAL_MIC"
+# Should show: $VIRTUAL_MIC.monitor
 ```
 
 **Why 48kHz?** The browser's `AudioContext` uses the system's native sample rate
@@ -128,8 +134,10 @@ at the PulseAudio level so no extra resampling happens in PulseAudio.
 
 ```bash
 nohup Xvfb :50 -screen 0 1280x720x24 > /dev/null 2>&1 &
+XVFB_PID=$!
 sleep 0.5
 nohup x11vnc -display :50 -rfbport 5950 -passwd intendant -forever -quiet > /dev/null 2>&1 &
+VNC_PID=$!
 sleep 0.5
 ```
 
@@ -140,18 +148,21 @@ short-lived shell wrappers around `nohup ... &` let the web server disappear
 between steps.
 
 ```bash
-> /tmp/intendant-web-stderr.log
-cd /home/user/projects/intendant && source .env && \
-  nohup ./target/release/intendant --direct --autonomy low --web \
-  "your task here" > /dev/null 2>/tmp/intendant-web-stderr.log &
+(
+  cd "$REPO"
+  [ ! -f .env ] || source .env
+  exec "$BIN" --direct --autonomy low --web "$PORT" --no-tls \
+    --bind 127.0.0.1 "your task here"
+) >"$RUN_DIR/intendant.log" 2>&1 &
+INTENDANT_PID=$!
 sleep 3
-cat /tmp/intendant-web-stderr.log  # Should show "Dashboard: http://0.0.0.0:8765"
+cat "$RUN_DIR/intendant.log"
 ```
 
 ### 5. Check the target live provider
 
 ```bash
-curl -s http://localhost:8765/config
+curl -s "$BASE/config"
 # Returns: {"provider":"gemini","model":"...","input_sample_rate":16000,"output_sample_rate":24000}
 # or:      {"provider":"openai","model":"...","input_sample_rate":24000,"output_sample_rate":24000}
 ```
@@ -160,25 +171,25 @@ Use the `provider` field to decide the Gemini vs OpenAI path below.
 
 ### 6. Launch Firefox with debugger
 
-Set up Firefox remote debug (once per environment):
+Configure a run-scoped Firefox profile:
 ```bash
-PROFILE=$(ls -d ~/.mozilla/firefox/*.default* | head -1)
+PROFILE="$RUN_DIR/firefox-profile"
+mkdir -p "$PROFILE"
 grep -q 'devtools.debugger.remote-enabled' "$PROFILE/user.js" 2>/dev/null || \
 cat >> "$PROFILE/user.js" << 'EOF'
 user_pref("devtools.debugger.remote-enabled", true);
 user_pref("devtools.chrome.enabled", true);
 user_pref("devtools.debugger.prompt-connection", false);
 user_pref("devtools.debugger.force-local", false);
+user_pref("media.navigator.permission.disabled", true);
 EOF
 ```
 
-Launch (pointing to `/app`). Use `-P default` so Firefox uses the profile where
-we set debugger prefs and mic permissions — without it, it may pick a different
-profile and the debugger server won't bind:
+Launch the isolated profile on `/app`:
 ```bash
-rm -f ~/.mozilla/firefox/*/.parentlock ~/.mozilla/firefox/*/lock 2>/dev/null
-DISPLAY=:50 nohup firefox -P default --start-debugger-server 6000 \
-  --new-window http://localhost:8765/app > /dev/null 2>&1 &
+DISPLAY=:50 nohup firefox --no-remote --profile "$PROFILE" \
+  --start-debugger-server 6000 --new-window "$BASE/app" > /dev/null 2>&1 &
+FIREFOX_PID=$!
 sleep 5
 ```
 
@@ -186,7 +197,7 @@ sleep 5
 
 For Gemini Live with tool calling, an API key must be in localStorage:
 ```bash
-set -a && source .env && set +a
+set -a && source "$REPO/.env" && set +a
 JS=$(python3 - <<'PY'
 import json, os
 print("localStorage.setItem('gemini_api_key', %s); 'stored'" % json.dumps(os.environ['GEMINI_API_KEY']))
@@ -202,13 +213,12 @@ sleep 3
 `localStorage` does not dismiss it. Reload after storing, or click the mic button
 again once the key exists.
 
-For OpenAI Realtime, set:
-```bash
-source .env && python3 scripts/ff-eval.py \
-  "localStorage.setItem('openai_api_key', '$OPENAI_API_KEY'); 'stored'"
-python3 scripts/ff-eval.py "location.reload(); 'reloading'"
-sleep 3
-```
+For OpenAI Realtime, do **not** place the long-lived key in Firefox storage.
+`OPENAI_API_KEY` must be available to the daemon when it starts (step 4);
+the browser obtains a short-lived Realtime client secret from the daemon's
+voice-session endpoint. If the key was absent at startup, stop only
+`$INTENDANT_PID`, relaunch the same command after sourcing `$REPO/.env`, and
+reload the page.
 
 ## Sending Audio
 
@@ -224,7 +234,7 @@ say() {
   espeak-ng "$text" -s "$speed" --stdout | \
     ffmpeg -loglevel error -i pipe:0 \
       -f s16le -ar 48000 -ac 1 pipe:1 | \
-    paplay --device=virtual_mic --format=s16le --rate=48000 --channels=1 --raw
+    paplay --device="$VIRTUAL_MIC" --format=s16le --rate=48000 --channels=1 --raw
 }
 ```
 
@@ -248,7 +258,7 @@ say "yes"
 ```bash
 # 2 seconds of silence at 48kHz mono s16le = 192000 bytes of zeros
 dd if=/dev/zero bs=192000 count=1 2>/dev/null | \
-  paplay --device=virtual_mic --format=s16le --rate=48000 --channels=1 --raw
+  paplay --device="$VIRTUAL_MIC" --format=s16le --rate=48000 --channels=1 --raw
 ```
 
 ## Connecting Live Mode from Browser
@@ -277,7 +287,7 @@ It does **not** prove Firefox is actively capturing microphone audio. Verify bot
 
 ### Verify live connection
 ```bash
-curl -s http://localhost:8765/debug | python3 -c "
+curl -s "$BASE/debug" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 v = d.get('voice', {})
@@ -290,7 +300,7 @@ assert connected, 'Live model not connected'
 ### Wait for live connection
 ```bash
 for i in $(seq 1 15); do
-  CONNECTED=$(curl -s http://localhost:8765/debug | python3 -c "
+  CONNECTED=$(curl -s "$BASE/debug" | python3 -c "
 import sys, json; print(json.load(sys.stdin).get('voice', {}).get('connected', False))" 2>/dev/null)
   [ "$CONNECTED" = "True" ] && break
   sleep 1
@@ -323,7 +333,7 @@ pactl list short source-outputs
 say "What is the current status?" 130
 sleep 5
 
-curl -s http://localhost:8765/debug | python3 -c "
+curl -s "$BASE/debug" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 v = d.get('voice', {})
@@ -337,7 +347,8 @@ assert v.get('voice_log_count', 0) > 0, 'No voice logs — model may not have re
 If `/debug` stays quiet, inspect the session log for `voice:audio_send` diagnostics:
 
 ```bash
-tail -n 200 ~/.intendant/logs/*/session.jsonl | grep 'voice:audio_send'
+IHOME="${INTENDANT_HOME:-$HOME/.intendant}"
+tail -n 200 "$IHOME"/logs/*/session.jsonl | grep 'voice:audio_send'
 ```
 
 This confirms the path up to the browser send loop is active:
@@ -348,7 +359,7 @@ This confirms the path up to the browser send loop is active:
 say "Please list the files in /tmp" 130
 sleep 8
 
-curl -s http://localhost:8765/debug | python3 -c "
+curl -s "$BASE/debug" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 state = d.get('agent_state', d)
@@ -362,7 +373,7 @@ assert phase != 'idle', f'Task not started — phase still idle'
 ```bash
 # Wait for approval
 for i in $(seq 1 30); do
-  PENDING=$(curl -s http://localhost:8765/debug | python3 -c "
+  PENDING=$(curl -s "$BASE/debug" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 pa = d.get('agent_state', d).get('pending_approval')
@@ -378,7 +389,7 @@ say "Yes, approve that" 130
 sleep 5
 
 # Verify approval cleared
-curl -s http://localhost:8765/debug | python3 -c "
+curl -s "$BASE/debug" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 pa = d.get('agent_state', d).get('pending_approval')
@@ -397,7 +408,7 @@ python3 scripts/ff-eval.py "document.querySelector('.mic-btn')?.click(); 'clicke
 sleep 3
 
 # 2. Verify connected
-curl -s http://localhost:8765/debug | python3 -c "
+curl -s "$BASE/debug" | python3 -c "
 import sys, json; d = json.load(sys.stdin)
 assert d.get('voice',{}).get('connected'), 'Live not connected'
 print('Live connected OK')
@@ -408,7 +419,7 @@ say "Please list the files in /tmp" 130
 sleep 8
 
 # 4. Assert task started
-curl -s http://localhost:8765/debug | python3 -c "
+curl -s "$BASE/debug" | python3 -c "
 import sys, json; d = json.load(sys.stdin)
 phase = d.get('agent_state', d).get('phase', 'idle')
 assert phase != 'idle', f'Task not started: {phase}'
@@ -417,7 +428,7 @@ print(f'Task started — phase: {phase}')
 
 # 5. Wait for and verify approval
 for i in $(seq 1 30); do
-  PENDING=$(curl -s http://localhost:8765/debug | python3 -c "
+  PENDING=$(curl -s "$BASE/debug" | python3 -c "
 import sys,json; pa=json.load(sys.stdin).get('agent_state',{}).get('pending_approval')
 print('yes' if pa and str(pa)!='null' else 'no')" 2>/dev/null)
   [ "$PENDING" = "yes" ] && break; sleep 1
@@ -426,7 +437,7 @@ done
 # 6. Approve via live and verify
 say "Yes, approve that" 130
 sleep 5
-curl -s http://localhost:8765/debug | python3 -c "
+curl -s "$BASE/debug" | python3 -c "
 import sys, json; d = json.load(sys.stdin)
 pa = d.get('agent_state', d).get('pending_approval')
 assert pa is None or str(pa) == 'null', f'Approval not cleared: {pa}'
@@ -438,33 +449,22 @@ print('Approved OK')
 
 ### No audio reaching the live model
 
-1. **Check virtual mic exists**: `pactl list short sources | grep virtual_mic`
-2. **Check default source**: `pactl get-default-source` — should be `virtual_mic.monitor`
+1. **Check virtual mic exists**: `pactl list short sources | grep "$VIRTUAL_MIC"`
+2. **Check default source**: `pactl get-default-source` — should be
+   `$VIRTUAL_MIC.monitor`
 3. **Check Firefox is actually recording**: `pactl list short source-outputs`
    - If empty, live may be connected but `getUserMedia` is not active.
-3. **Test audio flow**: Play a tone and check PulseAudio levels:
+4. **Test audio flow**: Play a tone and check PulseAudio levels:
    ```bash
    ffmpeg -f lavfi -i "sine=frequency=440:duration=2" -f s16le -ar 48000 -ac 1 pipe:1 2>/dev/null | \
-     paplay --device=virtual_mic --format=s16le --rate=48000 --channels=1 --raw &
-   pactl list short sources | grep RUNNING  # Should show virtual_mic.monitor as RUNNING
+     paplay --device="$VIRTUAL_MIC" --format=s16le --rate=48000 --channels=1 --raw &
+   pactl list short sources | grep RUNNING  # Should show $VIRTUAL_MIC.monitor as RUNNING
    ```
-4. **Check browser mic permission**: Firefox may not have granted mic access.
-   Pre-grant via:
-   ```bash
-   PROFILE=$(ls -d ~/.mozilla/firefox/*.default* | head -1)
-   python3 -c "
-   import sqlite3, time
-   db = sqlite3.connect('$PROFILE/permissions.sqlite')
-   db.execute('''INSERT OR REPLACE INTO moz_perms
-     (origin, type, permission, expireType, expireTime, modificationTime)
-     VALUES ('http://localhost:8765', 'microphone', 1, 0, 0, ?)''',
-     (int(time.time() * 1000),))
-   db.commit()
-   db.close()
-   print('Microphone permission granted for localhost:8765')
-   "
-   ```
-   **IMPORTANT**: Set this permission BEFORE launching Firefox.
+5. **Check browser mic permission**: this run's isolated profile sets
+   `media.navigator.permission.disabled=true` in `user.js` before Firefox
+   starts. Verify the line is present. If you remove that test-only bypass,
+   grant the prompt interactively over VNC; do not edit `permissions.sqlite`
+   while Firefox owns the profile.
 
 ### Live model not responding to speech
 
@@ -485,9 +485,10 @@ print('Approved OK')
 
 ### OpenAI Realtime
 
-- Browser gets a client secret via `POST /session` (server-side minting with
-  the API key).
-- Or set `openai_api_key` in localStorage for direct browser auth.
+- Browser gets a short-lived client secret from the daemon (dashboard-control
+  `api_voice_session`, with `POST /session` as the direct-dashboard fallback).
+- The long-lived OpenAI key stays daemon-side; browser `localStorage` is not an
+  OpenAI authentication path.
 - Input sample rate: **24kHz** (WASM downsamples from 48kHz)
 - `modalities: ["audio", "text"]`
 - OpenAI Realtime tends to be more sensitive to audio quality — speak slower
@@ -496,14 +497,14 @@ print('Approved OK')
 ## Cleanup
 
 ```bash
-# Remove virtual mic
-pactl list short modules | grep 'sink_name=virtual_mic' | awk '{print $1}' | xargs -r -I{} pactl unload-module {} 2>/dev/null
+# Restore the previous source and unload only this run's PulseAudio module.
+pactl set-default-source "$PREV_SOURCE" 2>/dev/null || true
+pactl unload-module "$PULSE_MODULE_ID" 2>/dev/null || true
 
-# Kill processes (use pgrep -x to avoid matching the shell itself)
-for p in $(pgrep -x intendant 2>/dev/null); do kill "$p" 2>/dev/null; done
-for p in $(pgrep -x firefox -x firefox-esr 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
-for p in $(pgrep -x Xvfb 2>/dev/null); do kill "$p" 2>/dev/null; done
-for p in $(pgrep -x x11vnc 2>/dev/null); do kill "$p" 2>/dev/null; done
+# Stop only processes whose PIDs this run captured.
+kill "$INTENDANT_PID" "$VNC_PID" "$XVFB_PID" 2>/dev/null || true
+kill -9 "$FIREFOX_PID" 2>/dev/null || true
+rm -rf "$RUN_DIR"
 ```
 
 ## Notes from verified runs

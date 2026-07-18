@@ -90,15 +90,6 @@ pub fn presence_tools() -> Vec<ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Keywords to search for."
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Filter by tags."
-                    },
-                    "channel": {
-                        "type": "string",
-                        "description": "Filter by knowledge channel."
                     }
                 },
                 "required": []

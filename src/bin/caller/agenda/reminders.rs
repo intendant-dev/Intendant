@@ -21,11 +21,12 @@
 //! Occurrence identity: `occurrence_id = sha256("reminder\0" item_id "\0"
 //! due_ms)` (hex, truncated). This is the lean-v1 projection of the
 //! umbrella RFC §7.5 shape — entry id + effect discriminator + due
-//! instance; the approved-revision component arrives with real effect
-//! manifests. Patching an item's due mints a new occurrence (reschedule =
-//! supersession); `Complete`/`Retire` cancel pending occurrences because
-//! the planner only considers open items; `Reopen` never refires a
-//! terminal occurrence (one-shot semantics — only a new due re-arms).
+//! instance. Scheduled-session effects use a separate identity that also
+//! binds the effect id and approved manifest digest. Patching an item's
+//! due mints a new reminder occurrence (reschedule = supersession);
+//! `Complete`/`Retire` cancel pending occurrences because the planner only
+//! considers open items; `Reopen` never refires a terminal occurrence
+//! (one-shot semantics — only a new due re-arms).
 //!
 //! Co-homed daemons: like the op log, the journal refolds when its file
 //! grows (`refresh_if_stale`), which narrows but cannot eliminate the

@@ -267,6 +267,13 @@ raw frame names are reserved for the `egress_*` relay path):
 | `api_credential_custody_trail` | browser → daemon request with no params | recent custody events (`at_unix_ms`, `event`, `kind`, `label`, `actor`, `origin`, `detail`) from the daemon's own record — lease grants/expiries/revocations, relay changes, restart resets; metadata only, never material. `origin` stamps the session's origin class on ceremonies (`hosted` / `direct` / `local` / `peer`; empty on sessionless events and pre-field records). Kept at `~/.intendant/custody-audit.jsonl` (0600, bounded), rendered in Access → Advanced → Custody trail |
 | `api_daemon_vault_fetch` | browser → daemon request with no params | the daemon-stored sealed blob, if any: `revision`, `vault` (E2E ciphertext the daemon cannot read), `updated_unix_ms`; `revision: 0, vault: null` when empty |
 | `api_daemon_vault_publish` | browser → daemon request with `revision` and the full `vault` blob | `stored` (`false` = idempotent same-revision republish); rollback, same-revision divergence, and MAC-stripping are refused with a `vault revision conflict:`-prefixed error the dashboard treats like the hosted store's HTTP 409 |
+| `api_daemon_vault_deposit_key_fetch` | browser → daemon request with no params | whether the write-only deposit public key is present and, when present, its `alg`, `pub_raw_b64u`, and publication time |
+| `api_daemon_vault_deposit_key_publish` | browser → daemon request with `pub_raw_b64u` and optional `alg` (default `ECDH-P256`) | `stored: true` after the public key is written |
+| `api_daemon_vault_deposits_fetch` | browser → daemon request with no params | queued sealed deposit records; ciphertext and metadata only |
+| `api_daemon_vault_deposits_consume` | browser → daemon request with deposit `ids` | `removed` count; the dashboard calls this only after the re-wrapped vault blob has published |
+| `api_credential_egress_register` | browser → daemon request with provider `kinds` and optional `request_credits` capability | registered provider kinds for this authenticated dashboard-control session |
+| `api_credential_egress_unregister` | browser → daemon request with optional provider `kinds`; omitted removes every relay for the session | `unregistered` count |
+| `api_credential_egress_probe` | browser → daemon request with `kind` (`anthropic` or `gemini`) and optional `model` | forced relay test result (`text`, `model`), even when a local key or lease exists |
 
 Leases ride the same per-frame IAM checks as every other tunnel
 operation; granting requires a session whose principal holds a new

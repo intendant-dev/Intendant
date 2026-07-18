@@ -52,9 +52,11 @@ dashboard endpoint together, end to end.
 cd /Users/vm/projects/codex-minimal-lineage/codex-rs
 cargo build -p codex-cli --bin codex
 
-# 2. Intendant
-cd /Users/vm/projects/intendant
-cargo build --bin intendant
+# 2. Intendant — use an isolated worktree, never the shared repo root
+cd /path/to/your/intendant/worktree
+cargo build --bin intendant --bin intendant-runtime
+INTENDANT_BIN="$PWD/target/debug/intendant"
+printf 'Run the controller from this shell, or copy this absolute path: %s\n' "$INTENDANT_BIN"
 
 # 3. Toy git repo (disposable)
 REPO=$(mktemp -d /tmp/fission-e2e-repo.XXXX)
@@ -82,7 +84,8 @@ in its own terminal; everything else runs against it.
 ```bash
 PORT=18901
 cd "$REPO"
-/Users/vm/projects/intendant/target/debug/intendant --agent codex \
+INTENDANT_BIN=/path/to/your/intendant/worktree/target/debug/intendant
+"$INTENDANT_BIN" --agent codex \
   --web $PORT --no-tls --bind 127.0.0.1 \
   "You are running a fission smoke test in $REPO. Do exactly this, in order: \
    (1) run \`git log --oneline -1\` and \`ls\`. \

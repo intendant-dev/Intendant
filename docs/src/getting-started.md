@@ -404,8 +404,9 @@ flags:
   gateway, then falls through to the daemon loop when it ends.
 - `--mcp` turns the process into an MCP server on stdio (no dashboard).
 - `--json` emits JSONL events to stdout (headless stdio; no dashboard).
-- `--no-web` runs headless in the terminal: a single round, log output to
-  stderr, no UI (`--json` adds scripted stdin follow-ups and approvals).
+- `--no-web` runs one headless task/session in the terminal (the agent loop may
+  take many model/tool turns), with log output on stderr and no UI. `--json`
+  adds scripted stdin follow-ups and approvals.
 
 So a plain `intendant "task"` on a desktop gives you a dashboard URL; the
 terminal itself is a launcher and log tail. (`--no-tui` from the retired
@@ -437,7 +438,7 @@ terminal UI era is still accepted as a no-op.)
 # Explicit local/plaintext debug escape
 ./target/release/intendant --no-tls --bind 127.0.0.1
 
-# Headless single round (dashboard off)
+# Headless task/session (dashboard off)
 ./target/release/intendant --no-web "task"
 
 # MCP server on stdio
@@ -467,7 +468,7 @@ value is missing.
 | `--model` | `<name>` | Override the model (sets `MODEL_NAME`) |
 | `--task-file` | `<path>` | Read the initial task from a file instead of argv |
 | `--autonomy` | `<level>` | Autonomy level: `low`, `medium`, `high`, `full` (loose parse; unknown → `medium`) |
-| `--log-file` | `<dir>` | Override the session log directory (default `~/.intendant/logs/<uuid>/`) |
+| `--log-file` | `<dir>` | Override the session log directory (default `$INTENDANT_HOME/logs/<uuid>/`, falling back to `~/.intendant/logs/<uuid>/`) |
 | `--continue`, `-c` | — | Resume the most recent session for this project |
 | `--resume`, `-r` | `[id]` | Resume a session by id, prefix, or path; with no id behaves like `--continue` |
 | `--no-tui` | — | Deprecated no-op (the terminal TUI was removed); headless is `--no-web` |
@@ -651,19 +652,24 @@ Android and desktop Chrome/Firefox also import the Apple-compatible bundle.
 ## Testing
 
 ```bash
-cargo test --bins         # unit tests (fast, no API keys)
-cargo test -- --list      # list all test names
+cargo test -p intendant --bins
+cargo test -p intendant-core -p intendant-display -p intendant-platform \
+  -p owner-plane-core -p owner-plane-reducer
+cargo test -p intendant --test e2e
+cargo clippy --workspace -- -D warnings
 ```
 
-Unit tests are inline `#[cfg(test)]` modules across the binaries and library
-crates. The `#[tokio::test]` cases in `tests/e2e/main.rs` spawn the real
-binaries against the deterministic scripted mock provider (`PROVIDER=mock` +
+These keyless commands cover all three package binaries, the workspace library
+gates (including the stamped owner-plane corpus), the real-binary E2E suite,
+and workspace-wide Clippy. Unit tests are inline `#[cfg(test)]` modules. The
+`#[tokio::test]` cases in `tests/e2e/main.rs` spawn the real binaries against
+the deterministic scripted mock provider (`PROVIDER=mock` +
 `INTENDANT_MOCK_SCRIPT`). They need no API key or network, use the synthetic
 1280×720 display backend rather than native capture, and run in CI on macOS,
-Linux, and Windows; run them locally with `cargo test --test e2e`. Real-LLM or
-headed-display scenarios live under `tests/skills/` and are deliberately
-outside CI. See [Session Logging](./session-logging.md) for the logging/search
-coverage exercised through that real-binary suite.
+Linux, and Windows. Real-LLM or headed-display scenarios live under
+`tests/skills/` and are deliberately outside CI. See
+[Session Logging](./session-logging.md) for the logging/search coverage
+exercised through that real-binary suite.
 
 ## Runtime (standalone)
 

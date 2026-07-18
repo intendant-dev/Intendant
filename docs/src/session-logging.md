@@ -5,7 +5,8 @@
 Every `intendant` invocation gets a structured session log directory. It is the
 single source of truth for what happened in a session: a line-per-event JSONL
 stream, full per-turn artifacts, the agent's stdout/stderr, file-history
-snapshots, and (in headless/web/MCP runs) the controller's own console output.
+snapshots, and (for a controller process's bootstrap session) the controller's
+own console output.
 It serves four audiences: a human debugging after the fact, the dashboard
 replaying a session into the browser, the resume path rehydrating a
 conversation to continue work, and the message-search indexer deriving its
@@ -17,37 +18,57 @@ The implementation lives in the `session_log/` module: `mod.rs` (the
 files, voice/presence logging), `bus_events.rs` (the event-bus-driven typed
 writer methods), `replay.rs` (the JSONL → `AppEvent` inverse), and
 `history.rs` (conversation read-back and recent-entry tails). Sessions
-are fully isolated — there is no global state file; each session is one
-self-contained directory.
+keep their canonical transcript and artifacts in one self-contained directory.
+Auxiliary daemon-wide files still exist for display-name overlays, external
+wrapper bindings, deleted-session bookkeeping, and the rolling message-search
+cache; those indexes are derived/navigation state rather than a replacement
+for the per-session log.
 
 ## On-Disk Layout
 
-By default each session is a UUID-named directory under `~/.intendant/logs/`
-(verified in `SessionLog::resolve_path`). `--log-file <DIR>` overrides the
-directory outright (used to pin a session to a known path). The controller hands
-the chosen directory to the runtime subprocess via the `INTENDANT_LOG_DIR`
-environment variable, so per-command stdout/stderr land in the same place.
+By default each session is a UUID-named directory under
+`<state-root>/logs/`, where the state root is `INTENDANT_HOME` when set and
+`~/.intendant` otherwise (verified in `SessionLog::resolve_path`).
+`--log-file <DIR>` overrides the directory outright (used to pin a session to a
+known path). The controller hands the chosen directory to the runtime subprocess
+via the `INTENDANT_LOG_DIR` environment variable, so per-command stdout/stderr
+land in the same place.
+
+> **Current fallback defect:** if opening the selected directory fails, startup
+> opens `/tmp/intendant_session` for the structured `SessionLog`, but keeps the
+> original `log_dir` for `INTENDANT_LOG_DIR`, `daemon.log`, and
+> frames/recordings; it also never registers the fallback with the panic hook.
+> The fallback is therefore partial, not a reliable single replacement
+> directory.
 
 ```
-~/.intendant/logs/<uuid>/
-├── session_meta.json        # id, created_at, project_root, name, task, status, last_turn, role, rounds
+<state-root>/logs/<uuid>/
+├── session_meta.json        # id, timestamps, project/name/task/status/turn/role/rounds; optional worktree
+├── session_agent_config.json # external-backend launch pins/lineage (when applicable)
 ├── session.jsonl            # structured event log — one JSON object per line (the spine)
 ├── transcript.jsonl         # simplified {ts, role, text, tools_called?} — rebuilt at session end
 ├── conversation.jsonl       # serialized native Conversation, for --continue / --resume
+├── summary.json             # terminal task/outcome/turn-count summary
 ├── session_summary.json     # accumulated stats (duration, voice, CU tasks, tokens, errors)
-├── daemon.log               # controller stdout/stderr tee (web/headless/MCP only; Unix only)
+├── daemon.log               # process-bootstrap controller stdout/stderr tee (Unix only)
+├── fission_ledger.json      # managed-Codex fission state (when used)
+├── context_rewinds/         # managed-context rewind records/source copies (when used)
+├── model-request-traces/    # exact Codex request archive (exact mode only)
 ├── human_question           # askHuman IPC: question file (session-scoped)
 ├── human_response           # askHuman IPC: response file (session-scoped)
 ├── <nonce>_stdout.log       # runtime stdout for command nonce N  (e.g. 1_stdout.log)
 ├── <nonce>_stderr.log       # runtime stderr for command nonce N
+├── <nonce>_pty.log          # full over-cap execPty transcript (only when needed)
 ├── frames/                  # display & camera frame captures
 │   ├── frames.jsonl         #   frame manifest (id, stream, timestamp, sent_to_live)
 │   └── *.jpg                #   HQ JPEG frames
 ├── file_snapshots/          # file-watcher rewind/redo history (see Control Plane & Daemon)
 │   ├── baseline/            #   initial text-file snapshot
+│   ├── baseline_manifest.json # baseline metadata/fingerprints
 │   ├── objects/             #   content-addressed blobs (sha256-named)
-│   ├── rounds/              #   per-round artifacts
-│   └── history.json         #   rounds[], abandoned_branches[], current_head_id, next_id
+│   ├── rounds/round_<id>/manifest.json # full maps/backreferences
+│   ├── history.json         #   slim rounds/heads/branches index
+│   └── store.lock           #   advisory snapshot-store lock
 └── turns/
     ├── turn_001_messages.json    # full messages array sent to the API (debug-only, see below)
     ├── turn_001_model.txt        # full model response text
@@ -78,7 +99,9 @@ full-context dumps measured ~47% of a real fleet log store):
 
 Turn files are named `turn_{NNN}_{suffix}` with `NNN` zero-padded to three digits
 (`write_turn_file` / `append_turn_file`). Per-nonce runtime logs are named
-`{nonce}_stdout.log` / `{nonce}_stderr.log` (`agent.rs`).
+`{nonce}_stdout.log` / `{nonce}_stderr.log`; an `execPty` result larger than
+10 KiB additionally attempts to preserve its full text in `{nonce}_pty.log`
+(`agent.rs`).
 
 ### `session_meta.json`
 
@@ -101,7 +124,9 @@ Turn files are named `turn_{NNN}_{suffix}` with `NNN` zero-padded to three digit
 `role` is set for sub-agent sessions (`orchestrator`, `research`,
 `implementation`, `testing`) and is how the resume scan skips them. This file
 drives `--continue` (most-recent session for the project) and `--resume <id>`
-(by full id or prefix).
+(by full id or prefix). Worktree-backed top-level sessions also carry an
+optional `worktree` object (branch, checkout path, base root/branch/commit);
+the field is omitted for ordinary sessions.
 
 ## The `session.jsonl` Event Stream
 
@@ -133,12 +158,13 @@ The event vocabulary is broad and grows with the system. Grouped by area
 | Runtime | `agent_input`, `agent_output` |
 | Approvals | `approval`, `approval_resolved`, `auto_approved`, `human_question`, `human_response_sent` |
 | Context | `context_snapshot`, `snapshot_created`, `conversation_rolled_back`, `rolled_back`, `redone`, `history_pruned` |
-| Sessions/graph | `session_identity`, `session_relationship`, `session_attached`, `session_capabilities`, `sub_agent_result`, `presence_checkpoint` |
+| Sessions/graph | `session_identity`, `session_relationship`, `session_attached`, `session_capabilities`, `session_note`, `session_goal`, `session_vitals`, `sub_agent_result`, `presence_checkpoint` |
+| User-facing text | `user_notification`, `user_transcript` |
 | Computer use | `cu_task_start`, `cu_turn`, `cu_task_complete`, `cu_task_error` |
 | Display | `display_ready`, `display_taken`, `display_released`, `display_resize`, `debug_screen_ready`, `debug_screen_torn_down` |
-| Voice/live | `live_audio_started`, `live_audio_progress`, `live_audio_completed`, `live_usage_update`, `presence_connected`, `presence_disconnected`, `presence_log`, `presence_usage_update` |
-| Recording | `recording_started`, `recording_stopped`, `recording_error` |
-| Generic | `info`, `debug`, `error`, `tool_request`, `tool_response` |
+| Voice/live | `live_audio_started`, `live_audio_progress`, `live_audio_completed`, `live_usage_update`, `voice_log`, `presence_connected`, `presence_disconnected`, `presence_log`, `presence_usage_update` |
+| Recording | `recording_started`, `recording_stopped`, `recording_deleted`, `recording_error` |
+| Generic | `info`, `warn`, `debug`, `error`, `tool_request`, `tool_response` |
 
 Each is written by a typed method on `SessionLog` (e.g. `turn_start`,
 `model_response`, `agent_input`, `agent_output`, `approval`, `json_extracted`,
@@ -203,7 +229,8 @@ Two companion events complete the lane:
 ### Querying
 
 ```bash
-S=~/.intendant/logs/<uuid>
+STATE_ROOT="${INTENDANT_HOME:-$HOME/.intendant}"
+S="$STATE_ROOT/logs/<uuid>"
 
 # Event overview
 jq -r '.event' "$S/session.jsonl"
@@ -230,13 +257,13 @@ grep '"event":"conversation_message"' "$S/session.jsonl" \
 grep -E '"event":"(approval|approval_resolved|auto_approved)"' "$S/session.jsonl" | jq .
 
 # All sessions, newest first
-ls -lt ~/.intendant/logs/
+ls -lt "$STATE_ROOT/logs/"
 
 # Sessions for one project
-grep -l '"project_root":"/home/user/myproject"' ~/.intendant/logs/*/session_meta.json
+grep -l '"project_root":"/home/user/myproject"' "$STATE_ROOT"/logs/*/session_meta.json
 ```
 
-## `transcript.jsonl` and `session_summary.json`
+## `transcript.jsonl`, `summary.json`, and `session_summary.json`
 
 `transcript.jsonl` is a simplified, human-skimmable conversation log
 (`{ts, role, text, tools_called?}` per line). It is appended live and then fully
@@ -244,8 +271,11 @@ grep -l '"project_root":"/home/user/myproject"' ~/.intendant/logs/*/session_meta
 complete and consistent even if the live append missed anything (notably voice
 tokens, which are buffered into whole utterances before being emitted).
 
-`session_summary.json` is written at session end with accumulated statistics:
-duration, voice provider/model and connection/reconnect counts, model-turn
+`summary.json` is the compact terminal record: task, outcome, total turns,
+session id/directory, end time, and optional round count.
+
+`session_summary.json` is the distinct rich statistics record written beside
+it: duration, voice provider/model and connection/reconnect counts, model-turn
 count, computer-use task summaries, frames sent, errors, and total tokens.
 
 ## Resume and Rehydration
@@ -276,13 +306,15 @@ session supervisor resumes those through each backend's native resume token (see
 ## Multi-Session and the Session Graph
 
 A persistent daemon (an idle `--web` launch) runs many sessions over its
-lifetime, each its own `~/.intendant/logs/<uuid>/` directory. The
+lifetime, each its own `<state-root>/logs/<uuid>/` directory. The
 `session_supervisor` (see
 [Control Plane & Persistent Daemon](./control-plane-and-daemon.md)) creates these
 directories on `CreateSession`/`StartTask`, tracks which is active, and records
-parent/child relationships (`side`, `subagent`). Those relationships are also
-logged into the streams as `session_identity` and `session_relationship` events,
-which lets a consumer reconstruct the session tree purely from the logs.
+parent/child relationships. Common UI edges are `side`, `subagent`, and `fork`;
+managed lineage adds `anchor-fork`, rewind, and fission relationship kinds.
+Those relationships are logged as `session_identity` and
+`session_relationship` events, which lets a consumer reconstruct the graph
+purely from the logs.
 
 ## Session Naming and Aliasing Across Backends
 
@@ -295,9 +327,10 @@ session is an Intendant session or an external backend's. This lives in
   correctly).
 - **Intendant sessions** store the name directly in their own
   `session_meta.json` (`write_intendant_session_name`), located by id or prefix
-  under `~/.intendant/logs/`.
+  under `<state-root>/logs/`.
 - **External backends** get an **overlay**: a single
-  `~/.intendant/session_names.json`, keyed `source → { session_id → name }`. When
+  `<state-root>/session_names.json`, keyed
+  `source → { session_id → name }`. When
   the dashboard lists sessions, `apply_session_name_overlays` merges these names
   onto the listed sessions (matching on `session_id` or `resume_id`), without
   touching the backend's own files.
@@ -311,18 +344,18 @@ otherwise the overlay is used.
 
 ## The `daemon.log` Controller Tee
 
-When the controller does **not** own a real interactive TTY — i.e. web, headless,
-or MCP runs — `daemon_log_tee::install` redirects the controller's own stderr and
-stdout into `~/.intendant/logs/<uuid>/daemon.log`, prefixing each line with a
-wallclock timestamp, while still mirroring everything to the original terminal.
+Every controller process attempts `daemon_log_tee::install` once after opening
+its bootstrap session log. On Unix it redirects the controller's own stderr and
+stdout into that directory's `daemon.log`, prefixing each line with a wallclock
+timestamp, while still mirroring everything to the original terminal.
 This captures controller-side `eprintln!`, panics, and tracing that would
 otherwise never reach `session.jsonl` (which only records *agent* events). The
 dashboard's "Download session report" zip includes `daemon.log` so a tester's
 bundle is temporally analyzable by a developer.
 
-This is **Unix-only**: on Windows `install` is a no-op. It is deliberately
-**always installed** — no frontend owns the raw TTY, so routing stdout
-through the tee is always safe.
+This is **Unix-only**: on Windows `install` is a no-op. The tee is
+process-scoped, not session-supervisor-scoped: child session directories created
+inside a long-lived daemon generally do not each get another `daemon.log`.
 
 ## How the Dashboard Consumes the Logs
 
@@ -367,11 +400,12 @@ owns matching, normalization, and the resident fold arena.
 
 ### The shard store
 
-`Store::default_root()` is `~/.intendant/cache/message_search/v1`; the
-adjacent lease-staging dirs (below) share the parent:
+`Store::default_root()` is
+`<state-root>/cache/message_search/v1` (`INTENDANT_HOME` or the default
+`~/.intendant`); the adjacent lease-staging dirs (below) share the parent:
 
 ```
-~/.intendant/cache/message_search/
+<state-root>/cache/message_search/
 ├── v1/
 │   ├── manifest.json       # the single mutable file — swapped by atomic rename
 │   ├── writer.lock         # advisory O_EXCL lockfile (5-minute stale takeover)
@@ -501,7 +535,7 @@ background sweep every **30 seconds**; the first sweep runs one full interval
 after boot, so one-shot CLI runs exit before ever paying for it. Sweeps do
 real file I/O and run under `spawn_blocking`. One sweep:
 
-- enumerates `~/.intendant/logs/*/session.jsonl`, the Codex roots (the user's
+- enumerates `<state-root>/logs/*/session.jsonl`, the Codex roots (the user's
   Codex home plus leased-active homes and staged lease entries), and the
   Claude project roots (`~/.claude/projects` plus the leased/staged
   equivalents);
@@ -643,7 +677,8 @@ skip rules on the external side):
 - reasoning content (`turns/*_reasoning.txt` stays a diagnostic);
 - meta and sidecar records (Claude `isMeta`/`isCompactSummary` rows, sidecar
   state types, records without `uuid`/`timestamp`);
-- system injections — working-dir/memory/skills preludes, nudges, acks,
+- system injections — working-directory/project-instructions/skills preludes,
+  nudges, acks,
   agent-stdout-as-user, Codex machine injections, Claude harness envelopes
   (`is_injected_external_user_text`);
 - context summaries (compaction output);
