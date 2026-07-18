@@ -343,6 +343,7 @@ impl IntendantServer {
                         let mut schema =
                             serde_json::to_value(&*tool.input_schema).unwrap_or_default();
                         inline_schema_refs(&mut schema);
+                        ensure_object_typed_schema_root(&mut schema);
                         serde_json::json!({
                             "name": tool.name,
                             "description": tool.description,
@@ -2692,6 +2693,74 @@ fn resolve_refs(value: &mut serde_json::Value, defs: &serde_json::Map<String, se
     }
 }
 
+/// Force a served tool `inputSchema` root to be explicitly object-typed.
+///
+/// The MCP spec requires every tool `inputSchema` to be a JSON Schema of
+/// `"type": "object"`, and real clients enforce it: claude-code validates the
+/// whole `tools/list` result client-side and rejects the ENTIRE list when one
+/// tool's schema root is not object-typed — one bad schema costs the session
+/// every Intendant tool. schemars renders internally-tagged enums (e.g.
+/// `agenda_op`'s `AgendaCommand`) as a bare `{"oneOf": [...]}` root with no
+/// top-level `"type"`, even though every variant serializes as a JSON object
+/// by construction.
+///
+/// When the root lacks `"type"` and provably describes an object — it carries
+/// object-vocabulary keywords, or every `oneOf`/`anyOf`/`allOf` branch is
+/// itself object-shaped — inject the top-level `"type": "object"` the spec
+/// requires. Roots that already declare a `"type"`, or whose shape cannot be
+/// proven object-only, are left untouched: the serving-path pin test
+/// (`every_profile_serves_only_object_typed_tool_schemas`) fails on any tool
+/// this cannot fix, so a bad schema breaks the suite instead of shipping.
+fn ensure_object_typed_schema_root(schema: &mut serde_json::Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+    if obj.contains_key("type") {
+        return;
+    }
+    if schema_describes_object(obj) {
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
+    }
+}
+
+/// Whether a typeless JSON Schema provably validates only JSON objects.
+fn schema_describes_object(schema: &serde_json::Map<String, serde_json::Value>) -> bool {
+    // Object-vocabulary keywords only constrain (and only make sense on)
+    // object instances.
+    if [
+        "properties",
+        "required",
+        "additionalProperties",
+        "patternProperties",
+    ]
+    .iter()
+    .any(|key| schema.contains_key(*key))
+    {
+        return true;
+    }
+    // A combinator root is object-only when every branch is: schemars renders
+    // internally-tagged enums as `oneOf` over object-typed variants.
+    ["oneOf", "anyOf", "allOf"].iter().any(|key| {
+        schema
+            .get(*key)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|branches| {
+                !branches.is_empty()
+                    && branches.iter().all(|branch| {
+                        branch.as_object().is_some_and(|branch| {
+                            match branch.get("type").and_then(serde_json::Value::as_str) {
+                                Some(kind) => kind == "object",
+                                None => schema_describes_object(branch),
+                            }
+                        })
+                    })
+            })
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -4739,5 +4808,75 @@ pub(crate) mod tests {
         let original = schema.clone();
         inline_schema_refs(&mut schema);
         assert_eq!(schema, original);
+    }
+
+    #[test]
+    fn ensure_object_typed_schema_root_fixes_tagged_enum_one_of() {
+        // The schemars shape for an internally-tagged enum (agenda_op's
+        // AgendaCommand): a bare oneOf root over object variants, no
+        // top-level type — the exact shape MCP clients reject.
+        let mut schema = serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": { "op": { "type": "string", "const": "add" } },
+                    "required": ["op"]
+                },
+                {
+                    "type": "object",
+                    "properties": { "op": { "type": "string", "const": "retire" } },
+                    "required": ["op"]
+                }
+            ]
+        });
+        ensure_object_typed_schema_root(&mut schema);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["oneOf"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn ensure_object_typed_schema_root_accepts_typeless_object_vocabulary() {
+        // A typeless branch that itself carries object vocabulary (nested
+        // combinators do this) still proves the root object-only.
+        let mut schema = serde_json::json!({
+            "anyOf": [
+                { "properties": { "a": { "type": "string" } }, "required": ["a"] },
+                { "type": "object", "properties": { "b": { "type": "number" } } }
+            ]
+        });
+        ensure_object_typed_schema_root(&mut schema);
+        assert_eq!(schema["type"], "object");
+    }
+
+    #[test]
+    fn ensure_object_typed_schema_root_leaves_declared_types_alone() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } }
+        });
+        let original = schema.clone();
+        ensure_object_typed_schema_root(&mut schema);
+        assert_eq!(schema, original);
+    }
+
+    #[test]
+    fn ensure_object_typed_schema_root_never_mislabels_non_object_shapes() {
+        // A oneOf with a non-object branch genuinely admits non-object
+        // instances; injecting "type": "object" would silently invalidate
+        // that branch. Leave it for the serving-path pin test to reject.
+        let mut mixed = serde_json::json!({
+            "oneOf": [
+                { "type": "object", "properties": {} },
+                { "type": "string" }
+            ]
+        });
+        let original = mixed.clone();
+        ensure_object_typed_schema_root(&mut mixed);
+        assert_eq!(mixed, original);
+
+        // An unconstrained root proves nothing; leave it untouched.
+        let mut empty = serde_json::json!({});
+        ensure_object_typed_schema_root(&mut empty);
+        assert_eq!(empty, serde_json::json!({}));
     }
 }
