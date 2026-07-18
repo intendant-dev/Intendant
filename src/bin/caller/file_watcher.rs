@@ -645,25 +645,37 @@ fn compute_files_changed(
 /// Persist a named tempfile at `dest_path`, using an atomic rename when the
 /// tempfile is already on the destination filesystem and re-staging in the
 /// destination directory when it is not.
+///
+/// The rename goes through `std::fs::rename`, NOT `NamedTempFile::persist`:
+/// std applies Windows' `\\?\` long-path conversion to both arguments,
+/// while the crate's persist hands raw paths to `MoveFileExW`, which fails
+/// `ERROR_PATH_NOT_FOUND` the moment a path crosses `MAX_PATH` (260) —
+/// proven live by the protocol-watch store on the CI runner, whose
+/// temp-file spellings sit ~2 characters over while their targets sit
+/// under. `keep()` first so the handle is closed before the rename
+/// (Windows refuses to move a file with an open handle) and the file
+/// survives if the rename errors for the caller to report.
 pub(crate) fn persist_tempfile(
     temp_file: tempfile::NamedTempFile,
     dest_path: &Path,
 ) -> io::Result<()> {
-    match temp_file.persist(dest_path) {
-        Ok(_) => Ok(()),
-        Err(err) if err.error.kind() == io::ErrorKind::CrossesDevices => {
-            copy_tempfile_across_filesystems(err.file, dest_path)
+    let (file, temp_path) = temp_file.keep().map_err(|err| err.error)?;
+    drop(file);
+    match std::fs::rename(&temp_path, dest_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
+            copy_kept_tempfile_across_filesystems(&temp_path, dest_path)
         }
-        Err(err) => Err(err.error),
+        Err(err) => {
+            let _ = std::fs::remove_file(&temp_path);
+            Err(err)
+        }
     }
 }
 
-fn copy_tempfile_across_filesystems(
-    temp_file: tempfile::NamedTempFile,
-    dest_path: &Path,
-) -> io::Result<()> {
+fn copy_kept_tempfile_across_filesystems(temp_path: &Path, dest_path: &Path) -> io::Result<()> {
     let dest_dir = path_parent_or_cwd(dest_path);
-    let mut source = temp_file.reopen()?;
+    let mut source = std::fs::File::open(temp_path)?;
     let mut dest_temp = tempfile::Builder::new()
         .prefix(".intendant-write-")
         .suffix(".tmp")
@@ -671,7 +683,12 @@ fn copy_tempfile_across_filesystems(
     io::copy(&mut source, &mut dest_temp)?;
     dest_temp.flush()?;
     dest_temp.as_file_mut().sync_all()?;
-    dest_temp.persist(dest_path).map_err(|err| err.error)?;
+    let (dest_file, dest_temp_path) = dest_temp.keep().map_err(|err| err.error)?;
+    drop(dest_file);
+    std::fs::rename(&dest_temp_path, dest_path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&dest_temp_path);
+    })?;
+    let _ = std::fs::remove_file(temp_path);
     Ok(())
 }
 
