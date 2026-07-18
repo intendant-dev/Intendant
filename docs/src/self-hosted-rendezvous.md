@@ -559,8 +559,13 @@ The verifier fetches the logged manifest, checks the tree-head
 signature, the entry's inclusion proof, and consistency against the
 tree head pinned under the daemon state root
 (`~/.intendant/hosted-verify/<host>.json`, honoring `$INTENDANT_HOME`),
-then downloads every listed artifact exactly as a browser would and
-compares hashes — nonzero exit and a per-artifact diff on divergence.
+and the highest verified artifact-manifest index pinned beside it
+(`~/.intendant/hosted-verify/<host>.artifact-manifest.json`). A lower
+manifest index, or different manifest hash at the pinned index, is a loud
+verification failure even though that older leaf remains included in the
+append-only tree. The verifier then downloads every listed artifact exactly
+as a browser would and compares hashes — nonzero exit and a per-artifact diff
+on divergence.
 Metadata bodies, proof arrays, artifact lists, and their strings are all
 bounded before verification work. Manifests must have unique, strictly sorted
 paths and cover the stable Connect pages, installers, service worker, and brand

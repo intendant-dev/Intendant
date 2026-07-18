@@ -1016,6 +1016,8 @@ pub(crate) async fn handle_transfer_upload_chunk(
         Err(e) => {
             let status = if e.contains("too large") {
                 413
+            } else if e.contains("timed out") {
+                408
             } else if e.contains("custom-domain control became unavailable") {
                 403
             } else {

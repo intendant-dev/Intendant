@@ -247,9 +247,12 @@ pub(crate) fn public_origin_from_request(
     if classified_name.is_some_and(|classified| classified != selected_name) {
         return Err("public TLS server-name provenance does not match its lane".to_string());
     }
-    let expected = format!("https://{selected_name}");
-    if origin != expected {
-        return Err("request Host must equal the exact public TLS server name".to_string());
+    let request_name = url::Url::parse(&origin)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .ok_or_else(|| "request Host authority has no DNS name".to_string())?;
+    if request_name != selected_name {
+        return Err("request Host name must equal the exact public TLS server name".to_string());
     }
     Ok(origin)
 }
@@ -964,7 +967,7 @@ mod tests {
 
     #[test]
     fn custom_origin_requires_exact_tls_sni_and_host_agreement() {
-        let request = "GET / HTTP/1.1\r\nHost: box.example.test\r\n\r\n";
+        let request = "GET / HTTP/1.1\r\nHost: box.example.test:8443\r\n\r\n";
         assert_eq!(
             public_origin_from_request(
                 request,
@@ -974,7 +977,7 @@ mod tests {
                 Some("box.example.test"),
             )
             .unwrap(),
-            "https://box.example.test"
+            "https://box.example.test:8443"
         );
         assert!(public_origin_from_request(
             request,
@@ -997,7 +1000,7 @@ mod tests {
     #[test]
     fn public_origin_cannot_cross_or_omit_the_selected_tls_lane() {
         let custom_request = "GET / HTTP/1.1\r\nHost: box.owner.example\r\n\r\n";
-        let fleet_request = "GET / HTTP/1.1\r\nHost: d-1.fleet.example\r\n\r\n";
+        let fleet_request = "GET / HTTP/1.1\r\nHost: d-1.fleet.example:8765\r\n\r\n";
         assert_eq!(
             public_origin_from_request(
                 fleet_request,
@@ -1007,7 +1010,7 @@ mod tests {
                 None,
             )
             .unwrap(),
-            "https://d-1.fleet.example"
+            "https://d-1.fleet.example:8765"
         );
         assert!(public_origin_from_request(
             custom_request,
@@ -1054,6 +1057,15 @@ mod tests {
             "https://box.owner.example",
             "relay provenance may supply an exact public SNI before fleet classification",
         );
+        let wrong_name_same_port = "GET / HTTP/1.1\r\nHost: other.fleet.example:8765\r\n\r\n";
+        assert!(public_origin_from_request(
+            wrong_name_same_port,
+            true,
+            Some("d-1.fleet.example"),
+            Some("d-1.fleet.example"),
+            None,
+        )
+        .is_err());
     }
 
     #[test]

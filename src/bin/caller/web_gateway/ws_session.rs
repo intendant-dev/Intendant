@@ -34,6 +34,59 @@ impl WsAuthorityGuard {
     }
 }
 
+/// Send one outbound frame without letting socket backpressure postpone live
+/// authority revocation. The authority tick remains active while the sink is
+/// pending; cancellation drops the send future immediately so the inbound
+/// task can tear down display peers independently of writer progress.
+async fn send_ws_with_live_authority<S>(
+    sink: &mut S,
+    message: Message,
+    authority_guard: &WsAuthorityGuard,
+    grant: &crate::dashboard_control::DashboardControlGrant,
+    session_cancel: &CancellationToken,
+) -> Result<(), ()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    if !authority_guard.opening_authority_is_current(grant) {
+        session_cancel.cancel();
+        return Err(());
+    }
+    let send = sink.send(message);
+    tokio::pin!(send);
+    let start =
+        tokio::time::Instant::now() + crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL;
+    let mut authority_tick = tokio::time::interval_at(
+        start,
+        crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+    );
+    authority_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = session_cancel.cancelled() => return Err(()),
+            result = &mut send => return result.map_err(|_| ()),
+            _ = authority_tick.tick() => {
+                if !authority_guard.opening_authority_is_current(grant) {
+                    session_cancel.cancel();
+                    return Err(());
+                }
+            }
+        }
+    }
+}
+
+async fn send_ws_close_bounded<S>(sink: &mut S)
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let _ = tokio::time::timeout(
+        crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+        sink.send(Message::Close(None)),
+    )
+    .await;
+}
+
 fn websocket_owns_dashboard_control_session(session_ids: &[String], session_id: &str) -> bool {
     !session_id.is_empty() && session_ids.iter().any(|owned| owned == session_id)
 }
@@ -226,8 +279,8 @@ pub(crate) async fn ws_outbound_task(
             _ = session_cancel.cancelled() => break,
             _ = authority_tick.tick() => {
                 if !authority_guard.opening_authority_is_current(&grant) {
-                    let _ = ws_tx.send(Message::Close(None)).await;
                     session_cancel.cancel();
+                    send_ws_close_bounded(&mut ws_tx).await;
                     break;
                 }
             }
@@ -235,15 +288,20 @@ pub(crate) async fn ws_outbound_task(
                 match msg {
                     Some(line) => {
                         if !authority_guard.opening_authority_is_current(&grant) {
-                            let _ = ws_tx.send(Message::Close(None)).await;
                             session_cancel.cancel();
+                            send_ws_close_bounded(&mut ws_tx).await;
                             break;
                         }
                         if !grant.allows_dashboard_event_line(&line) {
                             continue;
                         }
-                        if ws_tx
-                            .send(Message::Text(line.into()))
+                        if send_ws_with_live_authority(
+                            &mut ws_tx,
+                            Message::Text(line.into()),
+                            &authority_guard,
+                            &grant,
+                            &session_cancel,
+                        )
                             .await
                             .is_err()
                         {
@@ -264,15 +322,20 @@ pub(crate) async fn ws_outbound_task(
                 match msg {
                     Some(line) => {
                         if !authority_guard.opening_authority_is_current(&grant) {
-                            let _ = ws_tx.send(Message::Close(None)).await;
                             session_cancel.cancel();
+                            send_ws_close_bounded(&mut ws_tx).await;
                             break;
                         }
                         if !grant.allows_dashboard_event_line(&line) {
                             continue;
                         }
-                        if ws_tx
-                            .send(Message::Text(line.into()))
+                        if send_ws_with_live_authority(
+                            &mut ws_tx,
+                            Message::Text(line.into()),
+                            &authority_guard,
+                            &grant,
+                            &session_cancel,
+                        )
                             .await
                             .is_err()
                         {
@@ -301,16 +364,16 @@ pub(crate) async fn ws_outbound_task(
                         // so part of the bootstrap may already be on the wire
                         // — fail closed and end the connection rather than
                         // follow a partial bootstrap with live events.
-                        let _ = ws_tx.send(Message::Close(None)).await;
                         session_cancel.cancel();
+                        send_ws_close_bounded(&mut ws_tx).await;
                         break;
                     }
                 }
             }
             msg = outbound_rx.recv(), if bootstrap_flushed => {
                 if !authority_guard.opening_authority_is_current(&grant) {
-                    let _ = ws_tx.send(Message::Close(None)).await;
                     session_cancel.cancel();
+                    send_ws_close_bounded(&mut ws_tx).await;
                     break;
                 }
                 match msg {
@@ -327,8 +390,13 @@ pub(crate) async fn ws_outbound_task(
                                 }
                             }
                         }
-                        if ws_tx
-                            .send(Message::Text(line.into()))
+                        if send_ws_with_live_authority(
+                            &mut ws_tx,
+                            Message::Text(line.into()),
+                            &authority_guard,
+                            &grant,
+                            &session_cancel,
+                        )
                             .await
                             .is_err()
                         {
@@ -377,7 +445,16 @@ pub(crate) async fn ws_outbound_task(
                         }
                         let mut send_failed = false;
                         for frame in frames {
-                            if ws_tx.send(Message::Text(frame.into())).await.is_err() {
+                            if send_ws_with_live_authority(
+                                &mut ws_tx,
+                                Message::Text(frame.into()),
+                                &authority_guard,
+                                &grant,
+                                &session_cancel,
+                            )
+                            .await
+                            .is_err()
+                            {
                                 send_failed = true;
                                 break;
                             }
@@ -397,8 +474,8 @@ pub(crate) async fn ws_outbound_task(
             // superseded revisions on drain, and the Lagged arm re-snapshots.
             msg = authority_change_rx.recv(), if bootstrap_flushed => {
                 if !authority_guard.opening_authority_is_current(&grant) {
-                    let _ = ws_tx.send(Message::Close(None)).await;
                     session_cancel.cancel();
+                    send_ws_close_bounded(&mut ws_tx).await;
                     break;
                 }
                 match msg {
@@ -430,8 +507,13 @@ pub(crate) async fn ws_outbound_task(
                             "display_id": change.display_id,
                             "state": state,
                         }).to_string();
-                        if ws_tx
-                            .send(Message::Text(frame.into()))
+                        if send_ws_with_live_authority(
+                            &mut ws_tx,
+                            Message::Text(frame.into()),
+                            &authority_guard,
+                            &grant,
+                            &session_cancel,
+                        )
                             .await
                             .is_err()
                         {
@@ -473,8 +555,13 @@ pub(crate) async fn ws_outbound_task(
                                 "display_id": did,
                                 "state": state,
                             }).to_string();
-                            if ws_tx
-                                .send(Message::Text(frame.into()))
+                            if send_ws_with_live_authority(
+                                &mut ws_tx,
+                                Message::Text(frame.into()),
+                                &authority_guard,
+                                &grant,
+                                &session_cancel,
+                            )
                                 .await
                                 .is_err()
                             {
@@ -2801,9 +2888,46 @@ mod input_authorizer_cache_tests {
 #[cfg(test)]
 mod signaling_ownership_tests {
     use super::{bind_input_authorizer_to_ws_session, websocket_owns_dashboard_control_session};
+    use futures_util::Sink;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::task::{Context, Poll};
     use tokio_util::sync::CancellationToken;
+
+    struct PendingMessageSink;
+
+    impl Sink<tokio_tungstenite::tungstenite::Message> for PendingMessageSink {
+        type Error = ();
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            _item: tokio_tungstenite::tungstenite::Message,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+    }
 
     #[test]
     fn websocket_rejects_cross_connection_dashboard_control_session_ids() {
@@ -2867,6 +2991,56 @@ mod signaling_ownership_tests {
         assert!(
             !guard.opening_authority_is_current(&grant),
             "an active custom-domain socket must lose authority with the live lane gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn backpressured_ws_send_cannot_delay_live_authority_teardown() {
+        let dir = tempfile::tempdir().unwrap();
+        let observed = Arc::new(AtomicBool::new(true));
+        let hosted = Arc::new(crate::access::hosted_control::HostedControlRuntime::new(
+            false,
+            dir.path().to_path_buf(),
+            None,
+            None,
+            String::new(),
+            false,
+        ));
+        let runtime = Arc::new(crate::custom_domain::CustomDomainRuntime::new(
+            &crate::project::CustomDomainConfig {
+                enabled: true,
+                name: Some("box.owner.example.test".to_string()),
+                ..Default::default()
+            },
+            dir.path().to_path_buf(),
+            hosted,
+            Some(Arc::clone(&observed)),
+        ));
+        let guard = super::WsAuthorityGuard::new(Some(runtime));
+        let grant = crate::dashboard_control::DashboardControlGrant::TrustedLocal;
+        let cancel = CancellationToken::new();
+        let close = Arc::clone(&observed);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            close.store(false, Ordering::SeqCst);
+        });
+        let mut sink = PendingMessageSink;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::send_ws_with_live_authority(
+                &mut sink,
+                tokio_tungstenite::tungstenite::Message::Text("blocked".into()),
+                &guard,
+                &grant,
+                &cancel,
+            ),
+        )
+        .await
+        .expect("the live authority tick must interrupt a backpressured writer");
+        assert!(result.is_err());
+        assert!(
+            cancel.is_cancelled(),
+            "peer cleanup must be released independently of writer progress"
         );
     }
 

@@ -7,7 +7,8 @@
 //! hashes them, and compares against the logged manifest — then verifies
 //! the manifest's inclusion proof against the signed tree head and the
 //! tree head's consistency against a locally pinned one under the daemon
-//! state root (`~/.intendant/hosted-verify/`, honoring `$INTENDANT_HOME`).
+//! state root (`~/.intendant/hosted-verify/`, honoring `$INTENDANT_HOME`),
+//! and rejects artifact-manifest rollback below the highest verified index.
 //!
 //! Deliberately OUT of band: page JS served by the origin can never
 //! honestly self-verify, so the checking happens from a vantage point the
@@ -511,6 +512,17 @@ struct SthPin {
     pinned_unix_ms: u64,
 }
 
+/// Highest artifact-manifest observation accepted for one rendezvous. The
+/// tree-head pin proves append-only history; this companion pin prevents a
+/// server from selecting an older, still-included bundle leaf after a newer
+/// bundle has already been verified.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ArtifactManifestPin {
+    index: u64,
+    manifest_hash: String,
+    pinned_unix_ms: u64,
+}
+
 /// One pin per rendezvous host under the daemon state root
 /// (`~/.intendant/hosted-verify/<host>.json`; `$INTENDANT_HOME` honored
 /// by `platform::intendant_home`).
@@ -534,6 +546,10 @@ fn pin_path(state_root: &Path, base: &Url) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
+fn artifact_manifest_pin_path(state_root: &Path, base: &Url) -> PathBuf {
+    pin_path(state_root, base).with_extension("artifact-manifest.json")
+}
+
 fn load_pin(path: &Path) -> Result<Option<SthPin>, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -543,6 +559,71 @@ fn load_pin(path: &Path) -> Result<Option<SthPin>, String> {
     serde_json::from_str(&text)
         .map(Some)
         .map_err(|error| format!("parse {}: {error}", path.display()))
+}
+
+fn load_artifact_manifest_pin(path: &Path) -> Result<Option<ArtifactManifestPin>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|error| format!("parse {}: {error}", path.display()))
+}
+
+fn check_artifact_manifest_high_water(
+    pin: Option<&ArtifactManifestPin>,
+    index: u64,
+    manifest_hash: &str,
+) -> Result<(), String> {
+    let Some(pin) = pin else {
+        return Ok(());
+    };
+    if index < pin.index {
+        return Err(format!(
+            "artifact manifest index regressed from pinned {} to {index}",
+            pin.index
+        ));
+    }
+    if index == pin.index && manifest_hash != pin.manifest_hash {
+        return Err(format!(
+            "artifact manifest changed at pinned index {}",
+            pin.index
+        ));
+    }
+    Ok(())
+}
+
+fn commit_artifact_manifest_pin(
+    path: &Path,
+    index: u64,
+    manifest_hash: &str,
+) -> Result<(), String> {
+    let lock_dir = pin_lock_dir(path)?;
+    crate::access::authority_store::with_lock(&lock_dir, || {
+        let current = load_artifact_manifest_pin(path).map_err(crate::access::AccessError)?;
+        check_artifact_manifest_high_water(current.as_ref(), index, manifest_hash)
+            .map_err(crate::access::AccessError)?;
+        if current
+            .as_ref()
+            .is_some_and(|pin| pin.index == index && pin.manifest_hash == manifest_hash)
+        {
+            return Ok(());
+        }
+        let pin = ArtifactManifestPin {
+            index,
+            manifest_hash: manifest_hash.to_string(),
+            pinned_unix_ms: current
+                .as_ref()
+                .map(|pin| pin.pinned_unix_ms)
+                .unwrap_or_else(now_unix_ms),
+        };
+        let text = serde_json::to_string_pretty(&pin)
+            .map_err(|error| crate::access::AccessError(error.to_string()))?;
+        crate::access::authority_store::atomic_write_private_locked(path, text.as_bytes())
+    })
+    .map_err(|error| error.to_string())
 }
 
 fn same_tree_head(left: &SthPin, right: &SthPin) -> bool {
@@ -1236,6 +1317,10 @@ pub(crate) async fn verify_hosted_bundle(
 
     // The manifest self-verifies, then the live bytes match it.
     let leaf = parse_manifest_leaf(&entry.leaf_json).map_err(verification)?;
+    let manifest_pin_file = artifact_manifest_pin_path(state_root, base);
+    let manifest_pin = load_artifact_manifest_pin(&manifest_pin_file).map_err(verification)?;
+    check_artifact_manifest_high_water(manifest_pin.as_ref(), entry.index, &leaf.manifest_hash)
+        .map_err(verification)?;
     let mismatches =
         compare_live_artifacts(&client, base, &leaf.artifacts, BUNDLE_FETCH_LIMITS).await?;
     if !mismatches.is_empty() {
@@ -1249,7 +1334,11 @@ pub(crate) async fn verify_hosted_bundle(
         });
     }
 
-    // Everything held — advance the pin.
+    // Everything held. Advance the selected-manifest high-water mark before
+    // the tree head: a crash between the writes may cause an extra
+    // consistency check, but can never reopen an older bundle observation.
+    commit_artifact_manifest_pin(&manifest_pin_file, entry.index, &leaf.manifest_hash)
+        .map_err(verification)?;
     commit_verified_pin(&client, base, &entry).await?;
 
     Ok(VerifyReport {
@@ -1878,8 +1967,9 @@ Usage: intendant hosted-verify [--connect <url>]
 Without --releases: fetches the logged artifact manifest with its
 inclusion proof and signed tree head, verifies the tree head extends the
 one pinned under the daemon state root (~/.intendant/hosted-verify/,
-honoring $INTENDANT_HOME — releases share the same pin), then downloads
-every listed artifact exactly as a browser would and compares hashes.
+honoring $INTENDANT_HOME — releases share the same tree-head pin), rejects
+rollback below the highest artifact-manifest index already verified, then
+downloads every listed artifact exactly as a browser would and compares hashes.
 Exit codes: 0 verified · 1 divergence or proof failure · 2 usage ·
 3 could not check (network / older service).";
 
@@ -3311,6 +3401,28 @@ mod tests {
             &Url::parse("https://other.example.test").unwrap(),
         );
         assert_ne!(path, other);
+    }
+
+    #[test]
+    fn artifact_manifest_high_water_rejects_rollback_and_same_index_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = Url::parse("https://connect.example.test").unwrap();
+        let path = artifact_manifest_pin_path(dir.path(), &base);
+        commit_artifact_manifest_pin(&path, 7, "newer-hash").unwrap();
+        commit_artifact_manifest_pin(&path, 7, "newer-hash").unwrap();
+
+        let rollback = commit_artifact_manifest_pin(&path, 3, "older-hash").unwrap_err();
+        assert!(rollback.contains("regressed"), "error was {rollback}");
+        let replacement = commit_artifact_manifest_pin(&path, 7, "different-hash").unwrap_err();
+        assert!(
+            replacement.contains("changed at pinned index"),
+            "error was {replacement}"
+        );
+
+        commit_artifact_manifest_pin(&path, 9, "latest-hash").unwrap();
+        let pin = load_artifact_manifest_pin(&path).unwrap().unwrap();
+        assert_eq!(pin.index, 9);
+        assert_eq!(pin.manifest_hash, "latest-hash");
     }
 
     #[test]

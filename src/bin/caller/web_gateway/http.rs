@@ -470,11 +470,12 @@ pub(crate) async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
     stream: &mut S,
     max_bytes: usize,
 ) -> Result<SpooledBody, String> {
-    stream_body_to_tempfile_inner(
+    stream_body_to_tempfile_with_deadline_and_guard(
         header_text,
         initial_request_bytes,
         stream,
         max_bytes,
+        request_body_read_timeout(max_bytes),
         false,
         || Ok(()),
     )
@@ -491,15 +492,46 @@ pub(crate) async fn stream_body_to_tempfile_with_guard<
     max_bytes: usize,
     guard: G,
 ) -> Result<SpooledBody, String> {
-    stream_body_to_tempfile_inner(
+    stream_body_to_tempfile_with_deadline_and_guard(
         header_text,
         initial_request_bytes,
         stream,
         max_bytes,
+        request_body_read_timeout(max_bytes),
         true,
         guard,
     )
     .await
+}
+
+async fn stream_body_to_tempfile_with_deadline_and_guard<
+    S: AsyncRead + Unpin,
+    G: FnMut() -> Result<(), String>,
+>(
+    header_text: &str,
+    initial_request_bytes: &[u8],
+    stream: &mut S,
+    max_bytes: usize,
+    deadline: std::time::Duration,
+    poll_guard: bool,
+    guard: G,
+) -> Result<SpooledBody, String> {
+    match tokio::time::timeout(
+        deadline,
+        stream_body_to_tempfile_inner(
+            header_text,
+            initial_request_bytes,
+            stream,
+            max_bytes,
+            poll_guard,
+            guard,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("request body read timed out".to_string()),
+    }
 }
 
 async fn stream_body_to_tempfile_inner<S: AsyncRead + Unpin, G: FnMut() -> Result<(), String>>(
@@ -1508,6 +1540,27 @@ mod tests {
             Ok(_) => panic!("the streaming body unexpectedly completed"),
         };
         assert_eq!(error, "live authority closed");
+    }
+
+    #[tokio::test]
+    async fn tempfile_stream_has_a_bounded_body_read_deadline() {
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        let header_text = "POST /api/transfers/job/chunk HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        let result = stream_body_to_tempfile_with_deadline_and_guard(
+            header_text,
+            header_text.as_bytes(),
+            &mut reader,
+            4,
+            std::time::Duration::from_millis(20),
+            false,
+            || Ok(()),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("the streaming body unexpectedly completed"),
+        };
+        assert_eq!(error, "request body read timed out");
     }
 
     #[test]
