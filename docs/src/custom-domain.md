@@ -142,7 +142,7 @@ order; a stopped owner's lease can be reclaimed without changing the order key.
 The active worker renews and rechecks its owner lease throughout DNS and ACME
 waits and before certificate side effects. The final pair write, process-local
 TLS install, and issuance-record removal run under the same authority lock and
-owner-token check, so a superseded worker cannot install after takeover.
+owner-token check, so a superseded worker cannot install after ownership transfer.
 Normal ownership replacement or a sibling-completed generation is treated as
 worker handoff, not as authority-store corruption. The built-in fleet-name CT
 comparator does not track this owner-controlled name. The sovereign-lane
