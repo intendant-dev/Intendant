@@ -642,54 +642,88 @@ fn compute_files_changed(
     changed
 }
 
-/// Persist a named tempfile at `dest_path`, using an atomic rename when the
-/// tempfile is already on the destination filesystem and re-staging in the
-/// destination directory when it is not.
-///
-/// The rename goes through `std::fs::rename`, NOT `NamedTempFile::persist`:
-/// std applies Windows' `\\?\` long-path conversion to both arguments,
-/// while the crate's persist hands raw paths to `MoveFileExW`, which fails
-/// `ERROR_PATH_NOT_FOUND` the moment a path crosses `MAX_PATH` (260) —
-/// proven live by the protocol-watch store on the CI runner, whose
-/// temp-file spellings sit ~2 characters over while their targets sit
-/// under. `keep()` first so the handle is closed before the rename
-/// (Windows refuses to move a file with an open handle) and the file
-/// survives if the rename errors for the caller to report.
-pub(crate) fn persist_tempfile(
-    temp_file: tempfile::NamedTempFile,
-    dest_path: &Path,
-) -> io::Result<()> {
-    let (file, temp_path) = temp_file.keep().map_err(|err| err.error)?;
-    drop(file);
-    match std::fs::rename(&temp_path, dest_path) {
+/// Create a uniquely named staging file inside `dest_dir`, std-only.
+/// NEVER the `tempfile` crate on this seam: its Windows `keep()`/
+/// `persist()` call `SetFileAttributesW`/`MoveFileExW` with the RAW path
+/// (no `\\?\` long-path conversion) and fail `ERROR_PATH_NOT_FOUND` the
+/// moment a path reaches `MAX_PATH` (260) — proven live by the
+/// protocol-watch store, whose staging spellings sat at exactly 260 on
+/// both CI and the fleet rig while every std operation on the same paths
+/// succeeded (std converts on every call). Created 0600 on Unix
+/// (owner-only from the first byte, per the hygiene convention).
+pub(crate) fn stage_in(dest_dir: &Path) -> io::Result<(std::fs::File, PathBuf)> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = dest_dir.join(format!(".iw-{}-{n:x}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => return Ok((file, candidate)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Atomically move a staged file (from [`stage_in`] or an equivalent
+/// closed-handle temp) onto `dest_path`: same-filesystem rename, or a
+/// re-stage + rename in the destination directory when the stage lives on
+/// another filesystem. The staged file is consumed on success and removed
+/// on failure. std-only for the same `MAX_PATH` reason as [`stage_in`].
+pub(crate) fn persist_staged(temp_path: &Path, dest_path: &Path) -> io::Result<()> {
+    match std::fs::rename(temp_path, dest_path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
-            copy_kept_tempfile_across_filesystems(&temp_path, dest_path)
+            let result = (|| {
+                let dest_dir = path_parent_or_cwd(dest_path);
+                let mut source = std::fs::File::open(temp_path)?;
+                let (mut dest_file, dest_temp_path) = stage_in(dest_dir)?;
+                let copied =
+                    io::copy(&mut source, &mut dest_file).and_then(|_| dest_file.sync_all());
+                drop(dest_file);
+                match copied {
+                    Ok(()) => std::fs::rename(&dest_temp_path, dest_path).inspect_err(|_| {
+                        let _ = std::fs::remove_file(&dest_temp_path);
+                    }),
+                    Err(err) => {
+                        let _ = std::fs::remove_file(&dest_temp_path);
+                        Err(err)
+                    }
+                }
+            })();
+            let _ = std::fs::remove_file(temp_path);
+            result
         }
         Err(err) => {
-            let _ = std::fs::remove_file(&temp_path);
+            let _ = std::fs::remove_file(temp_path);
             Err(err)
         }
     }
 }
 
-fn copy_kept_tempfile_across_filesystems(temp_path: &Path, dest_path: &Path) -> io::Result<()> {
-    let dest_dir = path_parent_or_cwd(dest_path);
-    let mut source = std::fs::File::open(temp_path)?;
-    let mut dest_temp = tempfile::Builder::new()
-        .prefix(".intendant-write-")
-        .suffix(".tmp")
-        .tempfile_in(dest_dir)?;
-    io::copy(&mut source, &mut dest_temp)?;
-    dest_temp.flush()?;
-    dest_temp.as_file_mut().sync_all()?;
-    let (dest_file, dest_temp_path) = dest_temp.keep().map_err(|err| err.error)?;
-    drop(dest_file);
-    std::fs::rename(&dest_temp_path, dest_path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&dest_temp_path);
-    })?;
-    let _ = std::fs::remove_file(temp_path);
-    Ok(())
+/// Persist a crate-made `NamedTempFile` via [`persist_staged`], bypassing
+/// the crate's raw-path Windows `keep()` (see [`stage_in`]): the handle is
+/// closed, the `TempPath` guard is forgotten (its Drop would delete by
+/// path; its `keep()` would make the raw `SetFileAttributesW` call), and
+/// the move goes through std. On Windows the persisted file may retain
+/// FILE_ATTRIBUTE_TEMPORARY (a cache hint the crate's `keep()` would have
+/// cleared with exactly the call that breaks past `MAX_PATH`); the data
+/// itself is synced by the callers before persisting.
+pub(crate) fn persist_tempfile(
+    temp_file: tempfile::NamedTempFile,
+    dest_path: &Path,
+) -> io::Result<()> {
+    let (file, temp_path) = temp_file.into_parts();
+    drop(file);
+    let path = temp_path.to_path_buf();
+    std::mem::forget(temp_path);
+    persist_staged(&path, dest_path)
 }
 
 fn path_parent_or_cwd(path: &Path) -> &Path {
@@ -711,16 +745,14 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
     };
     let parent = path_parent_or_cwd(path);
     std::fs::create_dir_all(parent).map_err(stage("create parent dir"))?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".intendant-write-")
-        .suffix(".tmp")
-        .tempfile_in(parent)
-        .map_err(stage("create temp file"))?;
-    tmp.write_all(content).map_err(stage("write temp file"))?;
-    tmp.as_file_mut()
-        .sync_all()
-        .map_err(stage("sync temp file"))?;
-    persist_tempfile(tmp, path).map_err(stage("persist temp file"))?;
+    let (mut file, temp_path) = stage_in(parent).map_err(stage("create temp file"))?;
+    let written = file.write_all(content).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(stage("write temp file")(err));
+    }
+    persist_staged(&temp_path, path).map_err(stage("persist temp file"))?;
     Ok(())
 }
 
@@ -3442,6 +3474,40 @@ async fn apply_notify_result(
 
 #[cfg(test)]
 mod tests {
+    /// atomic_write end to end at Windows-hostile lengths: destination
+    /// dir past the legacy `MAX_PATH` (260) with staging files alongside.
+    /// The 2026-07-18 queue incident: staging spellings at exactly 260
+    /// failed `ERROR_PATH_NOT_FOUND` inside the tempfile crate's raw
+    /// Win32 calls while every std op succeeded — this pins the std-only
+    /// seam on all three platforms (unix path length here is trivially
+    /// legal; the assertion earns its keep on the Windows CI legs).
+    #[test]
+    fn atomic_write_survives_max_path_hostile_lengths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut dir = tmp.path().to_path_buf();
+        while dir.as_os_str().len() < 300 {
+            dir = dir.join("dddddddddd");
+        }
+        let dest = dir.join(format!("{}.json", "f".repeat(64)));
+        super::atomic_write(&dest, b"long-path payload").unwrap();
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"long-path payload",
+            "content must round-trip at {} chars",
+            dest.as_os_str().len()
+        );
+        // Overwrite through the same seam (rename-over-existing).
+        super::atomic_write(&dest, b"second payload").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"second payload");
+        // No staging debris left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".iw-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
     use super::*;
     use tempfile::TempDir;
 
