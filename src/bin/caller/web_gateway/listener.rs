@@ -47,6 +47,38 @@ async fn accept_gateway_connection(
     }
 }
 
+async fn read_relay_source_bucket(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut line = Vec::with_capacity(52);
+    let mut byte = [0u8; 1];
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read_exact(&mut byte)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) | Err(_) => return None,
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0]);
+        if line.len() > crate::relay_tunnel::GATEWAY_RELAY_SOURCE_MAX_BYTES {
+            return None;
+        }
+    }
+    let line = std::str::from_utf8(&line).ok()?;
+    let (magic, bucket) = line.split_once(' ')?;
+    if magic != crate::relay_tunnel::GATEWAY_RELAY_SOURCE_MAGIC
+        || bucket.len() != 43
+        || !bucket
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    Some(bucket.to_string())
+}
+
 fn bind_relay_gateway_ingress(config: &crate::project::ConnectConfig) -> Option<TcpListener> {
     if !(config.enabled && config.relay_enabled) {
         return None;
@@ -1404,7 +1436,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
             let hosted_control = Arc::clone(&hosted_control);
             let custom_domain = Arc::clone(&custom_domain);
             let tls_client_cert_required = tls_client_cert_required;
-            let source_hint = peer_addr.ip().to_string();
+            let direct_source_hint = peer_addr.ip().to_string();
             let tls_failure_log_state = Arc::clone(&tls_failure_log_state);
             // `TlsAcceptor` wraps an `Arc<ServerConfig>`, so cloning is cheap
             // (one Arc bump). `None` when TLS is disabled.
@@ -1459,6 +1491,14 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                 // decrypted request head before dispatching.
                 let mut buf = [0u8; 2048];
                 let mut raw_stream = stream;
+                let source_hint = if gateway_ingress.is_reachability_relay() {
+                    let Some(bucket) = read_relay_source_bucket(&mut raw_stream).await else {
+                        return;
+                    };
+                    bucket
+                } else {
+                    direct_source_hint
+                };
                 let peeked = match raw_stream.peek(&mut buf).await {
                     Ok(n) if n > 0 => n,
                     _ => return,
@@ -3164,8 +3204,52 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
+    async fn relay_tls_request(
+        addr: std::net::SocketAddr,
+        server_cert: rustls::pki_types::CertificateDer<'static>,
+        request: &str,
+    ) -> String {
+        let mut tls = relay_tls_test_stream(addr, server_cert).await;
+        tls.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(10),
+            tls.read_to_end(&mut response),
+        )
+        .await
+        .expect("relay ingress response timed out")
+        .unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
     async fn tls_test_stream(
         addr: std::net::SocketAddr,
+        server_cert: rustls::pki_types::CertificateDer<'static>,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tls_test_stream_from_tcp(tcp, server_cert).await
+    }
+
+    async fn relay_tls_test_stream(
+        addr: std::net::SocketAddr,
+        server_cert: rustls::pki_types::CertificateDer<'static>,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tcp.write_all(
+            format!(
+                "{} {}\n",
+                crate::relay_tunnel::GATEWAY_RELAY_SOURCE_MAGIC,
+                "a".repeat(43)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        tls_test_stream_from_tcp(tcp, server_cert).await
+    }
+
+    async fn tls_test_stream_from_tcp(
+        tcp: tokio::net::TcpStream,
         server_cert: rustls::pki_types::CertificateDer<'static>,
     ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
         let mut roots = rustls::RootCertStore::empty();
@@ -3174,7 +3258,6 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
         connector.connect(server_name, tcp).await.unwrap()
     }
@@ -3338,7 +3421,7 @@ mod tests {
             "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             "GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         ] {
-            let response = tls_request(
+            let response = relay_tls_request(
                 gateway.relay_addr,
                 gateway.server_cert.clone(),
                 request,
@@ -3350,7 +3433,7 @@ mod tests {
             );
         }
 
-        let public = tls_request(
+        let public = relay_tls_request(
             gateway.relay_addr,
             gateway.server_cert.clone(),
             "GET /connect/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -3360,7 +3443,7 @@ mod tests {
             public.starts_with("HTTP/1.1 200"),
             "authority-free discovery bytes must remain reachable through the relay: {public}"
         );
-        let dark_bootstrap = tls_request(
+        let dark_bootstrap = relay_tls_request(
             gateway.relay_addr,
             gateway.server_cert.clone(),
             &hosted_http_request("GET", "/api/hosted-control/bootstrap", None),
@@ -3382,10 +3465,13 @@ mod tests {
         cleartext
             .write_all(
                 format!(
-                    "POST /mcp?mcp_token={token} HTTP/1.1\r\n\
+                    "{} {}\n\
+                     POST /mcp?mcp_token={token} HTTP/1.1\r\n\
                      Host: localhost\r\n\
                      Content-Length: 0\r\n\
-                     Connection: close\r\n\r\n"
+                     Connection: close\r\n\r\n",
+                    crate::relay_tunnel::GATEWAY_RELAY_SOURCE_MAGIC,
+                    "a".repeat(43),
                 )
                 .as_bytes(),
             )
@@ -3470,7 +3556,7 @@ mod tests {
             "the hosted gate must not replace a direct trusted dashboard: {direct_bootstrap}"
         );
 
-        let bootstrap_response = tls_request(
+        let bootstrap_response = relay_tls_request(
             gateway.relay_addr,
             gateway.server_cert.clone(),
             &hosted_http_request("GET", "/api/hosted-control/bootstrap", None),
@@ -3504,7 +3590,7 @@ mod tests {
             &input.proof_payload("daemon-test", "https://localhost"),
         );
         let create_body = serde_json::to_string(&input).unwrap();
-        let create_response = tls_request(
+        let create_response = relay_tls_request(
             gateway.relay_addr,
             gateway.server_cert.clone(),
             &hosted_http_request("POST", "/api/hosted-control/requests", Some(&create_body)),
@@ -3564,7 +3650,7 @@ mod tests {
             "signature": hosted_sign(&key, &poll_payload),
         })
         .to_string();
-        let poll_response = tls_request(
+        let poll_response = relay_tls_request(
             gateway.relay_addr,
             gateway.server_cert.clone(),
             &hosted_http_request(
@@ -3585,7 +3671,7 @@ mod tests {
         let config_request = format!(
             "GET {config_target} HTTP/1.1\r\nHost: localhost\r\n{config_headers}Connection: close\r\n\r\n"
         );
-        let config_response = tls_request(
+        let config_response = relay_tls_request(
             gateway.relay_addr,
             gateway.server_cert.clone(),
             &config_request,
@@ -3600,7 +3686,7 @@ mod tests {
         assert!(projected_config.get("presence_enabled").is_none());
         assert!(projected_config.get("connect").is_none());
 
-        let replay_response = tls_request(
+        let replay_response = relay_tls_request(
             gateway.relay_addr,
             gateway.server_cert.clone(),
             &config_request,
@@ -3611,7 +3697,7 @@ mod tests {
             "HTTP proof replay must fail: {replay_response}"
         );
 
-        let unproved = tls_request(
+        let unproved = relay_tls_request(
             gateway.relay_addr,
             gateway.server_cert.clone(),
             &hosted_http_request("GET", "/config", None),
@@ -3622,7 +3708,7 @@ mod tests {
             "unproved relay control must retain the discovery-only refusal: {unproved}"
         );
         let mcp_headers = hosted_proof_headers(&key, &lease, "POST", "/mcp", "mcp-proof");
-        let proved_mcp = tls_request(
+        let proved_mcp = relay_tls_request(
             gateway.relay_addr,
             gateway.server_cert.clone(),
             &format!(
@@ -3638,7 +3724,7 @@ mod tests {
         let ticket_target = "/api/hosted-control/ws-ticket";
         let ticket_headers =
             hosted_proof_headers(&key, &lease, "POST", ticket_target, "ticket-proof");
-        let ticket_response = tls_request(
+        let ticket_response = relay_tls_request(
             gateway.relay_addr,
             gateway.server_cert.clone(),
             &format!(
@@ -3655,7 +3741,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let tls = tls_test_stream(gateway.relay_addr, gateway.server_cert.clone()).await;
+        let tls = relay_tls_test_stream(gateway.relay_addr, gateway.server_cert.clone()).await;
         let (mut ws, upgrade) = tokio_tungstenite::client_async(
             format!("wss://localhost/?hosted_ticket={ticket}"),
             tls,
@@ -3700,7 +3786,7 @@ mod tests {
             );
         }
 
-        let reused_ticket = tls_request(
+        let reused_ticket = relay_tls_request(
             gateway.relay_addr,
             gateway.server_cert.clone(),
             &format!(

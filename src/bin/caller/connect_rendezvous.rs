@@ -388,6 +388,10 @@ fn register_nudge() -> &'static Notify {
 /// started with, so the gateway toggle can stop/restart at runtime.
 struct ClientState {
     handle: Option<JoinHandle<()>>,
+    /// Monotonic runtime-client generation. Every stop and start advances it;
+    /// task-side mutations are serialized against this value so a response
+    /// from a replaced rendezvous cannot update current authority state.
+    epoch: u64,
     dashboard_control: Option<Arc<DashboardControlRegistry>>,
     hosted_control: Option<Arc<crate::access::hosted_control::HostedControlRuntime>>,
     /// Last effective config supplied by boot or the live settings surface.
@@ -408,6 +412,7 @@ fn client_state() -> &'static Mutex<ClientState> {
     STATE.get_or_init(|| {
         Mutex::new(ClientState {
             handle: None,
+            epoch: 0,
             dashboard_control: None,
             hosted_control: None,
             effective_config: None,
@@ -415,6 +420,42 @@ fn client_state() -> &'static Mutex<ClientState> {
             fleet_zone_observed: None,
         })
     })
+}
+
+fn client_epoch_is_current(epoch: u64) -> bool {
+    client_state()
+        .lock()
+        .expect("connect client state poisoned")
+        .epoch
+        == epoch
+}
+
+fn with_current_client_epoch(epoch: u64, update: impl FnOnce()) -> bool {
+    let state = client_state()
+        .lock()
+        .expect("connect client state poisoned");
+    if state.epoch != epoch {
+        return false;
+    }
+    update();
+    true
+}
+
+/// Only enablement, destination, and explicit daemon identity are live
+/// settings. The relay/custom-domain/auth fields belong to the boot-wired
+/// runtime and take effect together on restart.
+fn live_reconfigured_connect_config(
+    current: Option<&ConnectConfig>,
+    requested: ConnectConfig,
+) -> ConnectConfig {
+    let Some(current) = current else {
+        return requested;
+    };
+    let mut effective = current.clone();
+    effective.enabled = requested.enabled;
+    effective.rendezvous_url = requested.rendezvous_url;
+    effective.daemon_id = requested.daemon_id;
+    effective
 }
 
 pub fn spawn_connect_rendezvous_client(
@@ -450,6 +491,7 @@ pub(crate) fn stop_client() {
         let mut state = client_state()
             .lock()
             .expect("connect client state poisoned");
+        state.epoch = state.epoch.wrapping_add(1);
         (state.handle.take(), state.fleet_zone_observed.clone())
     };
     if let Some(handle) = handle {
@@ -471,6 +513,12 @@ pub(crate) fn stop_client() {
 /// provided the dashboard-control registry (the gateway calling this
 /// implies it already exists).
 pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
+    let config = {
+        let state = client_state()
+            .lock()
+            .expect("connect client state poisoned");
+        live_reconfigured_connect_config(state.effective_config.as_ref(), config)
+    };
     crate::credential_leases::configure_dns_credential_child_scrub(&config.custom_domain);
     stop_client();
     if !config.enabled {
@@ -539,10 +587,14 @@ fn start_client(
     fleet_zone_observed: Arc<std::sync::atomic::AtomicBool>,
 ) {
     crate::credential_leases::configure_dns_credential_child_scrub(&config.custom_domain);
-    client_state()
-        .lock()
-        .expect("connect client state poisoned")
-        .effective_config = Some(config.clone());
+    let epoch = {
+        let mut state = client_state()
+            .lock()
+            .expect("connect client state poisoned");
+        state.epoch = state.epoch.wrapping_add(1);
+        state.effective_config = Some(config.clone());
+        state.epoch
+    };
     with_status(|status| {
         status.configured = config.enabled;
         status.env_forced = ConnectConfig::env_forced();
@@ -600,19 +652,30 @@ fn start_client(
             gateway_tcp_port,
             hosted_control,
             fleet_zone_observed,
+            epoch,
         )
         .await;
         // Natural exit (identity or HTTP-client construction failure) —
         // an abort via `stop_client` never reaches this line, but that
         // path flips the flag itself.
-        with_status(|status| {
-            status.running = false;
+        with_current_client_epoch(epoch, || {
+            with_status(|status| {
+                status.running = false;
+            });
         });
     });
-    client_state()
-        .lock()
-        .expect("connect client state poisoned")
-        .handle = Some(handle);
+    let mut handle = Some(handle);
+    {
+        let mut state = client_state()
+            .lock()
+            .expect("connect client state poisoned");
+        if state.epoch == epoch {
+            state.handle = handle.take();
+        }
+    }
+    if let Some(stale) = handle {
+        stale.abort();
+    }
 }
 
 async fn run_connect_rendezvous_client(
@@ -622,13 +685,16 @@ async fn run_connect_rendezvous_client(
     gateway_tcp_port: Option<u16>,
     hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
     fleet_zone_observed: Arc<std::sync::atomic::AtomicBool>,
+    epoch: u64,
 ) {
     let identity = match DaemonIdentity::load_or_create_default() {
         Ok(identity) => identity,
         Err(e) => {
             eprintln!("[connect] daemon identity unavailable: {e}");
-            with_status(|status| {
-                status.last_error = Some(format!("daemon identity unavailable: {e}"));
+            with_current_client_epoch(epoch, || {
+                with_status(|status| {
+                    status.last_error = Some(format!("daemon identity unavailable: {e}"));
+                });
             });
             return;
         }
@@ -650,17 +716,21 @@ async fn run_connect_rendezvous_client(
         Ok(client) => client,
         Err(e) => {
             eprintln!("[connect] failed to build HTTP client: {e}");
-            with_status(|status| {
-                status.last_error = Some(format!("failed to build HTTP client: {e}"));
+            with_current_client_epoch(epoch, || {
+                with_status(|status| {
+                    status.last_error = Some(format!("failed to build HTTP client: {e}"));
+                });
             });
             return;
         }
     };
     let retry_delay = Duration::from_millis(config.retry_delay_ms.max(100));
     eprintln!("[connect] rendezvous client enabled for daemon {daemon_id}");
-    with_status(|status| {
-        status.running = true;
-        status.daemon_id = Some(daemon_id.clone());
+    with_current_client_epoch(epoch, || {
+        with_status(|status| {
+            status.running = true;
+            status.daemon_id = Some(daemon_id.clone());
+        });
     });
 
     loop {
@@ -674,7 +744,9 @@ async fn run_connect_rendezvous_client(
         )
         .await
         {
-            Ok(response) => note_register_response(&response, &base_url, &fleet_zone_observed),
+            Ok(response) => {
+                note_register_response(&response, &base_url, &fleet_zone_observed, epoch)
+            }
             Err(RegisterError::Rejected(e)) => {
                 eprintln!(
                     "[connect] register rejected: {e} — the rendezvous refused this daemon \
@@ -682,13 +754,13 @@ async fn run_connect_rendezvous_client(
                      registration); retrying every {}s",
                     REGISTER_REJECTED_RETRY.as_secs()
                 );
-                note_register_error(&e, &fleet_zone_observed);
+                note_register_error(&e, &fleet_zone_observed, epoch);
                 tokio::time::sleep(REGISTER_REJECTED_RETRY).await;
                 continue;
             }
             Err(RegisterError::Transient(e)) => {
                 eprintln!("[connect] register failed: {e}");
-                note_register_error(&e, &fleet_zone_observed);
+                note_register_error(&e, &fleet_zone_observed, epoch);
                 tokio::time::sleep(retry_delay).await;
                 continue;
             }
@@ -704,6 +776,9 @@ async fn run_connect_rendezvous_client(
                 result = poll_next(&client, &base_url, &config, &daemon_id) => {
                     match result {
                         Ok(Some(event)) => {
+                            if !client_epoch_is_current(epoch) {
+                                return;
+                            }
                             handle_event(
                                 &client,
                                 &base_url,
@@ -713,6 +788,7 @@ async fn run_connect_rendezvous_client(
                                 &dashboard_control,
                                 gateway_tcp_port,
                                 event,
+                                epoch,
                             )
                             .await;
                             // Fall through to the refresh check below: a
@@ -728,8 +804,10 @@ async fn run_connect_rendezvous_client(
                         }
                         Err(e) => {
                             eprintln!("[connect] poll failed: {e}");
-                            with_status(|status| {
-                                status.last_error = Some(format!("poll failed: {e}"));
+                            with_current_client_epoch(epoch, || {
+                                with_status(|status| {
+                                    status.last_error = Some(format!("poll failed: {e}"));
+                                });
                             });
                             tokio::time::sleep(retry_delay).await;
                             break;
@@ -750,7 +828,7 @@ async fn run_connect_rendezvous_client(
                 .await
                 {
                     Ok(response) => {
-                        note_register_response(&response, &base_url, &fleet_zone_observed);
+                        note_register_response(&response, &base_url, &fleet_zone_observed, epoch);
                         last_register = Instant::now();
                     }
                     Err(RegisterError::Rejected(e)) => {
@@ -759,13 +837,13 @@ async fn run_connect_rendezvous_client(
                              every {}s",
                             REGISTER_REJECTED_RETRY.as_secs()
                         );
-                        note_register_error(&e, &fleet_zone_observed);
+                        note_register_error(&e, &fleet_zone_observed, epoch);
                         tokio::time::sleep(REGISTER_REJECTED_RETRY).await;
                         break;
                     }
                     Err(RegisterError::Transient(e)) => {
                         eprintln!("[connect] refresh register failed: {e}");
-                        note_register_error(&e, &fleet_zone_observed);
+                        note_register_error(&e, &fleet_zone_observed, epoch);
                         tokio::time::sleep(retry_delay).await;
                         break;
                     }
@@ -775,7 +853,17 @@ async fn run_connect_rendezvous_client(
     }
 }
 
-fn note_register_error(error: &str, fleet_zone_observed: &std::sync::atomic::AtomicBool) {
+fn note_register_error(
+    error: &str,
+    fleet_zone_observed: &std::sync::atomic::AtomicBool,
+    epoch: u64,
+) {
+    with_current_client_epoch(epoch, || {
+        note_current_register_error(error, fleet_zone_observed);
+    });
+}
+
+fn note_current_register_error(error: &str, fleet_zone_observed: &std::sync::atomic::AtomicBool) {
     fleet_zone_observed.store(false, std::sync::atomic::Ordering::SeqCst);
     with_status(|status| {
         status.registered = false;
@@ -789,6 +877,17 @@ fn note_register_error(error: &str, fleet_zone_observed: &std::sync::atomic::Ato
 /// every-60s repeat was log noise; the current code is always visible in
 /// the Access card).
 fn note_register_response(
+    response: &RegisterResponse,
+    base_url: &Url,
+    fleet_zone_observed: &std::sync::atomic::AtomicBool,
+    epoch: u64,
+) {
+    with_current_client_epoch(epoch, || {
+        note_current_register_response(response, base_url, fleet_zone_observed);
+    });
+}
+
+fn note_current_register_response(
     response: &RegisterResponse,
     base_url: &Url,
     fleet_zone_observed: &std::sync::atomic::AtomicBool,
@@ -1047,6 +1146,7 @@ async fn handle_event(
     _dashboard_control: &Arc<DashboardControlRegistry>,
     _gateway_tcp_port: Option<u16>,
     event: RendezvousEvent,
+    epoch: u64,
 ) {
     // Defense in depth for mixed-version and self-hosted deployments: the
     // current service never enqueues these events, but an older service can.
@@ -1150,51 +1250,53 @@ async fn handle_event(
                     .map_err(|e| e.to_string())
             }) {
                 Ok(()) => {
-                    // 2xx means the service verified the proof and bound
-                    // the claim — this is the moment the daemon's own
-                    // acknowledgment becomes durable truth.
-                    if let Some(user_id) = account_user_id {
-                        let record = SignedClaimRecord {
-                            claim_id: claim_id.to_string(),
-                            daemon_id: daemon_id.to_string(),
-                            rendezvous: base_origin(base_url),
-                            account_user_id: user_id,
-                            account_name: account_name.clone(),
-                            protocol: protocol.to_string(),
-                            signed_at_unix_ms: crate::access::client_key::now_unix_ms(),
-                        };
-                        store_signed_claim_record(&record);
-                        eprintln!(
-                            "[connect] route link acknowledged for {} — no IAM authority changed",
-                            if record.account_name.is_empty() {
-                                record.account_user_id.clone()
-                            } else {
-                                format!("@{}", record.account_name)
-                            }
-                        );
-                        with_status(|status| {
-                            status.claimed = Some(true);
-                            status.claimed_by_user_id = Some(record.account_user_id.clone());
-                            status.claimed_by_handle = if record.account_name.is_empty() {
-                                None
-                            } else {
-                                Some(record.account_name.clone())
+                    with_current_client_epoch(epoch, || {
+                        // 2xx means the current service verified the proof
+                        // and bound the claim — this is the moment the
+                        // daemon's own acknowledgment becomes durable truth.
+                        if let Some(user_id) = account_user_id {
+                            let record = SignedClaimRecord {
+                                claim_id: claim_id.to_string(),
+                                daemon_id: daemon_id.to_string(),
+                                rendezvous: base_origin(base_url),
+                                account_user_id: user_id,
+                                account_name: account_name.clone(),
+                                protocol: protocol.to_string(),
+                                signed_at_unix_ms: crate::access::client_key::now_unix_ms(),
                             };
-                            status.claim_binding = Some(ClaimBinding::DaemonSigned);
-                            status.claim_code = None;
-                            status.claim_url = None;
-                            status.claim_code_expires_unix_ms = None;
-                            status.signed_claim = Some(record);
-                        });
-                    } else {
-                        with_status(|status| {
-                            status.claimed = Some(true);
-                            status.claim_binding = Some(ClaimBinding::ServiceAsserted);
-                            status.claim_code = None;
-                            status.claim_url = None;
-                            status.claim_code_expires_unix_ms = None;
-                        });
-                    }
+                            store_signed_claim_record(&record);
+                            eprintln!(
+                                "[connect] route link acknowledged for {} — no IAM authority changed",
+                                if record.account_name.is_empty() {
+                                    record.account_user_id.clone()
+                                } else {
+                                    format!("@{}", record.account_name)
+                                }
+                            );
+                            with_status(|status| {
+                                status.claimed = Some(true);
+                                status.claimed_by_user_id = Some(record.account_user_id.clone());
+                                status.claimed_by_handle = if record.account_name.is_empty() {
+                                    None
+                                } else {
+                                    Some(record.account_name.clone())
+                                };
+                                status.claim_binding = Some(ClaimBinding::DaemonSigned);
+                                status.claim_code = None;
+                                status.claim_url = None;
+                                status.claim_code_expires_unix_ms = None;
+                                status.signed_claim = Some(record);
+                            });
+                        } else {
+                            with_status(|status| {
+                                status.claimed = Some(true);
+                                status.claim_binding = Some(ClaimBinding::ServiceAsserted);
+                                status.claim_code = None;
+                                status.claim_url = None;
+                                status.claim_code_expires_unix_ms = None;
+                            });
+                        }
+                    });
                 }
                 Err(e) => eprintln!("[connect] post claim proof failed: {e}"),
             }
@@ -1989,8 +2091,12 @@ mod tests {
 
         for event in events {
             assert!(hosted_control_event_refusal(&event).is_some());
+            let epoch = client_state()
+                .lock()
+                .expect("connect client state poisoned")
+                .epoch;
             handle_event(
-                &client, &base_url, &config, "daemon-1", &identity, &registry, None, event,
+                &client, &base_url, &config, "daemon-1", &identity, &registry, None, event, epoch,
             )
             .await;
             assert_eq!(tabs.snapshot(), tabs_before);
@@ -2264,7 +2370,7 @@ mod tests {
 
         let base_url = Url::parse("https://connect.example").unwrap();
         let fleet_zone_observed = std::sync::atomic::AtomicBool::new(false);
-        note_register_response(
+        note_current_register_response(
             &RegisterResponse {
                 claimed: true,
                 claimed_by_user_id: Some("alice-user-id".to_string()),
@@ -2285,10 +2391,10 @@ mod tests {
             Some(ClaimBinding::DaemonSigned)
         );
         assert!(fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
-        note_register_error("registration refresh unavailable", &fleet_zone_observed);
+        note_current_register_error("registration refresh unavailable", &fleet_zone_observed);
         assert!(!fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
 
-        note_register_response(
+        note_current_register_response(
             &RegisterResponse {
                 claimed: true,
                 claimed_by_user_id: Some("mallory-user-id".to_string()),
@@ -2316,7 +2422,7 @@ mod tests {
         // phrase; otherwise the dashboard displays an unclaimable code.
         let local_code = current_route_claim_code().unwrap();
         assert_ne!(local_code, "word-word-word");
-        note_register_response(
+        note_current_register_response(
             &RegisterResponse {
                 claimed: false,
                 claimed_by_user_id: None,
@@ -2347,7 +2453,7 @@ mod tests {
         // A new service returns null plaintext fields because it retained the
         // signed local hash. In that case the same local phrase and its
         // fragment URL are the claim surface.
-        note_register_response(
+        note_current_register_response(
             &RegisterResponse {
                 claimed: false,
                 claimed_by_user_id: None,
@@ -2373,5 +2479,67 @@ mod tests {
         // registry.
         clear_route_claim_code();
         with_status(|status| *status = ConnectStatus::default());
+    }
+
+    #[test]
+    fn live_reconfigure_preserves_boot_wired_custom_domain_and_credentials() {
+        let mut current = ConnectConfig {
+            enabled: true,
+            rendezvous_url: Some("https://old.example".to_string()),
+            auth_token: Some("boot-token".to_string()),
+            ..ConnectConfig::default()
+        };
+        current.custom_domain.enabled = true;
+        current.custom_domain.name = Some("box.example.test".to_string());
+        current.custom_domain.dns = Some(crate::project::CustomDomainDnsConfig::Cloudflare {
+            zone_id: "zone-id".to_string(),
+            token_env: Some("BOOT_DNS_API_TOKEN".to_string()),
+            propagation_delay_secs: 10,
+        });
+        let mut requested = current.clone();
+        requested.enabled = false;
+        requested.rendezvous_url = Some("https://new.example".to_string());
+        requested.auth_token = Some("changed-token".to_string());
+        requested.custom_domain.name = Some("changed.example.test".to_string());
+        requested.custom_domain.dns = Some(crate::project::CustomDomainDnsConfig::Cloudflare {
+            zone_id: "changed-zone".to_string(),
+            token_env: Some("CHANGED_DNS_API_TOKEN".to_string()),
+            propagation_delay_secs: 20,
+        });
+
+        let effective = live_reconfigured_connect_config(Some(&current), requested);
+        assert!(!effective.enabled);
+        assert_eq!(
+            effective.rendezvous_url.as_deref(),
+            Some("https://new.example")
+        );
+        assert_eq!(effective.auth_token.as_deref(), Some("boot-token"));
+        assert_eq!(
+            effective.custom_domain.name.as_deref(),
+            Some("box.example.test")
+        );
+        assert_eq!(
+            effective
+                .custom_domain
+                .dns_credential_env_for_child_scrub()
+                .as_deref(),
+            Some("BOOT_DNS_API_TOKEN")
+        );
+    }
+
+    #[test]
+    fn stale_client_epoch_cannot_fold_a_register_response() {
+        let current_epoch = {
+            let state = client_state()
+                .lock()
+                .expect("connect client state poisoned");
+            state.epoch
+        };
+        let stale_epoch = current_epoch.wrapping_sub(1);
+        let folded = std::sync::atomic::AtomicBool::new(false);
+        with_current_client_epoch(stale_epoch, || {
+            folded.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(!folded.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

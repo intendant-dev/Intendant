@@ -310,7 +310,9 @@ Connect ever terminating TLS or seeing plaintext:
   the daemon **dials back** a data connection carrying that nonce. The
   relay correlates the two and splices them 1:1. On the daemon side the
   tunnel opens a second connection to a dedicated, ephemeral,
-  loopback-only gateway ingress instead of the public gateway listener.
+  loopback-only gateway ingress instead of the public gateway listener. Each
+  fallback or exact-name queue has its own wake signal, so activity for one
+  route does not wake parked polls for unrelated routes.
 - Control protocol v2 also binds a normalized, sorted list of exact custom
   names and a process-stable poller id into that daemon signature. Exact-name
   liveness and dialbacks remain attached to the v2 poller that supplied the
@@ -359,7 +361,10 @@ Deployment notes:
   substituted address verbatim.
 - Abuse is bounded by pre-demux global and per-source-IP connection caps,
   a per-tunnel cap, a per-connection byte cap, idle teardown, and a bounded
-  dial-back wait.
+  dial-back wait. For daemon-local public-ceremony admission, the relay maps
+  each route and browser source address to a process-salted opaque bucket and
+  carries that bucket beside the dialback nonce. The gateway uses it only for
+  availability fairness; it never participates in identity or authority.
 
 A daemon opts in through `[connect] relay_enabled` + `relay_endpoint`
 (see the configuration reference). It then holds the control channel,
@@ -525,9 +530,11 @@ tree head pinned under the daemon state root
 then downloads every listed artifact exactly as a browser would and
 compares hashes — nonzero exit and a per-artifact diff on divergence.
 Metadata bodies, proof arrays, artifact lists, and their strings are all
-bounded before verification work. Verification fetches do not follow HTTP
-redirects, so a served log response cannot turn the monitor into a request to
-another origin, loopback, link-local, or LAN service.
+bounded before verification work. Each artifact is capped at 64 MiB; one
+manifest run is additionally capped at 256 MiB and five minutes, with bounded
+response-header and between-chunk idle waits. Verification fetches do not
+follow HTTP redirects, so a served log response cannot turn the monitor into a
+request to another origin, loopback, link-local, or LAN service.
 Every daemon with Connect enabled also runs this check on boot and then
 daily as an advisory tripwire (the CT tripwire's sibling): a divergence flips
 `hosted_bundle_state` to `alert` on the Connect status payload and
@@ -593,7 +600,10 @@ GitHub release's asset *metadata* — names, sizes, and the sha256
 digests the API reports — without downloading multi-hundred-MB
 artifacts; assets on the release that the log never blessed are flagged
 too. `--download` upgrades to fetching every artifact and hashing it
-against the log — the strongest check. With an explicit tag, a release
+against the log — the strongest check. Release downloads permit progressing
+large transfers up to the per-artifact cap instead of imposing the metadata
+client's short total timeout; connection, response-header, and between-chunk
+idle waits remain bounded. With an explicit tag, a release
 absent from the log is a failure (exit 1): an unlogged release is
 exactly what the check exists to catch. (`--repo <owner/name>` points
 self-hosted forks at their own repository, and the optional

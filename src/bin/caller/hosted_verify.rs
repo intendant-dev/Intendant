@@ -620,10 +620,15 @@ fn pin_decision(pin: Option<&SthPin>, sth: &Sth) -> Result<PinDecision, String> 
 /// Bundle artifacts are ≤ a few MB; anything past this cap is already a
 /// divergence, not a download worth finishing.
 const ARTIFACT_BYTE_CAP: usize = 64 * 1024 * 1024;
+/// Bound a whole manifest independently of its artifact count.
+const BUNDLE_TOTAL_BYTE_CAP: usize = 256 * 1024 * 1024;
+const BUNDLE_TOTAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const ARTIFACT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const ARTIFACT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 enum ArtifactFetch {
-    Hashed { sha256_hex: String },
+    Hashed { sha256_hex: String, bytes: usize },
     HttpStatus(u16),
     TooLarge,
 }
@@ -631,8 +636,8 @@ enum ArtifactFetch {
 /// The per-artifact verdict: `None` = matches the log.
 fn artifact_mismatch(artifact: &ManifestArtifact, fetched: &ArtifactFetch) -> Option<String> {
     match fetched {
-        ArtifactFetch::Hashed { sha256_hex } if *sha256_hex == artifact.sha256 => None,
-        ArtifactFetch::Hashed { sha256_hex } => Some(format!(
+        ArtifactFetch::Hashed { sha256_hex, .. } if *sha256_hex == artifact.sha256 => None,
+        ArtifactFetch::Hashed { sha256_hex, .. } => Some(format!(
             "{}: manifest {} · served {}",
             artifact.path,
             short_hash(&artifact.sha256),
@@ -697,9 +702,11 @@ fn http_client() -> Result<reqwest::Client, String> {
 fn release_download_client() -> Result<reqwest::Client, String> {
     // GitHub release assets normally redirect to its object store. This
     // client is used only for a URL returned by the separately fetched
-    // GitHub release API, never for Connect-controlled metadata.
+    // GitHub release API, never for Connect-controlled metadata. Large
+    // artifacts have no short total timeout; the fetcher below separately
+    // bounds connection/header wait and idle time between body chunks.
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::limited(5))
         .user_agent("intendant-hosted-verify")
         .build()
@@ -803,22 +810,50 @@ async fn fetch_artifact(
     url: Url,
     byte_cap: usize,
 ) -> Result<ArtifactFetch, String> {
+    fetch_artifact_with_timeouts(
+        client,
+        url,
+        byte_cap,
+        ARTIFACT_RESPONSE_TIMEOUT,
+        ARTIFACT_IDLE_TIMEOUT,
+    )
+    .await
+}
+
+async fn fetch_artifact_with_timeouts(
+    client: &reqwest::Client,
+    url: Url,
+    byte_cap: usize,
+    response_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<ArtifactFetch, String> {
     use futures_util::StreamExt as _;
-    let response = client
-        .get(url.clone())
-        .send()
+    let response = tokio::time::timeout(response_timeout, client.get(url.clone()).send())
         .await
+        .map_err(|_| format!("GET {url}: response headers timed out"))?
         .map_err(|e| format!("GET {url}: {e}"))?;
     let status = response.status();
     if !status.is_success() {
         return Ok(ArtifactFetch::HttpStatus(status.as_u16()));
     }
+    if response
+        .content_length()
+        .is_some_and(|length| length > byte_cap as u64)
+    {
+        return Ok(ArtifactFetch::TooLarge);
+    }
     let mut hasher = Sha256::new();
     let mut total = 0usize;
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = tokio::time::timeout(idle_timeout, stream.next())
+            .await
+            .map_err(|_| format!("GET {url}: response body became idle"))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
         let chunk = chunk.map_err(|e| format!("GET {url}: {e}"))?;
-        total += chunk.len();
+        total = total.saturating_add(chunk.len());
         if total > byte_cap {
             return Ok(ArtifactFetch::TooLarge);
         }
@@ -827,7 +862,83 @@ async fn fetch_artifact(
     let digest: [u8; 32] = hasher.finalize().into();
     Ok(ArtifactFetch::Hashed {
         sha256_hex: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        bytes: total,
     })
+}
+
+#[derive(Clone, Copy)]
+struct BundleFetchLimits {
+    per_artifact_bytes: usize,
+    total_bytes: usize,
+    total_timeout: Duration,
+    response_timeout: Duration,
+    idle_timeout: Duration,
+}
+
+const BUNDLE_FETCH_LIMITS: BundleFetchLimits = BundleFetchLimits {
+    per_artifact_bytes: ARTIFACT_BYTE_CAP,
+    total_bytes: BUNDLE_TOTAL_BYTE_CAP,
+    total_timeout: BUNDLE_TOTAL_TIMEOUT,
+    response_timeout: ARTIFACT_RESPONSE_TIMEOUT,
+    idle_timeout: ARTIFACT_IDLE_TIMEOUT,
+};
+
+async fn compare_live_artifacts(
+    client: &reqwest::Client,
+    base: &Url,
+    artifacts: &[ManifestArtifact],
+    limits: BundleFetchLimits,
+) -> Result<Vec<String>, VerifyFailure> {
+    use VerifyFailure::Unavailable;
+
+    let compare = async {
+        let mut mismatches = Vec::new();
+        let mut fetched_bytes = 0usize;
+        for artifact in artifacts {
+            let remaining = limits
+                .total_bytes
+                .checked_sub(fetched_bytes)
+                .filter(|n| *n > 0)
+                .ok_or_else(|| {
+                    Unavailable(
+                        "hosted bundle verification reached its aggregate byte budget".to_string(),
+                    )
+                })?;
+            let fetch_cap = limits.per_artifact_bytes.min(remaining);
+            let url =
+                crate::connect_rendezvous::join_url(base, &artifact.path).map_err(Unavailable)?;
+            let fetched = fetch_artifact_with_timeouts(
+                client,
+                url,
+                fetch_cap,
+                limits.response_timeout,
+                limits.idle_timeout,
+            )
+            .await
+            .map_err(Unavailable)?;
+            match &fetched {
+                ArtifactFetch::Hashed { bytes, .. } => {
+                    fetched_bytes = fetched_bytes.saturating_add(*bytes);
+                }
+                ArtifactFetch::TooLarge if fetch_cap < limits.per_artifact_bytes => {
+                    return Err(Unavailable(
+                        "hosted bundle verification reached its aggregate byte budget".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+            if let Some(diff) = artifact_mismatch(artifact, &fetched) {
+                mismatches.push(diff);
+            }
+        }
+        Ok(mismatches)
+    };
+
+    tokio::time::timeout(limits.total_timeout, compare)
+        .await
+        .map_err(|_| {
+            Unavailable("hosted bundle verification reached its aggregate time budget".to_string())
+        })?
 }
 
 /// A log-endpoint response carried through the shared first half of the
@@ -1089,16 +1200,8 @@ pub(crate) async fn verify_hosted_bundle(
 
     // The manifest self-verifies, then the live bytes match it.
     let leaf = parse_manifest_leaf(&entry.leaf_json).map_err(verification)?;
-    let mut mismatches = Vec::new();
-    for artifact in &leaf.artifacts {
-        let url = crate::connect_rendezvous::join_url(base, &artifact.path).map_err(Unavailable)?;
-        let fetched = fetch_artifact(&client, url, ARTIFACT_BYTE_CAP)
-            .await
-            .map_err(Unavailable)?;
-        if let Some(diff) = artifact_mismatch(artifact, &fetched) {
-            mismatches.push(diff);
-        }
-    }
+    let mismatches =
+        compare_live_artifacts(&client, base, &leaf.artifacts, BUNDLE_FETCH_LIMITS).await?;
     if !mismatches.is_empty() {
         return Err(Verification {
             summary: format!(
@@ -1554,10 +1657,10 @@ pub(crate) async fn verify_hosted_release(
                 .await
                 .map_err(Unavailable)?
             {
-                ArtifactFetch::Hashed { sha256_hex } if sha256_hex == artifact.sha256 => {
+                ArtifactFetch::Hashed { sha256_hex, .. } if sha256_hex == artifact.sha256 => {
                     downloaded += 1;
                 }
-                ArtifactFetch::Hashed { sha256_hex } => mismatches.push(format!(
+                ArtifactFetch::Hashed { sha256_hex, .. } => mismatches.push(format!(
                     "{}: logged sha256 {} · downloaded {}",
                     artifact.name,
                     short_hash(&artifact.sha256),
@@ -2337,7 +2440,8 @@ mod tests {
             artifact_mismatch(
                 &expected,
                 &ArtifactFetch::Hashed {
-                    sha256_hex: sha256_hex(b"the logged bundle")
+                    sha256_hex: sha256_hex(b"the logged bundle"),
+                    bytes: b"the logged bundle".len(),
                 }
             ),
             None
@@ -2346,6 +2450,7 @@ mod tests {
             &expected,
             &ArtifactFetch::Hashed {
                 sha256_hex: sha256_hex(b"a different bundle"),
+                bytes: b"a different bundle".len(),
             },
         )
         .unwrap();
@@ -2359,6 +2464,120 @@ mod tests {
         assert!(artifact_mismatch(&expected, &ArtifactFetch::TooLarge)
             .unwrap()
             .contains("exceeded"));
+    }
+
+    async fn spawn_artifact_budget_server() -> (Url, tokio::task::JoinHandle<()>) {
+        let router = axum::Router::new()
+            .route(
+                "/one",
+                axum::routing::get(|| async { axum::body::Bytes::from_static(b"abc") }),
+            )
+            .route(
+                "/two",
+                axum::routing::get(|| async { axum::body::Bytes::from_static(b"def") }),
+            )
+            .route(
+                "/slow",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    axum::body::Bytes::from_static(b"x")
+                }),
+            )
+            .route(
+                "/stream",
+                axum::routing::get(|| async {
+                    let stream = futures_util::stream::unfold(0usize, |index| async move {
+                        if index == 6 {
+                            return None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(15)).await;
+                        Some((
+                            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"x")),
+                            index + 1,
+                        ))
+                    });
+                    axum::body::Body::from_stream(stream)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (Url::parse(&format!("http://{address}/")).unwrap(), server)
+    }
+
+    #[tokio::test]
+    async fn bundle_fetch_enforces_aggregate_byte_and_time_budgets() {
+        let (base, server) = spawn_artifact_budget_server().await;
+        let client = http_client().unwrap();
+        let artifacts = [
+            ManifestArtifact {
+                path: "/one".to_string(),
+                sha256: sha256_hex(b"abc"),
+            },
+            ManifestArtifact {
+                path: "/two".to_string(),
+                sha256: sha256_hex(b"def"),
+            },
+        ];
+        let limits = BundleFetchLimits {
+            per_artifact_bytes: 64,
+            total_bytes: 5,
+            total_timeout: Duration::from_secs(1),
+            response_timeout: Duration::from_secs(1),
+            idle_timeout: Duration::from_secs(1),
+        };
+        match compare_live_artifacts(&client, &base, &artifacts, limits).await {
+            Err(VerifyFailure::Unavailable(error)) => {
+                assert!(error.contains("aggregate byte budget"), "{error}");
+            }
+            other => panic!("aggregate byte budget must stop the fetch, got {other:?}"),
+        }
+
+        let slow = [ManifestArtifact {
+            path: "/slow".to_string(),
+            sha256: sha256_hex(b"x"),
+        }];
+        let limits = BundleFetchLimits {
+            total_bytes: 64,
+            total_timeout: Duration::from_millis(10),
+            ..limits
+        };
+        match compare_live_artifacts(&client, &base, &slow, limits).await {
+            Err(VerifyFailure::Unavailable(error)) => {
+                assert!(error.contains("aggregate time budget"), "{error}");
+            }
+            other => panic!("aggregate time budget must stop the fetch, got {other:?}"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn release_download_accepts_a_progressing_stream_without_a_short_total_timeout() {
+        let (base, server) = spawn_artifact_budget_server().await;
+        let client = release_download_client().unwrap();
+        let url = base.join("stream").unwrap();
+        let fetched = fetch_artifact_with_timeouts(
+            &client,
+            url,
+            64,
+            Duration::from_secs(1),
+            Duration::from_millis(40),
+        )
+        .await
+        .unwrap();
+        match fetched {
+            ArtifactFetch::Hashed {
+                sha256_hex: digest,
+                bytes,
+            } => {
+                assert_eq!(bytes, 6);
+                assert_eq!(digest, sha256_hex(b"xxxxxx"));
+            }
+            other => panic!("progressing stream must hash successfully, got {other:?}"),
+        }
+        server.abort();
     }
 
     #[test]

@@ -255,15 +255,23 @@ fn sni_route_label(sni: &str) -> Option<String> {
 
 struct ExactTunnelSession {
     last_seen_unix_ms: u64,
-    pending: VecDeque<String>,
+    pending: VecDeque<PendingDialback>,
+    notify: Arc<Notify>,
     server_names: Vec<String>,
 }
 
 /// A daemon label's fallback presence plus independently proved v2 pollers.
 struct TunnelEntry {
     fallback_last_seen_unix_ms: u64,
-    fallback_pending: VecDeque<String>,
+    fallback_pending: VecDeque<PendingDialback>,
+    fallback_notify: Arc<Notify>,
     exact_sessions: HashMap<String, ExactTunnelSession>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingDialback {
+    nonce: String,
+    source_bucket: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -297,8 +305,9 @@ pub(crate) struct RelayState {
     tunnels: StdMutex<HashMap<String, TunnelEntry>>,
     /// nonce -> the browser splicer waiting for the daemon's dial-back.
     pending_dialbacks: StdMutex<HashMap<String, oneshot::Sender<(TcpStream, ConnectionGuard)>>>,
-    /// Wakes parked control polls when a nonce is enqueued for them.
-    control_notify: Notify,
+    /// Per-process salt for availability-only source buckets returned to a
+    /// daemon. The opaque value is used only for admission fairness.
+    source_bucket_salt: String,
     /// Global and per-source-IP raw-socket admission, taken before protocol
     /// demux and retained for the physical connection's lifetime.
     connection_admission: StdMutex<ConnectionAdmission>,
@@ -309,7 +318,7 @@ pub(crate) struct RelayState {
 }
 
 enum PendingPoll {
-    Nonce(String),
+    Dialback(PendingDialback),
     Woken,
     TimedOut,
     RegistrationRejected,
@@ -332,7 +341,7 @@ impl RelayState {
             advertise_addrs,
             tunnels: StdMutex::new(HashMap::new()),
             pending_dialbacks: StdMutex::new(HashMap::new()),
-            control_notify: Notify::new(),
+            source_bucket_salt: random_b64u(32),
             connection_admission: StdMutex::new(ConnectionAdmission::default()),
             tunnel_splices: StdMutex::new(HashMap::new()),
             name_proof_roots,
@@ -377,6 +386,7 @@ impl RelayState {
             .or_insert_with(|| TunnelEntry {
                 fallback_last_seen_unix_ms: now,
                 fallback_pending: VecDeque::new(),
+                fallback_notify: Arc::new(Notify::new()),
                 exact_sessions: HashMap::new(),
             });
         entry.exact_sessions.retain(|_, session| {
@@ -400,6 +410,7 @@ impl RelayState {
                 .or_insert_with(|| ExactTunnelSession {
                     last_seen_unix_ms: now,
                     pending: VecDeque::new(),
+                    notify: Arc::new(Notify::new()),
                     server_names: Vec::new(),
                 });
             session.last_seen_unix_ms = now;
@@ -409,7 +420,7 @@ impl RelayState {
     }
 
     /// Pop the next unclaimed dial-back nonce for a tunnel, if any.
-    fn pop_pending(&self, label: &str, poller_id: Option<&str>) -> Option<String> {
+    fn pop_pending(&self, label: &str, poller_id: Option<&str>) -> Option<PendingDialback> {
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
         let entry = tunnels.get_mut(label)?;
         if let Some(poller_id) = poller_id {
@@ -424,6 +435,19 @@ impl RelayState {
         entry.fallback_pending.pop_front()
     }
 
+    fn pending_notify(&self, label: &str, poller_id: Option<&str>) -> Option<Arc<Notify>> {
+        let tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+        let entry = tunnels.get(label)?;
+        poller_id
+            .and_then(|poller_id| {
+                entry
+                    .exact_sessions
+                    .get(poller_id)
+                    .map(|session| Arc::clone(&session.notify))
+            })
+            .or_else(|| Some(Arc::clone(&entry.fallback_notify)))
+    }
+
     async fn pop_pending_or_wait(
         &self,
         label: &str,
@@ -431,14 +455,17 @@ impl RelayState {
         remaining: Duration,
         before_park: impl FnOnce() -> bool,
     ) -> PendingPoll {
-        // `notify_waiters` carries no stored permit. Enable the waiter before
-        // observing the queue and before refreshing registration so an
-        // enqueue at either boundary cannot strand this poll.
-        let notified = self.control_notify.notified();
+        let Some(notify) = self.pending_notify(label, poller_id) else {
+            return PendingPoll::RegistrationRejected;
+        };
+        // Enable the keyed waiter before observing the queue and before
+        // refreshing registration so an enqueue at either boundary cannot
+        // strand this poll. `notify_one` also retains one permit.
+        let notified = notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if let Some(nonce) = self.pop_pending(label, poller_id) {
-            return PendingPoll::Nonce(nonce);
+        if let Some(dialback) = self.pop_pending(label, poller_id) {
+            return PendingPoll::Dialback(dialback);
         }
         if !before_park() {
             return PendingPoll::RegistrationRejected;
@@ -518,20 +545,43 @@ impl RelayState {
 
     /// Queue a dial-back nonce for a tunnel's control poll. Fails closed if the
     /// tunnel is not active or its queue is at capacity.
-    fn enqueue_dialback(&self, route: &TunnelRoute, nonce: String, now: u64) -> bool {
+    fn enqueue_dialback(
+        &self,
+        route: &TunnelRoute,
+        nonce: String,
+        source_ip: IpAddr,
+        now: u64,
+    ) -> bool {
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
         let Some(entry) = tunnels.get_mut(route.label()) else {
             return false;
         };
-        let queued = match route {
+        let source_bucket = self.source_bucket(route.label(), source_ip);
+        let dialback = PendingDialback {
+            nonce,
+            source_bucket,
+        };
+        let notifies = match route {
             TunnelRoute::Fallback { .. } => {
                 if now.saturating_sub(entry.fallback_last_seen_unix_ms) > RELAY_TUNNEL_LIVENESS_MS
                     || entry.fallback_pending.len() >= RELAY_MAX_PENDING_PER_TUNNEL
                 {
-                    false
+                    None
                 } else {
-                    entry.fallback_pending.push_back(nonce);
-                    true
+                    entry.fallback_pending.push_back(dialback);
+                    // A v2 poller consumes both its exact-name queue and the
+                    // daemon-label fallback queue. Wake every eligible poller
+                    // for this one daemon, while keeping unrelated tunnels
+                    // fully isolated.
+                    let mut notifies = Vec::with_capacity(1 + entry.exact_sessions.len());
+                    notifies.push(Arc::clone(&entry.fallback_notify));
+                    notifies.extend(
+                        entry
+                            .exact_sessions
+                            .values()
+                            .map(|session| Arc::clone(&session.notify)),
+                    );
+                    Some(notifies)
                 }
             }
             TunnelRoute::Exact { poller_id, .. } => {
@@ -541,19 +591,31 @@ impl RelayState {
                 if now.saturating_sub(session.last_seen_unix_ms) > RELAY_TUNNEL_LIVENESS_MS
                     || session.pending.len() >= RELAY_MAX_PENDING_PER_TUNNEL
                 {
-                    false
+                    None
                 } else {
-                    session.pending.push_back(nonce);
-                    true
+                    session.pending.push_back(dialback);
+                    Some(vec![Arc::clone(&session.notify)])
                 }
             }
         };
-        if !queued {
+        let Some(notifies) = notifies else {
             return false;
-        }
+        };
         drop(tunnels);
-        self.control_notify.notify_waiters();
+        for notify in notifies {
+            notify.notify_one();
+        }
         true
+    }
+
+    fn source_bucket(&self, label: &str, source_ip: IpAddr) -> String {
+        sha256_b64u(
+            format!(
+                "intendant-relay-source-v1\n{}\n{label}\n{source_ip}\n",
+                self.source_bucket_salt
+            )
+            .as_bytes(),
+        )
     }
 
     /// Drop tunnels whose control channel has gone quiet, and reap any nonces
@@ -1042,10 +1104,13 @@ pub(crate) async fn relay_next(
             })
             .await
         {
-            PendingPoll::Nonce(nonce) => {
+            PendingPoll::Dialback(dialback) => {
                 return Ok(Json(json!({
                     "ok": true,
-                    "dialback": { "nonce": nonce },
+                    "dialback": {
+                        "nonce": dialback.nonce,
+                        "source_bucket": dialback.source_bucket,
+                    },
                 }))
                 .into_response());
             }
@@ -1262,7 +1327,7 @@ async fn peek_first_byte_until(stream: &TcpStream, deadline: tokio::time::Instan
 async fn handle_browser_connection(
     relay: Arc<RelayState>,
     stream: TcpStream,
-    _connection_guard: ConnectionGuard,
+    connection_guard: ConnectionGuard,
 ) {
     let sni = match peek_sni(&stream).await {
         Some(sni) => sni,
@@ -1287,7 +1352,7 @@ async fn handle_browser_connection(
             .expect("relay dialbacks poisoned");
         pending.insert(nonce.clone(), tx);
     }
-    if !relay.enqueue_dialback(&route, nonce.clone(), now) {
+    if !relay.enqueue_dialback(&route, nonce.clone(), connection_guard.ip, now) {
         relay
             .pending_dialbacks
             .lock()
@@ -1725,14 +1790,15 @@ mod tests {
             label: "d-live".to_string(),
         };
         // No tunnel yet: enqueue refuses.
-        assert!(!relay.enqueue_dialback(&route, "n0".to_string(), now));
+        let source_ip = "198.51.100.10".parse().unwrap();
+        assert!(!relay.enqueue_dialback(&route, "n0".to_string(), source_ip, now));
         assert!(relay.touch_tunnel("d-live", now, None, None));
         assert!(relay.tunnel_active("d-live", now));
         for i in 0..RELAY_MAX_PENDING_PER_TUNNEL {
-            assert!(relay.enqueue_dialback(&route, format!("n{i}"), now));
+            assert!(relay.enqueue_dialback(&route, format!("n{i}"), source_ip, now));
         }
         assert!(
-            !relay.enqueue_dialback(&route, "overflow".to_string(), now),
+            !relay.enqueue_dialback(&route, "overflow".to_string(), source_ip, now),
             "the pending queue is capped"
         );
         // A stale tunnel is inactive and unroutable.
@@ -1812,15 +1878,99 @@ mod tests {
         };
         let outcome = relay
             .pop_pending_or_wait(label, None, Duration::from_millis(20), || {
-                assert!(relay.enqueue_dialback(&route, "nonce-after-pop".to_string(), now));
+                assert!(relay.enqueue_dialback(
+                    &route,
+                    "nonce-after-pop".to_string(),
+                    "198.51.100.10".parse().unwrap(),
+                    now,
+                ));
                 true
             })
             .await;
         assert!(matches!(outcome, PendingPoll::Woken));
         assert_eq!(
-            relay.pop_pending(label, None).as_deref(),
+            relay
+                .pop_pending(label, None)
+                .as_ref()
+                .map(|dialback| dialback.nonce.as_str()),
             Some("nonce-after-pop")
         );
+    }
+
+    #[tokio::test]
+    async fn dialback_wakes_only_the_target_tunnel_queue() {
+        let relay = relay_state();
+        let now = now_unix_ms();
+        let first = "d-11111111111111111111";
+        let second = "d-22222222222222222222";
+        assert!(relay.touch_tunnel(first, now, None, None));
+        assert!(relay.touch_tunnel(second, now, None, None));
+        let second_notify = relay.pending_notify(second, None).unwrap();
+        let unrelated = second_notify.notified();
+        tokio::pin!(unrelated);
+        unrelated.as_mut().enable();
+
+        assert!(relay.enqueue_dialback(
+            &TunnelRoute::Fallback {
+                label: first.to_string(),
+            },
+            "target-nonce".to_string(),
+            "198.51.100.10".parse().unwrap(),
+            now,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), unrelated)
+                .await
+                .is_err(),
+            "an unrelated tunnel poll must remain parked"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_dialback_wakes_an_exact_poller_for_the_same_tunnel() {
+        let relay = relay_state();
+        let now = now_unix_ms();
+        let label = "d-11111111111111111111";
+        let poller = "11111111111111111111111111111111";
+        let names = ["box.example.test".to_string()];
+        assert!(relay.touch_tunnel(label, now, Some(poller), Some(&names)));
+        let exact_notify = relay.pending_notify(label, Some(poller)).unwrap();
+        let notified = exact_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        assert!(relay.enqueue_dialback(
+            &TunnelRoute::Fallback {
+                label: label.to_string(),
+            },
+            "fallback-nonce".to_string(),
+            "198.51.100.10".parse().unwrap(),
+            now,
+        ));
+        tokio::time::timeout(Duration::from_millis(20), notified)
+            .await
+            .expect("the exact poller also serves its daemon-label fallback");
+        assert_eq!(
+            relay
+                .pop_pending(label, Some(poller))
+                .map(|dialback| dialback.nonce),
+            Some("fallback-nonce".to_string())
+        );
+    }
+
+    #[test]
+    fn relay_source_buckets_are_stable_per_route_and_source() {
+        let relay = relay_state();
+        let first = relay.source_bucket("d-11111111111111111111", "198.51.100.10".parse().unwrap());
+        assert_eq!(
+            first,
+            relay.source_bucket("d-11111111111111111111", "198.51.100.10".parse().unwrap())
+        );
+        assert_ne!(
+            first,
+            relay.source_bucket("d-11111111111111111111", "198.51.100.11".parse().unwrap())
+        );
+        assert_eq!(first.len(), 43);
     }
 
     #[test]
@@ -1835,7 +1985,12 @@ mod tests {
             Some(std::slice::from_ref(&name))
         ));
         let exact = relay.resolve_tunnel(&name, now).unwrap();
-        assert!(relay.enqueue_dialback(&exact, "exact-nonce".to_string(), now));
+        assert!(relay.enqueue_dialback(
+            &exact,
+            "exact-nonce".to_string(),
+            "198.51.100.10".parse().unwrap(),
+            now,
+        ));
         assert!(relay.touch_tunnel("d-rolling", now + RELAY_TUNNEL_LIVENESS_MS, None, None));
         assert_eq!(relay.pop_pending("d-rolling", None), None);
         assert_eq!(
@@ -1844,7 +1999,9 @@ mod tests {
             "a different v2 poller cannot consume the proved route"
         );
         assert_eq!(
-            relay.pop_pending("d-rolling", Some(TEST_POLLER_ID)),
+            relay
+                .pop_pending("d-rolling", Some(TEST_POLLER_ID))
+                .map(|dialback| dialback.nonce),
             Some("exact-nonce".to_string())
         );
         assert_eq!(

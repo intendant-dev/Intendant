@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::{net::SocketAddr, time::Duration};
 
 use reqwest::{Client, Url};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
@@ -46,9 +47,19 @@ struct RelayServerNameProof {
     signature: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RelayDialback {
+    nonce: String,
+    source_bucket: Option<String>,
+}
+
 /// The first line the daemon writes on a dial-back data connection (mirrors
 /// `bin/connect/relay.rs`): this magic and the single-use nonce.
 const DIALBACK_MAGIC: &str = "ITRLY1";
+/// The daemon-side tunnel writes this availability-only source hint before
+/// the browser's TLS bytes on the dedicated loopback relay ingress.
+pub(crate) const GATEWAY_RELAY_SOURCE_MAGIC: &str = "ITGWS1";
+pub(crate) const GATEWAY_RELAY_SOURCE_MAX_BYTES: usize = 64;
 /// Control long-poll timeout requested of the relay.
 const CONTROL_POLL_TIMEOUT_MS: u64 = 15_000;
 /// Reconnect backoff bounds after control-channel errors.
@@ -173,12 +184,12 @@ async fn run_relay_tunnel(
             poller_id: &poller_id,
         };
         match poll_relay_next(&poll, &name_materials).await {
-            Ok(Some(nonce)) => {
+            Ok(Some(dialback)) => {
                 backoff = BACKOFF_MIN;
                 let endpoint = relay_endpoint.clone();
                 tokio::spawn(async move {
                     if let Err(error) =
-                        handle_dialback(&endpoint, gateway_ingress_addr, &nonce).await
+                        handle_dialback(&endpoint, gateway_ingress_addr, &dialback).await
                     {
                         eprintln!("[relay] dial-back failed: {error}");
                     }
@@ -214,7 +225,7 @@ struct RelayPollContext<'a> {
 async fn poll_relay_next(
     poll: &RelayPollContext<'_>,
     name_materials: &[crate::custom_domain::RelayCertificateMaterial],
-) -> Result<Option<String>, String> {
+) -> Result<Option<RelayDialback>, String> {
     let v2_body = match build_relay_poll_body(poll, RELAY_CONTROL_PROTOCOL, name_materials) {
         Ok(body) => body,
         Err(error) if !name_materials.is_empty() => {
@@ -371,7 +382,9 @@ fn relay_name_proof_signing_payload(
     .into_bytes()
 }
 
-async fn decode_relay_poll_response(response: reqwest::Response) -> Result<Option<String>, String> {
+async fn decode_relay_poll_response(
+    response: reqwest::Response,
+) -> Result<Option<RelayDialback>, String> {
     if response.status().as_u16() == 204 {
         return Ok(None);
     }
@@ -381,10 +394,26 @@ async fn decode_relay_poll_response(response: reqwest::Response) -> Result<Optio
         return Err(format!("relay control poll rejected: HTTP {status} {text}"));
     }
     let value: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-    Ok(value
-        .pointer("/dialback/nonce")
-        .and_then(|v| v.as_str())
-        .map(str::to_string))
+    let Some(nonce) = value.pointer("/dialback/nonce").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    if nonce.is_empty() || nonce.len() > 64 {
+        return Err("relay returned an invalid dial-back nonce".to_string());
+    }
+    let source_bucket = value
+        .pointer("/dialback/source_bucket")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    if source_bucket
+        .as_deref()
+        .is_some_and(|bucket| !valid_source_bucket(bucket))
+    {
+        return Err("relay returned an invalid source bucket".to_string());
+    }
+    Ok(Some(RelayDialback {
+        nonce: nonce.to_string(),
+        source_bucket,
+    }))
 }
 
 fn relay_control_signing_payload(
@@ -422,19 +451,41 @@ fn relay_control_signing_payload(
 async fn handle_dialback(
     relay_endpoint: &str,
     gateway_ingress_addr: SocketAddr,
-    nonce: &str,
+    dialback: &RelayDialback,
 ) -> Result<(), String> {
     let mut data = TcpStream::connect(relay_endpoint)
         .await
         .map_err(|e| format!("connect relay {relay_endpoint}: {e}"))?;
-    data.write_all(format!("{DIALBACK_MAGIC} {nonce}\n").as_bytes())
+    data.write_all(format!("{DIALBACK_MAGIC} {}\n", dialback.nonce).as_bytes())
         .await
         .map_err(|e| format!("write dial-back hello: {e}"))?;
-    let gateway = TcpStream::connect(gateway_ingress_addr)
+    let mut gateway = TcpStream::connect(gateway_ingress_addr)
         .await
         .map_err(|e| format!("connect dedicated gateway ingress {gateway_ingress_addr}: {e}"))?;
+    let source_bucket = dialback
+        .source_bucket
+        .clone()
+        .filter(|bucket| valid_source_bucket(bucket))
+        .unwrap_or_else(shared_relay_source_bucket);
+    gateway
+        .write_all(format!("{GATEWAY_RELAY_SOURCE_MAGIC} {source_bucket}\n").as_bytes())
+        .await
+        .map_err(|error| format!("write gateway relay-source preamble: {error}"))?;
     splice(data, gateway).await;
     Ok(())
+}
+
+fn valid_source_bucket(bucket: &str) -> bool {
+    bucket.len() == 43
+        && bucket
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn shared_relay_source_bucket() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"intendant-relay-source-fallback-v1");
+    crate::daemon_identity::b64u(&hasher.finalize())
 }
 
 /// Bidirectional byte splice with a per-direction byte cap and idle teardown.
@@ -709,6 +760,16 @@ mod tests {
         let gateway_port = gateway_listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             let (mut stream, _) = gateway_listener.accept().await.unwrap();
+            let mut preamble = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                stream.read_exact(&mut byte).await.unwrap();
+                if byte[0] == b'\n' {
+                    break;
+                }
+                preamble.push(byte[0]);
+            }
+            assert!(String::from_utf8(preamble).unwrap().starts_with("ITGWS1 "));
             let mut buf = vec![0u8; 64];
             let n = stream.read(&mut buf).await.unwrap();
             let upper: Vec<u8> = buf[..n].iter().map(|b| b.to_ascii_uppercase()).collect();
@@ -721,7 +782,10 @@ mod tests {
             handle_dialback(
                 &relay_addr.to_string(),
                 std::net::SocketAddr::from(([127, 0, 0, 1], gateway_port)),
-                "the-nonce",
+                &RelayDialback {
+                    nonce: "the-nonce".to_string(),
+                    source_bucket: Some("a".repeat(43)),
+                },
             )
             .await
             .unwrap();

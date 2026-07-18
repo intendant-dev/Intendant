@@ -43,6 +43,10 @@ const FLEET_CERT_ISSUANCE_FILE: &str = "fleet-cert-issuance.json";
 const FLEET_CERT_ISSUANCE_SCHEMA_VERSION: u32 = 2;
 const FLEET_CERT_ISSUANCE_MAX_BYTES: u64 = 64 * 1024;
 const FLEET_CERT_ISSUANCE_TTL_MS: u64 = 2 * 60 * 60 * 1000;
+/// ACME order URLs outlive the local ownership lease, but they are not
+/// permanent. This horizon comfortably exceeds public-CA order lifetimes
+/// while ensuring a deleted order cannot block renewal and CT commits forever.
+const FLEET_CERT_RESUMABLE_ORDER_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const FLEET_CERT_ISSUANCE_OWNER_LEASE_MS: u64 = 10 * 60 * 1000;
 const FLEET_CERT_ISSUANCE_MAX_ACTIVE: usize = 16;
 
@@ -1100,9 +1104,12 @@ fn load_issuance_store_locked_in(cert_dir: &Path) -> Result<InFlightIssuanceStor
         // order reaches an explicit terminal state (which calls `finish`) so
         // a certificate finalized during a long outage can still have its
         // serial recorded as our own before the CT guard evaluates it.
-        order.order_url.is_some()
-            || now.saturating_sub(order.updated_unix_ms.max(order.started_unix_ms))
-                < FLEET_CERT_ISSUANCE_TTL_MS
+        let age = now.saturating_sub(order.updated_unix_ms.max(order.started_unix_ms));
+        if order.order_url.is_some() {
+            age < FLEET_CERT_RESUMABLE_ORDER_TTL_MS
+        } else {
+            age < FLEET_CERT_ISSUANCE_TTL_MS
+        }
     });
     Ok(store)
 }
@@ -1335,6 +1342,22 @@ impl IssuanceGuard {
         Ok(())
     }
 
+    fn restart_order(&mut self) -> Result<(), String> {
+        self.order = update_claimed_issuance_in(
+            &self.cert_dir,
+            &self.order.token,
+            &self.owner_token,
+            |order| {
+                order.order_url = None;
+                order.private_key_pem = None;
+                order.csr_der_b64 = None;
+                order.started_unix_ms = now_unix_ms();
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
     fn finalization_material(&mut self, name: &str) -> Result<(String, Vec<u8>), String> {
         if let (Some(private_key_pem), Some(csr_der_b64)) = (
             self.order.private_key_pem.as_ref(),
@@ -1414,6 +1437,29 @@ impl Drop for IssuanceGuard {
     }
 }
 
+pub(crate) fn acme_order_resume_is_terminal(error: &instant_acme::Error) -> bool {
+    let instant_acme::Error::Api(problem) = error else {
+        return false;
+    };
+    if matches!(problem.status, Some(404 | 410)) {
+        return true;
+    }
+    let kind_is_malformed = problem
+        .r#type
+        .as_deref()
+        .is_some_and(|kind| kind.ends_with(":malformed"));
+    let detail = problem
+        .detail
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    kind_is_malformed
+        && detail.contains("order")
+        && ["not found", "does not exist", "expired", "unknown"]
+            .iter()
+            .any(|marker| detail.contains(marker))
+}
+
 /// One guarded flow at a time — a second request while one runs is a
 /// no-op with an honest error.
 fn request_in_flight() -> &'static std::sync::atomic::AtomicBool {
@@ -1464,10 +1510,20 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
     // 2. The ACME order.
     let account = acme_account().await?;
     let mut order = if let Some(order_url) = issuance.order_url() {
-        account
-            .order(order_url.to_string())
-            .await
-            .map_err(|error| format!("resume ACME order: {error}"))?
+        match account.order(order_url.to_string()).await {
+            Ok(order) => order,
+            Err(error) if acme_order_resume_is_terminal(&error) => {
+                issuance.restart_order()?;
+                let identifiers = [instant_acme::Identifier::Dns(name.clone())];
+                let order = account
+                    .new_order(&instant_acme::NewOrder::new(&identifiers))
+                    .await
+                    .map_err(|error| format!("replace terminal ACME order: {error}"))?;
+                issuance.record_order_url(order.url())?;
+                order
+            }
+            Err(error) => return Err(format!("resume ACME order: {error}")),
+        }
     } else {
         let identifiers = [instant_acme::Identifier::Dns(name.clone())];
         let order = account
@@ -3065,8 +3121,9 @@ mod tests {
                 .iter_mut()
                 .find(|order| order.token == token)
                 .unwrap();
-            order.started_unix_ms = 1;
-            order.updated_unix_ms = 1;
+            let old = now_unix_ms().saturating_sub(FLEET_CERT_ISSUANCE_TTL_MS + 1);
+            order.started_unix_ms = old;
+            order.updated_unix_ms = old;
             order.owner_token = None;
             order.owner_lease_expires_unix_ms = 0;
             write_issuance_store_locked_in(temp.path(), &store)
@@ -3080,6 +3137,57 @@ mod tests {
             Some("https://acme.example.test/order/finalized")
         );
         resumed.finish().unwrap();
+    }
+
+    #[test]
+    fn stale_resumable_order_no_longer_blocks_a_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = "d-11111111111111111111.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
+        let mut issuance = IssuanceGuard::begin(temp.path(), name).unwrap();
+        issuance
+            .record_order_url("https://acme.example.test/order/deleted")
+            .unwrap();
+        let token = issuance.order.token.clone();
+        drop(issuance);
+
+        crate::access::authority_store::with_lock(temp.path(), || {
+            let mut store =
+                load_issuance_store_locked_in(temp.path()).map_err(crate::access::AccessError)?;
+            let order = store
+                .orders
+                .iter_mut()
+                .find(|order| order.token == token)
+                .unwrap();
+            let stale = now_unix_ms().saturating_sub(FLEET_CERT_RESUMABLE_ORDER_TTL_MS + 1);
+            order.started_unix_ms = stale;
+            order.updated_unix_ms = stale;
+            order.owner_token = None;
+            order.owner_lease_expires_unix_ms = 0;
+            write_issuance_store_locked_in(temp.path(), &store)
+        })
+        .unwrap();
+
+        let replacement = IssuanceGuard::begin(temp.path(), name).unwrap();
+        assert_ne!(replacement.order.token, token);
+        assert_eq!(replacement.order_url(), None);
+        replacement.finish().unwrap();
+    }
+
+    #[test]
+    fn missing_acme_order_response_is_terminal_but_transport_failure_is_not() {
+        let missing_problem: instant_acme::Problem = serde_json::from_value(serde_json::json!({
+            "type": "urn:ietf:params:acme:error:malformed",
+            "detail": "order does not exist",
+            "status": 404
+        }))
+        .unwrap();
+        assert!(acme_order_resume_is_terminal(&instant_acme::Error::Api(
+            missing_problem
+        )));
+        assert!(!acme_order_resume_is_terminal(
+            &instant_acme::Error::Timeout(None)
+        ));
     }
 
     #[test]

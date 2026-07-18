@@ -1403,8 +1403,10 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::HostedControlRequestCreate => {
-                let source_bucket =
-                    (!gateway_ingress.is_reachability_relay()).then_some(source_hint.as_str());
+                // Direct ingress supplies the peer IP; relay ingress supplies
+                // an opaque, relay-salted source bucket. Both are
+                // availability hints only and never participate in authority.
+                let source_bucket = Some(source_hint.as_str());
                 return handle_hosted_control_request_create(
                     stream,
                     route_body,
@@ -1448,8 +1450,7 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::CustomDomainPasskey => {
-                let source_bucket =
-                    (!gateway_ingress.is_reachability_relay()).then_some(source_hint.as_str());
+                let source_bucket = Some(source_hint.as_str());
                 return handle_custom_domain_passkey(
                     stream,
                     req_path,

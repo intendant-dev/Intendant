@@ -63,9 +63,10 @@ cross-process authority lock, so independently load-balanced relay
 connections cannot replay one proof or spend one ticket once per daemon
 process. Pending requests are not displaced by newer requests; a full pending
 queue refuses another doorbell until an owner decides one or one expires. The
-relay's loopback last hop is not treated as a distinct remote-client address,
-so public availability is globally bounded rather than promised fairly among
-anonymous callers.
+relay's loopback last hop carries a process-salted opaque bucket derived from
+the route and the browser connection's source address. The bucket separates
+anonymous admission windows for availability but is never treated as an
+identity, credential, or authority input; global bounds remain the backstop.
 
 ## Trust anchors
 
