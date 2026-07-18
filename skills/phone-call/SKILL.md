@@ -81,10 +81,34 @@ and works before the call connects.
 ### 5. Clean up
 
 ```bash
-kill 12345 2>/dev/null
+PJSUA_CALL_PID='PASTE_THE_PID_PRINTED_BY_STEP_2_HERE'
+case "$PJSUA_CALL_PID" in
+  ''|*[!0-9]*)
+    echo "Refusing cleanup: replace the placeholder with the numeric PID from step 2" >&2
+    exit 1
+    ;;
+esac
+if [ "$PJSUA_CALL_PID" -le 1 ]; then
+  echo "Refusing cleanup: invalid pjsua-call PID $PJSUA_CALL_PID" >&2
+  exit 1
+fi
+if ! kill -0 "$PJSUA_CALL_PID" 2>/dev/null; then
+  echo "pjsua-call PID $PJSUA_CALL_PID has already exited"
+  exit 0
+fi
+PJSUA_CALL_COMMAND=$(ps -p "$PJSUA_CALL_PID" -o command= 2>/dev/null)
+case "$PJSUA_CALL_COMMAND" in
+  *"$HOME/bin/pjsua"*) kill "$PJSUA_CALL_PID" ;;
+  *)
+    echo "Refusing cleanup: PID $PJSUA_CALL_PID is not this skill's pjsua process" >&2
+    exit 1
+    ;;
+esac
 ```
 
-Replace `12345` with the exact PID printed by step 2.
+Replace the non-numeric placeholder with the exact PID printed by step 2. The
+validation deliberately fails closed if it was not replaced, is not a positive
+process PID, or no longer identifies `~/bin/pjsua`.
 
 ## Response Schema — REQUIRED
 

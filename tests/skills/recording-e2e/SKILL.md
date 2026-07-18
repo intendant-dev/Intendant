@@ -69,18 +69,141 @@ cargo build --release --bin intendant --bin intendant-runtime
 
 Never stop another agent's Intendant, browser, Xvfb, or VNC process. This
 example uses display `:50`, VNC port `5950`, and dashboard port `18766`; if
-any is occupied, choose unused values and update the variables.
+any is occupied, choose unused values and update the variables. The setup
+persists every value that later snippets need in one deterministic,
+worktree-local state file. An existing state file is treated as an active or
+unclean run and is never overwritten; inspect and clean it up first.
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+BIN="$REPO/target/release/intendant"
+STATE_FILE="$REPO/target/recording-e2e.state"
+mkdir -p "$REPO/target"
+if [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; then
+  echo "Refusing to overwrite stale recording E2E state: $STATE_FILE" >&2
+  exit 1
+fi
+
 PORT=18766
+VNC_PORT=5950
+DISPLAY_NUM=50
+DEBUG_PORT=6000
 BASE="http://127.0.0.1:$PORT"
 RUN_DIR=$(mktemp -d /tmp/intendant-recording-e2e.XXXXXX)
-if pgrep -fa '^Xvfb :50([[:space:]]|$)|^x11vnc .*:50'; then
-  echo "Display :50 is already owned; choose an unused display"; exit 1
+TESTDIR=$(mktemp -d /tmp/intendant-rec-test-XXXXXX)
+PROFILE="$RUN_DIR/firefox-profile"
+if pgrep -fa "^Xvfb :${DISPLAY_NUM}([[:space:]]|$)|^x11vnc .*:${DISPLAY_NUM}"; then
+  echo "Display :$DISPLAY_NUM is already owned; choose an unused display" >&2
+  rmdir "$TESTDIR" "$RUN_DIR"
+  exit 1
 fi
-ss -ltn 2>/dev/null | grep -E ':(5950|18766)\b' && {
-  echo "Choose unused display/VNC/dashboard values before continuing"; exit 1;
+ss -ltn 2>/dev/null | grep -E ":(${VNC_PORT}|${PORT}|${DEBUG_PORT})\\b" && {
+  echo "Choose unused VNC/dashboard/debugger ports before continuing" >&2
+  rmdir "$TESTDIR" "$RUN_DIR"
+  exit 1
 }
+
+# Create the final pathname exclusively. If this shell is interrupted after
+# this point, the leftover file deliberately blocks a second run.
+umask 077
+if ! (set -o noclobber; : > "$STATE_FILE") 2>/dev/null; then
+  echo "Another run created $STATE_FILE" >&2
+  rmdir "$TESTDIR" "$RUN_DIR"
+  exit 1
+fi
+{
+  printf 'STATE_VERSION=1\n'
+  printf 'STATE_REPO=%q\n' "$REPO"
+  printf 'BIN=%q\nPORT=%q\nVNC_PORT=%q\nDISPLAY_NUM=%q\nDEBUG_PORT=%q\n' \
+    "$BIN" "$PORT" "$VNC_PORT" "$DISPLAY_NUM" "$DEBUG_PORT"
+  printf 'BASE=%q\nRUN_DIR=%q\nTESTDIR=%q\nPROFILE=%q\nSTREAM=%q\n' \
+    "$BASE" "$RUN_DIR" "$TESTDIR" "$PROFILE" ""
+  cat <<'STATE_VALIDATION'
+# This tail runs whenever a later snippet sources the file. Keep the state
+# owner-only: it is shell syntax, not an untrusted interchange format.
+_recording_state_ok=1
+[ "${STATE_VERSION:-}" = 1 ] || _recording_state_ok=0
+_recording_current_repo=$(git rev-parse --show-toplevel 2>/dev/null) ||
+  _recording_state_ok=0
+[ "${STATE_REPO:-}" = "$_recording_current_repo" ] ||
+  _recording_state_ok=0
+[ "${STATE_FILE:-}" = "$STATE_REPO/target/recording-e2e.state" ] ||
+  _recording_state_ok=0
+[ "${BIN:-}" = "$STATE_REPO/target/release/intendant" ] ||
+  _recording_state_ok=0
+case "${RUN_DIR:-}" in
+  /tmp/intendant-recording-e2e.?*) [ -d "$RUN_DIR" ] && [ ! -L "$RUN_DIR" ] ||
+    _recording_state_ok=0 ;;
+  *) _recording_state_ok=0 ;;
+esac
+case "${TESTDIR:-}" in
+  /tmp/intendant-rec-test-?*) [ -d "$TESTDIR" ] && [ ! -L "$TESTDIR" ] ||
+    _recording_state_ok=0 ;;
+  *) _recording_state_ok=0 ;;
+esac
+[ "${PROFILE:-}" = "$RUN_DIR/firefox-profile" ] ||
+  _recording_state_ok=0
+for _recording_number in "${PORT:-}" "${VNC_PORT:-}" "${DISPLAY_NUM:-}" \
+  "${DEBUG_PORT:-}"; do
+  case "$_recording_number" in
+    ''|*[!0-9]*) _recording_state_ok=0 ;;
+  esac
+done
+[ "${BASE:-}" = "http://127.0.0.1:$PORT" ] ||
+  _recording_state_ok=0
+if [ "$_recording_state_ok" != 1 ]; then
+  echo "Invalid or misplaced recording E2E state" >&2
+  unset _recording_state_ok _recording_current_repo _recording_number
+  return 1 2>/dev/null || exit 1
+fi
+unset _recording_state_ok _recording_current_repo _recording_number
+
+recording_e2e_pid_start_ticks() {
+  python3 - "$1" <<'PY'
+import pathlib, sys
+raw = pathlib.Path(f"/proc/{sys.argv[1]}/stat").read_text()
+print(raw[raw.rfind(")") + 2:].split()[19])
+PY
+}
+recording_e2e_pid_matches() {
+  _recording_pid=$1 _recording_start=$2 _recording_match=$3
+  case "$_recording_pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_recording_pid" -gt 1 ] || return 1
+  case "$_recording_start" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$(recording_e2e_pid_start_ticks "$_recording_pid" 2>/dev/null)" = \
+    "$_recording_start" ] || return 1
+  _recording_cmd=$(tr '\0' ' ' < "/proc/$_recording_pid/cmdline" 2>/dev/null) ||
+    return 1
+  case "$_recording_cmd" in *"$_recording_match"*) return 0 ;; *) return 1 ;; esac
+}
+recording_e2e_record_pid() {
+  _recording_key=$1 _recording_pid=$2 _recording_match=$3
+  case "$_recording_key" in XVFB|VNC|INTENDANT|FIREFOX) ;; *) return 1 ;; esac
+  case "$_recording_pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_recording_pid" -gt 1 ] || return 1
+  _recording_start=$(recording_e2e_pid_start_ticks "$_recording_pid") ||
+    return 1
+  printf '%s_PID=%q\n%s_START=%q\n%s_MATCH=%q\n' \
+    "$_recording_key" "$_recording_pid" \
+    "$_recording_key" "$_recording_start" \
+    "$_recording_key" "$_recording_match" >> "$STATE_FILE"
+}
+recording_e2e_stop_pid() {
+  _recording_label=$1 _recording_pid=$2 _recording_start=$3 _recording_match=$4
+  [ -n "$_recording_pid" ] || return 0
+  case "$_recording_pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_recording_pid" -gt 1 ] || return 1
+  kill -0 "$_recording_pid" 2>/dev/null || return 0
+  recording_e2e_pid_matches "$_recording_pid" "$_recording_start" \
+    "$_recording_match" ||
+    { echo "Refusing unverified $_recording_label PID $_recording_pid" >&2;
+      return 1; }
+  kill "$_recording_pid"
+}
+STATE_VALIDATION
+} > "$STATE_FILE"
+chmod 600 "$STATE_FILE"
+echo "Recording E2E state: $STATE_FILE"
 ```
 
 ### 3. Create intendant.toml with recording enabled
@@ -89,7 +212,11 @@ Recording is disabled by default. Create a temporary project directory with
 recording enabled and short segment duration for faster testing:
 
 ```bash
-TESTDIR=$(mktemp -d /tmp/intendant-rec-test-XXXXXX)
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
 cat > "$TESTDIR/intendant.toml" << 'EOF'
 [recording]
 enabled = true
@@ -112,11 +239,22 @@ uses `:50` only after the availability check above; Intendant reserves `:99+`
 for its own Xvfb instances.
 
 ```bash
-nohup Xvfb :50 -screen 0 1280x720x24 > /dev/null 2>&1 &
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+
+nohup Xvfb ":$DISPLAY_NUM" -screen 0 1280x720x24 > /dev/null 2>&1 &
 XVFB_PID=$!
+recording_e2e_record_pid XVFB "$XVFB_PID" "Xvfb :$DISPLAY_NUM" ||
+  { kill "$XVFB_PID" 2>/dev/null || true; exit 1; }
 sleep 0.5
-nohup x11vnc -display :50 -rfbport 5950 -passwd intendant -forever -quiet > /dev/null 2>&1 &
+nohup x11vnc -display ":$DISPLAY_NUM" -rfbport "$VNC_PORT" \
+  -passwd intendant -forever -quiet > /dev/null 2>&1 &
 VNC_PID=$!
+recording_e2e_record_pid VNC "$VNC_PID" "-rfbport $VNC_PORT" ||
+  { kill "$VNC_PID" 2>/dev/null || true; exit 1; }
 sleep 0.5
 ```
 
@@ -131,6 +269,12 @@ Use `--autonomy high` so the agent auto-approves safe commands without prompting
 Run from `$TESTDIR` so intendant picks up the `intendant.toml` config.
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+
 (
   cd "$TESTDIR"
   [ ! -f "$REPO/.env" ] || source "$REPO/.env"
@@ -139,6 +283,8 @@ Run from `$TESTDIR` so intendant picks up the `intendant.toml` config.
     "run 'xeyes' in the background, then take a screenshot after 5 seconds. After the screenshot, run 'xclock' and wait 20 seconds."
 ) >"$RUN_DIR/intendant.log" 2>&1 &
 INTENDANT_PID=$!
+recording_e2e_record_pid INTENDANT "$INTENDANT_PID" "--web $PORT" ||
+  { kill "$INTENDANT_PID" 2>/dev/null || true; exit 1; }
 sleep 3
 cat "$RUN_DIR/intendant.log"
 ```
@@ -146,14 +292,25 @@ cat "$RUN_DIR/intendant.log"
 ### 6. Launch Firefox on display :50
 
 ```bash
-mkdir -p "$RUN_DIR/firefox-profile"
-DISPLAY=:50 nohup firefox --no-remote --profile "$RUN_DIR/firefox-profile" \
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+
+mkdir -p "$PROFILE"
+DISPLAY=":$DISPLAY_NUM" nohup firefox --no-remote --profile "$PROFILE" \
   --new-window "$BASE/app" > /dev/null 2>&1 &
 FIREFOX_PID=$!
+recording_e2e_record_pid FIREFOX "$FIREFOX_PID" "$PROFILE" ||
+  { kill "$FIREFOX_PID" 2>/dev/null || true; exit 1; }
 sleep 8
 ```
 
 ## Asserting on Recording State
+
+Each block below deliberately reloads the owner-only state file. Do not omit
+that preamble or rely on variables from a previous agent/runtime invocation.
 
 ### Wait for recording to start
 
@@ -161,6 +318,12 @@ The recording starts automatically when the agent triggers Xvfb. Poll the
 `/recordings` endpoint until a stream appears:
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+
 for i in $(seq 1 60); do
   STREAMS=$(curl -s "$BASE/recordings" 2>/dev/null)
   COUNT=$(echo "$STREAMS" | python3 -c "
@@ -180,6 +343,12 @@ echo "$STREAMS" | python3 -m json.tool 2>/dev/null
 ### Verify recording stream metadata
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+
 curl -s "$BASE/recordings" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
@@ -206,12 +375,23 @@ With `segment_duration_secs = 8`, the first segment finalizes after ~8 seconds
 of recording. ffmpeg writes to `segments.csv` when a segment completes.
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+
 # Extract stream name first
 STREAM=$(curl -s "$BASE/recordings" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 print(data[0]['stream_name'] if data else '')
 " 2>/dev/null)
+case "$STREAM" in
+  display_*) case "$STREAM" in *[!A-Za-z0-9_.-]*) false ;; *) true ;; esac ;;
+  *) false ;;
+esac || { echo "Unsafe or missing stream name: $STREAM" >&2; exit 1; }
+printf 'STREAM=%q\n' "$STREAM" >> "$STATE_FILE"
 echo "Waiting for segments on stream: $STREAM"
 
 for i in $(seq 1 30); do
@@ -231,6 +411,14 @@ echo "Segments found: $SEGCOUNT"
 ### Verify segment metadata
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+[ -n "${STREAM:-}" ] ||
+  { echo "STREAM is not persisted in $STATE_FILE" >&2; exit 1; }
+
 curl -s "$BASE/recordings/$STREAM/segments" | python3 -c "
 import sys, json
 segments = json.load(sys.stdin)
@@ -252,6 +440,14 @@ print('Segment metadata OK')
 ### Verify segment file is serveable and valid MP4
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+[ -n "${STREAM:-}" ] ||
+  { echo "STREAM is not persisted in $STATE_FILE" >&2; exit 1; }
+
 # Get first segment filename
 SEG_FILE=$(curl -s "$BASE/recordings/$STREAM/segments" | python3 -c "
 import sys, json
@@ -288,6 +484,14 @@ print('Segment file valid MP4 OK')
 ### Verify path traversal protection
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+[ -n "${STREAM:-}" ] ||
+  { echo "STREAM is not persisted in $STATE_FILE" >&2; exit 1; }
+
 # These should return 400 or 404, not serve files
 STATUS=$(curl --path-as-is -s -o /dev/null -w "%{http_code}" "$BASE/recordings/$STREAM/../../../etc/passwd")
 echo "Path traversal attempt: HTTP $STATUS"
@@ -303,6 +507,14 @@ echo "Invalid filename: HTTP $STATUS"
 Wait for at least 2 segments (requires ~16s with segment_duration_secs=8):
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+[ -n "${STREAM:-}" ] ||
+  { echo "STREAM is not persisted in $STATE_FILE" >&2; exit 1; }
+
 for i in $(seq 1 30); do
   SEGCOUNT=$(curl -s "$BASE/recordings/$STREAM/segments" | python3 -c "
 import sys, json
@@ -338,8 +550,13 @@ Use `ff-eval.py` if Firefox debugger is active, or use xdotool to navigate.
 
 If Firefox was launched with `--start-debugger-server 6000`:
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+
 # Configure only this run's isolated Firefox profile.
-PROFILE="$RUN_DIR/firefox-profile"
 grep -q 'devtools.debugger.remote-enabled' "$PROFILE/user.js" 2>/dev/null || \
 cat >> "$PROFILE/user.js" << 'DEOF'
 user_pref("devtools.debugger.remote-enabled", true);
@@ -351,16 +568,45 @@ DEOF
 
 Then relaunch Firefox with debugger:
 ```bash
-kill -9 "$FIREFOX_PID" 2>/dev/null || true
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+
+if kill -0 "${FIREFOX_PID:-}" 2>/dev/null; then
+  recording_e2e_stop_pid Firefox "$FIREFOX_PID" "${FIREFOX_START:-}" \
+    "${FIREFOX_MATCH:-}" || exit 1
+  for _ in $(seq 1 20); do
+    kill -0 "$FIREFOX_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$FIREFOX_PID" 2>/dev/null; then
+    recording_e2e_pid_matches "$FIREFOX_PID" "$FIREFOX_START" \
+      "$FIREFOX_MATCH" ||
+      { echo "Firefox PID identity changed while stopping" >&2; exit 1; }
+    kill -9 "$FIREFOX_PID"
+  fi
+fi
 sleep 1
-DISPLAY=:50 nohup firefox --no-remote --profile "$PROFILE" \
-  --start-debugger-server 6000 --new-window "$BASE/app" > /dev/null 2>&1 &
+DISPLAY=":$DISPLAY_NUM" nohup firefox --no-remote --profile "$PROFILE" \
+  --start-debugger-server "$DEBUG_PORT" --new-window "$BASE/app" \
+  > /dev/null 2>&1 &
 FIREFOX_PID=$!
+recording_e2e_record_pid FIREFOX "$FIREFOX_PID" "$PROFILE" ||
+  { kill "$FIREFOX_PID" 2>/dev/null || true; exit 1; }
 sleep 8
 ```
 
 Check recording UI state via JavaScript:
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+cd "$REPO" || exit 1
+
 # Switch to the Live display destination (internal route id: displays).
 python3 scripts/ff-eval.py "switchTab('displays'); activeTab"
 sleep 1
@@ -379,6 +625,13 @@ python3 scripts/ff-eval.py "
 ### Verify RecordingPlayer loaded segments
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+cd "$REPO" || exit 1
+
 python3 scripts/ff-eval.py "
   const player = recPlayer;
   if (!player) 'no player';
@@ -396,6 +649,13 @@ python3 scripts/ff-eval.py "
 ### Test playback controls
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+cd "$REPO" || exit 1
+
 # Start playback
 python3 scripts/ff-eval.py "
   const btn = document.getElementById('rec-play-btn');
@@ -425,6 +685,13 @@ python3 scripts/ff-eval.py "
 ### Test speed control
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+cd "$REPO" || exit 1
+
 python3 scripts/ff-eval.py "
   const select = document.getElementById('rec-speed');
   select.value = '4';
@@ -439,6 +706,13 @@ python3 scripts/ff-eval.py "window.recPlayer?.video?.playbackRate"
 ### Test timeline seeking
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+cd "$REPO" || exit 1
+
 # Seek to middle of recording
 python3 scripts/ff-eval.py "
   const player = window.recPlayer;
@@ -454,6 +728,12 @@ python3 scripts/ff-eval.py "
 Connect via WebSocket and verify recording events are broadcast:
 
 ```bash
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+
 python3 -c "
 import asyncio, json, websockets
 
@@ -490,6 +770,24 @@ PORT=18766
 BASE="http://127.0.0.1:$PORT"
 RUN_DIR=$(mktemp -d /tmp/intendant-recording-e2e.XXXXXX)
 TESTDIR=$(mktemp -d /tmp/intendant-rec-test-XXXXXX)
+pid_start_ticks() {
+  python3 - "$1" <<'PY'
+import pathlib, sys
+raw = pathlib.Path(f"/proc/{sys.argv[1]}/stat").read_text()
+print(raw[raw.rfind(")") + 2:].split()[19])
+PY
+}
+stop_owned_pid() {
+  _pid=$1 _start=$2 _match=$3
+  [ -n "$_pid" ] || return 0
+  case "$_pid" in *[!0-9]*) return 1 ;; esac
+  [ "$_pid" -gt 1 ] || return 1
+  case "$_start" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$_pid" 2>/dev/null || return 0
+  [ "$(pid_start_ticks "$_pid" 2>/dev/null)" = "$_start" ] || return 1
+  _cmd=$(tr '\0' ' ' < "/proc/$_pid/cmdline" 2>/dev/null) || return 1
+  case "$_cmd" in *"$_match"*) kill "$_pid" ;; *) return 1 ;; esac
+}
 cat > "$TESTDIR/intendant.toml" << 'EOF'
 [recording]
 enabled = true
@@ -507,9 +805,11 @@ ss -ltn 2>/dev/null | grep -E ':(5950|18766)\b' && exit 1
 # Start observer Xvfb
 nohup Xvfb :50 -screen 0 1280x720x24 > /dev/null 2>&1 &
 XVFB_PID=$!
+XVFB_START=$(pid_start_ticks "$XVFB_PID") || exit 1
 sleep 0.5
 nohup x11vnc -display :50 -rfbport 5950 -passwd intendant -forever -quiet > /dev/null 2>&1 &
 VNC_PID=$!
+VNC_START=$(pid_start_ticks "$VNC_PID") || exit 1
 
 # Launch intendant
 (
@@ -519,6 +819,7 @@ VNC_PID=$!
     --bind 127.0.0.1 "run 'xeyes' in the background, then wait 30 seconds"
 ) >"$RUN_DIR/intendant.log" 2>&1 &
 INTENDANT_PID=$!
+INTENDANT_START=$(pid_start_ticks "$INTENDANT_PID") || exit 1
 sleep 3
 cat "$RUN_DIR/intendant.log"
 
@@ -572,9 +873,12 @@ STATUS=$(curl --path-as-is -s -o /dev/null -w "%{http_code}" "$BASE/recordings/$
 echo "ASSERT 5: Path traversal HTTP $STATUS (expect 400 or 404)"
 
 # ── Cleanup ──
-kill "$INTENDANT_PID" "$VNC_PID" "$XVFB_PID" 2>/dev/null || true
-[ -z "${FIREFOX_PID:-}" ] || kill -9 "$FIREFOX_PID" 2>/dev/null || true
-rm -rf "$TESTDIR" "$RUN_DIR"
+stop_owned_pid "$INTENDANT_PID" "$INTENDANT_START" "--web $PORT" &&
+  stop_owned_pid "$VNC_PID" "$VNC_START" "-rfbport 5950" &&
+  stop_owned_pid "$XVFB_PID" "$XVFB_START" "Xvfb :50" ||
+  { echo "Refusing cleanup: an owned PID could not be verified" >&2; exit 1; }
+case "$TESTDIR" in /tmp/intendant-rec-test-?*) rm -rf -- "$TESTDIR" ;; *) exit 1 ;; esac
+case "$RUN_DIR" in /tmp/intendant-recording-e2e.?*) rm -rf -- "$RUN_DIR" ;; *) exit 1 ;; esac
 echo "Done"
 ```
 
@@ -585,6 +889,11 @@ echo "Done"
 1. **Check intendant.toml**: Recording must be `enabled = true`. Verify intendant
    found the config:
    ```bash
+   REPO=$(git rev-parse --show-toplevel) || exit 1
+   STATE_FILE="$REPO/target/recording-e2e.state"
+   [ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+     { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+   . "$STATE_FILE" || exit 1
    grep -i record "$RUN_DIR/intendant.log"
    ```
 2. **Check ffmpeg**: `ffmpeg -version` must succeed. libx264 and x11grab required.
@@ -592,6 +901,11 @@ echo "Done"
    If the task doesn't involve GUI commands, no Xvfb launches, no recording starts.
 4. **Check DisplayReady event**: Connect via WebSocket and look for `display_ready`:
    ```bash
+   REPO=$(git rev-parse --show-toplevel) || exit 1
+   STATE_FILE="$REPO/target/recording-e2e.state"
+   [ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+     { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+   . "$STATE_FILE" || exit 1
    python3 -c "
    import asyncio, json, websockets
    async def watch():
@@ -644,7 +958,35 @@ echo "Done"
 ## Cleanup
 
 ```bash
-kill "$INTENDANT_PID" "$VNC_PID" "$XVFB_PID" 2>/dev/null || true
-kill -9 "$FIREFOX_PID" 2>/dev/null || true
-rm -rf "$TESTDIR" "$RUN_DIR"
+REPO=$(git rev-parse --show-toplevel) || exit 1
+STATE_FILE="$REPO/target/recording-e2e.state"
+[ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -O "$STATE_FILE" ] ||
+  { echo "Missing or unsafe state file: $STATE_FILE" >&2; exit 1; }
+. "$STATE_FILE" || exit 1
+
+cleanup_ok=1
+recording_e2e_stop_pid Firefox "${FIREFOX_PID:-}" "${FIREFOX_START:-}" \
+  "${FIREFOX_MATCH:-}" || cleanup_ok=0
+recording_e2e_stop_pid Intendant "${INTENDANT_PID:-}" "${INTENDANT_START:-}" \
+  "${INTENDANT_MATCH:-}" || cleanup_ok=0
+recording_e2e_stop_pid x11vnc "${VNC_PID:-}" "${VNC_START:-}" \
+  "${VNC_MATCH:-}" || cleanup_ok=0
+recording_e2e_stop_pid Xvfb "${XVFB_PID:-}" "${XVFB_START:-}" \
+  "${XVFB_MATCH:-}" || cleanup_ok=0
+[ "$cleanup_ok" = 1 ] ||
+  { echo "Leaving state and directories for manual inspection" >&2; exit 1; }
+
+# The sourced state already required real, non-symlink directories with these
+# exact prefixes. Recheck immediately before the destructive operation.
+case "$TESTDIR" in
+  /tmp/intendant-rec-test-?*) [ -d "$TESTDIR" ] && [ ! -L "$TESTDIR" ] ||
+    exit 1; rm -rf -- "$TESTDIR" ;;
+  *) exit 1 ;;
+esac
+case "$RUN_DIR" in
+  /tmp/intendant-recording-e2e.?*) [ -d "$RUN_DIR" ] && [ ! -L "$RUN_DIR" ] ||
+    exit 1; rm -rf -- "$RUN_DIR" ;;
+  *) exit 1 ;;
+esac
+rm -f -- "$STATE_FILE"
 ```
