@@ -234,6 +234,29 @@ fn fleet_origin_provenance_cache(
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+fn current_cached_fleet_origin_provenance(
+    path: &Path,
+    fingerprint: &FleetOriginProvenanceFingerprint,
+) -> Option<Arc<FleetOriginProvenance>> {
+    let cached = {
+        let cache = fleet_origin_provenance_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        cache
+            .get(path)
+            .filter(|entry| &entry.fingerprint == fingerprint)
+            .map(|entry| Arc::clone(&entry.provenance))
+    }?;
+    // The path can be atomically replaced after the caller's first metadata
+    // read but before the cache lookup. Validate again after cloning the
+    // candidate; a match linearizes this read at the second fingerprint.
+    matches!(
+        fleet_origin_provenance_fingerprint(path),
+        Some(after) if &after == fingerprint
+    )
+    .then_some(cached)
+}
+
 fn normalize_provenance_entries(values: Vec<String>, cap: usize) -> (Vec<String>, bool) {
     let original_len = values.len();
     let mut invalid = false;
@@ -373,16 +396,8 @@ fn load_fleet_origin_provenance_cached_arc_in(
         // an empty provenance set.
         return load_fleet_origin_provenance_uncached_in(cert_dir).map(Arc::new);
     };
-    {
-        let cache = fleet_origin_provenance_cache()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(entry) = cache
-            .get(&path)
-            .filter(|entry| entry.fingerprint == fingerprint)
-        {
-            return Ok(Arc::clone(&entry.provenance));
-        }
+    if let Some(provenance) = current_cached_fleet_origin_provenance(&path, &fingerprint) {
+        return Ok(provenance);
     }
     let provenance = Arc::new(load_fleet_origin_provenance_uncached_in(cert_dir)?);
     if matches!(
@@ -3161,8 +3176,17 @@ mod tests {
         let hit = load_fleet_origin_provenance_cached_arc_in(temp.path()).unwrap();
         assert!(Arc::ptr_eq(&first, &hit));
 
+        // Reproduce the cache-hit interleaving deterministically: the caller
+        // fingerprints generation one, another process replaces the
+        // authority record, and only then does the caller consult the cache.
+        let path = fleet_origin_provenance_path_in(temp.path());
+        let stale_fingerprint = fleet_origin_provenance_fingerprint(&path).unwrap();
         let second_name = "d-11111111111111111111.fleet.example.test";
         remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), second_name).unwrap();
+        assert!(
+            current_cached_fleet_origin_provenance(&path, &stale_fingerprint).is_none(),
+            "a path replacement between fingerprint and cache lookup must invalidate the hit"
+        );
         let changed = load_fleet_origin_provenance_cached_arc_in(temp.path()).unwrap();
         assert!(!Arc::ptr_eq(&first, &changed));
         assert_eq!(changed.name.as_deref(), Some(second_name));
