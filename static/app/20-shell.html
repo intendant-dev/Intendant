@@ -118,14 +118,42 @@
 
     <!-- Activity Tab -->
     <div id="tab-activity" class="tab-pane active">
+      <!-- Activity v3 view header: the five views as one segmented switch
+           on the left; the Log view's tools on the right (session switcher,
+           Focus/Grid, minimize-done, and the Options popover holding
+           verbosity + host filter). The tools are CSS-gated to the log
+           sub-tab (#activity-subtabs:has([data-activity-tab="log"].active))
+           — every element keeps its id, so ui2-chrome.js / ui2-activity.js
+           wiring is untouched by the move out of the oversight bar. -->
       <div class="subtabs" id="activity-subtabs">
-        <button class="subtab-btn active" data-activity-tab="log">Log</button>
-        <button class="subtab-btn" data-activity-tab="context">Context</button>
-        <button class="subtab-btn" data-activity-tab="managed">Managed</button>
-        <button class="subtab-btn" data-activity-tab="changes">
-          Changes <span class="badge" id="badge-changes" style="display:none"></span>
-        </button>
-        <button class="subtab-btn" data-activity-tab="control">Control</button>
+        <div class="ui2-view-switch" role="group" aria-label="Activity views">
+          <button class="subtab-btn active" data-activity-tab="log"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l2.5-6 4 12 2.5-6h5"/></svg>Timeline</button>
+          <button class="subtab-btn" data-activity-tab="context"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 7.5l8 4.5 8-4.5Z"/><path d="m4 12 8 4.5 8-4.5"/><path d="m4 16.5 8 4.5 8-4.5"/></svg>Context</button>
+          <button class="subtab-btn" data-activity-tab="managed"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v9"/><path d="M8.5 12h7"/></svg>Managed</button>
+          <button class="subtab-btn" data-activity-tab="changes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3v12"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="6" r="2.5"/><path d="M18 8.5v3a4 4 0 0 1-4 4H9.5"/></svg>Changes <span class="badge" id="badge-changes" style="display:none"></span></button>
+          <button class="subtab-btn" data-activity-tab="control"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10"/><path d="M18 7h2"/><circle cx="16" cy="7" r="2"/><path d="M4 17h4"/><path d="M12 17h8"/><circle cx="10" cy="17" r="2"/></svg>Control</button>
+        </div>
+        <div class="ui2-activity-tools">
+          <select class="ui2-session-switcher" id="ui2-session-switcher"
+                  aria-label="Focused session" title="Focused session — Focus shows this session's timeline; the composer targets it"></select>
+          <div class="ui2-layout-toggle" id="ui2-layout-toggle" role="group" aria-label="Timeline layout">
+            <button type="button" id="ui2-layout-focus-btn" data-layout="focus"
+                    title="Focus — the targeted session's timeline (session windows hidden)">Focus</button>
+            <button type="button" id="ui2-layout-grid-btn" data-layout="grid"
+                    title="Grid — session windows with the concurrent stream below">Grid</button>
+          </div>
+          <button type="button" class="ui2-minimize-done" id="ui2-minimize-done-btn" hidden
+                  title="Minimize every finished sub-agent window">
+            Minimize done<span class="ui2-minimize-done-count" id="ui2-minimize-done-count">0</span>
+          </button>
+          <button type="button" class="ui2-view-options-btn" id="ui2-view-options-btn"
+                  aria-haspopup="true" aria-expanded="false" title="Timeline display options">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10"/><path d="M18 7h2"/><circle cx="16" cy="7" r="2"/><path d="M4 17h4"/><path d="M12 17h8"/><circle cx="10" cy="17" r="2"/></svg>Options
+          </button>
+        </div>
+        <!-- The Options popover panel: still #activity-log-controls, still
+             hidden off-log by the router's .hidden (!important) — the v3
+             popover's .open is deliberately weaker so off-log always wins. -->
         <div class="activity-subtab-controls" id="activity-log-controls">
           <label class="subtab-control-label" for="verbosity-select">Verbosity</label>
           <select class="verbosity-select" id="verbosity-select" title="Log verbosity">

@@ -432,15 +432,25 @@ function ui2BuildVitalsRail() {
   if (!pane || document.getElementById('ui2-vitals-rail')) return;
   const rail = document.createElement('aside');
   rail.id = 'ui2-vitals-rail';
-  rail.setAttribute('aria-label', 'Session vitals');
+  rail.setAttribute('aria-label', 'Session inspector');
+  // v3 inspector: grouped sections, same row ids — ui2RailTick writes by
+  // id and ui2RailSetRow queries .ui2-rail-value inside each row, so the
+  // 1 Hz refresh path is unchanged by the re-chrome.
   rail.innerHTML = `
-    <div class="ui2-rail-session" id="ui2-rail-session">No session yet</div>
-    <div class="ui2-rail-row" id="ui2-rail-git"><span class="ui2-rail-label">Working tree</span><span class="ui2-rail-value">—</span></div>
-    <div class="ui2-rail-row" id="ui2-rail-ctx"><span class="ui2-rail-label">Context budget</span><span class="ui2-rail-value">—</span><div class="ui2-rail-meter"><i id="ui2-rail-ctx-fill"></i></div></div>
-    <div class="ui2-rail-row" id="ui2-rail-cache"><span class="ui2-rail-label">Prompt cache</span><span class="ui2-rail-value">—</span></div>
-    <div class="ui2-rail-row" id="ui2-rail-limits"><span class="ui2-rail-label">Rate limits</span><span class="ui2-rail-value">—</span></div>
-    <button type="button" class="ui2-rail-row ui2-rail-changes" id="ui2-rail-changes" title="Open the Changes sub-tab"><span class="ui2-rail-label">Changes</span><span class="ui2-rail-value">—</span></button>
-    <button type="button" class="ui2-rail-advanced" id="ui2-rail-advanced" title="Raw state and observers live on the Debug tab">Advanced &amp; raw state</button>`;
+    <div class="ui2-rail-head">
+      <div class="ui2-rail-eyebrow">Inspector</div>
+      <div class="ui2-rail-session" id="ui2-rail-session">No session yet</div>
+    </div>
+    <div class="ui2-rail-section">
+      <div class="ui2-rail-row" id="ui2-rail-git"><span class="ui2-rail-label">Working tree</span><span class="ui2-rail-value">—</span></div>
+      <div class="ui2-rail-row" id="ui2-rail-ctx"><span class="ui2-rail-label">Context budget</span><span class="ui2-rail-value">—</span><div class="ui2-rail-meter"><i id="ui2-rail-ctx-fill"></i></div></div>
+      <div class="ui2-rail-row" id="ui2-rail-cache"><span class="ui2-rail-label">Prompt cache</span><span class="ui2-rail-value">—</span></div>
+      <div class="ui2-rail-row" id="ui2-rail-limits"><span class="ui2-rail-label">Rate limits</span><span class="ui2-rail-value">—</span></div>
+    </div>
+    <div class="ui2-rail-foot">
+      <button type="button" class="ui2-rail-row ui2-rail-changes" id="ui2-rail-changes" title="Open the Changes sub-tab"><span class="ui2-rail-label">Changes</span><span class="ui2-rail-value">—</span></button>
+      <button type="button" class="ui2-rail-advanced" id="ui2-rail-advanced" title="Raw state and observers live on the Debug tab">Advanced &amp; raw state</button>
+    </div>`;
   pane.appendChild(rail);
   const changes = document.getElementById('ui2-rail-changes');
   if (changes) changes.addEventListener('click', () => {
@@ -451,6 +461,38 @@ function ui2BuildVitalsRail() {
   if (advanced) advanced.addEventListener('click', () => {
     if (typeof routeTo === 'function') routeTo('debug');
     else if (typeof switchTab === 'function') switchTab('debug');
+  });
+}
+
+// ── Timeline "Options" popover (verbosity + host filter) ───────────────
+// The panel is #activity-log-controls — the router hides it off-log with
+// .hidden (display:none !important), which deliberately beats .open, so a
+// stale open state can never leak the panel onto another sub-tab.
+function ui2WireViewOptions() {
+  const btn = document.getElementById('ui2-view-options-btn');
+  const panel = document.getElementById('activity-log-controls');
+  if (!btn || !panel) return;
+  const setOpen = (open) => {
+    if (open) {
+      // Anchor to the trigger's bottom-right (position:fixed — see CSS).
+      const r = btn.getBoundingClientRect();
+      panel.style.top = `${Math.round(r.bottom + 6)}px`;
+      panel.style.left = '';
+      panel.style.right = `${Math.max(8, Math.round(window.innerWidth - r.right))}px`;
+    }
+    panel.classList.toggle('open', open);
+    btn.setAttribute('aria-expanded', String(open));
+  };
+  btn.addEventListener('click', () => setOpen(!panel.classList.contains('open')));
+  document.addEventListener('pointerdown', (e) => {
+    if (!panel.classList.contains('open')) return;
+    if (panel.contains(e.target) || btn.contains(e.target)) return;
+    setOpen(false);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || !panel.classList.contains('open')) return;
+    setOpen(false);
+    btn.focus();
   });
 }
 
@@ -536,6 +578,7 @@ function ui2RailTick(force) {
     ui2AugmentApprovalPanel();
     ui2WireLayoutToggle();
     ui2WireMinimizeDoneControl();
+    ui2WireViewOptions();
     ui2DressComposer();
     ui2BuildVitalsRail();
     ui2RailTick(true);
