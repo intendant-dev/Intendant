@@ -112,6 +112,9 @@ Setup, one time:
 
 The register response then carries each daemon's `fleet_dns` name; the
 daemon's Connect card shows it with an **Enable HTTPS discovery** button.
+The daemon accepts a present hint only when its zone and name agree in the
+canonical `d-<20hex>.<zone>` form; incomplete or inconsistent metadata does
+not become durable fleet provenance.
 Address records persist in the state file and follow the daemon-record
 lifecycle (they survive link/release; the stale-unlinked sweep drops
 them). ACME TXT challenges are in-memory and self-expire. Posture:
@@ -372,6 +375,10 @@ dials back browser connections into the gateway's private relay ingress,
 and publishes relay-mode fleet DNS while the tunnel is up. That ingress
 binds only to an ephemeral `127.0.0.1` port, is never advertised, and
 does not share the public listener's trusted-local classification. Connect
+runtime settings may move the ordinary registration client to another
+destination, but an already running tunnel keeps its signed control URL,
+relay-mode DNS calls, credentials, daemon identity, and raw dialback endpoint
+on one boot configuration generation until restart. Connect
 shows its **Request control** navigation only when registration carries the
 daemon-signed hosted-capability hint and that daemon has a relay-mode DNS
 record; older daemons and direct-mode DNS remain discovery-only in the

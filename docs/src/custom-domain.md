@@ -56,6 +56,10 @@ service-controlled name as owner-controlled during startup. HTTP requests and
 WebSocket upgrades recheck that live gate even on an existing TLS connection;
 active custom-domain sockets carry the same gate into their recurring
 authorization and buffered-input checks, so losing eligibility closes them.
+A present fleet-DNS observation is accepted only when both fields form the
+same canonical `d-<20hex>.<zone>` pair; an empty, noncanonical, or mismatched
+pair leaves the gate closed and writes no provenance. An absent fleet-DNS hint
+is the complete observation that the current service has no delegated zone.
 
 ## Pin certificate issuance
 
@@ -115,11 +119,20 @@ bounded lifetime measured from the current order's immutable start time;
 ownership claims and retry updates cannot extend it. A sibling process
 therefore adopts a newly committed generation instead of consuming another CA
 order; a stopped owner's lease can be reclaimed without changing the order key.
+The active worker renews and rechecks its owner lease throughout DNS and ACME
+waits and before certificate side effects. CT comparison is deferred only
+while that live owner is inside the pre-ledger issuance window; a dormant or
+expired resumable order remains recoverable but cannot suppress CT evidence.
+Normal ownership replacement or a sibling-completed generation is treated as
+worker handoff, not as authority-store corruption.
 
 Custom-domain, relay, and credential wiring is restart-only. The live Connect
 toggle may change enablement or the rendezvous destination, but the running
 daemon preserves those boot-wired fields together until restart; this also
-keeps DNS credential scrubbing aligned with the certificate worker.
+keeps DNS credential scrubbing aligned with the certificate worker. A running
+relay tunnel pins its signed control polls, relay-mode DNS updates, and raw
+dialback endpoint to that same boot configuration generation, so a live
+Connect destination change cannot split a nonce and its data endpoint.
 
 Cloudflare requires a narrowly scoped token with DNS edit access to the named
 zone. Generic RFC2136 is also supported:

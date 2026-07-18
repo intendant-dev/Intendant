@@ -156,9 +156,11 @@ renewed automatically, private keys never leaving the machine. Issuance intent
 is recorded durably before ACME begins, so a crash before the first
 certificate pair is committed remains retryable. The active order URL, CSR,
 and certificate private key are journaled before finalization; an ambiguous
-finalize or certificate-poll result resumes the same order and keeps CT
-classification deferred until the resulting serial is recorded locally. Pair
-and own-certificate ledger reads and replacements share the daemon
+finalize or certificate-poll result resumes the same order. A live issuance
+owner renews its lease through network waits and defers CT classification only
+inside the pre-ledger commit window; dormant resumable orders remain
+recoverable while CT evidence is reconciled normally. Pair and own-certificate
+ledger reads and replacements share the daemon
 authority-store lock; restored and newly issued certificates must name the
 current exact fleet origin. With
 hosted control off, that gives a warning-free public shell/discovery endpoint.

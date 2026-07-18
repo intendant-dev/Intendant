@@ -1025,7 +1025,7 @@ mod tests {
         crate::fleet_cert::remember_fleet_origin_for_test(
             dir.path(),
             Some("example.test"),
-            "fleet.example.test",
+            "d-1234567890abcdef1234.example.test",
         )
         .unwrap();
         let error = runtime

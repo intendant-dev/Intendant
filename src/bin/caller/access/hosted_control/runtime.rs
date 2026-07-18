@@ -107,8 +107,6 @@ pub struct HostedControlRuntime {
     pub(super) daemon_id: String,
     daemon_label: String,
     display_media_relay_configured: bool,
-    doorbell_rate: Arc<Mutex<DoorbellRateState>>,
-    poll_rate: Arc<Mutex<PollRateState>>,
     pub(super) witness_rate: Arc<Mutex<WitnessRateState>>,
 }
 
@@ -130,7 +128,7 @@ impl std::fmt::Debug for HostedControlRuntime {
 }
 
 const SHARED_TRANSIENT_FILE: &str = "hosted-control-transient.json";
-const SHARED_TRANSIENT_SCHEMA_VERSION: u32 = 1;
+const SHARED_TRANSIENT_SCHEMA_VERSION: u32 = 2;
 const SHARED_TRANSIENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -157,6 +155,10 @@ struct SharedTransientState {
     public_replay: Vec<ReplayRecord>,
     lease_replay: Vec<ReplayRecord>,
     tickets: HashMap<String, WsTicketRecord>,
+    #[serde(default)]
+    doorbell_rate: DoorbellRateState,
+    #[serde(default)]
+    poll_rate: PollRateState,
 }
 
 impl Default for SharedTransientState {
@@ -166,6 +168,8 @@ impl Default for SharedTransientState {
             public_replay: Vec::new(),
             lease_replay: Vec::new(),
             tickets: HashMap::new(),
+            doorbell_rate: DoorbellRateState::default(),
+            poll_rate: PollRateState::default(),
         }
     }
 }
@@ -176,14 +180,16 @@ enum ReplayLane {
     Lease,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DoorbellRateState {
     global: VecDeque<i64>,
     by_key: HashMap<String, VecDeque<i64>>,
     by_source: HashMap<String, VecDeque<i64>>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PollRateState {
     global: VecDeque<i64>,
     by_request: HashMap<String, VecDeque<i64>>,
@@ -243,8 +249,6 @@ impl HostedControlRuntime {
             daemon_id,
             daemon_label,
             display_media_relay_configured,
-            doorbell_rate: Arc::new(Mutex::new(DoorbellRateState::default())),
-            poll_rate: Arc::new(Mutex::new(PollRateState::default())),
             witness_rate: Arc::new(Mutex::new(WitnessRateState::default())),
         }
     }
@@ -1155,63 +1159,67 @@ impl HostedControlRuntime {
         source_bucket: Option<&str>,
         now: i64,
     ) -> Result<(), String> {
-        let cutoff = now.saturating_sub(60_000);
-        let mut rate = self
-            .doorbell_rate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        retain_recent(&mut rate.global, cutoff);
-        rate.by_key.retain(|_, entries| {
-            retain_recent(entries, cutoff);
-            !entries.is_empty()
-        });
-        rate.by_source.retain(|_, entries| {
-            retain_recent(entries, cutoff);
-            !entries.is_empty()
-        });
-        if rate.global.len() >= DOORBELL_GLOBAL_PER_MINUTE {
-            return Err("hosted lease request rate limit reached".to_string());
-        }
-        let key_entries = rate.by_key.entry(fingerprint.to_string()).or_default();
-        if key_entries.len() >= DOORBELL_PER_KEY_PER_MINUTE {
-            return Err("hosted lease request key rate limit reached".to_string());
-        }
-        if let Some(source) = source_bucket.filter(|source| !source.trim().is_empty()) {
-            let source_entries = rate.by_source.entry(source.to_string()).or_default();
-            if source_entries.len() >= 30 {
-                return Err("hosted lease request source rate limit reached".to_string());
+        let fingerprint = stable_id_digest(fingerprint);
+        let source_bucket = source_bucket
+            .filter(|source| !source.trim().is_empty())
+            .map(stable_id_digest);
+        mutate_shared_transient(&self.cert_dir, |state| {
+            let cutoff = now.saturating_sub(60_000);
+            let rate = &mut state.doorbell_rate;
+            retain_recent(&mut rate.global, cutoff);
+            rate.by_key.retain(|_, entries| {
+                retain_recent(entries, cutoff);
+                !entries.is_empty()
+            });
+            rate.by_source.retain(|_, entries| {
+                retain_recent(entries, cutoff);
+                !entries.is_empty()
+            });
+            if rate.global.len() >= DOORBELL_GLOBAL_PER_MINUTE {
+                return Err("hosted lease request rate limit reached".to_string());
             }
-            source_entries.push_back(now);
-        }
-        rate.global.push_back(now);
-        rate.by_key
-            .entry(fingerprint.to_string())
-            .or_default()
-            .push_back(now);
-        Ok(())
+            if rate.by_key.get(&fingerprint).map_or(0, VecDeque::len) >= DOORBELL_PER_KEY_PER_MINUTE
+            {
+                return Err("hosted lease request key rate limit reached".to_string());
+            }
+            if let Some(source) = source_bucket.as_ref() {
+                let source_entries = rate.by_source.entry(source.clone()).or_default();
+                if source_entries.len() >= 30 {
+                    return Err("hosted lease request source rate limit reached".to_string());
+                }
+                source_entries.push_back(now);
+            }
+            rate.global.push_back(now);
+            rate.by_key.entry(fingerprint).or_default().push_back(now);
+            Ok(())
+        })
     }
 
     fn check_poll_rate(&self, request_id: &str, now: i64) -> Result<(), String> {
-        let cutoff = now.saturating_sub(60_000);
-        let mut rate = self
-            .poll_rate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        retain_recent(&mut rate.global, cutoff);
-        rate.by_request.retain(|_, entries| {
-            retain_recent(entries, cutoff);
-            !entries.is_empty()
-        });
-        if rate.global.len() >= POLL_GLOBAL_PER_MINUTE {
-            return Err("hosted lease poll global rate limit reached".to_string());
-        }
-        let request_entries = rate.by_request.entry(request_id.to_string()).or_default();
-        if request_entries.len() >= POLL_PER_REQUEST_PER_MINUTE {
-            return Err("hosted lease poll request rate limit reached".to_string());
-        }
-        request_entries.push_back(now);
-        rate.global.push_back(now);
-        Ok(())
+        let request_id = stable_id_digest(request_id);
+        mutate_shared_transient(&self.cert_dir, |state| {
+            let cutoff = now.saturating_sub(60_000);
+            let rate = &mut state.poll_rate;
+            retain_recent(&mut rate.global, cutoff);
+            rate.by_request.retain(|_, entries| {
+                retain_recent(entries, cutoff);
+                !entries.is_empty()
+            });
+            if rate.global.len() >= POLL_GLOBAL_PER_MINUTE {
+                return Err("hosted lease poll global rate limit reached".to_string());
+            }
+            if rate.by_request.get(&request_id).map_or(0, VecDeque::len)
+                >= POLL_PER_REQUEST_PER_MINUTE
+            {
+                return Err("hosted lease poll request rate limit reached".to_string());
+            }
+            rate.by_request
+                .entry(request_id)
+                .or_default()
+                .push_back(now);
+            rate.global.push_back(now);
+            Ok(())
+        })
     }
 }
 
@@ -1258,6 +1266,34 @@ fn shared_transient_path(cert_dir: &Path) -> PathBuf {
     cert_dir.join(SHARED_TRANSIENT_FILE)
 }
 
+fn valid_rate_digest(value: &str) -> bool {
+    value.len() == 43 && valid_id_component(value)
+}
+
+fn doorbell_rate_state_is_valid(rate: &DoorbellRateState) -> bool {
+    rate.global.len() <= DOORBELL_GLOBAL_PER_MINUTE
+        && rate.by_key.len() <= DOORBELL_GLOBAL_PER_MINUTE
+        && rate.by_source.len() <= DOORBELL_GLOBAL_PER_MINUTE
+        && rate.by_key.iter().all(|(key, entries)| {
+            valid_rate_digest(key) && entries.len() <= DOORBELL_PER_KEY_PER_MINUTE
+        })
+        && rate
+            .by_source
+            .iter()
+            .all(|(source, entries)| valid_rate_digest(source) && entries.len() <= 30)
+        && rate.by_key.values().map(VecDeque::len).sum::<usize>() <= rate.global.len()
+        && rate.by_source.values().map(VecDeque::len).sum::<usize>() <= rate.global.len()
+}
+
+fn poll_rate_state_is_valid(rate: &PollRateState) -> bool {
+    rate.global.len() <= POLL_GLOBAL_PER_MINUTE
+        && rate.by_request.len() <= POLL_GLOBAL_PER_MINUTE
+        && rate.by_request.iter().all(|(request, entries)| {
+            valid_rate_digest(request) && entries.len() <= POLL_PER_REQUEST_PER_MINUTE
+        })
+        && rate.by_request.values().map(VecDeque::len).sum::<usize>() <= rate.global.len()
+}
+
 fn load_shared_transient_locked(cert_dir: &Path) -> Result<SharedTransientState, String> {
     use std::io::Read as _;
 
@@ -1281,10 +1317,15 @@ fn load_shared_transient_locked(cert_dir: &Path) -> Result<SharedTransientState,
     }
     let mut state: SharedTransientState = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if state.schema_version == 1 {
+        state.schema_version = SHARED_TRANSIENT_SCHEMA_VERSION;
+    }
     if state.schema_version != SHARED_TRANSIENT_SCHEMA_VERSION
         || state.public_replay.len() > PROOF_NONCES_GLOBAL_CAP
         || state.lease_replay.len() > PROOF_NONCES_GLOBAL_CAP
         || state.tickets.len() > WS_TICKETS_GLOBAL_CAP
+        || !doorbell_rate_state_is_valid(&state.doorbell_rate)
+        || !poll_rate_state_is_valid(&state.poll_rate)
         || state
             .public_replay
             .iter()
@@ -1314,6 +1355,21 @@ fn load_shared_transient_locked(cert_dir: &Path) -> Result<SharedTransientState,
     state
         .lease_replay
         .retain(|record| record.timestamp_unix_ms >= replay_cutoff);
+    let rate_cutoff = now_ms().saturating_sub(60_000);
+    retain_recent(&mut state.doorbell_rate.global, rate_cutoff);
+    state.doorbell_rate.by_key.retain(|_, entries| {
+        retain_recent(entries, rate_cutoff);
+        !entries.is_empty()
+    });
+    state.doorbell_rate.by_source.retain(|_, entries| {
+        retain_recent(entries, rate_cutoff);
+        !entries.is_empty()
+    });
+    retain_recent(&mut state.poll_rate.global, rate_cutoff);
+    state.poll_rate.by_request.retain(|_, entries| {
+        retain_recent(entries, rate_cutoff);
+        !entries.is_empty()
+    });
     Ok(state)
 }
 
@@ -1910,12 +1966,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let runtime = runtime(&temp);
         let now = now_ms();
-        runtime
-            .doorbell_rate
-            .lock()
-            .unwrap()
-            .global
-            .extend(std::iter::repeat_n(now, DOORBELL_GLOBAL_PER_MINUTE));
+        replace_shared_transient(&runtime, |state| {
+            state
+                .doorbell_rate
+                .global
+                .extend(std::iter::repeat_n(now, DOORBELL_GLOBAL_PER_MINUTE));
+        });
         let key = browser_key();
         let error = runtime
             .create_request(
@@ -2006,12 +2062,12 @@ mod tests {
             )
             .unwrap();
         let now = now_ms();
-        runtime
-            .poll_rate
-            .lock()
-            .unwrap()
-            .global
-            .extend(std::iter::repeat_n(now, POLL_GLOBAL_PER_MINUTE));
+        replace_shared_transient(&runtime, |state| {
+            state
+                .poll_rate
+                .global
+                .extend(std::iter::repeat_n(now, POLL_GLOBAL_PER_MINUTE));
+        });
         let proof = HostedLeasePollProof {
             request_id: request.request_id,
             nonce: "poll-rate-limit".to_string(),
@@ -2027,6 +2083,50 @@ mod tests {
             1,
             "the rejected poll must not consume replay capacity"
         );
+    }
+
+    #[test]
+    fn public_admission_rate_windows_are_shared_between_runtime_instances() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = runtime(&temp);
+        let sibling = runtime(&temp);
+        let now = now_ms();
+        replace_shared_transient(&first, |state| {
+            state
+                .doorbell_rate
+                .global
+                .extend(std::iter::repeat_n(now, DOORBELL_GLOBAL_PER_MINUTE));
+            state
+                .poll_rate
+                .global
+                .extend(std::iter::repeat_n(now, POLL_GLOBAL_PER_MINUTE));
+        });
+
+        assert!(sibling
+            .check_doorbell_rate("sibling-key", Some("sibling-source"), now)
+            .unwrap_err()
+            .contains("rate limit"));
+        assert!(sibling
+            .check_poll_rate("request:sibling", now)
+            .unwrap_err()
+            .contains("global rate limit"));
+    }
+
+    #[test]
+    fn legacy_shared_transient_state_migrates_with_empty_rate_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        std::fs::create_dir_all(&runtime.cert_dir).unwrap();
+        std::fs::write(
+            shared_transient_path(&runtime.cert_dir),
+            br#"{"schema_version":1,"public_replay":[],"lease_replay":[],"tickets":{}}"#,
+        )
+        .unwrap();
+
+        let migrated = shared_transient(&runtime);
+        assert_eq!(migrated.schema_version, SHARED_TRANSIENT_SCHEMA_VERSION);
+        assert!(migrated.doorbell_rate.global.is_empty());
+        assert!(migrated.poll_rate.global.is_empty());
     }
 
     #[test]

@@ -32,8 +32,8 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
 use crate::connect_rendezvous::{
-    authenticated, dns_publish_via_relay, join_url, signed_daemon_context, RELAY_CONTROL_PROTOCOL,
-    RELAY_CONTROL_PROTOCOL_V1,
+    authenticated, dns_publish_via_relay, join_url, signed_daemon_context_for_config,
+    RELAY_CONTROL_PROTOCOL, RELAY_CONTROL_PROTOCOL_V1,
 };
 use crate::daemon_identity::DaemonIdentity;
 use crate::project::ConnectConfig;
@@ -98,20 +98,22 @@ pub fn spawn_relay_tunnel_client(
         eprintln!("[relay] tunnel enabled but its dedicated gateway ingress is unavailable");
         return;
     };
+    let dns_config = config.clone();
     tokio::spawn(run_relay_tunnel(
+        config,
         endpoint,
         gateway_ingress_addr,
         current_fleet_zone_observed,
     ));
-    tokio::spawn(relay_dns_reassert_loop());
+    tokio::spawn(relay_dns_reassert_loop(dns_config));
 }
 
 /// Best-effort: keep the fleet name pointed at the relay while the tunnel is
 /// up. Only meaningful when the rendezvous runs both fleet DNS and the relay;
 /// failures are expected weather for other configurations and logged quietly.
-async fn relay_dns_reassert_loop() {
+async fn relay_dns_reassert_loop(config: ConnectConfig) {
     loop {
-        if let Err(error) = dns_publish_via_relay(true).await {
+        if let Err(error) = dns_publish_via_relay(&config, true).await {
             eprintln!("[relay] relay-mode dns publish (best-effort): {error}");
         }
         tokio::time::sleep(DNS_REASSERT_INTERVAL).await;
@@ -119,6 +121,7 @@ async fn relay_dns_reassert_loop() {
 }
 
 async fn run_relay_tunnel(
+    config: ConnectConfig,
     relay_endpoint: String,
     gateway_ingress_addr: SocketAddr,
     current_fleet_zone_observed: Arc<AtomicBool>,
@@ -142,20 +145,23 @@ async fn run_relay_tunnel(
         // Relay readiness is process-local, so reload it before registering
         // this poller as a possible dialback recipient.
         crate::fleet_cert::refresh_installed_state();
-        // Resolve the signing context fresh each cycle so a rendezvous URL or
-        // identity that only becomes available after boot is picked up.
-        let (config, base_url, identity, daemon_id) = match signed_daemon_context() {
-            Ok(context) => context,
-            Err(error) => {
-                eprintln!("[relay] tunnel context unavailable: {error}");
-                backoff = sleep_backoff(backoff).await;
-                continue;
-            }
-        };
+        // Resolve identity material fresh each cycle, but keep the complete
+        // relay configuration generation fixed. A live Connect destination
+        // change must not pair a nonce from a new control plane with the
+        // boot-captured raw dial-back endpoint.
+        let (control_config, base_url, identity, daemon_id) =
+            match signed_daemon_context_for_config(config.clone()) {
+                Ok(context) => context,
+                Err(error) => {
+                    eprintln!("[relay] tunnel context unavailable: {error}");
+                    backoff = sleep_backoff(backoff).await;
+                    continue;
+                }
+            };
         let name_materials = if !current_fleet_zone_observed.load(Ordering::SeqCst) {
             Vec::new()
         } else {
-            match crate::custom_domain::relay_certificate_material(&config.custom_domain) {
+            match crate::custom_domain::relay_certificate_material(&control_config.custom_domain) {
                 Ok(Some(material)) => {
                     last_custom_error = None;
                     vec![material]
@@ -177,7 +183,7 @@ async fn run_relay_tunnel(
         };
         let poll = RelayPollContext {
             client: &client,
-            config: &config,
+            config: &control_config,
             base_url: &base_url,
             identity: &identity,
             daemon_id: &daemon_id,

@@ -48,6 +48,7 @@ const FLEET_CERT_ISSUANCE_TTL_MS: u64 = 2 * 60 * 60 * 1000;
 /// while ensuring a deleted order cannot block renewal and CT commits forever.
 const FLEET_CERT_RESUMABLE_ORDER_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const FLEET_CERT_ISSUANCE_OWNER_LEASE_MS: u64 = 10 * 60 * 1000;
+const FLEET_CERT_ISSUANCE_HEARTBEAT_MS: u64 = 60 * 1000;
 const FLEET_CERT_ISSUANCE_MAX_ACTIVE: usize = 16;
 
 /// Durable service-controlled-name provenance. Certificates and Connect
@@ -97,6 +98,12 @@ fn normalized_dns_name(value: &str) -> Option<String> {
 
 fn fleet_zone_from_exact_name(name: &str) -> Option<String> {
     let name = normalized_dns_name(name)?;
+    if !matches!(
+        rustls::pki_types::ServerName::try_from(name.clone()).ok()?,
+        rustls::pki_types::ServerName::DnsName(_)
+    ) {
+        return None;
+    }
     let (label, zone) = name.split_once('.')?;
     let digest = label.strip_prefix("d-")?;
     (digest.len() == 20 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) && !zone.is_empty())
@@ -222,17 +229,26 @@ fn remember_fleet_origin_in(
 ) -> Result<FleetOriginProvenance, String> {
     let name = normalized_dns_name(name)
         .ok_or_else(|| "rendezvous returned an empty fleet name".to_string())?;
+    let derived_zone = fleet_zone_from_exact_name(&name).ok_or_else(|| {
+        "rendezvous returned a fleet name outside the canonical d-<20hex>.<zone> form".to_string()
+    })?;
+    let supplied_zone = zone
+        .and_then(normalized_dns_name)
+        .ok_or_else(|| "rendezvous returned an empty fleet zone".to_string())?;
+    if supplied_zone != derived_zone {
+        return Err(format!(
+            "rendezvous fleet name belongs to {derived_zone}, not the supplied zone {supplied_zone}"
+        ));
+    }
     crate::access::authority_store::with_lock(cert_dir, || {
         let needs_rewrite = fleet_origin_provenance_needs_rewrite_in(cert_dir);
         let mut provenance =
             load_fleet_origin_provenance_in(cert_dir).map_err(crate::access::AccessError)?;
         let before = provenance.clone();
-        provenance.zone = zone.and_then(normalized_dns_name);
-        if let Some(zone) = provenance.zone.clone() {
-            provenance.known_zones.push(zone);
-            provenance.known_zones.sort();
-            provenance.known_zones.dedup();
-        }
+        provenance.zone = Some(derived_zone.clone());
+        provenance.known_zones.push(derived_zone);
+        provenance.known_zones.sort();
+        provenance.known_zones.dedup();
         provenance.name = Some(name.clone());
         provenance.known_names.push(name);
         provenance.known_names.sort();
@@ -416,34 +432,65 @@ fn with_status(update: impl FnOnce(&mut FleetCertStatus)) {
 /// first time the name is learned.
 pub fn note_fleet_dns(zone: Option<String>, name: Option<String>) -> bool {
     fleet_dns_observed_this_process().store(true, Ordering::SeqCst);
-    let mut provenance_accepted = true;
-    if let Some(name) = name.as_deref() {
-        // The rendezvous-assigned public name is never an authority anchor,
-        // regardless of whether its WebPKI certificate has been issued or
-        // installed yet. Register provenance before updating live state so
-        // gateway requests fail closed during name/certificate transitions.
-        crate::web_tls::register_fleet_server_name(name);
-        match remember_fleet_origin_in(&cert_dir(), zone.as_deref(), name) {
-            Ok(provenance) if provenance.provenance_incomplete => {
-                mark_fleet_origin_provenance_incomplete();
-            }
-            Ok(_) => {}
-            Err(error) => {
-                // In-memory exact-name classification still fails closed for
-                // this process, but persistence failure means older names may
-                // be unrecoverable after restart. Keep the conservative IAM
-                // guard sticky and surface the durability failure loudly.
-                mark_fleet_origin_provenance_incomplete();
-                provenance_accepted = false;
-                eprintln!("[fleet-cert] persist fleet-origin provenance failed: {error}");
-            }
+    let (zone, name) = match (zone, name) {
+        // An absent hint is a complete observation that this rendezvous has no
+        // current delegated fleet zone. It must not resurrect remembered
+        // live status, but it does not make the historical provenance ledger
+        // incomplete.
+        (None, None) => {
+            with_status(|status| {
+                status.zone = None;
+                status.name = None;
+            });
+            return true;
         }
+        (Some(zone), Some(name)) => (zone, name),
+        _ => {
+            with_status(|status| {
+                status.zone = None;
+                status.name = None;
+            });
+            eprintln!(
+                "[fleet-cert] rejected incomplete fleet DNS provenance; expected both zone and name"
+            );
+            return false;
+        }
+    };
+
+    // The rendezvous-assigned public name is never an authority anchor,
+    // regardless of whether its WebPKI certificate has been issued or
+    // installed yet. Validate and durably register its exact canonical
+    // zone/name pair before exposing either live status or the custom-lane
+    // observation gate.
+    let provenance = match remember_fleet_origin_in(&cert_dir(), Some(&zone), &name) {
+        Ok(provenance) => provenance,
+        Err(error) => {
+            with_status(|status| {
+                status.zone = None;
+                status.name = None;
+            });
+            eprintln!("[fleet-cert] reject fleet-origin provenance: {error}");
+            return false;
+        }
+    };
+    let provenance_accepted = !provenance.provenance_incomplete;
+    if !provenance_accepted {
+        mark_fleet_origin_provenance_incomplete();
     }
+    let zone = provenance
+        .zone
+        .clone()
+        .expect("validated fleet provenance has a zone");
+    let name = provenance
+        .name
+        .clone()
+        .expect("validated fleet provenance has a name");
+    crate::web_tls::register_fleet_server_name(&name);
     let newly_named = {
         let mut status = registry().lock().expect("fleet cert status poisoned");
-        let newly_named = name.is_some() && status.name != name;
-        status.zone = zone;
-        status.name = name;
+        let newly_named = status.name.as_deref() != Some(name.as_str());
+        status.zone = Some(zone);
+        status.name = Some(name);
         newly_named
     };
     if newly_named {
@@ -1271,6 +1318,33 @@ fn finish_issuance_claim_in(
     .map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IssuanceClaimState {
+    Current,
+    Superseded,
+    Completed,
+}
+
+fn issuance_claim_state_in(
+    cert_dir: &Path,
+    token: &str,
+    owner_token: &str,
+) -> Result<IssuanceClaimState, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let store = load_issuance_store_locked_in(cert_dir).map_err(crate::access::AccessError)?;
+        Ok(
+            match store.orders.iter().find(|order| order.token == token) {
+                None => IssuanceClaimState::Completed,
+                Some(order) if order.owner_token.as_deref() == Some(owner_token) => {
+                    IssuanceClaimState::Current
+                }
+                Some(_) => IssuanceClaimState::Superseded,
+            },
+        )
+    })
+    .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 fn begin_issuance_in(cert_dir: &Path, name: &str) -> Result<String, String> {
     let (order, owner_token) = claim_issuance_in(cert_dir, name)?;
@@ -1286,6 +1360,16 @@ fn finish_issuance_in(cert_dir: &Path, token: &str) -> Result<(), String> {
 fn issuance_active_locked_in(cert_dir: &Path, name: &str) -> Result<bool, String> {
     let store = load_issuance_store_locked_in(cert_dir)?;
     Ok(store.orders.iter().any(|order| order.name == name))
+}
+
+fn issuance_ct_commit_window_active_locked_in(cert_dir: &Path, name: &str) -> Result<bool, String> {
+    let store = load_issuance_store_locked_in(cert_dir)?;
+    let now = now_unix_ms();
+    Ok(store.orders.iter().any(|order| {
+        order.name == name
+            && order.owner_token.is_some()
+            && now <= order.owner_lease_expires_unix_ms
+    }))
 }
 
 fn issuance_active_in(cert_dir: &Path, name: &str) -> Result<bool, String> {
@@ -1315,6 +1399,42 @@ impl IssuanceGuard {
 
     fn order_url(&self) -> Option<&str> {
         self.order.order_url.as_deref()
+    }
+
+    fn renew(&mut self) -> Result<(), String> {
+        self.order = update_claimed_issuance_in(
+            &self.cert_dir,
+            &self.order.token,
+            &self.owner_token,
+            |_| Ok(()),
+        )?;
+        Ok(())
+    }
+
+    async fn await_with_heartbeat<F>(&mut self, future: F) -> Result<F::Output, String>
+    where
+        F: std::future::Future,
+    {
+        self.renew()?;
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(
+            FLEET_CERT_ISSUANCE_HEARTBEAT_MS,
+        ));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `interval`'s first tick is immediate; the explicit renewal above
+        // establishes ownership before the network future is first polled.
+        heartbeat.tick().await;
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                output = &mut future => {
+                    self.renew()?;
+                    return Ok(output);
+                }
+                _ = heartbeat.tick() => {
+                    self.renew()?;
+                }
+            }
+        }
     }
 
     fn record_order_url(&mut self, order_url: &str) -> Result<(), String> {
@@ -1401,16 +1521,35 @@ impl IssuanceGuard {
     fn finish(mut self) -> Result<(), String> {
         let result =
             finish_issuance_claim_in(&self.cert_dir, &self.order.token, Some(&self.owner_token));
-        if let Err(error) = &result {
-            with_status(|status| {
-                status.ct_state = "unreadable".to_string();
-                status.ct_last_error =
-                    Some(format!("clear durable certificate issuance state: {error}"));
-            });
-        } else {
-            self.claimed = false;
+        match result {
+            Ok(()) => {
+                self.claimed = false;
+                Ok(())
+            }
+            Err(error) => {
+                match issuance_claim_state_in(&self.cert_dir, &self.order.token, &self.owner_token)
+                {
+                    Ok(IssuanceClaimState::Completed) => {
+                        // A sibling finished the same durable generation while
+                        // this worker was paused. Adopt the shared completion.
+                        self.claimed = false;
+                        Ok(())
+                    }
+                    Ok(IssuanceClaimState::Superseded) => {
+                        self.claimed = false;
+                        Err("certificate issuance ownership was superseded".to_string())
+                    }
+                    Ok(IssuanceClaimState::Current) | Err(_) => {
+                        with_status(|status| {
+                            status.ct_state = "unreadable".to_string();
+                            status.ct_last_error =
+                                Some(format!("clear durable certificate issuance state: {error}"));
+                        });
+                        Err(error)
+                    }
+                }
+            }
         }
-        result
     }
 
     fn abandon(self) -> Result<(), String> {
@@ -1426,13 +1565,18 @@ impl Drop for IssuanceGuard {
         if let Err(error) =
             release_issuance_in(&self.cert_dir, &self.order.token, &self.owner_token)
         {
-            eprintln!("[fleet-cert] release durable issuance ownership: {error}");
-            with_status(|status| {
-                status.ct_state = "unreadable".to_string();
-                status.ct_last_error = Some(format!(
-                    "release durable certificate issuance ownership: {error}"
-                ));
-            });
+            match issuance_claim_state_in(&self.cert_dir, &self.order.token, &self.owner_token) {
+                Ok(IssuanceClaimState::Completed | IssuanceClaimState::Superseded) => {}
+                Ok(IssuanceClaimState::Current) | Err(_) => {
+                    eprintln!("[fleet-cert] release durable issuance ownership: {error}");
+                    with_status(|status| {
+                        status.ct_state = "unreadable".to_string();
+                        status.ct_last_error = Some(format!(
+                            "release durable certificate issuance ownership: {error}"
+                        ));
+                    });
+                }
+            }
         }
     }
 }
@@ -1504,20 +1648,27 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
     });
 
     // 1. Make the name resolve: publish the addresses (daemon-signed).
-    let published = crate::connect_rendezvous::dns_publish_addresses(&addresses).await?;
+    let published = issuance
+        .await_with_heartbeat(crate::connect_rendezvous::dns_publish_addresses(&addresses))
+        .await??;
     with_status(|status| status.addresses = published.clone());
 
     // 2. The ACME order.
-    let account = acme_account().await?;
+    let account = issuance.await_with_heartbeat(acme_account()).await??;
     let mut order = if let Some(order_url) = issuance.order_url() {
-        match account.order(order_url.to_string()).await {
+        match issuance
+            .await_with_heartbeat(account.order(order_url.to_string()))
+            .await?
+        {
             Ok(order) => order,
             Err(error) if acme_order_resume_is_terminal(&error) => {
                 issuance.restart_order()?;
                 let identifiers = [instant_acme::Identifier::Dns(name.clone())];
-                let order = account
-                    .new_order(&instant_acme::NewOrder::new(&identifiers))
-                    .await
+                let new_order = instant_acme::NewOrder::new(&identifiers);
+                let order = account.new_order(&new_order);
+                let order = issuance
+                    .await_with_heartbeat(order)
+                    .await?
                     .map_err(|error| format!("replace terminal ACME order: {error}"))?;
                 issuance.record_order_url(order.url())?;
                 order
@@ -1526,9 +1677,11 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
         }
     } else {
         let identifiers = [instant_acme::Identifier::Dns(name.clone())];
-        let order = account
-            .new_order(&instant_acme::NewOrder::new(&identifiers))
-            .await
+        let new_order = instant_acme::NewOrder::new(&identifiers);
+        let order = account.new_order(&new_order);
+        let order = issuance
+            .await_with_heartbeat(order)
+            .await?
             .map_err(|error| format!("acme new order: {error}"))?;
         issuance.record_order_url(order.url())?;
         order
@@ -1538,7 +1691,7 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
     if order_status == instant_acme::OrderStatus::Pending {
         {
             let mut authorizations = order.authorizations();
-            while let Some(result) = authorizations.next().await {
+            while let Some(result) = issuance.await_with_heartbeat(authorizations.next()).await? {
                 let mut authz = result.map_err(|e| format!("acme authorization: {e}"))?;
                 match authz.status {
                     instant_acme::AuthorizationStatus::Pending => {}
@@ -1551,29 +1704,38 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
                     .challenge(instant_acme::ChallengeType::Dns01)
                     .ok_or_else(|| "acme order offers no dns-01 challenge".to_string())?;
                 let txt_value = challenge.key_authorization().dns_value();
-                crate::connect_rendezvous::dns_acme_set(&txt_value).await?;
-                challenge
-                    .set_ready()
-                    .await
+                issuance
+                    .await_with_heartbeat(crate::connect_rendezvous::dns_acme_set(&txt_value))
+                    .await??;
+                let ready = challenge.set_ready();
+                issuance
+                    .await_with_heartbeat(ready)
+                    .await?
                     .map_err(|e| format!("acme challenge ready: {e}"))?;
             }
         }
-        order_status = order
-            .poll_ready(&instant_acme::RetryPolicy::default())
-            .await
+        let retry = instant_acme::RetryPolicy::default();
+        let ready = order.poll_ready(&retry);
+        order_status = issuance
+            .await_with_heartbeat(ready)
+            .await?
             .map_err(|e| format!("acme validation: {e}"))?;
     }
     if order_status == instant_acme::OrderStatus::Invalid {
-        let _ = crate::connect_rendezvous::dns_acme_clear().await;
+        let cleanup = issuance
+            .await_with_heartbeat(crate::connect_rendezvous::dns_acme_clear())
+            .await?;
+        let _ = cleanup;
         issuance.abandon()?;
         return Err("acme order became invalid".to_string());
     }
     let private_key_pem = match order_status {
         instant_acme::OrderStatus::Ready => {
             let (private_key_pem, csr_der) = issuance.finalization_material(&name)?;
-            order
-                .finalize_csr(&csr_der)
-                .await
+            let finalize = order.finalize_csr(&csr_der);
+            issuance
+                .await_with_heartbeat(finalize)
+                .await?
                 .map_err(|error| format!("acme finalize: {error}"))?;
             private_key_pem
         }
@@ -1584,9 +1746,11 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
             return Err(format!("acme order cannot be resumed from state {other:?}"));
         }
     };
-    let cert_chain_pem = order
-        .poll_certificate(&instant_acme::RetryPolicy::default())
-        .await
+    let retry = instant_acme::RetryPolicy::default();
+    let certificate = order.poll_certificate(&retry);
+    let cert_chain_pem = issuance
+        .await_with_heartbeat(certificate)
+        .await?
         .map_err(|e| format!("acme certificate: {e}"))?;
     require_fleet_certificate_dns_name(&cert_chain_pem, &name)?;
     ensure_current_fleet_name(&name)?;
@@ -1594,18 +1758,24 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
     // crash here can't make this certificate look foreign later. Failure is
     // loud and retryable: installing an unrecorded certificate would create
     // a false CT alert.
+    issuance.renew()?;
     record_own_certificate_in(&certificate_dir, &cert_chain_pem, &name, &acme_directory())?;
     // Best-effort challenge cleanup after the serial is durable. Keeping the
     // issuance marker through both steps prevents a CT poll from classifying
     // the just-issued precertificate before its own-serial record exists.
-    let _ = crate::connect_rendezvous::dns_acme_clear().await;
+    let cleanup = issuance
+        .await_with_heartbeat(crate::connect_rendezvous::dns_acme_clear())
+        .await?;
+    let _ = cleanup;
 
     // 3. Persist + install live. The per-file replacements are atomic and
     // the shared authority lock prevents two daemon processes from
     // interleaving different pairs. A crash between the two replacements is
     // detected at restore and retried by the renewal loop.
+    issuance.renew()?;
     persist_certificate_pair_in(&certificate_dir, &name, &cert_chain_pem, &private_key_pem)?;
     ensure_current_fleet_name(&name)?;
+    issuance.renew()?;
     crate::web_tls::install_fleet_certificate(&name, &cert_chain_pem, &private_key_pem)?;
     let mut name_changed = false;
     with_status(|status| {
@@ -1622,6 +1792,7 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
             "fleet name changed after certificate issuance completed for {name}; retry against the current name"
         ));
     }
+    issuance.renew()?;
     issuance.finish()?;
     Ok(())
 }
@@ -2170,7 +2341,9 @@ fn commit_ct_entries_in(
                 "fleet name changed before CT evidence commit for {name}"
             )));
         }
-        if issuance_active_locked_in(cert_dir, &name).map_err(crate::access::AccessError)? {
+        if issuance_ct_commit_window_active_locked_in(cert_dir, &name)
+            .map_err(crate::access::AccessError)?
+        {
             return Ok(CtCommit::DeferredForIssuance);
         }
 
@@ -2444,26 +2617,32 @@ mod tests {
         let first = remember_fleet_origin_in(
             temp.path(),
             Some("Fleet.Example.Test."),
-            "Old.Fleet.Example.Test.",
+            "D-00000000000000000000.Fleet.Example.Test.",
         )
         .unwrap();
         assert_eq!(first.zone.as_deref(), Some("fleet.example.test"));
-        assert_eq!(first.name.as_deref(), Some("old.fleet.example.test"));
+        assert_eq!(
+            first.name.as_deref(),
+            Some("d-00000000000000000000.fleet.example.test")
+        );
 
         remember_fleet_origin_in(
             temp.path(),
             Some("fleet.example.test"),
-            "new.fleet.example.test",
+            "d-11111111111111111111.fleet.example.test",
         )
         .unwrap();
         let restored = load_fleet_origin_provenance_in(temp.path()).unwrap();
-        assert_eq!(restored.name.as_deref(), Some("new.fleet.example.test"));
+        assert_eq!(
+            restored.name.as_deref(),
+            Some("d-11111111111111111111.fleet.example.test")
+        );
         assert_eq!(restored.known_zones, vec!["fleet.example.test".to_string()]);
         assert_eq!(
             restored.known_names,
             vec![
-                "new.fleet.example.test".to_string(),
-                "old.fleet.example.test".to_string(),
+                "d-00000000000000000000.fleet.example.test".to_string(),
+                "d-11111111111111111111.fleet.example.test".to_string(),
             ]
         );
         assert!(is_service_controlled_name_in(temp.path(), "custom.fleet.example.test").unwrap());
@@ -2477,6 +2656,38 @@ mod tests {
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         }
         let _ = metadata;
+    }
+
+    #[test]
+    fn fleet_origin_provenance_requires_a_coherent_canonical_pair() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = "d-1234567890abcdef1234.fleet.example.test";
+        assert!(remember_fleet_origin_in(temp.path(), None, name)
+            .unwrap_err()
+            .contains("empty fleet zone"));
+        assert!(
+            remember_fleet_origin_in(temp.path(), Some("other.example.test"), name)
+                .unwrap_err()
+                .contains("not the supplied zone")
+        );
+        assert!(remember_fleet_origin_in(
+            temp.path(),
+            Some("fleet.example.test"),
+            "box.fleet.example.test"
+        )
+        .unwrap_err()
+        .contains("canonical"));
+        assert!(remember_fleet_origin_in(
+            temp.path(),
+            Some("fleet.example.test/invalid"),
+            "d-1234567890abcdef1234.fleet.example.test/invalid"
+        )
+        .unwrap_err()
+        .contains("canonical"));
+        assert!(
+            !fleet_origin_provenance_path_in(temp.path()).exists(),
+            "invalid metadata must not become durable provenance"
+        );
     }
 
     #[test]
@@ -2679,7 +2890,7 @@ mod tests {
     #[test]
     fn renewal_retries_an_unusable_restored_pair_without_an_expiry() {
         let temp = tempfile::tempdir().unwrap();
-        let name = "d-test.fleet.example.test";
+        let name = "d-11111111111111111111.fleet.example.test";
         remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
         assert!(read_stored_certificate_pair_in(temp.path())
             .unwrap()
@@ -2756,8 +2967,8 @@ mod tests {
     #[test]
     fn certificate_commit_is_bound_to_the_current_durable_fleet_name() {
         let temp = tempfile::tempdir().unwrap();
-        let old_name = "old.fleet.example.test";
-        let new_name = "new.fleet.example.test";
+        let old_name = "d-00000000000000000000.fleet.example.test";
+        let new_name = "d-11111111111111111111.fleet.example.test";
         remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), old_name).unwrap();
         persist_certificate_pair_in(temp.path(), old_name, "old certificate", "old key").unwrap();
         remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), new_name).unwrap();
@@ -2893,7 +3104,7 @@ mod tests {
     #[test]
     fn concurrent_own_certificate_records_do_not_overwrite_each_other() {
         let temp = tempfile::tempdir().unwrap();
-        let name = "one.fleet.example.test";
+        let name = "d-11111111111111111111.fleet.example.test";
         let certificate = |serial: u8| {
             let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
             params.serial_number = Some(rcgen::SerialNumber::from(vec![serial]));
@@ -3007,7 +3218,7 @@ mod tests {
     #[test]
     fn ct_commits_merge_foreign_evidence_until_the_serial_is_recorded_as_own() {
         let temp = tempfile::tempdir().unwrap();
-        let name = "one.fleet.example.test";
+        let name = "d-11111111111111111111.fleet.example.test";
         remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
         let first = commit_ct_entries_in(
             temp.path(),
@@ -3040,9 +3251,9 @@ mod tests {
     #[test]
     fn ct_commit_defers_while_a_durable_issuance_is_active() {
         let temp = tempfile::tempdir().unwrap();
-        let name = "one.fleet.example.test";
+        let name = "d-11111111111111111111.fleet.example.test";
         remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
-        let token = begin_issuance_in(temp.path(), name).unwrap();
+        let issuance = IssuanceGuard::begin(temp.path(), name).unwrap();
         assert!(matches!(
             commit_ct_entries_in(
                 temp.path(),
@@ -3057,11 +3268,88 @@ mod tests {
             .unwrap(),
             CtCommit::DeferredForIssuance
         ));
-        finish_issuance_in(temp.path(), &token).unwrap();
+        issuance.finish().unwrap();
         assert!(matches!(
             commit_ct_entries_in(temp.path(), name, Vec::new(), 2).unwrap(),
             CtCommit::Applied(_)
         ));
+    }
+
+    #[test]
+    fn ct_commit_does_not_defer_for_a_dormant_or_expired_issuance_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = "d-11111111111111111111.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
+
+        let dormant = begin_issuance_in(temp.path(), name).unwrap();
+        assert!(matches!(
+            commit_ct_entries_in(temp.path(), name, Vec::new(), 1).unwrap(),
+            CtCommit::Applied(_)
+        ));
+        finish_issuance_in(temp.path(), &dormant).unwrap();
+
+        let live = IssuanceGuard::begin(temp.path(), name).unwrap();
+        crate::access::authority_store::with_lock(temp.path(), || {
+            let mut store =
+                load_issuance_store_locked_in(temp.path()).map_err(crate::access::AccessError)?;
+            let order = store
+                .orders
+                .iter_mut()
+                .find(|order| order.token == live.order.token)
+                .unwrap();
+            order.owner_lease_expires_unix_ms = now_unix_ms().saturating_sub(1);
+            write_issuance_store_locked_in(temp.path(), &store)
+        })
+        .unwrap();
+        assert!(matches!(
+            commit_ct_entries_in(temp.path(), name, Vec::new(), 2).unwrap(),
+            CtCommit::Applied(_)
+        ));
+        drop(live);
+    }
+
+    #[test]
+    fn completed_or_superseded_issuance_claims_are_not_store_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = "d-11111111111111111111.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
+
+        let completed = IssuanceGuard::begin(temp.path(), name).unwrap();
+        finish_issuance_in(temp.path(), &completed.order.token).unwrap();
+        assert_eq!(
+            issuance_claim_state_in(temp.path(), &completed.order.token, &completed.owner_token)
+                .unwrap(),
+            IssuanceClaimState::Completed
+        );
+        completed.finish().unwrap();
+
+        let mut superseded = IssuanceGuard::begin(temp.path(), name).unwrap();
+        crate::access::authority_store::with_lock(temp.path(), || {
+            let mut store =
+                load_issuance_store_locked_in(temp.path()).map_err(crate::access::AccessError)?;
+            let order = store
+                .orders
+                .iter_mut()
+                .find(|order| order.token == superseded.order.token)
+                .unwrap();
+            order.owner_token = Some("11111111111111111111111111111111".to_string());
+            write_issuance_store_locked_in(temp.path(), &store)
+        })
+        .unwrap();
+        assert!(superseded
+            .renew()
+            .unwrap_err()
+            .contains("ownership changed"));
+        assert_eq!(
+            issuance_claim_state_in(
+                temp.path(),
+                &superseded.order.token,
+                &superseded.owner_token
+            )
+            .unwrap(),
+            IssuanceClaimState::Superseded
+        );
+        drop(superseded);
     }
 
     #[test]

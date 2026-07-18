@@ -905,18 +905,12 @@ fn note_current_register_response(
     }
     // Fleet DNS: hand the name to the certificate machinery (it installs
     // any stored certificate the first time the name is learned).
-    let provenance_accepted = crate::fleet_cert::note_fleet_dns(
-        response
-            .fleet_dns
-            .as_ref()
-            .map(|hint| hint.zone.clone())
-            .filter(|zone| !zone.is_empty()),
-        response
-            .fleet_dns
-            .as_ref()
-            .map(|hint| hint.name.clone())
-            .filter(|name| !name.is_empty()),
-    );
+    let provenance_accepted = match response.fleet_dns.as_ref() {
+        Some(hint) => {
+            crate::fleet_cert::note_fleet_dns(Some(hint.zone.clone()), Some(hint.name.clone()))
+        }
+        None => crate::fleet_cert::note_fleet_dns(None, None),
+    };
     fleet_zone_observed.store(provenance_accepted, std::sync::atomic::Ordering::SeqCst);
     with_status(|status| {
         status.registered = true;
@@ -1610,6 +1604,16 @@ pub(crate) fn signed_daemon_context() -> Result<(ConnectConfig, Url, DaemonIdent
         .clone();
     let status = status_snapshot();
     let config = signed_daemon_config(stored, &status);
+    signed_daemon_context_for_config(config)
+}
+
+/// Resolve a daemon-signed request context from one immutable configuration
+/// generation. Long-lived side channels use this instead of the live client
+/// snapshot so their control URL, identity, credentials, and data endpoint
+/// cannot straddle two runtime configurations.
+pub(crate) fn signed_daemon_context_for_config(
+    config: ConnectConfig,
+) -> Result<(ConnectConfig, Url, DaemonIdentity, String), String> {
     let base_url = config
         .rendezvous_url
         .as_deref()
@@ -1665,7 +1669,23 @@ async fn dns_signed_post(
     payload_tail: &str,
     extra: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let (config, base_url, identity, daemon_id) = signed_daemon_context()?;
+    dns_signed_post_with_context(
+        signed_daemon_context()?,
+        path,
+        protocol,
+        payload_tail,
+        extra,
+    )
+    .await
+}
+
+async fn dns_signed_post_with_context(
+    (config, base_url, identity, daemon_id): (ConnectConfig, Url, DaemonIdentity, String),
+    path: &str,
+    protocol: &str,
+    payload_tail: &str,
+    extra: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let daemon_public_key = identity.public_key_b64u();
     let issued_at_unix_ms = crate::access::client_key::now_unix_ms().max(0) as u64;
     let payload = format!(
@@ -1751,8 +1771,12 @@ pub(crate) async fn dns_acme_clear() -> Result<(), String> {
 /// resolves to the relay, or revert to direct address publishing
 /// (`enable = false`). Best-effort: only meaningful when the rendezvous runs
 /// both fleet DNS and the relay.
-pub(crate) async fn dns_publish_via_relay(enable: bool) -> Result<(), String> {
-    dns_signed_post(
+pub(crate) async fn dns_publish_via_relay(
+    config: &ConnectConfig,
+    enable: bool,
+) -> Result<(), String> {
+    dns_signed_post_with_context(
+        signed_daemon_context_for_config(config.clone())?,
         "api/dns/relay",
         DNS_RELAY_PROTOCOL,
         if enable { "1" } else { "0" },
@@ -2347,6 +2371,37 @@ mod tests {
         assert_eq!(legacy.claim_code.as_deref(), Some("a-b-c"));
         assert_eq!(legacy.claimed_by_user_id, None);
         assert_eq!(legacy.claim_code_expires_unix_ms, None);
+    }
+
+    #[test]
+    fn present_incoherent_fleet_dns_hint_does_not_open_the_observation_gate() {
+        let base_url = Url::parse("https://connect.example").unwrap();
+        let observed = std::sync::atomic::AtomicBool::new(true);
+        let mut response = RegisterResponse {
+            claimed: false,
+            claimed_by_user_id: None,
+            claimed_by_handle: None,
+            claim_code: None,
+            claim_code_expires_unix_ms: None,
+            claim_url: None,
+            daemon_session_token: None,
+            daemon_session_expires_unix_ms: None,
+            observed_ip: None,
+            fleet_dns: Some(FleetDnsHint {
+                zone: String::new(),
+                name: String::new(),
+            }),
+        };
+        note_current_register_response(&response, &base_url, &observed);
+        assert!(!observed.load(std::sync::atomic::Ordering::SeqCst));
+
+        response.fleet_dns = Some(FleetDnsHint {
+            zone: "other.example.test".to_string(),
+            name: "d-1234567890abcdef1234.fleet.example.test".to_string(),
+        });
+        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        note_current_register_response(&response, &base_url, &observed);
+        assert!(!observed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// A register response asserting a different account link than the daemon's
