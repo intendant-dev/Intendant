@@ -27,9 +27,23 @@ pub(crate) struct RelayCertificateMaterial {
 /// construction repeats this against its explicit store for testability.
 pub(crate) fn configure_pending_credential_child_scrub() {
     let cert_dir = crate::access::backend::select_backend().cert_dir();
-    if let Err(error) = dns::refresh_pending_credential_child_scrub(&cert_dir) {
+    refresh_pending_credential_child_scrub_in(&cert_dir);
+}
+
+/// Refresh the child scrub from the shared durable journal immediately before
+/// a supervised process spawn. Another daemon process can create the journal
+/// after this process starts, so startup-only cache population is insufficient.
+pub(crate) fn refresh_pending_credential_child_scrub_in(cert_dir: &Path) {
+    if let Err(error) = dns::refresh_pending_credential_child_scrub(cert_dir) {
         eprintln!("[custom-domain] load pending DNS credential child-scrub state: {error}");
     }
+}
+
+pub(crate) fn with_pending_credential_child_scrub_in<T>(
+    cert_dir: &Path,
+    operation: impl FnOnce() -> T,
+) -> T {
+    dns::with_pending_credential_child_scrub(cert_dir, operation)
 }
 
 fn domain_control_error_in(

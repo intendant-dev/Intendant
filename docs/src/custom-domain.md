@@ -52,7 +52,10 @@ is used. While Connect is enabled, the lane stays closed until the current
 rendezvous registration has supplied a fleet-zone observation and that
 provenance has been accepted durably. Learning a later overlapping fleet zone
 therefore disables the custom lane instead of temporarily reclassifying a
-service-controlled name as owner-controlled during startup.
+service-controlled name as owner-controlled during startup. HTTP requests and
+WebSocket upgrades recheck that live gate even on an existing TLS connection;
+active custom-domain sockets carry the same gate into their recurring
+authorization and buffered-input checks, so losing eligibility closes them.
 
 ## Pin certificate issuance
 
@@ -93,7 +96,11 @@ environment-variable fallback but never embeds the secret. While a cleanup
 journal exists, its fallback name remains in the supervised-child environment
 scrub even if the lane is disabled or later names a different fallback. An
 unreadable journal makes that scrub conservatively remove all DNS-shaped
-credential names until the journal is repaired or retired.
+credential names until the journal is repaired or retired. Every supervised
+coding-agent spawn reloads the shared journal immediately before constructing
+the child environment and holds the shared authority lock until the operating
+system copies it, so a sibling daemon process cannot create a journal across
+that boundary or leave the scrub cache stale.
 
 Certificate files are shared across daemon processes. Every renewal pass
 reloads and validates that shared pair before deciding to order. New
@@ -178,9 +185,10 @@ assertions; active leases remain separately visible and revocable.
 The daemon checks the stored certificate at boot and checks renewal every
 twelve hours, renewing inside thirty days of expiry. Failed checks retry with a
 bounded backoff, and granting a DNS credential lease wakes both issuance and
-pending cleanup immediately. The Access card shows the certificate state,
-expiry, provider, account URI, passkeys, and the last configuration or issuance
-error.
+pending cleanup immediately. The wake uses a monotonic grant generation, so a
+grant completed between the provider error and the retry waiter cannot be
+lost. The Access card shows the certificate state, expiry, provider, account
+URI, passkeys, and the last configuration or issuance error.
 
 The custom name and service-assigned fleet name are distinct TLS provenance
 classes. Exact custom SNI must agree with the HTTP Host and browser Origin.

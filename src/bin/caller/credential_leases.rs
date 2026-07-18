@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 pub const DEFAULT_TTL_MS: u64 = 15 * 60 * 1000;
@@ -199,7 +200,19 @@ pub(crate) fn configure_pending_dns_credential_child_scrub(
 /// from a supervised coding-agent child. Other API-token variables remain
 /// available unless an unreadable cleanup journal requires the fail-closed
 /// all-DNS scrub.
+#[cfg(test)]
 pub(crate) fn scrub_dns_credential_env_name(
+    command: &mut tokio::process::Command,
+    active_name: Option<&str>,
+    pending_store: Option<&Path>,
+) {
+    if let Some(cert_dir) = pending_store {
+        crate::custom_domain::refresh_pending_credential_child_scrub_in(cert_dir);
+    }
+    apply_dns_credential_env_scrub(command, active_name);
+}
+
+fn apply_dns_credential_env_scrub(
     command: &mut tokio::process::Command,
     active_name: Option<&str>,
 ) {
@@ -239,17 +252,61 @@ pub(crate) fn scrub_dns_credential_env_name(
     }
 }
 
+/// Spawn a supervised coding-agent process with durable DNS cleanup authority
+/// and its environment snapshot serialized under the shared authority lock.
+/// Lock/read failures set the conservative all-DNS scrub before spawning.
+pub(crate) fn spawn_with_dns_credential_scrub(
+    command: &mut tokio::process::Command,
+    active_name: Option<&str>,
+    pending_store: Option<&Path>,
+) -> std::io::Result<tokio::process::Child> {
+    match pending_store {
+        Some(cert_dir) => {
+            crate::custom_domain::with_pending_credential_child_scrub_in(cert_dir, || {
+                apply_dns_credential_env_scrub(command, active_name);
+                command.spawn()
+            })
+        }
+        None => {
+            apply_dns_credential_env_scrub(command, active_name);
+            command.spawn()
+        }
+    }
+}
+
 fn dns_credential_grant_notify() -> &'static tokio::sync::Notify {
     static NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
     NOTIFY.get_or_init(tokio::sync::Notify::new)
 }
 
+fn dns_credential_grant_generation_counter() -> &'static AtomicU64 {
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    &GENERATION
+}
+
+/// Snapshot the monotonic DNS-lease grant generation immediately before a
+/// provider attempt. A later wait compares against this value so a grant
+/// racing the provider error cannot be lost before the waiter parks.
+pub(crate) fn dns_credential_grant_generation() -> u64 {
+    dns_credential_grant_generation_counter().load(Ordering::SeqCst)
+}
+
 /// Wait until either the retry horizon passes or a DNS credential lease is
-/// granted. Returns true for a grant wake so callers can reset backoff.
-pub(crate) async fn wait_for_dns_credential_grant(timeout: std::time::Duration) -> bool {
+/// granted after `observed_generation`. Enabling the waiter before the second
+/// generation read closes both sides of the grant-before-park race.
+pub(crate) async fn wait_for_dns_credential_grant_after(
+    observed_generation: u64,
+    timeout: std::time::Duration,
+) -> bool {
+    let notified = dns_credential_grant_notify().notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if dns_credential_grant_generation() != observed_generation {
+        return true;
+    }
     tokio::select! {
         _ = tokio::time::sleep(timeout) => false,
-        _ = dns_credential_grant_notify().notified() => true,
+        _ = notified => true,
     }
 }
 
@@ -1027,6 +1084,7 @@ pub fn grant(
     // grant's own sweep expired) runs only after the store lock is gone.
     run_deferred_cleanup(cleanup);
     if result.is_ok() && kind.starts_with("dns:") {
+        dns_credential_grant_generation_counter().fetch_add(1, Ordering::SeqCst);
         dns_credential_grant_notify().notify_waiters();
     }
     result
@@ -1271,7 +1329,7 @@ mod tests {
             .env("OWNER_DNS_API_TOKEN", "custom")
             .env("OTHER_TOOL_API_TOKEN", "unrelated")
             .env("ORDINARY_CHILD_SETTING", "kept");
-        scrub_dns_credential_env_name(&mut command, Some("OWNER_DNS_API_TOKEN"));
+        scrub_dns_credential_env_name(&mut command, Some("OWNER_DNS_API_TOKEN"), None);
         let changes = command
             .as_std()
             .get_envs()
@@ -1318,7 +1376,7 @@ mod tests {
             .env("OLD_DNS_API_TOKEN", "pending cleanup")
             .env("CURRENT_DNS_API_TOKEN", "current")
             .env("ORDINARY_CHILD_SETTING", "kept");
-        scrub_dns_credential_env_name(&mut command, Some("CURRENT_DNS_API_TOKEN"));
+        scrub_dns_credential_env_name(&mut command, Some("CURRENT_DNS_API_TOKEN"), None);
         let changes = command
             .as_std()
             .get_envs()
@@ -1347,7 +1405,7 @@ mod tests {
         configure_pending_dns_credential_child_scrub(dir.path(), Ok(None));
         let mut after_cleanup = tokio::process::Command::new("never-spawned");
         after_cleanup.env("OLD_DNS_API_TOKEN", "available again");
-        scrub_dns_credential_env_name(&mut after_cleanup, None);
+        scrub_dns_credential_env_name(&mut after_cleanup, None, None);
         assert_eq!(
             after_cleanup
                 .as_std()
@@ -1363,7 +1421,7 @@ mod tests {
         );
         let mut unreadable = tokio::process::Command::new("never-spawned");
         unreadable.env("UNLISTED_DNS_API_TOKEN", "fail closed");
-        scrub_dns_credential_env_name(&mut unreadable, None);
+        scrub_dns_credential_env_name(&mut unreadable, None, None);
         assert_eq!(
             unreadable
                 .as_std()
@@ -1379,7 +1437,9 @@ mod tests {
     async fn dns_lease_grant_wakes_waiting_certificate_work() {
         let _guard = lock();
         reset();
-        let waiter = tokio::spawn(wait_for_dns_credential_grant(
+        let observed_generation = dns_credential_grant_generation();
+        let waiter = tokio::spawn(wait_for_dns_credential_grant_after(
+            observed_generation,
             std::time::Duration::from_secs(60),
         ));
         tokio::task::yield_now().await;
@@ -1400,6 +1460,34 @@ mod tests {
                 .unwrap()
                 .unwrap()
         );
+        reset();
+    }
+
+    #[tokio::test]
+    async fn dns_lease_grant_before_wait_registration_is_observed() {
+        let _guard = lock();
+        reset();
+        let observed_generation = dns_credential_grant_generation();
+        grant(
+            "dns:cloudflare",
+            "DNS",
+            "lease material",
+            None,
+            "owner",
+            "test",
+            Some(MIN_TTL_MS),
+            Some(0),
+        )
+        .unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_dns_credential_grant_after(
+                observed_generation,
+                std::time::Duration::from_secs(60),
+            ),
+        )
+        .await
+        .unwrap());
         reset();
     }
 

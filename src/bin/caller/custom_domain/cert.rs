@@ -570,6 +570,7 @@ pub(super) fn spawn(
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
+            let credential_generation = crate::credential_leases::dns_credential_grant_generation();
             if let Err(error) =
                 ensure_certificate(&domain, dns.as_ref(), issuance_enabled, &cert_dir, &status)
                     .await
@@ -585,7 +586,11 @@ pub(super) fn spawn(
                 });
                 eprintln!("[custom-domain] certificate check: {error}");
                 let credential_granted =
-                    crate::credential_leases::wait_for_dns_credential_grant(error_retry).await;
+                    crate::credential_leases::wait_for_dns_credential_grant_after(
+                        credential_generation,
+                        error_retry,
+                    )
+                    .await;
                 error_retry = if credential_granted {
                     ERROR_RETRY_INITIAL
                 } else {

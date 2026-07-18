@@ -3083,6 +3083,7 @@ impl ExternalAgent for ClaudeCodeAgent {
         config: AgentConfig,
     ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, CallerError> {
         let dns_credential_env = config.dns_credential_env.clone();
+        let dns_credential_store = config.dns_credential_store.clone();
         if let Some(budget) = self.invalid_max_budget() {
             return Err(CallerError::ExternalAgent(format!(
                 "claude-code max_budget_usd must be a positive dollar amount, got {budget}; \
@@ -3206,11 +3207,12 @@ impl ExternalAgent for ClaudeCodeAgent {
         crate::platform::die_with_parent(&mut command);
         #[cfg(target_os = "linux")]
         crate::linux_display_env::apply_to_tokio_command(&mut command);
-        crate::credential_leases::scrub_dns_credential_env_name(
+        let mut child = crate::credential_leases::spawn_with_dns_credential_scrub(
             &mut command,
             dns_credential_env.as_deref(),
-        );
-        let mut child = command.spawn().map_err(|e| {
+            dns_credential_store.as_deref(),
+        )
+        .map_err(|e| {
             CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
         })?;
         let child_pid = child.id();

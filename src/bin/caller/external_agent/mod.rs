@@ -1264,6 +1264,10 @@ pub struct AgentConfig {
     /// supervised child. Derived before gateway startup as well as on live
     /// settings changes; the credential value is never copied here.
     pub dns_credential_env: Option<String>,
+    /// Shared daemon authority store whose durable DNS cleanup journal is
+    /// re-read fail-closed immediately before this supervised child spawns.
+    /// `None` is reserved for hermetic agent-wrapper tests.
+    pub dns_credential_store: Option<PathBuf>,
     /// Intendant session id to include in the injected MCP URL so tool
     /// exposure can be scoped to the Codex process that is calling.
     pub mcp_session_id: Option<String>,

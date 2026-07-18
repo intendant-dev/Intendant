@@ -46,6 +46,45 @@ pub(crate) fn is_public_control_lane_configured(
     custom_domain_sni || (discovery_only && fleet_lane_enabled)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PublicControlLane<'a> {
+    pub(crate) discovery_only: bool,
+    pub(crate) public_lease_ingress: bool,
+    pub(crate) configured: bool,
+    pub(crate) live_custom_domain: Option<&'a str>,
+    pub(crate) custom_domain_revoked: bool,
+}
+
+/// Derive the public-lane classification from live custom-name eligibility.
+/// Retaining the selected custom SNI separately from its current eligibility
+/// prevents a revoked owner-name lane from falling through to the fleet-lane
+/// switch on an already-open TLS connection.
+pub(crate) fn classify_public_control_lane<'a>(
+    base_discovery_only: bool,
+    selected_custom_domain: Option<&'a str>,
+    custom_domain_enabled: bool,
+    fleet_lane_enabled: bool,
+) -> PublicControlLane<'a> {
+    let live_custom_domain = selected_custom_domain.filter(|_| custom_domain_enabled);
+    let custom_domain_revoked = selected_custom_domain.is_some() && live_custom_domain.is_none();
+    let discovery_only = base_discovery_only || custom_domain_revoked;
+    let public_lease_ingress =
+        is_public_lease_ingress(discovery_only, live_custom_domain.is_some());
+    let configured = !custom_domain_revoked
+        && is_public_control_lane_configured(
+            discovery_only,
+            live_custom_domain.is_some(),
+            fleet_lane_enabled,
+        );
+    PublicControlLane {
+        discovery_only,
+        public_lease_ingress,
+        configured,
+        live_custom_domain,
+        custom_domain_revoked,
+    }
+}
+
 fn json_value<T: serde::Serialize>(value: T) -> ApiResponse {
     match serde_json::to_value(value) {
         Ok(value) => ApiResponse::json(200, JsonBody::Value(value)),
@@ -655,6 +694,16 @@ mod tests {
         assert!(is_public_control_lane_configured(false, true, false));
         assert!(is_public_control_lane_configured(true, false, true));
         assert!(!is_public_control_lane_configured(false, false, true));
+    }
+
+    #[test]
+    fn revoked_custom_lane_never_falls_through_to_fleet_control() {
+        let lane = classify_public_control_lane(true, Some("box.owner.example"), false, true);
+        assert!(lane.discovery_only);
+        assert!(lane.public_lease_ingress);
+        assert!(!lane.configured);
+        assert_eq!(lane.live_custom_domain, None);
+        assert!(lane.custom_domain_revoked);
     }
 
     #[test]

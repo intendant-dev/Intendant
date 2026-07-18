@@ -306,16 +306,19 @@ pub(crate) async fn serve_http_request(
     // IAM, loopback, browser-mTLS, process-token `/mcp`, or signaling context
     // is resolved. SNI provenance comes from rustls certificate selection,
     // never this request's mutable Host header.
-    let discovery_only_ingress = gateway_ingress.is_reachability_relay()
+    let base_discovery_only_ingress = gateway_ingress.is_reachability_relay()
         || tls_fleet_origin
         || request_names_known_fleet_origin(header_text);
-    let public_lease_ingress =
-        is_public_lease_ingress(discovery_only_ingress, tls_custom_domain.is_some());
-    let configured_public_control_lane = is_public_control_lane_configured(
-        discovery_only_ingress,
-        tls_custom_domain.is_some(),
+    let custom_domain_selected = tls_custom_domain.is_some();
+    let public_lane = classify_public_control_lane(
+        base_discovery_only_ingress,
+        tls_custom_domain.as_deref(),
+        custom_domain.enabled(),
         fleet_hosted_control_enabled,
     );
+    let public_lease_ingress = public_lane.public_lease_ingress;
+    let configured_public_control_lane = public_lane.configured;
+    let tls_custom_domain = public_lane.live_custom_domain;
     if is_custom_domain_only_hosted_control_path(req_method, req_path)
         && tls_custom_domain.is_none()
     {
@@ -355,8 +358,7 @@ pub(crate) async fn serve_http_request(
         && http_header_value(header_text, "x-intendant-hosted-lease").is_some()
     {
         let result = hosted_request_proof_from_headers(header_text).and_then(|proof| {
-            let fleet_origin =
-                public_origin_from_request(header_text, is_tls, tls_custom_domain.as_deref())?;
+            let fleet_origin = public_origin_from_request(header_text, is_tls, tls_custom_domain)?;
             hosted_control.verify_request_proof(
                 req_method,
                 request_line.split_whitespace().nth(1).unwrap_or(req_path),
@@ -386,7 +388,7 @@ pub(crate) async fn serve_http_request(
     };
     if public_lease_ingress && !authority_free_request && hosted_verified.is_none() {
         use tokio::io::AsyncWriteExt;
-        let error = if tls_custom_domain.is_some() {
+        let error = if custom_domain_selected {
             "this public endpoint requires a valid bounded lease; use a trusted direct surface for root administration"
         } else {
             "the public fleet-name endpoint is discovery-only without a valid bounded lease; use loopback or the independently fingerprint-verified direct mTLS address for control"
@@ -1397,7 +1399,7 @@ pub(crate) async fn serve_http_request(
                     custom_domain,
                     header_text,
                     is_tls,
-                    tls_custom_domain.as_deref(),
+                    tls_custom_domain,
                     route.cors,
                 )
                 .await;
@@ -1411,7 +1413,7 @@ pub(crate) async fn serve_http_request(
                     stream,
                     route_body,
                     hosted_control,
-                    public_origin_from_request(header_text, is_tls, tls_custom_domain.as_deref()),
+                    public_origin_from_request(header_text, is_tls, tls_custom_domain),
                     source_bucket,
                     route.cors,
                 )
@@ -1458,7 +1460,7 @@ pub(crate) async fn serve_http_request(
                     custom_domain,
                     header_text,
                     is_tls,
-                    tls_custom_domain.as_deref(),
+                    tls_custom_domain,
                     source_bucket,
                     route.cors,
                 )

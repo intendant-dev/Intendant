@@ -1685,17 +1685,13 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     let tls_server_name = tls_stream.get_ref().1.server_name();
                     let selected_custom =
                         crate::web_tls::custom_domain_server_name(tls_server_name);
-                    if selected_custom.is_some() && !custom_domain.enabled() {
-                        // A name configured as custom can become known to lie
-                        // in a service fleet zone after this process starts.
-                        // Reclassify it at the TLS boundary immediately: it is
-                        // discovery-only, never an owner-name control lane.
-                        tls_fleet_origin = true;
-                        tls_custom_domain = None;
-                    } else {
-                        tls_fleet_origin = crate::web_tls::is_fleet_server_name(tls_server_name);
-                        tls_custom_domain = selected_custom;
-                    }
+                    // Preserve the selected custom-name provenance for every
+                    // request on this TLS connection. Its live eligibility is
+                    // rechecked per HTTP request / WS upgrade; erasing it here
+                    // would let an ineligible owner-name lane fall through to
+                    // the independently configured fleet-name switch.
+                    tls_fleet_origin = crate::web_tls::is_fleet_server_name(tls_server_name);
+                    tls_custom_domain = selected_custom;
                     let peer_certs = tls_stream
                         .get_ref()
                         .1
@@ -1916,16 +1912,19 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                 // ── WebSocket upgrade path — request 1 or any kept-alive
                 //    follow-up whose head asked to upgrade. ──
                 {
-                    let discovery_only_ws = gateway_ingress.is_reachability_relay()
+                    let base_discovery_only_ws = gateway_ingress.is_reachability_relay()
                         || tls_fleet_origin
                         || request_names_known_fleet_origin(&header_text);
-                    let public_lease_ws =
-                        is_public_lease_ingress(discovery_only_ws, tls_custom_domain.is_some());
-                    let configured_public_ws = is_public_control_lane_configured(
-                        discovery_only_ws,
-                        tls_custom_domain.is_some(),
+                    let custom_domain_selected = tls_custom_domain.is_some();
+                    let public_lane = classify_public_control_lane(
+                        base_discovery_only_ws,
+                        tls_custom_domain.as_deref(),
+                        custom_domain.enabled(),
                         config.connect.hosted_control_enabled,
                     );
+                    let public_lease_ws = public_lane.public_lease_ingress;
+                    let configured_public_ws = public_lane.configured;
+                    let live_tls_custom_domain = public_lane.live_custom_domain;
                     let hosted_ws_authority = if configured_public_ws && hosted_control.enabled() {
                         let ticket =
                             query_param(header_text.lines().next().unwrap_or(""), "hosted_ticket");
@@ -1933,13 +1932,13 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                             Some(ticket) => match public_origin_from_request(
                                 &header_text,
                                 is_tls,
-                                tls_custom_domain.as_deref(),
+                                live_tls_custom_domain,
                             )
                             .and_then(|origin| {
                                 hosted_control.consume_ws_ticket(
                                     &ticket,
                                     &origin,
-                                    if tls_custom_domain.is_some() {
+                                    if live_tls_custom_domain.is_some() {
                                         "custom-domain-wss"
                                     } else if gateway_ingress.is_reachability_relay() {
                                         "hosted-relay-wss"
@@ -1964,7 +1963,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     };
                     if public_lease_ws && hosted_ws_authority.is_none() {
                         use tokio::io::AsyncWriteExt;
-                        let error = if tls_custom_domain.is_some() {
+                        let error = if custom_domain_selected {
                             "this public endpoint requires a valid bounded lease; use a trusted direct surface for root administration"
                         } else {
                             "the public fleet-name endpoint is discovery-only without a valid bounded lease; use loopback or the independently fingerprint-verified direct mTLS address for control"
@@ -2104,6 +2103,11 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         finalize_http_stream(&mut stream).await;
                         return;
                     }
+                    let ws_authority_guard = WsAuthorityGuard::new(
+                        live_tls_custom_domain
+                            .is_some()
+                            .then(|| Arc::clone(&custom_domain)),
+                    );
                     let peer_identity_for_ws = peer_connection_identity.clone();
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
@@ -2203,6 +2207,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         bootstrap_caches.clone(),
                         bootstrap_flushed_rx,
                         dashboard_control_grant_for_ws.clone(),
+                        ws_authority_guard.clone(),
                         ws_session_cancel.clone(),
                     ));
 
@@ -2620,6 +2625,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         terminal_registry: terminal_registry.clone(),
                         dashboard_control: Arc::clone(&dashboard_control),
                         dashboard_control_grant: dashboard_control_grant_for_ws.clone(),
+                        authority_guard: ws_authority_guard,
                         peer_file_transfer_registry: Arc::clone(&peer_file_transfer_registry),
                         hosted_control: Arc::clone(&hosted_control),
                         peer_identity: peer_identity_for_ws.clone(),

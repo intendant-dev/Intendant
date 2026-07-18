@@ -283,6 +283,7 @@ pub(crate) fn spawn_cleanup_loop(cert_dir: PathBuf) {
     tokio::spawn(async move {
         let mut error_retry = PENDING_CHALLENGE_ERROR_RETRY_INITIAL;
         loop {
+            let credential_generation = crate::credential_leases::dns_credential_grant_generation();
             match retry_pending_challenge(&cert_dir).await {
                 Ok(true) => {
                     error_retry = PENDING_CHALLENGE_ERROR_RETRY_INITIAL;
@@ -295,7 +296,11 @@ pub(crate) fn spawn_cleanup_loop(cert_dir: PathBuf) {
                 Err(error) => {
                     eprintln!("[custom-domain] pending DNS-01 cleanup: {error}");
                     let credential_granted =
-                        crate::credential_leases::wait_for_dns_credential_grant(error_retry).await;
+                        crate::credential_leases::wait_for_dns_credential_grant_after(
+                            credential_generation,
+                            error_retry,
+                        )
+                        .await;
                     error_retry = if credential_granted {
                         PENDING_CHALLENGE_ERROR_RETRY_INITIAL
                     } else {
@@ -420,6 +425,38 @@ pub(super) fn refresh_pending_credential_child_scrub(cert_dir: &Path) -> Result<
         env_name.clone(),
     );
     env_name.map(|_| ())
+}
+
+/// Refresh the journal-derived scrub and run one child-spawn edge under the
+/// same authority-store lock. Every journal writer uses this lock, so a
+/// sibling process cannot create cleanup authority between the refresh and
+/// the point where the operating system copies the child's environment.
+pub(super) fn with_pending_credential_child_scrub<T>(
+    cert_dir: &Path,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let mut operation = Some(operation);
+    let locked = crate::access::authority_store::with_lock(cert_dir, || {
+        if let Err(error) = refresh_pending_credential_child_scrub(cert_dir) {
+            eprintln!("[custom-domain] load pending DNS credential child-scrub state: {error}");
+        }
+        Ok(operation.take().expect(
+            "pending DNS credential child-scrub operation consumed",
+        )())
+    });
+    match locked {
+        Ok(result) => result,
+        Err(error) => {
+            crate::credential_leases::configure_pending_dns_credential_child_scrub(
+                cert_dir,
+                Err(error.to_string()),
+            );
+            eprintln!("[custom-domain] lock pending DNS credential child-scrub state: {error}");
+            operation
+                .take()
+                .expect("pending DNS credential child-scrub operation consumed")()
+        }
+    }
 }
 
 fn write_pending_challenge_locked(
@@ -1057,6 +1094,55 @@ mod tests {
         assert_eq!(claimed.id, pending.id);
         remove_pending_challenge(dir.path(), &pending.id, &cleanup_token).unwrap();
         assert!(load_pending_challenge(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn child_spawn_refreshes_a_journal_created_by_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = PendingChallenge {
+            schema_version: PENDING_CHALLENGE_SCHEMA_VERSION,
+            id: "flow-cross-process".to_string(),
+            domain: "box.example.test".to_string(),
+            record_name: "_acme-challenge.box.example.test".to_string(),
+            value: "challenge-value".to_string(),
+            provider: CustomDomainDnsConfig::Cloudflare {
+                zone_id: "abc123".to_string(),
+                token_env: Some("OTHER_PROCESS_DNS_API_TOKEN".to_string()),
+                propagation_delay_secs: 0,
+            },
+            cloudflare_record_id: None,
+            phase: PendingChallengePhase::Active,
+            owner_token: Some("cccccccccccccccccccccccccccccccc".to_string()),
+            lease_expires_unix_ms: now_unix_ms().saturating_add(PENDING_CHALLENGE_ACTIVE_LEASE_MS),
+        };
+        crate::credential_leases::configure_pending_dns_credential_child_scrub(
+            dir.path(),
+            Ok(None),
+        );
+        crate::access::authority_store::with_lock(dir.path(), || {
+            write_pending_challenge_locked(dir.path(), &pending)
+        })
+        .unwrap();
+
+        let mut command = tokio::process::Command::new(dir.path().join("missing-supervised-child"));
+        command.env("OTHER_PROCESS_DNS_API_TOKEN", "must not be inherited");
+        assert!(crate::credential_leases::spawn_with_dns_credential_scrub(
+            &mut command,
+            None,
+            Some(dir.path()),
+        )
+        .is_err());
+        assert_eq!(
+            command
+                .as_std()
+                .get_envs()
+                .find(|(name, _)| { *name == std::ffi::OsStr::new("OTHER_PROCESS_DNS_API_TOKEN") })
+                .and_then(|(_, value)| value),
+            None
+        );
+
+        std::fs::remove_file(pending_challenge_path(dir.path())).unwrap();
+        refresh_pending_credential_child_scrub(dir.path()).unwrap();
     }
 
     #[test]
