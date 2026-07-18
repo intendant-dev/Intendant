@@ -1041,12 +1041,15 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     // The Connect registration response flips this shared gate only after
     // its fleet-zone observation has been accepted durably.
     let fleet_zone_observed = Arc::new(std::sync::atomic::AtomicBool::new(!config.connect.enabled));
+    let (relay_lifecycle_tx, relay_lifecycle_rx) =
+        tokio::sync::watch::channel(config.connect.enabled);
     crate::connect_rendezvous::spawn_connect_rendezvous_client(
         config.connect.clone(),
         dashboard_control.clone(),
         tcp_advertised_port,
         Arc::clone(&hosted_control),
         Arc::clone(&fleet_zone_observed),
+        relay_lifecycle_tx,
     );
     // Reachability relay tunnel: hold a control channel to Connect and splice
     // relayed browser connections into the dedicated loopback-only ingress
@@ -1061,6 +1064,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
         config.connect.clone(),
         relay_ingress_addr,
         Arc::clone(&fleet_zone_observed),
+        relay_lifecycle_rx,
     );
     // Pending-request attention nudges: watch approvals/questions on the bus
     // and ping the Connect rendezvous when they age with no dashboard around.

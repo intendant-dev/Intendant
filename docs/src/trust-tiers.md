@@ -159,7 +159,10 @@ and certificate private key are journaled before finalization; an ambiguous
 finalize or certificate-poll result resumes the same order. A live issuance
 owner renews its lease through network waits and defers CT classification only
 inside the pre-ledger commit window; dormant resumable orders remain
-recoverable while CT evidence is reconciled normally. Pair and own-certificate
+recoverable while CT evidence is reconciled normally. Before opening a new
+order, a process adopts any sibling-committed exact-name pair that is already
+outside the renewal window and refreshes its process-local TLS resolver. Pair
+and own-certificate
 ledger reads and replacements share the daemon
 authority-store lock; restored and newly issued certificates must name the
 current exact fleet origin. With

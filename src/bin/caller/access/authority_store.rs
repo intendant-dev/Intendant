@@ -7,10 +7,11 @@
 //! overwrite each other's decisions with stale snapshots.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::{AccessError, AccessResult};
@@ -26,14 +27,27 @@ thread_local! {
     static HELD_STORE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
-fn process_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+fn process_locks() -> &'static Mutex<HashSet<PathBuf>> {
+    static LOCKS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct ProcessStoreLock {
+    path: PathBuf,
+}
+
+impl Drop for ProcessStoreLock {
+    fn drop(&mut self) {
+        let mut locks = process_locks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.remove(&self.path);
+    }
 }
 
 struct AuthorityStoreLock {
     file: File,
-    _process: MutexGuard<'static, ()>,
+    _process: ProcessStoreLock,
 }
 
 impl Drop for AuthorityStoreLock {
@@ -62,22 +76,29 @@ fn lock_timeout_error(path: &Path) -> AccessError {
     ))
 }
 
-fn acquire_lock(cert_dir: &Path, started: Instant) -> AccessResult<AuthorityStoreLock> {
-    let process = loop {
-        match process_lock().try_lock() {
-            Ok(guard) => break guard,
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(AccessError(
-                    "authority-store process lock was poisoned; refusing to mutate authority state"
-                        .to_string(),
-                ));
-            }
-            Err(TryLockError::WouldBlock) if timed_out(started) => {
-                return Err(lock_timeout_error(&cert_dir.join(LOCK_FILE)));
-            }
-            Err(TryLockError::WouldBlock) => std::thread::sleep(LOCK_RETRY),
+fn acquire_process_lock(cert_dir: &Path, started: Instant) -> AccessResult<ProcessStoreLock> {
+    loop {
+        let mut locks = process_locks().lock().map_err(|_| {
+            AccessError(
+                "authority-store process locks were poisoned; refusing to mutate authority state"
+                    .to_string(),
+            )
+        })?;
+        if locks.insert(cert_dir.to_path_buf()) {
+            return Ok(ProcessStoreLock {
+                path: cert_dir.to_path_buf(),
+            });
         }
-    };
+        drop(locks);
+        if timed_out(started) {
+            return Err(lock_timeout_error(&cert_dir.join(LOCK_FILE)));
+        }
+        std::thread::sleep(LOCK_RETRY);
+    }
+}
+
+fn acquire_lock(cert_dir: &Path, started: Instant) -> AccessResult<AuthorityStoreLock> {
+    let process = acquire_process_lock(cert_dir, started)?;
 
     let lock_path = cert_dir.join(LOCK_FILE);
     let file = OpenOptions::new()
@@ -251,5 +272,28 @@ mod tests {
         let second = tempfile::tempdir().unwrap();
         let error = with_lock(first.path(), || with_lock(second.path(), || Ok(()))).unwrap_err();
         assert!(error.to_string().contains("refusing cross-store nesting"));
+    }
+
+    #[test]
+    fn independent_stores_do_not_share_a_process_lock_slot() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let second_path = second.path().to_path_buf();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut worker = None;
+
+        with_lock(first.path(), || {
+            worker = Some(std::thread::spawn(move || {
+                done_tx.send(with_lock(&second_path, || Ok(()))).unwrap();
+            }));
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|error| {
+                    AccessError(format!("independent store stayed blocked: {error}"))
+                })??;
+            Ok(())
+        })
+        .unwrap();
+        worker.unwrap().join().unwrap();
     }
 }

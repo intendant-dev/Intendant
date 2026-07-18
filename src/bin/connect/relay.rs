@@ -41,6 +41,7 @@ use tokio::net::{TcpListener, TcpStream};
 /// from the registered identity key, mirroring the fleet-DNS publish auth.
 pub(crate) const RELAY_CONTROL_PROTOCOL_V1: &str = "intendant-connect-relay-control-v1";
 pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v2";
+pub(crate) const RELAY_DISCONNECT_PROTOCOL: &str = "intendant-connect-relay-disconnect-v1";
 const RELAY_NAME_PROOF_PROTOCOL: &str = "intendant-connect-relay-name-proof-v1";
 const RELAY_MAX_SERVER_NAMES: usize = 8;
 const RELAY_NAME_PROOF_CHAIN_MAX_BYTES: usize = 128 * 1024;
@@ -419,6 +420,23 @@ impl RelayState {
         true
     }
 
+    fn remove_tunnel(&self, label: &str, poller_id: &str) {
+        let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+        let mut remove_entry = false;
+        if let Some(entry) = tunnels.get_mut(label) {
+            entry.exact_sessions.remove(poller_id);
+            if entry.exact_sessions.is_empty() {
+                entry.fallback_last_seen_unix_ms = 0;
+                entry.fallback_pending.clear();
+                entry.fallback_notify.notify_waiters();
+                remove_entry = true;
+            }
+        }
+        if remove_entry {
+            tunnels.remove(label);
+        }
+    }
+
     /// Pop the next unclaimed dial-back nonce for a tunnel, if any.
     fn pop_pending(&self, label: &str, poller_id: Option<&str>) -> Option<PendingDialback> {
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
@@ -748,7 +766,7 @@ fn relay_control_signing_payload(
 ) -> Vec<u8> {
     let mut payload =
         format!("{protocol}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n").into_bytes();
-    if protocol == RELAY_CONTROL_PROTOCOL {
+    if matches!(protocol, RELAY_CONTROL_PROTOCOL | RELAY_DISCONNECT_PROTOCOL) {
         let poller_id = poller_id.unwrap_or_default();
         payload.extend_from_slice(poller_id.len().to_string().as_bytes());
         payload.push(b'\n');
@@ -996,17 +1014,32 @@ pub(crate) async fn relay_next(
     Json(body): Json<RelayNextRequest>,
 ) -> ApiResult<Response> {
     let daemon_id = body.daemon_id.trim().to_string();
-    let (poller_id, server_names) = match body.protocol.as_str() {
+    let (poller_id, server_names, disconnect) = match body.protocol.as_str() {
         RELAY_CONTROL_PROTOCOL => (
             Some(canonical_poller_id(body.poller_id.as_deref())?),
             Some(canonical_server_names(&body.server_names)?),
+            false,
         ),
+        RELAY_DISCONNECT_PROTOCOL
+            if body.server_names.is_empty() && body.server_name_proofs.is_empty() =>
+        {
+            (
+                Some(canonical_poller_id(body.poller_id.as_deref())?),
+                Some(Vec::new()),
+                true,
+            )
+        }
+        RELAY_DISCONNECT_PROTOCOL => {
+            return Err(ApiError::bad_request(
+                "relay disconnect cannot register server names or proofs",
+            ));
+        }
         RELAY_CONTROL_PROTOCOL_V1
             if body.poller_id.is_none()
                 && body.server_names.is_empty()
                 && body.server_name_proofs.is_empty() =>
         {
-            (None, None)
+            (None, None, false)
         }
         RELAY_CONTROL_PROTOCOL_V1 => {
             return Err(ApiError::bad_request(
@@ -1054,21 +1087,32 @@ pub(crate) async fn relay_next(
         .as_ref()
         .expect("relay presence checked in relay_request_daemon")
         .clone();
-    if let Some(server_names) = server_names.as_deref() {
-        verify_server_name_proofs(
-            &relay,
-            &daemon_id,
-            &daemon.daemon_public_key,
-            body.issued_at_unix_ms,
-            server_names,
-            &body.server_name_proofs,
-        )?;
+    if !disconnect {
+        if let Some(server_names) = server_names.as_deref() {
+            verify_server_name_proofs(
+                &relay,
+                &daemon_id,
+                &daemon.daemon_public_key,
+                body.issued_at_unix_ms,
+                server_names,
+                &body.server_name_proofs,
+            )?;
+        }
     }
     let Some(label) = daemon_label(&daemon_id) else {
         return Err(ApiError::bad_request(
             "daemon id does not derive a fleet label",
         ));
     };
+    if disconnect {
+        relay.remove_tunnel(
+            &label,
+            poller_id
+                .as_deref()
+                .expect("disconnect requires a canonical poller id"),
+        );
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
     if !relay.touch_tunnel(
         &label,
         now_unix_ms(),
@@ -2058,6 +2102,29 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn signed_disconnect_withdraws_exact_and_fallback_routes_immediately() {
+        let relay = RelayState::new(
+            "127.0.0.1:443".parse().unwrap(),
+            vec!["203.0.113.10".parse().unwrap()],
+        );
+        let poller = "11111111111111111111111111111111";
+        let names = vec!["box.example.test".to_string()];
+        let now = now_unix_ms();
+        assert!(relay.touch_tunnel("d-disconnect", now, Some(poller), Some(&names)));
+        assert!(relay.resolve_tunnel("box.example.test", now).is_some());
+        assert!(relay
+            .resolve_tunnel("d-disconnect.fleet.example.test", now)
+            .is_some());
+
+        relay.remove_tunnel("d-disconnect", poller);
+
+        assert!(relay.resolve_tunnel("box.example.test", now).is_none());
+        assert!(relay
+            .resolve_tunnel("d-disconnect.fleet.example.test", now)
+            .is_none());
+    }
+
     // ── Dial-back framing ───────────────────────────────────────────────────
 
     async fn connected_pair() -> (TcpStream, TcpStream) {
@@ -2405,6 +2472,65 @@ mod tests {
             };
             assert_eq!(resolved_label(routed).as_deref(), Some(label.as_str()));
         }
+    }
+
+    #[tokio::test]
+    async fn signed_disconnect_request_withdraws_the_registered_poller() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, public) = test_identity();
+        let daemon_id = "relay-disconnect";
+        let label = daemon_label(daemon_id).unwrap();
+        let relay = relay_state();
+        let issued = crate::now_unix_ms();
+        let exact_name = "disconnect.example.test";
+        assert!(relay.touch_tunnel(
+            &label,
+            issued,
+            Some(TEST_POLLER_ID),
+            Some(&[exact_name.to_string()])
+        ));
+        let state = crate::build_test_state(
+            dir.path(),
+            registered_store(daemon_id, &public),
+            crate::TestStateOverrides {
+                open_daemon_registration: true,
+                relay: Some(relay.clone()),
+                ..Default::default()
+            },
+        );
+        let payload = relay_control_signing_payload(
+            RELAY_DISCONNECT_PROTOCOL,
+            daemon_id,
+            &public,
+            issued,
+            Some(TEST_POLLER_ID),
+            &[],
+        );
+        let body = RelayNextRequest {
+            protocol: RELAY_DISCONNECT_PROTOCOL.to_string(),
+            daemon_id: daemon_id.to_string(),
+            daemon_public_key: public,
+            issued_at_unix_ms: issued,
+            signature: crate::b64u(key.sign(&payload).as_ref()),
+            poller_id: Some(TEST_POLLER_ID.to_string()),
+            server_names: Vec::new(),
+            server_name_proofs: Vec::new(),
+            timeout_ms: None,
+        };
+
+        let response = relay_next(
+            axum::extract::State(state),
+            HeaderMap::new(),
+            axum::Json(body),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(relay.resolve_tunnel(exact_name, issued).is_none());
+        assert!(relay
+            .resolve_tunnel(&format!("{label}.fleet.example.test"), issued)
+            .is_none());
     }
 
     #[tokio::test]

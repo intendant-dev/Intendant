@@ -23,6 +23,7 @@ const ISSUANCE_LEASE_FILE: &str = "custom-domain-cert-issuance.json";
 const ISSUANCE_LEASE_SCHEMA_VERSION: u32 = 2;
 const ISSUANCE_LEASE_MAX_BYTES: u64 = 128 * 1024;
 const ISSUANCE_LEASE_MS: u64 = 45 * 60 * 1000;
+const ISSUANCE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 const ISSUANCE_LOCAL_TTL_MS: u64 = 2 * 60 * 60 * 1000;
 const ISSUANCE_RESUMABLE_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
@@ -412,6 +413,30 @@ impl IssuanceLeaseGuard {
         self.update(|_| Ok(()))
     }
 
+    async fn await_with_heartbeat<F>(&mut self, future: F) -> Result<F::Output, String>
+    where
+        F: std::future::Future,
+    {
+        self.renew()?;
+        let mut heartbeat = tokio::time::interval(ISSUANCE_HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first interval tick is immediate. Ownership is renewed above
+        // before the network future is first polled.
+        heartbeat.tick().await;
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                output = &mut future => {
+                    self.renew()?;
+                    return Ok(output);
+                }
+                _ = heartbeat.tick() => {
+                    self.renew()?;
+                }
+            }
+        }
+    }
+
     fn order_url(&self) -> Option<&str> {
         self.record.order_url.as_deref()
     }
@@ -479,6 +504,54 @@ impl IssuanceLeaseGuard {
         self.record.private_key_pem.clone().ok_or_else(|| {
             "custom-domain order reached processing without durable key material".to_string()
         })
+    }
+
+    fn commit_and_install(
+        mut self,
+        domain: &ValidatedCustomDomain,
+        certificate_chain_pem: &str,
+        private_key_pem: &str,
+    ) -> Result<(), String> {
+        crate::access::authority_store::with_lock(&self.cert_dir, || {
+            let record = load_issuance_lease_locked(&self.cert_dir)
+                .map_err(crate::access::AccessError)?
+                .ok_or_else(|| {
+                    crate::access::AccessError(
+                        "custom-domain certificate issuance lease disappeared".to_string(),
+                    )
+                })?;
+            if record.owner_token.as_deref() != Some(self.owner_token.as_str())
+                || record.name != domain.name
+            {
+                return Err(crate::access::AccessError(
+                    "custom-domain certificate issuance ownership changed".to_string(),
+                ));
+            }
+            if crate::fleet_cert::is_service_controlled_name_in(&self.cert_dir, &domain.name)
+                .map_err(crate::access::AccessError)?
+            {
+                return Err(crate::access::AccessError(
+                    "custom-domain name became service-controlled while issuance was running"
+                        .to_string(),
+                ));
+            }
+            write_certificate_pair_locked(
+                &self.cert_dir,
+                domain,
+                certificate_chain_pem,
+                private_key_pem,
+            )?;
+            crate::web_tls::install_custom_domain_certificate(
+                &domain.name,
+                certificate_chain_pem,
+                private_key_pem,
+            )
+            .map_err(crate::access::AccessError)?;
+            crate::access::authority_store::remove_file_locked(&issuance_lease_path(&self.cert_dir))
+        })
+        .map_err(|error| error.to_string())?;
+        self.active = false;
+        Ok(())
     }
 
     fn finish(mut self) -> Result<(), String> {
@@ -700,14 +773,18 @@ async fn request_certificate(
         IssuanceClaim::Acquired(guard) => *guard,
     };
     let identifiers = [instant_acme::Identifier::Dns(domain.name.clone())];
-    let mut order = if let Some(order_url) = issuance.order_url() {
-        match account.order(order_url.to_string()).await {
+    let mut order = if let Some(order_url) = issuance.order_url().map(str::to_string) {
+        match issuance
+            .await_with_heartbeat(account.order(order_url))
+            .await?
+        {
             Ok(order) => order,
             Err(error) if crate::fleet_cert::acme_order_resume_is_terminal(&error) => {
                 issuance.restart_order()?;
-                let order = account
-                    .new_order(&instant_acme::NewOrder::new(&identifiers))
-                    .await
+                let new_order = instant_acme::NewOrder::new(&identifiers);
+                let order = issuance
+                    .await_with_heartbeat(account.new_order(&new_order))
+                    .await?
                     .map_err(|error| {
                         format!("replace terminal custom-domain ACME order: {error}")
                     })?;
@@ -717,9 +794,10 @@ async fn request_certificate(
             Err(error) => return Err(format!("resume custom-domain ACME order: {error}")),
         }
     } else {
-        let order = account
-            .new_order(&instant_acme::NewOrder::new(&identifiers))
-            .await
+        let new_order = instant_acme::NewOrder::new(&identifiers);
+        let order = issuance
+            .await_with_heartbeat(account.new_order(&new_order))
+            .await?
             .map_err(|error| format!("custom-domain ACME new order: {error}"))?;
         issuance.record_order_url(order.url())?;
         order
@@ -732,7 +810,9 @@ async fn request_certificate(
         if order_status == instant_acme::OrderStatus::Pending {
             {
                 let mut authorizations = order.authorizations();
-                while let Some(result) = authorizations.next().await {
+                while let Some(result) =
+                    issuance.await_with_heartbeat(authorizations.next()).await?
+                {
                     let mut authorization = result
                         .map_err(|error| format!("custom-domain ACME authorization: {error}"))?;
                     match authorization.status {
@@ -750,16 +830,22 @@ async fn request_certificate(
                             "custom-domain ACME order offers no dns-01 challenge".to_string()
                         })?;
                     let value = challenge.key_authorization().dns_value();
-                    let lease =
-                        super::dns::set_challenge_in(dns_config, &domain.name, &value, cert_dir)
-                            .await?;
+                    let lease = issuance
+                        .await_with_heartbeat(super::dns::set_challenge_in(
+                            dns_config,
+                            &domain.name,
+                            &value,
+                            cert_dir,
+                        ))
+                        .await??;
                     dns_challenge_lease = Some(lease);
-                    issuance.renew()?;
                     let mut propagation_wait =
                         Duration::from_secs(super::dns::propagation_delay_secs(dns_config));
                     while !propagation_wait.is_zero() {
                         let wait = propagation_wait.min(DNS_CHALLENGE_LEASE_RENEW_INTERVAL);
-                        tokio::time::sleep(wait).await;
+                        issuance
+                            .await_with_heartbeat(tokio::time::sleep(wait))
+                            .await?;
                         propagation_wait = propagation_wait.saturating_sub(wait);
                         super::dns::renew_pending_challenge(
                             cert_dir,
@@ -767,18 +853,17 @@ async fn request_certificate(
                                 .as_ref()
                                 .expect("DNS challenge lease was just stored"),
                         )?;
-                        issuance.renew()?;
                     }
-                    challenge
-                        .set_ready()
-                        .await
+                    issuance
+                        .await_with_heartbeat(challenge.set_ready())
+                        .await?
                         .map_err(|error| format!("custom-domain ACME challenge ready: {error}"))?;
                 }
             }
-            issuance.renew()?;
-            order_status = order
-                .poll_ready(&instant_acme::RetryPolicy::default())
-                .await
+            let retry = instant_acme::RetryPolicy::default();
+            order_status = issuance
+                .await_with_heartbeat(order.poll_ready(&retry))
+                .await?
                 .map_err(|error| format!("custom-domain ACME validation: {error}"))?;
         }
         Ok(order_status)
@@ -787,7 +872,10 @@ async fn request_certificate(
 
     let cleanup_result = if let Some(lease) = dns_challenge_lease.as_ref() {
         match super::dns::mark_pending_challenge_cleanup(cert_dir, lease) {
-            Ok(()) => match super::dns::retry_pending_challenge(cert_dir).await {
+            Ok(()) => match issuance
+                .await_with_heartbeat(super::dns::retry_pending_challenge(cert_dir))
+                .await?
+            {
                 Ok(true) => Ok(()),
                 Ok(false) => Err("custom-domain DNS-01 cleanup is still leased".to_string()),
                 Err(error) => Err(error),
@@ -813,9 +901,9 @@ async fn request_certificate(
     let private_key_pem = match order_status {
         instant_acme::OrderStatus::Ready => {
             let (private_key_pem, csr_der) = issuance.finalization_material(&domain.name)?;
-            order
-                .finalize_csr(&csr_der)
-                .await
+            issuance
+                .await_with_heartbeat(order.finalize_csr(&csr_der))
+                .await?
                 .map_err(|error| format!("custom-domain ACME finalize: {error}"))?;
             private_key_pem
         }
@@ -828,39 +916,22 @@ async fn request_certificate(
             ));
         }
     };
-    let cert_chain_pem = order
-        .poll_certificate(&instant_acme::RetryPolicy::default())
-        .await
+    let retry = instant_acme::RetryPolicy::default();
+    let cert_chain_pem = issuance
+        .await_with_heartbeat(order.poll_certificate(&retry))
+        .await?
         .map_err(|error| format!("custom-domain ACME certificate: {error}"))?;
-    issuance.renew()?;
     require_exact_dns_name(&cert_chain_pem, &domain.name)?;
     crate::web_tls::validate_custom_domain_certificate_key_pair(&cert_chain_pem, &private_key_pem)?;
     let not_after = crate::fleet_cert::cert_not_after_unix_ms(&cert_chain_pem)
         .ok_or_else(|| "custom-domain certificate has no usable expiry".to_string())?;
-    crate::access::authority_store::with_lock(cert_dir, || {
-        if crate::fleet_cert::is_service_controlled_name_in(cert_dir, &domain.name)
-            .map_err(crate::access::AccessError)?
-        {
-            return Err(crate::access::AccessError(
-                "custom-domain name became service-controlled while issuance was running"
-                    .to_string(),
-            ));
-        }
-        write_certificate_pair_locked(cert_dir, domain, &cert_chain_pem, &private_key_pem)
-    })
-    .map_err(|error| error.to_string())?;
-    crate::web_tls::install_custom_domain_certificate(
-        &domain.name,
-        &cert_chain_pem,
-        &private_key_pem,
-    )?;
+    issuance.commit_and_install(domain, &cert_chain_pem, &private_key_pem)?;
     update_status(status, |current| {
         current.state = "valid".to_string();
         current.not_after_unix_ms = Some(not_after);
         current.restore_error = None;
         current.last_error = None;
     });
-    issuance.finish()?;
     Ok(())
 }
 
@@ -1061,6 +1132,42 @@ mod tests {
         let status = status.read().unwrap();
         assert_eq!(status.state, "valid");
         assert_eq!(status.restore_error, None);
+    }
+
+    #[test]
+    fn final_certificate_commit_is_fenced_by_the_current_issuance_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = ValidatedCustomDomain {
+            name: "owner-fence.example.test".to_string(),
+            rp_id: "owner-fence.example.test".to_string(),
+            origin: "https://owner-fence.example.test".to_string(),
+        };
+        let issuance = match IssuanceLeaseGuard::begin(&domain, dir.path()).unwrap() {
+            IssuanceClaim::Acquired(guard) => *guard,
+            IssuanceClaim::CertificateCurrent => panic!("no certificate exists yet"),
+        };
+        crate::access::authority_store::with_lock(dir.path(), || {
+            let mut record = load_issuance_lease_locked(dir.path())
+                .map_err(crate::access::AccessError)?
+                .unwrap();
+            record.owner_token = Some("11111111111111111111111111111111".to_string());
+            write_issuance_lease_locked(dir.path(), &record)
+        })
+        .unwrap();
+        let certificate = rcgen::generate_simple_self_signed(vec![domain.name.clone()]).unwrap();
+
+        let error = issuance
+            .commit_and_install(
+                &domain,
+                &certificate.cert.pem(),
+                &certificate.signing_key.serialize_pem(),
+            )
+            .unwrap_err();
+        assert!(error.contains("ownership changed"), "{error}");
+        assert!(
+            read_stored_certificate_pair(dir.path()).unwrap().is_none(),
+            "a superseded worker cannot commit or install its certificate"
+        );
     }
 
     #[test]

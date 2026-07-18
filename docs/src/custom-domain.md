@@ -97,6 +97,14 @@ reclaimable journal before creating another challenge, covering crashes,
 cancellation, and transient provider failures. Store the credential as a
 daemon credential lease where possible; configuration names an
 environment-variable fallback but never embeds the secret. While a cleanup
+journal is being reaped, its mutation-completion generation is compared again
+before removal. A provider mutation that returns after its creator lost the
+lease re-creates the exact cleanup obligation (including the provider record
+id when available); if a newer challenge already owns the primary journal, a
+bounded secondary backlog retains the older exact cleanup independently and
+blocks further challenge creation until it is drained. A
+late TXT write therefore cannot land after the last durable cleanup record
+disappeared. While a cleanup
 journal exists, its fallback name remains in the supervised-child environment
 scrub even if the lane is disabled or later names a different fallback. An
 unreadable journal makes that scrub conservatively remove all DNS-shaped
@@ -120,7 +128,10 @@ ownership claims and retry updates cannot extend it. A sibling process
 therefore adopts a newly committed generation instead of consuming another CA
 order; a stopped owner's lease can be reclaimed without changing the order key.
 The active worker renews and rechecks its owner lease throughout DNS and ACME
-waits and before certificate side effects. CT comparison is deferred only
+waits and before certificate side effects. The final pair write, process-local
+TLS install, and issuance-record removal run under the same authority lock and
+owner-token check, so a superseded worker cannot install after takeover. CT
+comparison is deferred only
 while that live owner is inside the pre-ledger issuance window; a dormant or
 expired resumable order remains recoverable but cannot suppress CT evidence.
 Normal ownership replacement or a sibling-completed generation is treated as
@@ -132,7 +143,11 @@ daemon preserves those boot-wired fields together until restart; this also
 keeps DNS credential scrubbing aligned with the certificate worker. A running
 relay tunnel pins its signed control polls, relay-mode DNS updates, and raw
 dialback endpoint to that same boot configuration generation, so a live
-Connect destination change cannot split a nonce and its data endpoint.
+Connect destination change cannot split a nonce and its data endpoint. Turning
+Connect off cancels the boot-pinned poll and its active dialback tasks, sends a
+signed poller disconnect, and explicitly withdraws relay-mode fleet DNS.
+Turning it back on resumes only after the new registration has closed the
+fleet-zone observation gate again.
 
 Cloudflare requires a narrowly scoped token with DNS edit access to the named
 zone. Generic RFC2136 is also supported:

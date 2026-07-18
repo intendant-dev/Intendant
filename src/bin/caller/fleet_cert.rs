@@ -50,6 +50,7 @@ const FLEET_CERT_RESUMABLE_ORDER_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const FLEET_CERT_ISSUANCE_OWNER_LEASE_MS: u64 = 10 * 60 * 1000;
 const FLEET_CERT_ISSUANCE_HEARTBEAT_MS: u64 = 60 * 1000;
 const FLEET_CERT_ISSUANCE_MAX_ACTIVE: usize = 16;
+const FLEET_CERT_RENEW_BEFORE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// Durable service-controlled-name provenance. Certificates and Connect
 /// registration are both replaceable/optional at startup, but a name once
@@ -922,6 +923,21 @@ fn read_stored_certificate_pair_locked_in(
     }
 }
 
+fn stored_certificate_is_current_locked_in(cert_dir: &Path, name: &str) -> Result<bool, String> {
+    let Some((cert_pem, key_pem)) = read_stored_certificate_pair_locked_in(cert_dir)? else {
+        return Ok(false);
+    };
+    if require_fleet_certificate_dns_name(&cert_pem, name).is_err()
+        || crate::web_tls::validate_fleet_certificate_key_pair(&cert_pem, &key_pem).is_err()
+    {
+        return Ok(false);
+    }
+    let Some(not_after) = cert_not_after_unix_ms(&cert_pem) else {
+        return Ok(false);
+    };
+    Ok(not_after > now_unix_ms().saturating_add(FLEET_CERT_RENEW_BEFORE_MS))
+}
+
 fn now_unix_ms() -> u64 {
     crate::access::client_key::now_unix_ms().max(0) as u64
 }
@@ -1180,50 +1196,99 @@ fn write_issuance_store_locked_in(
     )
 }
 
+enum IssuanceRequestClaim {
+    CertificateCurrent,
+    Acquired(Box<IssuanceGuard>),
+}
+
+fn claim_issuance_locked_in(
+    cert_dir: &Path,
+    name: String,
+    adopt_current_pair: bool,
+) -> crate::access::AccessResult<IssuanceRequestClaim> {
+    let provenance =
+        load_fleet_origin_provenance_in(cert_dir).map_err(crate::access::AccessError)?;
+    if provenance.name.as_deref() != Some(name.as_str()) {
+        return Err(crate::access::AccessError(format!(
+            "fleet name changed before issuance began for {name}"
+        )));
+    }
+    if adopt_current_pair
+        && stored_certificate_is_current_locked_in(cert_dir, &name)
+            .map_err(crate::access::AccessError)?
+    {
+        let mut store =
+            load_issuance_store_locked_in(cert_dir).map_err(crate::access::AccessError)?;
+        let before = store.orders.len();
+        store.orders.retain(|order| order.name != name);
+        if store.orders.len() != before {
+            write_issuance_store_locked_in(cert_dir, &store)?;
+        }
+        return Ok(IssuanceRequestClaim::CertificateCurrent);
+    }
+
+    let mut store = load_issuance_store_locked_in(cert_dir).map_err(crate::access::AccessError)?;
+    let now = now_unix_ms();
+    let owner_token = uuid::Uuid::new_v4().simple().to_string();
+    let order = if let Some(order) = store.orders.iter_mut().find(|order| order.name == name) {
+        if order.owner_token.is_some() && now <= order.owner_lease_expires_unix_ms {
+            return Err(crate::access::AccessError(
+                "a certificate request is already running in another daemon process".to_string(),
+            ));
+        }
+        order.owner_token = Some(owner_token.clone());
+        order.owner_lease_expires_unix_ms = now.saturating_add(FLEET_CERT_ISSUANCE_OWNER_LEASE_MS);
+        order.updated_unix_ms = now;
+        order.clone()
+    } else {
+        let order = InFlightIssuance {
+            token: uuid::Uuid::new_v4().simple().to_string(),
+            name,
+            started_unix_ms: now,
+            updated_unix_ms: now,
+            owner_token: Some(owner_token.clone()),
+            owner_lease_expires_unix_ms: now.saturating_add(FLEET_CERT_ISSUANCE_OWNER_LEASE_MS),
+            order_url: None,
+            private_key_pem: None,
+            csr_der_b64: None,
+        };
+        store.orders.push(order.clone());
+        order
+    };
+    write_issuance_store_locked_in(cert_dir, &store)?;
+    Ok(IssuanceRequestClaim::Acquired(Box::new(IssuanceGuard {
+        cert_dir: cert_dir.to_path_buf(),
+        order,
+        owner_token,
+        claimed: true,
+    })))
+}
+
+fn claim_issuance_request_in(cert_dir: &Path, name: &str) -> Result<IssuanceRequestClaim, String> {
+    let name = normalized_dns_name(name)
+        .ok_or_else(|| "cannot start issuance for an empty fleet name".to_string())?;
+    crate::access::authority_store::with_lock(cert_dir, || {
+        claim_issuance_locked_in(cert_dir, name, true)
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
 fn claim_issuance_in(cert_dir: &Path, name: &str) -> Result<(InFlightIssuance, String), String> {
     let name = normalized_dns_name(name)
         .ok_or_else(|| "cannot start issuance for an empty fleet name".to_string())?;
     crate::access::authority_store::with_lock(cert_dir, || {
-        let provenance =
-            load_fleet_origin_provenance_in(cert_dir).map_err(crate::access::AccessError)?;
-        if provenance.name.as_deref() != Some(name.as_str()) {
-            return Err(crate::access::AccessError(format!(
-                "fleet name changed before issuance began for {name}"
-            )));
-        }
-        let mut store =
-            load_issuance_store_locked_in(cert_dir).map_err(crate::access::AccessError)?;
-        let now = now_unix_ms();
-        let owner_token = uuid::Uuid::new_v4().simple().to_string();
-        let order = if let Some(order) = store.orders.iter_mut().find(|order| order.name == name) {
-            if order.owner_token.is_some() && now <= order.owner_lease_expires_unix_ms {
-                return Err(crate::access::AccessError(
-                    "a certificate request is already running in another daemon process"
-                        .to_string(),
-                ));
+        match claim_issuance_locked_in(cert_dir, name, false)? {
+            IssuanceRequestClaim::Acquired(guard) => {
+                let order = guard.order.clone();
+                let owner_token = guard.owner_token.clone();
+                std::mem::forget(guard);
+                Ok((order, owner_token))
             }
-            order.owner_token = Some(owner_token.clone());
-            order.owner_lease_expires_unix_ms =
-                now.saturating_add(FLEET_CERT_ISSUANCE_OWNER_LEASE_MS);
-            order.updated_unix_ms = now;
-            order.clone()
-        } else {
-            let order = InFlightIssuance {
-                token: uuid::Uuid::new_v4().simple().to_string(),
-                name,
-                started_unix_ms: now,
-                updated_unix_ms: now,
-                owner_token: Some(owner_token.clone()),
-                owner_lease_expires_unix_ms: now.saturating_add(FLEET_CERT_ISSUANCE_OWNER_LEASE_MS),
-                order_url: None,
-                private_key_pem: None,
-                csr_der_b64: None,
-            };
-            store.orders.push(order.clone());
-            order
-        };
-        write_issuance_store_locked_in(cert_dir, &store)?;
-        Ok((order, owner_token))
+            IssuanceRequestClaim::CertificateCurrent => {
+                unreachable!("test issuance claims do not adopt a stored certificate")
+            }
+        }
     })
     .map_err(|error| error.to_string())
 }
@@ -1387,6 +1452,7 @@ struct IssuanceGuard {
 }
 
 impl IssuanceGuard {
+    #[cfg(test)]
     fn begin(cert_dir: &Path, name: &str) -> Result<Self, String> {
         let (order, owner_token) = claim_issuance_in(cert_dir, name)?;
         Ok(Self {
@@ -1641,7 +1707,25 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
     // missing first pair look indistinguishable from a never-enabled daemon.
     let certificate_dir = cert_dir();
     mark_issuance_requested_in(&certificate_dir)?;
-    let mut issuance = IssuanceGuard::begin(&certificate_dir, &name)?;
+    let mut issuance = match claim_issuance_request_in(&certificate_dir, &name)? {
+        IssuanceRequestClaim::CertificateCurrent => {
+            refresh_installed_state_in(&certificate_dir);
+            let adopted = status_snapshot();
+            if adopted.state == "valid"
+                && fleet_name_matches(adopted.name.as_deref(), &name)
+                && adopted.not_after_unix_ms.is_some_and(|expiry| {
+                    expiry > now_unix_ms().saturating_add(FLEET_CERT_RENEW_BEFORE_MS)
+                })
+            {
+                return Ok(());
+            }
+            return Err(
+                "a sibling committed a current fleet certificate, but this process could not install it"
+                    .to_string(),
+            );
+        }
+        IssuanceRequestClaim::Acquired(guard) => *guard,
+    };
     with_status(|status| {
         status.state = "requesting".to_string();
         status.last_error = None;
@@ -2529,7 +2613,7 @@ fn should_request_certificate(
     }
     status.state == "valid"
         && status.not_after_unix_ms.is_some_and(|not_after| {
-            not_after.saturating_sub(now_unix_ms) <= 30 * 24 * 60 * 60 * 1000
+            not_after.saturating_sub(now_unix_ms) <= FLEET_CERT_RENEW_BEFORE_MS
         })
 }
 
@@ -2980,6 +3064,32 @@ mod tests {
         assert_eq!(
             read_stored_certificate_pair_in(temp.path()).unwrap(),
             Some(("old certificate".to_string(), "old key".to_string()))
+        );
+    }
+
+    #[test]
+    fn issuance_claim_adopts_a_sibling_current_pair_before_opening_an_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = "d-22222222222222222222.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
+        let sibling = IssuanceGuard::begin(temp.path(), name).unwrap();
+        let certificate = rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
+        persist_certificate_pair_in(
+            temp.path(),
+            name,
+            &certificate.cert.pem(),
+            &certificate.signing_key.serialize_pem(),
+        )
+        .unwrap();
+        sibling.finish().unwrap();
+
+        assert!(matches!(
+            claim_issuance_request_in(temp.path(), name).unwrap(),
+            IssuanceRequestClaim::CertificateCurrent
+        ));
+        assert!(
+            !issuance_active_in(temp.path(), name).unwrap(),
+            "the committed pair is terminal authority and leaves no duplicate order"
         );
     }
 

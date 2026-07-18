@@ -321,7 +321,9 @@ Connect ever terminating TLS or seeing plaintext:
   liveness and dialbacks remain attached to the v2 poller that supplied the
   certificate proof; a rolling v1 sibling can refresh and consume only the
   derived fleet-label fallback. An exact SNI claim routes only when one daemon
-  identity owns it; competing live claims fail closed.
+  identity owns it; competing live claims fail closed. A separate
+  daemon-signed disconnect protocol removes that poller's exact and fallback
+  registration immediately instead of waiting for the liveness timeout.
 - The browser's TLS handshake therefore completes end-to-end against the
   **daemon's own fleet certificate**. Connect moves only ciphertext.
 
@@ -378,7 +380,11 @@ does not share the public listener's trusted-local classification. Connect
 runtime settings may move the ordinary registration client to another
 destination, but an already running tunnel keeps its signed control URL,
 relay-mode DNS calls, credentials, daemon identity, and raw dialback endpoint
-on one boot configuration generation until restart. Connect
+on one boot configuration generation until restart. Disabling Connect cancels
+that generation's in-flight control poll and dialbacks, sends its signed
+disconnect, and publishes `enable = false` to `/api/dns/relay`; re-enabling
+resumes the same boot generation only after the registration gate is closed
+for fresh fleet-zone observation. Connect
 shows its **Request control** navigation only when registration carries the
 daemon-signed hosted-capability hint and that daemon has a relay-mode DNS
 record; older daemons and direct-mode DNS remain discovery-only in the

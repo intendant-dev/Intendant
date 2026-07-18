@@ -405,6 +405,10 @@ struct ClientState {
     /// Set only after the currently enabled rendezvous has returned a
     /// registration response whose fleet-zone provenance was accepted.
     fleet_zone_observed: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Shared lifecycle for boot-pinned relay/DNS side channels. Runtime
+    /// Connect disablement cancels their in-flight work immediately; enabling
+    /// resumes the same immutable boot generation.
+    relay_lifecycle: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 fn client_state() -> &'static Mutex<ClientState> {
@@ -418,6 +422,7 @@ fn client_state() -> &'static Mutex<ClientState> {
             effective_config: None,
             gateway_tcp_port: None,
             fleet_zone_observed: None,
+            relay_lifecycle: None,
         })
     })
 }
@@ -464,6 +469,7 @@ pub fn spawn_connect_rendezvous_client(
     gateway_tcp_port: Option<u16>,
     hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
     fleet_zone_observed: Arc<std::sync::atomic::AtomicBool>,
+    relay_lifecycle: tokio::sync::watch::Sender<bool>,
 ) {
     {
         let mut state = client_state()
@@ -473,6 +479,7 @@ pub fn spawn_connect_rendezvous_client(
         state.hosted_control = Some(Arc::clone(&hosted_control));
         state.gateway_tcp_port = gateway_tcp_port;
         state.fleet_zone_observed = Some(Arc::clone(&fleet_zone_observed));
+        state.relay_lifecycle = Some(relay_lifecycle);
     }
     start_client(
         config,
@@ -487,18 +494,25 @@ pub fn spawn_connect_rendezvous_client(
 /// cancellation-safe HTTP calls, so an abort leaves no local state
 /// half-written.
 pub(crate) fn stop_client() {
-    let (handle, fleet_zone_observed) = {
+    let (handle, fleet_zone_observed, relay_lifecycle) = {
         let mut state = client_state()
             .lock()
             .expect("connect client state poisoned");
         state.epoch = state.epoch.wrapping_add(1);
-        (state.handle.take(), state.fleet_zone_observed.clone())
+        (
+            state.handle.take(),
+            state.fleet_zone_observed.clone(),
+            state.relay_lifecycle.clone(),
+        )
     };
     if let Some(handle) = handle {
         handle.abort();
     }
     if let Some(observed) = fleet_zone_observed {
         observed.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    if let Some(lifecycle) = relay_lifecycle {
+        lifecycle.send_replace(false);
     }
     with_status(|status| {
         status.running = false;
@@ -604,6 +618,14 @@ fn start_client(
     });
     crate::hosted_verify::note_connect_config(config.enabled, config.rendezvous_url.as_deref());
     fleet_zone_observed.store(!config.enabled, std::sync::atomic::Ordering::SeqCst);
+    if let Some(lifecycle) = client_state()
+        .lock()
+        .expect("connect client state poisoned")
+        .relay_lifecycle
+        .clone()
+    {
+        lifecycle.send_replace(config.enabled);
+    }
     if !config.enabled {
         // One line per gateway spawn: a daemon that silently never
         // registers is indistinguishable from a broken rendezvous — say
@@ -1567,6 +1589,7 @@ pub(crate) const DNS_RELAY_PROTOCOL: &str = "intendant-connect-dns-relay-v1";
 /// `bin/connect/relay.rs`).
 pub(crate) const RELAY_CONTROL_PROTOCOL_V1: &str = "intendant-connect-relay-control-v1";
 pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v2";
+pub(crate) const RELAY_DISCONNECT_PROTOCOL: &str = "intendant-connect-relay-disconnect-v1";
 
 #[cfg(test)] // golden-test twin of the payload `dns_signed_post` builds inline
 fn dns_publish_signing_payload(

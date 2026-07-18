@@ -30,10 +30,12 @@ use reqwest::{Client, Url};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use crate::connect_rendezvous::{
     authenticated, dns_publish_via_relay, join_url, signed_daemon_context_for_config,
-    RELAY_CONTROL_PROTOCOL, RELAY_CONTROL_PROTOCOL_V1,
+    RELAY_CONTROL_PROTOCOL, RELAY_CONTROL_PROTOCOL_V1, RELAY_DISCONNECT_PROTOCOL,
 };
 use crate::daemon_identity::DaemonIdentity;
 use crate::project::ConnectConfig;
@@ -80,8 +82,9 @@ pub fn spawn_relay_tunnel_client(
     config: ConnectConfig,
     gateway_ingress_addr: Option<SocketAddr>,
     current_fleet_zone_observed: Arc<AtomicBool>,
+    lifecycle: watch::Receiver<bool>,
 ) {
-    if !(config.enabled && config.relay_enabled) {
+    if !config.relay_enabled {
         return;
     }
     let Some(endpoint) = config
@@ -99,24 +102,88 @@ pub fn spawn_relay_tunnel_client(
         return;
     };
     let dns_config = config.clone();
+    let tunnel_lifecycle = lifecycle.clone();
     tokio::spawn(run_relay_tunnel(
         config,
         endpoint,
         gateway_ingress_addr,
         current_fleet_zone_observed,
+        tunnel_lifecycle,
     ));
-    tokio::spawn(relay_dns_reassert_loop(dns_config));
+    tokio::spawn(relay_dns_reassert_loop(dns_config, lifecycle));
 }
 
 /// Best-effort: keep the fleet name pointed at the relay while the tunnel is
 /// up. Only meaningful when the rendezvous runs both fleet DNS and the relay;
 /// failures are expected weather for other configurations and logged quietly.
-async fn relay_dns_reassert_loop(config: ConnectConfig) {
+async fn relay_dns_reassert_loop(config: ConnectConfig, mut lifecycle: watch::Receiver<bool>) {
+    // A prior process may have exited after publishing relay mode. Begin
+    // conservatively so disabled startup also sends one explicit withdrawal.
+    let mut relay_dns_may_be_published = true;
+    let mut withdrawal_backoff = BACKOFF_MIN;
     loop {
-        if let Err(error) = dns_publish_via_relay(&config, true).await {
+        if !*lifecycle.borrow_and_update() {
+            if relay_dns_may_be_published {
+                match dns_publish_via_relay(&config, false).await {
+                    Ok(()) => {
+                        relay_dns_may_be_published = false;
+                        withdrawal_backoff = BACKOFF_MIN;
+                    }
+                    Err(error) => {
+                        eprintln!("[relay] relay-mode dns withdrawal (best-effort): {error}");
+                        tokio::select! {
+                            biased;
+                            changed = lifecycle.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                            }
+                            _ = tokio::time::sleep(withdrawal_backoff) => {
+                                withdrawal_backoff =
+                                    (withdrawal_backoff * 2).min(BACKOFF_MAX);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            if lifecycle.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        withdrawal_backoff = BACKOFF_MIN;
+        // Once the signed request begins its remote effect is ambiguous until
+        // an explicit withdrawal succeeds, even if local cancellation wins.
+        relay_dns_may_be_published = true;
+        let publish = tokio::select! {
+            biased;
+            changed = lifecycle.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                None
+            }
+            result = dns_publish_via_relay(&config, true) => Some(result),
+        };
+        let Some(publish) = publish else {
+            continue;
+        };
+        if let Err(error) = publish {
             eprintln!("[relay] relay-mode dns publish (best-effort): {error}");
         }
-        tokio::time::sleep(DNS_REASSERT_INTERVAL).await;
+        if !*lifecycle.borrow_and_update() {
+            continue;
+        }
+        tokio::select! {
+            biased;
+            changed = lifecycle.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(DNS_REASSERT_INTERVAL) => {}
+        }
     }
 }
 
@@ -125,6 +192,7 @@ async fn run_relay_tunnel(
     relay_endpoint: String,
     gateway_ingress_addr: SocketAddr,
     current_fleet_zone_observed: Arc<AtomicBool>,
+    mut lifecycle: watch::Receiver<bool>,
 ) {
     let client = match Client::builder()
         .timeout(Duration::from_millis(CONTROL_POLL_TIMEOUT_MS + 10_000))
@@ -137,10 +205,48 @@ async fn run_relay_tunnel(
         }
     };
     eprintln!("[relay] tunnel client enabled (dial-back via {relay_endpoint})");
+    loop {
+        while !*lifecycle.borrow_and_update() {
+            if lifecycle.changed().await.is_err() {
+                return;
+            }
+        }
+        let poller_id = uuid::Uuid::new_v4().simple().to_string();
+        run_enabled_relay_tunnel(
+            &config,
+            &relay_endpoint,
+            gateway_ingress_addr,
+            &current_fleet_zone_observed,
+            &client,
+            &poller_id,
+            &mut lifecycle,
+        )
+        .await;
+        if let Err(error) = withdraw_relay_name_registration(&config, &client, &poller_id).await {
+            eprintln!("[relay] exact-name withdrawal (best-effort): {error}");
+        }
+        if lifecycle.has_changed().is_err() {
+            return;
+        }
+    }
+}
+
+async fn run_enabled_relay_tunnel(
+    config: &ConnectConfig,
+    relay_endpoint: &str,
+    gateway_ingress_addr: SocketAddr,
+    current_fleet_zone_observed: &AtomicBool,
+    client: &Client,
+    poller_id: &str,
+    lifecycle: &mut watch::Receiver<bool>,
+) {
     let mut backoff = BACKOFF_MIN;
     let mut last_custom_error: Option<String> = None;
-    let poller_id = uuid::Uuid::new_v4().simple().to_string();
+    let mut dialbacks = JoinSet::new();
     loop {
+        if !*lifecycle.borrow_and_update() {
+            return;
+        }
         // Another daemon process may have renewed the shared fleet pair.
         // Relay readiness is process-local, so reload it before registering
         // this poller as a possible dialback recipient.
@@ -154,7 +260,10 @@ async fn run_relay_tunnel(
                 Ok(context) => context,
                 Err(error) => {
                     eprintln!("[relay] tunnel context unavailable: {error}");
-                    backoff = sleep_backoff(backoff).await;
+                    backoff = match sleep_backoff_or_disabled(backoff, lifecycle).await {
+                        Some(next) => next,
+                        None => return,
+                    };
                     continue;
                 }
             };
@@ -182,18 +291,35 @@ async fn run_relay_tunnel(
             }
         };
         let poll = RelayPollContext {
-            client: &client,
+            client,
             config: &control_config,
             base_url: &base_url,
             identity: &identity,
             daemon_id: &daemon_id,
-            poller_id: &poller_id,
+            poller_id,
         };
-        match poll_relay_next(&poll, &name_materials).await {
+        let poll_result = tokio::select! {
+            biased;
+            changed = lifecycle.changed() => {
+                if changed.is_err() || !*lifecycle.borrow_and_update() {
+                    None
+                } else {
+                    continue;
+                }
+            }
+            result = poll_relay_next(&poll, &name_materials) => Some(result),
+        };
+        let Some(poll_result) = poll_result else {
+            return;
+        };
+        if !*lifecycle.borrow_and_update() {
+            return;
+        }
+        match poll_result {
             Ok(Some(dialback)) => {
                 backoff = BACKOFF_MIN;
-                let endpoint = relay_endpoint.clone();
-                tokio::spawn(async move {
+                let endpoint = relay_endpoint.to_string();
+                dialbacks.spawn(async move {
                     if let Err(error) =
                         handle_dialback(&endpoint, gateway_ingress_addr, &dialback).await
                     {
@@ -206,15 +332,51 @@ async fn run_relay_tunnel(
             }
             Err(error) => {
                 eprintln!("[relay] control poll failed: {error}");
-                backoff = sleep_backoff(backoff).await;
+                backoff = match sleep_backoff_or_disabled(backoff, lifecycle).await {
+                    Some(next) => next,
+                    None => return,
+                };
+            }
+        }
+        while dialbacks.try_join_next().is_some() {}
+    }
+}
+
+async fn sleep_backoff_or_disabled(
+    current: Duration,
+    lifecycle: &mut watch::Receiver<bool>,
+) -> Option<Duration> {
+    tokio::select! {
+        _ = tokio::time::sleep(current) => Some((current * 2).min(BACKOFF_MAX)),
+        changed = lifecycle.changed() => {
+            if changed.is_err() || !*lifecycle.borrow_and_update() {
+                None
+            } else {
+                Some(current)
             }
         }
     }
 }
 
-async fn sleep_backoff(current: Duration) -> Duration {
-    tokio::time::sleep(current).await;
-    (current * 2).min(BACKOFF_MAX)
+async fn withdraw_relay_name_registration(
+    config: &ConnectConfig,
+    client: &Client,
+    poller_id: &str,
+) -> Result<(), String> {
+    let (control_config, base_url, identity, daemon_id) =
+        signed_daemon_context_for_config(config.clone())?;
+    let poll = RelayPollContext {
+        client,
+        config: &control_config,
+        base_url: &base_url,
+        identity: &identity,
+        daemon_id: &daemon_id,
+        poller_id,
+    };
+    let body = build_relay_disconnect_body(&poll);
+    decode_relay_poll_response(send_relay_poll(&poll, &body).await?)
+        .await
+        .map(|_| ())
 }
 
 /// One control-channel long-poll. Returns the dial-back nonce if the relay
@@ -328,6 +490,27 @@ fn build_relay_poll_body(
     Ok(body)
 }
 
+fn build_relay_disconnect_body(poll: &RelayPollContext<'_>) -> serde_json::Value {
+    let daemon_public_key = poll.identity.public_key_b64u();
+    let issued_at_unix_ms = crate::access::client_key::now_unix_ms().max(0) as u64;
+    let payload = relay_control_signing_payload(
+        RELAY_DISCONNECT_PROTOCOL,
+        poll.daemon_id,
+        &daemon_public_key,
+        issued_at_unix_ms,
+        Some(poll.poller_id),
+        &[],
+    );
+    serde_json::json!({
+        "protocol": RELAY_DISCONNECT_PROTOCOL,
+        "daemon_id": poll.daemon_id,
+        "daemon_public_key": daemon_public_key,
+        "issued_at_unix_ms": issued_at_unix_ms,
+        "signature": poll.identity.sign_b64u(&payload),
+        "poller_id": poll.poller_id,
+    })
+}
+
 async fn send_relay_poll(
     poll: &RelayPollContext<'_>,
     body: &serde_json::Value,
@@ -432,7 +615,7 @@ fn relay_control_signing_payload(
 ) -> Vec<u8> {
     let mut payload =
         format!("{protocol}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n").into_bytes();
-    if protocol == RELAY_CONTROL_PROTOCOL {
+    if matches!(protocol, RELAY_CONTROL_PROTOCOL | RELAY_DISCONNECT_PROTOCOL) {
         let poller_id = poller_id.unwrap_or_default();
         payload.extend_from_slice(poller_id.len().to_string().as_bytes());
         payload.push(b'\n');
@@ -548,8 +731,14 @@ mod tests {
         // tokio runtime is not required because we never spawn.)
         let ingress = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 8765)));
         let observed = Arc::new(AtomicBool::new(true));
-        spawn_relay_tunnel_client(relay_disabled(), ingress, Arc::clone(&observed));
-        spawn_relay_tunnel_client(ConnectConfig::default(), ingress, observed);
+        let (_, lifecycle) = watch::channel(false);
+        spawn_relay_tunnel_client(
+            relay_disabled(),
+            ingress,
+            Arc::clone(&observed),
+            lifecycle.clone(),
+        );
+        spawn_relay_tunnel_client(ConnectConfig::default(), ingress, observed, lifecycle);
     }
 
     #[test]
@@ -573,6 +762,29 @@ mod tests {
                 "11111111111111111111111111111111\n",
                 "16\n",
                 "box.example.test\n",
+            )
+        );
+    }
+
+    #[test]
+    fn disconnect_signature_payload_binds_the_poller_identity() {
+        let payload = relay_control_signing_payload(
+            RELAY_DISCONNECT_PROTOCOL,
+            "daemon",
+            "public",
+            42,
+            Some("11111111111111111111111111111111"),
+            &[],
+        );
+        assert_eq!(
+            String::from_utf8(payload).unwrap(),
+            concat!(
+                "intendant-connect-relay-disconnect-v1\n",
+                "daemon\n",
+                "public\n",
+                "42\n",
+                "32\n",
+                "11111111111111111111111111111111\n",
             )
         );
     }
