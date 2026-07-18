@@ -1117,6 +1117,13 @@ pub(crate) async fn ws_inbound_task(
                         // the tunnel's api_presence_video_frame commits
                         // through (fire-and-forget: no response frame).
                         let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
+                        if reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "frame_id",
+                            &frame_id,
+                        ) {
+                            continue;
+                        }
                         let stream = json["stream"].as_str().unwrap_or("cam0").to_string();
                         if let Some(data_b64) = json["data"].as_str() {
                             use base64::Engine;
@@ -1145,6 +1152,13 @@ pub(crate) async fn ws_inbound_task(
                         // are independent of any running task. Same store fn as
                         // the tunnel's api_media_annotation_attach.
                         let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
+                        if reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "frame_id",
+                            &frame_id,
+                        ) {
+                            continue;
+                        }
                         let stream = json["stream"].as_str().unwrap_or("annotation").to_string();
                         let note = json["note"].as_str().unwrap_or("").to_string();
                         if let Some(data_b64) = json["data"].as_str() {
@@ -1193,6 +1207,13 @@ pub(crate) async fn ws_inbound_task(
                         // through the same store fns as the tunnel's
                         // api_media_annotation_submit.
                         let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
+                        if reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "frame_id",
+                            &frame_id,
+                        ) {
+                            continue;
+                        }
                         let stream = json["stream"].as_str().unwrap_or("annotation").to_string();
                         let note = json["note"].as_str().unwrap_or("").to_string();
                         let inject = json["inject"].as_bool().unwrap_or(false);
@@ -1255,13 +1276,34 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("clip_start") => {
                         let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
+                        if reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "clip_id",
+                            &clip_id,
+                        ) {
+                            continue;
+                        }
                         let stream = json["stream"].as_str().unwrap_or("recording").to_string();
                         let note = json["note"].as_str().unwrap_or("").to_string();
                         let inject = json["inject"].as_bool().unwrap_or(false);
                         let in_secs = json["in_secs"].as_f64().unwrap_or(0.0);
                         let out_secs = json["out_secs"].as_f64().unwrap_or(0.0);
                         let fps = json["fps"].as_u64().unwrap_or(2) as u32;
-                        let total = json["total_frames"].as_u64().unwrap_or(0) as usize;
+                        let total = json["total_frames"].as_u64().unwrap_or(0);
+                        let total = match validate_dashboard_clip_frame_count(total) {
+                            Ok(total) => total,
+                            Err(error) => {
+                                let _ = direct_tx_inbound.send(
+                                    serde_json::json!({
+                                        "t": "media_error",
+                                        "ok": false,
+                                        "error": error,
+                                    })
+                                    .to_string(),
+                                );
+                                continue;
+                            }
+                        };
                         clip_accumulators.insert(
                             clip_id.clone(),
                             DashboardMediaClipOperation {
@@ -1287,6 +1329,17 @@ pub(crate) async fn ws_inbound_task(
                     Some("clip_frame") => {
                         let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
                         let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
+                        if reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "clip_id",
+                            &clip_id,
+                        ) || reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "frame_id",
+                            &frame_id,
+                        ) {
+                            continue;
+                        }
                         if let Some(data_b64) = json["data"].as_str() {
                             // Register frame in frame registry — the same
                             // store fn as the tunnel's api_media_clip_frame.
@@ -1312,6 +1365,13 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("clip_end") => {
                         let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
+                        if reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "clip_id",
+                            &clip_id,
+                        ) {
+                            continue;
+                        }
 
                         if let Some(acc) = clip_accumulators.remove(&clip_id) {
                             let frames_registered = acc.frames.len();

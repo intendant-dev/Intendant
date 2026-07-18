@@ -86,6 +86,7 @@ pub(crate) async fn dashboard_media_session_handles(
 // response shapes.
 pub(crate) use crate::web_gateway::{
     inject_annotation_context, inject_clip_context, register_dashboard_media_frame,
+    validate_dashboard_media_id, DASHBOARD_MEDIA_CLIP_MAX_FRAMES,
 };
 
 pub(crate) async fn api_presence_video_frame_upload_task_response(
@@ -95,8 +96,8 @@ pub(crate) async fn api_presence_video_frame_upload_task_response(
 ) -> ControlTaskResponse {
     let params = upload.params.clone();
     let frame_id = string_param(&params, &["frame_id", "frameId"]);
-    if frame_id.is_empty() {
-        return media_error_task_response(id, 400, "missing frame_id");
+    if let Err(error) = validate_dashboard_media_id("frame_id", &frame_id) {
+        return media_error_task_response(id, 400, error);
     }
     let stream = optional_string_param(&params, &["stream", "stream_name", "streamName"])
         .unwrap_or_else(|| "cam0".to_string());
@@ -153,8 +154,8 @@ pub(crate) async fn api_media_annotation_upload_task_response(
 ) -> ControlTaskResponse {
     let params = upload.params.clone();
     let frame_id = string_param(&params, &["frame_id", "frameId"]);
-    if frame_id.is_empty() {
-        return media_error_task_response(id, 400, "missing frame_id");
+    if let Err(error) = validate_dashboard_media_id("frame_id", &frame_id) {
+        return media_error_task_response(id, 400, error);
     }
     let stream = optional_string_param(&params, &["stream"]).unwrap_or_else(|| "annotation".into());
     let note = optional_string_param(&params, &["note"]).unwrap_or_default();
@@ -267,12 +268,8 @@ pub(crate) async fn api_media_clip_start_response(
 ) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let clip_id = string_param(&params, &["clip_id", "clipId", "op_id", "opId"]);
-    if clip_id.is_empty() {
-        return media_http_response(
-            id,
-            400,
-            serde_json::json!({"ok": false, "error": "missing clip_id"}),
-        );
+    if let Err(error) = validate_dashboard_media_id("clip_id", &clip_id) {
+        return media_http_response(id, 400, serde_json::json!({"ok": false, "error": error}));
     }
     let total_frames = usize_param(&params, "total_frames", 0);
     if total_frames > DASHBOARD_MEDIA_CLIP_MAX_FRAMES {
@@ -336,11 +333,11 @@ pub(crate) async fn api_media_clip_frame_upload_task_response(
     let params = upload.params.clone();
     let clip_id = string_param(&params, &["clip_id", "clipId", "op_id", "opId"]);
     let frame_id = string_param(&params, &["frame_id", "frameId"]);
-    if clip_id.is_empty() {
-        return media_error_task_response(id, 400, "missing clip_id");
+    if let Err(error) = validate_dashboard_media_id("clip_id", &clip_id) {
+        return media_error_task_response(id, 400, error);
     }
-    if frame_id.is_empty() {
-        return media_error_task_response(id, 400, "missing frame_id");
+    if let Err(error) = validate_dashboard_media_id("frame_id", &frame_id) {
+        return media_error_task_response(id, 400, error);
     }
     let bytes = match read_inbound_upload_bytes(&mut upload) {
         Ok(bytes) if !bytes.is_empty() => bytes,
@@ -400,12 +397,8 @@ pub(crate) async fn api_media_clip_end_response(
 ) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let clip_id = string_param(&params, &["clip_id", "clipId", "op_id", "opId"]);
-    if clip_id.is_empty() {
-        return media_http_response(
-            id,
-            400,
-            serde_json::json!({"ok": false, "error": "missing clip_id"}),
-        );
+    if let Err(error) = validate_dashboard_media_id("clip_id", &clip_id) {
+        return media_http_response(id, 400, serde_json::json!({"ok": false, "error": error}));
     }
     let frames_sent = usize_param(&params, "frames_sent", usize::MAX);
     let clip = {
@@ -481,12 +474,8 @@ pub(crate) async fn api_media_clip_cancel_response(
 ) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let clip_id = string_param(&params, &["clip_id", "clipId", "op_id", "opId"]);
-    if clip_id.is_empty() {
-        return media_http_response(
-            id,
-            400,
-            serde_json::json!({"ok": false, "error": "missing clip_id"}),
-        );
+    if let Err(error) = validate_dashboard_media_id("clip_id", &clip_id) {
+        return media_http_response(id, 400, serde_json::json!({"ok": false, "error": error}));
     }
     let existed = runtime
         .media_clip_ops
@@ -1174,6 +1163,61 @@ mod tests {
     }
 
     use crate::dashboard_control::tests::{runtime, test_upload_state};
+
+    #[tokio::test]
+    async fn media_upload_rejects_unsafe_frame_id_before_storage() {
+        let session_dir = tempfile::tempdir().unwrap();
+        let rt = runtime();
+        let registry = Arc::new(tokio::sync::RwLock::new(crate::frames::FrameRegistry::new(
+            session_dir.path(),
+        )));
+        {
+            let mut session = rt.shared_session.write().await;
+            session.frame_registry = Some(registry);
+        }
+        let upload = test_upload_state(
+            "api_media_annotation_submit",
+            serde_json::json!({
+                "frame_id": "../escaped",
+                "stream": "annotation",
+            }),
+            b"attacker bytes",
+        );
+
+        let response =
+            api_media_annotation_upload_task_response("invalid-frame".into(), upload, rt, true)
+                .await;
+
+        assert_eq!(response.frame["result"]["_httpStatus"], 400);
+        assert_eq!(response.frame["result"]["ok"], false);
+        assert_eq!(
+            response.frame["result"]["error"],
+            "invalid frame_id: must contain only ASCII letters, digits, '_' or '-'"
+        );
+        assert!(!session_dir.path().join("escaped.jpg").exists());
+    }
+
+    #[tokio::test]
+    async fn media_clip_rejects_unsafe_clip_id_before_operation_insert() {
+        let rt = runtime();
+        let response = api_media_clip_start_response(
+            "invalid-clip".into(),
+            Some(&serde_json::json!({
+                "clip_id": "<img-onerror>",
+                "total_frames": 1,
+            })),
+            &rt,
+        )
+        .await;
+
+        assert_eq!(response["result"]["_httpStatus"], 400);
+        assert_eq!(response["result"]["ok"], false);
+        assert_eq!(
+            response["result"]["error"],
+            "invalid clip_id: must contain only ASCII letters, digits, '_' or '-'"
+        );
+        assert!(rt.media_clip_ops.lock().await.is_empty());
+    }
 
     #[tokio::test]
     async fn media_annotation_upload_registers_frame() {
