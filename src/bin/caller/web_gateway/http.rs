@@ -470,9 +470,52 @@ pub(crate) async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
     stream: &mut S,
     max_bytes: usize,
 ) -> Result<SpooledBody, String> {
+    stream_body_to_tempfile_inner(
+        header_text,
+        initial_request_bytes,
+        stream,
+        max_bytes,
+        false,
+        || Ok(()),
+    )
+    .await
+}
+
+pub(crate) async fn stream_body_to_tempfile_with_guard<
+    S: AsyncRead + Unpin,
+    G: FnMut() -> Result<(), String>,
+>(
+    header_text: &str,
+    initial_request_bytes: &[u8],
+    stream: &mut S,
+    max_bytes: usize,
+    guard: G,
+) -> Result<SpooledBody, String> {
+    stream_body_to_tempfile_inner(
+        header_text,
+        initial_request_bytes,
+        stream,
+        max_bytes,
+        true,
+        guard,
+    )
+    .await
+}
+
+async fn stream_body_to_tempfile_inner<S: AsyncRead + Unpin, G: FnMut() -> Result<(), String>>(
+    header_text: &str,
+    initial_request_bytes: &[u8],
+    stream: &mut S,
+    max_bytes: usize,
+    poll_guard: bool,
+    mut guard: G,
+) -> Result<SpooledBody, String> {
     use std::io::Write;
     use tokio::io::AsyncReadExt;
 
+    if poll_guard {
+        guard()?;
+    }
     let content_length: usize = header_text
         .lines()
         .find(|l| l.to_lowercase().starts_with("content-length:"))
@@ -507,7 +550,15 @@ pub(crate) async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
     let mut buf = vec![0u8; 64 * 1024];
     while written < content_length {
         let want = (content_length - written).min(buf.len());
-        match stream.read(&mut buf[..want]).await {
+        let read = if poll_guard {
+            poll_guarded_read(stream, &mut buf[..want], &mut guard).await?
+        } else {
+            stream.read(&mut buf[..want]).await
+        };
+        if poll_guard {
+            guard()?;
+        }
+        match read {
             Ok(0) => {
                 return Err(format!(
                     "connection closed mid-upload at {} / {} bytes",
@@ -522,6 +573,9 @@ pub(crate) async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
             }
             Err(e) => return Err(format!("socket read: {e}")),
         }
+    }
+    if poll_guard {
+        guard()?;
     }
     tmp.as_file_mut()
         .flush()
@@ -945,6 +999,31 @@ const REQUEST_BODY_BASE_TIMEOUT: std::time::Duration = std::time::Duration::from
 const REQUEST_BODY_READ_CHUNK_BYTES: usize = 16 * 1024;
 const REQUEST_BODY_TIMEOUT_FREE_BYTES: usize = 64 * 1024;
 const REQUEST_BODY_TIMEOUT_BYTES_PER_SEC: usize = 128 * 1024;
+const LIVE_BODY_GUARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+async fn poll_guarded_read<S, G, E>(
+    stream: &mut S,
+    buffer: &mut [u8],
+    guard: &mut G,
+) -> Result<std::io::Result<usize>, E>
+where
+    S: AsyncRead + Unpin,
+    G: FnMut() -> Result<(), E>,
+{
+    use tokio::io::AsyncReadExt;
+    guard()?;
+    let read = stream.read(buffer);
+    tokio::pin!(read);
+    let start = tokio::time::Instant::now() + LIVE_BODY_GUARD_POLL_INTERVAL;
+    let mut interval = tokio::time::interval_at(start, LIVE_BODY_GUARD_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            result = &mut read => return Ok(result),
+            _ = interval.tick() => guard()?,
+        }
+    }
+}
 
 fn request_body_read_timeout(max_bytes: usize) -> std::time::Duration {
     let excess = max_bytes.saturating_sub(REQUEST_BODY_TIMEOUT_FREE_BYTES);
@@ -957,22 +1036,70 @@ pub(crate) async fn read_request_body_capped<S: AsyncRead + Unpin>(
     header_text: &str,
     max_bytes: usize,
 ) -> Result<String, (u16, String)> {
-    read_request_body_capped_with_timeout(
+    read_request_body_capped_with_timeout_and_guard(
         stream,
         header_text,
         max_bytes,
         request_body_read_timeout(max_bytes),
+        false,
+        || Ok(()),
     )
     .await
 }
 
+pub(crate) async fn read_request_body_capped_with_guard<
+    S: AsyncRead + Unpin,
+    G: FnMut() -> Result<(), (u16, String)>,
+>(
+    stream: &mut S,
+    header_text: &str,
+    max_bytes: usize,
+    guard: G,
+) -> Result<String, (u16, String)> {
+    read_request_body_capped_with_timeout_and_guard(
+        stream,
+        header_text,
+        max_bytes,
+        request_body_read_timeout(max_bytes),
+        true,
+        guard,
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn read_request_body_capped_with_timeout<S: AsyncRead + Unpin>(
     stream: &mut S,
     header_text: &str,
     max_bytes: usize,
     timeout: std::time::Duration,
 ) -> Result<String, (u16, String)> {
+    read_request_body_capped_with_timeout_and_guard(
+        stream,
+        header_text,
+        max_bytes,
+        timeout,
+        false,
+        || Ok(()),
+    )
+    .await
+}
+
+async fn read_request_body_capped_with_timeout_and_guard<
+    S: AsyncRead + Unpin,
+    G: FnMut() -> Result<(), (u16, String)>,
+>(
+    stream: &mut S,
+    header_text: &str,
+    max_bytes: usize,
+    timeout: std::time::Duration,
+    poll_guard: bool,
+    mut guard: G,
+) -> Result<String, (u16, String)> {
     use tokio::io::AsyncReadExt;
+    if poll_guard {
+        guard()?;
+    }
     let content_length: usize = header_text
         .lines()
         .find(|l| l.to_lowercase().starts_with("content-length:"))
@@ -990,6 +1117,9 @@ async fn read_request_body_capped_with_timeout<S: AsyncRead + Unpin>(
     }
     let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
     if peeked_body.len() >= content_length {
+        if poll_guard {
+            guard()?;
+        }
         return Ok(crate::types::truncate_str(peeked_body, content_length).to_string());
     }
     let mut full = Vec::with_capacity(
@@ -1003,18 +1133,30 @@ async fn read_request_body_capped_with_timeout<S: AsyncRead + Unpin>(
         let mut chunk = [0u8; REQUEST_BODY_READ_CHUNK_BYTES];
         while full.len() < content_length {
             let remaining = content_length - full.len();
-            let n = stream
-                .read(&mut chunk[..remaining.min(REQUEST_BODY_READ_CHUNK_BYTES)])
-                .await
-                .map_err(|error| {
-                    (
-                        400,
-                        serde_json::json!({
-                            "error": format!("read request body: {error}")
-                        })
-                        .to_string(),
-                    )
-                })?;
+            let read = if poll_guard {
+                poll_guarded_read(
+                    stream,
+                    &mut chunk[..remaining.min(REQUEST_BODY_READ_CHUNK_BYTES)],
+                    &mut guard,
+                )
+                .await?
+            } else {
+                stream
+                    .read(&mut chunk[..remaining.min(REQUEST_BODY_READ_CHUNK_BYTES)])
+                    .await
+            };
+            if poll_guard {
+                guard()?;
+            }
+            let n = read.map_err(|error| {
+                (
+                    400,
+                    serde_json::json!({
+                        "error": format!("read request body: {error}")
+                    })
+                    .to_string(),
+                )
+            })?;
             if n == 0 {
                 return Err((
                     400,
@@ -1023,6 +1165,9 @@ async fn read_request_body_capped_with_timeout<S: AsyncRead + Unpin>(
                 ));
             }
             full.extend_from_slice(&chunk[..n]);
+        }
+        if poll_guard {
+            guard()?;
         }
         Ok::<(), (u16, String)>(())
     })
@@ -1298,6 +1443,71 @@ mod tests {
             response.starts_with(b"HTTP/1.1 408 Request Timeout\r\n"),
             "the rendered response must preserve the body-timeout status"
         );
+    }
+
+    #[tokio::test]
+    async fn read_request_body_capped_stops_when_live_guard_closes() {
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let close = std::sync::Arc::clone(&live);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            close.store(false, std::sync::atomic::Ordering::Release);
+        });
+        let header_text = "POST /api/fs/write HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_request_body_capped_with_guard(&mut reader, header_text, 4, || {
+                if live.load(std::sync::atomic::Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err((
+                        403,
+                        serde_json::json!({"error": "live authority closed"}).to_string(),
+                    ))
+                }
+            }),
+        )
+        .await
+        .expect("the live guard must interrupt a stalled capped-body read")
+        .unwrap_err();
+        assert_eq!(error.0, 403);
+        assert!(error.1.contains("live authority closed"));
+    }
+
+    #[tokio::test]
+    async fn tempfile_stream_stops_when_live_guard_closes() {
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let close = std::sync::Arc::clone(&live);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            close.store(false, std::sync::atomic::Ordering::Release);
+        });
+        let header_text = "POST /api/transfers/job/chunk HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream_body_to_tempfile_with_guard(
+                header_text,
+                header_text.as_bytes(),
+                &mut reader,
+                4,
+                || {
+                    if live.load(std::sync::atomic::Ordering::Acquire) {
+                        Ok(())
+                    } else {
+                        Err("live authority closed".to_string())
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("the live guard must interrupt a stalled streaming-body read");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("the streaming body unexpectedly completed"),
+        };
+        assert_eq!(error, "live authority closed");
     }
 
     #[test]

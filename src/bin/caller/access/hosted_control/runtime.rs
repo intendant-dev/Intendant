@@ -722,6 +722,27 @@ impl HostedControlRuntime {
         Ok(verified)
     }
 
+    /// Refresh an already-authenticated request's lease and IAM snapshot
+    /// without consuming another proof nonce. Long request-body reads must
+    /// call this again before dispatching side effects so expiry, revocation,
+    /// ceiling changes, and the certificate guard take effect within the
+    /// same HTTP exchange.
+    pub fn revalidate_verified_lease(
+        &self,
+        verified: &VerifiedHostedLease,
+    ) -> Result<VerifiedHostedLease, String> {
+        self.ensure_enabled()?;
+        let current = self.load_verified_lease(
+            &verified.document.lease_id,
+            &verified.document.fleet_origin,
+            &verified.principal.transport,
+        )?;
+        if current.document != verified.document {
+            return Err("hosted lease document changed during the request".to_string());
+        }
+        Ok(current)
+    }
+
     pub fn mint_ws_ticket(&self, verified: &VerifiedHostedLease) -> Result<HostedWsTicket, String> {
         self.ensure_enabled()?;
         self.ensure_lane_available()?;
@@ -2906,7 +2927,12 @@ mod tests {
         let runtime = runtime(&temp);
         let key = browser_key();
         let (_, revoked) = issue_lease(&runtime, &key, HostedPreset::Tasks, 3600);
+        let opening = runtime
+            .load_verified_lease(&revoked.lease_id, "https://laptop.example.test", "relay")
+            .unwrap();
+        assert!(runtime.revalidate_verified_lease(&opening).is_ok());
         assert!(runtime.revoke_lease(&revoked.lease_id, &owner()).unwrap());
+        assert!(runtime.revalidate_verified_lease(&opening).is_err());
         assert!(runtime
             .load_verified_lease(&revoked.lease_id, "https://laptop.example.test", "relay")
             .is_err());

@@ -109,6 +109,79 @@ pub(crate) const HOSTED_AUTHORITY_BUSY_ERROR: &str =
     "hosted-control authority work is busy; retry the request";
 static HOSTED_AUTHORITY_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
+/// Live authority carried across an HTTP request after its proof nonce has
+/// been consumed. Request-body reads can be long enough for the lease, IAM
+/// snapshot, certificate guard, or owner-name eligibility to change, so
+/// handlers refresh this value immediately before dispatching effects.
+#[derive(Clone)]
+pub(crate) struct HostedHttpAuthority {
+    runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
+    custom_domain: Option<Arc<crate::custom_domain::CustomDomainRuntime>>,
+    verified: crate::access::hosted_control::VerifiedHostedLease,
+}
+
+impl HostedHttpAuthority {
+    pub(crate) fn new(
+        runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
+        custom_domain: Option<Arc<crate::custom_domain::CustomDomainRuntime>>,
+        verified: crate::access::hosted_control::VerifiedHostedLease,
+    ) -> Self {
+        Self {
+            runtime,
+            custom_domain,
+            verified,
+        }
+    }
+
+    pub(crate) fn verified(&self) -> &crate::access::hosted_control::VerifiedHostedLease {
+        &self.verified
+    }
+
+    pub(crate) fn access_context(&self) -> HttpAccessContext {
+        HttpAccessContext {
+            principal: self.verified.principal.clone(),
+            iam_state: Some(Arc::clone(&self.verified.iam_state)),
+        }
+    }
+
+    pub(crate) fn has_custom_domain_guard(&self) -> bool {
+        self.custom_domain.is_some()
+    }
+
+    pub(crate) fn ensure_custom_domain_live(&self) -> Result<(), String> {
+        if self
+            .custom_domain
+            .as_ref()
+            .is_some_and(|runtime| !runtime.enabled())
+        {
+            return Err("custom-domain control became unavailable during the request".to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn revalidate(&self) -> Result<Self, String> {
+        self.ensure_custom_domain_live()?;
+        let runtime = Arc::clone(&self.runtime);
+        let opening = self.verified.clone();
+        let verified =
+            run_hosted_authority_io(move || runtime.revalidate_verified_lease(&opening)).await?;
+        self.ensure_custom_domain_live()?;
+        Ok(Self {
+            runtime: Arc::clone(&self.runtime),
+            custom_domain: self.custom_domain.clone(),
+            verified,
+        })
+    }
+}
+
+pub(crate) fn hosted_authority_error_status(error: &str) -> u16 {
+    if error == HOSTED_AUTHORITY_BUSY_ERROR {
+        429
+    } else {
+        403
+    }
+}
+
 async fn run_bounded_authority_io<T: Send + 'static>(
     workers: &'static tokio::sync::Semaphore,
     operation: impl FnOnce() -> Result<T, String> + Send + 'static,

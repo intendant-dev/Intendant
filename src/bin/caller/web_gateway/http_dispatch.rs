@@ -531,12 +531,16 @@ pub(crate) async fn serve_http_request(
         return;
     }
 
-    let hosted_verified_for_handler = hosted_verified.clone();
-    let http_access_context = if let Some(verified) = hosted_verified.as_ref() {
-        HttpAccessContext {
-            principal: verified.principal.clone(),
-            iam_state: Some(Arc::clone(&verified.iam_state)),
-        }
+    let mut hosted_http_authority = hosted_verified.clone().map(|verified| {
+        HostedHttpAuthority::new(
+            Arc::clone(&hosted_control),
+            custom_domain_selected.then(|| Arc::clone(&custom_domain)),
+            verified,
+        )
+    });
+    let mut hosted_verified_for_handler = hosted_verified.clone();
+    let mut http_access_context = if let Some(authority) = hosted_http_authority.as_ref() {
+        authority.access_context()
     } else if authority_free_request {
         authority_free_http_access_context(is_tls)
     } else {
@@ -702,7 +706,20 @@ pub(crate) async fn serve_http_request(
                     BodyPolicy::Capped(cap) => cap,
                     _ => crate::gateway_routes::DEFAULT_BODY_CAP_BYTES,
                 };
-                match read_request_body_capped(&mut stream, header_text, cap).await {
+                let body = if let Some(authority) = hosted_http_authority
+                    .as_ref()
+                    .filter(|authority| authority.has_custom_domain_guard())
+                {
+                    read_request_body_capped_with_guard(&mut stream, header_text, cap, || {
+                        authority.ensure_custom_domain_live().map_err(|error| {
+                            (403, serde_json::json!({ "error": error }).to_string())
+                        })
+                    })
+                    .await
+                } else {
+                    read_request_body_capped(&mut stream, header_text, cap).await
+                };
+                match body {
                     Ok(body) => {
                         // Keep-alive body leg: dispatch consumed exactly
                         // the declared body (`read_request_body_capped`
@@ -739,6 +756,88 @@ pub(crate) async fn serve_http_request(
                 }
             }
         };
+        // Proof verification precedes the body read, which can last many
+        // minutes on the largest capped route. Refresh the lease, IAM
+        // snapshot, certificate guard, and custom-name gate after that await
+        // and repeat the route gates before any handler can apply an effect.
+        // The streaming transfer row performs the same refresh again after
+        // its handler finishes spooling the body.
+        if let Some(authority) = hosted_http_authority.as_ref() {
+            let refreshed = match authority.revalidate().await {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    use tokio::io::AsyncWriteExt;
+                    let status = hosted_authority_error_status(&error);
+                    let response = apply_cors_posture(
+                        HttpResponse::json(
+                            status_reason(status),
+                            serde_json::json!({ "error": error }).to_string(),
+                        ),
+                        route.cors,
+                        fleet_cors_origin.as_deref(),
+                    );
+                    let _ = stream.write_all(&response.into_bytes()).await;
+                    finalize_http_stream(&mut stream).await;
+                    return;
+                }
+            };
+            http_access_context = refreshed.access_context();
+            hosted_verified_for_handler = Some(refreshed.verified().clone());
+            hosted_http_authority = Some(refreshed);
+
+            if let Some(op) = dashboard_http_operation(req_method, req_path)
+                .or_else(|| legacy_protected_http_operation(req_path))
+            {
+                let decision = http_access_context.decision(op);
+                if !decision.allowed {
+                    use tokio::io::AsyncWriteExt;
+                    let response = http_access_forbidden_response(&http_access_context, decision);
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    finalize_http_stream(&mut stream).await;
+                    return;
+                }
+            }
+            if let Some((op, kind)) = peer_filesystem_query_request(req_method, req_path) {
+                let path = query_param(request_line, "path").unwrap_or_default();
+                if let Err(message) = authorize_http_filesystem_access(
+                    &http_access_context,
+                    peer_connection_identity.as_ref(),
+                    op,
+                    kind,
+                    &path,
+                    &bus,
+                ) {
+                    use tokio::io::AsyncWriteExt;
+                    let response = json_error("403 Forbidden", message);
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    finalize_http_stream(&mut stream).await;
+                    return;
+                }
+            }
+            let verified = hosted_verified_for_handler
+                .as_ref()
+                .expect("hosted authority refresh keeps a verified lease");
+            let preset = crate::access::hosted_control::hosted_preset_for_principal(
+                &verified.iam_state,
+                &verified.principal,
+            );
+            if !matches!(
+                preset,
+                Ok(preset)
+                    if crate::access::hosted_control::hosted_http_route_allowed(
+                        preset, req_method, req_path,
+                    )
+            ) {
+                use tokio::io::AsyncWriteExt;
+                let response = json_error(
+                    "403 Forbidden",
+                    "route is outside the current hosted lease HTTP projection",
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
+        }
         // The transfer rows' `{id}` capture (both delete shapes capture
         // exactly the id — the literal segments don't capture).
         let transfer_job_id = || {
@@ -799,6 +898,7 @@ pub(crate) async fn serve_http_request(
                     bus,
                     route.cors,
                     fleet_cors_origin.as_deref(),
+                    hosted_http_authority,
                 )
                 .await;
             }

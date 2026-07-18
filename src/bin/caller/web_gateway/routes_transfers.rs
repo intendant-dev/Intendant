@@ -948,11 +948,12 @@ pub(crate) async fn handle_transfer_upload_chunk(
     discard: Vec<u8>,
     job_id: String,
     project_root: Option<std::path::PathBuf>,
-    http_access_context: HttpAccessContext,
+    mut http_access_context: HttpAccessContext,
     peer_connection_identity: Option<PeerConnectionIdentity>,
     bus: EventBus,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
+    hosted_authority: Option<HostedHttpAuthority>,
 ) {
     use tokio::io::AsyncWriteExt;
     let scope = http_transfer_scope(project_root.as_deref());
@@ -977,7 +978,7 @@ pub(crate) async fn handle_transfer_upload_chunk(
         return;
     }
     let mut params = serde_json::Map::new();
-    params.insert("id".to_string(), serde_json::Value::String(job_id));
+    params.insert("id".to_string(), serde_json::Value::String(job_id.clone()));
     for key in ["offset", "resume_token"] {
         if let Some(value) = query_param(request_line, key) {
             params.insert(key.to_string(), serde_json::Value::String(value));
@@ -990,19 +991,79 @@ pub(crate) async fn handle_transfer_upload_chunk(
     {
         let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
     }
-    let response = match stream_body_to_tempfile(
-        header_text,
-        &discard,
-        &mut stream,
-        TRANSFER_HTTP_CHUNK_MAX_BYTES,
-    )
-    .await
+    let body = if let Some(authority) = hosted_authority
+        .as_ref()
+        .filter(|authority| authority.has_custom_domain_guard())
     {
+        stream_body_to_tempfile_with_guard(
+            header_text,
+            &discard,
+            &mut stream,
+            TRANSFER_HTTP_CHUNK_MAX_BYTES,
+            || authority.ensure_custom_domain_live(),
+        )
+        .await
+    } else {
+        stream_body_to_tempfile(
+            header_text,
+            &discard,
+            &mut stream,
+            TRANSFER_HTTP_CHUNK_MAX_BYTES,
+        )
+        .await
+    };
+    let response = match body {
         Err(e) => {
-            let status = if e.contains("too large") { 413 } else { 400 };
+            let status = if e.contains("too large") {
+                413
+            } else if e.contains("custom-domain control became unavailable") {
+                403
+            } else {
+                400
+            };
             transfer_error_api_response(status, e)
         }
-        Ok(body) => transfer_upload_chunk_api_response(scope, &params, body).await,
+        Ok(body) => {
+            if let Some(authority) = hosted_authority {
+                match authority.revalidate().await {
+                    Ok(refreshed) => {
+                        http_access_context = refreshed.access_context();
+                    }
+                    Err(error) => {
+                        let status = hosted_authority_error_status(&error);
+                        write_api_response(
+                            stream,
+                            transfer_error_api_response(status, error),
+                            cors,
+                            fleet_origin,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                if let Err(message) = authorize_http_transfer_access(
+                    &http_access_context,
+                    peer_connection_identity.as_ref(),
+                    crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                    TransferAccessTarget::Job {
+                        store: &scope,
+                        handle: &job_id,
+                        access: TransferJobAccess::WriteDestination,
+                    },
+                    &bus,
+                ) {
+                    write_api_response(
+                        stream,
+                        transfer_error_api_response(403, message),
+                        cors,
+                        fleet_origin,
+                    )
+                    .await;
+                    return;
+                }
+            }
+            transfer_upload_chunk_api_response(scope, &params, body).await
+        }
     };
     write_api_response(stream, response, cors, fleet_origin).await;
 }
