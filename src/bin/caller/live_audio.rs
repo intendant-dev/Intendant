@@ -2055,23 +2055,10 @@ async fn whisper_inbound_loop<T>(
 // dispatch path's approval registry (popped directly by the MCP
 // approve/deny tools) against the event bus's `ControlCommand` approval
 // verbs (how the web dashboard, tunnel, and control socket resolve), so it
-// works uniformly across daemon shapes. Ids come from a dedicated high
-// range so they can never collide with per-session turn-keyed approvals or
-// the ask range, and the session supervisor's approval routing consults
+// works uniformly across daemon shapes. Ids come from the process-wide
+// approval allocator, and the session supervisor's approval routing consults
 // [`spawn_consent_pending`] so a gate id is not misreported as an unknown
 // approval.
-
-/// Base of the live-audio consent id range. Per-session loops key approvals
-/// by small turn counters and `ask_user` draws from `1 << 40`; this range is
-/// disjoint from both while staying below JS's `Number.MAX_SAFE_INTEGER`.
-const SPAWN_CONSENT_ID_BASE: u64 = 1 << 41;
-
-static SPAWN_CONSENT_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(SPAWN_CONSENT_ID_BASE);
-
-fn next_spawn_consent_id() -> u64 {
-    SPAWN_CONSENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
 
 /// Default blocking wait for the consent prompt (same as `ask_user`).
 pub(crate) const SPAWN_CONSENT_WAIT: Duration = Duration::from_secs(300);
@@ -2220,7 +2207,7 @@ pub(crate) async fn request_spawn_consent(
 ) -> Result<SpawnConsent, String> {
     use crate::event::{AppEvent, ApprovalResponse, ControlMsg};
 
-    let id = next_spawn_consent_id();
+    let id = crate::event::next_approval_id();
 
     // Native JSON mode: the stdin loop owns the response channel. Arm the
     // slot before announcing so an instant response cannot miss it.
@@ -2329,8 +2316,8 @@ pub(crate) async fn request_spawn_consent(
                         );
                     }
                     Ok(Ok(AppEvent::ControlCommand(msg))) => match msg {
-                        // Ids from the dedicated consent range are globally
-                        // unique — match on id alone (same as `ask_user`).
+                        // Approval ids are process-wide — match on id alone
+                        // (same as `ask_user`).
                         ControlMsg::Approve { id: verb_id, .. }
                         | ControlMsg::ApproveAll { id: verb_id, .. }
                             if verb_id == id =>
@@ -4212,8 +4199,8 @@ mod tests {
     }
 
     /// Wait for the gate's ApprovalRequired and return its id, asserting the
-    /// prompt rides the approval rail with the live-audio category and an id
-    /// from the dedicated consent range.
+    /// prompt rides the approval rail with the live-audio category and a
+    /// JavaScript-safe id from the process-wide allocator.
     async fn wait_for_consent_prompt(rx: &mut tokio::sync::broadcast::Receiver<AppEvent>) -> u64 {
         loop {
             match tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -4228,10 +4215,7 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(category, crate::autonomy::ActionCategory::LiveAudioSpawn);
-                    assert!(
-                        id >= SPAWN_CONSENT_ID_BASE,
-                        "consent ids come from the dedicated range: {id}"
-                    );
+                    assert!(id <= (1_u64 << 53) - 1, "consent id is not wire-safe: {id}");
                     assert!(
                         command_preview.contains("spawn_live_audio"),
                         "{command_preview}"
