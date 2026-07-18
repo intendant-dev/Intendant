@@ -422,27 +422,28 @@ fn extract_denied_path(text: &str) -> Option<PathBuf> {
                 return Some(path.to_path_buf());
             }
         }
-        // Windows drive-letter paths survive the ':' split as
-        // "C" + "\path…" — rejoin heuristically, preferring the
-        // single-quoted form PowerShell emits ("Access to the path
-        // 'C:\x' is denied").
+        // Windows drive-letter paths: scan for `X:\` occurrences
+        // directly (the ':' split above severs the drive prefix). The
+        // candidate runs to the first quote — PowerShell's "Access to the
+        // path 'C:\x' is denied." — or `: ` separator, or end of line.
         #[cfg(windows)]
         {
-            if let Some(idx) = line.find(":\\") {
-                if idx >= 1 {
-                    let start = idx - 1;
-                    let tail = &line[start..];
+            let bytes = line.as_bytes();
+            let mut i = 0usize;
+            while i + 2 < bytes.len() {
+                if bytes[i].is_ascii_alphabetic() && bytes[i + 1] == b':' && bytes[i + 2] == b'\\' {
+                    let tail = &line[i..];
                     let end = tail
-                        .find('\'')
+                        .find(['\'', '"'])
                         .or_else(|| tail.find(": "))
-                        .or_else(|| tail.find(':').filter(|i| *i > 2))
                         .unwrap_or(tail.len());
-                    let candidate = tail[..end].trim().trim_matches(['\'', '"']);
+                    let candidate = tail[..end].trim().trim_end_matches(['.', ',']);
                     let path = Path::new(candidate);
                     if path.is_absolute() {
                         return Some(path.to_path_buf());
                     }
                 }
+                i += 1;
             }
         }
     }
