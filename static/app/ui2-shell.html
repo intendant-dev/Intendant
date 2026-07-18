@@ -79,31 +79,9 @@
     <span class="ui2-ovs-session" id="ui2-session-id"></span>
   </div>
   <div class="ui2-ovs-spacer"></div>
-  <!-- Activity layout toggle: Focus (one centered timeline) vs Grid (the
-       session-window grid + concurrent stream). CSS shows it only while
-       the Activity tab is active (html[data-ui2-tab="activity"]);
-       ui2-activity.js owns the state (html[data-ui2-layout] + localStorage). -->
-  <div class="ui2-layout-toggle" id="ui2-layout-toggle" role="group" aria-label="Activity layout">
-    <button type="button" id="ui2-layout-focus-btn" data-layout="focus"
-            title="Focus — the targeted session's timeline (session windows hidden)">Focus</button>
-    <button type="button" id="ui2-layout-grid-btn" data-layout="grid"
-            title="Grid — session windows with the concurrent stream below">Grid</button>
-  </div>
-  <!-- Bulk minimize for finished sub-agent windows (grid hygiene). Hidden
-       (JS `hidden` attr) until at least one done sub-agent window is still
-       expanded; the count chip says how many one click will collapse.
-       ui2-activity.js owns the count + click (minimizeDoneSubagentWindows
-       in 41-session-window-actions.js does the collapsing). -->
-  <button type="button" class="ui2-minimize-done" id="ui2-minimize-done-btn" hidden
-          title="Minimize every finished sub-agent window">
-    Minimize done<span class="ui2-minimize-done-count" id="ui2-minimize-done-count">0</span>
-  </button>
-  <!-- Session switcher (the decision's missing half): picks the Focus
-       session / composer target. Populated from the live session set by
-       ui2-chrome.js; drives the same focus/target mechanism as clicking a
-       session window. Activity-only, like the layout toggle. -->
-  <select class="ui2-session-switcher" id="ui2-session-switcher"
-          aria-label="Focused session" title="Focused session — Focus shows this session's timeline; the composer targets it"></select>
+  <!-- Activity layout toggle / minimize-done / session switcher moved into
+       the Activity view header (20-shell.html #activity-subtabs) in the v3
+       redesign — same ids, same wiring, contextual to the Timeline view. -->
   <!-- Backend truth absorbed from the v1 status bar (hidden under v2):
        provider·model, turn counter, live token/cost readout. Values are
        mirrors of the pinned #sb-*/#tk-* elements. -->

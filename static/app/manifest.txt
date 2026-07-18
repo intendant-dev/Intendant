@@ -25,6 +25,7 @@ ui2-station.css
 ui2-vault.css
 ui2-sessions.css
 ui2-activity.css
+ui2-activity-panes.css
 ui2-agenda.css
 ui2-memory.css
 ui2-grid.css
