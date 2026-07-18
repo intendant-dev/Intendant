@@ -471,7 +471,7 @@ impl SessionSupervisor {
                 attachments.len()
             ));
         }
-        let attachments_for_agent = UserAttachments::from_items(resolved_attachments);
+        let attachments_for_agent = resolved_attachments;
 
         let source = backend
             .as_ref()
@@ -1027,7 +1027,7 @@ impl SessionSupervisor {
             log_dir,
             external_backend.clone(),
             direct.unwrap_or(true),
-            UserAttachments::from_items(resolved_attachments),
+            resolved_attachments,
             None,
             Some(resume_token.clone()),
             (external_backend.is_some() && !force_new).then_some(resume_token),

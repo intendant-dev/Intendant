@@ -63,14 +63,36 @@ pub(crate) struct LoopStats {
     pub(crate) announced_native_session_id: Option<String>,
 }
 
+// `pub` (not `pub(crate)`): this rides the `pub` `AppEvent` enum
+// (`ExternalFollowUpRequested`), and in a bin crate the wider visibility
+// only exists to keep the field/type visibilities consistent — exactly
+// like `external_agent::AgentAttachment`, which the field carried before.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct UserAttachments {
-    pub(crate) items: Vec<external_agent::AgentAttachment>,
+pub struct UserAttachments {
+    pub items: Vec<external_agent::AgentAttachment>,
+    /// Renderable upload-store refs for the SAME user message, minted at
+    /// attachment-resolution time (`resolve_attachments_with_scopes`) for
+    /// the upload-backed entries. These ride the canonical
+    /// `UserMessageLog` row (live wire + session-log persistence) so
+    /// replayed transcripts can show the user's attachments; frame grabs
+    /// have no upload blob and mint no ref. Never consumed by backends —
+    /// display metadata only.
+    pub refs: Vec<crate::types::SessionNoteAttachment>,
 }
 
 impl UserAttachments {
-    pub(crate) fn from_items(items: Vec<external_agent::AgentAttachment>) -> Self {
-        Self { items }
+    pub fn from_items(items: Vec<external_agent::AgentAttachment>) -> Self {
+        Self {
+            items,
+            refs: Vec::new(),
+        }
+    }
+
+    pub fn from_resolved(
+        items: Vec<external_agent::AgentAttachment>,
+        refs: Vec<crate::types::SessionNoteAttachment>,
+    ) -> Self {
+        Self { items, refs }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
