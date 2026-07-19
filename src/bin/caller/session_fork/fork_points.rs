@@ -277,12 +277,15 @@ pub(crate) fn native_fork_points(
 
 /// Resolve the fork anchor for an edited Claude Code user message by its
 /// exact prose. Claude Code has no in-place rewind on the supervision
-/// wire, so an edit is serviced as an anchor-fork branch — but the live
-/// lane's `user_turn_index` counts THIS supervision run (claude turn
-/// state is not seeded from history), so the turn number cannot address
-/// the transcript chain. The edited row's original text can: match it
-/// against the active chain's user turns and anchor at the unique match's
-/// parent. Ambiguity or absence is a refusal, never a guess — the
+/// wire, so an edit is serviced as an anchor-fork branch — and the
+/// edited row's original text is the address: match it against the
+/// active chain's user turns and anchor at the unique match's parent.
+/// Text stays the anchor key even though plain resumes now seed the
+/// live lane's `user_turn_index` from the transcript
+/// (`claude_user_turn_state_from_history`): the seed is best-effort
+/// (`--fork-session` resumes start on the placeholder id and re-count
+/// this supervision run), while prose matching addresses the chain
+/// regardless. Ambiguity or absence is a refusal, never a guess — the
 /// transcript's inline fork affordance covers those cases exactly.
 pub(crate) fn claude_edit_branch_anchor(
     transcript_path: &Path,

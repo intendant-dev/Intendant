@@ -116,6 +116,8 @@ pub(crate) use intendant_display::x11_input;
 // God-file split (see CLAUDE.md "File size budget"): regions extracted from
 // this file live in the modules below; the glob re-exports keep existing
 // crate:: and unqualified references resolving unchanged.
+mod claude_history;
+pub(crate) use claude_history::*;
 mod codex_history;
 pub(crate) use codex_history::*;
 mod external_output;
