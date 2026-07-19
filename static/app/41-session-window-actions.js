@@ -3839,12 +3839,28 @@ function updateQuestionProgress() {
 // authentication is ambient (mTLS client cert → IAM principal), so agent
 // markup executing with dashboard-origin authority could drive the daemon
 // API as the operator. Pinned by question_preview_iframe_sandbox_is_pinned.
-function appendQuestionPreviews(block, q) {
+function appendQuestionPreviews(block, q, qIndex) {
   const previews = Array.isArray(q.previews) ? q.previews : [];
   if (!previews.length) return;
   const strip = document.createElement('div');
   strip.className = 'question-previews';
+  strip.dataset.mode = 'grid';
   if (previews.length > 1) strip.classList.add('multi');
+
+  // Focus mode chrome: tabs flip between candidates while one card owns
+  // the whole strip; Grid returns to side-by-side.
+  const tabs = document.createElement('div');
+  tabs.className = 'question-preview-tabs';
+  tabs.hidden = true;
+  strip.appendChild(tabs);
+  const gridBtn = document.createElement('button');
+  gridBtn.type = 'button';
+  gridBtn.className = 'question-preview-tab question-preview-tab-grid';
+  gridBtn.textContent = 'Grid';
+  gridBtn.title = 'Back to the side-by-side grid';
+  gridBtn.addEventListener('click', () => focusQuestionPreview(strip, null));
+  tabs.appendChild(gridBtn);
+
   const missingChip = (p, why) => {
     const chip = document.createElement('span');
     chip.className = 'question-preview-missing';
@@ -3852,34 +3868,67 @@ function appendQuestionPreviews(block, q) {
     chip.title = why || 'preview unavailable (blob deleted from the upload store)';
     return chip;
   };
-  previews.forEach((p) => {
+  previews.forEach((p, pIndex) => {
     const card = document.createElement('figure');
     card.className = 'question-preview-card';
+    card.dataset.p = String(pIndex);
+
+    const tab = document.createElement('button');
+    tab.type = 'button';
+    tab.className = 'question-preview-tab';
+    tab.dataset.p = String(pIndex);
+    tab.textContent = p.label || `#${pIndex + 1}`;
+    tab.addEventListener('click', () => focusQuestionPreview(strip, pIndex));
+    tabs.insertBefore(tab, gridBtn);
+
     const caption = document.createElement('figcaption');
     caption.className = 'question-preview-label';
     const captionText = document.createElement('span');
     captionText.textContent = p.label || '';
     caption.appendChild(captionText);
+    const capActions = document.createElement('span');
+    capActions.className = 'question-preview-cap-actions';
+    // When an option shares this card's label, offer the pick right where
+    // the user is looking (same selection path as the option buttons).
+    const optIndex = (q.options || []).findIndex((o) => o.label === p.label);
+    if (optIndex >= 0) {
+      const choose = document.createElement('button');
+      choose.type = 'button';
+      choose.className = 'question-preview-choose';
+      choose.textContent = `Choose ${p.label}`;
+      choose.addEventListener('click', () => {
+        questionOptionClicked(qIndex, optIndex);
+        const btns = document.querySelectorAll(
+          `#question-content .question-block[data-q="${qIndex}"] .question-option`
+        );
+        choose.classList.toggle('chosen', !!btns[optIndex]?.classList.contains('selected'));
+      });
+      capActions.appendChild(choose);
+    }
+    const focusBtn = document.createElement('button');
+    focusBtn.type = 'button';
+    focusBtn.className = 'question-preview-focus';
+    focusBtn.textContent = '⛶';
+    focusBtn.title = 'Focus this preview (tabs switch candidates)';
+    focusBtn.addEventListener('click', () => {
+      const focused = strip.dataset.mode === 'focus' && card.classList.contains('focused');
+      focusQuestionPreview(strip, focused ? null : pIndex);
+    });
+    capActions.appendChild(focusBtn);
+    caption.appendChild(capActions);
     card.appendChild(caption);
+
     if (p.kind === 'html' && p.url) {
       const frame = document.createElement('iframe');
       frame.className = 'question-preview-frame';
       frame.setAttribute('sandbox', 'allow-scripts');
       frame.setAttribute('referrerpolicy', 'no-referrer');
       frame.title = p.label || 'preview';
-      const grow = document.createElement('button');
-      grow.type = 'button';
-      grow.className = 'question-preview-expand';
-      grow.textContent = 'Expand';
-      grow.addEventListener('click', () => {
-        grow.textContent = card.classList.toggle('expanded') ? 'Collapse' : 'Expand';
-      });
-      caption.appendChild(grow);
       card.appendChild(frame);
       fetch(p.url)
         .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
         .then((html) => { frame.srcdoc = html; })
-        .catch(() => { grow.remove(); frame.replaceWith(missingChip(p)); });
+        .catch(() => { frame.replaceWith(missingChip(p)); });
     } else if (p.kind === 'image' && p.url) {
       const img = document.createElement('img');
       img.className = 'question-preview-image';
@@ -3908,6 +3957,51 @@ function appendQuestionPreviews(block, q) {
   block.appendChild(strip);
 }
 
+// Focus one preview card (by index) or return to the grid (null). Focus
+// mode gives the card the whole strip at near-pane height; the tab row
+// flips between candidates without a round-trip through the grid.
+function focusQuestionPreview(strip, index) {
+  const focus = index !== null && index !== undefined;
+  strip.dataset.mode = focus ? 'focus' : 'grid';
+  const tabs = strip.querySelector('.question-preview-tabs');
+  if (tabs) tabs.hidden = !focus;
+  strip.querySelectorAll('.question-preview-tab').forEach((t) => {
+    t.classList.toggle('active', focus && t.dataset.p === String(index));
+  });
+  strip.querySelectorAll('.question-preview-card').forEach((c) => {
+    c.classList.toggle('focused', focus && c.dataset.p === String(index));
+  });
+}
+
+// Tuck the pending question away without answering: the panel hides, a
+// floating chip restores it, and the asking agent keeps blocking — the
+// question stays pending on the daemon either way.
+function setQuestionMinimized(min) {
+  const panel = document.getElementById('question-panel');
+  if (!panel) return;
+  panel.classList.toggle('question-minimized', min);
+  let chip = document.getElementById('question-restore-chip');
+  if (min) {
+    if (!chip) {
+      chip = document.createElement('button');
+      chip.id = 'question-restore-chip';
+      chip.type = 'button';
+      chip.title = 'Reopen the pending agent question';
+      chip.addEventListener('click', () => setQuestionMinimized(false));
+      document.body.appendChild(chip);
+    }
+    const first = pendingQuestion?.questions?.[0];
+    const extra =
+      (pendingQuestion?.questions?.length || 1) > 1
+        ? ` +${pendingQuestion.questions.length - 1}`
+        : '';
+    chip.textContent = `❓ ${first?.header || 'Agent question'}${extra} — pending`;
+    chip.hidden = false;
+  } else if (chip) {
+    chip.hidden = true;
+  }
+}
+
 function showUserQuestion(id, questions, sessionId) {
   if (processingLogReplay) return;
   const list = Array.isArray(questions) ? questions : [];
@@ -3931,10 +4025,19 @@ function showUserQuestion(id, questions, sessionId) {
   content.innerHTML = '';
   const multi = list.length > 1;
   const title = document.createElement('div');
-  title.className = 'approval-title';
-  title.textContent = multi
+  title.className = 'approval-title question-title-row';
+  const titleText = document.createElement('span');
+  titleText.textContent = multi
     ? `The agent has ${list.length} questions`
     : 'The agent has a question';
+  title.appendChild(titleText);
+  const tuck = document.createElement('button');
+  tuck.type = 'button';
+  tuck.className = 'question-tuck';
+  tuck.textContent = '–';
+  tuck.title = 'Tuck away — the question stays pending; a chip brings it back';
+  tuck.addEventListener('click', () => setQuestionMinimized(true));
+  title.appendChild(tuck);
   content.appendChild(title);
 
   // Pinned index (2+ questions): one chip per header, kept above the
@@ -3978,7 +4081,7 @@ function showUserQuestion(id, questions, sessionId) {
     text.textContent = q.question;
     block.appendChild(text);
 
-    appendQuestionPreviews(block, q);
+    appendQuestionPreviews(block, q, qIndex);
 
     const options = document.createElement('div');
     options.className = 'question-options';
@@ -4043,7 +4146,17 @@ function showUserQuestion(id, questions, sessionId) {
   stationCurrentHumanQuestion = `${list[0].question}${extra}`;
   stationScheduleUpdate();
   revealActivityLogPanel();
-  document.getElementById('question-panel').classList.add('visible');
+  const panel = document.getElementById('question-panel');
+  // Preview-bearing questions escape the reading-column measure — the
+  // comparison is the content, so the card owns the pane width.
+  panel.classList.toggle(
+    'has-previews',
+    list.some((entry) => Array.isArray(entry.previews) && entry.previews.length)
+  );
+  // A new (or re-shown) question always surfaces, even if an earlier one
+  // was tucked away.
+  setQuestionMinimized(false);
+  panel.classList.add('visible');
   setApprovalIndicator(true);
 }
 
@@ -4052,6 +4165,9 @@ function clearPendingQuestion() {
   stationCurrentHumanQuestion = '';
   stationScheduleUpdate();
   setApprovalIndicator(false);
+  // Resolved: drop the tucked-away chip and the wide-panel state.
+  setQuestionMinimized(false);
+  document.getElementById('question-panel')?.classList.remove('has-previews');
 }
 
 function showPanel(id) { hideAllPanels(); document.getElementById(id).classList.add('visible'); }
