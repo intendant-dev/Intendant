@@ -275,6 +275,128 @@ pub(crate) fn native_fork_points(
     Ok(catalog)
 }
 
+/// Resolve the fork anchor for an edited Claude Code user message by its
+/// exact prose. Claude Code has no in-place rewind on the supervision
+/// wire, so an edit is serviced as an anchor-fork branch — but the live
+/// lane's `user_turn_index` counts THIS supervision run (claude turn
+/// state is not seeded from history), so the turn number cannot address
+/// the transcript chain. The edited row's original text can: match it
+/// against the active chain's user turns and anchor at the unique match's
+/// parent. Ambiguity or absence is a refusal, never a guess — the
+/// transcript's inline fork affordance covers those cases exactly.
+pub(crate) fn claude_edit_branch_anchor(
+    transcript_path: &Path,
+    original_text: &str,
+) -> Result<ForkAnchorSpec, String> {
+    let wanted = original_text.trim();
+    if wanted.is_empty() {
+        return Err("the edited row carried no original text to locate".to_string());
+    }
+    let tree = shared_claude_tree_scan(transcript_path)
+        .map_err(|err| format!("transcript scan failed: {err}"))?;
+    let Some(leaf) = tree.active_leaf.as_deref() else {
+        return Err("the transcript has no active message chain".to_string());
+    };
+    let on_chain: std::collections::HashSet<&str> = tree
+        .ancestor_chain(leaf)
+        .iter()
+        .map(|node| node.uuid.as_str())
+        .collect();
+
+    let file = std::fs::File::open(transcript_path)
+        .map_err(|err| format!("transcript open failed: {err}"))?;
+    let mut matches: Vec<(String, Option<String>)> = Vec::new();
+    for line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
+        let Ok(line) = line else { continue };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if obj.get("type").and_then(serde_json::Value::as_str) != Some("user")
+            || obj.get("isMeta").and_then(serde_json::Value::as_bool) == Some(true)
+            || obj
+                .get("isCompactSummary")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            || obj.get("isSidechain").and_then(serde_json::Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let Some(uuid) = obj.get("uuid").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !on_chain.contains(uuid) {
+            continue;
+        }
+        let content = obj.get("message").and_then(|m| m.get("content"));
+        let mut prose = String::new();
+        match content {
+            Some(serde_json::Value::String(text)) => prose.push_str(text),
+            Some(serde_json::Value::Array(blocks)) => {
+                for block in blocks {
+                    if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+                        if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
+                            if !prose.is_empty() {
+                                prose.push('\n');
+                            }
+                            prose.push_str(text);
+                        }
+                    }
+                }
+            }
+            _ => continue,
+        }
+        // The rendered row the user edited had the supervision addendum
+        // trimmed and injected harness lines filtered — apply the same
+        // transforms so prose comparison is apples to apples.
+        let prose = prose
+            .split(crate::external_agent::claude_code::CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER)
+            .next()
+            .unwrap_or("")
+            .trim();
+        if prose.is_empty()
+            || crate::external_agent::transcript_text::is_injected_external_user_text(prose)
+        {
+            continue;
+        }
+        if prose == wanted {
+            matches.push((
+                uuid.to_string(),
+                obj.get("parentUuid")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            ));
+        }
+    }
+
+    match matches.as_slice() {
+        [] => Err(
+            "this message was not found on the session's active chain (it may sit on an \
+             abandoned branch or behind a compaction) — use the transcript row's fork button"
+                .to_string(),
+        ),
+        [(_, parent)] => match parent {
+            Some(parent) => Ok(ForkAnchorSpec {
+                kind: "message".to_string(),
+                turn: None,
+                item_id: None,
+                position: None,
+                seq: None,
+                message_uuid: Some(parent.clone()),
+            }),
+            None => Err("cannot branch from before the session's first message".to_string()),
+        },
+        many => Err(format!(
+            "this prompt appears {} times in the session — use the transcript row's fork \
+             button to pick the exact occurrence",
+            many.len()
+        )),
+    }
+}
+
 /// Fork points for a Claude Code session, derived from its transcript
 /// tree: the active head, inactive sibling branch tips, and user-turn
 /// boundaries on the active chain. Every anchor is a chain-slice target
@@ -717,5 +839,79 @@ mod tests {
             .find(|point| point.id == "msg:b1")
             .expect("post-compact turn boundary listed");
         assert!(!post.pre_compaction);
+    }
+
+    fn edit_fixture_line(uuid: &str, parent: Option<&str>, kind: &str, text: &str) -> String {
+        serde_json::json!({
+            "uuid": uuid,
+            "parentUuid": parent,
+            "type": kind,
+            "timestamp": "2026-07-19T00:00:00.000Z",
+            "message": {"role": kind, "content": [{"type": "text", "text": text}]},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn claude_edit_branch_anchor_unique_match_anchors_at_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.jsonl");
+        // u1 → a1 → u2a (abandoned, same text as u2b) → and u2b → a2 (active).
+        let lines = [
+            edit_fixture_line("u1", None, "user", "first prompt"),
+            edit_fixture_line("a1", Some("u1"), "assistant", "reply one"),
+            edit_fixture_line("u2a", Some("a1"), "user", "do the thing"),
+            edit_fixture_line("u2b", Some("a1"), "user", "do the thing"),
+            edit_fixture_line("a2", Some("u2b"), "assistant", "done"),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        // The abandoned duplicate is off-chain and must not create
+        // ambiguity: the unique on-chain match anchors at its parent.
+        let anchor = claude_edit_branch_anchor(&path, "do the thing").expect("anchor");
+        assert_eq!(anchor.kind, "message");
+        assert_eq!(anchor.message_uuid.as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn claude_edit_branch_anchor_trims_supervision_addendum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.jsonl");
+        let addendum_suffixed = format!(
+            "run the tests\n\n{}\nharness plumbing",
+            crate::external_agent::claude_code::CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER
+        );
+        let lines = [
+            edit_fixture_line("u1", None, "user", "first prompt"),
+            edit_fixture_line("a1", Some("u1"), "assistant", "ok"),
+            edit_fixture_line("u2", Some("a1"), "user", &addendum_suffixed),
+            edit_fixture_line("a2", Some("u2"), "assistant", "ran"),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let anchor = claude_edit_branch_anchor(&path, "run the tests").expect("anchor");
+        assert_eq!(anchor.message_uuid.as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn claude_edit_branch_anchor_refuses_ambiguity_absence_and_first_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.jsonl");
+        let lines = [
+            edit_fixture_line("u1", None, "user", "first prompt"),
+            edit_fixture_line("a1", Some("u1"), "assistant", "ok"),
+            edit_fixture_line("u2", Some("a1"), "user", "continue"),
+            edit_fixture_line("a2", Some("u2"), "assistant", "more"),
+            edit_fixture_line("u3", Some("a2"), "user", "continue"),
+            edit_fixture_line("a3", Some("u3"), "assistant", "done"),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let ambiguous = claude_edit_branch_anchor(&path, "continue").expect_err("ambiguous");
+        assert!(ambiguous.contains("2 times"), "{ambiguous}");
+        let missing = claude_edit_branch_anchor(&path, "never said this").expect_err("missing");
+        assert!(missing.contains("not found"), "{missing}");
+        let first = claude_edit_branch_anchor(&path, "first prompt").expect_err("first turn");
+        assert!(first.contains("first message"), "{first}");
     }
 }

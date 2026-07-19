@@ -2785,9 +2785,15 @@ function appendEditUserMessageButton(entry, c) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = 'log-edit-message';
+  const meta = typeof sessionConfigMetadata === 'function'
+    ? sessionConfigMetadata(String(c?.session_id || ''))
+    : null;
+  const editSource = typeof sessionConfigSource === 'function' ? sessionConfigSource(meta) : '';
   btn.title = c.superseded
     ? 'Create a managed branch from this historical message'
-    : 'Edit this user message and rerun from here';
+    : editSource === 'claude-code'
+      ? 'Edit this message and branch: the edited prompt reruns in a new session (Claude Code cannot rewind in place)'
+      : 'Edit this user message and rerun from here';
   btn.innerHTML = '&#9998;';
   btn.dataset.sessionId = c.session_id || '';
   btn.dataset.userTurnIndex = String(c.user_turn_index);
