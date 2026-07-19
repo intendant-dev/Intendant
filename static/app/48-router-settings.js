@@ -484,6 +484,14 @@ const contextAnalysisBySnapshot = new WeakMap();
 function switchActivitySubtab(name) {
   if (activeActivitySubtab === name) return;
   activeActivitySubtab = name;
+  // Stamped state for CSS: ui2-activity.css gates the Timeline tools and
+  // the Arrange menu on this attribute instead of
+  // `:has(.subtab-btn[data-activity-tab="log"].active)` — the subtabs bar
+  // sits beside the per-second-ticking Activity panes, and `:has()`
+  // registrations there taxed every mutation's style-invalidation walk
+  // (derive from the stamp the switcher already owns, don't make the
+  // engine infer it). The HTML default is data-active-subtab="log".
+  document.getElementById('activity-subtabs')?.setAttribute('data-active-subtab', name);
   document.querySelectorAll('#activity-subtabs .subtab-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.activityTab === name);
   });

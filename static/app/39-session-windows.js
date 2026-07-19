@@ -682,6 +682,31 @@ function renderSessionWindowTier(win) {
 }
 
 function refreshSessionGoalTicker() {
+  // Pane gate: session windows live in the Activity tab, so with the tab
+  // parked (another tab active, or the page backgrounded) the per-second
+  // elapsed-time repaint wrote textContent into a display:none subtree —
+  // and every write still runs style invalidation (the `:has()`
+  // before-mutation walk). While parked, keep only the schedule math (is
+  // any goal still active, so the interval arms/disarms exactly as
+  // before) and defer ONE full repaint; flushPaneRenders runs it
+  // synchronously on pane re-entry, so the pane never shows stale text.
+  if (!paneIsVisible('activity')) {
+    let hasActiveGoal = false;
+    for (const [sid] of sessionWindows) {
+      const goal = (sessionMetadataById.get(sid) || {}).goal || null;
+      // Mirrors renderSessionWindowGoal's return value without its DOM
+      // writes: active means "has an objective and status active".
+      if (goal?.objective && normalizeGoalStatus(goal.status) === 'active') hasActiveGoal = true;
+    }
+    renderOrDefer('activity', 'session-goal-tick', refreshSessionGoalTicker);
+    if (hasActiveGoal && !sessionGoalTicker) {
+      sessionGoalTicker = setInterval(refreshSessionGoalTicker, 1000);
+    } else if (!hasActiveGoal && sessionGoalTicker) {
+      clearInterval(sessionGoalTicker);
+      sessionGoalTicker = null;
+    }
+    return;
+  }
   let hasActiveGoal = false;
   for (const [sid, win] of sessionWindows) {
     const goal = (sessionMetadataById.get(sid) || {}).goal || null;
@@ -1785,6 +1810,12 @@ function startVitalsPanelTicker() {
       stopVitalsPanelTicker();
       return;
     }
+    // Page Visibility gate only (not the pane's): the panel is a
+    // body-level overlay, so it can outlive a keyboard/hash tab switch and
+    // stay legitimately on screen — but a backgrounded page has no reader,
+    // and each 1 Hz text write still ran style invalidation. The
+    // visibilitychange hook below repaints immediately on return.
+    if (document.hidden) return;
     try { host._vxTick(); } catch (_) { /* next tick retries */ }
   }, 1000);
 }
@@ -1794,6 +1825,23 @@ function stopVitalsPanelTicker() {
   clearInterval(vitalsPanelTicker);
   vitalsPanelTicker = null;
 }
+
+// Catch-up for the two body-level overlays whose tickers park on
+// document.hidden (the vitals explainer above, the background-task output
+// viewer below): on return to a visible page, repaint immediately instead
+// of waiting out the current interval — countdown text and output tails
+// must never show parked-era values to a reader who just came back.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  const vx = document.getElementById('vitals-explainer');
+  if (vx && !vx.hidden && typeof vx._vxTick === 'function') {
+    try { vx._vxTick(); } catch (_) { /* the 1 Hz interval retries */ }
+  }
+  const bgov = document.getElementById('bg-output-viewer');
+  if (bgov && !bgov.hidden && typeof bgov._refresh === 'function') {
+    bgov._refresh();
+  }
+});
 
 // Write-guarded textContent: no-op when the rendered second hasn't
 // rolled over, so ticks never churn text nodes (or observers) idly.
@@ -2357,6 +2405,7 @@ function closeBgOutputViewer() {
   const host = document.getElementById('bg-output-viewer');
   if (!host) return;
   host.hidden = true;
+  host._refresh = null;
   if (host._refreshTimer) {
     clearInterval(host._refreshTimer);
     host._refreshTimer = null;
@@ -2391,6 +2440,12 @@ function openSessionBackgroundTaskOutput(sessionId, task) {
   host.hidden = false;
 
   const refresh = async () => {
+    // Backgrounded page: the 2 s tail poll exists only to paint this
+    // panel, so park the request and the writes together (the interval
+    // stays armed and no-ops). The visibilitychange catch-up near
+    // startVitalsPanelTicker repaints — and re-observes a finished task —
+    // immediately on return.
+    if (document.hidden) return;
     let body = null;
     try {
       const resp = await daemonApi.request(
@@ -2425,6 +2480,7 @@ function openSessionBackgroundTaskOutput(sessionId, task) {
     }
   };
   refresh();
+  host._refresh = refresh;
   host._refreshTimer = setInterval(refresh, 2000);
 }
 
@@ -2879,6 +2935,17 @@ function sessionVitalsNeedsTick(vitals) {
 }
 
 function refreshSessionVitalsTicker() {
+  // Pane gate: with the Activity tab parked (another tab active, or the
+  // page backgrounded) the countdown repaints wrote textContent into a
+  // display:none subtree every second, and each write still ran style
+  // invalidation (the `:has()` before-mutation walk). While parked, the
+  // tick keeps its non-UI duties — the arm/disarm schedule math and the
+  // cache-expiry alert, which matters MOST when the user is not watching
+  // (it posts the toast/Notification) — and skips only the DOM writes,
+  // deferring ONE full repaint that flushPaneRenders runs synchronously
+  // on pane re-entry. win.vitalsNeededTick deliberately stays untouched
+  // while parked so the trailing settle render still happens on re-entry.
+  const visible = paneIsVisible('activity');
   let ticking = false;
   for (const [sid, win] of sessionWindows) {
     const vitals = (sessionMetadataById.get(sid) || {}).vitals || null;
@@ -2888,16 +2955,20 @@ function refreshSessionVitalsTicker() {
     // to its cold glyph and a passed limit-reset drops its "↻~Xm" text —
     // instead of freezing mid-count.
     if (!needsTick && !win.vitalsNeededTick) continue;
-    win.vitalsNeededTick = needsTick;
-    renderSessionWindowVitals(win, vitals);
-    // The stalled degradation is purely time-derived — let the status
-    // pill follow the derived state (no-op unless the state flipped).
-    maybeRefreshSessionWindowActivityPill(sid, win, vitals);
     // Arm from the predicate, not the render result: the render reports
     // only cache-ttl models as ticking, which left percentless limit-reset
     // countdowns frozen because nothing kept the interval alive for them.
     if (needsTick) ticking = true;
     maybeAlertCacheExpiry(sid, win, vitals);
+    if (!visible) continue;
+    win.vitalsNeededTick = needsTick;
+    renderSessionWindowVitals(win, vitals);
+    // The stalled degradation is purely time-derived — let the status
+    // pill follow the derived state (no-op unless the state flipped).
+    maybeRefreshSessionWindowActivityPill(sid, win, vitals);
+  }
+  if (!visible) {
+    renderOrDefer('activity', 'session-vitals-tick', refreshSessionVitalsTicker);
   }
   if (ticking && !sessionVitalsTicker) {
     sessionVitalsTicker = setInterval(refreshSessionVitalsTicker, 1000);

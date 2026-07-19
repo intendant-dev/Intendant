@@ -1709,13 +1709,26 @@ function agentSigninCountdownText(deadlineMs) {
   const seconds = String(totalSec % 60).padStart(2, '0');
   return `code expires in ${minutes}:${seconds}`;
 }
+function agentSigninRenderCountdowns() {
+  for (const el of document.querySelectorAll('[data-signin-countdown]')) {
+    el.textContent = agentSigninCountdownText(Number(el.dataset.signinCountdown));
+  }
+}
 function agentSigninEnsureTicker() {
   const needsTick = agentSigninPhase('codex') === 'awaiting_user';
   if (needsTick && !agentSigninTickTimer) {
     agentSigninTickTimer = window.setInterval(() => {
-      for (const el of document.querySelectorAll('[data-signin-countdown]')) {
-        el.textContent = agentSigninCountdownText(Number(el.dataset.signinCountdown));
+      // Pane gate: the countdown lives in the Access pane
+      // (#agent-signin-section), so with that tab parked (or the page
+      // backgrounded) the per-second textContent write hit a display:none
+      // subtree — and still ran style invalidation. While parked, defer
+      // ONE repaint; flushPaneRenders runs it on pane re-entry, so the
+      // countdown is correct the instant the pane shows.
+      if (!paneIsVisible('access')) {
+        renderOrDefer('access', 'agent-signin-countdown', agentSigninRenderCountdowns);
+        return;
       }
+      agentSigninRenderCountdowns();
     }, 1000);
   } else if (!needsTick && agentSigninTickTimer) {
     window.clearInterval(agentSigninTickTimer);
