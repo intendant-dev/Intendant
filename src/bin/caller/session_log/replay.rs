@@ -562,12 +562,17 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|d| d.get("item_id"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let message_uuid = data
+                .and_then(|d| d.get("message_uuid"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             Some(AppEvent::AgentStarted {
                 session_id,
                 turn: turn.unwrap_or(0),
                 commands_preview,
                 item_id,
                 source,
+                message_uuid,
             })
         }
         "agent_output" => {
@@ -615,6 +620,10 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|d| d.get("item_id"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let message_uuid = data
+                .and_then(|d| d.get("message_uuid"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
             Some(AppEvent::AgentOutput {
                 session_id,
                 stdout: stdout.into(),
@@ -622,6 +631,7 @@ pub fn session_log_entry_to_app_event(
                 source,
                 output_id,
                 item_id,
+                message_uuid,
             })
         }
 
@@ -2114,6 +2124,7 @@ mod tests {
             Some("Codex"),
             Some("out-1"),
             Some("call-9"),
+            Some("uuid-result-1"),
         );
         drop(log);
 
@@ -2125,6 +2136,7 @@ mod tests {
                 source,
                 output_id,
                 item_id,
+                message_uuid,
                 ..
             } => {
                 assert_eq!(session_id.as_deref(), Some("child-thread"));
@@ -2132,6 +2144,7 @@ mod tests {
                 assert_eq!(source.as_deref(), Some("Codex"));
                 assert_eq!(output_id.as_deref(), Some("out-1"));
                 assert_eq!(item_id.as_deref(), Some("call-9"));
+                assert_eq!(message_uuid.as_deref(), Some("uuid-result-1"));
             }
             other => panic!("expected AgentOutput, got {:?}", other),
         }
@@ -2700,6 +2713,7 @@ mod tests {
             "exec: echo hi",
             Some("call-1"),
             Some("Codex"),
+            Some("uuid-call-1"),
         );
         drop(log);
 
@@ -2711,6 +2725,10 @@ mod tests {
         );
         assert_eq!(data.get("item_id").and_then(|v| v.as_str()), Some("call-1"));
         assert_eq!(data.get("source").and_then(|v| v.as_str()), Some("Codex"));
+        assert_eq!(
+            data.get("message_uuid").and_then(|v| v.as_str()),
+            Some("uuid-call-1")
+        );
 
         match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
             AppEvent::AgentStarted {
@@ -2719,12 +2737,14 @@ mod tests {
                 commands_preview,
                 item_id,
                 source,
+                message_uuid,
             } => {
                 assert_eq!(session_id.as_deref(), Some("session-1"));
                 assert_eq!(turn, 7);
                 assert_eq!(commands_preview, "exec: echo hi");
                 assert_eq!(item_id.as_deref(), Some("call-1"));
                 assert_eq!(source.as_deref(), Some("Codex"));
+                assert_eq!(message_uuid.as_deref(), Some("uuid-call-1"));
             }
             other => panic!("expected AgentStarted, got {:?}", other),
         }

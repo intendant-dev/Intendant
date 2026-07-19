@@ -1791,6 +1791,7 @@ mod tests {
                 "do things",
                 None,
                 Some("Codex"),
+                None,
             );
             {
                 use std::io::Write as _;
@@ -1871,6 +1872,7 @@ mod tests {
                 "edit files",
                 None,
                 Some("Codex"),
+                None,
             );
             {
                 use std::io::Write as _;
@@ -1944,6 +1946,7 @@ mod tests {
                 "round one",
                 None,
                 Some("Codex"),
+                None,
             );
             {
                 use std::io::Write as _;
@@ -1970,6 +1973,7 @@ mod tests {
                 "resumed round two",
                 None,
                 Some("Codex"),
+                None,
             );
 
             // Live observed the resume (newest truth = RunningAgent).
@@ -2011,6 +2015,7 @@ mod tests {
                 "round one",
                 None,
                 Some("Codex"),
+                None,
             );
             // The REAL writer: round_complete rows persist NO session id
             // (replay reconstructs session_id: None), and this one is the
@@ -2097,6 +2102,7 @@ mod tests {
                 "round one",
                 None,
                 Some("Codex"),
+                None,
             );
 
             let state = test_state();
@@ -2153,6 +2159,7 @@ mod tests {
                 "round two",
                 None,
                 Some("Codex"),
+                None,
             );
             hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
             assert_eq!(
@@ -2181,6 +2188,7 @@ mod tests {
                 "edit files",
                 None,
                 Some("Codex"),
+                None,
             );
 
             let state = test_state();
@@ -4046,6 +4054,7 @@ mod tests {
                         commands_preview: "edit static/app.html".to_string(),
                         item_id: None,
                         source: Some("Codex".to_string()),
+                        message_uuid: None,
                     },
                 );
                 apply_observed_event_to_mcp_state(

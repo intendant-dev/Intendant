@@ -1249,6 +1249,11 @@ pub enum AgentEvent {
         item_id: String,
         tool_name: String,
         preview: String,
+        /// The backend transcript line this call rides on (Claude Code's
+        /// top-level envelope `uuid` — the address the fork engine
+        /// chain-slices at). `None` for backends without per-line
+        /// transcript uuids (Codex) and for synthesized closers.
+        message_uuid: Option<String>,
     },
     /// Structured paths of files a write-ish tool run touches, verbatim as
     /// the backend's wire item stated them. Adapters emit this alongside
@@ -1266,11 +1271,21 @@ pub enum AgentEvent {
     /// bookkeeping: implies no turn.
     CwdAnnounced { cwd: String },
     /// Incremental output from a running tool.
-    ToolOutputDelta { item_id: String, text: String },
+    ToolOutputDelta {
+        item_id: String,
+        text: String,
+        /// The transcript line the result rides on (its own envelope
+        /// `uuid`, not the call's) — see [`AgentEvent::ToolStarted`].
+        message_uuid: Option<String>,
+    },
     /// A tool execution completed.
     ToolCompleted {
         item_id: String,
         status: ToolCompletionStatus,
+        /// The result envelope's transcript uuid — carried here too so a
+        /// completion-time output flush (the limiter's buffered tail) can
+        /// stamp the row it emits. See [`AgentEvent::ToolStarted`].
+        message_uuid: Option<String>,
     },
     /// The agent requests approval to execute a command.
     ApprovalRequest {

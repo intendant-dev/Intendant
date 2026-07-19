@@ -1450,6 +1450,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                             ),
                             item_id: Some(item_id.clone()),
                             source: config.agent_source.clone(),
+                            message_uuid: None,
                         });
                     }
                 }
@@ -1509,6 +1510,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 item_id,
                 preview,
                 tool_name,
+                message_uuid,
             } => {
                 if event_is_primary
                     && agent.supports_item_anchor_rewind()
@@ -1675,6 +1677,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         commands_preview: preview_text,
                         item_id: Some(item_id.clone()),
                         source: config.agent_source.clone(),
+                        message_uuid,
                     });
                 }
                 emit_external_context_snapshot_if_changed(
@@ -1685,7 +1688,11 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 )
                 .await;
             }
-            external_agent::AgentEvent::ToolOutputDelta { item_id, text } => {
+            external_agent::AgentEvent::ToolOutputDelta {
+                item_id,
+                text,
+                message_uuid,
+            } => {
                 if managed_context_blocked_tool_items.contains(&item_id) {
                     continue;
                 }
@@ -1696,10 +1703,15 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         config.session_id.as_deref(),
                         stdout,
                         Some(&item_id),
+                        message_uuid.as_deref(),
                     );
                 }
             }
-            external_agent::AgentEvent::ToolCompleted { item_id, status } => {
+            external_agent::AgentEvent::ToolCompleted {
+                item_id,
+                status,
+                message_uuid,
+            } => {
                 if managed_context_blocked_tool_items.remove(&item_id) {
                     continue;
                 }
@@ -1712,6 +1724,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         config.session_id.as_deref(),
                         stdout,
                         Some(&item_id),
+                        message_uuid.as_deref(),
                     );
                 }
                 let tool_preview = tool_previews.remove(&item_id);
@@ -3094,18 +3107,21 @@ mod tests {
                 item_id: "cmd-1".to_string(),
                 tool_name: "command".to_string(),
                 preview: "git status".to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
             .send(external_agent::AgentEvent::ToolOutputDelta {
                 item_id: "cmd-1".to_string(),
                 text: "git status output that must not leak".to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
             .send(external_agent::AgentEvent::ToolCompleted {
                 item_id: "cmd-1".to_string(),
                 status: external_agent::ToolCompletionStatus::Success,
+                message_uuid: None,
             })
             .unwrap();
         // Fission tools are allowed at density watch but must STILL be
@@ -3115,12 +3131,14 @@ mod tests {
                 item_id: "fission-1".to_string(),
                 tool_name: "mcp".to_string(),
                 preview: "intendant:fission_spawn".to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
             .send(external_agent::AgentEvent::ToolCompleted {
                 item_id: "fission-1".to_string(),
                 status: external_agent::ToolCompletionStatus::Success,
+                message_uuid: None,
             })
             .unwrap();
         event_tx
@@ -3246,18 +3264,21 @@ mod tests {
                 tool_name: "command".to_string(),
                 preview: "./target/release/intendant --web 8997 --no-tui --no-tls --agent codex"
                     .to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
             .send(external_agent::AgentEvent::ToolOutputDelta {
                 item_id: "cmd-1".to_string(),
                 text: "dashboard server output that should not be surfaced".to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
             .send(external_agent::AgentEvent::ToolCompleted {
                 item_id: "cmd-1".to_string(),
                 status: external_agent::ToolCompletionStatus::Cancelled,
+                message_uuid: None,
             })
             .unwrap();
         event_tx
@@ -3379,6 +3400,7 @@ mod tests {
                 item_id: "cmd-1".to_string(),
                 tool_name: "command".to_string(),
                 preview: "cargo test --bins".to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
@@ -3401,12 +3423,14 @@ mod tests {
             .send(external_agent::AgentEvent::ToolOutputDelta {
                 item_id: "cmd-1".to_string(),
                 text: "test result output".to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
             .send(external_agent::AgentEvent::ToolCompleted {
                 item_id: "cmd-1".to_string(),
                 status: external_agent::ToolCompletionStatus::Success,
+                message_uuid: None,
             })
             .unwrap();
         event_tx
@@ -3548,18 +3572,21 @@ mod tests {
                 item_id: "sed-1".to_string(),
                 tool_name: "command".to_string(),
                 preview: "sed -n '1,200p' src/bin/caller/main.rs".to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
             .send(external_agent::AgentEvent::ToolOutputDelta {
                 item_id: "sed-1".to_string(),
                 text: "sed output that must not leak".to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
             .send(external_agent::AgentEvent::ToolCompleted {
                 item_id: "sed-1".to_string(),
                 status: external_agent::ToolCompletionStatus::Success,
+                message_uuid: None,
             })
             .unwrap();
         event_tx
@@ -3567,18 +3594,21 @@ mod tests {
                 item_id: "rg-1".to_string(),
                 tool_name: "command".to_string(),
                 preview: "rg -n density src/bin/caller".to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
             .send(external_agent::AgentEvent::ToolOutputDelta {
                 item_id: "rg-1".to_string(),
                 text: "rg output that must not leak".to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
             .send(external_agent::AgentEvent::ToolCompleted {
                 item_id: "rg-1".to_string(),
                 status: external_agent::ToolCompletionStatus::Success,
+                message_uuid: None,
             })
             .unwrap();
         // Fission tools are NOT broad ordinary work at watch pressure:
@@ -3589,12 +3619,14 @@ mod tests {
                 item_id: "fission-1".to_string(),
                 tool_name: "mcp".to_string(),
                 preview: "intendant:fission_spawn".to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
             .send(external_agent::AgentEvent::ToolCompleted {
                 item_id: "fission-1".to_string(),
                 status: external_agent::ToolCompletionStatus::Success,
+                message_uuid: None,
             })
             .unwrap();
         event_tx
@@ -3769,12 +3801,14 @@ mod tests {
                 item_id: "anchors-1".to_string(),
                 tool_name: "mcp".to_string(),
                 preview: "list_rewind_anchors".to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
             .send(external_agent::AgentEvent::ToolCompleted {
                 item_id: "anchors-1".to_string(),
                 status: external_agent::ToolCompletionStatus::Success,
+                message_uuid: None,
             })
             .unwrap();
         event_tx
@@ -3909,12 +3943,14 @@ mod tests {
                 item_id: "shot-1".to_string(),
                 tool_name: "mcp".to_string(),
                 preview: "take_screenshot".to_string(),
+                message_uuid: None,
             })
             .unwrap();
         event_tx
             .send(external_agent::AgentEvent::ToolCompleted {
                 item_id: "shot-1".to_string(),
                 status: external_agent::ToolCompletionStatus::Success,
+                message_uuid: None,
             })
             .unwrap();
         event_tx

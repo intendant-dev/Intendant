@@ -1538,6 +1538,7 @@ mod tests {
             source: None,
             output_id: None,
             item_id: None,
+            message_uuid: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_none());
 
@@ -1647,6 +1648,7 @@ mod tests {
                 commands_preview: "echo hello".to_string(),
                 item_id: None,
                 source: None,
+                message_uuid: None,
             },
             &state,
         );
@@ -1664,6 +1666,7 @@ mod tests {
                 source: None,
                 output_id: None,
                 item_id: None,
+                message_uuid: None,
             },
             &state,
         );

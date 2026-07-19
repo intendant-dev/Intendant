@@ -2103,6 +2103,7 @@ mod tests {
                 "edit src/bin/caller/mcp.rs",
                 None,
                 Some("Codex"),
+                None,
             );
             log.context_snapshot_for_session(
                 Some("codex-thread"),

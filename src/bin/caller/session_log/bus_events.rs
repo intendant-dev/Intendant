@@ -562,6 +562,7 @@ impl SessionLog {
         commands_preview: &str,
         item_id: Option<&str>,
         source: Option<&str>,
+        message_uuid: Option<&str>,
     ) {
         let mut data = serde_json::Map::new();
         if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
@@ -580,6 +581,15 @@ impl SessionLog {
             data.insert(
                 "source".to_string(),
                 serde_json::Value::String(source.to_string()),
+            );
+        }
+        // The transcript line address rides the persisted row so replayed
+        // tool rows carry it natively (the detail-view annotator only
+        // stamps rows that lack one).
+        if let Some(message_uuid) = message_uuid.map(str::trim).filter(|s| !s.is_empty()) {
+            data.insert(
+                "message_uuid".to_string(),
+                serde_json::Value::String(message_uuid.to_string()),
             );
         }
         self.emit(LogEvent {
@@ -1760,9 +1770,10 @@ impl SessionLog {
         source: Option<&str>,
         output_id: Option<&str>,
     ) {
-        self.agent_output_with_session_id(None, stdout, stderr, source, output_id, None);
+        self.agent_output_with_session_id(None, stdout, stderr, source, output_id, None, None);
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn agent_output_with_session_id(
         &mut self,
         session_id: Option<&str>,
@@ -1771,6 +1782,7 @@ impl SessionLog {
         source: Option<&str>,
         output_id: Option<&str>,
         item_id: Option<&str>,
+        message_uuid: Option<&str>,
     ) {
         let stdout_span = if !stdout.is_empty() {
             self.append_turn_file_span("stdout.txt", stdout)
@@ -1793,6 +1805,11 @@ impl SessionLog {
         }
         if let Some(id) = item_id.map(str::trim).filter(|id| !id.is_empty()) {
             data["item_id"] = serde_json::Value::String(id.to_string());
+        }
+        // The result envelope's transcript address — persisted beside
+        // item_id so replayed output rows carry it natively.
+        if let Some(uuid) = message_uuid.map(str::trim).filter(|s| !s.is_empty()) {
+            data["message_uuid"] = serde_json::Value::String(uuid.to_string());
         }
         if let Some(src) = source {
             data["source"] = serde_json::Value::String(src.to_string());

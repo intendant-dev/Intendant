@@ -3073,11 +3073,13 @@ pub(crate) fn emit_external_tool_output(
     session_id: Option<&str>,
     stdout: String,
     item_id: Option<&str>,
+    message_uuid: Option<&str>,
 ) {
     if stdout.is_empty() {
         return;
     }
     let item_id = item_id.map(str::trim).filter(|id| !id.is_empty());
+    let message_uuid = message_uuid.map(str::trim).filter(|id| !id.is_empty());
     let output_id = event::next_agent_output_id();
     slog(config.session_log, |l| {
         l.agent_output_with_session_id(
@@ -3087,6 +3089,7 @@ pub(crate) fn emit_external_tool_output(
             config.agent_source.as_deref(),
             Some(&output_id),
             item_id,
+            message_uuid,
         )
     });
     config.bus.send(AppEvent::AgentOutput {
@@ -3096,6 +3099,7 @@ pub(crate) fn emit_external_tool_output(
         source: config.agent_source.clone(),
         output_id: Some(output_id),
         item_id: item_id.map(str::to_string),
+        message_uuid: message_uuid.map(str::to_string),
     });
 }
 
@@ -3328,6 +3332,7 @@ pub(crate) fn handle_idle_codex_subagent_event(
             item_id,
             tool_name,
             preview,
+            message_uuid,
         } => {
             let commands_preview = external_tool_preview_text(&tool_name, &preview)
                 .unwrap_or_else(|| tool_name.clone());
@@ -3342,6 +3347,7 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 commands_preview,
                 item_id: Some(item_id),
                 source: config.agent_source.clone(),
+                message_uuid,
             });
         }
         external_agent::AgentEvent::FileActivity { .. } => {
@@ -3353,7 +3359,11 @@ pub(crate) fn handle_idle_codex_subagent_event(
             // Same gating as FileActivity: a subagent thread's working
             // directory is not the supervising session's locus.
         }
-        external_agent::AgentEvent::ToolOutputDelta { item_id, text } => {
+        external_agent::AgentEvent::ToolOutputDelta {
+            item_id,
+            text,
+            message_uuid,
+        } => {
             let tool_output_limiter = stats
                 .codex_subagent_tool_output_limiters
                 .entry(child_thread_id.clone())
@@ -3361,9 +3371,19 @@ pub(crate) fn handle_idle_codex_subagent_event(
             let Some(stdout) = tool_output_limiter.filter(&item_id, text) else {
                 return;
             };
-            emit_external_tool_output(config, Some(&child_thread_id), stdout, Some(&item_id));
+            emit_external_tool_output(
+                config,
+                Some(&child_thread_id),
+                stdout,
+                Some(&item_id),
+                message_uuid.as_deref(),
+            );
         }
-        external_agent::AgentEvent::ToolCompleted { item_id, status } => {
+        external_agent::AgentEvent::ToolCompleted {
+            item_id,
+            status,
+            message_uuid,
+        } => {
             if let Some(limiter) = stats
                 .codex_subagent_tool_output_limiters
                 .get_mut(&child_thread_id)
@@ -3374,6 +3394,7 @@ pub(crate) fn handle_idle_codex_subagent_event(
                         Some(&child_thread_id),
                         stdout,
                         Some(&item_id),
+                        message_uuid.as_deref(),
                     );
                 }
             }
@@ -4096,6 +4117,7 @@ mod tests {
                 item_id: "t1".into(),
                 preview: "ls".into(),
                 tool_name: "Bash".into(),
+                message_uuid: None,
             },
             external_agent::AgentEvent::SubAgentToolCall {
                 item_id: "t2".into(),
@@ -4134,6 +4156,7 @@ mod tests {
             external_agent::AgentEvent::ToolCompleted {
                 item_id: "t1".into(),
                 status: external_agent::ToolCompletionStatus::Cancelled,
+                message_uuid: None,
             },
             external_agent::AgentEvent::Log {
                 level: "info".into(),
@@ -4320,6 +4343,7 @@ mod tests {
                     "BEGIN\n{}END-MARKER\n",
                     "middle\n".repeat(EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT)
                 ),
+                message_uuid: None,
             },
         );
 
@@ -4342,6 +4366,7 @@ mod tests {
             external_agent::AgentEvent::ToolOutputDelta {
                 item_id: "call-1".to_string(),
                 text: "more".to_string(),
+                message_uuid: None,
             },
         );
 
@@ -4357,6 +4382,7 @@ mod tests {
             external_agent::AgentEvent::ToolCompleted {
                 item_id: "call-1".to_string(),
                 status: external_agent::ToolCompletionStatus::Success,
+                message_uuid: None,
             },
         );
 

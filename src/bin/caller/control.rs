@@ -256,6 +256,7 @@ mod tests {
             source: None,
             output_id: None,
             item_id: None,
+            message_uuid: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event\":\"agent_output\""));
