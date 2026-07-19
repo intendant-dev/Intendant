@@ -201,14 +201,15 @@ one. `replace_lines` errors if `end_line < line_number`.
   **last 10 KB** of each (`LOG_TAIL_BYTES`). Each artifact is atomically
   created as a new file, and the runtime reads its tail through the original
   open handle, so an existing or later-replaced symlink is never followed.
-- **Credentials are stripped at two boundaries.** The controller removes
-  canonical provider names, inherited `*_API_KEY` / `*_API_TOKEN` names, and
-  ambient host-credential names (agent sockets, forge/cloud/registry tokens,
-  credential-store pointers) before spawning the runtime. The `INTENDANT_*`
-  namespace is reserved for controller→runtime control and is exempt. Both
-  `execAsAgent` and `execPty` independently repeat the provider and ambient
-  scrub before starting their model-driven shell; they do not merely trust the
-  runtime's inherited environment. See
+- **The environment defaults closed at two boundaries.** Before spawning the
+  runtime, the controller clears inheritance and copies only catalogued
+  OS/process essentials, non-secret toolchain controls, locale variables, and
+  exact names deliberately granted through `INTENDANT_ENV_PASSTHROUGH`.
+  Provider/model API keys remain an absolute deny. Runtime controls such as the
+  log directory, sandbox paths, and user-display grant are injected individually
+  after the clear; unknown names, including unknown `INTENDANT_*` names, do not
+  inherit. `execAsAgent` and `execPty` independently repeat the provider and
+  ambient credential scrub before starting their model-driven shell. See
   [Configuration → Child-process environment](./configuration.md#child-process-environment)
   for the current passthrough limitation.
 - **Display gating**: `DISPLAY` is set to the chosen display. Access to the user's
