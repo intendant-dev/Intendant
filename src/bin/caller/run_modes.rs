@@ -1748,6 +1748,11 @@ pub(crate) async fn run_with_presence(
                                 &mut codex_thread_action_dedupe,
                                 &mut prefetched_events,
                                 Some(&mut side_session_state),
+                                // The persistent external thread lane has no
+                                // primary ordinal tracking (it emits no user
+                                // ordinals), so idle steer deliveries stay
+                                // turnless here.
+                                None,
                                 false,
                                 false,
                                 false,
@@ -2580,6 +2585,9 @@ pub(crate) async fn run_with_presence(
                     &mut persistent_cancelled_follow_ups,
                     &mut codex_thread_action_dedupe,
                     Some(&mut side_session_state),
+                    // No primary ordinal tracking in this lane (see the idle
+                    // drain above).
+                    None,
                     active_followup.managed_context_recovery_kickstart,
                     active_followup.managed_context_density_handoff,
                     active_followup.managed_context_density_handoff_completed,
