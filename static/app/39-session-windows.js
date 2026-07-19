@@ -4051,6 +4051,7 @@ function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
     renderSessionWindowRange(win, win.renderStart);
   }
   applySessionWindowOutputScroll(win, shouldFollow);
+  notifyMinimizedSessionWindowHistoryAppend(win);
 }
 
 function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSessionId) {

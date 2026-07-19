@@ -114,6 +114,9 @@ function appendSessionWindowActionMenuItem(parent, action, codex = false) {
 // fields; a no-op once real entries exist.
 function renderSessionWindowLogPlaceholder(win) {
   if (!win || !win.log) return;
+  // Minimized windows keep their transcript unmounted (data-only appends;
+  // see setSessionWindowMinimized) — the placeholder is transcript DOM too.
+  if (win.minimized) return;
   const existing = win.log.querySelector('.session-window-empty');
   // Real entries present: never stomp them (placeholder is gone already).
   if (win.log.childElementCount > (existing ? 1 : 0)) return;
@@ -683,16 +686,51 @@ function toggleSessionWindowHeaderCollapsed(sessionId) {
   setSessionWindowHeaderCollapsed(sid, !win.headerCollapsed);
 }
 
+// Minimize UNMOUNTS the transcript children — a minimized card used to
+// keep its whole rendered window (up to SESSION_WINDOW_RENDER_LIMIT
+// entries) mounted under display:none, so auto-minimized done sub-agents
+// and the Collapse-all sweep saved nothing. The data plane is untouched:
+// win.logHistory keeps accumulating through the ordinary append paths
+// (which go data-only via the win.minimized guards in
+// renderSessionWindowRange / renderSessionWindowTail /
+// appendSessionWindowRenderedTailItem(s)), so restore loses nothing —
+// it re-materializes the visible tail from the history records and lands
+// at the bottom (the existing jump-bottom behavior).
+function unmountSessionWindowTranscript(win) {
+  if (!win || !win.log) return;
+  win.log.replaceChildren();
+  // Nothing is mounted: an empty range at the head is the honest render
+  // state (restore re-renders via renderSessionWindowRange, which has no
+  // early-out, so there is no stale-match hazard).
+  win.renderStart = 0;
+  win.renderEnd = 0;
+}
+
+function restoreSessionWindowTranscript(win) {
+  if (!win || !win.log) return;
+  const history = ensureSessionWindowHistory(win);
+  renderSessionWindowRange(win, sessionWindowTailStart(history.length));
+  win.followOutput = true;
+  win.pendingOutput = false;
+  updateSessionWindowJumpButton(win);
+  scheduleSessionWindowScrollToBottom(win);
+}
+
 function setSessionWindowMinimized(sessionId, minimized) {
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win) return;
+  const wasMinimized = !!win.minimized;
   win.minimized = !!minimized;
   if (win.minimized && maximizedSessionWindowId === sid) {
     maximizedSessionWindowId = '';
     updateSessionWindowMaximizeState();
   }
   updateSessionWindowMinimizeState(sid);
+  if (win.minimized !== wasMinimized) {
+    if (win.minimized) unmountSessionWindowTranscript(win);
+    else restoreSessionWindowTranscript(win);
+  }
   refreshSessionWindowPathLabels(win);
   applySessionWindowGridHeight();
   scheduleSessionRelationshipRender();
