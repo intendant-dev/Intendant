@@ -2113,14 +2113,19 @@ pub(crate) async fn rollback_parent_thread_from_turn(
     if first_user_turn_index == 0 {
         return Err("Cannot rewind user turn 0".to_string());
     }
-    if first_user_turn_index as usize > *round {
+    // Bounds and rollback depth come from the prompt-ordinal state, not
+    // `round`: rounds also count spontaneous backend turns (and restart on
+    // resume for unseeded backends), so a round-based depth over-rolls
+    // the backend. `round` is reset below purely as the round counter.
+    let active_user_turns = user_turn_revisions.active_count();
+    if first_user_turn_index > active_user_turns {
         return Err(format!(
             "Cannot rewind to user turn {}; current user turn count is {}",
-            first_user_turn_index, *round
+            first_user_turn_index, active_user_turns
         ));
     }
 
-    let turns_to_drop = *round as u32 - first_user_turn_index + 1;
+    let turns_to_drop = active_user_turns - first_user_turn_index + 1;
     agent
         .rollback_turns(turns_to_drop)
         .await
@@ -2144,7 +2149,10 @@ pub(crate) async fn handle_parent_undo_thread_action(
     config: &DrainConfig<'_>,
 ) {
     let turns = undo_turns_from_params(&params);
-    let result = match parent_rewind_first_turn_for_undo(*round, turns) {
+    let result = match parent_rewind_first_turn_for_undo(
+        user_turn_revisions.active_count() as usize,
+        turns,
+    ) {
         Ok(first_user_turn_index) => rollback_parent_thread_from_turn(
             agent,
             round,
