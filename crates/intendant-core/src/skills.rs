@@ -34,6 +34,25 @@ pub struct SkillConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub sandbox: Option<bool>,
+    /// Free-text environment requirements (Agent Skills standard
+    /// `compatibility`). Surfaced verbatim in the injected catalog so the
+    /// model can pre-filter — deliberately ahead of other harnesses,
+    /// which drop the field before the model ever sees it (verified
+    /// 2026-07-19 on claude 2.1.215 / codex 0.144.6).
+    #[serde(default)]
+    pub compatibility: Option<String>,
+    /// Intendant extension: `distribution: global` marks a skill the
+    /// daemon installs machine-wide into `~/.agents/skills/` at startup.
+    /// Unknown values are kept verbatim and treated as not-global.
+    #[serde(default)]
+    pub distribution: Option<String>,
+}
+
+impl SkillConfig {
+    /// Whether the daemon should install this skill machine-wide.
+    pub fn is_global(&self) -> bool {
+        self.distribution.as_deref() == Some("global")
+    }
 }
 
 /// Where a skill was discovered.
@@ -70,7 +89,7 @@ pub struct Skill {
 ///
 /// The file must start with `---`, followed by YAML frontmatter, closed by
 /// another `---` line. Everything after is the body.
-fn parse_skill_md(content: &str, source_path: &Path) -> Result<(SkillConfig, String), String> {
+pub fn parse_skill_md(content: &str, source_path: &Path) -> Result<(SkillConfig, String), String> {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
         return Err(format!(
@@ -114,6 +133,8 @@ fn parse_frontmatter(yaml: &str) -> Result<SkillConfig, String> {
     let mut autonomy: Option<String> = None;
     let mut disable_auto_invocation = false;
     let mut sandbox: Option<bool> = None;
+    let mut compatibility: Option<String> = None;
+    let mut distribution: Option<String> = None;
 
     let lines: Vec<&str> = yaml.lines().collect();
     let mut i = 0;
@@ -172,6 +193,8 @@ fn parse_frontmatter(yaml: &str) -> Result<SkillConfig, String> {
                 disable_auto_invocation = value == "true";
             }
             "sandbox" => sandbox = Some(value == "true"),
+            "compatibility" => compatibility = Some(value),
+            "distribution" => distribution = Some(value),
             _ => {} // Ignore unknown fields for forward compatibility
         }
     }
@@ -185,6 +208,8 @@ fn parse_frontmatter(yaml: &str) -> Result<SkillConfig, String> {
         autonomy,
         disable_auto_invocation,
         sandbox,
+        compatibility: compatibility.filter(|c| !c.is_empty()),
+        distribution: distribution.filter(|d| !d.is_empty()),
     })
 }
 
@@ -333,10 +358,7 @@ pub fn format_skill_catalog(skills: &[Skill]) -> String {
     if !auto_skills.is_empty() {
         out.push_str("**Auto-invocable** (use when the task matches):\n");
         for s in &auto_skills {
-            out.push_str(&format!(
-                "- **{}**: {}\n",
-                s.config.name, s.config.description
-            ));
+            push_catalog_line(&mut out, s);
         }
         out.push('\n');
     }
@@ -344,15 +366,26 @@ pub fn format_skill_catalog(skills: &[Skill]) -> String {
     if !manual_skills.is_empty() {
         out.push_str("**Manual only** (only invoke when explicitly requested):\n");
         for s in &manual_skills {
-            out.push_str(&format!(
-                "- **{}**: {}\n",
-                s.config.name, s.config.description
-            ));
+            push_catalog_line(&mut out, s);
         }
         out.push('\n');
     }
 
     out
+}
+
+/// One catalog entry. `compatibility` rides after the description so the
+/// model can rule a skill out before invoking it (the field's intent per
+/// the Agent Skills standard — description stays purpose-only).
+fn push_catalog_line(out: &mut String, s: &Skill) {
+    out.push_str(&format!(
+        "- **{}**: {}",
+        s.config.name, s.config.description
+    ));
+    if let Some(compat) = s.config.compatibility.as_deref() {
+        out.push_str(&format!(" (compatibility: {compat})"));
+    }
+    out.push('\n');
 }
 
 /// Load a skill body with `$ARGUMENTS` substitution.
@@ -457,6 +490,65 @@ Instructions here.
         assert!(config.description.contains("Deploy the current branch"));
         assert!(config.description.contains("integration test suite"));
         assert_eq!(config.autonomy, Some("low".to_string()));
+    }
+
+    #[test]
+    fn parse_compatibility_and_distribution() {
+        let content = "---\nname: caller\ndescription: Operate the daemon\ncompatibility: >\n  Requires a reachable Intendant daemon.\n  Supervised sessions have $INTENDANT injected.\ndistribution: global\n---\nbody\n";
+        let (config, _) = parse_skill_md(content, Path::new("test/SKILL.md")).unwrap();
+        assert_eq!(
+            config.compatibility.as_deref(),
+            Some("Requires a reachable Intendant daemon. Supervised sessions have $INTENDANT injected.")
+        );
+        assert!(config.is_global());
+
+        // Absent / empty fields normalize to None; unknown distribution
+        // values are kept but are not global.
+        let (config, _) = parse_skill_md(
+            "---\nname: a\ndescription: b\ncompatibility:\n---\nbody\n",
+            Path::new("test/SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(config.compatibility, None);
+        assert!(!config.is_global());
+        let (config, _) = parse_skill_md(
+            "---\nname: a\ndescription: b\ndistribution: project\n---\nbody\n",
+            Path::new("test/SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(config.distribution.as_deref(), Some("project"));
+        assert!(!config.is_global());
+    }
+
+    #[test]
+    fn catalog_surfaces_compatibility_after_description() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join("skills").join("gated");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: gated\ndescription: Do the thing.\ncompatibility: macOS only.\n---\nbody\n",
+        )
+        .unwrap();
+        let plain = root.join("skills").join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(
+            plain.join("SKILL.md"),
+            "---\nname: plain\ndescription: No requirements.\n---\nbody\n",
+        )
+        .unwrap();
+
+        let skills = discover_skills_in(Some(root), None);
+        let catalog = format_skill_catalog(&skills);
+        assert!(
+            catalog.contains("- **gated**: Do the thing. (compatibility: macOS only.)"),
+            "{catalog}"
+        );
+        assert!(
+            catalog.contains("- **plain**: No requirements.\n"),
+            "{catalog}"
+        );
     }
 
     #[test]
@@ -627,6 +719,8 @@ Instructions here.
                     autonomy: None,
                     disable_auto_invocation: false,
                     sandbox: None,
+                    compatibility: None,
+                    distribution: None,
                 },
                 body: String::new(),
                 source_path: PathBuf::new(),
@@ -639,6 +733,8 @@ Instructions here.
                     autonomy: None,
                     disable_auto_invocation: true,
                     sandbox: None,
+                    compatibility: None,
+                    distribution: None,
                 },
                 body: String::new(),
                 source_path: PathBuf::new(),
@@ -662,6 +758,8 @@ Instructions here.
                 autonomy: None,
                 disable_auto_invocation: false,
                 sandbox: None,
+                compatibility: None,
+                distribution: None,
             },
             body: "Deploy $ARGUMENTS to staging.".to_string(),
             source_path: PathBuf::new(),
@@ -683,6 +781,8 @@ Instructions here.
                 autonomy: None,
                 disable_auto_invocation: false,
                 sandbox: None,
+                compatibility: None,
+                distribution: None,
             },
             body: "Just run clippy.".to_string(),
             source_path: PathBuf::new(),
@@ -701,6 +801,8 @@ Instructions here.
                 autonomy: None,
                 disable_auto_invocation: false,
                 sandbox: None,
+                compatibility: None,
+                distribution: None,
             },
             body: "Deploy $ARGUMENTS now.".to_string(),
             source_path: PathBuf::new(),
@@ -723,6 +825,8 @@ Instructions here.
                 autonomy: None,
                 disable_auto_invocation: false,
                 sandbox: None,
+                compatibility: None,
+                distribution: None,
             },
             body: String::new(),
             source_path: PathBuf::new(),

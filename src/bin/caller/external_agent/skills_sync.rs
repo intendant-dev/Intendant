@@ -279,6 +279,115 @@ fn git_common_dir(project_root: &Path) -> Option<PathBuf> {
     })
 }
 
+/// Report from one global-install pass.
+#[derive(Debug, Default)]
+pub(crate) struct GlobalInstallReport {
+    pub(crate) installed: Vec<String>,
+    pub(crate) unchanged: usize,
+    pub(crate) skipped_user_owned: Vec<String>,
+    pub(crate) removed_stale: Vec<String>,
+}
+
+/// Install every `distribution: global` builtin skill into
+/// `~/.agents/skills/` — the Agent Skills standard personal path that
+/// Codex, Intendant itself, and (via the setup-script symlink) Claude
+/// Code all read. Same ownership contract as project materialization:
+/// marker-first writes, marked-only sweeps, user-authored directories
+/// always win. Content-identical installs are no-ops, so restarts and
+/// concurrent daemons do not churn the folder; sweeps remove only marked
+/// dirs, which are derived copies that regenerate from their sources.
+/// Honors [`SKIP_ENV`].
+pub(crate) fn install_global_skills() -> io::Result<GlobalInstallReport> {
+    if std::env::var_os(SKIP_ENV).is_some_and(|v| !v.is_empty()) {
+        return Ok(GlobalInstallReport::default());
+    }
+    let Some(home) = dirs::home_dir() else {
+        return Ok(GlobalInstallReport::default());
+    };
+    install_global_skills_in(&home)
+}
+
+/// Home-injectable core of [`install_global_skills`].
+fn install_global_skills_in(home: &Path) -> io::Result<GlobalInstallReport> {
+    let mut report = GlobalInstallReport::default();
+    let target_dir = home.join(".agents").join("skills");
+
+    let globals: Vec<(&str, &str)> = crate::builtin_skills::BUILTIN_SKILLS
+        .iter()
+        .filter(|(name, content)| {
+            intendant_core::skills::parse_skill_md(content, Path::new(name))
+                .map(|(config, _)| config.is_global())
+                .unwrap_or(false)
+        })
+        .copied()
+        .collect();
+
+    // Sweep marked dirs that are no longer (or never were) in the global
+    // set — renames and demotions clean up on the next daemon start.
+    if let Ok(entries) = std::fs::read_dir(&target_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() || !path.join(MATERIALIZED_MARKER).exists() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !globals.iter().any(|(n, _)| *n == name) {
+                std::fs::remove_dir_all(&path)?;
+                report.removed_stale.push(name);
+            }
+        }
+    }
+
+    for (name, content) in globals {
+        let dest = target_dir.join(name);
+        let marker = dest.join(MATERIALIZED_MARKER);
+        let skill_md = dest.join("SKILL.md");
+        if dest.exists() && !marker.exists() {
+            // User-authored (possibly via a symlinked personal skills
+            // setup) — the user's copy always wins.
+            report.skipped_user_owned.push(name.to_string());
+            continue;
+        }
+        if marker.exists()
+            && std::fs::read_to_string(&skill_md).is_ok_and(|current| current == content)
+        {
+            report.unchanged += 1;
+            continue;
+        }
+        if dest.exists() {
+            std::fs::remove_dir_all(&dest)?;
+        }
+        std::fs::create_dir_all(&dest)?;
+        std::fs::write(&marker, "source: builtin (daemon-installed)\n")?;
+        std::fs::write(&skill_md, content)?;
+        report.installed.push(name.to_string());
+    }
+    Ok(report)
+}
+
+/// Startup wrapper for the session-serving modes: run the install and
+/// log one line when it changed anything.
+pub(crate) fn install_global_skills_at_startup() {
+    match install_global_skills() {
+        Ok(report) => {
+            if !report.installed.is_empty() || !report.removed_stale.is_empty() {
+                let kept = if report.skipped_user_owned.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} user-owned kept", report.skipped_user_owned.len())
+                };
+                eprintln!(
+                    "[skills] global install: {} installed, {} unchanged, {} stale removed{kept}",
+                    report.installed.len(),
+                    report.unchanged,
+                    report.removed_stale.len(),
+                );
+            }
+        }
+        Err(e) => eprintln!("[skills] global install failed: {e}"),
+    }
+}
+
 /// Log-friendly one-line summary used by the spawn sites.
 pub(crate) fn describe_report(report: &ProvisionReport) -> Option<String> {
     if report.materialized.is_empty()
@@ -446,6 +555,59 @@ mod tests {
             listing.contains(".claude/"),
             "user-owned dir vanished from git status: {listing}"
         );
+    }
+
+    #[test]
+    fn global_install_is_idempotent_and_ownership_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let expected_globals: Vec<&str> = crate::builtin_skills::BUILTIN_SKILLS
+            .iter()
+            .filter(|(name, content)| {
+                intendant_core::skills::parse_skill_md(content, Path::new(name))
+                    .map(|(config, _)| config.is_global())
+                    .unwrap_or(false)
+            })
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            !expected_globals.is_empty(),
+            "at least one builtin skill must be distribution: global"
+        );
+
+        // A user-authored dir colliding with one global, and a stale
+        // marked leftover from an older daemon.
+        let target = home.join(".agents").join("skills");
+        let user_owned = target.join(expected_globals[0]);
+        std::fs::create_dir_all(&user_owned).unwrap();
+        std::fs::write(user_owned.join("SKILL.md"), "user copy").unwrap();
+        let stale = target.join("retired-builtin");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join(MATERIALIZED_MARKER), "old").unwrap();
+
+        let first = install_global_skills_in(home).unwrap();
+        assert_eq!(first.installed.len(), expected_globals.len() - 1);
+        assert_eq!(
+            first.skipped_user_owned,
+            vec![expected_globals[0].to_string()]
+        );
+        assert_eq!(first.removed_stale, vec!["retired-builtin".to_string()]);
+        assert!(!stale.exists());
+        assert_eq!(
+            std::fs::read_to_string(user_owned.join("SKILL.md")).unwrap(),
+            "user copy"
+        );
+        for name in expected_globals.iter().skip(1) {
+            let dest = target.join(name);
+            assert!(dest.join("SKILL.md").exists(), "{name} missing");
+            assert!(dest.join(MATERIALIZED_MARKER).exists(), "{name} unmarked");
+        }
+
+        // Second run: pure no-op.
+        let second = install_global_skills_in(home).unwrap();
+        assert!(second.installed.is_empty(), "{second:?}");
+        assert!(second.removed_stale.is_empty(), "{second:?}");
+        assert_eq!(second.unchanged, expected_globals.len() - 1);
     }
 
     #[test]
