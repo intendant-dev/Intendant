@@ -190,26 +190,57 @@ pub(crate) fn is_codex_injected_user_text_for_main(text: &str) -> bool {
     crate::external_agent::transcript_text::is_injected_external_user_text(text)
 }
 
+/// User-turn state for a resumed Codex thread. The transcript's prompt
+/// ordinal is the turn authority (see `claude_history.rs` for the full
+/// rationale), so this must count EXACTLY the rows the replay/hydration
+/// lane (`session_catalog::transcripts::parse_codex_session_entries`)
+/// assigns ordinals to — the same steer ledger the catalog builds for
+/// this session is applied here.
 pub(crate) fn codex_user_turn_state_from_history(
+    home: &Path,
     session_id: &str,
 ) -> Option<UserTurnRevisionState> {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
-    let path = find_codex_session_file_for_main(&home, session_id)?;
-    codex_user_turn_state_from_history_file(&path)
+    let path = find_codex_session_file_for_main(home, session_id)?;
+    let steers = crate::web_gateway::external_mid_turn_steer_ledger(home, "codex", session_id);
+    codex_user_turn_state_from_history_file(&path, &steers)
 }
 
+/// Reconstruct per-turn revision state from one rollout file, mirroring
+/// the replay lane's admission rule row for row (the parity oracle test
+/// below pins the composition):
+///
+/// - Lane preference mirrors `codex_session_canonical_lanes`: ANY
+///   `user_message` event proves the event lane (even one whose row the
+///   parser then drops), and provider `response_item` user messages are
+///   then ignored entirely — so each candidate lane gets its own steer
+///   cursor, exactly like the parser's single cursor only ever seeing one
+///   lane's user rows.
+/// - A row is counted only when the replay renders AND numbers it
+///   (`push_codex_transcript_message` → `push_external_transcript_entry`):
+///   text present and non-empty, not harness-injected
+///   (`is_injected_external_user_text`), and not a ledger-proven mid-turn
+///   steer (those render turnless).
+/// - `thread_rolled_back` rewinds recorded turns, so a replaced prompt
+///   re-seeds with a bumped revision like the replay's replacement rows.
 pub(crate) fn codex_user_turn_state_from_history_file(
     path: &Path,
+    steers: &crate::web_gateway::ExternalSteerLedger,
 ) -> Option<UserTurnRevisionState> {
     let contents = std::fs::read_to_string(path).ok()?;
     let mut saw_user_message_event = false;
     let mut event_state = UserTurnRevisionState::default();
     let mut fallback_state = UserTurnRevisionState::default();
+    let mut event_steers = steers.cursor();
+    let mut fallback_steers = steers.cursor();
 
     for line in contents.lines() {
         let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        let row_ts_ms = obj
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(crate::web_gateway::timestamp_millis_from_str);
         match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "event_msg" => {
                 let Some(payload) = obj.get("payload") else {
@@ -218,6 +249,18 @@ pub(crate) fn codex_user_turn_state_from_history_file(
                 match payload.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                     "user_message" => {
                         saw_user_message_event = true;
+                        let Some(text) =
+                            crate::external_agent::codex::rollout::codex_event_message_text(payload)
+                                .map(|(_, text)| text)
+                        else {
+                            continue;
+                        };
+                        if text.trim().is_empty() || is_codex_injected_user_text_for_main(&text) {
+                            continue;
+                        }
+                        if event_steers.try_consume_mid_turn_steer(&text, row_ts_ms) {
+                            continue;
+                        }
                         event_state.record_next_turn();
                     }
                     "thread_rolled_back" => {
@@ -231,12 +274,16 @@ pub(crate) fn codex_user_turn_state_from_history_file(
                     _ => {}
                 }
             }
-            "response_item"
-                if obj
-                    .get("payload")
-                    .and_then(codex_payload_user_text)
-                    .is_some() =>
-            {
+            "response_item" => {
+                let Some(text) = obj.get("payload").and_then(codex_payload_user_text) else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if fallback_steers.try_consume_mid_turn_steer(&text, row_ts_ms) {
+                    continue;
+                }
                 fallback_state.record_next_turn();
             }
             _ => {}
@@ -314,10 +361,191 @@ mod tests {
         )
         .unwrap();
 
-        let state = codex_user_turn_state_from_history_file(&path).expect("state");
+        let state = codex_user_turn_state_from_history_file(
+            &path,
+            &crate::web_gateway::ExternalSteerLedger::default(),
+        )
+        .expect("state");
         assert_eq!(state.active_count(), 1);
         assert_eq!(state.active_revision(1), Some(1));
         assert_eq!(state.active_revision(2), None);
+    }
+
+    /// The resume-seed ⇄ replay-lane parity oracle (Codex twin of
+    /// `claude_resume_seed_matches_replay_lane_prompt_ordinals`): over one
+    /// fixture rollout containing normal prompts, a provider-request
+    /// duplicate, harness-injected user shapes, an empty user_message, a
+    /// ledger-proven mid-turn steer, and a thread_rolled_back +
+    /// replacement, the seed's active count and revisions equal what
+    /// `parse_codex_session_entries` serves as live (non-superseded)
+    /// prompt ordinals — so a resumed live lane continues the transcript's
+    /// numbering. Exercises the same pipeline the daemon runs at resume:
+    /// wrapper-index steer-ledger build → filtered event-lane count.
+    #[test]
+    fn codex_resume_seed_matches_replay_lane_prompt_ordinals() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "019efeed-aaaa-bbbb-cccc-turnseed0002";
+        let wrapper_id = "wrapper-codex-turn-seed";
+        let steer_text = "also update the changelog";
+
+        // Wrapper session log carrying the mid-turn steer arc (request +
+        // accepted), discovered through the wrapper index like the live
+        // catalog's ledger build.
+        let wrapper_dir = home.path().join(".intendant").join("logs").join(wrapper_id);
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        let requested_ts_ms = chrono::DateTime::parse_from_rfc3339("2026-05-17T16:49:29Z")
+            .unwrap()
+            .timestamp_millis();
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "16:49:29", "ts_ms": requested_ts_ms,
+                    "event": "steer_requested", "level": "info",
+                    "message": format!("Steer requested: {steer_text}"),
+                    "data": { "session_id": session_id, "id": "steer-1", "status": "pending", "text": steer_text },
+                }),
+                serde_json::json!({
+                    "ts": "16:49:29", "ts_ms": requested_ts_ms + 150,
+                    "event": "steer_accepted", "level": "info",
+                    "message": "Steer accepted",
+                    "data": { "session_id": session_id, "id": "steer-1", "status": "accepted" },
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        crate::external_wrapper_index::upsert(
+            home.path(),
+            "codex",
+            session_id,
+            wrapper_id,
+            &wrapper_dir,
+            None,
+        )
+        .unwrap();
+
+        let path = home.path().join("rollout.jsonl");
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T16:48:52Z", "type": "session_meta",
+                "payload": { "id": session_id }
+            }),
+            // Provider-request duplicate of the first prompt: skipped
+            // outright when the event lane is canonical.
+            serde_json::json!({
+                "timestamp": "2026-05-17T16:49:00Z", "type": "response_item",
+                "payload": { "type": "message", "role": "user",
+                    "content": [{ "type": "input_text", "text": "fix the flaky test" }] }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T16:49:00Z", "type": "event_msg",
+                "payload": { "type": "user_message", "message": "fix the flaky test" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T16:49:05Z", "type": "event_msg",
+                "payload": { "type": "agent_message", "message": "On it." }
+            }),
+            // Harness-injected and empty user events: lane markers only,
+            // no row, no ordinal.
+            serde_json::json!({
+                "timestamp": "2026-05-17T16:49:20Z", "type": "event_msg",
+                "payload": { "type": "user_message",
+                    "message": "<subagent_notification>\n{\"agent_path\":\"child\"}\n</subagent_notification>" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T16:49:21Z", "type": "event_msg",
+                "payload": { "type": "user_message", "message": "" }
+            }),
+            // The mid-turn steer, echoed after its wrapper-log request:
+            // renders turnless and burns no ordinal.
+            serde_json::json!({
+                "timestamp": "2026-05-17T16:49:30Z", "type": "event_msg",
+                "payload": { "type": "user_message", "message": steer_text }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T16:49:40Z", "type": "event_msg",
+                "payload": { "type": "user_message", "message": "second prompt" }
+            }),
+            // Rollback supersedes "second prompt"; its replacement re-seeds
+            // turn 2 at revision 2.
+            serde_json::json!({
+                "timestamp": "2026-05-17T16:49:50Z", "type": "event_msg",
+                "payload": { "type": "thread_rolled_back", "num_turns": 1 }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T16:49:55Z", "type": "event_msg",
+                "payload": { "type": "user_message", "message": "second prompt revised" }
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .into_iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let steers =
+            crate::web_gateway::external_mid_turn_steer_ledger(home.path(), "codex", session_id);
+        let seed = codex_user_turn_state_from_history_file(&path, &steers).expect("seed");
+        let entries =
+            crate::web_gateway::parse_codex_session_entries(&path, &steers).expect("replay");
+
+        let live_user_rows: Vec<(&str, Option<u64>, Option<u64>)> = entries
+            .iter()
+            .filter(|e| {
+                e["source"] == "user"
+                    && e.get("superseded").and_then(|v| v.as_bool()) != Some(true)
+            })
+            .map(|e| {
+                (
+                    e["content"].as_str().unwrap_or(""),
+                    e.get("user_turn_index").and_then(|v| v.as_u64()),
+                    e.get("user_turn_revision").and_then(|v| v.as_u64()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            live_user_rows,
+            vec![
+                ("fix the flaky test", Some(1), Some(1)),
+                (steer_text, None, None),
+                ("second prompt revised", Some(2), Some(2)),
+            ],
+            "replay lane numbers non-injected, non-steer prompts; the rollback \
+             replacement carries a bumped revision"
+        );
+        let replay_max = live_user_rows
+            .iter()
+            .filter_map(|(_, turn, _)| *turn)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            u64::from(seed.active_count()),
+            replay_max,
+            "resume seed must equal the replay lane's highest live prompt ordinal"
+        );
+        assert_eq!(seed.active_count(), 2);
+        assert_eq!(
+            seed.active_revision(1),
+            Some(1),
+            "untouched turns keep revision 1"
+        );
+        assert_eq!(
+            seed.active_revision(2),
+            Some(2),
+            "the rolled-back-and-replaced turn's revision matches the replay's replacement row"
+        );
+
+        // The live lane's next prompt continues the transcript numbering.
+        let mut live = seed;
+        assert_eq!(live.record_next_turn(), (3, 1));
     }
 
     #[test]

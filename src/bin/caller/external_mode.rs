@@ -343,7 +343,8 @@ pub(crate) async fn run_external_agent_mode(
         backend_session_id.as_str(),
     ) {
         (external_agent::AgentBackend::Codex, Some(_), session_id) => {
-            codex_user_turn_state_from_history(session_id).unwrap_or_default()
+            codex_user_turn_state_from_history(&platform::home_dir(), session_id)
+                .unwrap_or_default()
         }
         // A `--fork-session` resume starts on the placeholder id (the
         // forked child announces its own id mid-turn), so only a
