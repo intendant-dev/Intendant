@@ -92,6 +92,11 @@ pub(crate) async fn run_daemon(
     daemon_startup_resume_dir: Option<PathBuf>,
     provider_identity: crate::usage_rail::ProviderIdentity,
 ) -> Result<(), CallerError> {
+    // Install `distribution: global` builtin skills into ~/.agents/skills
+    // (marker-owned, no-op when unchanged) so every agent on this machine
+    // — supervised or not — can discover them.
+    crate::external_agent::skills_sync::install_global_skills_at_startup();
+
     // Retention guard for the daemon-global fallback store (projectless
     // staged uploads / transfer jobs): prune entries idle past the
     // retention window so the store cannot grow unbounded across restarts.

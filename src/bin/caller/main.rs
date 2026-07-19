@@ -14,6 +14,7 @@ mod background_tasks;
 mod browser_workspace;
 #[path = "../../build_info.rs"]
 mod build_info;
+mod builtin_skills;
 mod claude_auth_ceremony;
 mod codex_auth_ceremony;
 mod computer_use;

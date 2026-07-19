@@ -882,6 +882,13 @@ checkout's shared `.git/info/exclude` (one block covers all worktrees).
 Caps and the `INTENDANT_SKIP_SKILL_PROVISION` kill switch are documented
 in the configuration chapter's Skills section.
 
+Separately from per-project materialization, daemon startup installs the
+builtin `distribution: global` skills into `~/.agents/skills/` (same
+ownership contract), so they reach every agent on the machine — including
+unsupervised ones, whose actual authority over the daemon remains whatever
+IAM grants their principal. See "Global distribution" in the configuration
+chapter.
+
 ## Configuration
 
 External-agent settings live under `[agent]` in `intendant.toml`

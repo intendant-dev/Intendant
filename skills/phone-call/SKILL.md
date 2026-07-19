@@ -5,8 +5,11 @@ description: >
   using spawn_live_audio. The AI model talks through the Vortex Audio
   virtual device, which pjsua routes to the SIP call. Returns typed
   structured data from the conversation.
-compatibility: macOS only. Requires Vortex Audio HAL plugin, pjsua, and a GUI session with TCC mic permission.
+compatibility: Requires a reachable Intendant daemon. macOS only. Requires Vortex Audio HAL plugin, pjsua, and a GUI session with TCC mic permission.
+distribution: global
 ---
+
+> If `$INTENDANT`/`INTENDANT_MCP_URL` is unset and no local Intendant daemon answers, this skill does not apply — say so and stop.
 
 # Phone Call via SIP + Live Audio
 

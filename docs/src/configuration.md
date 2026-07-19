@@ -1189,10 +1189,30 @@ disable-auto-invocation: true
 Frontmatter fields: `name` (required), `description` (required), `autonomy`
 and `sandbox` (parsed, reserved — not yet enforced), `disable-auto-invocation`
 (only the user can trigger it; splits the injected catalog's auto vs manual
-sections). `disable-model-invocation`, `compatibility`, and `allowed-tools`
-are accepted in frontmatter for forward compatibility but are **not yet
-interpreted** by the parser. Project skills take precedence over personal
-skills of the same name.
+sections), `compatibility` (free-text environment requirements, surfaced
+verbatim in the injected catalog after the description so the model can rule
+a skill out *before* invoking it — descriptions stay purpose-only; other
+harnesses currently drop this field before the model sees it, so a one-line
+guard at the top of the body remains the late gate for them), and
+`distribution` (Intendant extension: `global` marks a skill the daemon
+installs machine-wide — see below). `disable-model-invocation` and
+`allowed-tools` are accepted for forward compatibility but are **not yet
+interpreted**. Project skills take precedence over personal skills of the
+same name.
+
+### Global distribution
+
+At startup (daemon, headless, and MCP modes), the daemon installs every
+builtin skill marked `distribution: global` into `~/.agents/skills/` — the
+Agent Skills standard personal path that Codex, Intendant itself, and (via
+the setup scripts' `~/.claude/skills` symlink) Claude Code all read, so the
+skills reach every agent on the machine, supervised or not. The skills are
+embedded in the binary (`builtin_skills.rs`, pinned to `skills/` by test),
+must be single-file, and follow the same ownership contract as project
+materialization: marker-owned copies, content-identical installs are no-ops,
+stale marked copies are swept on upgrade, and a user-authored directory with
+the same name always wins. `INTENDANT_SKIP_SKILL_PROVISION=1` disables this
+along with project materialization.
 
 ### Materialization for supervised external agents
 

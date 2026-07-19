@@ -933,8 +933,26 @@ if (-not ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win3
     Die "this script is for Windows"
 }
 
+
+# Claude Code reads ~\.claude\skills; junction it to the Agent Skills
+# standard dir so personal and daemon-installed skills reach it too.
+function Link-ClaudeSkills {
+    $agents = Join-Path $env:USERPROFILE ".agents\skills"
+    $claude = Join-Path $env:USERPROFILE ".claude\skills"
+    New-Item -ItemType Directory -Force -Path $agents | Out-Null
+    if ((Test-Path $claude) -and -not ((Get-Item $claude -Force).LinkType)) {
+        Warn "~\.claude\skills is a real directory -- leaving it; merge it into ~\.agents\skills to unify"
+        return
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path $claude) | Out-Null
+    if (Test-Path $claude) { (Get-Item $claude -Force).Delete() }
+    New-Item -ItemType Junction -Path $claude -Target $agents | Out-Null
+    Ok "~\.claude\skills -> ~\.agents\skills"
+}
+
 if ($Check) {
     Run-Check
 } else {
     Run-Install
+    Link-ClaudeSkills
 }
