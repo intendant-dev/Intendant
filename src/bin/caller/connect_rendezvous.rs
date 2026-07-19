@@ -975,11 +975,17 @@ fn note_register_error(
 }
 
 fn note_current_register_error(error: &str, fleet_zone_observed: &std::sync::atomic::AtomicBool) {
+    close_fleet_zone_observation(fleet_zone_observed);
+    with_status(|status| fold_register_error_status(status, error));
+}
+
+fn close_fleet_zone_observation(fleet_zone_observed: &std::sync::atomic::AtomicBool) {
     fleet_zone_observed.store(false, std::sync::atomic::Ordering::SeqCst);
-    with_status(|status| {
-        status.registered = false;
-        status.last_error = Some(error.to_string());
-    });
+}
+
+fn fold_register_error_status(status: &mut ConnectStatus, error: &str) {
+    status.registered = false;
+    status.last_error = Some(error.to_string());
 }
 
 /// Fold a register response into the status snapshot, cross-checking the
@@ -1010,23 +1016,12 @@ fn registration_matches_relay_endpoint(base_url: &Url, relay_rendezvous_key: Opt
     })
 }
 
-fn note_current_register_response_for_relay(
+fn note_fleet_zone_observation(
     response: &RegisterResponse,
     base_url: &Url,
     fleet_zone_observed: &std::sync::atomic::AtomicBool,
     relay_rendezvous_key: Option<&str>,
 ) {
-    let now = crate::access::client_key::now_unix_ms();
-    let mut print_claim: Option<String> = None;
-    let daemon_session_token = response.daemon_session_token.clone().filter(|_| {
-        response
-            .daemon_session_expires_unix_ms
-            .is_none_or(|expires| expires > now.max(0) as u64)
-    });
-    set_daemon_session(daemon_session_token);
-    if response.claimed {
-        clear_route_claim_code();
-    }
     // Fleet DNS: hand the name to the certificate machinery (it installs
     // any stored certificate the first time the name is learned).
     let provenance_accepted = match response.fleet_dns.as_ref() {
@@ -1039,100 +1034,128 @@ fn note_current_register_response_for_relay(
         provenance_accepted && registration_matches_relay_endpoint(base_url, relay_rendezvous_key),
         std::sync::atomic::Ordering::SeqCst,
     );
-    with_status(|status| {
-        status.registered = true;
-        status.last_register_unix_ms = Some(now);
-        status.last_error = None;
-        status.observed_ip = response.observed_ip.clone();
-        status.claimed = Some(response.claimed);
-        if response.claimed {
-            status.claimed_by_user_id = response.claimed_by_user_id.clone();
-            status.claimed_by_handle = response.claimed_by_handle.clone();
-            status.claim_code = None;
-            status.claim_url = None;
-            status.claim_code_expires_unix_ms = None;
-            status.claim_binding =
-                Some(match (&status.signed_claim, &response.claimed_by_user_id) {
-                    (Some(record), Some(asserted)) if record.account_user_id == *asserted => {
-                        ClaimBinding::DaemonSigned
-                    }
-                    (Some(_), Some(_)) => ClaimBinding::Mismatch,
-                    // An older service asserts no linked account id — nothing to
-                    // cross-check against, even with a local record.
-                    (Some(_), None) | (None, _) => ClaimBinding::ServiceAsserted,
-                });
-            if status.claim_binding == Some(ClaimBinding::Mismatch) {
-                eprintln!(
-                    "[connect] WARNING: the rendezvous asserts this daemon is claimed by \
-                     account {} but this daemon co-signed a claim by account {} — a re-bind \
-                     this daemon never acknowledged",
-                    response
-                        .claimed_by_user_id
-                        .as_deref()
-                        .unwrap_or("<unknown>"),
-                    status
-                        .signed_claim
-                        .as_ref()
-                        .map(|record| record.account_user_id.as_str())
-                        .unwrap_or("<none>"),
-                );
-            }
-        } else {
-            status.claimed_by_user_id = None;
-            status.claimed_by_handle = None;
-            status.claim_binding = None;
-            // New services retain only the daemon-minted hash and return
-            // null plaintext fields. Older services ignore that hash, mint
-            // their own plaintext code, and return the code/URL pair that
-            // they can actually redeem. Treat any legacy fields as a
-            // coherent pair; mixing their URL or code with the local phrase
-            // would display an unclaimable credential during a rolling
-            // service upgrade.
-            let local_code = peek_route_claim_code();
-            let (effective_code, effective_url) =
-                if response.claim_code.is_some() || response.claim_url.is_some() {
-                    (response.claim_code.clone(), response.claim_url.clone())
-                } else {
-                    let local_url = local_code
-                        .as_deref()
-                        .map(|code| route_claim_url(base_url, code));
-                    (local_code, local_url)
-                };
-            if status.claim_code != effective_code {
-                print_claim = match (&effective_url, &effective_code) {
-                    (Some(url), _) if !url.is_empty() => Some(format!(
-                        "one-time claim code: link this daemon at {url}. Linking changes no \
-                             IAM and grants no access"
-                    )),
-                    (_, Some(code)) if !code.is_empty() => Some(format!(
-                        "one-time claim code {code}. Linking changes no IAM and grants no access"
-                    )),
-                    _ => None,
-                };
-            }
-            status.claim_code = effective_code;
-            status.claim_url = effective_url;
-            status.claim_code_expires_unix_ms = response.claim_code_expires_unix_ms;
-        }
-    });
-    if let Some(line) = print_claim {
-        eprintln!("[connect] {line}");
-    }
 }
 
-#[cfg(test)]
-fn note_current_register_response(
+fn fold_register_response_status(
+    status: &mut ConnectStatus,
+    response: &RegisterResponse,
+    base_url: &Url,
+    now: i64,
+    local_code: Option<String>,
+) -> (Option<String>, Option<(String, String)>) {
+    let mut print_claim = None;
+    let mut claim_mismatch = None;
+    status.registered = true;
+    status.last_register_unix_ms = Some(now);
+    status.last_error = None;
+    status.observed_ip = response.observed_ip.clone();
+    status.claimed = Some(response.claimed);
+    if response.claimed {
+        status.claimed_by_user_id = response.claimed_by_user_id.clone();
+        status.claimed_by_handle = response.claimed_by_handle.clone();
+        status.claim_code = None;
+        status.claim_url = None;
+        status.claim_code_expires_unix_ms = None;
+        status.claim_binding = Some(match (&status.signed_claim, &response.claimed_by_user_id) {
+            (Some(record), Some(asserted)) if record.account_user_id == *asserted => {
+                ClaimBinding::DaemonSigned
+            }
+            (Some(_), Some(_)) => ClaimBinding::Mismatch,
+            // An older service asserts no linked account id — nothing to
+            // cross-check against, even with a local record.
+            (Some(_), None) | (None, _) => ClaimBinding::ServiceAsserted,
+        });
+        if status.claim_binding == Some(ClaimBinding::Mismatch) {
+            claim_mismatch = Some((
+                response
+                    .claimed_by_user_id
+                    .clone()
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+                status
+                    .signed_claim
+                    .as_ref()
+                    .map(|record| record.account_user_id.clone())
+                    .unwrap_or_else(|| "<none>".to_string()),
+            ));
+        }
+    } else {
+        status.claimed_by_user_id = None;
+        status.claimed_by_handle = None;
+        status.claim_binding = None;
+        // New services retain only the daemon-minted hash and return
+        // null plaintext fields. Older services ignore that hash, mint
+        // their own plaintext code, and return the code/URL pair that
+        // they can actually redeem. Treat any legacy fields as a
+        // coherent pair; mixing their URL or code with the local phrase
+        // would display an unclaimable credential during a rolling
+        // service upgrade.
+        let (effective_code, effective_url) =
+            if response.claim_code.is_some() || response.claim_url.is_some() {
+                (response.claim_code.clone(), response.claim_url.clone())
+            } else {
+                let local_url = local_code
+                    .as_deref()
+                    .map(|code| route_claim_url(base_url, code));
+                (local_code, local_url)
+            };
+        if status.claim_code != effective_code {
+            print_claim = match (&effective_url, &effective_code) {
+                (Some(url), _) if !url.is_empty() => Some(format!(
+                    "one-time claim code: link this daemon at {url}. Linking changes no \
+                         IAM and grants no access"
+                )),
+                (_, Some(code)) if !code.is_empty() => Some(format!(
+                    "one-time claim code {code}. Linking changes no IAM and grants no access"
+                )),
+                _ => None,
+            };
+        }
+        status.claim_code = effective_code;
+        status.claim_url = effective_url;
+        status.claim_code_expires_unix_ms = response.claim_code_expires_unix_ms;
+    }
+    (print_claim, claim_mismatch)
+}
+
+fn note_current_register_response_for_relay(
     response: &RegisterResponse,
     base_url: &Url,
     fleet_zone_observed: &std::sync::atomic::AtomicBool,
+    relay_rendezvous_key: Option<&str>,
 ) {
-    let relay_rendezvous_key = rendezvous_endpoint_key(Some(base_url.as_str()));
-    note_current_register_response_for_relay(
+    let now = crate::access::client_key::now_unix_ms();
+    let daemon_session_token = response.daemon_session_token.clone().filter(|_| {
+        response
+            .daemon_session_expires_unix_ms
+            .is_none_or(|expires| expires > now.max(0) as u64)
+    });
+    set_daemon_session(daemon_session_token);
+    let local_code = if response.claimed {
+        clear_route_claim_code();
+        None
+    } else {
+        peek_route_claim_code()
+    };
+    note_fleet_zone_observation(
         response,
         base_url,
         fleet_zone_observed,
-        relay_rendezvous_key.as_deref(),
+        relay_rendezvous_key,
     );
+    let mut fold = (None, None);
+    with_status(|status| {
+        fold = fold_register_response_status(status, response, base_url, now, local_code);
+    });
+    if let Some((asserted, signed)) = fold.1 {
+        eprintln!(
+            "[connect] WARNING: the rendezvous asserts this daemon is claimed by \
+             account {asserted} but this daemon co-signed a claim by account {signed} — a \
+             re-bind this daemon never acknowledged"
+        );
+    }
+    if let Some(line) = fold.0 {
+        eprintln!("[connect] {line}");
+    }
 }
 
 /// Report leases that expired without an .env fallback (credential
@@ -2137,6 +2160,20 @@ pub(crate) fn join_url(base_url: &Url, path: &str) -> Result<Url, String> {
 mod tests {
     use super::*;
 
+    fn note_test_fleet_zone_observation(
+        response: &RegisterResponse,
+        base_url: &Url,
+        observed: &std::sync::atomic::AtomicBool,
+    ) {
+        let relay_rendezvous_key = rendezvous_endpoint_key(Some(base_url.as_str()));
+        note_fleet_zone_observation(
+            response,
+            base_url,
+            observed,
+            relay_rendezvous_key.as_deref(),
+        );
+    }
+
     fn hosted_event_test_registry(
         root: &std::path::Path,
     ) -> (
@@ -2562,7 +2599,7 @@ mod tests {
                 name: String::new(),
             }),
         };
-        note_current_register_response(&response, &base_url, &observed);
+        note_test_fleet_zone_observation(&response, &base_url, &observed);
         assert!(!observed.load(std::sync::atomic::Ordering::SeqCst));
 
         response.fleet_dns = Some(FleetDnsHint {
@@ -2570,7 +2607,7 @@ mod tests {
             name: "d-1234567890abcdef1234.fleet.example.test".to_string(),
         });
         observed.store(true, std::sync::atomic::Ordering::SeqCst);
-        note_current_register_response(&response, &base_url, &observed);
+        note_test_fleet_zone_observation(&response, &base_url, &observed);
         assert!(!observed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
@@ -2578,7 +2615,7 @@ mod tests {
     fn omitted_fleet_dns_hint_does_not_open_the_observation_gate() {
         let base_url = Url::parse("https://connect.example").unwrap();
         let observed = std::sync::atomic::AtomicBool::new(true);
-        note_current_register_response(
+        note_test_fleet_zone_observation(
             &RegisterResponse {
                 claimed: false,
                 claimed_by_user_id: None,
@@ -2632,14 +2669,13 @@ mod tests {
             protocol: CLAIM_PROTOCOL_V2.to_string(),
             signed_at_unix_ms: 1_700_000_000_000,
         };
-        with_status(|status| {
-            *status = ConnectStatus::default();
-            status.signed_claim = Some(record);
-        });
-
+        let mut status = ConnectStatus {
+            signed_claim: Some(record),
+            ..ConnectStatus::default()
+        };
         let base_url = Url::parse("https://connect.example").unwrap();
-        let fleet_zone_observed = std::sync::atomic::AtomicBool::new(false);
-        note_current_register_response(
+        let (claim_line, mismatch) = fold_register_response_status(
+            &mut status,
             &RegisterResponse {
                 claimed: true,
                 claimed_by_user_id: Some("alice-user-id".to_string()),
@@ -2653,17 +2689,25 @@ mod tests {
                 fleet_dns: None,
             },
             &base_url,
-            &fleet_zone_observed,
+            1_700_000_000_000,
+            None,
         );
+        assert_eq!(status.claim_binding, Some(ClaimBinding::DaemonSigned));
+        assert_eq!(claim_line, None);
+        assert_eq!(mismatch, None);
+
+        let fleet_zone_observed = std::sync::atomic::AtomicBool::new(true);
+        close_fleet_zone_observation(&fleet_zone_observed);
+        fold_register_error_status(&mut status, "registration refresh unavailable");
+        assert!(!status.registered);
         assert_eq!(
-            status_snapshot().claim_binding,
-            Some(ClaimBinding::DaemonSigned)
+            status.last_error.as_deref(),
+            Some("registration refresh unavailable")
         );
-        assert!(!fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
-        note_current_register_error("registration refresh unavailable", &fleet_zone_observed);
         assert!(!fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
 
-        note_current_register_response(
+        let (_, mismatch) = fold_register_response_status(
+            &mut status,
             &RegisterResponse {
                 claimed: true,
                 claimed_by_user_id: Some("mallory-user-id".to_string()),
@@ -2677,21 +2721,23 @@ mod tests {
                 fleet_dns: None,
             },
             &base_url,
-            &fleet_zone_observed,
+            1_700_000_000_001,
+            None,
         );
+        assert_eq!(status.claim_binding, Some(ClaimBinding::Mismatch));
         assert_eq!(
-            status_snapshot().claim_binding,
-            Some(ClaimBinding::Mismatch)
+            mismatch,
+            Some(("mallory-user-id".to_string(), "alice-user-id".to_string()))
         );
-        assert!(!fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
 
         // During a mixed-version rollout an older service ignores the
         // daemon-minted hash and returns the different plaintext phrase it
         // can redeem. Its coherent response pair must outrank the local
         // phrase; otherwise the dashboard displays an unclaimable code.
-        let local_code = current_route_claim_code().unwrap();
+        let local_code = "local-claim-code".to_string();
         assert_ne!(local_code, "word-word-word");
-        note_current_register_response(
+        let (claim_line, mismatch) = fold_register_response_status(
+            &mut status,
             &RegisterResponse {
                 claimed: false,
                 claimed_by_user_id: None,
@@ -2707,9 +2753,11 @@ mod tests {
                 fleet_dns: None,
             },
             &base_url,
-            &fleet_zone_observed,
+            1_700_000_600_000,
+            Some(local_code.clone()),
         );
-        let status = status_snapshot();
+        assert_eq!(mismatch, None);
+        assert!(claim_line.is_some());
         assert_eq!(status.claimed, Some(false));
         assert_eq!(status.claim_binding, None);
         assert_eq!(status.claim_code.as_deref(), Some("word-word-word"));
@@ -2722,7 +2770,8 @@ mod tests {
         // A new service returns null plaintext fields because it retained the
         // signed local hash. In that case the same local phrase and its
         // fragment URL are the claim surface.
-        note_current_register_response(
+        let (claim_line, mismatch) = fold_register_response_status(
+            &mut status,
             &RegisterResponse {
                 claimed: false,
                 claimed_by_user_id: None,
@@ -2736,18 +2785,15 @@ mod tests {
                 fleet_dns: None,
             },
             &base_url,
-            &fleet_zone_observed,
+            1_700_001_200_000,
+            Some(local_code.clone()),
         );
-        let status = status_snapshot();
+        assert_eq!(mismatch, None);
+        assert!(claim_line.is_some());
         assert_eq!(status.claim_code.as_deref(), Some(local_code.as_str()));
         let local_url = route_claim_url(&base_url, &local_code);
         assert_eq!(status.claim_url.as_deref(), Some(local_url.as_str()));
         assert_eq!(status.claim_code_expires_unix_ms, Some(1_700_001_200_000));
-
-        // Leave no residue for other tests sharing the process-global
-        // registry.
-        clear_route_claim_code();
-        with_status(|status| *status = ConnectStatus::default());
     }
 
     #[test]
