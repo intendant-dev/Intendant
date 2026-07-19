@@ -273,7 +273,12 @@ pub(crate) fn index_external_wrapper_session_row(home: &Path, session: &serde_js
         return;
     };
     let project_root = value_str(session, "project_root").map(PathBuf::from);
-    let _ = crate::external_wrapper_index::upsert(
+    // Backfill, never upsert: the list scan re-visits every historical
+    // wrapper row on every pass, and an ACTIVATING write here re-elected
+    // "active" in directory-scan order, clobbering the real active wrapper
+    // minted at identity-commit (`session_log/bus_events.rs`) within one
+    // pass. The scan may only record history.
+    let _ = crate::external_wrapper_index::backfill(
         home,
         &source,
         &backend_session_id,
