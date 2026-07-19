@@ -483,7 +483,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "ask_user",
         manual_http_tool_definition!(
             "ask_user",
-            "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Returns {status, answer, answers}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform.",
+            "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total. Returns {status, answer, answers}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform.",
             AskUserParams
         ),
     );
@@ -677,6 +677,34 @@ mod tests {
             (
                 "list_rewind_anchors",
                 IntendantServer::list_rewind_anchors_tool_attr(),
+            ),
+        ] {
+            let manual_description = manual
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .and_then(|tool| tool["description"].as_str())
+                .unwrap_or_else(|| panic!("missing manual HTTP definition for {name}"));
+            let attr_description = attr.description.as_deref().unwrap_or_default();
+            assert_eq!(
+                manual_description, attr_description,
+                "{name} manual HTTP description drifted from its #[tool] attribute"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_http_interaction_tool_descriptions_match_tool_attributes() {
+        // Same drift guard as the rewind tools for the agent→user
+        // interaction family: the manual HTTP definitions and the #[tool]
+        // attributes are two copies of the same description.
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, true, None);
+        for (name, attr) in [
+            ("ask_user", IntendantServer::ask_user_tool_attr()),
+            ("notify_user", IntendantServer::notify_user_tool_attr()),
+            (
+                "post_session_note",
+                IntendantServer::post_session_note_tool_attr(),
             ),
         ] {
             let manual_description = manual

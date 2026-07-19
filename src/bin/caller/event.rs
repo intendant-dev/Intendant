@@ -4470,6 +4470,7 @@ mod tests {
                     description: "Relational".into(),
                 }],
                 multi_select: false,
+                previews: Vec::new(),
             }],
         };
         match app_event_to_outbound(&event).unwrap() {

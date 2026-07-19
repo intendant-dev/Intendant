@@ -160,6 +160,48 @@ pub struct UserQuestionOption {
     pub description: String,
 }
 
+/// One rendered preview card attached to a [`UserQuestion`] — the
+/// "show, then ask" surface: prototype variants to choose between,
+/// before/after states to judge. Blob-backed variants are *references*
+/// into the session upload store (mirroring [`SessionNoteAttachment`]):
+/// the WebSocket broadcast and the session log stay small, and the
+/// dashboard fetches the bytes lazily from `url`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionPreview {
+    /// Short card caption (e.g. "A", "Before", or the matching option
+    /// label). Shown above the rendered preview.
+    pub label: String,
+    #[serde(flatten)]
+    pub source: QuestionPreviewSource,
+}
+
+/// What a [`QuestionPreview`] card renders.
+///
+/// `Html` is agent-authored markup. The dashboard renders it ONLY inside
+/// an `<iframe sandbox="allow-scripts">` populated via `srcdoc` — an
+/// opaque origin, never `allow-same-origin`: dashboard authentication is
+/// ambient (mTLS client cert → IAM principal), so agent HTML executing
+/// with dashboard-origin authority would be XSS with the operator's full
+/// daemon authority. The `/raw` route's attachment + nosniff posture is
+/// unchanged and still forbids direct navigation from rendering blobs;
+/// this variant only changes how the dashboard *consumes* the bytes
+/// (authenticated fetch → srcdoc), never how the route serves them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuestionPreviewSource {
+    /// A self-contained HTML document committed to the upload store.
+    Html { upload_id: String, url: String },
+    /// A raster image committed to the upload store (same MIME allowlist
+    /// as session-note attachments; SVG stays excluded).
+    Image {
+        upload_id: String,
+        mime: String,
+        url: String,
+    },
+    /// A small inline text/code snippet, rendered preformatted (escaped).
+    Text { content: String },
+}
+
 /// One question an agent asks the human, with structured choices
 /// (Claude Code's `AskUserQuestion` shape). Unlike an approval this is a
 /// request for *input*, not permission: it is never auto-approved, and the
@@ -176,6 +218,10 @@ pub struct UserQuestion {
     /// Multiple options may be selected (answers join with ", ").
     #[serde(default)]
     pub multi_select: bool,
+    /// Rendered preview cards shown above the options — show, then ask
+    /// (prototype variants, before/after states). See [`QuestionPreview`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previews: Vec<QuestionPreview>,
 }
 
 /// Urgency of an agent→user notification (`notify_user`). A closed

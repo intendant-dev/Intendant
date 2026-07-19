@@ -2323,6 +2323,7 @@ pub(crate) async fn run_agent_loop(
                         header: String::new(),
                         options: Vec::new(),
                         multi_select: false,
+                        previews: Vec::new(),
                     }],
                 });
                 let answer = match rx.await {
@@ -2924,6 +2925,7 @@ Proceed with explicit assumptions and continue without additional questions."
                         header: String::new(),
                         options: Vec::new(),
                         multi_select: false,
+                        previews: Vec::new(),
                     }],
                 });
                 let answer = match rx.await {
@@ -4067,6 +4069,7 @@ fn raise_sandbox_consent_cards(
                     },
                 ],
                 multi_select: false,
+                previews: Vec::new(),
             }],
         });
         let bus = bus.clone();

@@ -450,34 +450,57 @@ fn parse_user_questions(input: &serde_json::Value) -> Option<Vec<crate::types::U
             if text.is_empty() {
                 return None;
             }
-            let options = q
+            let mut options = Vec::new();
+            let mut previews = Vec::new();
+            for opt in q
                 .get("options")
                 .and_then(|o| o.as_array())
-                .map(|opts| {
-                    opts.iter()
-                        .filter_map(|opt| {
-                            // The schema says `{label, description}`, but older
-                            // CLIs sent plain strings — accept both.
-                            let (label, description) = match opt {
-                                serde_json::Value::String(s) => (s.trim(), ""),
-                                _ => (
-                                    opt.get("label").and_then(|l| l.as_str())?.trim(),
-                                    opt.get("description")
-                                        .and_then(|d| d.as_str())
-                                        .unwrap_or(""),
-                                ),
-                            };
-                            if label.is_empty() {
-                                return None;
-                            }
-                            Some(crate::types::UserQuestionOption {
-                                label: label.to_string(),
-                                description: description.trim().to_string(),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                // The schema says `{label, description}`, but older
+                // CLIs sent plain strings — accept both.
+                let (label, description) = match opt {
+                    serde_json::Value::String(s) => (s.trim(), ""),
+                    _ => {
+                        let Some(label) = opt.get("label").and_then(|l| l.as_str()) else {
+                            continue;
+                        };
+                        (
+                            label.trim(),
+                            opt.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                        )
+                    }
+                };
+                if label.is_empty() {
+                    continue;
+                }
+                // Claude Code's option schema also carries an optional
+                // `preview` (mockups, code snippets) its own picker renders
+                // on focus; surface it as an inline text card on the
+                // dashboard rail, labeled by its option.
+                let preview = opt
+                    .get("preview")
+                    .and_then(|p| p.as_str())
+                    .map(str::trim)
+                    .unwrap_or("");
+                if !preview.is_empty() {
+                    previews.push(crate::types::QuestionPreview {
+                        label: label.to_string(),
+                        source: crate::types::QuestionPreviewSource::Text {
+                            content: crate::types::truncate_str(
+                                preview,
+                                crate::mcp::ASK_USER_MAX_TEXT_PREVIEW_BYTES,
+                            )
+                            .to_string(),
+                        },
+                    });
+                }
+                options.push(crate::types::UserQuestionOption {
+                    label: label.to_string(),
+                    description: description.trim().to_string(),
+                });
+            }
             Some(crate::types::UserQuestion {
                 question: text.to_string(),
                 header: q
@@ -491,6 +514,7 @@ fn parse_user_questions(input: &serde_json::Value) -> Option<Vec<crate::types::U
                     .get("multiSelect")
                     .and_then(|m| m.as_bool())
                     .unwrap_or(false),
+                previews,
             })
         })
         .collect();
@@ -6721,6 +6745,41 @@ mod tests {
         assert_eq!(questions[0].options[0].description, "");
         assert!(questions[0].multi_select);
         assert_eq!(questions[0].header, "");
+        assert!(questions[0].previews.is_empty());
+    }
+
+    #[test]
+    fn parse_user_questions_carries_option_previews_as_text_cards() {
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "Which layout?",
+                "header": "Layout",
+                "options": [
+                    {"label": "Dense", "description": "d", "preview": "  <table> mock  "},
+                    {"label": "Cozy", "preview": "   "},
+                    {"label": "Big", "preview": "x".repeat(10_000)},
+                    "Plain",
+                ],
+            }]
+        });
+        let questions = parse_user_questions(&input).expect("parsed");
+        assert_eq!(questions[0].options.len(), 4);
+        // Non-empty previews become inline text cards labeled by their
+        // option; whitespace-only previews are dropped; oversized ones
+        // truncate to the ask preview text cap.
+        let previews = &questions[0].previews;
+        assert_eq!(previews.len(), 2);
+        assert_eq!(previews[0].label, "Dense");
+        assert!(matches!(
+            &previews[0].source,
+            crate::types::QuestionPreviewSource::Text { content } if content == "<table> mock"
+        ));
+        assert_eq!(previews[1].label, "Big");
+        assert!(matches!(
+            &previews[1].source,
+            crate::types::QuestionPreviewSource::Text { content }
+                if content.len() == crate::mcp::ASK_USER_MAX_TEXT_PREVIEW_BYTES
+        ));
     }
 
     #[test]

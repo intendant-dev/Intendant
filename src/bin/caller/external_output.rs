@@ -958,12 +958,14 @@ mod tests {
                     },
                 ],
                 multi_select: false,
+                previews: Vec::new(),
             },
             crate::types::UserQuestion {
                 question: "Auth?".into(),
                 header: String::new(),
                 options: Vec::new(),
                 multi_select: false,
+                previews: Vec::new(),
             },
         ];
         assert_eq!(
@@ -982,12 +984,14 @@ mod tests {
                 header: String::new(),
                 options: Vec::new(),
                 multi_select: false,
+                previews: Vec::new(),
             },
             crate::types::UserQuestion {
                 question: "Q2".into(),
                 header: String::new(),
                 options: Vec::new(),
                 multi_select: true,
+                previews: Vec::new(),
             },
         ];
         let answers = unanswered_question_answers(&questions, "note");

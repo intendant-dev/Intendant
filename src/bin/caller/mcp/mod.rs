@@ -61,7 +61,7 @@ pub(crate) use tool_params::*;
 mod tools_ask;
 pub(crate) use tools_ask::{
     ask_user_question_pending, ASK_USER_DEFAULT_WAIT_SECS, ASK_USER_MAX_OPTIONS,
-    ASK_USER_MAX_WAIT_SECS, NOTIFY_USER_MAX_TEXT_BYTES,
+    ASK_USER_MAX_TEXT_PREVIEW_BYTES, ASK_USER_MAX_WAIT_SECS, NOTIFY_USER_MAX_TEXT_BYTES,
 };
 mod tools_display;
 mod tools_managed;
