@@ -11,6 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_AGENT_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
+/// Process-wide allocator for every approval and structured-question rail.
+///
+/// Approval registries are session-scoped, but events and frontend state are
+/// daemon-wide. A single allocator keeps their numeric wire ids unambiguous
+/// even when several sessions block concurrently. The base leaves all legacy
+/// turn/range ids below it and remains exactly representable by JavaScript.
+static NEXT_APPROVAL_ID: AtomicU64 = AtomicU64::new(1 << 44);
+const MAX_SAFE_WIRE_ID: u64 = (1 << 53) - 1;
 const OUTBOUND_CONTEXT_SNAPSHOT_RAW_INLINE_LIMIT: usize = 128 * 1024;
 
 pub fn next_agent_output_id() -> String {
@@ -20,6 +28,15 @@ pub fn next_agent_output_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or_default();
     format!("ao-{millis:x}-{seq:x}")
+}
+
+pub(crate) fn next_approval_id() -> u64 {
+    let id = NEXT_APPROVAL_ID.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        id <= MAX_SAFE_WIRE_ID,
+        "process exhausted the JavaScript-safe approval id space"
+    );
+    id
 }
 
 /// Source of a context injection item.
@@ -4017,6 +4034,14 @@ pub fn spawn_human_question_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_ids_are_process_wide_monotonic_and_wire_safe() {
+        let first = next_approval_id();
+        let second = next_approval_id();
+        assert!(second > first);
+        assert!(second <= MAX_SAFE_WIRE_ID);
+    }
 
     #[test]
     fn event_bus_send_receive() {

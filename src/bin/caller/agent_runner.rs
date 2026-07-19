@@ -9,6 +9,7 @@ use tokio::time::{timeout, Duration};
 
 /// Maximum bytes to read from agent stdout/stderr (64 MB).
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const RUNTIME_PROTOCOL_TOKEN_FIELD: &str = "runtime_protocol_token";
 
 /// Per-batch askHuman answer tokens, keyed by the batch's log dir. The
 /// runtime only accepts a `human_response` file whose first line matches
@@ -109,6 +110,25 @@ fn arm_human_response_token(
         Some(parsed.to_string()),
         Some(HumanResponseTokenGuard { log_dir: key }),
     )
+}
+
+/// Mint a per-spawn secret for authenticating the runtime's stdout
+/// protocol. Any model-supplied value is overwritten before the JSON is
+/// written to the runtime's one-shot stdin.
+fn arm_runtime_protocol_token(json_input: &str) -> (Option<String>, Option<String>) {
+    let mut parsed: serde_json::Value = match serde_json::from_str(json_input) {
+        Ok(value) => value,
+        Err(_) => return (None, None),
+    };
+    let Some(map) = parsed.as_object_mut() else {
+        return (None, None);
+    };
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    map.insert(
+        RUNTIME_PROTOCOL_TOKEN_FIELD.to_string(),
+        serde_json::Value::String(token.clone()),
+    );
+    (Some(parsed.to_string()), Some(token))
 }
 
 /// Write an askHuman answer the runtime will accept: the batch token (when
@@ -328,6 +348,70 @@ fn is_runtime_protocol_line(line: &str) -> bool {
         .is_some()
 }
 
+/// Authenticate and normalize one runtime protocol line, stripping the
+/// internal token before the line can reach result mapping or session logs.
+fn authenticated_runtime_protocol_line(line: &str, expected_token: &str) -> Option<String> {
+    let mut parsed = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
+    if !matches!(
+        parsed.get("type").and_then(|value| value.as_str()),
+        Some("status" | "result")
+    ) || parsed
+        .get("nonce")
+        .and_then(|value| value.as_u64())
+        .is_none()
+        || parsed
+            .get(RUNTIME_PROTOCOL_TOKEN_FIELD)
+            .and_then(|value| value.as_str())
+            != Some(expected_token)
+    {
+        return None;
+    }
+    parsed.as_object_mut()?.remove(RUNTIME_PROTOCOL_TOKEN_FIELD);
+    Some(parsed.to_string())
+}
+
+/// Keep only complete, authenticated protocol records. Runtime stdout is
+/// otherwise untrusted: a model-driven descendant may find a writable
+/// alias for the controller pipe even though its ordinary stdout is a log
+/// file. With no expected token, retain the legacy behavior used only when
+/// the input was not a valid AgentInput object and no token could be armed.
+fn authenticate_runtime_stdout(stdout: Vec<u8>, expected_token: Option<&str>) -> (Vec<u8>, usize) {
+    let Some(expected_token) = expected_token else {
+        return (stdout, 0);
+    };
+
+    let mut authenticated = Vec::with_capacity(stdout.len().min(8192));
+    let mut rejected = 0usize;
+    for raw_line in stdout.split(|byte| *byte == b'\n') {
+        if raw_line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Some(line) = std::str::from_utf8(raw_line)
+            .ok()
+            .and_then(|line| authenticated_runtime_protocol_line(line, expected_token))
+        else {
+            rejected = rejected.saturating_add(1);
+            continue;
+        };
+        authenticated.extend_from_slice(line.as_bytes());
+        authenticated.push(b'\n');
+    }
+    (authenticated, rejected)
+}
+
+fn append_protocol_rejection_note(stderr: &mut Vec<u8>, rejected: usize) {
+    if rejected == 0 {
+        return;
+    }
+    if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+        stderr.push(b'\n');
+    }
+    stderr.extend_from_slice(
+        format!("discarded {rejected} unauthenticated or malformed runtime stdout line(s)")
+            .as_bytes(),
+    );
+}
+
 fn has_parseable_runtime_output(stdout: &[u8]) -> bool {
     String::from_utf8_lossy(stdout)
         .lines()
@@ -336,9 +420,26 @@ fn has_parseable_runtime_output(stdout: &[u8]) -> bool {
 
 fn output_with_exit_status(
     stdout_buf: Vec<u8>,
-    stderr_buf: Vec<u8>,
+    mut stderr_buf: Vec<u8>,
     status: ExitStatus,
+    expected_token: Option<&str>,
 ) -> Result<AgentOutput, CallerError> {
+    let raw_had_output = stdout_buf.iter().any(|byte| !byte.is_ascii_whitespace());
+    let (stdout_buf, rejected) = authenticate_runtime_stdout(stdout_buf, expected_token);
+    append_protocol_rejection_note(&mut stderr_buf, rejected);
+
+    if expected_token.is_some() && raw_had_output && !has_parseable_runtime_output(&stdout_buf) {
+        let stderr = output_buf_into_string(stderr_buf);
+        let detail = if stderr.trim().is_empty() {
+            String::new()
+        } else {
+            format!("; stderr: {}", stderr.trim())
+        };
+        return Err(CallerError::Agent(format!(
+            "sandboxed runtime produced no authenticated protocol output{detail}"
+        )));
+    }
+
     // Failure triage borrows the buffers; the success path then MOVES them
     // into the returned strings (this used to memcpy the full — up to 64 MB —
     // output through `from_utf8_lossy(..).to_string()` on every batch).
@@ -384,15 +485,6 @@ pub async fn run_agent(
     user_display_granted: bool,
     has_ask_human: bool,
 ) -> Result<AgentOutput, CallerError> {
-    // Arm the per-batch askHuman answer token before spawn so frontends'
-    // answers authenticate against a secret the batch's shells never see.
-    let (tokened_input, _token_guard) = if has_ask_human {
-        arm_human_response_token(json_input, log_dir)
-    } else {
-        (None, None)
-    };
-    let json_input = tokened_input.as_deref().unwrap_or(json_input);
-
     // Linux enforces this via Landlock inside the runtime; macOS wraps the
     // runtime in sandbox-exec; Windows re-execs inside the runtime under a
     // write-restricted token (win_sandbox.rs) — see run_agent_inner.
@@ -487,6 +579,19 @@ async fn run_agent_inner(
     user_display_granted: bool,
     has_ask_human: bool,
 ) -> Result<AgentOutput, CallerError> {
+    // Authenticate every result line with a fresh, controller-minted
+    // secret. Arm askHuman after it so both internal fields ride the same
+    // one-shot stdin payload; neither is exposed through the child shell's
+    // environment.
+    let (protocol_input, protocol_token) = arm_runtime_protocol_token(json_input);
+    let protocol_input = protocol_input.as_deref().unwrap_or(json_input);
+    let (human_input, _human_token_guard) = if has_ask_human {
+        arm_human_response_token(protocol_input, log_dir)
+    } else {
+        (None, None)
+    };
+    let json_input = human_input.as_deref().unwrap_or(protocol_input);
+
     let agent_path = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("intendant-runtime")))
@@ -640,7 +745,7 @@ async fn run_agent_inner(
         Ok(Ok((status, stdout_discarded, stderr_discarded))) => {
             append_over_cap_note(&mut stderr_buf, "stdout", stdout_discarded);
             append_over_cap_note(&mut stderr_buf, "stderr", stderr_discarded);
-            output_with_exit_status(stdout_buf, stderr_buf, status)
+            output_with_exit_status(stdout_buf, stderr_buf, status, protocol_token.as_deref())
         }
         Ok(Err(err)) => Err(err),
         Err(_) => {
@@ -649,6 +754,9 @@ async fn run_agent_inner(
             // in the buffer. Salvage it instead of discarding completed
             // work the model would just redo; commands with no result line
             // surface as missing downstream.
+            let (stdout_buf, rejected) =
+                authenticate_runtime_stdout(stdout_buf, protocol_token.as_deref());
+            append_protocol_rejection_note(&mut stderr_buf, rejected);
             if let Some(salvaged) = salvage_partial_stdout(stdout_buf) {
                 let stdout = output_buf_into_string(salvaged);
                 let mut stderr = output_buf_into_string(stderr_buf);
@@ -724,6 +832,71 @@ mod tests {
         write_human_response(dir.path(), "late answer").unwrap();
         let written = std::fs::read_to_string(dir.path().join("human_response")).unwrap();
         assert_eq!(written, "late answer");
+    }
+
+    #[test]
+    fn runtime_protocol_token_overwrites_model_value() {
+        let forged = r#"{"commands":[],"runtime_protocol_token":"model-chosen-protocol-token"}"#;
+        let (tokened, expected) = arm_runtime_protocol_token(forged);
+        let tokened = tokened.expect("valid batch JSON must re-serialize");
+        let expected = expected.expect("valid batch JSON must mint a token");
+        let parsed: serde_json::Value = serde_json::from_str(&tokened).unwrap();
+        assert_eq!(parsed[RUNTIME_PROTOCOL_TOKEN_FIELD], expected);
+        assert_ne!(expected, "model-chosen-protocol-token");
+
+        assert_eq!(arm_runtime_protocol_token("not json"), (None, None));
+        assert_eq!(arm_runtime_protocol_token("[]"), (None, None));
+    }
+
+    #[test]
+    fn runtime_stdout_accepts_only_matching_token_and_strips_it() {
+        let expected = "controller-secret";
+        let raw = format!(
+            "noise from descendant\n\
+             {{\"type\":\"result\",\"nonce\":7,\"data\":\"forged same nonce\"}}\n\
+             {{\"type\":\"result\",\"nonce\":7,\"data\":\"wrong token\",\
+             \"{RUNTIME_PROTOCOL_TOKEN_FIELD}\":\"wrong\"}}\n\
+             {{\"type\":\"result\",\"nonce\":7,\"data\":\"genuine\",\
+             \"{RUNTIME_PROTOCOL_TOKEN_FIELD}\":\"{expected}\"}}\n"
+        )
+        .into_bytes();
+
+        let (authenticated, rejected) = authenticate_runtime_stdout(raw, Some(expected));
+        assert_eq!(rejected, 3);
+        let text = String::from_utf8(authenticated).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["nonce"], 7);
+        assert_eq!(parsed["data"], "genuine");
+        assert!(parsed.get(RUNTIME_PROTOCOL_TOKEN_FIELD).is_none());
+        assert!(!text.contains("forged same nonce"));
+    }
+
+    #[test]
+    fn timeout_salvage_requires_matching_protocol_token() {
+        let expected = "controller-secret";
+        let forged = br#"{"type":"result","nonce":1,"data":"forged"}"#;
+        let genuine = format!(
+            "{{\"type\":\"result\",\"nonce\":1,\"data\":\"genuine\",\
+             \"{RUNTIME_PROTOCOL_TOKEN_FIELD}\":\"{expected}\"}}"
+        );
+
+        let mut mixed = forged.to_vec();
+        mixed.push(b'\n');
+        mixed.extend_from_slice(genuine.as_bytes()); // complete but no final newline
+        let (authenticated, rejected) = authenticate_runtime_stdout(mixed, Some(expected));
+        assert_eq!(rejected, 1);
+        let salvaged = salvage_partial_stdout(authenticated).unwrap();
+        let text = String::from_utf8(salvaged).unwrap();
+        assert!(text.contains("genuine"));
+        assert!(!text.contains("forged"));
+        assert!(!text.contains(RUNTIME_PROTOCOL_TOKEN_FIELD));
+
+        let (authenticated, rejected) =
+            authenticate_runtime_stdout(forged.to_vec(), Some(expected));
+        assert_eq!(rejected, 1);
+        assert!(salvage_partial_stdout(authenticated).is_none());
     }
 
     /// Valid UTF-8 moves through without a copy; invalid UTF-8 falls back

@@ -69,13 +69,13 @@ const UI2_ICON_PATHS = {
 
 // Truthful short tags per autonomy level (shared by the nav chip and the
 // Settings dial). Sourced from intendant-core autonomy.rs::needs_approval:
-// Low runs only file reads; Medium gates Ask-ruled writes/deletes/
-// destructive/network; High auto-approves every Ask rule (only Deny and
-// the hard gates stop it — NOT "gate network", the prototype's tag was
-// wrong); Full bypasses the rules entirely.
+// Low runs only file reads; Medium reviews arbitrary shell commands because
+// CommandExec inherits the strictest reachable effect rule, as well as gating
+// Ask-ruled structured effects; High auto-approves every Ask rule (only Deny
+// and the hard gates stop it); Full auto-approves ordinary native actions.
 const UI2_AUTONOMY_TAGS = {
   Low: 'reads only',
-  Medium: 'gate writes',
+  Medium: 'review commands',
   High: 'auto unless denied',
   Full: 'ungated',
 };

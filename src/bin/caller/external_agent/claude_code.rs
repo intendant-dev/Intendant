@@ -1524,10 +1524,17 @@ impl CcReader {
         }
     }
 
-    /// Surface the injected Intendant MCP server's health from the init
-    /// message. A failed loopback connection was previously invisible: the
-    /// backend simply ran without display/CU tools and nobody could tell
-    /// why from a frontend.
+    /// Surface the injected Intendant MCP server's health as Claude Code
+    /// reports it in the init message — the client-side echo, phrased as
+    /// such. The daemon's gate reports its own serves firsthand and
+    /// immediately (`web_gateway::note_supervised_mcp_serve`); this
+    /// turn-boundary echo is the only authority on client-side
+    /// *registration* — the CLI can accept the transport yet reject the
+    /// served tool list (schema validation), so "connected" is reported
+    /// with the number of Intendant tools it actually registered. A failed
+    /// loopback connection was previously invisible: the backend simply
+    /// ran without display/CU tools and nobody could tell why from a
+    /// frontend.
     fn report_intendant_mcp_status(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         let status = msg
             .get("mcp_servers")
@@ -1545,14 +1552,38 @@ impl CcReader {
         }
         self.last_intendant_mcp_status = Some(status.clone());
         match status.as_str() {
-            "connected" => out.log("info", "Intendant MCP server connected"),
+            "connected" => {
+                // Registration truth: count the Intendant tools the CLI
+                // accepted into its tool set (`mcp__intendant__*` names).
+                // Transport-connected with zero registered tools is the
+                // client-side-rejection signature — the count keeps that
+                // visible.
+                let registered = msg.get("tools").and_then(|t| t.as_array()).map(|tools| {
+                    tools
+                        .iter()
+                        .filter(|tool| {
+                            tool.as_str()
+                                .is_some_and(|name| name.starts_with("mcp__intendant__"))
+                        })
+                        .count()
+                });
+                out.log(
+                    "info",
+                    match registered {
+                        Some(count) => format!(
+                            "Claude Code reports MCP: connected — {count} tools registered"
+                        ),
+                        None => "Claude Code reports MCP: connected".to_string(),
+                    },
+                );
+            }
             "missing" => out.log(
                 "warn",
-                "Intendant MCP server missing from Claude Code's MCP config — display/CU tools unavailable",
+                "Claude Code reports MCP: Intendant server missing from its MCP config — display/CU tools unavailable",
             ),
             other => out.log(
                 "warn",
-                format!("Intendant MCP server status: {other} — display/CU tools may be unavailable"),
+                format!("Claude Code reports MCP: {other} — display/CU tools may be unavailable"),
             ),
         }
     }
@@ -4932,7 +4963,7 @@ mod tests {
         let out = reader.process_line(init_failed);
         assert!(out.events.iter().any(|e| matches!(
             e,
-            AgentEvent::Log { level, message } if level == "warn" && message.contains("status: failed")
+            AgentEvent::Log { level, message } if level == "warn" && message.contains("Claude Code reports MCP: failed")
         )));
         // Same status again: quiet.
         let out = reader.process_line(init_failed);
@@ -4940,13 +4971,32 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, AgentEvent::Log { message, .. } if message.contains("failed"))));
-        // Recovery is reported.
+        // Recovery is reported, with the registered-tool count (zero here:
+        // the init lists no `mcp__intendant__*` tools — the client-side
+        // rejection signature stays visible even though the transport
+        // connected).
         let out = reader.process_line(
             r#"{"type":"system","subtype":"init","model":"m","tools":[],"mcp_servers":[{"name":"intendant","status":"connected"}],"session_id":"s1"}"#,
         );
         assert!(out.events.iter().any(|e| matches!(
             e,
-            AgentEvent::Log { level, message } if level == "info" && message.contains("connected")
+            AgentEvent::Log { level, message } if level == "info"
+                && message.contains("Claude Code reports MCP: connected — 0 tools registered")
+        )));
+    }
+
+    #[test]
+    fn reader_reports_intendant_registered_tool_count() {
+        let mut reader = test_reader();
+        // Only `mcp__intendant__*` names count as registered Intendant
+        // tools; built-ins and other MCP servers' tools do not.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"init","model":"m","tools":["Bash","mcp__intendant__take_screenshot","mcp__intendant__get_status","mcp__other__x"],"mcp_servers":[{"name":"intendant","status":"connected"}],"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message } if level == "info"
+                && message.contains("Claude Code reports MCP: connected — 2 tools registered")
         )));
     }
 

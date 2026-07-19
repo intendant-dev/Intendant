@@ -343,6 +343,7 @@ impl IntendantServer {
                         let mut schema =
                             serde_json::to_value(&*tool.input_schema).unwrap_or_default();
                         inline_schema_refs(&mut schema);
+                        ensure_object_typed_schema_root(&mut schema);
                         serde_json::json!({
                             "name": tool.name,
                             "description": tool.description,
@@ -452,7 +453,10 @@ impl IntendantServer {
                     self.get_logs_for_session(params, session_id).await,
                 ))
             }
-            "get_pending_approval" => Ok(text_tool_result(self.get_pending_approval().await)),
+            "get_pending_approval" => Ok(text_tool_result(
+                self.get_pending_approval_scoped(McpToolScope::from_actor(&actor))
+                    .await,
+            )),
             "get_pending_input" => Ok(text_tool_result(self.get_pending_input().await)),
             "approve" => {
                 let Parameters(params) = parse_params::<ApproveParams>(args)?;
@@ -852,11 +856,11 @@ enum ActionOutcome {
 /// behavior; a supervised agent session — bound by MCP token possession —
 /// is contained even though its transport-default principal is
 /// root-compatible for IAM: it may not rewrite the daemon-global shared
-/// autonomy (`set_autonomy`, `approve_all`) and may only resolve approvals
-/// raised by its own session. The same idea as `grant_user_display`'s
-/// owner-surface gate, keyed on actor provenance instead of trust posture
-/// so deliberately granted scoped humans and federated peers are not
-/// caught by it.
+/// autonomy (`set_autonomy`, `approve_all`) or resolve any approval,
+/// including one raised by its own session. The same idea as
+/// `grant_user_display`'s owner-surface gate, keyed on actor provenance
+/// instead of trust posture so deliberately granted scoped humans and
+/// federated peers are not caught by it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum McpToolScope<'a> {
     /// Full historical behavior.
@@ -883,50 +887,29 @@ impl<'a> McpToolScope<'a> {
 }
 
 /// Send `response` to the registry waiter registered under `id`.
-fn resolve_approval(registry: &ApprovalRegistry, id: u64, response: ApprovalResponse) {
+///
+/// `true` means the exact responder existed and was consumed. Callers must
+/// not retire frontend state merely because some other approval is pending.
+fn resolve_approval(registry: &ApprovalRegistry, id: u64, response: ApprovalResponse) -> bool {
     if let Ok(mut reg) = registry.lock() {
         if let Some(responder) = reg.remove(&id) {
             let _ = responder.send(response);
+            return true;
         }
     }
+    false
 }
 
-/// Denial message when `scope` may not resolve the currently pending
-/// approval, or None when resolution may proceed. Own-session resolution
-/// compares the approval's recorded owning session against the caller's
-/// token-bound session id (alias-aware); unknown ownership on either side
-/// fails closed. Must run under the same state borrow as the resolution so
-/// the decision and the `take()` cannot interleave with a pending swap.
-fn scope_denies_pending_approval(state: &McpAppState, scope: McpToolScope<'_>) -> Option<String> {
-    let McpToolScope::AgentSession { session_id } = scope else {
+/// Approval decisions are owner acts. A supervised agent may raise a prompt,
+/// but possession of its session-scoped MCP token must never let it answer
+/// that prompt itself (including always-ask live-audio consent).
+fn scope_denies_approval_resolution(scope: McpToolScope<'_>) -> Option<String> {
+    let McpToolScope::AgentSession { .. } = scope else {
         return None;
     };
-    let Some(pending) = state.pending_approval.as_ref() else {
-        // Nothing pending: fall through to the ordinary no-op.
-        return None;
-    };
-    let owner = pending
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty());
-    let own = session_id.map(str::trim).filter(|id| !id.is_empty());
-    let owned = match (owner, own) {
-        (Some(owner), Some(own)) => {
-            owner == own
-                || state
-                    .session_related_ids(own)
-                    .iter()
-                    .any(|related| related == owner)
-        }
-        _ => false,
-    };
-    if owned {
-        return None;
-    }
     Some(
-        "the pending approval was not raised by your session. A supervised agent session may \
-         only resolve its own session's approvals; the daemon owner resolves others from the \
+        "approval decisions require an owner surface. A supervised agent session cannot resolve \
+         approval prompts, including prompts raised by itself; ask the user to decide from the \
          dashboard or `intendant ctl`."
             .to_string(),
     )
@@ -951,36 +934,34 @@ fn scope_denies_daemon_lifecycle(scope: McpToolScope<'_>, tool: &str) -> Option<
     }
 }
 
-/// Resolve the pending approval prompt with `response` — the single handler
+/// Resolve exactly `requested_id` with `response` — the single handler
 /// behind the approve/deny/skip/approve_all tools and their `ControlMsg`
 /// twins. Phase transition and log line derive from the response kind.
-/// `scope` contains agent-session callers to their own session's approvals
-/// (and refuses ApproveAll outright — it widens daemon-global autonomy);
-/// the check and the `take()` share one `&mut state`, so they are atomic.
+/// Supervised agent sessions are refused outright: approval is an owner act.
+/// The exact-id lookup, responder removal, and pending-state removal share
+/// one `&mut state`, so another prompt cannot be substituted between them.
 fn resolve_pending_approval(
     state: &mut McpAppState,
+    requested_id: u64,
     response: ApprovalResponse,
     scope: McpToolScope<'_>,
 ) -> ActionOutcome {
-    if matches!(scope, McpToolScope::AgentSession { .. })
-        && matches!(response, ApprovalResponse::ApproveAll)
-    {
-        return ActionOutcome::Denied {
-            reason: "approve_all raises daemon-wide autonomy to Full and is not available to \
-                     supervised agent sessions; approve your own session's approvals one at a \
-                     time, or ask the user (ask_user)"
-                .to_string(),
-        };
-    }
-    if let Some(reason) = scope_denies_pending_approval(state, scope) {
+    if let Some(reason) = scope_denies_approval_resolution(scope) {
         return ActionOutcome::Denied { reason };
     }
-    let Some(pending) = state.pending_approval.take() else {
+    let Some(pending) = state.pending_approvals.get(&requested_id) else {
         return ActionOutcome::NoOp {
-            reason: "No pending approval".to_string(),
+            reason: format!("No pending approval with id {requested_id}"),
         };
     };
-    let (phase, log) = match &response {
+    debug_assert_eq!(pending.id, requested_id);
+    if !resolve_approval(&state.approval_registry, requested_id, response.clone()) {
+        return ActionOutcome::NoOp {
+            reason: format!("Approval {requested_id} no longer has a pending responder"),
+        };
+    }
+    state.pending_approvals.remove(&requested_id);
+    let (resolved_phase, log) = match &response {
         ApprovalResponse::Approve => (Phase::RunningAgent, "Approved by MCP agent"),
         ApprovalResponse::Skip => (Phase::RunningAgent, "Skipped by MCP agent"),
         ApprovalResponse::Deny => (Phase::Done, "Denied by MCP agent"),
@@ -990,7 +971,11 @@ fn resolve_pending_approval(
         ),
         ApprovalResponse::Answer { .. } => (Phase::RunningAgent, "Question answered by MCP agent"),
     };
-    resolve_approval(&state.approval_registry, pending.id, response);
+    let phase = if state.pending_approvals.is_empty() {
+        resolved_phase
+    } else {
+        Phase::WaitingApproval
+    };
     state.set_phase(phase);
     state.push_log(LogLevel::Info, log.to_string());
     ActionOutcome::Ok
@@ -1589,8 +1574,19 @@ impl IntendantServer {
         description = "Get the current pending approval request, if any. Returns null if no approval is pending."
     )]
     async fn get_pending_approval(&self) -> String {
+        self.get_pending_approval_scoped(McpToolScope::Unrestricted)
+            .await
+    }
+
+    async fn get_pending_approval_scoped(&self, scope: McpToolScope<'_>) -> String {
         let s = self.state.read().await;
-        match s.approval_snapshot() {
+        let snapshot = match scope {
+            McpToolScope::Unrestricted => s.approval_snapshot(),
+            McpToolScope::AgentSession { session_id } => {
+                s.approval_snapshot_for_session(session_id)
+            }
+        };
+        match snapshot {
             Some(snap) => {
                 serde_json::to_string_pretty(&snap).unwrap_or_else(|_| "null".to_string())
             }
@@ -1624,7 +1620,7 @@ impl IntendantServer {
         scope: McpToolScope<'_>,
     ) -> String {
         let mut s = self.state.write().await;
-        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Approve, scope);
+        let outcome = resolve_pending_approval(&mut s, params.id, ApprovalResponse::Approve, scope);
         if outcome == ActionOutcome::Ok {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
@@ -1643,7 +1639,7 @@ impl IntendantServer {
 
     pub(crate) async fn deny_scoped(&self, params: DenyParams, scope: McpToolScope<'_>) -> String {
         let mut s = self.state.write().await;
-        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Deny, scope);
+        let outcome = resolve_pending_approval(&mut s, params.id, ApprovalResponse::Deny, scope);
         if outcome == ActionOutcome::Ok {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
@@ -1664,7 +1660,7 @@ impl IntendantServer {
 
     pub(crate) async fn skip_scoped(&self, params: SkipParams, scope: McpToolScope<'_>) -> String {
         let mut s = self.state.write().await;
-        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Skip, scope);
+        let outcome = resolve_pending_approval(&mut s, params.id, ApprovalResponse::Skip, scope);
         if outcome == ActionOutcome::Ok {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
@@ -1688,7 +1684,8 @@ impl IntendantServer {
         scope: McpToolScope<'_>,
     ) -> String {
         let mut s = self.state.write().await;
-        let outcome = resolve_pending_approval(&mut s, ApprovalResponse::ApproveAll, scope);
+        let outcome =
+            resolve_pending_approval(&mut s, params.id, ApprovalResponse::ApproveAll, scope);
         if outcome == ActionOutcome::Ok {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
@@ -2692,6 +2689,74 @@ fn resolve_refs(value: &mut serde_json::Value, defs: &serde_json::Map<String, se
     }
 }
 
+/// Force a served tool `inputSchema` root to be explicitly object-typed.
+///
+/// The MCP spec requires every tool `inputSchema` to be a JSON Schema of
+/// `"type": "object"`, and real clients enforce it: claude-code validates the
+/// whole `tools/list` result client-side and rejects the ENTIRE list when one
+/// tool's schema root is not object-typed — one bad schema costs the session
+/// every Intendant tool. schemars renders internally-tagged enums (e.g.
+/// `agenda_op`'s `AgendaCommand`) as a bare `{"oneOf": [...]}` root with no
+/// top-level `"type"`, even though every variant serializes as a JSON object
+/// by construction.
+///
+/// When the root lacks `"type"` and provably describes an object — it carries
+/// object-vocabulary keywords, or every `oneOf`/`anyOf`/`allOf` branch is
+/// itself object-shaped — inject the top-level `"type": "object"` the spec
+/// requires. Roots that already declare a `"type"`, or whose shape cannot be
+/// proven object-only, are left untouched: the serving-path pin test
+/// (`every_profile_serves_only_object_typed_tool_schemas`) fails on any tool
+/// this cannot fix, so a bad schema breaks the suite instead of shipping.
+fn ensure_object_typed_schema_root(schema: &mut serde_json::Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+    if obj.contains_key("type") {
+        return;
+    }
+    if schema_describes_object(obj) {
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
+    }
+}
+
+/// Whether a typeless JSON Schema provably validates only JSON objects.
+fn schema_describes_object(schema: &serde_json::Map<String, serde_json::Value>) -> bool {
+    // Object-vocabulary keywords only constrain (and only make sense on)
+    // object instances.
+    if [
+        "properties",
+        "required",
+        "additionalProperties",
+        "patternProperties",
+    ]
+    .iter()
+    .any(|key| schema.contains_key(*key))
+    {
+        return true;
+    }
+    // A combinator root is object-only when every branch is: schemars renders
+    // internally-tagged enums as `oneOf` over object-typed variants.
+    ["oneOf", "anyOf", "allOf"].iter().any(|key| {
+        schema
+            .get(*key)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|branches| {
+                !branches.is_empty()
+                    && branches.iter().all(|branch| {
+                        branch.as_object().is_some_and(|branch| {
+                            match branch.get("type").and_then(serde_json::Value::as_str) {
+                                Some(kind) => kind == "object",
+                                None => schema_describes_object(branch),
+                            }
+                        })
+                    })
+            })
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2783,12 +2848,15 @@ pub(crate) mod tests {
     ) -> tokio::sync::oneshot::Receiver<ApprovalResponse> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         state.approval_registry.lock().unwrap().insert(id, tx);
-        state.pending_approval = Some(PendingApprovalState {
+        state.pending_approvals.insert(
             id,
-            command_preview: "echo hi".to_string(),
-            category: "exec".to_string(),
-            session_id: session_id.map(str::to_string),
-        });
+            PendingApprovalState {
+                id,
+                command_preview: "echo hi".to_string(),
+                category: "exec".to_string(),
+                session_id: session_id.map(str::to_string),
+            },
+        );
         rx
     }
 
@@ -2843,7 +2911,7 @@ pub(crate) mod tests {
         assert!(dispatch_result_text(&result).contains("Denied"));
         assert_eq!(autonomy.read().await.level, initial_level);
         assert!(
-            state.read().await.pending_approval.is_some(),
+            state.read().await.pending_approvals.contains_key(&7),
             "denied approve_all must leave the approval pending"
         );
         assert!(rx.try_recv().is_err(), "no response reached the waiter");
@@ -2946,42 +3014,31 @@ pub(crate) mod tests {
         assert!(state.read().await.should_quit);
     }
 
-    /// H5 containment: agent-session callers resolve only approvals raised
-    /// by their own session; the owner surface still resolves anything.
+    /// H4 containment: approval is an owner act, caller ids bind exactly,
+    /// and concurrent prompts cannot replace or consume one another.
     #[tokio::test]
-    async fn agent_sessions_resolve_only_their_own_approvals() {
+    async fn approval_resolution_is_owner_only_and_exactly_bound() {
         let bus = EventBus::new();
         let state = test_state();
         let server = IntendantServer::new(state.clone(), bus);
 
-        // Cross-session: the pending approval belongs to another session.
+        // Arm two concurrent sessions in the daemon-wide observable state.
         let mut other_rx = {
             let mut s = state.write().await;
             arm_pending_approval(&mut s, 11, Some("sess-other"))
         };
-        let result = server
-            .call_tool_by_name_as_caller(
-                "approve",
-                serde_json::json!({ "id": 11 }),
-                Some("sess-a"),
-                None,
-                agent_session_caller("sess-a"),
-            )
-            .await
-            .expect("dispatch");
-        assert!(
-            dispatch_result_text(&result).contains("Denied"),
-            "cross-session approval resolution must be denied"
-        );
-        assert!(state.read().await.pending_approval.is_some());
-        assert!(other_rx.try_recv().is_err());
+        let mut own_rx = {
+            let mut s = state.write().await;
+            arm_pending_approval(&mut s, 13, Some("sess-a"))
+        };
 
-        // deny/skip are contained the same way (they also resolve).
-        for tool in ["deny", "skip"] {
+        // A supervised agent cannot approve either another session or its
+        // own prompt, and deny/skip are the same owner-only decision.
+        for (tool, id) in [("approve", 11), ("approve", 13), ("deny", 13), ("skip", 13)] {
             let result = server
                 .call_tool_by_name_as_caller(
                     tool,
-                    serde_json::json!({ "id": 11 }),
+                    serde_json::json!({ "id": id }),
                     Some("sess-a"),
                     None,
                     agent_session_caller("sess-a"),
@@ -2990,72 +3047,73 @@ pub(crate) mod tests {
                 .expect("dispatch");
             assert!(
                 dispatch_result_text(&result).contains("Denied"),
-                "{tool} must be denied cross-session"
+                "{tool}({id}) must be denied to an agent session"
             );
-            assert!(state.read().await.pending_approval.is_some());
         }
+        assert_eq!(state.read().await.pending_approvals.len(), 2);
+        assert!(other_rx.try_recv().is_err());
+        assert!(own_rx.try_recv().is_err());
 
-        // An approval whose owning session was never recorded fails closed
-        // for agent callers.
-        state.write().await.pending_approval = Some(PendingApprovalState {
-            id: 12,
-            command_preview: "echo hi".to_string(),
-            category: "exec".to_string(),
-            session_id: None,
-        });
+        let owner = || {
+            ToolCaller::from_gate(
+                &crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https"),
+                None,
+            )
+        };
+
+        // An owner-supplied id that is not pending is a no-op. It must not
+        // fall back to whichever prompt most recently arrived.
         let result = server
             .call_tool_by_name_as_caller(
                 "approve",
                 serde_json::json!({ "id": 12 }),
-                Some("sess-a"),
                 None,
-                agent_session_caller("sess-a"),
+                None,
+                owner(),
             )
             .await
             .expect("dispatch");
-        assert!(dispatch_result_text(&result).contains("Denied"));
+        assert!(dispatch_result_text(&result).contains("No pending approval with id 12"));
+        assert_eq!(state.read().await.pending_approvals.len(), 2);
+        assert!(other_rx.try_recv().is_err());
+        assert!(own_rx.try_recv().is_err());
 
-        // Own-session resolution works — including through a linked
-        // backend alias.
-        let own_rx = {
-            let mut s = state.write().await;
-            s.link_session_aliases("sess-a", "backend-a");
-            arm_pending_approval(&mut s, 13, Some("backend-a"))
-        };
+        // Exact owner resolution consumes only id 13; id 11 and its waiter
+        // survive, and the global phase remains waiting for that prompt.
         let result = server
             .call_tool_by_name_as_caller(
                 "approve",
                 serde_json::json!({ "id": 13 }),
-                Some("sess-a"),
                 None,
-                agent_session_caller("sess-a"),
+                None,
+                owner(),
             )
             .await
             .expect("dispatch");
         assert_eq!(dispatch_result_text(&result), "ok");
-        assert!(state.read().await.pending_approval.is_none());
         assert_eq!(own_rx.await.unwrap(), ApprovalResponse::Approve);
+        {
+            let s = state.read().await;
+            assert!(!s.pending_approvals.contains_key(&13));
+            assert!(s.pending_approvals.contains_key(&11));
+            assert_eq!(s.phase, Phase::WaitingApproval);
+        }
+        assert!(other_rx.try_recv().is_err());
 
-        // The owner surface still resolves another session's approval.
-        let owner_rx = {
-            let mut s = state.write().await;
-            arm_pending_approval(&mut s, 14, Some("sess-other"))
-        };
+        // The remaining exact id can then be resolved independently.
         let result = server
             .call_tool_by_name_as_caller(
                 "approve",
-                serde_json::json!({ "id": 14 }),
+                serde_json::json!({ "id": 11 }),
                 None,
                 None,
-                ToolCaller::from_gate(
-                    &crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https"),
-                    None,
-                ),
+                owner(),
             )
             .await
             .expect("dispatch");
         assert_eq!(dispatch_result_text(&result), "ok");
-        assert_eq!(owner_rx.await.unwrap(), ApprovalResponse::Approve);
+        assert_eq!(other_rx.await.unwrap(), ApprovalResponse::Approve);
+        assert!(state.read().await.pending_approvals.is_empty());
     }
 
     #[test]
@@ -3222,7 +3280,7 @@ pub(crate) mod tests {
             assert_eq!(s.budget_pct, 0.0);
             assert_eq!(s.phase, Phase::Idle);
             assert!(s.log_entries.is_empty());
-            assert!(s.pending_approval.is_none());
+            assert!(s.pending_approvals.is_empty());
             assert!(s.human_question.is_none());
             assert!(!s.should_quit);
         });
@@ -4468,6 +4526,7 @@ pub(crate) mod tests {
             let mut s = state.write().await;
             let outcome = resolve_pending_approval(
                 &mut s,
+                999,
                 ApprovalResponse::Approve,
                 McpToolScope::Unrestricted,
             );
@@ -4739,5 +4798,75 @@ pub(crate) mod tests {
         let original = schema.clone();
         inline_schema_refs(&mut schema);
         assert_eq!(schema, original);
+    }
+
+    #[test]
+    fn ensure_object_typed_schema_root_fixes_tagged_enum_one_of() {
+        // The schemars shape for an internally-tagged enum (agenda_op's
+        // AgendaCommand): a bare oneOf root over object variants, no
+        // top-level type — the exact shape MCP clients reject.
+        let mut schema = serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": { "op": { "type": "string", "const": "add" } },
+                    "required": ["op"]
+                },
+                {
+                    "type": "object",
+                    "properties": { "op": { "type": "string", "const": "retire" } },
+                    "required": ["op"]
+                }
+            ]
+        });
+        ensure_object_typed_schema_root(&mut schema);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["oneOf"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn ensure_object_typed_schema_root_accepts_typeless_object_vocabulary() {
+        // A typeless branch that itself carries object vocabulary (nested
+        // combinators do this) still proves the root object-only.
+        let mut schema = serde_json::json!({
+            "anyOf": [
+                { "properties": { "a": { "type": "string" } }, "required": ["a"] },
+                { "type": "object", "properties": { "b": { "type": "number" } } }
+            ]
+        });
+        ensure_object_typed_schema_root(&mut schema);
+        assert_eq!(schema["type"], "object");
+    }
+
+    #[test]
+    fn ensure_object_typed_schema_root_leaves_declared_types_alone() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } }
+        });
+        let original = schema.clone();
+        ensure_object_typed_schema_root(&mut schema);
+        assert_eq!(schema, original);
+    }
+
+    #[test]
+    fn ensure_object_typed_schema_root_never_mislabels_non_object_shapes() {
+        // A oneOf with a non-object branch genuinely admits non-object
+        // instances; injecting "type": "object" would silently invalidate
+        // that branch. Leave it for the serving-path pin test to reject.
+        let mut mixed = serde_json::json!({
+            "oneOf": [
+                { "type": "object", "properties": {} },
+                { "type": "string" }
+            ]
+        });
+        let original = mixed.clone();
+        ensure_object_typed_schema_root(&mut mixed);
+        assert_eq!(mixed, original);
+
+        // An unconstrained root proves nothing; leave it untouched.
+        let mut empty = serde_json::json!({});
+        ensure_object_typed_schema_root(&mut empty);
+        assert_eq!(empty, serde_json::json!({}));
     }
 }
