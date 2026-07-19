@@ -194,8 +194,13 @@ html.ui-v2 #activity-subtabs .ui2-layout-toggle button[aria-pressed="true"] {
   box-shadow: var(--ui2-shadow-seg), inset 0 0 0 1px var(--line);
 }
 
-/* minimize-done: a small amber hygiene pill */
-html.ui-v2 #activity-subtabs .ui2-minimize-done {
+/* minimize-done + hide-done: small amber hygiene pills (minimize drops
+   finished sub-agents to header bars; hide closes every hard-done
+   window's card — the sessions stay in Sessions). hide-done is
+   grid-only like the sweep pills below: Focus hides the cards it acts
+   on. */
+html.ui-v2 #activity-subtabs .ui2-minimize-done,
+html.ui-v2 #activity-subtabs .ui2-hide-done {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -211,9 +216,13 @@ html.ui-v2 #activity-subtabs .ui2-minimize-done {
   cursor: pointer;
   transition: background var(--t-fast);
 }
-html.ui-v2 #activity-subtabs .ui2-minimize-done[hidden] { display: none; }
-html.ui-v2 #activity-subtabs .ui2-minimize-done:hover { background: rgba(var(--amber-rgb), .14); }
-html.ui-v2 #activity-subtabs .ui2-minimize-done-count {
+html.ui-v2 #activity-subtabs .ui2-minimize-done[hidden],
+html.ui-v2 #activity-subtabs .ui2-hide-done[hidden],
+html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-hide-done { display: none; }
+html.ui-v2 #activity-subtabs .ui2-minimize-done:hover,
+html.ui-v2 #activity-subtabs .ui2-hide-done:hover { background: rgba(var(--amber-rgb), .14); }
+html.ui-v2 #activity-subtabs .ui2-minimize-done-count,
+html.ui-v2 #activity-subtabs .ui2-hide-done-count {
   min-width: 16px; height: 16px;
   display: inline-flex; align-items: center; justify-content: center;
   padding: 0 4px;
@@ -223,11 +232,14 @@ html.ui-v2 #activity-subtabs .ui2-minimize-done-count {
   font-size: 9.5px;
 }
 
-/* collapse/expand-all: the grid sweep twin of the hygiene pill — neutral
-   ink (a layout action, not an attention nudge), and grid-only: Focus
-   hides the session windows the sweep acts on (ui2-activity.js keeps the
-   label naming the direction one click will act) */
-html.ui-v2 #activity-subtabs .ui2-collapse-all {
+/* collapse/expand-all + its header-details twin: the grid sweep pills —
+   neutral ink (layout actions, not attention nudges), and grid-only:
+   Focus hides the session windows the sweeps act on (ui2-activity.js
+   keeps each label naming the direction one click will act).
+   .ui2-collapse-all drives the window axis (minimized);
+   .ui2-header-details drives the header-details axis (headerCollapsed). */
+html.ui-v2 #activity-subtabs .ui2-collapse-all,
+html.ui-v2 #activity-subtabs .ui2-header-details {
   display: inline-flex;
   align-items: center;
   height: 28px;
@@ -242,9 +254,12 @@ html.ui-v2 #activity-subtabs .ui2-collapse-all {
   cursor: pointer;
   transition: background var(--t-fast), color var(--t-fast);
 }
-html.ui-v2 #activity-subtabs .ui2-collapse-all:hover { color: var(--text); background: var(--hover-wash); }
+html.ui-v2 #activity-subtabs .ui2-collapse-all:hover,
+html.ui-v2 #activity-subtabs .ui2-header-details:hover { color: var(--text); background: var(--hover-wash); }
 html.ui-v2 #activity-subtabs .ui2-collapse-all[hidden],
-html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-collapse-all { display: none; }
+html.ui-v2 #activity-subtabs .ui2-header-details[hidden],
+html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-collapse-all,
+html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-header-details { display: none; }
 
 /* Options trigger */
 html.ui-v2 #activity-subtabs .ui2-view-options-btn {
