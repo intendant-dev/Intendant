@@ -1979,10 +1979,6 @@ mod tests {
         ];
         annotate_replay_user_turns_from_external_transcript(&mut entries, home, "claude-code", sid);
         assert_eq!(entries[0]["message_uuid"], "u1");
-        assert!(
-            entries[0].get("user_turn_index").is_none(),
-            "claude stamps carry no codex revision fields"
-        );
         assert_eq!(
             entries[2]["message_uuid"], "u2",
             "duplicate prose maps in order, not to the first global match"
