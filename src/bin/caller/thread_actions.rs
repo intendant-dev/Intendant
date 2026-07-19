@@ -2925,6 +2925,8 @@ pub(crate) async fn drain_external_child_turn(
         cancelled_follow_ups,
         codex_thread_action_dedupe,
         None,
+        // Child drains never own the primary session's ordinal state.
+        None,
         false,
         false,
         false,
