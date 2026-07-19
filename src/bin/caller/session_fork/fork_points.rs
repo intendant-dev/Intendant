@@ -317,7 +317,10 @@ pub(crate) fn claude_edit_branch_anchor(
         };
         if obj.get("type").and_then(serde_json::Value::as_str) != Some("user")
             || obj.get("isMeta").and_then(serde_json::Value::as_bool) == Some(true)
-            || obj.get("isCompactSummary").and_then(serde_json::Value::as_bool) == Some(true)
+            || obj
+                .get("isCompactSummary")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
             || obj.get("isSidechain").and_then(serde_json::Value::as_bool) == Some(true)
         {
             continue;
