@@ -1280,7 +1280,7 @@ impl SessionLog {
             event: "info".to_string(),
             level: Some("info".to_string()),
             message: Some(format!("[user] {}", msg)),
-            data: (!data.is_empty()).then(|| serde_json::Value::Object(data)),
+            data: (!data.is_empty()).then_some(serde_json::Value::Object(data)),
             file: None,
             file2: None,
         });

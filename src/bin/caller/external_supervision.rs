@@ -261,6 +261,7 @@ pub(crate) fn try_buffered_idle_agent_event(
 /// the live `UserMessageLog` bus event carrying the same fields — so the
 /// live wire row and its replayed copy are identically tagged and the
 /// dashboard's transcript-signature dedupe collapses them across lanes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_user_message_log(
     bus: &EventBus,
     session_log: &SharedSessionLog,
