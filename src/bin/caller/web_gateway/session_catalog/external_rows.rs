@@ -1304,9 +1304,12 @@ mod tests {
         .unwrap();
     }
 
+    /// The serialization seam prepends the embedded bundle's build stamp
+    /// to every rendered head.
     fn golden_live_text_plain_transcript(status_line: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nx-intendant-app-build: {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            crate::web_gateway::static_assets::app_build(),
             body.len()
         )
     }
@@ -1344,7 +1347,8 @@ mod tests {
         assert_eq!(
             transcript,
             format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+                crate::web_gateway::static_assets::app_build(),
                 body.len()
             )
         );
@@ -1392,7 +1396,8 @@ mod tests {
         assert_eq!(
             transcript,
             format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{expected_body}",
+                "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{expected_body}",
+                crate::web_gateway::static_assets::app_build(),
                 expected_body.len()
             )
         );
@@ -1414,7 +1419,8 @@ mod tests {
         assert_eq!(
             transcript,
             format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{expected_playlist}",
+                "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{expected_playlist}",
+                crate::web_gateway::static_assets::app_build(),
                 expected_playlist.len()
             )
         );
@@ -1456,7 +1462,8 @@ mod tests {
             .await,
         );
         let mut expected = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nCache-Control: public, max-age=3600\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nCache-Control: public, max-age=3600\r\nConnection: close\r\n\r\n",
+            crate::web_gateway::static_assets::app_build(),
             session_bytes.len()
         );
         expected.push_str(&String::from_utf8(session_bytes).unwrap());
@@ -1471,9 +1478,10 @@ mod tests {
             .await,
         );
         assert!(
-            transcript.starts_with(
-                "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 22\r\nCache-Control: public, max-age=3600\r\nConnection: close\r\n\r\n"
-            ),
+            transcript.starts_with(&format!(
+                "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: video/mp2t\r\nContent-Length: 22\r\nCache-Control: public, max-age=3600\r\nConnection: close\r\n\r\n",
+                crate::web_gateway::static_assets::app_build()
+            )),
             "{transcript}"
         );
         assert!(
@@ -1557,7 +1565,8 @@ mod tests {
         let jpeg = b"hq frame jpeg bytes".to_vec();
         let transcript = golden_live_transcript(frame_hq_api_response(Some(jpeg.clone())));
         let mut expected = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nCache-Control: public, max-age=31536000, immutable\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nCache-Control: public, max-age=31536000, immutable\r\nConnection: close\r\n\r\n",
+            crate::web_gateway::static_assets::app_build(),
             jpeg.len()
         );
         expected.push_str(&String::from_utf8(jpeg).unwrap());

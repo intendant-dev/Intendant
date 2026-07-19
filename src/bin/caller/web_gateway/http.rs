@@ -904,6 +904,23 @@ impl HttpResponse {
 
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         let mut head = format!("HTTP/1.1 {}\r\n", self.status);
+        // Every buffered gateway response carries the served-bundle build
+        // stamp. The /ws reconnect and control-tunnel handshakes already
+        // re-check `/config`'s `app_build`, but a tab with neither event
+        // lane alive (e.g. WebKit + mTLS hangs client-cert WebSockets and
+        // the tunnel can be down) still makes plain HTTP API calls
+        // constantly — this header is the lane that reaches it, so
+        // `maybeNudgeStaleBuild` can fire after a daemon upgrade instead
+        // of the tab running stale code indefinitely. Emitted here at
+        // serialization time — not as a `headers` entry — so no posture
+        // helper can strip or reorder it; empty stamp (pre-stamp
+        // artifact) emits nothing, which the SPA treats as "no signal".
+        let app_build = super::static_assets::app_build();
+        if !app_build.is_empty() {
+            head.push_str("x-intendant-app-build: ");
+            head.push_str(app_build);
+            head.push_str("\r\n");
+        }
         for (name, value) in &self.headers {
             head.push_str(name);
             head.push_str(": ");
@@ -1471,29 +1488,38 @@ mod tests {
     #[test]
     fn http_response_builder_reproduces_legacy_framing_byte_for_byte() {
         // The five string helpers now serialize through HttpResponse; pin
-        // the exact historical bytes so the rebase stays byte-identical.
+        // the exact historical bytes (plus the serialization-time build
+        // stamp, minted from the embedded artifact) so the rebase stays
+        // byte-identical.
+        let stamp = crate::web_gateway::static_assets::app_build();
         assert_eq!(
             json_response("200 OK", "{\"ok\":true}".to_string()),
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: 11\r\n\
-             Cache-Control: no-cache\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {\"ok\":true}"
+            format!(
+                "HTTP/1.1 200 OK\r\n\
+                 x-intendant-app-build: {stamp}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: 11\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {{\"ok\":true}}"
+            )
         );
         assert_eq!(
             html_response("404 Not Found", "<h1>gone</h1>".to_string()),
-            "HTTP/1.1 404 Not Found\r\n\
-             Content-Type: text/html; charset=utf-8\r\n\
-             Content-Length: 13\r\n\
-             Cache-Control: no-cache\r\n\
-             Access-Control-Allow-Origin: *\r\n\
-             Content-Security-Policy: frame-ancestors 'none'\r\n\
-             X-Frame-Options: DENY\r\n\
-             Connection: close\r\n\
-             \r\n\
-             <h1>gone</h1>"
+            format!(
+                "HTTP/1.1 404 Not Found\r\n\
+                 x-intendant-app-build: {stamp}\r\n\
+                 Content-Type: text/html; charset=utf-8\r\n\
+                 Content-Length: 13\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
+                 Content-Security-Policy: frame-ancestors 'none'\r\n\
+                 X-Frame-Options: DENY\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 <h1>gone</h1>"
+            )
         );
         // The builder's CORS postures match the historical
         // post-processor bytes (the string-form fleet helper is gone —
@@ -1509,29 +1535,74 @@ mod tests {
             HttpResponse::json("200 OK", "{}")
                 .fleet_cors(Some("https://fleet.example"))
                 .into_string(),
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: 2\r\n\
-             Cache-Control: no-cache\r\n\
-             Connection: close\r\n\
-             Access-Control-Allow-Origin: https://fleet.example\r\n\
-             Vary: Origin\r\n\
-             \r\n\
-             {}"
+            format!(
+                "HTTP/1.1 200 OK\r\n\
+                 x-intendant-app-build: {stamp}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: 2\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Connection: close\r\n\
+                 Access-Control-Allow-Origin: https://fleet.example\r\n\
+                 Vary: Origin\r\n\
+                 \r\n\
+                 {{}}"
+            )
         );
         assert_eq!(
             HttpResponse::json("200 OK", "{}")
                 .fleet_cors(None)
                 .into_string(),
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: 2\r\n\
-             Cache-Control: no-cache\r\n\
-             Connection: close\r\n\
-             Vary: Origin\r\n\
-             \r\n\
-             {}"
+            format!(
+                "HTTP/1.1 200 OK\r\n\
+                 x-intendant-app-build: {stamp}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: 2\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Connection: close\r\n\
+                 Vary: Origin\r\n\
+                 \r\n\
+                 {{}}"
+            )
         );
+    }
+
+    #[test]
+    fn every_buffered_response_carries_the_app_build_header() {
+        // The stale-tab reload nudge's HTTP lane: a tab with neither
+        // event lane alive (WebKit + mTLS, tunnel down) only hears a new
+        // daemon build through response headers on its plain API calls.
+        // The stamp is emitted at the single serialization seam, so every
+        // buffered shape carries it — exactly once, right after the
+        // status line, with the same value `/config` serves as
+        // `app_build`.
+        let stamp = crate::web_gateway::static_assets::app_build();
+        assert!(
+            !stamp.is_empty(),
+            "embedded app.html must carry a minted build stamp"
+        );
+        let expected = format!("x-intendant-app-build: {stamp}\r\n");
+        for response in [
+            json_response("200 OK", "{}".to_string()),
+            html_response("200 OK", "<p>hi</p>".to_string()),
+            HttpResponse::with_content("200 OK", "text/plain", "x").into_string(),
+            HttpResponse::json("404 Not Found", "{}")
+                .connection_reuse(true)
+                .into_string(),
+        ] {
+            assert_eq!(
+                response.matches("x-intendant-app-build:").count(),
+                1,
+                "exactly one build-stamp header: {response}"
+            );
+            let after_status = response
+                .split_once("\r\n")
+                .map(|(_, rest)| rest)
+                .unwrap_or_default();
+            assert!(
+                after_status.starts_with(&expected),
+                "build stamp must lead the header block: {response}"
+            );
+        }
     }
 
     #[test]

@@ -689,6 +689,35 @@ fn context_window_from_model_usage(model_usage: &serde_json::Value, model: &str)
     entry.get("contextWindow").and_then(|v| v.as_u64())
 }
 
+/// Known context windows by model-id family, per Anthropic's model catalog:
+/// the Claude 5 family (Fable/Mythos/Sonnet 5), Opus 4.6+, and Sonnet 4.6
+/// are 1M-window models; Haiku 4.5 is 200k. Matched on the id prefix so
+/// dated snapshot ids (`claude-haiku-4-5-20251001`) resolve too. Only a
+/// fallback: an explicit `modelUsage.contextWindow` report always wins.
+/// Without this, a 1M-window session whose results never state a window is
+/// divided by the 200k default — the footprint/window clamp then pins the
+/// context meter at exactly 100% for the whole session (observed live on a
+/// claude-fable-5 session at 442k real footprint).
+fn claude_model_context_window(model: &str) -> Option<u64> {
+    const ONE_M: u64 = 1_000_000;
+    let model = model.trim();
+    for (prefix, window) in [
+        ("claude-fable-5", ONE_M),
+        ("claude-mythos-5", ONE_M),
+        ("claude-opus-4-8", ONE_M),
+        ("claude-opus-4-7", ONE_M),
+        ("claude-opus-4-6", ONE_M),
+        ("claude-sonnet-5", ONE_M),
+        ("claude-sonnet-4-6", ONE_M),
+        ("claude-haiku-4-5", 200_000),
+    ] {
+        if model.starts_with(prefix) {
+            return Some(window);
+        }
+    }
+    None
+}
+
 /// Map Intendant's configured permission mode onto Claude Code's CLI
 /// values. Always yields a flag value — `default` included: when
 /// `--permission-mode` is omitted the CLI resolves its default from the
@@ -1044,6 +1073,9 @@ struct CcReader {
     /// Most recent model name seen (init message / message_start).
     model: String,
     context_window: u64,
+    /// The window came from an explicit `modelUsage.contextWindow` report;
+    /// once true, model-echo fallbacks never overwrite it.
+    context_window_reported: bool,
     /// Raw usage of the turn's most recent API call (`message_delta`).
     /// The turn `result`'s own usage SUMS every call in the turn — spend,
     /// not footprint — so the end-of-turn context meter re-emits this
@@ -1096,6 +1128,7 @@ impl CcReader {
             limit_windows: std::collections::BTreeMap::new(),
             model: "claude".to_string(),
             context_window: DEFAULT_CONTEXT_WINDOW,
+            context_window_reported: false,
             last_call_usage: None,
             cache_ttl_flavor: None,
             last_intendant_mcp_status: None,
@@ -1115,6 +1148,14 @@ impl CcReader {
             return;
         }
         self.model = model.to_string();
+        // No result has stated a window yet: size the meter from the model
+        // family instead of the 200k default (a 1M-window model against the
+        // default reads as a meter pinned at 100%).
+        if !self.context_window_reported {
+            if let Some(window) = claude_model_context_window(model) {
+                self.context_window = window;
+            }
+        }
         out.events.push(AgentEvent::ConfigFacts {
             facts: crate::types::SessionConfigVitals {
                 model: Some(model.to_string()),
@@ -2359,6 +2400,7 @@ impl CcReader {
         if let Some(model_usage) = msg.get("modelUsage") {
             if let Some(window) = context_window_from_model_usage(model_usage, &self.model) {
                 self.context_window = window;
+                self.context_window_reported = true;
             }
         }
         if self.shared.compact_pending.swap(false, Ordering::SeqCst)
@@ -4948,6 +4990,73 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, AgentEvent::MessageDelta { text } if text == "hel")));
+    }
+
+    #[test]
+    fn model_family_windows_resolve_and_unknown_models_fall_through() {
+        assert_eq!(
+            claude_model_context_window("claude-fable-5"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            claude_model_context_window("claude-sonnet-5"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            claude_model_context_window("claude-opus-4-8"),
+            Some(1_000_000)
+        );
+        // Dated snapshot ids resolve via the prefix.
+        assert_eq!(
+            claude_model_context_window("claude-haiku-4-5-20251001"),
+            Some(200_000)
+        );
+        assert_eq!(claude_model_context_window("claude"), None);
+        assert_eq!(claude_model_context_window("gpt-x"), None);
+    }
+
+    /// A 1M-window model whose results never state a contextWindow must not
+    /// be metered against the 200k default — the footprint/window clamp
+    /// would pin the meter at exactly 100% (observed live on a fable
+    /// session at a 442k real footprint). The model echo sizes the window
+    /// from the family table; an explicit report still always wins and is
+    /// never overwritten by later echoes.
+    #[test]
+    fn model_echo_sizes_window_until_a_result_reports_one() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-fable-5","usage":{"input_tokens":1,"output_tokens":1}}},"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.context_window, 1_000_000);
+
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":2,"cache_read_input_tokens":441603,"cache_creation_input_tokens":810,"output_tokens":1479}},"session_id":"s1"}"#,
+        );
+        let usage = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Usage { usage } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.context_window, 1_000_000);
+        assert!(
+            usage.usage_pct > 40.0 && usage.usage_pct < 50.0,
+            "442k of 1M must read as ~44%, not a clamped 100%: {}",
+            usage.usage_pct
+        );
+
+        // An explicit report wins over the family table…
+        reader.process_line(
+            r#"{"type":"result","modelUsage":{"claude-fable-5":{"contextWindow":850000}},"usage":{"input_tokens":1,"output_tokens":1},"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.context_window, 850_000);
+        // …and later model echoes never overwrite the reported figure.
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-sonnet-5","usage":{"input_tokens":1,"output_tokens":1}}},"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.context_window, 850_000);
     }
 
     #[test]

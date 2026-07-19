@@ -613,6 +613,21 @@ async function daemonApiHttpRequest(method, params, opts) {
   } catch (err) {
     throw daemonApiHttpError(err, method);
   }
+  // Stale-tab nudge on the plain-HTTP lane: the /ws reconnect and tunnel
+  // handshakes re-check /config's app_build, but a tab with neither event
+  // lane alive (e.g. WebKit + mTLS hangs client-cert WebSockets and the
+  // tunnel can be down) would otherwise never hear a new daemon build.
+  // Every gateway response carries the served-bundle stamp as a header;
+  // compare at this one chokepoint. Guarded end to end — a missing header
+  // (older daemon, cross-origin) is a no-op and must never break the call.
+  try {
+    const servedBuild = resp.headers && typeof resp.headers.get === 'function'
+      ? resp.headers.get('x-intendant-app-build')
+      : '';
+    if (servedBuild && typeof maybeNudgeStaleBuild === 'function') {
+      maybeNudgeStaleBuild(servedBuild);
+    }
+  } catch (_err) { /* the nudge is best-effort */ }
   const body = await resp.json().catch(() => ({}));
   return { ok: resp.ok, status: resp.status, body: body ?? {} };
 }
