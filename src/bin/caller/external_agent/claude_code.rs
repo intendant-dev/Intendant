@@ -468,7 +468,9 @@ fn parse_user_questions(input: &serde_json::Value) -> Option<Vec<crate::types::U
                         };
                         (
                             label.trim(),
-                            opt.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                            opt.get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or(""),
                         )
                     }
                 };

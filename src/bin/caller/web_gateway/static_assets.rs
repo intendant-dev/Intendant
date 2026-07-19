@@ -689,6 +689,35 @@ mod tests {
         assert!(text.ends_with("self.onmessage=null;\n"));
     }
 
+    /// Agent-authored question-preview HTML must only ever render inside
+    /// a sandboxed iframe with an opaque origin. Dashboard authentication
+    /// is ambient (mTLS client cert → IAM principal), so a same-origin
+    /// grant — or any unsandboxed embed of agent markup — would let it
+    /// drive the gateway with the operator's full authority. If this test
+    /// fails, someone widened the sandbox: fix the widening, not the test.
+    #[test]
+    fn question_preview_iframe_sandbox_is_pinned() {
+        assert!(
+            APP_HTML.contains("setAttribute('sandbox', 'allow-scripts')"),
+            "question-preview iframe lost its sandbox attribute"
+        );
+        assert_eq!(
+            APP_HTML.matches("setAttribute('sandbox'").count(),
+            1,
+            "every iframe sandbox attribute must be the pinned allow-scripts-only set"
+        );
+        assert_eq!(
+            APP_HTML.matches("allow-same-origin").count(),
+            0,
+            "allow-same-origin must never appear anywhere in the dashboard bundle"
+        );
+        assert_eq!(
+            APP_HTML.matches(".srcdoc").count(),
+            1,
+            "srcdoc must have exactly one writer: the sandboxed question-preview renderer"
+        );
+    }
+
     #[test]
     fn test_app_html_embedded() {
         assert!(!APP_HTML.is_empty());

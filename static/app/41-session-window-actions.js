@@ -3807,6 +3807,88 @@ function updateQuestionProgress() {
   if (progress) progress.textContent = `${answered} of ${total} answered`;
 }
 
+// ── Question preview cards (show, then ask) ──
+// q.previews: [{label, kind: 'html'|'image'|'text', url?, content?}] —
+// prototype variants to pick between, before/after states to judge.
+// html/image are upload-store references fetched lazily; text is inline.
+//
+// SECURITY INVARIANT: agent-authored html renders ONLY inside a sandboxed
+// srcdoc iframe with an opaque origin — never widen the sandbox attribute
+// (no same-origin, forms, or top-navigation grants) and never render
+// agent markup outside it (no blob:/createObjectURL documents either:
+// blob URLs inherit this dashboard's origin). Dashboard
+// authentication is ambient (mTLS client cert → IAM principal), so agent
+// markup executing with dashboard-origin authority could drive the daemon
+// API as the operator. Pinned by question_preview_iframe_sandbox_is_pinned.
+function appendQuestionPreviews(block, q) {
+  const previews = Array.isArray(q.previews) ? q.previews : [];
+  if (!previews.length) return;
+  const strip = document.createElement('div');
+  strip.className = 'question-previews';
+  if (previews.length > 1) strip.classList.add('multi');
+  const missingChip = (p, why) => {
+    const chip = document.createElement('span');
+    chip.className = 'question-preview-missing';
+    chip.textContent = `${p.label || 'preview'} unavailable`;
+    chip.title = why || 'preview unavailable (blob deleted from the upload store)';
+    return chip;
+  };
+  previews.forEach((p) => {
+    const card = document.createElement('figure');
+    card.className = 'question-preview-card';
+    const caption = document.createElement('figcaption');
+    caption.className = 'question-preview-label';
+    const captionText = document.createElement('span');
+    captionText.textContent = p.label || '';
+    caption.appendChild(captionText);
+    card.appendChild(caption);
+    if (p.kind === 'html' && p.url) {
+      const frame = document.createElement('iframe');
+      frame.className = 'question-preview-frame';
+      frame.setAttribute('sandbox', 'allow-scripts');
+      frame.setAttribute('referrerpolicy', 'no-referrer');
+      frame.title = p.label || 'preview';
+      const grow = document.createElement('button');
+      grow.type = 'button';
+      grow.className = 'question-preview-expand';
+      grow.textContent = 'Expand';
+      grow.addEventListener('click', () => {
+        grow.textContent = card.classList.toggle('expanded') ? 'Collapse' : 'Expand';
+      });
+      caption.appendChild(grow);
+      card.appendChild(frame);
+      fetch(p.url)
+        .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
+        .then((html) => { frame.srcdoc = html; })
+        .catch(() => { grow.remove(); frame.replaceWith(missingChip(p)); });
+    } else if (p.kind === 'image' && p.url) {
+      const img = document.createElement('img');
+      img.className = 'question-preview-image';
+      img.loading = 'lazy';
+      img.src = p.url;
+      img.alt = p.label || 'preview';
+      const link = document.createElement('a');
+      link.className = 'question-preview-imagelink';
+      link.href = p.url;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.title = p.label || 'preview';
+      link.appendChild(img);
+      img.addEventListener('error', () => { link.replaceWith(missingChip(p)); }, { once: true });
+      card.appendChild(link);
+    } else if (p.kind === 'text' && p.content) {
+      const pre = document.createElement('pre');
+      pre.className = 'question-preview-text';
+      pre.textContent = p.content;
+      card.appendChild(pre);
+    } else {
+      card.appendChild(missingChip(p, 'unsupported preview kind'));
+    }
+    strip.appendChild(card);
+  });
+  block.appendChild(strip);
+}
+
 function showUserQuestion(id, questions, sessionId) {
   if (processingLogReplay) return;
   const list = Array.isArray(questions) ? questions : [];
@@ -3876,6 +3958,8 @@ function showUserQuestion(id, questions, sessionId) {
     text.className = 'question-text';
     text.textContent = q.question;
     block.appendChild(text);
+
+    appendQuestionPreviews(block, q);
 
     const options = document.createElement('div');
     options.className = 'question-options';

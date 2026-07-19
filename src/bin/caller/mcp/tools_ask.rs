@@ -238,10 +238,7 @@ pub(crate) fn decode_ask_previews(
                 ASK_USER_MAX_TOTAL_PREVIEW_BYTES / (1024 * 1024)
             ));
         }
-        decoded.push(DecodedPreview {
-            label,
-            source,
-        });
+        decoded.push(DecodedPreview { label, source });
     }
     Ok(decoded)
 }
@@ -473,38 +470,39 @@ impl IntendantServer {
             let scope = crate::global_store::StoreScope::resolve(project_root.as_deref());
             let mut committed: Vec<crate::types::QuestionPreview> = Vec::new();
             for preview in decoded_previews {
-                let source = match preview.source {
-                    DecodedPreviewSource::Text(content) => {
-                        Ok(crate::types::QuestionPreviewSource::Text { content })
-                    }
-                    DecodedPreviewSource::Html(html) => commit_preview_blob(
-                        html.as_bytes(),
-                        &preview.label,
-                        "html",
-                        "text/html",
-                        &log_dir,
-                        &session_id,
-                        &scope,
-                    )
-                    .map(|descriptor| crate::types::QuestionPreviewSource::Html {
-                        url: preview_raw_url(&descriptor.id),
-                        upload_id: descriptor.id,
-                    }),
-                    DecodedPreviewSource::Image { mime, bytes } => commit_preview_blob(
-                        &bytes,
-                        &preview.label,
-                        super::tools_notes::note_image_extension(mime),
-                        mime,
-                        &log_dir,
-                        &session_id,
-                        &scope,
-                    )
-                    .map(|descriptor| crate::types::QuestionPreviewSource::Image {
-                        url: preview_raw_url(&descriptor.id),
-                        upload_id: descriptor.id,
-                        mime: mime.to_string(),
-                    }),
-                };
+                let source =
+                    match preview.source {
+                        DecodedPreviewSource::Text(content) => {
+                            Ok(crate::types::QuestionPreviewSource::Text { content })
+                        }
+                        DecodedPreviewSource::Html(html) => commit_preview_blob(
+                            html.as_bytes(),
+                            &preview.label,
+                            "html",
+                            "text/html",
+                            &log_dir,
+                            &session_id,
+                            &scope,
+                        )
+                        .map(|descriptor| crate::types::QuestionPreviewSource::Html {
+                            url: preview_raw_url(&descriptor.id),
+                            upload_id: descriptor.id,
+                        }),
+                        DecodedPreviewSource::Image { mime, bytes } => commit_preview_blob(
+                            &bytes,
+                            &preview.label,
+                            super::tools_notes::note_image_extension(mime),
+                            mime,
+                            &log_dir,
+                            &session_id,
+                            &scope,
+                        )
+                        .map(|descriptor| crate::types::QuestionPreviewSource::Image {
+                            url: preview_raw_url(&descriptor.id),
+                            upload_id: descriptor.id,
+                            mime: mime.to_string(),
+                        }),
+                    };
                 match source {
                     Ok(source) => committed.push(crate::types::QuestionPreview {
                         label: preview.label,
@@ -521,8 +519,7 @@ impl IntendantServer {
                                 } => upload_id,
                                 crate::types::QuestionPreviewSource::Text { .. } => continue,
                             };
-                            let _ =
-                                crate::upload_store::delete_upload(upload_id, &log_dir, &scope);
+                            let _ = crate::upload_store::delete_upload(upload_id, &log_dir, &scope);
                         }
                         return Err(message);
                     }
@@ -891,13 +888,14 @@ mod tests {
         // Per-kind caps and validation.
         let err = decode_ask_previews(&[html_preview("A", "   ")]).unwrap_err();
         assert!(err.contains("html must not be empty"), "{err}");
-        let err = decode_ask_previews(&[html_preview("A", &"x".repeat(ASK_USER_MAX_HTML_BYTES + 1))])
-            .unwrap_err();
+        let err =
+            decode_ask_previews(&[html_preview("A", &"x".repeat(ASK_USER_MAX_HTML_BYTES + 1))])
+                .unwrap_err();
         assert!(err.contains("max 2 MB"), "{err}");
         let err = decode_ask_previews(&[image_preview("A", None, b"png")]).unwrap_err();
         assert!(err.contains("media_type is required"), "{err}");
-        let err =
-            decode_ask_previews(&[image_preview("A", Some("image/svg+xml"), b"<svg/>")]).unwrap_err();
+        let err = decode_ask_previews(&[image_preview("A", Some("image/svg+xml"), b"<svg/>")])
+            .unwrap_err();
         assert!(err.contains("unsupported media_type"), "{err}");
         let err = decode_ask_previews(&[text_preview(
             "A",
@@ -926,13 +924,17 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.len(), 3);
         assert_eq!(decoded[0].label, "A — dense layout");
-        assert!(matches!(&decoded[0].source, DecodedPreviewSource::Html(h) if h.contains("<body>a</body>")));
+        assert!(
+            matches!(&decoded[0].source, DecodedPreviewSource::Html(h) if h.contains("<body>a</body>"))
+        );
         // image/jpg canonicalizes to image/jpeg like note attachments.
         assert!(
             matches!(&decoded[1].source, DecodedPreviewSource::Image { mime, bytes } if *mime == "image/jpeg" && bytes.starts_with(b"\xff\xd8"))
         );
         assert_eq!(decoded[2].label.len(), 80);
-        assert!(matches!(&decoded[2].source, DecodedPreviewSource::Text(t) if t == "diff --git a b"));
+        assert!(
+            matches!(&decoded[2].source, DecodedPreviewSource::Text(t) if t == "diff --git a b")
+        );
     }
 
     /// The documented preview caps must always fit inside the `/mcp` body
@@ -1130,7 +1132,10 @@ mod tests {
         let scope = crate::global_store::StoreScope::resolve(Some(&project_root));
         match &previews[0].source {
             crate::types::QuestionPreviewSource::Html { upload_id, url } => {
-                assert_eq!(url, &format!("/api/session/current/uploads/{upload_id}/raw"));
+                assert_eq!(
+                    url,
+                    &format!("/api/session/current/uploads/{upload_id}/raw")
+                );
                 let descriptor = crate::upload_store::find_upload(upload_id, &log_dir, &scope)
                     .expect("html blob committed");
                 assert_eq!(descriptor.session_id, "sess-preview");
@@ -1146,7 +1151,10 @@ mod tests {
                 url,
             } => {
                 assert_eq!(mime, "image/png");
-                assert_eq!(url, &format!("/api/session/current/uploads/{upload_id}/raw"));
+                assert_eq!(
+                    url,
+                    &format!("/api/session/current/uploads/{upload_id}/raw")
+                );
                 let descriptor = crate::upload_store::find_upload(upload_id, &log_dir, &scope)
                     .expect("image blob committed");
                 assert_eq!(std::fs::read(&descriptor.path).unwrap(), png);
