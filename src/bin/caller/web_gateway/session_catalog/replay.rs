@@ -936,7 +936,7 @@ pub(crate) fn annotate_replay_user_turns_from_external_transcript(
     }
 
     let mut next_user_turn = 0usize;
-    for entry in entries {
+    for entry in entries.iter_mut() {
         if entry.get("event").and_then(|v| v.as_str()) != Some("log_entry") {
             continue;
         }
@@ -989,6 +989,58 @@ pub(crate) fn annotate_replay_user_turns_from_external_transcript(
                 if let Some(value) = turn.get(key) {
                     obj.insert(key.to_string(), value.clone());
                 }
+            }
+        }
+    }
+
+    // Second pass — tool rows. Transcript tool entries carry the exact
+    // `item_id` key plus their line's `message_uuid`; daemon-log tool rows
+    // carry the same item id. Stamping the uuid here is what makes the
+    // anchor-labeled rows of a fully supervised claude session forkable
+    // (their detail view renders only daemon-log rows).
+    let mut uuid_by_item: std::collections::HashMap<&str, &serde_json::Value> =
+        std::collections::HashMap::new();
+    for entry in transcript.iter() {
+        let (Some(item_id), Some(_)) = (
+            entry.get("item_id").and_then(|v| v.as_str()),
+            entry.get("message_uuid").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        uuid_by_item.entry(item_id).or_insert(entry);
+    }
+    if uuid_by_item.is_empty() {
+        return;
+    }
+    for entry in entries.iter_mut() {
+        if entry.get("event").and_then(|v| v.as_str()) != Some("log_entry") {
+            continue;
+        }
+        if entry.get("session_id").and_then(|v| v.as_str()) != Some(session_id) {
+            continue;
+        }
+        if entry.get("message_uuid").is_some() {
+            continue;
+        }
+        let stamped = entry
+            .get("item_id")
+            .and_then(|v| v.as_str())
+            .and_then(|item_id| uuid_by_item.get(item_id))
+            .map(|src| {
+                (
+                    src.get("message_uuid").cloned(),
+                    src.get("off_active_chain").cloned(),
+                )
+            });
+        let Some((uuid, off_chain)) = stamped else {
+            continue;
+        };
+        if let Some(obj) = entry.as_object_mut() {
+            if let Some(uuid) = uuid {
+                obj.insert("message_uuid".to_string(), uuid);
+            }
+            if let Some(off_chain) = off_chain {
+                obj.insert("off_active_chain".to_string(), off_chain);
             }
         }
     }
@@ -1966,7 +2018,7 @@ mod tests {
         let sid = "cc-stamp-test";
         let lines = [
             r#"{"uuid":"u1","parentUuid":null,"type":"user","timestamp":"2026-07-19T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"continue"}]}}"#,
-            r#"{"uuid":"a1","parentUuid":"u1","type":"assistant","timestamp":"2026-07-19T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok one"}]}}"#,
+            r#"{"uuid":"a1","parentUuid":"u1","type":"assistant","timestamp":"2026-07-19T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok one"},{"type":"tool_use","id":"toolu_9","name":"Bash","input":{"command":"ls"}}]}}"#,
             r#"{"uuid":"u2","parentUuid":"a1","type":"user","timestamp":"2026-07-19T00:00:03.000Z","message":{"role":"user","content":[{"type":"text","text":"continue"}]}}"#,
             r#"{"uuid":"a2","parentUuid":"u2","type":"assistant","timestamp":"2026-07-19T00:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok two"}]}}"#,
         ];
@@ -1974,7 +2026,7 @@ mod tests {
 
         let mut entries = vec![
             serde_json::json!({"event":"log_entry","session_id":sid,"source":"User","content":"continue"}),
-            serde_json::json!({"event":"log_entry","session_id":sid,"source":"Claude Code","content":"ok one"}),
+            serde_json::json!({"event":"log_entry","session_id":sid,"source":"Claude Code","kind":"tool_call","item_id":"toolu_9","content":"Bash: ls"}),
             serde_json::json!({"event":"log_entry","session_id":sid,"source":"User","content":"continue"}),
         ];
         annotate_replay_user_turns_from_external_transcript(&mut entries, home, "claude-code", sid);
@@ -1983,6 +2035,9 @@ mod tests {
             entries[2]["message_uuid"], "u2",
             "duplicate prose maps in order, not to the first global match"
         );
-        assert!(entries[1].get("message_uuid").is_none());
+        assert_eq!(
+            entries[1]["message_uuid"], "a1",
+            "tool rows stamp via their exact item_id key (the anchor-labeled rows)"
+        );
     }
 }
