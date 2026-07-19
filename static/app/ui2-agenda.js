@@ -510,16 +510,21 @@ function agendaRenderCard() {
 
 // The vitals rail owns the top-right column; stack the card just under
 // its live height (both hide together below 1180px / in grid layout).
+// Write-guarded: the 1 Hz reposition mostly re-derives the same state, and
+// re-stamping data-rail-hidden / style.top with unchanged values fed a
+// style-invalidation pass per second (the `:has()` before-mutation walk)
+// for nothing.
 function agendaPositionCard() {
   const card = document.getElementById('ui2-agenda-card');
   const rail = document.getElementById('ui2-vitals-rail');
   if (!card) return;
   if (!rail || !rail.offsetParent) {
-    card.dataset.railHidden = '1';
+    if (card.dataset.railHidden !== '1') card.dataset.railHidden = '1';
     return;
   }
-  delete card.dataset.railHidden;
-  card.style.top = `${rail.offsetTop + rail.offsetHeight + 12}px`;
+  if ('railHidden' in card.dataset) delete card.dataset.railHidden;
+  const top = `${rail.offsetTop + rail.offsetHeight + 12}px`;
+  if (card.style.top !== top) card.style.top = top;
 }
 
 {
@@ -560,7 +565,12 @@ function agendaPositionCard() {
     }
     agendaBuildCard();
     agendaRefresh();
-    setInterval(agendaPositionCard, 1000);
+    // Pane-gated: the card lives in #activity-log-pane, so with the
+    // Activity tab parked (another tab, or document.hidden) the reposition
+    // tick used to write data-rail-hidden into a display:none subtree once
+    // per second. renderOrDefer keeps only the latest reposition thunk
+    // while parked; flushPaneRenders runs it on pane re-entry.
+    setInterval(() => renderOrDefer('activity', 'ui2-agenda-card', agendaPositionCard), 1000);
     agendaPositionCard();
   };
   if (document.readyState === 'complete') wire();
