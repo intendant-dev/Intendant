@@ -325,6 +325,11 @@ pub enum OutboundEvent {
         /// groups output under its command in the Activity log.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
+        /// The result's transcript line uuid (Claude Code envelope
+        /// `uuid`) — the anchor-chip fork affordance keys on it.
+        /// Additive: absent for backends without per-line uuids.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_uuid: Option<String>,
     },
     ApprovalRequired {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -774,6 +779,11 @@ pub enum OutboundEvent {
         /// When set, overrides the default "agent"/"Run" source label (e.g. "Codex").
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        /// The backend transcript line the call rides on (Claude Code
+        /// envelope `uuid`) — the anchor-chip fork affordance keys on it.
+        /// Additive: absent for backends without per-line uuids.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_uuid: Option<String>,
     },
     DoneSignal {
         #[serde(default, skip_serializing_if = "Option::is_none")]

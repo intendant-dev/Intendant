@@ -1472,6 +1472,8 @@ impl CcReader {
                 AgentEvent::ToolCompleted {
                     item_id: tool_id,
                     status: ToolCompletionStatus::Cancelled,
+                    // Synthesized closer — no transcript line of its own.
+                    message_uuid: None,
                 },
             ));
         }
@@ -1991,6 +1993,11 @@ impl CcReader {
         // how the streamed deltas were buffered (deliberately not the
         // resolved child id `child_scope` carries).
         let thinking_scope = Self::thinking_scope(msg);
+        // The LINE's transcript address (top-level envelope `uuid`, not
+        // anything inside `message`): every tool_use block in this
+        // envelope lives at this uuid, which is where the fork engine can
+        // chain-slice the transcript.
+        let message_uuid = Self::envelope_message_uuid(msg);
         for block in content {
             match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                 "text" => {
@@ -2158,6 +2165,7 @@ impl CcReader {
                         item_id: tool_id,
                         tool_name,
                         preview: tool_input_preview(&input),
+                        message_uuid: message_uuid.clone(),
                     });
                     if child_scope.is_none() {
                         // Structured write-path signal for the git-vitals
@@ -2176,7 +2184,9 @@ impl CcReader {
                         self.observe_activity(ActivityObs::ToolsRunning, out);
                     }
                 }
-                "tool_result" => self.tool_result_events(block, out, false, None),
+                "tool_result" => {
+                    self.tool_result_events(block, out, false, None, message_uuid.as_deref())
+                }
                 _ => {}
             }
         }
@@ -2210,9 +2220,18 @@ impl CcReader {
         else {
             return;
         };
+        // The result LINE's own transcript uuid (top-level of the user
+        // envelope) — distinct from the call's assistant-envelope uuid.
+        let message_uuid = Self::envelope_message_uuid(msg);
         for block in content {
             if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-                self.tool_result_events(block, out, async_launch, msg.get("tool_use_result"));
+                self.tool_result_events(
+                    block,
+                    out,
+                    async_launch,
+                    msg.get("tool_use_result"),
+                    message_uuid.as_deref(),
+                );
             }
         }
     }
@@ -2223,6 +2242,7 @@ impl CcReader {
         out: &mut CcLineOutcome,
         async_launch: bool,
         tool_use_result: Option<&serde_json::Value>,
+        message_uuid: Option<&str>,
     ) {
         let tool_id = block
             .get("tool_use_id")
@@ -2351,6 +2371,7 @@ impl CcReader {
             out.events.push(AgentEvent::ToolOutputDelta {
                 item_id: tool_id.clone(),
                 text: content_text,
+                message_uuid: message_uuid.map(str::to_string),
             });
         }
 
@@ -2368,6 +2389,7 @@ impl CcReader {
         out.events.push(AgentEvent::ToolCompleted {
             item_id: tool_id,
             status,
+            message_uuid: message_uuid.map(str::to_string),
         });
     }
 
@@ -2389,6 +2411,20 @@ impl CcReader {
     /// child-materializing side effects.
     fn thinking_scope(msg: &serde_json::Value) -> Option<String> {
         msg.get("parent_tool_use_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// The wrapper LINE's transcript uuid — the top-level `uuid` every
+    /// stream-json envelope carries, naming its line in the CLI's own
+    /// transcript file. Deliberately NOT read from inside `message`: the
+    /// fork engine chain-slices the transcript by these line uuids, so
+    /// only the envelope's own address is honest. Absent (older CLIs,
+    /// synthetic lines) → `None`, never a guess.
+    fn envelope_message_uuid(msg: &serde_json::Value) -> Option<String> {
+        msg.get("uuid")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -2676,6 +2712,8 @@ impl CcReader {
             out.events.push(AgentEvent::ToolCompleted {
                 item_id: tool_id,
                 status: ToolCompletionStatus::Cancelled,
+                // Synthesized closer — no transcript line of its own.
+                message_uuid: None,
             });
         }
 
@@ -5154,7 +5192,7 @@ mod tests {
             .any(|e| matches!(e, AgentEvent::Message { text } if text == "Hello")));
         assert!(out.events.iter().any(|e| matches!(
             e,
-            AgentEvent::ToolStarted { item_id, tool_name, preview }
+            AgentEvent::ToolStarted { item_id, tool_name, preview, .. }
                 if item_id == "t1" && tool_name == "Bash" && preview == "ls"
         )));
         assert!(reader.open_tools.contains_key("t1"));
@@ -5357,10 +5395,10 @@ mod tests {
         assert!(out
             .events
             .iter()
-            .any(|e| matches!(e, AgentEvent::ToolOutputDelta { item_id, text } if item_id == "t9" && text == "hi")));
+            .any(|e| matches!(e, AgentEvent::ToolOutputDelta { item_id, text, .. } if item_id == "t9" && text == "hi")));
         assert!(out.events.iter().any(|e| matches!(
             e,
-            AgentEvent::ToolCompleted { item_id, status }
+            AgentEvent::ToolCompleted { item_id, status, .. }
                 if item_id == "t9" && *status == ToolCompletionStatus::Success
         )));
         assert!(reader.open_tools.is_empty());
@@ -5374,8 +5412,75 @@ mod tests {
         );
         assert!(out.events.iter().any(|e| matches!(
             e,
-            AgentEvent::ToolCompleted { item_id, status: ToolCompletionStatus::Failed { message } }
+            AgentEvent::ToolCompleted { item_id, status: ToolCompletionStatus::Failed { message }, .. }
                 if item_id == "t2" && message.contains("Denied")
+        )));
+    }
+
+    /// A tool call rides its assistant envelope's top-level `uuid` — the
+    /// transcript line address the fork engine chain-slices at. This is
+    /// what lights the anchor-chip fork affordance on LIVE tool rows
+    /// (hydrated detail rows get theirs from the replay annotator).
+    #[test]
+    fn reader_stamps_tool_started_with_assistant_envelope_uuid() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"uuid":"aaaa-1111","type":"assistant","message":{"content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"}}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolStarted { item_id, message_uuid, .. }
+                if item_id == "tu1" && message_uuid.as_deref() == Some("aaaa-1111")
+        )));
+    }
+
+    /// A tool result rides ITS OWN user envelope's `uuid` (not the
+    /// call's): both the output content event and the completion carry
+    /// the result line's address.
+    #[test]
+    fn reader_stamps_tool_result_events_with_result_envelope_uuid() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"uuid":"aaaa-1111","type":"assistant","message":{"content":[{"type":"tool_use","id":"tu2","name":"Bash","input":{"command":"pwd"}}]},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"uuid":"bbbb-2222","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu2","content":"/tmp"}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolOutputDelta { item_id, text, message_uuid }
+                if item_id == "tu2" && text == "/tmp"
+                    && message_uuid.as_deref() == Some("bbbb-2222")
+        )));
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCompleted { item_id, status: ToolCompletionStatus::Success, message_uuid }
+                if item_id == "tu2" && message_uuid.as_deref() == Some("bbbb-2222")
+        )));
+    }
+
+    /// Envelopes without a top-level `uuid` (older CLIs) yield `None` —
+    /// never a guessed address, never a panic.
+    #[test]
+    fn reader_tool_events_without_envelope_uuid_carry_none() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu3","name":"Bash","input":{"command":"ls"}}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolStarted { item_id, message_uuid: None, .. } if item_id == "tu3"
+        )));
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu3","content":"ok"}]},"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolOutputDelta { item_id, message_uuid: None, .. } if item_id == "tu3"
+        )));
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCompleted { item_id, message_uuid: None, .. } if item_id == "tu3"
         )));
     }
 
@@ -5762,7 +5867,7 @@ mod tests {
         );
         assert!(out.events.iter().any(|e| matches!(
             e,
-            AgentEvent::ToolCompleted { item_id, status: ToolCompletionStatus::Cancelled }
+            AgentEvent::ToolCompleted { item_id, status: ToolCompletionStatus::Cancelled, .. }
                 if item_id == "t5"
         )));
         assert!(reader.open_tools.is_empty());
@@ -6257,7 +6362,7 @@ mod tests {
                 if thread_id.as_deref() == Some(TASK_CHILD)
                     && matches!(
                         event.as_ref(),
-                        AgentEvent::ToolCompleted { item_id, status: ToolCompletionStatus::Cancelled }
+                        AgentEvent::ToolCompleted { item_id, status: ToolCompletionStatus::Cancelled, .. }
                             if item_id == "tb2"
                     )
         )));
@@ -6334,7 +6439,7 @@ mod tests {
         );
         assert!(out.events.iter().any(|e| matches!(
             e,
-            AgentEvent::ToolCompleted { item_id, status: ToolCompletionStatus::Cancelled }
+            AgentEvent::ToolCompleted { item_id, status: ToolCompletionStatus::Cancelled, .. }
                 if item_id == "main1"
         )));
         assert!(

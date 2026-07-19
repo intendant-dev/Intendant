@@ -30,6 +30,10 @@ pub enum UiCommand {
         output_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
+        /// The backend transcript line the row rides on (Claude Code
+        /// envelope `uuid`) — the anchor-chip fork affordance keys on it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_uuid: Option<String>,
         #[serde(default)]
         collapsible: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1162,6 +1166,7 @@ struct LogEntry {
     kind: Option<String>,
     output_id: Option<String>,
     item_id: Option<String>,
+    message_uuid: Option<String>,
     collapsible: bool,
     turn: Option<u64>,
     user_turn_index: Option<u32>,
@@ -1374,6 +1379,7 @@ impl AppState {
                 kind: entry.kind.clone(),
                 output_id: entry.output_id.clone(),
                 item_id: entry.item_id.clone(),
+                message_uuid: entry.message_uuid.clone(),
                 collapsible: entry.collapsible,
                 turn: None, // separator already handled
                 user_turn_index: entry.user_turn_index,
@@ -1711,6 +1717,7 @@ impl AppState {
                             None,
                             None,
                             None,
+                            None,
                             false,
                             None,
                         ));
@@ -1726,6 +1733,9 @@ impl AppState {
                 let preview = msg["commands_preview"].as_str().unwrap_or("");
                 let source = msg["source"].as_str().unwrap_or("agent");
                 let item_id = msg["item_id"].as_str().map(str::to_string);
+                // The call's transcript line uuid — rides the row so the
+                // anchor-chip fork affordance works in the live lane.
+                let message_uuid = msg["message_uuid"].as_str().map(str::to_string);
                 if !self.known_displays.is_empty() {
                     cmds.extend(self.add_log("detail", "Running on display", None, source));
                 }
@@ -1742,6 +1752,7 @@ impl AppState {
                     Some("tool_call"),
                     None,
                     item_id,
+                    message_uuid,
                     None,
                     None,
                     false,
@@ -1761,6 +1772,8 @@ impl AppState {
                 // Originating tool call — groups output under its command
                 // row instead of coalescing consecutive tools' output.
                 let item_id = msg["item_id"].as_str().map(str::to_string);
+                // The result envelope's transcript line uuid (fork anchor).
+                let message_uuid = msg["message_uuid"].as_str().map(str::to_string);
                 if let Some(stdout) = msg["stdout"].as_str() {
                     if !stdout.is_empty() {
                         let out = format_agent_output(stdout);
@@ -1774,6 +1787,7 @@ impl AppState {
                                 Some("agent_output"),
                                 output_id.clone(),
                                 item_id.clone(),
+                                message_uuid.clone(),
                                 None,
                                 None,
                                 false,
@@ -1793,6 +1807,7 @@ impl AppState {
                             Some("agent_output"),
                             output_id.clone(),
                             item_id.clone(),
+                            message_uuid.clone(),
                             None,
                             None,
                             false,
@@ -2782,6 +2797,7 @@ impl AppState {
                     kind,
                     None,
                     None,
+                    None,
                     user_turn_index,
                     user_turn_revision,
                     superseded,
@@ -2830,6 +2846,7 @@ impl AppState {
                     "system",
                     Vec::new(),
                     Some("rollback_marker"),
+                    None,
                     None,
                     None,
                     None,
@@ -3167,7 +3184,7 @@ impl AppState {
         images: Vec<String>,
     ) -> Vec<UiCommand> {
         self.add_log_with_metadata(
-            level, content, turn, source, images, None, None, None, None, None, false, None,
+            level, content, turn, source, images, None, None, None, None, None, None, false, None,
         )
     }
 
@@ -3182,6 +3199,7 @@ impl AppState {
         kind: Option<&str>,
         output_id: Option<String>,
         item_id: Option<String>,
+        message_uuid: Option<String>,
         user_turn_index: Option<u32>,
         user_turn_revision: Option<u32>,
         superseded: bool,
@@ -3211,6 +3229,7 @@ impl AppState {
             kind: kind_string.clone(),
             output_id: output_id.clone(),
             item_id: item_id.clone(),
+            message_uuid: message_uuid.clone(),
             collapsible: is_collapsible,
             turn,
             user_turn_index,
@@ -3243,6 +3262,7 @@ impl AppState {
             kind: kind_string,
             output_id,
             item_id,
+            message_uuid,
             collapsible: is_collapsible,
             turn: None, // separator already emitted
             user_turn_index,
@@ -5439,6 +5459,7 @@ mod tests {
             kind: None,
             output_id: None,
             item_id: None,
+            message_uuid: None,
             collapsible: false,
             turn: None,
             user_turn_index: None,
@@ -5456,6 +5477,52 @@ mod tests {
         };
         let json2 = serde_json::to_string(&cmd2).unwrap();
         assert!(json2.contains("\"cmd\":\"set_phase\""));
+    }
+
+    /// The live tool rows' transcript address: `agent_started` /
+    /// `agent_output` wire events carry `message_uuid`, and the emitted
+    /// AddLogEntry must keep it beside `item_id` — the record field the
+    /// anchor-chip fork affordance keys on.
+    #[test]
+    fn agent_events_carry_message_uuid_onto_log_rows() {
+        let mut s = AppState::new();
+        let cmds = s.handle_message(&json!({
+            "event": "agent_started",
+            "turn": 1,
+            "commands_preview": "Bash: ls",
+            "item_id": "toolu_1",
+            "source": "Claude Code",
+            "message_uuid": "uuid-call-1"
+        }));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry {
+                kind,
+                item_id,
+                message_uuid,
+                ..
+            } if kind.as_deref() == Some("tool_call")
+                && item_id.as_deref() == Some("toolu_1")
+                && message_uuid.as_deref() == Some("uuid-call-1")
+        )));
+
+        let cmds = s.handle_message(&json!({
+            "event": "agent_output",
+            "stdout": "file1\nfile2",
+            "stderr": "",
+            "item_id": "toolu_1",
+            "source": "Claude Code",
+            "message_uuid": "uuid-result-1"
+        }));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry {
+                kind,
+                message_uuid,
+                ..
+            } if kind.as_deref() == Some("agent_output")
+                && message_uuid.as_deref() == Some("uuid-result-1")
+        )));
     }
 
     #[test]

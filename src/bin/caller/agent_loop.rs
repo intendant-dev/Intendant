@@ -2647,6 +2647,7 @@ pub(crate) async fn run_agent_loop(
                 commands_preview: preview.clone(),
                 item_id: None,
                 source: None,
+                message_uuid: None,
             });
             if !batch_facts.write_paths.is_empty() {
                 // Structured write-path signal for the git-vitals
@@ -2683,6 +2684,7 @@ pub(crate) async fn run_agent_loop(
                 source: None,
                 output_id: Some(output_id),
                 item_id: None,
+                message_uuid: None,
             });
 
             // Map results back to individual tool responses
@@ -3231,6 +3233,7 @@ Proceed with explicit assumptions and continue without additional questions."
                 commands_preview: preview.clone(),
                 item_id: None,
                 source: None,
+                message_uuid: None,
             });
             if !batch_facts.write_paths.is_empty() {
                 // Structured write-path signal for the git-vitals
@@ -3267,6 +3270,7 @@ Proceed with explicit assumptions and continue without additional questions."
                 source: None,
                 output_id: Some(output_id),
                 item_id: None,
+                message_uuid: None,
             });
 
             // Sandbox write denials: same consent offer as the tool path,

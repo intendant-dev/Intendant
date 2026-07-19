@@ -180,6 +180,11 @@ pub enum AppEvent {
         commands_preview: String,
         item_id: Option<String>,
         source: Option<String>,
+        /// The backend transcript line the tool call rides on (Claude
+        /// Code's envelope `uuid`) — the address the anchor-chip fork
+        /// affordance cuts at. `None` for backends without per-line
+        /// transcript uuids.
+        message_uuid: Option<String>,
     },
     AgentOutput {
         session_id: Option<String>,
@@ -198,6 +203,9 @@ pub enum AppEvent {
         /// backend correlates output to calls — frontends group output
         /// under its command instead of coalescing consecutive tools.
         item_id: Option<String>,
+        /// The result's own transcript line uuid (`AgentStarted.message_uuid`'s
+        /// twin for the tool_result envelope).
+        message_uuid: Option<String>,
     },
     SubAgentResult {
         formatted: String,
@@ -2400,12 +2408,14 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             commands_preview,
             item_id,
             source,
+            message_uuid,
         } => Some(OutboundEvent::AgentStarted {
             session_id: session_id.clone(),
             turn: *turn,
             commands_preview: commands_preview.clone(),
             item_id: item_id.clone(),
             source: source.clone(),
+            message_uuid: message_uuid.clone(),
         }),
         AppEvent::AgentOutput {
             session_id,
@@ -2414,6 +2424,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             source,
             output_id,
             item_id,
+            message_uuid,
         } => {
             // Wire edge: every WS connection JSON-escapes and sends this
             // payload, so it carries a bounded per-stream preview. The full
@@ -2430,6 +2441,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 source: source.clone(),
                 output_id: output_id.clone(),
                 item_id: item_id.clone(),
+                message_uuid: message_uuid.clone(),
             })
         }
         AppEvent::DoneSignal {
@@ -3538,6 +3550,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             commands_preview,
             item_id,
             source,
+            message_uuid,
         } => {
             log.agent_started_with_session_id(
                 session_id.as_deref(),
@@ -3545,6 +3558,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
                 commands_preview,
                 item_id.as_deref(),
                 source.as_deref(),
+                message_uuid.as_deref(),
             );
         }
         AppEvent::DoneSignal {
@@ -4363,6 +4377,7 @@ mod tests {
             commands_preview: "exec: pwd".to_string(),
             item_id: Some("call-abc".to_string()),
             source: Some("Codex".to_string()),
+            message_uuid: Some("uuid-abc".to_string()),
         };
 
         match app_event_to_outbound(&event).unwrap() {
@@ -4372,12 +4387,14 @@ mod tests {
                 commands_preview,
                 item_id,
                 source,
+                message_uuid,
             } => {
                 assert_eq!(session_id.as_deref(), Some("session-1"));
                 assert_eq!(turn, 3);
                 assert_eq!(commands_preview, "exec: pwd");
                 assert_eq!(item_id.as_deref(), Some("call-abc"));
                 assert_eq!(source.as_deref(), Some("Codex"));
+                assert_eq!(message_uuid.as_deref(), Some("uuid-abc"));
             }
             other => panic!("expected AgentStarted, got {:?}", other),
         }
@@ -5866,6 +5883,7 @@ mod tests {
             source: None,
             output_id: None,
             item_id: None,
+            message_uuid: None,
         };
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
@@ -5885,6 +5903,7 @@ mod tests {
             source: Some("Codex".to_string()),
             output_id: Some("out-1".to_string()),
             item_id: Some("call-1".to_string()),
+            message_uuid: None,
         };
         let json = serde_json::to_string(&app_event_to_outbound(&event).unwrap()).unwrap();
         assert_eq!(
@@ -5901,6 +5920,7 @@ mod tests {
             source: None,
             output_id: None,
             item_id: None,
+            message_uuid: None,
         };
         let json = serde_json::to_string(&app_event_to_outbound(&event).unwrap()).unwrap();
         assert_eq!(
@@ -5925,6 +5945,7 @@ mod tests {
             source: None,
             output_id: Some("out-9".to_string()),
             item_id: None,
+            message_uuid: None,
         };
         match app_event_to_outbound(&event).unwrap() {
             crate::types::OutboundEvent::AgentOutput {
@@ -6171,6 +6192,7 @@ mod tests {
                 source: Some("Codex".to_string()),
                 output_id: Some("out-1".to_string()),
                 item_id: None,
+                message_uuid: None,
             },
         );
         drop(shared);

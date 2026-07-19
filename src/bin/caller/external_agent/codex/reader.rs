@@ -2433,6 +2433,7 @@ pub(crate) fn translate_notification_with_scope(
                             item_id,
                             tool_name: "command".to_string(),
                             preview: compact_codex_command_preview(&command),
+                            message_uuid: None,
                         },
                     );
                 }
@@ -2451,6 +2452,7 @@ pub(crate) fn translate_notification_with_scope(
                                 item_id,
                                 tool_name: "file_change".to_string(),
                                 preview: paths.join(", "),
+                                message_uuid: None,
                             },
                         );
                         // Same paths, structured — the drain forwards them
@@ -2523,6 +2525,7 @@ pub(crate) fn translate_notification_with_scope(
                             item_id,
                             tool_name: "mcp".to_string(),
                             preview,
+                            message_uuid: None,
                         },
                     );
                 }
@@ -2535,6 +2538,7 @@ pub(crate) fn translate_notification_with_scope(
                             item_id,
                             tool_name: "web_search".to_string(),
                             preview: codex_web_search_preview(params),
+                            message_uuid: None,
                         },
                     );
                 }
@@ -2561,7 +2565,11 @@ pub(crate) fn translate_notification_with_scope(
                     event_tx,
                     thread_id,
                     turn_id,
-                    AgentEvent::ToolOutputDelta { item_id, text },
+                    AgentEvent::ToolOutputDelta {
+                        item_id,
+                        text,
+                        message_uuid: None,
+                    },
                 );
             }
         }
@@ -2674,6 +2682,7 @@ pub(crate) fn translate_notification_with_scope(
                             AgentEvent::ToolOutputDelta {
                                 item_id: item_id.clone(),
                                 text,
+                                message_uuid: None,
                             },
                         );
                     }
@@ -2688,6 +2697,7 @@ pub(crate) fn translate_notification_with_scope(
                         AgentEvent::ToolOutputDelta {
                             item_id: item_id.clone(),
                             text,
+                            message_uuid: None,
                         },
                     );
                 }
@@ -2703,6 +2713,7 @@ pub(crate) fn translate_notification_with_scope(
                             AgentEvent::ToolOutputDelta {
                                 item_id: item_id.clone(),
                                 text,
+                                message_uuid: None,
                             },
                         );
                     }
@@ -2725,6 +2736,7 @@ pub(crate) fn translate_notification_with_scope(
                             AgentEvent::ToolOutputDelta {
                                 item_id: item_id.clone(),
                                 text,
+                                message_uuid: None,
                             },
                         );
                     }
@@ -2752,7 +2764,11 @@ pub(crate) fn translate_notification_with_scope(
                 event_tx,
                 thread_id,
                 turn_id,
-                AgentEvent::ToolCompleted { item_id, status },
+                AgentEvent::ToolCompleted {
+                    item_id,
+                    status,
+                    message_uuid: None,
+                },
             );
         }
 
@@ -3344,6 +3360,7 @@ mod tests {
                 item_id,
                 tool_name,
                 preview,
+                ..
             } => {
                 assert_eq!(item_id, "item-1");
                 assert_eq!(tool_name, "command");
@@ -3547,6 +3564,7 @@ mod tests {
                 item_id,
                 tool_name,
                 preview,
+                ..
             } => {
                 assert_eq!(item_id, "item-web-1");
                 assert_eq!(tool_name, "web_search");
@@ -3573,6 +3591,7 @@ mod tests {
                 item_id,
                 tool_name,
                 preview,
+                ..
             } => {
                 assert_eq!(item_id, "item-web-2");
                 assert_eq!(tool_name, "web_search");
@@ -3595,7 +3614,9 @@ mod tests {
         translate_notification("item/completed", &params, &tx);
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolCompleted { item_id, status } => {
+            AgentEvent::ToolCompleted {
+                item_id, status, ..
+            } => {
                 assert_eq!(item_id, "item-web-3");
                 assert_eq!(status, ToolCompletionStatus::Success);
             }
@@ -3617,6 +3638,7 @@ mod tests {
                 item_id,
                 tool_name,
                 preview,
+                ..
             } => {
                 assert_eq!(item_id, "item-2");
                 assert_eq!(tool_name, "file_change");
@@ -3784,7 +3806,7 @@ mod tests {
         translate_notification("item/commandExecution/outputDelta", &params, &tx);
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolOutputDelta { item_id, text } => {
+            AgentEvent::ToolOutputDelta { item_id, text, .. } => {
                 assert_eq!(item_id, "item-1");
                 assert_eq!(text, "output line");
             }
@@ -4139,7 +4161,7 @@ error: could not compile `intendant`
 
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolOutputDelta { item_id, text } => {
+            AgentEvent::ToolOutputDelta { item_id, text, .. } => {
                 assert_eq!(item_id, "item-source-read");
                 assert!(text.contains("comment heavy source line 000"));
                 assert!(text.contains("omitting additional large command output"));
@@ -4166,7 +4188,7 @@ error: could not compile `intendant`
 
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolOutputDelta { item_id, text } => {
+            AgentEvent::ToolOutputDelta { item_id, text, .. } => {
                 assert_eq!(item_id, "item-source-read");
                 assert!(text.contains("bytes from the middle"));
                 assert!(text.contains("comment heavy source line 119"));
@@ -4194,7 +4216,7 @@ error: could not compile `intendant`
 
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolOutputDelta { item_id, text } => {
+            AgentEvent::ToolOutputDelta { item_id, text, .. } => {
                 assert_eq!(item_id, "item-cat-source");
                 assert!(text.contains("comment heavy source line 000"));
                 assert!(text.contains("comment heavy source line 119"));
@@ -4222,7 +4244,7 @@ error: could not compile `intendant`
 
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolOutputDelta { item_id, text } => {
+            AgentEvent::ToolOutputDelta { item_id, text, .. } => {
                 assert_eq!(item_id, "item-static-app");
                 assert!(text.contains("function renderStationRow0"));
                 assert!(text.contains("END_STATIC_APP_HTML_MARKER"));
@@ -4241,7 +4263,9 @@ error: could not compile `intendant`
 
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolCompleted { item_id, status } => {
+            AgentEvent::ToolCompleted {
+                item_id, status, ..
+            } => {
                 assert_eq!(item_id, "item-static-app");
                 assert_eq!(status, ToolCompletionStatus::Success);
             }
@@ -4625,7 +4649,7 @@ error: build failed
         // First event: ToolOutputDelta with the aggregated output
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolOutputDelta { item_id, text } => {
+            AgentEvent::ToolOutputDelta { item_id, text, .. } => {
                 assert_eq!(item_id, "item-1");
                 assert_eq!(text, "hello\n");
             }
@@ -4634,7 +4658,9 @@ error: build failed
         // Second event: ToolCompleted
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolCompleted { item_id, status } => {
+            AgentEvent::ToolCompleted {
+                item_id, status, ..
+            } => {
                 assert_eq!(item_id, "item-1");
                 assert_eq!(status, ToolCompletionStatus::Success);
             }
@@ -4656,7 +4682,7 @@ error: build failed
         translate_notification("item/completed", &params, &tx);
 
         match rx.try_recv().unwrap() {
-            AgentEvent::ToolOutputDelta { item_id, text } => {
+            AgentEvent::ToolOutputDelta { item_id, text, .. } => {
                 assert_eq!(item_id, "call_CP7ok6SOm9fbU9zYp8Ok1IL3");
                 assert_eq!(text, "actual command output\n");
                 assert!(!text.contains("Chunk ID:"));
@@ -4665,7 +4691,9 @@ error: build failed
             other => panic!("expected ToolOutputDelta, got {:?}", other),
         }
         match rx.try_recv().unwrap() {
-            AgentEvent::ToolCompleted { item_id, status } => {
+            AgentEvent::ToolCompleted {
+                item_id, status, ..
+            } => {
                 assert_eq!(item_id, "call_CP7ok6SOm9fbU9zYp8Ok1IL3");
                 assert_eq!(status, ToolCompletionStatus::Success);
             }
@@ -4687,7 +4715,9 @@ error: build failed
         translate_notification("item/completed", &params, &tx);
 
         match rx.try_recv().unwrap() {
-            AgentEvent::ToolCompleted { item_id, status } => {
+            AgentEvent::ToolCompleted {
+                item_id, status, ..
+            } => {
                 assert_eq!(item_id, "call_IXwDrmqUWzOZ8mBwjyG3rJqd");
                 assert_eq!(status, ToolCompletionStatus::Success);
             }
@@ -4704,7 +4734,9 @@ error: build failed
         translate_notification("item/completed", &params, &tx);
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolCompleted { item_id, status } => {
+            AgentEvent::ToolCompleted {
+                item_id, status, ..
+            } => {
                 assert_eq!(item_id, "item-1");
                 assert_eq!(
                     status,
@@ -4844,7 +4876,9 @@ error: build failed
         translate_notification("item/completed", &params, &tx);
         let event = rx.try_recv().unwrap();
         match event {
-            AgentEvent::ToolCompleted { item_id, status } => {
+            AgentEvent::ToolCompleted {
+                item_id, status, ..
+            } => {
                 assert_eq!(item_id, "item-1");
                 assert_eq!(status, ToolCompletionStatus::Cancelled);
             }

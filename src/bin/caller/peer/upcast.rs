@@ -3574,6 +3574,7 @@ mod tests {
             commands_preview: "ls -la".into(),
             item_id: None,
             source: None,
+            message_uuid: None,
         });
         let start_id = started
             .iter()
@@ -3594,6 +3595,7 @@ mod tests {
             source: None,
             output_id: None,
             item_id: None,
+            message_uuid: None,
         });
         let progress_id = output
             .iter()
@@ -3641,6 +3643,7 @@ mod tests {
             source: None,
             output_id: None,
             item_id: None,
+            message_uuid: None,
         });
         let progress_text = output
             .iter()
@@ -3709,6 +3712,7 @@ mod tests {
             commands_preview: "ls -la".into(),
             item_id: None,
             source: None,
+            message_uuid: None,
         });
         let start_id = started
             .iter()
@@ -3728,6 +3732,7 @@ mod tests {
             source: None,
             output_id: None,
             item_id: None,
+            message_uuid: None,
         });
         let progress_id = output
             .iter()
@@ -3765,6 +3770,7 @@ mod tests {
                 commands_preview: "risky".into(),
                 item_id: None,
                 source: None,
+                message_uuid: None,
             });
             let out = u.upcast(&AppEvent::TaskComplete {
                 session_id: None,
@@ -3816,6 +3822,7 @@ mod tests {
             commands_preview: "risky".into(),
             item_id: None,
             source: None,
+            message_uuid: None,
         });
         let out = u.upcast(&OutboundEvent::TaskComplete {
             session_id: None,
@@ -4811,6 +4818,7 @@ mod tests {
             commands_preview: "echo hi".into(),
             item_id: None,
             source: None,
+            message_uuid: None,
         });
         assert!(
             !out.iter()
