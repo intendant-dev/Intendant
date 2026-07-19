@@ -86,12 +86,14 @@ The runtime/controller split is a deliberate security boundary:
 - **intendant-runtime** executes arbitrary shell commands but runs under
   OS filesystem restrictions (Landlock on Linux, Seatbelt on macOS, restricted
   tokens on Windows) and **never holds API keys**. At the controller→runtime
-  spawn boundary, provider credentials are removed case-insensitively (canonical
-  names plus inherited `*_API_KEY` / `*_API_TOKEN` names, except the
-  `INTENDANT_*` control namespace), together with ambient host credentials such
-  as agent sockets, forge/cloud/registry tokens, and credential-store pointers.
-  Both runtime shell handlers independently repeat the provider and ambient
-  scrub as defense in depth. It reads JSON commands from stdin, executes them
+  spawn boundary, the inherited environment is cleared and rebuilt from an
+  explicit, case-insensitive allowlist of OS/process essentials and non-secret
+  toolchain controls. Runtime control variables are injected individually
+  after the clear; unknown names, including unknown `INTENDANT_*` names, do not
+  inherit. `INTENDANT_ENV_PASSTHROUGH` deliberately extends the allowlist by
+  exact name, but can never re-admit provider/model API keys. Both runtime shell
+  handlers independently repeat the provider and ambient credential scrub as
+  defense in depth. It reads JSON commands from stdin, executes them
   sequentially, and writes results
   to stdout. Each controller spawn authenticates those result envelopes with a
   fresh secret delivered over stdin and stripped after verification, so a

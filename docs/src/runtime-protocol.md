@@ -137,7 +137,16 @@ These are the ~10 functions `intendant-runtime` actually implements:
 | `inspectPath` | Filesystem metadata (type, size, mtime; plus mode/uid/gid on Unix) | `path` |
 | `editFile` | Structured file editing without a shell | `file_path`, `operation`, `content`, `match_content`, `line_number`, `end_line` |
 | `writeFile` | Back-compat alias — rewritten to `editFile` with `operation:"write"` if unset | `file_path`, `content` |
-| `browse` | HTTP GET, HTML→text via `html2text` (50 KB cap, 15 s timeout, ≤5 redirects) | `url` |
+| `browse` | Public-internet HTTP GET, HTML→text via `html2text` (streamed 50 KiB hard cap, 15 s timeout, ≤5 validated redirects) | `url` |
+
+`browse` is not a LAN client: every initial URL and redirect hop is resolved
+before connecting, DNS is pinned to the checked answers, and any loopback,
+private, link-local, carrier-grade NAT, local-name, multicast, documentation,
+benchmark, or reserved address fails closed. Mixed public/private DNS answers
+are rejected as a unit. Ambient HTTP proxy variables are disabled for this
+path so they cannot bypass address validation or DNS pinning. The body reader
+stops and drops the response stream as soon as the 50 KiB prefix is full; it
+never buffers the remainder before truncating.
 | `askHuman` | Write a question to the log dir and **poll indefinitely** for a response file | `question` |
 | `execPty` | Run a command in a persistent PTY session for the life of this process | `command`, `shell_id` |
 
@@ -192,14 +201,15 @@ one. `replace_lines` errors if `end_line < line_number`.
   **last 10 KB** of each (`LOG_TAIL_BYTES`). Each artifact is atomically
   created as a new file, and the runtime reads its tail through the original
   open handle, so an existing or later-replaced symlink is never followed.
-- **Credentials are stripped at two boundaries.** The controller removes
-  canonical provider names, inherited `*_API_KEY` / `*_API_TOKEN` names, and
-  ambient host-credential names (agent sockets, forge/cloud/registry tokens,
-  credential-store pointers) before spawning the runtime. The `INTENDANT_*`
-  namespace is reserved for controller→runtime control and is exempt. Both
-  `execAsAgent` and `execPty` independently repeat the provider and ambient
-  scrub before starting their model-driven shell; they do not merely trust the
-  runtime's inherited environment. See
+- **The environment defaults closed at two boundaries.** Before spawning the
+  runtime, the controller clears inheritance and copies only catalogued
+  OS/process essentials, non-secret toolchain controls, locale variables, and
+  exact names deliberately granted through `INTENDANT_ENV_PASSTHROUGH`.
+  Provider/model API keys remain an absolute deny. Runtime controls such as the
+  log directory, sandbox paths, and user-display grant are injected individually
+  after the clear; unknown names, including unknown `INTENDANT_*` names, do not
+  inherit. `execAsAgent` and `execPty` independently repeat the provider and
+  ambient credential scrub before starting their model-driven shell. See
   [Configuration → Child-process environment](./configuration.md#child-process-environment)
   for the current passthrough limitation.
 - **Display gating**: `DISPLAY` is set to the chosen display. Access to the user's

@@ -60,7 +60,7 @@ for the headless `tests/e2e/` suite and demos) and requires
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INTENDANT_ENV_PASSTHROUGH` | unset | Comma-separated exact env-var names (case-insensitive) added to a supervised external CLI's cleared environment allowlist and exempted from the controller→runtime ambient-credential scrub. Provider API keys never pass. Native runtime exec/PTY shells apply a second scrub that currently does **not** honor this override, so classified ambient credentials such as `SSH_AUTH_SOCK` remain unavailable there; ordinary non-classified variables already inherit without naming them. |
+| `INTENDANT_ENV_PASSTHROUGH` | unset | Comma-separated exact env-var names (case-insensitive) added to the native runtime and supervised external CLI cleared-environment allowlists. Unknown variables do not otherwise inherit. Provider API keys never pass. Native runtime exec/PTY shells apply a second credential scrub that currently does **not** honor this override, so classified ambient credentials such as `SSH_AUTH_SOCK` remain unavailable there; named ordinary build variables do reach those shells. Treat every entry as an explicit grant of that variable's value to model-driven code. |
 
 ### Model and behavior tuning
 
