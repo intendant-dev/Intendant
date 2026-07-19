@@ -734,9 +734,11 @@ struct CcTaskChild {
     /// see it as an ephemeral child session wired to the parent via a
     /// `session_relationship` — it is not resumable or addressable.
     child_id: String,
-    /// A terminal state was already emitted; late envelopes (e.g. the main
-    /// agent continuing the child via SendMessage) still scope to the
-    /// child window, but no second terminal event fires.
+    /// A terminal state was already emitted. The latch guards against a
+    /// duplicate terminal for the same run segment only: envelopes routed
+    /// back into a terminal child (the main agent resuming the task — the
+    /// stream re-enters tagged with the same spawn tool_use id) clear it
+    /// again in `task_scope_for`, so the resumed run's own end can emit.
     terminal: bool,
 }
 
@@ -989,8 +991,16 @@ struct CcReader {
     /// In-band sub-agents by spawning tool_use id (the value child
     /// envelopes carry as `parent_tool_use_id`).
     task_children: HashMap<String, CcTaskChild>,
-    /// `task_id` (the key `system:task_*` events use) → spawning
-    /// tool_use id.
+    /// `task_id` (the key `system:task_*` events use) → the SPAWN
+    /// tool_use id, first-write-wins. Claude Code keys each
+    /// `system:task_notification` by whichever tool_use initiated THAT
+    /// run segment — the spawn for run #1, the resume message for a
+    /// resumed run — while the task_id stays stable across runs and
+    /// children stay keyed by the spawn id (the value child envelopes
+    /// carry as `parent_tool_use_id`). The first binding for a task_id is
+    /// therefore the spawn binding, and later `task_started`s for the
+    /// same task must never overwrite it: this map is how a resumed
+    /// run's notification finds its child again.
     task_ids: HashMap<String, String>,
     /// tool_use ids of plan-shaped calls (`TodoWrite`, `TaskUpdate`) already
     /// rendered as `PlanUpdate`, mapped to the tool name for failure logs, so
@@ -1248,9 +1258,26 @@ impl CcReader {
             };
             self.register_task_child(&ptid, None, spawn, out);
         }
-        self.task_children
-            .get(&ptid)
-            .map(|child| child.child_id.clone())
+        let child = self.task_children.get_mut(&ptid)?;
+        if child.terminal {
+            // The stream flowing into a terminal child proves the agent
+            // lives again: a resumed Task run re-enters the same child
+            // window (same spawn tool_use id), and its own end must be
+            // able to emit — re-arm the once-guard. Deliberately no fresh
+            // `SubAgentToolCall { inProgress }` rides the re-arm: the
+            // frontend derives the window's active look from the scoped
+            // stream itself and its end from the terminal's log line, not
+            // from the inProgress state, while a re-registration event
+            // would add parent-turn bookkeeping (AgentStarted/turn
+            // counters) — and, arriving while the parent sits idle, would
+            // open a spurious observe-drain round on it. The drain re-arms
+            // its SessionEnded dedupe from the same scoped stream
+            // (`thread_actions::note_external_subagent_liveness`). Side
+            // effect, intended: a re-armed child is non-terminal again,
+            // so shutdown (`close_open_task_children`) properly closes it.
+            child.terminal = false;
+        }
+        Some(child.child_id.clone())
     }
 
     /// Register an in-band sub-agent and announce it as a synthetic child
@@ -1613,14 +1640,27 @@ impl CcReader {
         // The correlation key is recorded for every task kind: it only
         // feeds task_notification's id resolution, and a stray entry for a
         // Bash task resolves to an id with no registered child (no-op).
+        // First-write-wins: the first tool_use seen for a task_id is the
+        // spawn segment's (see the `task_ids` field docs).
         let task_id = msg
             .get("task_id")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
         if let Some(task_id) = task_id {
-            self.task_ids
-                .insert(task_id.to_string(), tool_use_id.to_string());
+            let spawn_tool_use_id = self
+                .task_ids
+                .entry(task_id.to_string())
+                .or_insert_with(|| tool_use_id.to_string());
+            // A task_started re-announcing a known task under a NEW
+            // tool_use id describes a later run segment of the same task
+            // (a resume), never a second spawn. Registering or arming
+            // under the segment id would ghost a second child that then
+            // captures the run's task_notification away from the real
+            // child window.
+            if spawn_tool_use_id.as_str() != tool_use_id {
+                return;
+            }
         }
         // Background command announced (`run_in_background` Bash and
         // auto-backgrounded commands alike, live-probed on 2.1.211): arm
@@ -1709,17 +1749,18 @@ impl CcReader {
     /// `system:task_notification`: the async sub-agent's authoritative end
     /// (status + final summary).
     fn handle_task_notification(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        let task_id = msg
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let tool_use_id = msg
             .get("tool_use_id")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .or_else(|| {
-                msg.get("task_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|task_id| self.task_ids.get(task_id.trim()).cloned())
-            });
+            .or_else(|| task_id.and_then(|task_id| self.task_ids.get(task_id).cloned()));
         let Some(tool_use_id) = tool_use_id else {
             return;
         };
@@ -1771,6 +1812,21 @@ impl CcReader {
             self.observe_bg_tasks(out);
             return;
         }
+        // Segment re-keying: Claude Code keys a resumed run's notification
+        // by the tool_use that initiated THAT run segment (the resume
+        // message's id), while the child stays keyed by the spawn tool_use
+        // and the task_id stays stable across runs. When the notification's
+        // id misses the children, resolve through the first-write spawn
+        // binding so the resumed run terminates the original child window.
+        // Unknown tool_use AND unknown task_id stays a silent no-op
+        // (`emit_task_terminal` drops ids it never registered).
+        let tool_use_id = if self.task_children.contains_key(&tool_use_id) {
+            tool_use_id
+        } else {
+            task_id
+                .and_then(|task_id| self.task_ids.get(task_id).cloned())
+                .unwrap_or(tool_use_id)
+        };
         let (outer_status, state_status) = match status {
             "completed" | "success" => ("completed", "completed"),
             "failed" | "error" | "errored" => ("failed", "errored"),
@@ -5300,6 +5356,212 @@ mod tests {
                     AgentEvent::SubAgentToolCall { status, agents, .. }
                         if status == "failed" && agents[0].status == "errored"
                 )
+        )));
+    }
+
+    #[test]
+    fn resumed_task_stream_rearms_and_notification_rekeys_via_task_id() {
+        // Claude Code keys each task_notification by the tool_use that
+        // initiated THAT run segment — the Agent spawn for run #1, the
+        // resume message for a resumed run — while the task_id stays
+        // stable and child envelopes keep carrying the spawn id as
+        // parent_tool_use_id. Observed live: without re-keying, a resumed
+        // run re-activates the child window but can never re-terminate
+        // it.
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"aa440","tool_use_id":"toolu_01AAABBBCCCDDDEEE","description":"probe echo","subagent_type":"general-purpose","task_type":"local_agent","session_id":"s1"}"#,
+        );
+        // Run #1 ends under the spawn tool_use id.
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"aa440","tool_use_id":"toolu_01AAABBBCCCDDDEEE","status":"completed","summary":"first run done","session_id":"s1"}"#,
+        );
+        assert!(reader.task_children["toolu_01AAABBBCCCDDDEEE"].terminal);
+
+        // Resume: the stream re-enters the child, tagged with the SPAWN id.
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"back to work"}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        assert!(
+            !reader.task_children["toolu_01AAABBBCCCDDDEEE"].terminal,
+            "stream re-entry must re-arm the terminal once-guard"
+        );
+        // Deliberately no re-registration event rides the re-arm: the
+        // window's active look derives from the scoped stream itself.
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })),
+            "re-arm must not re-register: {:?}",
+            out.events
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(event.as_ref(), AgentEvent::Message { text } if text == "back to work")
+        )));
+
+        // Run #2 ends under the RESUME segment's tool_use id + the stable
+        // task_id: the notification must resolve back to the spawn child.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"aa440","tool_use_id":"toolu_01RESUMESEGMENT000","status":"completed","summary":"second run done","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::SubAgentToolCall { item_id, status, agents, .. }
+                            if item_id == "toolu_01AAABBBCCCDDDEEE"
+                                && status == "completed"
+                                && agents[0].status == "completed"
+                                && agents[0].message.as_deref() == Some("second run done")
+                    )
+        )));
+        assert!(reader.task_children["toolu_01AAABBBCCCDDDEEE"].terminal);
+        // A duplicate of run #2's notification stays silent — the
+        // once-guard is latched again.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"aa440","tool_use_id":"toolu_01RESUMESEGMENT000","status":"completed","summary":"second run done","session_id":"s1"}"#,
+        );
+        assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn task_id_spawn_binding_survives_later_task_started() {
+        // A resumed run may re-announce the same task_id under the new
+        // segment's tool_use id: the spawn binding is first-write-wins,
+        // and the segment id must not register a second (ghost) child
+        // that would capture the run's notification away from the real
+        // child window.
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"aa440","tool_use_id":"toolu_01AAABBBCCCDDDEEE","description":"probe echo","subagent_type":"general-purpose","task_type":"local_agent","session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"aa440","tool_use_id":"toolu_01RESUMESEGMENT000","description":"probe echo","subagent_type":"general-purpose","task_type":"local_agent","session_id":"s1"}"#,
+        );
+        assert_eq!(
+            reader.task_ids.get("aa440").map(String::as_str),
+            Some("toolu_01AAABBBCCCDDDEEE"),
+            "spawn binding must survive later task_starteds"
+        );
+        assert!(
+            !reader
+                .task_children
+                .contains_key("toolu_01RESUMESEGMENT000"),
+            "segment id must not ghost a second child"
+        );
+        assert!(
+            out.events.is_empty(),
+            "segment re-announce is silent: {:?}",
+            out.events
+        );
+        // A notification correlating only by task_id still resolves to
+        // the spawn child.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"aa440","status":"completed","summary":"done","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::SubAgentToolCall { item_id, status, .. }
+                            if item_id == "toolu_01AAABBBCCCDDDEEE" && status == "completed"
+                    )
+        )));
+    }
+
+    #[test]
+    fn unknown_notification_ids_stay_silent() {
+        // Neither the tool_use id nor the task_id is known: silent no-op —
+        // no spurious terminal, no panic, the real child untouched.
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"zz404","tool_use_id":"toolu_01NEVERSEEN0000000","status":"failed","summary":"whose task is this","session_id":"s1"}"#,
+        );
+        assert!(
+            out.events.is_empty(),
+            "unknown ids must no-op: {:?}",
+            out.events
+        );
+        assert!(!reader.task_children["toolu_01AAABBBCCCDDDEEE"].terminal);
+    }
+
+    #[test]
+    fn midrun_continuation_keeps_spawn_keying() {
+        // Steering a RUNNING task does not open a new run segment: child
+        // activity keeps flowing and the notification stays keyed by the
+        // spawn tool_use id. Pinned so the segment re-keying never
+        // disturbs the normal single-run flow.
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"aa440","tool_use_id":"toolu_01AAABBBCCCDDDEEE","description":"probe echo","subagent_type":"general-purpose","task_type":"local_agent","session_id":"s1"}"#,
+        );
+        // Mid-run child activity (never terminal): no re-arm, no
+        // re-register.
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"still working"}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })));
+        assert!(!reader.task_children["toolu_01AAABBBCCCDDDEEE"].terminal);
+        // The run's end still arrives under the spawn id and terminates
+        // exactly once.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"aa440","tool_use_id":"toolu_01AAABBBCCCDDDEEE","status":"completed","summary":"done","session_id":"s1"}"#,
+        );
+        let terminals = out
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::Scoped { event, .. }
+                        if matches!(
+                            event.as_ref(),
+                            AgentEvent::SubAgentToolCall { status, .. } if status == "completed"
+                        )
+                )
+            })
+            .count();
+        assert_eq!(terminals, 1);
+    }
+
+    #[test]
+    fn rearmed_child_is_closeable_at_shutdown_again() {
+        // Intended side effect of the re-arm: a resumed child that never
+        // re-terminates is open again, so shutdown closes it instead of
+        // skipping it as already-terminal.
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","tool_use_id":"toolu_01AAABBBCCCDDDEEE","status":"completed","session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"resumed"}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        let mut out = CcLineOutcome::default();
+        reader.close_open_task_children(&mut out);
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::SubAgentToolCall { status, agents, .. }
+                            if status == "interrupted" && agents[0].status == "shutdown"
+                    )
         )));
     }
 

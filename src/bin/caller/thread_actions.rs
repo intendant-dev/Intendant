@@ -2588,6 +2588,37 @@ pub(crate) fn emit_external_subagent_terminal(
     }
 }
 
+/// A substantive scoped event from a child thread already marked terminal
+/// proves the thread is alive again — a Claude Code Task resume streams new
+/// envelopes into the same child window — so clear the terminal dedupe and
+/// let the resumed run's own terminal emit `SessionEnded`/`Interrupted`
+/// again. Only fresh-conversation kinds (and an explicit `inProgress`
+/// sub-agent state) count: state-carrying `SubAgentToolCall` events must
+/// NOT clear it, because a repeated terminal state is exactly what the
+/// dedupe suppresses, and trailing bookkeeping (tool results, logs, usage)
+/// after a terminal is a straggler, not a resurrection.
+pub(crate) fn note_external_subagent_liveness(
+    stats: &mut LoopStats,
+    child_thread_id: &str,
+    event: &external_agent::AgentEvent,
+) {
+    let alive = match event {
+        external_agent::AgentEvent::Message { .. }
+        | external_agent::AgentEvent::MessageDelta { .. }
+        | external_agent::AgentEvent::Reasoning { .. }
+        | external_agent::AgentEvent::UserMessage { .. }
+        | external_agent::AgentEvent::ToolStarted { .. }
+        | external_agent::AgentEvent::PlanUpdate { .. } => true,
+        external_agent::AgentEvent::SubAgentToolCall { status, .. } => status == "inProgress",
+        _ => false,
+    };
+    if alive {
+        stats
+            .codex_subagent_terminal_sessions
+            .remove(child_thread_id.trim());
+    }
+}
+
 pub(crate) fn json_u32_field(value: &serde_json::Value, key: &str) -> Option<u32> {
     value
         .get(key)
@@ -3182,6 +3213,7 @@ pub(crate) fn handle_idle_codex_subagent_event(
     child_thread_id: String,
     event: external_agent::AgentEvent,
 ) {
+    note_external_subagent_liveness(stats, &child_thread_id, &event);
     let session_id = Some(child_thread_id.clone());
     match event {
         external_agent::AgentEvent::NativeSessionId { .. } => {
@@ -3941,6 +3973,171 @@ mod tests {
                 );
             }
             other => panic!("expected child completion LogEntry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reactivated_subagent_can_end_again() {
+        // A Claude Code Task resume streams into a child whose errored
+        // end already emitted SessionEnded: the scoped stream clears the
+        // terminal dedupe so the resumed run's own errored end reaches
+        // SessionEnded again — while a repeated terminal state without
+        // fresh activity stays suppressed.
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("parent-thread".to_string()),
+            alias_session_id: None,
+            backend_thread_id: None,
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("claude-code".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+            reload_credentials: None,
+        };
+        let mut stats = LoopStats::default();
+        let errored = external_agent::SubAgentState {
+            thread_id: "task-child".to_string(),
+            status: "errored".to_string(),
+            message: Some("run failed".to_string()),
+        };
+        fn session_ended_count(rx: &mut tokio::sync::broadcast::Receiver<AppEvent>) -> usize {
+            let mut count = 0;
+            while let Ok(event) = rx.try_recv() {
+                if matches!(
+                    &event,
+                    AppEvent::SessionEnded { session_id, .. } if session_id == "task-child"
+                ) {
+                    count += 1;
+                }
+            }
+            count
+        }
+
+        emit_external_subagent_terminal(&config, &mut stats, &errored);
+        assert_eq!(session_ended_count(&mut rx), 1, "first errored end emits");
+
+        // The same terminal state again, with no fresh activity in
+        // between: suppressed.
+        emit_external_subagent_terminal(&config, &mut stats, &errored);
+        assert_eq!(
+            session_ended_count(&mut rx),
+            0,
+            "repeat without liveness stays deduped"
+        );
+
+        // Resumed-run activity streams into the child while the session
+        // idles.
+        handle_idle_codex_subagent_event(
+            &config,
+            &mut stats,
+            "task-child".to_string(),
+            external_agent::AgentEvent::Message {
+                text: "resumed and working".to_string(),
+            },
+        );
+        let _ = session_ended_count(&mut rx); // drain the forwarding noise
+
+        emit_external_subagent_terminal(&config, &mut stats, &errored);
+        assert_eq!(
+            session_ended_count(&mut rx),
+            1,
+            "re-terminal after reactivation emits again"
+        );
+    }
+
+    #[test]
+    fn subagent_liveness_kinds_are_selective() {
+        // Fresh conversation from a terminal-marked child clears the
+        // SessionEnded dedupe; a repeated terminal state or trailing
+        // bookkeeping never does — that repetition is exactly what the
+        // dedupe suppresses.
+        let mut stats = LoopStats::default();
+        let seed = |stats: &mut LoopStats| {
+            stats
+                .codex_subagent_terminal_sessions
+                .insert("task-child".to_string());
+        };
+
+        for event in [
+            external_agent::AgentEvent::Message { text: "hi".into() },
+            external_agent::AgentEvent::Reasoning {
+                text: "planning".into(),
+            },
+            external_agent::AgentEvent::ToolStarted {
+                item_id: "t1".into(),
+                preview: "ls".into(),
+                tool_name: "Bash".into(),
+            },
+            external_agent::AgentEvent::SubAgentToolCall {
+                item_id: "t2".into(),
+                tool: "Agent".into(),
+                status: "inProgress".into(),
+                sender_thread_id: "task-child".into(),
+                receiver_thread_ids: vec!["task-grandchild".into()],
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents: Vec::new(),
+            },
+        ] {
+            seed(&mut stats);
+            note_external_subagent_liveness(&mut stats, "task-child", &event);
+            assert!(
+                !stats
+                    .codex_subagent_terminal_sessions
+                    .contains("task-child"),
+                "{event:?} must clear the terminal mark"
+            );
+        }
+
+        for event in [
+            external_agent::AgentEvent::SubAgentToolCall {
+                item_id: "t3".into(),
+                tool: "Agent".into(),
+                status: "failed".into(),
+                sender_thread_id: "parent-thread".into(),
+                receiver_thread_ids: vec!["task-child".into()],
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents: Vec::new(),
+            },
+            external_agent::AgentEvent::ToolCompleted {
+                item_id: "t1".into(),
+                status: external_agent::ToolCompletionStatus::Cancelled,
+            },
+            external_agent::AgentEvent::Log {
+                level: "info".into(),
+                message: "straggler".into(),
+            },
+            external_agent::AgentEvent::TurnCompleted { message: None },
+        ] {
+            seed(&mut stats);
+            note_external_subagent_liveness(&mut stats, "task-child", &event);
+            assert!(
+                stats
+                    .codex_subagent_terminal_sessions
+                    .contains("task-child"),
+                "{event:?} must not clear the terminal mark"
+            );
         }
     }
 
