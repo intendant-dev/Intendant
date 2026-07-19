@@ -902,16 +902,30 @@ pub(crate) fn annotate_replay_user_turns_from_external_transcript(
     };
     let user_turns: Vec<serde_json::Value> = transcript
         .iter()
-        .filter(|entry| entry.get("source").and_then(|v| v.as_str()) == Some("user"))
         .filter(|entry| {
             entry
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(|source| source.trim().eq_ignore_ascii_case("user"))
+                .unwrap_or(false)
+        })
+        .filter(|entry| {
+            // Codex turns carry the revision projection; claude turns carry
+            // the transcript message uuid (the inline fork join key). Either
+            // identity makes a transcript user turn worth stamping onto its
+            // daemon-log twin — a fully supervised session's detail view
+            // renders ONLY daemon-log rows, so without this stamp the
+            // claude fork affordances never appear there.
+            let has_revision = entry
                 .get("user_turn_index")
                 .and_then(|v| v.as_u64())
                 .is_some()
                 && entry
                     .get("user_turn_revision")
                     .and_then(|v| v.as_u64())
-                    .is_some()
+                    .is_some();
+            let has_uuid = entry.get("message_uuid").and_then(|v| v.as_str()).is_some();
+            has_revision || has_uuid
         })
         // Clone only the matched user turns; the shared transcript
         // snapshot itself is never deep-cloned on this path anymore.
@@ -922,7 +936,7 @@ pub(crate) fn annotate_replay_user_turns_from_external_transcript(
     }
 
     let mut next_user_turn = 0usize;
-    for entry in entries {
+    for entry in entries.iter_mut() {
         if entry.get("event").and_then(|v| v.as_str()) != Some("log_entry") {
             continue;
         }
@@ -969,10 +983,64 @@ pub(crate) fn annotate_replay_user_turns_from_external_transcript(
                 "replacement_for_user_turn_index",
                 "superseded",
                 "superseded_reason",
+                "message_uuid",
+                "off_active_chain",
             ] {
                 if let Some(value) = turn.get(key) {
                     obj.insert(key.to_string(), value.clone());
                 }
+            }
+        }
+    }
+
+    // Second pass — tool rows. Transcript tool entries carry the exact
+    // `item_id` key plus their line's `message_uuid`; daemon-log tool rows
+    // carry the same item id. Stamping the uuid here is what makes the
+    // anchor-labeled rows of a fully supervised claude session forkable
+    // (their detail view renders only daemon-log rows).
+    let mut uuid_by_item: std::collections::HashMap<&str, &serde_json::Value> =
+        std::collections::HashMap::new();
+    for entry in transcript.iter() {
+        let (Some(item_id), Some(_)) = (
+            entry.get("item_id").and_then(|v| v.as_str()),
+            entry.get("message_uuid").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        uuid_by_item.entry(item_id).or_insert(entry);
+    }
+    if uuid_by_item.is_empty() {
+        return;
+    }
+    for entry in entries.iter_mut() {
+        if entry.get("event").and_then(|v| v.as_str()) != Some("log_entry") {
+            continue;
+        }
+        if entry.get("session_id").and_then(|v| v.as_str()) != Some(session_id) {
+            continue;
+        }
+        if entry.get("message_uuid").is_some() {
+            continue;
+        }
+        let stamped = entry
+            .get("item_id")
+            .and_then(|v| v.as_str())
+            .and_then(|item_id| uuid_by_item.get(item_id))
+            .map(|src| {
+                (
+                    src.get("message_uuid").cloned(),
+                    src.get("off_active_chain").cloned(),
+                )
+            });
+        let Some((uuid, off_chain)) = stamped else {
+            continue;
+        };
+        if let Some(obj) = entry.as_object_mut() {
+            if let Some(uuid) = uuid {
+                obj.insert("message_uuid".to_string(), uuid);
+            }
+            if let Some(off_chain) = off_chain {
+                obj.insert("off_active_chain".to_string(), off_chain);
             }
         }
     }
@@ -1932,6 +2000,44 @@ mod tests {
         assert_eq!(
             context.pointer("/raw/0/role").and_then(|v| v.as_str()),
             Some("user")
+        );
+    }
+
+    /// A fully supervised claude session's detail view renders ONLY
+    /// daemon-log rows, which carry no transcript uuids — the inline fork
+    /// join keys on `message_uuid`, so without stamping, those views show
+    /// zero fork affordances (found live 2026-07-19). The annotator maps
+    /// daemon user rows onto transcript user turns in order (duplicate
+    /// prose maps sequentially, never globally) and stamps the uuid.
+    #[test]
+    fn claude_daemon_rows_get_transcript_uuids_stamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let project = home.join(".claude").join("projects").join("p1");
+        std::fs::create_dir_all(&project).unwrap();
+        let sid = "cc-stamp-test";
+        let lines = [
+            r#"{"uuid":"u1","parentUuid":null,"type":"user","timestamp":"2026-07-19T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"continue"}]}}"#,
+            r#"{"uuid":"a1","parentUuid":"u1","type":"assistant","timestamp":"2026-07-19T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok one"},{"type":"tool_use","id":"toolu_9","name":"Bash","input":{"command":"ls"}}]}}"#,
+            r#"{"uuid":"u2","parentUuid":"a1","type":"user","timestamp":"2026-07-19T00:00:03.000Z","message":{"role":"user","content":[{"type":"text","text":"continue"}]}}"#,
+            r#"{"uuid":"a2","parentUuid":"u2","type":"assistant","timestamp":"2026-07-19T00:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok two"}]}}"#,
+        ];
+        std::fs::write(project.join(format!("{sid}.jsonl")), lines.join("\n")).unwrap();
+
+        let mut entries = vec![
+            serde_json::json!({"event":"log_entry","session_id":sid,"source":"User","content":"continue"}),
+            serde_json::json!({"event":"log_entry","session_id":sid,"source":"Claude Code","kind":"tool_call","item_id":"toolu_9","content":"Bash: ls"}),
+            serde_json::json!({"event":"log_entry","session_id":sid,"source":"User","content":"continue"}),
+        ];
+        annotate_replay_user_turns_from_external_transcript(&mut entries, home, "claude-code", sid);
+        assert_eq!(entries[0]["message_uuid"], "u1");
+        assert_eq!(
+            entries[2]["message_uuid"], "u2",
+            "duplicate prose maps in order, not to the first global match"
+        );
+        assert_eq!(
+            entries[1]["message_uuid"], "a1",
+            "tool rows stamp via their exact item_id key (the anchor-labeled rows)"
         );
     }
 }
