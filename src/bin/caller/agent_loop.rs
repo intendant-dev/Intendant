@@ -1350,8 +1350,11 @@ pub(crate) async fn run_agent_loop(
                 // not. The record carries the raw steer text, not the
                 // `[User]`-prefixed conversation string.
                 if provenance == MessageProvenance::Steer {
+                    // Injection-lane steers carry raw images only
+                    // (`ContextInjection` mints no upload refs), so there
+                    // are no renderable refs to persist here.
                     slog(&session_log, |l| {
-                        let _ = l.conversation_message_user(seq, provenance, &inj.text, None);
+                        let _ = l.conversation_message_user(seq, provenance, &inj.text, None, &[]);
                     });
                 }
                 slog(&session_log, |l| {
@@ -2366,6 +2369,7 @@ pub(crate) async fn run_agent_loop(
                                 MessageProvenance::AskHumanAnswer,
                                 &reply,
                                 Some(seq),
+                                &[],
                             );
                         });
                     }
@@ -2951,6 +2955,7 @@ Proceed with explicit assumptions and continue without additional questions."
                             MessageProvenance::AskHumanAnswer,
                             &answer,
                             None,
+                            &[],
                         );
                     });
                 }
@@ -3778,12 +3783,16 @@ pub(crate) async fn run_round_loop(
                         followup_images,
                     )
                 };
+                // The canonical record carries the renderable upload refs
+                // delivered with this message (external-lane parity: the
+                // `[user]` rows persist the same array via `user_message`).
                 slog(&session_log, |l| {
                     let _ = l.conversation_message_user(
                         followup_seq,
                         followup_provenance,
                         &message.text,
                         None,
+                        &message.attachments.refs,
                     );
                 });
                 if let Some(id) = message.steer_id {

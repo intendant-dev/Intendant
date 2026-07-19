@@ -1260,6 +1260,53 @@ pub fn session_log_entry_to_app_event(
             })
         }
 
+        // ── Canonical message-lane records (native sessions) ──
+        //
+        // `conversation_message` rows normally render no timeline entry of
+        // their own — their diagnostic twins (the `Round N follow-up:` info
+        // rows, `model_response`) already carry the text, so replaying the
+        // canonical record too would double-serve every message. The ONE
+        // exception is a user row carrying renderable attachment refs
+        // (native parity with the external lane's `[user]` rows): the refs
+        // exist nowhere else in the log, so replay serves that row as
+        // `UserMessageLog` — the exact wire shape the external lane's user
+        // rows use — and the dashboard renders the same thumbnail strip
+        // (`turn: None` and untagged turn metadata, like the live lane's
+        // native rows). Legacy rows (no `attachments` field) keep replaying
+        // to nothing, byte-identical to before.
+        "conversation_message" => {
+            if data.and_then(|d| d.get("role")).and_then(|v| v.as_str()) != Some("user") {
+                return None;
+            }
+            let attachments = data
+                .and_then(|d| d.get("attachments"))
+                .and_then(|value| {
+                    serde_json::from_value::<Vec<crate::types::SessionNoteAttachment>>(
+                        value.clone(),
+                    )
+                    .ok()
+                })
+                .unwrap_or_default();
+            if attachments.is_empty() {
+                return None;
+            }
+            // `data.text` is the full raw user text; `message` is only a
+            // 200-char preview of it.
+            let content = data
+                .and_then(|d| d.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(message)
+                .to_string();
+            Some(AppEvent::UserMessageLog {
+                session_id: None,
+                content,
+                user_turn_index: None,
+                user_turn_revision: None,
+                replacement_for_user_turn_index: None,
+                attachments,
+            })
+        }
+
         // ── Info / warn / error / debug → LogEntry ──
         //
         // Source and level are derived from message prefixes to match what
@@ -1652,6 +1699,125 @@ mod tests {
                 other => panic!("expected untagged LogEntry, got {:?}", other),
             }
         }
+    }
+
+    #[test]
+    fn rt_conversation_message_user_row_with_attachments_replays_as_user_message_log() {
+        // Native parity with the external lane's `[user]` rows: a canonical
+        // user record carrying renderable upload refs replays as
+        // `UserMessageLog`, the same wire shape (log_entry, source User)
+        // the external lane serves — so the dashboard renders the same
+        // thumbnail strip on native user rows.
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        let refs = vec![crate::types::SessionNoteAttachment {
+            upload_id: "u-7".to_string(),
+            name: "grab.png".to_string(),
+            mime: "image/png".to_string(),
+            url: "/api/session/current/uploads/u-7/raw".to_string(),
+        }];
+        log.conversation_message_user(
+            9,
+            crate::conversation::MessageProvenance::FollowUp,
+            "look at the attached screenshot",
+            None,
+            &refs,
+        );
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "conversation_message");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::UserMessageLog {
+                session_id,
+                content,
+                user_turn_index,
+                user_turn_revision,
+                replacement_for_user_turn_index,
+                attachments,
+            } => {
+                // Session id is stamped later by the replay-metadata
+                // injector, exactly like the external `[user]` rows.
+                assert_eq!(session_id, None);
+                assert_eq!(content, "look at the attached screenshot");
+                // Native rows carry no wrapper turn metadata.
+                assert_eq!(user_turn_index, None);
+                assert_eq!(user_turn_revision, None);
+                assert_eq!(replacement_for_user_turn_index, None);
+                assert_eq!(attachments, refs);
+            }
+            other => panic!("expected UserMessageLog, got {:?}", other),
+        }
+
+        // The served wire row matches the external lane's user rows:
+        // log_entry with source User, no turn, attachments carried.
+        let outbound = crate::event::app_event_to_outbound(
+            &session_log_entry_to_app_event(&entry, &log_dir).unwrap(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&outbound).unwrap();
+        assert_eq!(
+            json.get("event").and_then(|v| v.as_str()),
+            Some("log_entry")
+        );
+        assert_eq!(json.get("source").and_then(|v| v.as_str()), Some("User"));
+        assert_eq!(json.get("turn"), None);
+        assert_eq!(
+            json.pointer("/attachments/0/upload_id")
+                .and_then(|v| v.as_str()),
+            Some("u-7")
+        );
+        assert_eq!(
+            json.pointer("/attachments/0/url").and_then(|v| v.as_str()),
+            Some("/api/session/current/uploads/u-7/raw")
+        );
+    }
+
+    #[test]
+    fn rt_conversation_message_rows_without_attachments_replay_to_nothing_like_legacy() {
+        // BACKWARD COMPAT: canonical records without attachment refs keep
+        // replaying to NO served entry at all — their diagnostic twins
+        // carry the text — so legacy logs (and every attachment-less row a
+        // new binary writes) replay byte-identically to before the field
+        // existed. Assistant records never convert, attachments or not.
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.conversation_message_user(
+            2,
+            crate::conversation::MessageProvenance::Task,
+            "plain task",
+            None,
+            &[],
+        );
+        log.model_response_with_message(3, "assistant reply", 10, 5, 15, 0, 0);
+        drop(log);
+
+        let rows = read_events(&log_dir, "conversation_message");
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert!(
+                session_log_entry_to_app_event(row, &log_dir).is_none(),
+                "attachment-less conversation_message must not serve an entry: {row}"
+            );
+        }
+
+        // A hand-written legacy line (pre-field binaries) — same verdict.
+        let legacy: serde_json::Value = serde_json::json!({
+            "ts": "10:00:00.000",
+            "ts_ms": 1_752_000_000_000_i64,
+            "event": "conversation_message",
+            "level": "info",
+            "message": "old prompt",
+            "data": {
+                "message_id": "m-1",
+                "message_seq": 1,
+                "role": "user",
+                "provenance": "task",
+                "text": "old prompt",
+            },
+        });
+        assert!(session_log_entry_to_app_event(&legacy, &log_dir).is_none());
     }
 
     /// A failed clear is terminal steer state: without a structured event +
