@@ -3575,10 +3575,12 @@ mod tests {
         response
     }
 
-    /// The historical `json_response` framing, spelled out literally.
+    /// The historical `json_response` framing, spelled out literally (the
+    /// serialization seam prepends the embedded bundle's build stamp).
     fn golden_json_transcript(status_line: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            crate::web_gateway::static_assets::app_build(),
             body.len()
         )
     }
@@ -3696,7 +3698,8 @@ mod tests {
         })
         .await;
         let mut expected = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nX-Content-Sha256: {}\r\nContent-Disposition: attachment; filename=\"golden.txt\"\r\nCache-Control: no-cache\r\nAccess-Control-Expose-Headers: X-Content-Sha256\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nX-Content-Sha256: {}\r\nContent-Disposition: attachment; filename=\"golden.txt\"\r\nCache-Control: no-cache\r\nAccess-Control-Expose-Headers: X-Content-Sha256\r\nConnection: close\r\n\r\n",
+            crate::web_gateway::static_assets::app_build(),
             GOLDEN_READ_CONTENT.len(),
             fs_sha256_hex(GOLDEN_READ_CONTENT),
         )
@@ -3721,9 +3724,11 @@ mod tests {
         })
         .await;
         // A partial read carries Content-Range instead of the sha header.
-        let mut expected = "HTTP/1.1 206 Partial Content\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 7-16/26\r\nContent-Disposition: attachment; filename=\"golden.txt\"\r\nCache-Control: no-cache\r\nAccess-Control-Expose-Headers: X-Content-Sha256\r\nConnection: close\r\n\r\n"
-            .to_string()
-            .into_bytes();
+        let mut expected = format!(
+            "HTTP/1.1 206 Partial Content\r\nx-intendant-app-build: {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 7-16/26\r\nContent-Disposition: attachment; filename=\"golden.txt\"\r\nCache-Control: no-cache\r\nAccess-Control-Expose-Headers: X-Content-Sha256\r\nConnection: close\r\n\r\n",
+            crate::web_gateway::static_assets::app_build(),
+        )
+        .into_bytes();
         expected.extend_from_slice(&GOLDEN_READ_CONTENT[7..17]);
         assert_eq!(transcript(&response), transcript(&expected));
     }
@@ -3745,7 +3750,8 @@ mod tests {
         .await;
         let body = r#"{"error":"range is not satisfiable"}"#;
         let expected = format!(
-            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nContent-Range: bytes */26\r\nAccept-Ranges: bytes\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 416 Range Not Satisfiable\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nContent-Range: bytes */26\r\nAccept-Ranges: bytes\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            crate::web_gateway::static_assets::app_build(),
             body.len()
         );
         assert_eq!(transcript(&response), expected);
@@ -4271,9 +4277,10 @@ mod tests {
         let text = String::from_utf8_lossy(&response);
         let (head, resp_body) = text.split_once("\r\n\r\n").expect("split");
         assert!(
-            head.starts_with(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
-            ),
+            head.starts_with(&format!(
+                "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: ",
+                crate::web_gateway::static_assets::app_build()
+            )),
             "{text}"
         );
         assert!(text.contains(upload_golden_tail()), "{head}");
@@ -4320,9 +4327,10 @@ mod tests {
         let text = String::from_utf8_lossy(&response);
         let (head, resp_body) = text.split_once("\r\n\r\n").expect("split");
         assert!(
-            head.starts_with(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
-            ),
+            head.starts_with(&format!(
+                "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: ",
+                crate::web_gateway::static_assets::app_build()
+            )),
             "{text}"
         );
         assert!(text.contains(upload_golden_tail()), "{head}");
@@ -4410,7 +4418,8 @@ mod tests {
         })
         .await;
         let expected = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n{}[]",
+            "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n{}[]",
+            crate::web_gateway::static_assets::app_build(),
             upload_golden_tail()
         );
         assert_eq!(String::from_utf8_lossy(&response), expected);
@@ -4430,7 +4439,8 @@ mod tests {
         .await;
         let body = r#"{"error":"upload not found"}"#;
         let expected = format!(
-            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}{}",
+            "HTTP/1.1 404 Not Found\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}{}",
+            crate::web_gateway::static_assets::app_build(),
             body.len(),
             upload_golden_tail(),
             body
@@ -4455,7 +4465,8 @@ mod tests {
         .await;
         let body = r#"{"ok":true}"#;
         let expected = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{}",
+            crate::web_gateway::static_assets::app_build(),
             body.len(),
             body
         );

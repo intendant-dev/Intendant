@@ -555,10 +555,12 @@ mod tests {
     /// The sink's bare JSON framing (`Connection` tail only, NO
     /// `Cache-Control`), spelled out literally — the shape's historical
     /// wildcard ACAO is retired (the own-origin row posture emits no
-    /// CORS header).
+    /// CORS header). The serialization seam prepends the embedded
+    /// bundle's build stamp.
     fn golden_diagnostics_transcript(status_line: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            crate::web_gateway::static_assets::app_build(),
             body.len()
         )
     }

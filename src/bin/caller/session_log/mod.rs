@@ -2118,6 +2118,7 @@ mod tests {
             crate::conversation::MessageProvenance::AskHumanAnswer,
             "the raw answer",
             Some(6),
+            &[],
         );
         drop(log);
         let event = read_last_event(dir.path(), "conversation_message");
@@ -2131,6 +2132,58 @@ mod tests {
         assert_eq!(event["data"]["text"].as_str(), Some("the raw answer"));
         assert_eq!(event["data"]["ref_seq"].as_u64(), Some(6));
         assert!(event["ts_ms"].as_i64().is_some());
+        // BACKWARD COMPAT: an attachment-less record keeps the exact
+        // pre-field data shape — no `attachments` key at all, so the
+        // emitted line is byte-shaped like every legacy row.
+        assert!(event["data"].get("attachments").is_none());
+        let keys: Vec<&str> = event["data"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut expected = vec![
+            "message_id",
+            "message_seq",
+            "provenance",
+            "ref_seq",
+            "role",
+            "text",
+        ];
+        expected.sort_unstable();
+        let mut got = keys.clone();
+        got.sort_unstable();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn conversation_message_user_persists_attachment_refs() {
+        // Native parity with the external lane's `[user]` rows: the
+        // canonical user record carries the renderable upload refs in
+        // `data.attachments`, in the same array shape `user_message`
+        // persists (SessionNoteAttachment).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::open(dir.path().to_path_buf()).unwrap();
+        let refs = vec![crate::types::SessionNoteAttachment {
+            upload_id: "u-1".to_string(),
+            name: "shot.png".to_string(),
+            mime: "image/png".to_string(),
+            url: "/api/session/current/uploads/u-1/raw".to_string(),
+        }];
+        log.conversation_message_user(
+            4,
+            crate::conversation::MessageProvenance::FollowUp,
+            "see the screenshot",
+            None,
+            &refs,
+        );
+        drop(log);
+        let event = read_last_event(dir.path(), "conversation_message");
+        assert_eq!(event["data"]["role"].as_str(), Some("user"));
+        assert_eq!(event["data"]["text"].as_str(), Some("see the screenshot"));
+        let replayed: Vec<crate::types::SessionNoteAttachment> =
+            serde_json::from_value(event["data"]["attachments"].clone()).unwrap();
+        assert_eq!(replayed, refs);
     }
 
     #[test]
