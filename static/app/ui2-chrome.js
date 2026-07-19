@@ -266,6 +266,18 @@ function ui2WireMirrors() {
     switcher.addEventListener('change', () => {
       const sid = switcher.value;
       const gridLayout = document.documentElement.dataset.ui2Layout === 'grid';
+      // Picking a SESSION while on Grid means "show me that one" — enter
+      // Focus through the same path the Focus button takes (ui2ApplyLayout
+      // keeps the toggle's aria-pressed pair correct); picking
+      // "all sessions" is the inverse gesture and returns to Grid. Within
+      // Focus, picking a session just promotes it (today's behavior).
+      // Layout FIRST: it is the declared intent, and the focus call below
+      // repaints session panes whose renderers can throw in degraded
+      // environments — the layout flip must not ride on their success.
+      if (typeof ui2ApplyLayout === 'function') {
+        if (sid && gridLayout) ui2ApplyLayout('focus');
+        else if (!sid) ui2ApplyLayout('grid');
+      }
       if (sid && typeof focusSessionWindow === 'function') focusSessionWindow(sid);
       else if (!sid && typeof discardPromptTargetReference === 'function') {
         const current = typeof resolvePromptTargetSessionId === 'function'
@@ -273,17 +285,8 @@ function ui2WireMirrors() {
         if (current) discardPromptTargetReference(current);
         if (typeof updatePromptTargetSessionHighlight === 'function') updatePromptTargetSessionHighlight();
       }
-      // Picking a SESSION while on Grid means "show me that one" — enter
-      // Focus through the same path the Focus button takes (ui2ApplyLayout
-      // keeps the toggle's aria-pressed pair correct); picking
-      // "all sessions" is the inverse gesture and returns to Grid. Within
-      // Focus, picking a session just promotes it (today's behavior);
-      // ui2ApplyLayout already ends with ui2ApplyFocusSurface, so the
-      // explicit call below only covers the no-layout-change paths.
-      if (typeof ui2ApplyLayout === 'function') {
-        if (sid && gridLayout) ui2ApplyLayout('focus');
-        else if (!sid) ui2ApplyLayout('grid');
-      }
+      // ui2ApplyLayout already ends with ui2ApplyFocusSurface; this
+      // explicit call covers the no-layout-change paths (Focus→promote).
       if (typeof ui2ApplyFocusSurface === 'function') ui2ApplyFocusSurface();
       // Change feedback: the target-chip brightness-pulse idiom
       // (39's updatePromptTargetChip), sized for a form control.
