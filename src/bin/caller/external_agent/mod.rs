@@ -1187,8 +1187,9 @@ pub enum AgentEvent {
     /// The agent's chain-of-thought / reasoning trace.
     ///
     /// Codex emits this via `item/completed` with `type: "reasoning"`. The
-    /// text is surfaced at `"detail"` verbosity (visible in Verbose + Debug,
-    /// hidden in Normal) via `AppEvent::ModelResponse` with `reasoning` set.
+    /// text is surfaced via `AppEvent::ModelResponse` with `reasoning` set,
+    /// which the dashboard renders as a first-class thinking row (level
+    /// "model", visible at Normal verbosity).
     Reasoning { text: String },
     /// The agent's execution plan (task decomposition with status).
     ///
