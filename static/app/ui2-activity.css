@@ -194,54 +194,16 @@ html.ui-v2 #activity-subtabs .ui2-layout-toggle button[aria-pressed="true"] {
   box-shadow: var(--ui2-shadow-seg), inset 0 0 0 1px var(--line);
 }
 
-/* minimize-done + hide-done: small amber hygiene pills (minimize drops
-   finished sub-agents to header bars; hide closes every hard-done
-   window's card — the sessions stay in Sessions). hide-done is
-   grid-only like the sweep pills below: Focus hides the cards it acts
-   on. */
-html.ui-v2 #activity-subtabs .ui2-minimize-done,
-html.ui-v2 #activity-subtabs .ui2-hide-done {
+/* Arrange ▾ — ONE compact menu trigger consolidating every bulk
+   session-window sweep (it replaced five standalone pills: minimize
+   done, hide done, collapse/expand all, expand/collapse details).
+   Sibling styling to Focus/Grid/Options, and grid-only like the pills
+   it replaced — Focus hides the session windows the sweeps act on —
+   plus hidden by ui2-activity.js while no session window exists. */
+html.ui-v2 #activity-subtabs .ui2-arrange-btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 10px;
-  border: 1px solid rgba(var(--amber-rgb), .3);
-  border-radius: 9px;
-  background: rgba(var(--amber-rgb), .08);
-  color: var(--amber);
-  font-family: inherit;
-  font-size: 11px;
-  font-weight: 700;
-  cursor: pointer;
-  transition: background var(--t-fast);
-}
-html.ui-v2 #activity-subtabs .ui2-minimize-done[hidden],
-html.ui-v2 #activity-subtabs .ui2-hide-done[hidden],
-html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-hide-done { display: none; }
-html.ui-v2 #activity-subtabs .ui2-minimize-done:hover,
-html.ui-v2 #activity-subtabs .ui2-hide-done:hover { background: rgba(var(--amber-rgb), .14); }
-html.ui-v2 #activity-subtabs .ui2-minimize-done-count,
-html.ui-v2 #activity-subtabs .ui2-hide-done-count {
-  min-width: 16px; height: 16px;
-  display: inline-flex; align-items: center; justify-content: center;
-  padding: 0 4px;
-  border-radius: var(--r-pill);
-  background: rgba(var(--amber-rgb), .2);
-  font-family: var(--mono);
-  font-size: 9.5px;
-}
-
-/* collapse/expand-all + its header-details twin: the grid sweep pills —
-   neutral ink (layout actions, not attention nudges), and grid-only:
-   Focus hides the session windows the sweeps act on (ui2-activity.js
-   keeps each label naming the direction one click will act).
-   .ui2-collapse-all drives the window axis (minimized);
-   .ui2-header-details drives the header-details axis (headerCollapsed). */
-html.ui-v2 #activity-subtabs .ui2-collapse-all,
-html.ui-v2 #activity-subtabs .ui2-header-details {
-  display: inline-flex;
-  align-items: center;
+  gap: 5px;
   height: 28px;
   padding: 0 10px;
   border: 1px solid var(--line);
@@ -250,16 +212,81 @@ html.ui-v2 #activity-subtabs .ui2-header-details {
   color: var(--text-3);
   font-family: inherit;
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 650;
   cursor: pointer;
-  transition: background var(--t-fast), color var(--t-fast);
+  transition: color var(--t-fast), background var(--t-fast), border-color var(--t-fast);
 }
-html.ui-v2 #activity-subtabs .ui2-collapse-all:hover,
-html.ui-v2 #activity-subtabs .ui2-header-details:hover { color: var(--text); background: var(--hover-wash); }
-html.ui-v2 #activity-subtabs .ui2-collapse-all[hidden],
-html.ui-v2 #activity-subtabs .ui2-header-details[hidden],
-html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-collapse-all,
-html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-header-details { display: none; }
+html.ui-v2 #activity-subtabs .ui2-arrange-btn svg {
+  width: 12px; height: 12px;
+  fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round;
+  transition: transform var(--t-fast);
+}
+html.ui-v2 #activity-subtabs .ui2-arrange-btn:hover { color: var(--text); background: var(--hover-wash); }
+html.ui-v2 #activity-subtabs .ui2-arrange-btn[aria-expanded="true"] {
+  color: var(--text);
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2 #activity-subtabs .ui2-arrange-btn[aria-expanded="true"] svg { transform: rotate(180deg); }
+html.ui-v2 #activity-subtabs .ui2-arrange-btn[hidden],
+html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-arrange-btn { display: none; }
+
+/* The Arrange menu popover: same mechanics as the Options popover below
+   (display:none base, .open shows, position:fixed against the subtab
+   row's overflow-x clipping, JS stamps top/right from the trigger). The
+   display gate carries the trigger's own conditions — grid layout AND
+   the log sub-tab active — so a stale .open can never surface the menu
+   in Focus or on another sub-tab. */
+html.ui-v2 #ui2-arrange-menu { display: none; }
+html.ui-v2[data-ui2-layout="grid"] #activity-subtabs:has(.subtab-btn[data-activity-tab="log"].active) #ui2-arrange-menu.open {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  position: fixed;
+  z-index: 80;
+  min-width: 232px;
+  margin: 0;
+  padding: 6px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow-menu);
+}
+html.ui-v2 #ui2-arrange-menu .ui2-arrange-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 30px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  text-align: left;
+  cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 #ui2-arrange-menu .ui2-arrange-item:hover:not([disabled]) { color: var(--text); background: var(--hover-wash); }
+html.ui-v2 #ui2-arrange-menu .ui2-arrange-item[disabled] { color: var(--text-3); opacity: .55; cursor: default; }
+html.ui-v2 #ui2-arrange-menu .ui2-arrange-item[hidden] { display: none; }
+html.ui-v2 #ui2-arrange-menu .ui2-arrange-count {
+  min-width: 16px; height: 16px;
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 0 4px;
+  border-radius: var(--r-pill);
+  background: rgba(var(--iris-rgb), .16);
+  color: var(--iris-2);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+}
+html.ui-v2 #ui2-arrange-menu .ui2-arrange-count[hidden] { display: none; }
 
 /* Options trigger */
 html.ui-v2 #activity-subtabs .ui2-view-options-btn {
