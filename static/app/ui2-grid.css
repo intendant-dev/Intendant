@@ -20,33 +20,29 @@ html.ui-v2 .session-window-grid {
    the grid claims exactly the share the user dragged, and the concurrent
    view gets the rest.
 
-   grid-auto-rows is the load-bearing declaration. The row-overlap that
-   ledger finding #4 recorded (5-6 windows: row 1's cards painted over
-   row 2 — "320px cards in 298px tracks") is a TRACK-SIZING effect: `auto`
-   rows in a definite-height grid have that height distributed across
-   them, so two rows in a 620px grid size to ~292px each while the cards
-   — which are content-sized, since
-   `.session-window:not(.header-collapsed):not(.minimized)` clears the
-   320px cap — stay ~320px and spill out of their track onto the next row.
-   Pinning the rows to max-content takes the container height out of track
-   sizing entirely: every row is exactly as tall as its cards, the surplus
-   becomes scrollable overflow, and rows can never collide.
-   (align-content does NOT help here — it distributes leftover space after
-   tracks are sized, so it never sees the compression. Measured.)
+   The row-overlap cure that used to live here (grid-auto-rows:
+   max-content + align-content: start) moved to the BASE
+   .session-window-grid rule in 12-styles-tasks-log.css: the ledger
+   finding #4 track-sizing artifact — `auto` rows in a definite-height
+   grid compress below their content-sized cards, which then paint over
+   the next row ("320px cards in 298px tracks") — was not specific to
+   .resized. Any clamped height reproduces it (the base 42vh max-height,
+   the flexed concurrent-log-minimized state, transient non-.resized
+   frames), so the pin is now universal and this rule keeps only the
+   definite-height + overflow mechanics.
 
-   The earlier fix — height:auto + the dragged size as a max-height cap —
-   did dodge the overlap, but only by making the height indefinite, which
-   silently removed drag-to-grow: an auto-height grid can never exceed its
-   content, so dragging the handle down just moved a cap nothing was
-   pressing against, and in fit mode (where the cap IS the content height)
-   the drag was a pure no-op. It also outranked v1's `.maximized` and
-   `.concurrent-log-minimized` geometry, so neither state could resize the
-   grid — hence the :not() scoping here. */
+   History, still binding: the earlier fix — height:auto + the dragged
+   size as a max-height cap — did dodge the overlap, but only by making
+   the height indefinite, which silently removed drag-to-grow: an
+   auto-height grid can never exceed its content, so dragging the handle
+   down just moved a cap nothing was pressing against, and in fit mode
+   (where the cap IS the content height) the drag was a pure no-op. It
+   also outranked v1's `.maximized` and `.concurrent-log-minimized`
+   geometry, so neither state could resize the grid — hence the :not()
+   scoping here. */
 html.ui-v2 .subtab-pane:not(.concurrent-log-minimized) .session-window-grid.resized:not(.maximized) {
   height: var(--session-window-grid-height);
   max-height: none;
-  grid-auto-rows: max-content;
-  align-content: start;
   overflow-y: auto;
   overflow-x: hidden;
 }

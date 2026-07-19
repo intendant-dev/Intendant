@@ -809,6 +809,18 @@ body.context-focus-active {
 .session-window-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  /* Universal anti-overlap (ledger finding #4, generalized): whenever the
+     grid's height is definite or clamped (a dragged .resized height, the
+     42vh max-height here, the flexed concurrent-log-minimized state),
+     `auto` rows are sized against the container and compress below their
+     content-sized cards, which then paint across the next row (the
+     minimized-bar-over-neighbor artifact). Pinning rows to max-content
+     keeps every row exactly as tall as its cards and turns surplus into
+     scroll; align-content: start stacks rows from the top. Both are
+     inert under .maximized (display: flex, single line). Mechanism
+     detail: ui2-grid.css (the .resized cure this generalizes). */
+  grid-auto-rows: max-content;
+  align-content: start;
   gap: 10px;
   padding: 8px;
   max-height: 42vh;
@@ -998,6 +1010,26 @@ body.context-focus-active {
 .session-window.minimized {
   min-height: 36px;
   max-height: 36px;
+  /* Dock band: minimized bars flow to the END of the grid (visual order
+     only — DOM order is untouched, so Focus display-gating, activate
+     scrollIntoView, and persistence are unaffected) and pack into dense
+     36px max-content rows below the active cards, taskbar-style. The
+     lineage wires re-render from live rects on the same rAF pass every
+     minimize change already schedules, so they follow the moved bars. */
+  order: 9;
+}
+/* Gentle dock-in when a card collapses to its bar. Opacity only — a
+   transform would skew the rect the wire-render rAF pass reads
+   mid-animation — and no FLIP/measured motion: DOM efficiency is an
+   explicit bar for this band. */
+@media (prefers-reduced-motion: no-preference) {
+  .session-window.minimized {
+    animation: session-window-dock-in .2s ease-out;
+  }
+}
+@keyframes session-window-dock-in {
+  from { opacity: .45; }
+  to { opacity: 1; }
 }
 .session-window.minimized .session-window-log,
 .session-window.minimized .session-window-cwd,

@@ -135,9 +135,43 @@ function ui2RefreshMinimizeDoneControl() {
   btn.title = count === 1
     ? 'Minimize the finished sub-agent window'
     : `Minimize all ${count} finished sub-agent windows`;
-  // The collapse-all pill rides the same freshness passes (badge refresh,
-  // relationship render, every minimize state change routes here).
+  // The hide-done, collapse-all, and header-details pills ride the same
+  // freshness passes (badge refresh, relationship render, every minimize
+  // state change routes here).
+  ui2RefreshHideDoneControl();
   ui2RefreshCollapseAllControl();
+  ui2RefreshHeaderDetailsControl();
+}
+
+// ── "Hide done" close sweep pill ───────────────────────────────────────
+// Beside "Minimize done" but the stronger hygiene action: CLOSE every
+// hard-done window's card (41's hideDoneSessionWindows — the same path
+// as the × button's "Hide card" choice), sub-agent or top-level alike.
+// Hard done evidence only (ended / phase done|interrupted — never bare
+// idle), so idle-parked and live windows always survive, and the closed
+// cards' sessions stay in the Sessions list, reopenable and replayable.
+// Hidden while nothing qualifies; grid-only via the stylesheet layout
+// gate like the sweep pills.
+function ui2CountHardDoneWindows() {
+  if (typeof sessionWindows === 'undefined'
+      || typeof sessionWindowHasHardDoneEvidence !== 'function') return 0;
+  let count = 0;
+  for (const sid of sessionWindows.keys()) {
+    if (sessionWindowHasHardDoneEvidence(sid)) count += 1;
+  }
+  return count;
+}
+
+function ui2RefreshHideDoneControl() {
+  const btn = document.getElementById('ui2-hide-done-btn');
+  if (!btn) return;
+  const count = ui2CountHardDoneWindows();
+  const countEl = document.getElementById('ui2-hide-done-count');
+  if (countEl) countEl.textContent = String(count);
+  btn.hidden = count === 0;
+  btn.title = count === 1
+    ? 'Hide the finished session card (its session stays in Sessions)'
+    : `Hide all ${count} finished session cards (their sessions stay in Sessions)`;
 }
 
 // ── "Collapse all / Expand all" grid sweep pill ────────────────────────
@@ -184,6 +218,51 @@ function ui2WireCollapseAllControl() {
   });
 }
 
+// ── "Expand details / Collapse details" header sweep pill ──────────────
+// Beside "Collapse all", driving the OTHER axis: every window's
+// click-to-expand header-details strip (41's
+// setAllSessionWindowHeadersCollapsed) — vitals chips, git indicators,
+// paths, goal, tier, relationships — while the windows themselves stay
+// put. Direction counts NON-minimized windows only (the same visibility
+// boundary the sibling counts with); the sweep still flips minimized
+// windows so a later restore honors the choice. Grid-only via the same
+// stylesheet layout gate as its neighbor.
+function ui2RefreshHeaderDetailsControl() {
+  const btn = document.getElementById('ui2-header-details-btn');
+  if (!btn) return;
+  const windows = typeof sessionWindows !== 'undefined' ? sessionWindows : null;
+  if (!windows || windows.size === 0) {
+    btn.hidden = true;
+    return;
+  }
+  let expanded = 0;
+  for (const win of windows.values()) {
+    if (win && !win.minimized && !win.headerCollapsed) expanded += 1;
+  }
+  const collapse = expanded > 0;
+  btn.hidden = false;
+  btn.dataset.direction = collapse ? 'collapse' : 'expand';
+  btn.textContent = collapse ? 'Collapse details' : 'Expand details';
+  btn.title = collapse
+    ? (expanded === 1
+        ? 'Collapse header details on the expanded session window'
+        : `Collapse header details on all ${expanded} expanded session windows`)
+    : 'Expand header details on every session window';
+  btn.setAttribute('aria-label', btn.title);
+}
+
+function ui2WireHeaderDetailsControl() {
+  const btn = document.getElementById('ui2-header-details-btn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const collapse = btn.dataset.direction !== 'expand';
+    if (typeof setAllSessionWindowHeadersCollapsed === 'function') {
+      setAllSessionWindowHeadersCollapsed(collapse);
+    }
+    ui2RefreshMinimizeDoneControl();
+  });
+}
+
 let ui2MinimizeDoneRefreshQueued = false;
 function ui2QueueMinimizeDoneRefresh() {
   if (ui2MinimizeDoneRefreshQueued) return;
@@ -202,6 +281,15 @@ function ui2WireMinimizeDoneControl() {
     ui2RefreshMinimizeDoneControl();
   });
   ui2RefreshMinimizeDoneControl();
+}
+
+function ui2WireHideDoneControl() {
+  const btn = document.getElementById('ui2-hide-done-btn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    if (typeof hideDoneSessionWindows === 'function') hideDoneSessionWindows();
+    ui2RefreshMinimizeDoneControl();
+  });
 }
 
 // Composer dressing: placeholder copy + the attach glyph. The send
@@ -685,7 +773,9 @@ function ui2RailTick(force) {
     ui2AugmentApprovalPanel();
     ui2WireLayoutToggle();
     ui2WireMinimizeDoneControl();
+    ui2WireHideDoneControl();
     ui2WireCollapseAllControl();
+    ui2WireHeaderDetailsControl();
     ui2WireViewOptions();
     ui2DressComposer();
     ui2BuildVitalsRail();
