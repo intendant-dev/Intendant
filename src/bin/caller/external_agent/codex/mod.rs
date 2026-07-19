@@ -1313,6 +1313,20 @@ impl ExternalAgent for CodexAgent {
         // before launch.
         let effective_web_port = web_port.unwrap_or(8765);
         let args = self.app_server_args(effective_web_port);
+        // Materialize the daemon's skill catalog into the project's
+        // standard scan paths (Codex reads `.agents/skills/`) so this
+        // backend discovers the same skills native sessions do.
+        match super::skills_sync::provision_project_skills(&config.working_dir) {
+            Ok(report) => {
+                if let Some(summary) = super::skills_sync::describe_report(&report) {
+                    eprintln!("[skills] {} in {}", summary, config.working_dir.display());
+                }
+            }
+            Err(e) => eprintln!(
+                "[skills] provisioning failed in {}: {e}",
+                config.working_dir.display()
+            ),
+        }
         let mut command = crate::platform::spawn_command(&self.command);
         command
             .args(&args)

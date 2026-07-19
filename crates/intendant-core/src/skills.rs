@@ -37,6 +37,13 @@ pub struct SkillConfig {
 }
 
 /// Where a skill was discovered.
+/// Marker file naming a skill directory as a *derived copy* materialized
+/// for supervised external backends (the caller's `skills_sync`). Marked
+/// directories are invisible to Intendant's own discovery — the source
+/// directory stays authoritative, so a stale copy can never shadow it —
+/// and are the only directories provisioning may delete and rewrite.
+pub const MATERIALIZED_MARKER: &str = ".intendant-materialized";
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkillSource {
     /// `<project_root>/.agents/skills/` or `<project_root>/.intendant/skills/` or `<project_root>/skills/`
@@ -190,11 +197,12 @@ pub fn discover_skills(project_root: Option<&Path>) -> Vec<Skill> {
     discover_skills_in(project_root, dirs::home_dir().as_deref())
 }
 
-/// Home-injectable core of [`discover_skills`]. Tests pin `home` (usually
-/// to `None` or a temp dir) so personal skills on the running machine leak
-/// into no assertion — the self-hosted CI runners share a real `$HOME`
-/// that legitimately contains `~/.agents/skills/`.
-fn discover_skills_in(project_root: Option<&Path>, home: Option<&Path>) -> Vec<Skill> {
+/// Home-injectable core of [`discover_skills`]. Tests and the
+/// external-backend skill provisioning pin `home` (usually to `None` or a
+/// temp dir) so personal skills on the running machine leak into no
+/// assertion — the self-hosted CI runners share a real `$HOME` that
+/// legitimately contains `~/.agents/skills/`.
+pub fn discover_skills_in(project_root: Option<&Path>, home: Option<&Path>) -> Vec<Skill> {
     let mut skills = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
 
@@ -260,6 +268,13 @@ fn load_skills_from_dir(
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
+            continue;
+        }
+
+        // Derived copies materialized for external backends are invisible
+        // here: their source directory is also on the discovery path and
+        // stays authoritative (see [`MATERIALIZED_MARKER`]).
+        if path.join(MATERIALIZED_MARKER).exists() {
             continue;
         }
 
@@ -442,6 +457,31 @@ Instructions here.
         assert!(config.description.contains("Deploy the current branch"));
         assert!(config.description.contains("integration test suite"));
         assert_eq!(config.autonomy, Some("low".to_string()));
+    }
+
+    #[test]
+    fn discovery_skips_materialized_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let live = root.join("skills").join("live-skill");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(
+            live.join("SKILL.md"),
+            "---\nname: live-skill\ndescription: real\n---\nbody\n",
+        )
+        .unwrap();
+        let derived = root.join(".agents").join("skills").join("derived-skill");
+        std::fs::create_dir_all(&derived).unwrap();
+        std::fs::write(
+            derived.join("SKILL.md"),
+            "---\nname: derived-skill\ndescription: copy\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(derived.join(MATERIALIZED_MARKER), "source: elsewhere\n").unwrap();
+
+        let skills = discover_skills_in(Some(root), None);
+        let names: Vec<&str> = skills.iter().map(|s| s.config.name.as_str()).collect();
+        assert_eq!(names, vec!["live-skill"], "marked copy must be invisible");
     }
 
     #[test]
