@@ -542,6 +542,7 @@ pub(crate) async fn serve_http_request(
         HostedHttpAuthority::new(
             Arc::clone(&hosted_control),
             custom_domain_selected.then(|| Arc::clone(&custom_domain)),
+            cert_dir.clone(),
             verified,
         )
     });
@@ -1358,6 +1359,7 @@ pub(crate) async fn serve_http_request(
                     request_line,
                     route.cors,
                     fleet_cors_origin.as_deref(),
+                    hosted_http_authority,
                 )
                 .await;
             }
@@ -1367,6 +1369,7 @@ pub(crate) async fn serve_http_request(
                     request_line,
                     route.cors,
                     fleet_cors_origin.as_deref(),
+                    hosted_http_authority,
                 )
                 .await;
             }
@@ -2581,11 +2584,85 @@ pub(crate) fn stream_response_http_head(
 /// NEVER parks — its body is EOF-delimited by design (`Connection:
 /// close` is pinned in its golden head), so it always finalizes.
 pub(crate) async fn write_api_response(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     response: ApiResponse,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
+    write_api_response_inner(stream, response, cors, fleet_origin, false, || true).await;
+}
+
+/// Hosted response edge: retain the opening lease/custom-domain predicate
+/// for the entire write, including time blocked on a line producer or socket
+/// backpressure. Unguarded local/mTLS callers keep the historical writer.
+pub(crate) async fn write_api_response_with_authority(
+    stream: DemuxStream,
+    response: ApiResponse,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+    authority: Option<&HostedHttpAuthority>,
+) {
+    let guarded = authority.is_some();
+    write_api_response_inner(stream, response, cors, fleet_origin, guarded, || {
+        authority.is_none_or(HostedHttpAuthority::opening_authority_is_current)
+    })
+    .await;
+}
+
+enum LiveAuthorityAwait<T> {
+    Ready(T),
+    AuthorityLost,
+}
+
+/// Await transport or producer progress without letting a pending future
+/// postpone recurring authority checks. The future is dropped immediately
+/// when the opening authority is no longer current.
+async fn await_with_live_authority<F, G>(
+    future: F,
+    guarded: bool,
+    authority_is_current: &mut G,
+) -> LiveAuthorityAwait<F::Output>
+where
+    F: std::future::Future,
+    G: FnMut() -> bool,
+{
+    if !guarded {
+        return LiveAuthorityAwait::Ready(future.await);
+    }
+    if !authority_is_current() {
+        return LiveAuthorityAwait::AuthorityLost;
+    }
+    tokio::pin!(future);
+    let first_tick =
+        tokio::time::Instant::now() + crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL;
+    let mut authority_tick = tokio::time::interval_at(
+        first_tick,
+        crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+    );
+    authority_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = authority_tick.tick() => {
+                if !authority_is_current() {
+                    return LiveAuthorityAwait::AuthorityLost;
+                }
+            }
+            output = &mut future => return LiveAuthorityAwait::Ready(output),
+        }
+    }
+}
+
+async fn write_api_response_inner<G>(
+    mut stream: DemuxStream,
+    response: ApiResponse,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+    guarded: bool,
+    mut authority_is_current: G,
+) where
+    G: FnMut() -> bool,
+{
     use tokio::io::AsyncWriteExt;
     match response {
         ApiResponse::Stream {
@@ -2599,21 +2676,80 @@ pub(crate) async fn write_api_response(
             let LineStream {
                 lines: mut line_rx,
                 source,
+                cancellation,
             } = line_stream;
-            if stream.write_all(&head).await.is_ok() {
-                while let Some(line) = line_rx.recv().await {
-                    if stream.write_all(line.as_bytes()).await.is_err() {
-                        break;
+            let mut completed = false;
+            let mut authority_lost = false;
+            match await_with_live_authority(
+                stream.write_all(&head),
+                guarded,
+                &mut authority_is_current,
+            )
+            .await
+            {
+                LiveAuthorityAwait::Ready(Ok(())) => loop {
+                    let line = match await_with_live_authority(
+                        line_rx.recv(),
+                        guarded,
+                        &mut authority_is_current,
+                    )
+                    .await
+                    {
+                        LiveAuthorityAwait::Ready(Some(line)) => line,
+                        LiveAuthorityAwait::Ready(None) => {
+                            completed = true;
+                            break;
+                        }
+                        LiveAuthorityAwait::AuthorityLost => {
+                            authority_lost = true;
+                            break;
+                        }
+                    };
+                    match await_with_live_authority(
+                        stream.write_all(line.as_bytes()),
+                        guarded,
+                        &mut authority_is_current,
+                    )
+                    .await
+                    {
+                        LiveAuthorityAwait::Ready(Ok(())) => {}
+                        LiveAuthorityAwait::Ready(Err(_)) => break,
+                        LiveAuthorityAwait::AuthorityLost => {
+                            authority_lost = true;
+                            break;
+                        }
                     }
-                }
+                },
+                LiveAuthorityAwait::Ready(Err(_)) => {}
+                LiveAuthorityAwait::AuthorityLost => authority_lost = true,
             }
             // Hang up before joining: after an early exit above (client
             // gone) the source may still be sending into the channel;
             // dropping the receiver fails those sends so the producer
             // finishes instead of deadlocking the join.
             drop(line_rx);
-            let _ = source.await;
-            finalize_http_stream(&mut stream).await;
+            if completed {
+                let _ = source.await;
+            } else {
+                cancellation.cancel();
+                source.abort();
+                // Do not join an aborted spawn_blocking producer: Tokio
+                // cannot stop one after it has begun. The cancellation
+                // token and dropped receiver stop its useful work at the
+                // next producer boundary while this transport closes now.
+            }
+            if authority_lost {
+                // A graceful TLS flush can itself be backpressured. Give it
+                // one authority beat, then drop the transport rather than
+                // letting a revoked response remain live indefinitely.
+                let _ = tokio::time::timeout(
+                    crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+                    finalize_http_stream(&mut stream),
+                )
+                .await;
+            } else {
+                finalize_http_stream(&mut stream).await;
+            }
         }
         mut buffered => {
             let keep = stream.exchange_reusable();
@@ -2642,14 +2778,45 @@ pub(crate) async fn write_api_response(
                 ),
                 other => (api_response_http_bytes(other, cors, fleet_origin), None),
             };
-            let mut write_ok = stream.write_all(&bytes).await.is_ok();
+            let mut authority_lost = false;
+            let mut write_ok = match await_with_live_authority(
+                stream.write_all(&bytes),
+                guarded,
+                &mut authority_is_current,
+            )
+            .await
+            {
+                LiveAuthorityAwait::Ready(result) => result.is_ok(),
+                LiveAuthorityAwait::AuthorityLost => {
+                    authority_lost = true;
+                    false
+                }
+            };
             if write_ok {
                 if let Some(body) = &shared_body {
-                    write_ok = stream.write_all(body.as_bytes()).await.is_ok();
+                    write_ok = match await_with_live_authority(
+                        stream.write_all(body.as_bytes()),
+                        guarded,
+                        &mut authority_is_current,
+                    )
+                    .await
+                    {
+                        LiveAuthorityAwait::Ready(result) => result.is_ok(),
+                        LiveAuthorityAwait::AuthorityLost => {
+                            authority_lost = true;
+                            false
+                        }
+                    };
                 }
             }
             if keep && write_ok {
                 stream.park().await;
+            } else if authority_lost {
+                let _ = tokio::time::timeout(
+                    crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+                    finalize_http_stream(&mut stream),
+                )
+                .await;
             } else {
                 finalize_http_stream(&mut stream).await;
             }
@@ -2661,6 +2828,45 @@ pub(crate) async fn write_api_response(
 mod tests {
     use super::*;
     use crate::gateway_routes::CorsPosture;
+
+    struct NeverWritable {
+        write_polled: Arc<tokio::sync::Notify>,
+    }
+
+    impl tokio::io::AsyncRead for NeverWritable {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for NeverWritable {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.write_polled.notify_one();
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn api_json_render_matches_legacy_json_response() {
@@ -2881,6 +3087,7 @@ mod tests {
         } = crate::web_gateway::sessions_stream_api_response_from(crate::web_gateway::LineStream {
             lines,
             source: tokio::spawn(async {}),
+            cancellation: tokio_util::sync::CancellationToken::new(),
         })
         else {
             panic!("sessions stream core must answer on the Stream lane");
@@ -2894,6 +3101,62 @@ mod tests {
         assert_eq!(
             String::from_utf8(head).unwrap(),
             SESSIONS_STREAM_HEAD_GOLDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn live_authority_interrupts_backpressured_stream_and_cancels_source() {
+        // Model a custom-domain eligibility loss after the response writer
+        // has entered a socket write that can never make progress. The
+        // recurring authority beat must drop that future, cancel/abort the
+        // producer, and return without waiting for client backpressure.
+        let write_polled = Arc::new(tokio::sync::Notify::new());
+        let transport = NeverWritable {
+            write_polled: Arc::clone(&write_polled),
+        };
+        let (line_tx, lines) = tokio::sync::mpsc::channel::<String>(1);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancellation_observer = cancellation.clone();
+        let producer_wait = cancellation.clone();
+        let source = tokio::spawn(async move {
+            let _ = line_tx.send("{\"type\":\"pending\"}\n".to_string()).await;
+            producer_wait.cancelled().await;
+        });
+        let response = ApiResponse::Stream {
+            status: 200,
+            content_type: "application/x-ndjson".to_string(),
+            headers: vec![("Connection", "close".to_string())],
+            stream: LineStream {
+                lines,
+                source,
+                cancellation,
+            },
+        };
+        let authority_live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer_authority = Arc::clone(&authority_live);
+        let writer = tokio::spawn(async move {
+            write_api_response_inner(
+                DemuxStream::new(Box::pin(transport)),
+                response,
+                CorsPosture::OwnOrigin,
+                None,
+                true,
+                || writer_authority.load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), write_polled.notified())
+            .await
+            .expect("response writer must reach the backpressured transport");
+        authority_live.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("authority loss must interrupt backpressure")
+            .expect("response writer task");
+        assert!(
+            cancellation_observer.is_cancelled(),
+            "the line producer must be cancelled with the response pump"
         );
     }
 }

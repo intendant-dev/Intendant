@@ -432,14 +432,15 @@ pub(crate) async fn sessions_search_response_body_with_cancel(
     project_filter: Vec<String>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> String {
-    if SESSION_SEARCH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+    let Some(in_flight) = SessionSearchInFlightGuard::try_acquire() else {
         return serde_json::json!({
             "error": "Another deep session search is already running. Wait for it to finish before starting a new one.",
             "busy": true,
         })
         .to_string();
-    }
+    };
     let body = match tokio::task::spawn_blocking(move || {
+        let _in_flight = in_flight;
         let home_path = crate::platform::home_dir();
         session_log_search_from_home_with_projects_cancel(
             &home_path,
@@ -458,7 +459,6 @@ pub(crate) async fn sessions_search_response_body_with_cancel(
         })
         .to_string(),
     };
-    SESSION_SEARCH_IN_FLIGHT.store(false, Ordering::SeqCst);
     body
 }
 

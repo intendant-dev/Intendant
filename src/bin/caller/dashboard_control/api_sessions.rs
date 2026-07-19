@@ -518,6 +518,7 @@ pub(crate) async fn stream_json_lines_response(
     let crate::web_gateway::LineStream {
         lines: mut line_rx,
         source: stream_task,
+        cancellation: _producer_cancellation,
     } = stream;
     if cancel.is_cancelled() {
         return hold_slot_until_producer_exits(slot, line_rx);
@@ -1611,6 +1612,7 @@ mod tests {
             crate::web_gateway::LineStream {
                 lines: line_rx,
                 source,
+                cancellation: CancellationToken::new(),
             },
             task_tx,
             generation,
@@ -2019,6 +2021,7 @@ mod tests {
             crate::web_gateway::LineStream {
                 lines: line_rx,
                 source: stream_task,
+                cancellation: CancellationToken::new(),
             },
             task_tx,
             7,
@@ -2998,7 +3001,11 @@ mod tests {
                 }
             }
         });
-        crate::web_gateway::LineStream { lines: rx, source }
+        crate::web_gateway::LineStream {
+            lines: rx,
+            source,
+            cancellation: CancellationToken::new(),
+        }
     }
 
     /// Same params ⇒ same event-line sequence on both lanes (design §8,
@@ -3036,6 +3043,7 @@ mod tests {
                         .into()
                     },
                     tx,
+                    CancellationToken::new(),
                 );
             });
             let mut lines = Vec::new();

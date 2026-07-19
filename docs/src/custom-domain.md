@@ -54,8 +54,9 @@ provenance has been accepted durably. Learning a later overlapping fleet zone
 therefore disables the custom lane instead of temporarily reclassifying a
 service-controlled name as owner-controlled during startup. HTTP requests and
 WebSocket upgrades recheck that live gate even on an existing TLS connection;
-active custom-domain sockets carry the same gate into their recurring
-authorization and buffered-input checks, so losing eligibility closes them.
+active custom-domain sockets and HTTP response streams carry the same gate into
+their recurring authorization, buffered-input, producer, and backpressure
+checks, so losing eligibility closes them and cancels any response producer.
 A fleet-DNS observation is accepted only when both fields form the same
 canonical `d-<20hex>.<zone>` pair; an absent, empty, noncanonical, or mismatched
 pair leaves the gate closed and writes no provenance. Absence clears current

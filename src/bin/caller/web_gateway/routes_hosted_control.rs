@@ -112,11 +112,14 @@ static HOSTED_AUTHORITY_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore
 /// Live authority carried across an HTTP request after its proof nonce has
 /// been consumed. Request-body reads can be long enough for the lease, IAM
 /// snapshot, certificate guard, or owner-name eligibility to change, so
-/// handlers refresh this value immediately before dispatching effects.
+/// handlers refresh this value immediately before dispatching effects and
+/// response streams retain its cheap opening-grant predicate until teardown.
 #[derive(Clone)]
 pub(crate) struct HostedHttpAuthority {
     runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
     custom_domain: Option<Arc<crate::custom_domain::CustomDomainRuntime>>,
+    live_grant: crate::dashboard_control::DashboardControlGrant,
+    iam_cert_dir: PathBuf,
     verified: crate::access::hosted_control::VerifiedHostedLease,
 }
 
@@ -124,11 +127,20 @@ impl HostedHttpAuthority {
     pub(crate) fn new(
         runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
         custom_domain: Option<Arc<crate::custom_domain::CustomDomainRuntime>>,
+        iam_cert_dir: PathBuf,
         verified: crate::access::hosted_control::VerifiedHostedLease,
     ) -> Self {
+        let live_grant = crate::dashboard_control::DashboardControlGrant::UserClient {
+            principal: verified.principal.clone(),
+            iam_state: Arc::clone(&verified.iam_state),
+            iam_cert_dir: Some(iam_cert_dir.clone()),
+            authority_memo: Default::default(),
+        };
         Self {
             runtime,
             custom_domain,
+            live_grant,
+            iam_cert_dir,
             verified,
         }
     }
@@ -159,6 +171,14 @@ impl HostedHttpAuthority {
         Ok(())
     }
 
+    /// Cheap recurring predicate for an already-admitted response pump.
+    /// Mirrors the WebSocket guard: the exact opening grant remains live,
+    /// including hosted lease status/expiry, ceiling, and certificate guard,
+    /// while a custom-domain request also retains owner-name eligibility.
+    pub(crate) fn opening_authority_is_current(&self) -> bool {
+        self.ensure_custom_domain_live().is_ok() && self.live_grant.opening_authority_is_current()
+    }
+
     pub(crate) async fn revalidate(&self) -> Result<Self, String> {
         self.ensure_custom_domain_live()?;
         let runtime = Arc::clone(&self.runtime);
@@ -166,11 +186,12 @@ impl HostedHttpAuthority {
         let verified =
             run_hosted_authority_io(move || runtime.revalidate_verified_lease(&opening)).await?;
         self.ensure_custom_domain_live()?;
-        Ok(Self {
-            runtime: Arc::clone(&self.runtime),
-            custom_domain: self.custom_domain.clone(),
+        Ok(Self::new(
+            Arc::clone(&self.runtime),
+            self.custom_domain.clone(),
+            self.iam_cert_dir.clone(),
             verified,
-        })
+        ))
     }
 }
 

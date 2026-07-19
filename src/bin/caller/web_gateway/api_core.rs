@@ -175,12 +175,15 @@ pub(crate) enum BytesPayload {
 /// response head; the tunnel framer wraps each in a `stream_event`
 /// frame between `stream_start`/`stream_end`. Items are complete
 /// NDJSON lines (trailing `\n` included). `source` is the producer
-/// task: writers drop `lines` first (hanging up unblocks a producer
-/// still sending after an early exit), then await it, so a panicked
-/// source is observable as the lane's error tail.
+/// task: a fully drained writer joins it; an early exit drops `lines`,
+/// cancels, and aborts without joining (a running `spawn_blocking` task
+/// cannot be forcibly stopped). `cancellation` therefore lets a transport
+/// stop producer work at its next boundary when live authority disappears,
+/// even while the transport writer itself is blocked by backpressure.
 pub(crate) struct LineStream {
     pub(crate) lines: tokio::sync::mpsc::Receiver<String>,
     pub(crate) source: tokio::task::JoinHandle<()>,
+    pub(crate) cancellation: tokio_util::sync::CancellationToken,
 }
 
 /// One API response, however it will leave the daemon. The HTTP adapter
