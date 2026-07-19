@@ -440,6 +440,9 @@ new MutationObserver(() => {
 const contextViz = {
   canvas: null,
   renderer: null,
+  // Sticky WebGL2-unavailable latch: contextInitThree probes getContext
+  // once, degrades to the empty-state note, and never retries (48b).
+  webglUnavailable: false,
   scene: null,
   camera: null,
   root: null,
