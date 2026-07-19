@@ -80,16 +80,44 @@ pub(super) fn encode_mcp_query_value(value: &str) -> String {
     encoded
 }
 
+/// Secret-bearing environment variable read by supervised MCP clients.
+///
+/// The value is injected after the external-child `env_clear()` boundary and
+/// is never copied from the controller's ambient environment. Client config
+/// placed on argv names this variable; it never contains the token itself.
+pub(super) const INTENDANT_MCP_BEARER_TOKEN_ENV: &str = "INTENDANT_MCP_BEARER_TOKEN";
+
+/// Resolve the bearer value a supervised MCP client should send. A session
+/// id derives a token bound to that exact agent principal; without one, the
+/// raw per-process token remains the transport fallback.
+pub(super) fn intendant_mcp_bearer_token(
+    mcp_token: Option<&str>,
+    session_id: Option<&str>,
+) -> Option<String> {
+    let token = mcp_token.map(str::trim).filter(|token| !token.is_empty())?;
+    Some(
+        match session_id
+            .map(str::trim)
+            .filter(|session| !session.is_empty())
+        {
+            Some(session_id) => crate::web_gateway::session_scoped_mcp_token(token, session_id),
+            None => token.to_string(),
+        },
+    )
+}
+
 /// Build the loopback MCP URL Intendant injects into a supervised backend.
 ///
-/// Carries the auth token, the Intendant session id (so tool calls are
-/// scoped to the calling backend), the `core` tool profile (the small
-/// bootstrap set — the broad surface is discovered lazily through
-/// `intendant ctl`), and, for Codex, the managed-context mode. When a
-/// session id is present the injected token is *session-scoped* (derived
-/// from the per-process token and the session id), so the backend
-/// authenticates as exactly that supervised agent session to the daemon's
-/// IAM layer and cannot present another session's identity.
+/// Carries the Intendant session id (so tool calls are scoped to the calling
+/// backend), the `core` tool profile (the small bootstrap set — the broad
+/// surface is discovered lazily through `intendant ctl`), and, for Codex, the
+/// managed-context mode. `mcp_token` is optional: the private
+/// `INTENDANT_MCP_URL` ctl bootstrap includes it, while argv-visible backend
+/// config omits it and authenticates with the bearer env instead. When a
+/// session id is present the token is *session-scoped* (derived from the
+/// per-process token and the session id), so the backend authenticates as
+/// exactly that supervised agent session to the daemon's IAM layer and cannot
+/// present another session's identity.
 pub(super) fn intendant_bootstrap_mcp_url(
     port: u16,
     session_id: Option<&str>,
@@ -105,11 +133,7 @@ pub(super) fn intendant_bootstrap_mcp_url(
         params.push(("managed_context", mode.to_string()));
     }
     params.push(("tool_profile", "core".to_string()));
-    if let Some(token) = mcp_token.map(str::trim).filter(|s| !s.is_empty()) {
-        let value = match session_id {
-            Some(session_id) => crate::web_gateway::session_scoped_mcp_token(token, session_id),
-            None => token.to_string(),
-        };
+    if let Some(value) = intendant_mcp_bearer_token(mcp_token, session_id) {
         params.push(("mcp_token", encode_mcp_query_value(&value)));
     }
     let query = params
@@ -123,16 +147,27 @@ pub(super) fn intendant_bootstrap_mcp_url(
 /// Inject the `intendant ctl` bootstrap environment into a supervised child:
 /// `INTENDANT` (absolute controller binary path), `INTENDANT_MCP_URL`
 /// (loopback endpoint with auth token + session scope baked in), and
-/// `INTENDANT_SESSION_ID`. With these set, `"$INTENDANT" ctl ...` works from
-/// any backend's shell without further configuration.
+/// `INTENDANT_SESSION_ID`. The separately injected
+/// `INTENDANT_MCP_BEARER_TOKEN` lets the backend's MCP client authenticate
+/// without putting the secret on argv. With these set,
+/// `"$INTENDANT" ctl ...` works from any backend's shell without further
+/// configuration.
 pub(super) fn add_intendant_bootstrap_env(
     command: &mut tokio::process::Command,
     mcp_url: &str,
     session_id: Option<&str>,
+    mcp_token: Option<&str>,
 ) {
     command.env("INTENDANT_MCP_URL", mcp_url);
     if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
         command.env("INTENDANT_SESSION_ID", session_id);
+    } else {
+        command.env_remove("INTENDANT_SESSION_ID");
+    }
+    if let Some(token) = intendant_mcp_bearer_token(mcp_token, session_id) {
+        command.env(INTENDANT_MCP_BEARER_TOKEN_ENV, token);
+    } else {
+        command.env_remove(INTENDANT_MCP_BEARER_TOKEN_ENV);
     }
     if let Ok(current_exe) = std::env::current_exe() {
         command.env("INTENDANT", current_exe);
@@ -212,6 +247,15 @@ const EXTERNAL_CHILD_BASE_ENV: &[&str] = &[
 /// user extension of the allowlist that can never re-admit provider keys.
 fn external_child_env_allowed(name: &str, passthrough: &HashSet<String>) -> bool {
     let upper = name.to_ascii_uppercase();
+    // Token-bearing MCP bootstrap values are injected explicitly after the
+    // clear. Never copy a stale value from a controller that is itself
+    // running as a supervised child of another daemon.
+    if matches!(
+        upper.as_str(),
+        "INTENDANT_MCP_URL" | "INTENDANT_MCP_BEARER_TOKEN" | "INTENDANT_SESSION_ID"
+    ) {
+        return false;
+    }
     // Controller→child control channel: `INTENDANT` + `INTENDANT_*`
     // bootstrap vars and the mock-provider rig's `PROVIDER` always ride.
     if upper == "INTENDANT" || upper.starts_with("INTENDANT_") || upper == "PROVIDER" {
@@ -1937,8 +1981,6 @@ mod tests {
             // rides PROVIDER + INTENDANT_MOCK_* into children).
             "PROVIDER",
             "INTENDANT",
-            "INTENDANT_MCP_URL",
-            "INTENDANT_SESSION_ID",
             "INTENDANT_MOCK_SCRIPT",
             "INTENDANT_MOCK_DISPLAY",
             "INTENDANT_ENV_PASSTHROUGH",
@@ -1973,6 +2015,11 @@ mod tests {
             "DOCKER_CONFIG",
             "DBUS_SESSION_BUS_ADDRESS",
             "MY_APP_SECRET",
+            // Bootstrap identity/credentials are spawn-injected, never
+            // inherited from an ambient parent session.
+            "INTENDANT_MCP_URL",
+            "INTENDANT_MCP_BEARER_TOKEN",
+            "INTENDANT_SESSION_ID",
             // Injection vectors and plain unknowns default-deny.
             "NODE_OPTIONS",
             "LD_PRELOAD",
@@ -1989,7 +2036,8 @@ mod tests {
     #[test]
     fn external_child_env_passthrough_extends_but_never_admits_provider_keys() {
         let passthrough = intendant_core::env_scrub::env_passthrough_set(Some(
-            "ssh_auth_sock, CARGO_TARGET_DIR, ANTHROPIC_API_KEY",
+            "ssh_auth_sock, CARGO_TARGET_DIR, ANTHROPIC_API_KEY, \
+             INTENDANT_MCP_URL, INTENDANT_MCP_BEARER_TOKEN",
         ));
         assert!(external_child_env_allowed("SSH_AUTH_SOCK", &passthrough));
         assert!(external_child_env_allowed("CARGO_TARGET_DIR", &passthrough));
@@ -2001,6 +2049,12 @@ mod tests {
             !external_child_env_allowed("GH_TOKEN", &passthrough),
             "non-named ambient credentials stay dropped"
         );
+        for name in ["INTENDANT_MCP_URL", "INTENDANT_MCP_BEARER_TOKEN"] {
+            assert!(
+                !external_child_env_allowed(name, &passthrough),
+                "{name} must only come from the explicit spawn injection"
+            );
+        }
     }
 
     /// The applier copies exactly the allowed inherited names onto the
@@ -2026,7 +2080,12 @@ mod tests {
 
         let mut command = tokio::process::Command::new("true");
         apply_external_child_env_policy_from(&mut command, inherited, &HashSet::new());
-        add_intendant_bootstrap_env(&mut command, "http://localhost:1/mcp?x", Some("sess-1"));
+        add_intendant_bootstrap_env(
+            &mut command,
+            "http://localhost:1/mcp?x",
+            Some("sess-1"),
+            Some("process-token"),
+        );
 
         let envs: Vec<(OsString, Option<OsString>)> = command
             .as_std()
@@ -2064,6 +2123,12 @@ mod tests {
         assert_eq!(
             set_value_for("INTENDANT_SESSION_ID"),
             Some(OsString::from("sess-1"))
+        );
+        assert_eq!(
+            set_value_for(INTENDANT_MCP_BEARER_TOKEN_ENV),
+            Some(OsString::from(
+                crate::web_gateway::session_scoped_mcp_token("process-token", "sess-1")
+            ))
         );
     }
 
