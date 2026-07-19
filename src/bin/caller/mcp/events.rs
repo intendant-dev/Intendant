@@ -630,12 +630,15 @@ pub fn spawn_event_listener(
                             LogLevel::Info,
                             format!("Approval required [{}]: {}", category, command_preview),
                         );
-                        s.pending_approval = Some(PendingApprovalState {
+                        s.pending_approvals.insert(
                             id,
-                            command_preview,
-                            category: category.to_string(),
-                            session_id: session_id.clone(),
-                        });
+                            PendingApprovalState {
+                                id,
+                                command_preview,
+                                category: category.to_string(),
+                                session_id: session_id.clone(),
+                            },
+                        );
                         resource_changed = Some("intendant://pending-approval");
                     }
 
@@ -758,8 +761,10 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::ApprovalResolved { id, ref action, .. } => {
-                        s.pending_approval = None;
-                        if action == "deny" {
+                        s.pending_approvals.remove(&id);
+                        if !s.pending_approvals.is_empty() {
+                            s.set_phase(Phase::WaitingApproval);
+                        } else if action == "deny" {
                             s.set_phase(Phase::Done);
                         } else {
                             s.set_phase(Phase::RunningAgent);
@@ -1622,7 +1627,7 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
     // (presence_*, external_agent, configured_codex_managed_context,
     // log_dir) — re-audit when the replay converter grows a producer; and
     // fields with replayable producers that the hydration applier never
-    // writes (pending_approval, human_question — ApprovalRequired's arm
+    // writes (pending_approvals, human_question — ApprovalRequired's arm
     // writes only phase state, HumanQuestionDetected has no applier arm) —
     // re-audit when the applier grows a write to them.
     let provider_name = s.provider_name.clone();

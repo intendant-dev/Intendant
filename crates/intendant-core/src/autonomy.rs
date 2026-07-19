@@ -8,8 +8,8 @@ use tokio::sync::RwLock;
 pub enum AutonomyLevel {
     /// Ask for every category except file reads; Deny rules still gate.
     Low,
-    /// Default. Apply category rules; default Ask rules cover writes,
-    /// deletes, and destructive actions.
+    /// Default. Apply category rules; arbitrary shell execution inherits
+    /// the strictest rule of every effect the shell can reach.
     #[default]
     Medium,
     /// Auto-approve ordinary Ask rules; Deny rules and hard gates still gate.
@@ -68,15 +68,17 @@ impl ActionCategory {
     pub fn severity(self) -> u8 {
         match self {
             Self::FileRead => 0,
-            Self::CommandExec => 1,
             Self::ToolCall => 1,
             Self::NetworkRequest => 2,
             Self::FileWrite => 3,
             Self::FileDelete => 4,
             Self::Destructive => 5,
-            Self::HumanInput => 6,
-            Self::LiveAudioSpawn => 7,
-            Self::DisplayControl => 8,
+            // A shell can perform every ordinary runtime effect, even when
+            // the best-effort classifier cannot recognize the spelling.
+            Self::CommandExec => 6,
+            Self::HumanInput => 7,
+            Self::LiveAudioSpawn => 8,
+            Self::DisplayControl => 9,
         }
     }
 }
@@ -166,6 +168,14 @@ impl ApprovalRule {
             _ => None,
         }
     }
+
+    fn strictest(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Deny, _) | (_, Self::Deny) => Self::Deny,
+            (Self::Ask, _) | (_, Self::Ask) => Self::Ask,
+            (Self::Auto, Self::Auto) => Self::Auto,
+        }
+    }
 }
 
 /// Category-level approval rules parsed from intendant.toml [approval] section.
@@ -185,10 +195,10 @@ pub struct ApprovalConfig {
     pub destructive: ApprovalRule,
     #[serde(default)]
     pub display_control: ApprovalRule,
-    /// External-agent tool / MCP calls (e.g. Codex invoking Intendant's
-    /// own MCP server tools). Defaults to `Auto` so users can auto-allow
-    /// these without going Full autonomy.
-    #[serde(default = "default_auto")]
+    /// Controller-dispatched and external-agent tool / MCP calls. Defaults
+    /// to `Ask`: external MCP servers are an untrusted instruction/data
+    /// boundary, so Medium autonomy must not silently cross it.
+    #[serde(default)]
     pub tool_call: ApprovalRule,
 }
 
@@ -206,12 +216,34 @@ impl Default for ApprovalConfig {
             network: ApprovalRule::Auto,
             destructive: ApprovalRule::Ask,
             display_control: ApprovalRule::Ask,
-            tool_call: ApprovalRule::Auto,
+            tool_call: ApprovalRule::Ask,
         }
     }
 }
 
 impl ApprovalConfig {
+    /// Effective rule for arbitrary shell execution.
+    ///
+    /// Shell syntax is an open-ended capability: variable indirection,
+    /// command substitution, interpreters, and newly installed binaries make
+    /// it impossible for substring classification to prove which effects a
+    /// command can reach. Govern the capability by the strictest configured
+    /// rule for its reachable effects instead. The classifier can still add
+    /// useful labels, but an unrecognized spelling cannot weaken policy.
+    fn shell_rule(&self) -> ApprovalRule {
+        [
+            self.command_exec,
+            self.file_read,
+            self.file_write,
+            self.file_delete,
+            self.network,
+            self.destructive,
+            self.display_control,
+        ]
+        .into_iter()
+        .fold(ApprovalRule::Auto, ApprovalRule::strictest)
+    }
+
     /// Set the rule for a category by its snake-case name (the
     /// `ApprovalConfig` field name / `ActionCategory` Display form).
     /// Categories that are always "ask" (`human_input`, `live_audio_spawn`)
@@ -237,7 +269,7 @@ impl ApprovalConfig {
             ActionCategory::FileRead => self.file_read,
             ActionCategory::FileWrite => self.file_write,
             ActionCategory::FileDelete => self.file_delete,
-            ActionCategory::CommandExec => self.command_exec,
+            ActionCategory::CommandExec => self.shell_rule(),
             ActionCategory::NetworkRequest => self.network,
             ActionCategory::Destructive => self.destructive,
             ActionCategory::HumanInput => ApprovalRule::Ask, // always ask
@@ -288,49 +320,15 @@ impl AutonomyState {
         }
     }
 
-    /// Generate a dedup key for a command. Strips nonce and display params
-    /// so retries of the same command with different display/nonce are recognized.
+    /// Generate a dedup key for an action.
+    ///
+    /// Keep the source byte-exact. Display selectors and `$NONCE[...]`
+    /// references affect what a command targets, and trying to erase them
+    /// without a complete shell parser lets executable syntax hide inside the
+    /// ignored span. Structured runtime call nonces are removed earlier by
+    /// [`batch_dedup_source`], where they are data rather than shell syntax.
     pub fn command_dedup_key(command: &str) -> String {
-        let normalized = command.replace(char::is_whitespace, " ");
-        let bytes = normalized.as_bytes();
-        let mut key = String::with_capacity(normalized.len());
-        let mut skip_next = false;
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b' ' {
-                key.push(' ');
-                i += 1;
-                continue;
-            }
-
-            let start = i;
-            while i < bytes.len() && bytes[i] != b' ' {
-                i += 1;
-            }
-            let part = &normalized[start..i];
-
-            if skip_next {
-                skip_next = false;
-                continue;
-            }
-            if part == "--display" || part == "display:" {
-                skip_next = true;
-                continue;
-            }
-            if part.starts_with("--display=") || part.starts_with("display:") {
-                continue;
-            }
-            key.push_str(part);
-        }
-        // Remove nonce references
-        while let Some(start) = key.find("$NONCE[") {
-            if let Some(end) = key[start..].find(']') {
-                key.replace_range(start..start + end + 1, "NONCE");
-            } else {
-                break;
-            }
-        }
-        key
+        command.to_owned()
     }
 
     /// Check if this action signature was already approved in this session.
@@ -386,13 +384,12 @@ impl AutonomyState {
                 // Apply global autonomy level
                 match self.level {
                     AutonomyLevel::Medium => {
-                        // Ask for writes, deletes, destructive, network.
-                        // ToolCall is here too, but its default rule is
-                        // Auto — this arm is reached only under an
-                        // explicit `tool_call = "ask"`.
+                        // Ask for shell execution and Ask-ruled effects,
+                        // including controller/external-agent tool calls.
                         matches!(
                             category,
-                            ActionCategory::FileWrite
+                            ActionCategory::CommandExec
+                                | ActionCategory::FileWrite
                                 | ActionCategory::FileDelete
                                 | ActionCategory::Destructive
                                 | ActionCategory::NetworkRequest
@@ -455,10 +452,10 @@ impl AutonomyState {
     /// - an explicit `Deny` rule refuses at every level, matching the
     ///   runtime batch consult (where a Deny rule is absolute);
     /// - otherwise [`Self::needs_approval`] for [`ActionCategory::ToolCall`]
-    ///   decides: Low always prompts, the default `Auto` rule dispatches
-    ///   without a prompt at Medium/High (orchestration and MCP stay usable
-    ///   at default autonomy), an explicit `Ask` rule prompts at Medium,
-    ///   and Full never asks.
+    ///   decides: Low always prompts, the default `Ask` rule prompts at
+    ///   Medium, High auto-approves ordinary Ask rules, and Full never asks.
+    ///   Users who deliberately trust their configured servers can opt into
+    ///   `tool_call = "auto"`.
     pub fn controller_tool_decision(&self) -> ControllerToolDecision {
         let rule = self.rules.rule_for(ActionCategory::ToolCall);
         if rule == ApprovalRule::Deny {
@@ -794,6 +791,19 @@ pub fn classify_batch(json_str: &str) -> Vec<(usize, Vec<ActionCategory>)> {
 mod tests {
     use super::*;
 
+    fn all_shell_rules_auto() -> ApprovalConfig {
+        ApprovalConfig {
+            file_read: ApprovalRule::Auto,
+            file_write: ApprovalRule::Auto,
+            file_delete: ApprovalRule::Auto,
+            command_exec: ApprovalRule::Auto,
+            network: ApprovalRule::Auto,
+            destructive: ApprovalRule::Auto,
+            display_control: ApprovalRule::Auto,
+            tool_call: ApprovalRule::Auto,
+        }
+    }
+
     #[test]
     fn autonomy_level_display() {
         assert_eq!(AutonomyLevel::Low.to_string(), "Low");
@@ -832,7 +842,51 @@ mod tests {
         assert_eq!(config.command_exec, ApprovalRule::Auto);
         assert_eq!(config.network, ApprovalRule::Auto);
         assert_eq!(config.destructive, ApprovalRule::Ask);
-        assert_eq!(config.tool_call, ApprovalRule::Auto);
+        assert_eq!(config.tool_call, ApprovalRule::Ask);
+        // The configured command-only field is Auto, but arbitrary shell
+        // execution inherits the stricter reachable-effect defaults.
+        assert_eq!(
+            config.rule_for(ActionCategory::CommandExec),
+            ApprovalRule::Ask
+        );
+    }
+
+    #[test]
+    fn shell_rule_is_the_strictest_reachable_rule() {
+        let reachable = [
+            "file_read",
+            "file_write",
+            "file_delete",
+            "command_exec",
+            "network",
+            "destructive",
+            "display_control",
+        ];
+
+        for category in reachable {
+            let mut rules = all_shell_rules_auto();
+            assert!(rules.set_rule_by_name(category, ApprovalRule::Ask));
+            assert_eq!(
+                rules.rule_for(ActionCategory::CommandExec),
+                ApprovalRule::Ask,
+                "{category} = ask must govern shell execution"
+            );
+
+            assert!(rules.set_rule_by_name(category, ApprovalRule::Deny));
+            assert_eq!(
+                rules.rule_for(ActionCategory::CommandExec),
+                ApprovalRule::Deny,
+                "{category} = deny must govern shell execution"
+            );
+        }
+
+        let mut rules = all_shell_rules_auto();
+        rules.tool_call = ApprovalRule::Deny;
+        assert_eq!(
+            rules.rule_for(ActionCategory::CommandExec),
+            ApprovalRule::Auto,
+            "controller tool policy is not reachable through the runtime shell"
+        );
     }
 
     #[test]
@@ -849,6 +903,7 @@ destructive = "deny"
         assert_eq!(config.file_read, ApprovalRule::Auto);
         assert_eq!(config.file_write, ApprovalRule::Deny);
         assert_eq!(config.command_exec, ApprovalRule::Ask);
+        assert_eq!(config.tool_call, ApprovalRule::Ask);
     }
 
     #[test]
@@ -893,10 +948,10 @@ destructive = "deny"
     }
 
     #[test]
-    fn medium_autonomy_asks_for_writes_and_destructive() {
+    fn medium_autonomy_asks_for_shell_writes_and_destructive() {
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
         assert!(!state.needs_approval(ActionCategory::FileRead));
-        assert!(!state.needs_approval(ActionCategory::CommandExec));
+        assert!(state.needs_approval(ActionCategory::CommandExec));
         assert!(!state.needs_approval(ActionCategory::NetworkRequest));
         assert!(state.needs_approval(ActionCategory::FileWrite));
         assert!(state.needs_approval(ActionCategory::FileDelete));
@@ -932,25 +987,32 @@ destructive = "deny"
     }
 
     #[test]
-    fn command_dedup_key_strips_display_params() {
-        assert_eq!(
+    fn command_dedup_key_keeps_effectful_targets_exact() {
+        assert_ne!(
             AutonomyState::command_dedup_key("xdotool --display=1 key Return"),
             AutonomyState::command_dedup_key("xdotool --display=99 key Return")
         );
-        assert_eq!(
+        assert_ne!(
             AutonomyState::command_dedup_key("xdotool display:1 key Return"),
             AutonomyState::command_dedup_key("xdotool display:99 key Return")
+        );
+        assert_ne!(
+            AutonomyState::command_dedup_key("kill $NONCE[1]"),
+            AutonomyState::command_dedup_key("kill $NONCE[2]")
         );
     }
 
     #[test]
-    fn approved_command_dedups_display_param_variants() {
+    fn dedup_never_erases_executable_shell_syntax() {
         let mut state = AutonomyState::default();
-        state.record_approved_command(None, "xdotool --display=1 key Return");
-        assert!(state.was_command_approved(None, "xdotool --display=99 key Return"));
+        state.record_approved_command(None, "echo $NONCE[$(touch /tmp/approved)]");
+        assert!(!state.was_command_approved(None, "echo $NONCE[$(touch /tmp/changed)]"));
 
-        state.record_approved_command(None, "xdotool display:1 key Escape");
-        assert!(state.was_command_approved(None, "xdotool display:99 key Escape"));
+        state.record_approved_command(None, "xdotool --display=$(printf 1) key Return");
+        assert!(!state.was_command_approved(None, "xdotool --display=$(printf 2) key Return"));
+
+        state.record_approved_command(None, "printf 'one two'");
+        assert!(!state.was_command_approved(None, "printf 'one\ttwo'"));
     }
 
     #[test]
@@ -1025,15 +1087,15 @@ destructive = "deny"
 
     #[test]
     fn controller_tool_decision_honors_rules_and_levels() {
-        // Default (Medium + tool_call = auto): dispatch without prompting,
-        // so MCP and orchestration stay usable at default autonomy.
+        // The shipped Medium default prompts before crossing a controller
+        // or external-agent tool boundary.
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
         assert_eq!(
             state.controller_tool_decision(),
-            ControllerToolDecision::AutoApprove
+            ControllerToolDecision::Ask
         );
 
-        // Low always prompts.
+        // Low also prompts.
         let state = AutonomyState::new(AutonomyLevel::Low, ApprovalConfig::default());
         assert_eq!(
             state.controller_tool_decision(),
@@ -1047,15 +1109,17 @@ destructive = "deny"
             ControllerToolDecision::AutoApprove
         );
 
-        // An explicit ask rule prompts at Medium, not at High (High
-        // auto-approves ordinary Ask rules).
+        // Users can deliberately opt into auto dispatch at Medium.
         let mut rules = ApprovalConfig::default();
-        rules.tool_call = ApprovalRule::Ask;
+        rules.tool_call = ApprovalRule::Auto;
         let state = AutonomyState::new(AutonomyLevel::Medium, rules.clone());
         assert_eq!(
             state.controller_tool_decision(),
-            ControllerToolDecision::Ask
+            ControllerToolDecision::AutoApprove
         );
+
+        // The default Ask rule is auto-approved at High.
+        rules.tool_call = ApprovalRule::Ask;
         let state = AutonomyState::new(AutonomyLevel::High, rules);
         assert_eq!(
             state.controller_tool_decision(),
@@ -1142,15 +1206,15 @@ destructive = "deny"
     }
 
     #[test]
-    fn medium_asks_for_tool_call_only_under_explicit_ask_rule() {
-        // Default Auto: no prompt at Medium.
+    fn medium_asks_for_tool_call_by_default_and_auto_is_explicit() {
+        // Default Ask: prompt at Medium.
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
-        assert!(!state.needs_approval(ActionCategory::ToolCall));
-        // Explicit ask rule: prompt at Medium.
-        let mut rules = ApprovalConfig::default();
-        rules.tool_call = ApprovalRule::Ask;
-        let state = AutonomyState::new(AutonomyLevel::Medium, rules);
         assert!(state.needs_approval(ActionCategory::ToolCall));
+        // Explicit auto rule: no prompt at Medium.
+        let mut rules = ApprovalConfig::default();
+        rules.tool_call = ApprovalRule::Auto;
+        let state = AutonomyState::new(AutonomyLevel::Medium, rules);
+        assert!(!state.needs_approval(ActionCategory::ToolCall));
     }
 
     #[test]
@@ -1172,6 +1236,20 @@ destructive = "deny"
         let cats = classify_command(&cmd);
         assert!(cats.contains(&ActionCategory::CommandExec));
         assert!(!cats.contains(&ActionCategory::Destructive));
+    }
+
+    #[test]
+    fn unrecognized_shell_effect_cannot_downgrade_default_policy() {
+        let cmd: serde_json::Value = serde_json::json!({
+            "function": "execAsAgent",
+            "nonce": 1,
+            "command": "python -c \"__import__('os').unlink('/tmp/x')\""
+        });
+        let cats = classify_command(&cmd);
+        assert_eq!(cats, vec![ActionCategory::CommandExec]);
+
+        let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
+        assert!(state.needs_approval(ActionCategory::CommandExec));
     }
 
     #[test]
@@ -1342,17 +1420,18 @@ destructive = "deny"
 
     #[test]
     fn severity_ordering() {
-        // Destructive > FileDelete > FileWrite > NetworkRequest > CommandExec > FileRead
+        // Arbitrary shell execution outranks every ordinary effect because
+        // the shell can reach all of them without a recognizable spelling.
+        assert!(ActionCategory::CommandExec.severity() > ActionCategory::Destructive.severity());
         assert!(ActionCategory::Destructive.severity() > ActionCategory::FileDelete.severity());
         assert!(ActionCategory::FileDelete.severity() > ActionCategory::FileWrite.severity());
         assert!(ActionCategory::FileWrite.severity() > ActionCategory::NetworkRequest.severity());
-        assert!(ActionCategory::NetworkRequest.severity() > ActionCategory::CommandExec.severity());
-        assert!(ActionCategory::CommandExec.severity() > ActionCategory::FileRead.severity());
+        assert!(ActionCategory::NetworkRequest.severity() > ActionCategory::FileRead.severity());
     }
 
     #[test]
     fn human_input_highest_severity() {
-        assert!(ActionCategory::HumanInput.severity() > ActionCategory::Destructive.severity());
+        assert!(ActionCategory::HumanInput.severity() > ActionCategory::CommandExec.severity());
     }
 
     #[test]
@@ -1523,11 +1602,17 @@ destructive = "deny"
     }
 
     #[test]
-    fn external_approval_tool_call_auto_approves() {
-        // ToolCall honors an explicit Auto rule (the default) without Full
-        // autonomy, so Intendant's own MCP tools can be auto-allowed.
+    fn external_approval_tool_call_asks_by_default_and_honors_explicit_auto() {
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
-        assert_eq!(state.rules.tool_call, ApprovalRule::Auto);
+        assert_eq!(state.rules.tool_call, ApprovalRule::Ask);
+        assert_eq!(
+            state.external_approval_decision(ActionCategory::ToolCall),
+            ExternalApprovalDecision::Ask
+        );
+
+        let mut rules = ApprovalConfig::default();
+        rules.tool_call = ApprovalRule::Auto;
+        let state = AutonomyState::new(AutonomyLevel::Medium, rules);
         assert_eq!(
             state.external_approval_decision(ActionCategory::ToolCall),
             ExternalApprovalDecision::AutoApprove

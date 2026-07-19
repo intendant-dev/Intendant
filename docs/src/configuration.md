@@ -60,7 +60,7 @@ for the headless `tests/e2e/` suite and demos) and requires
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INTENDANT_ENV_PASSTHROUGH` | unset | Comma-separated exact env-var names (case-insensitive) added to a supervised external CLI's cleared environment allowlist and exempted from the controller→runtime ambient-credential scrub. Provider API keys never pass. Native runtime exec/PTY shells apply a second scrub that currently does **not** honor this override, so classified ambient credentials such as `SSH_AUTH_SOCK` remain unavailable there; ordinary non-classified variables already inherit without naming them. |
+| `INTENDANT_ENV_PASSTHROUGH` | unset | Comma-separated exact env-var names (case-insensitive) added to the native runtime and supervised external CLI cleared-environment allowlists. Unknown variables do not otherwise inherit. Provider API keys never pass. Native runtime exec/PTY shells apply a second credential scrub that currently does **not** honor this override, so classified ambient credentials such as `SSH_AUTH_SOCK` remain unavailable there; named ordinary build variables do reach those shells. Treat every entry as an explicit grant of that variable's value to model-driven code. |
 
 ### Model and behavior tuning
 
@@ -201,6 +201,15 @@ Per-category approval rules. Each value is `auto` (run without asking), `ask`
 | `network` | rule | `auto` | NetworkRequest |
 | `destructive` | rule | `ask` | Destructive |
 | `display_control` | rule | `ask` | DisplayControl |
+| `tool_call` | rule | `ask` | ToolCall (outbound MCP, skills/orchestration, and external-agent tool/MCP permission requests) |
+
+Arbitrary `CommandExec` is governed by the strictest configured rule among
+`command_exec` and every effect a shell can reach: `file_read`, `file_write`,
+`file_delete`, `network`, `destructive`, and `display_control` (`deny` >
+`ask` > `auto`). Consequently the default effective shell rule is `ask` even
+though the `command_exec` field itself defaults to `auto`. This composition is
+deliberate: shell syntax cannot be classified completely, so effect rules must
+not be bypassable with indirection or a different executable spelling.
 
 The `HumanInput` and `LiveAudioSpawn` categories always require a human and are
 not configurable here.
@@ -988,6 +997,7 @@ command_exec = "auto"
 network = "auto"
 destructive = "ask"
 display_control = "ask"
+tool_call = "ask"
 
 [presence]
 enabled = true
@@ -1103,16 +1113,19 @@ Approval is decided by a three-layer model (full UI details in
 
 1. **Global autonomy** — `--autonomy <low|medium|high|full>` (defaults to
    `medium`). `low` asks for everything except file reads; `full` keeps the
-   human entirely out of the loop (auto-approve) except for `HumanInput`.
+   human entirely out of the loop (auto-approve) except for `HumanInput` and
+   `LiveAudioSpawn`.
 2. **Category rules** — the `[approval]` section above (`auto`/`ask`/`deny`) per
-   category.
+   category. Arbitrary shell execution inherits the strictest rule of every
+   effect it can reach.
 3. **Per-action approval** — `y` / `s` / `a` / `n` (approve / skip / approve-all
    / deny) prompts in any frontend.
 
-The nine action categories are: `FileRead`, `FileWrite`, `FileDelete`,
+The ten action categories are: `FileRead`, `FileWrite`, `FileDelete`,
 `CommandExec`, `NetworkRequest`, `Destructive`, `HumanInput`, `LiveAudioSpawn`,
-`DisplayControl`. `DisplayControl` uses a session-grant model — approve once and
-subsequent display actions skip the prompt (revocable in-frontend).
+`DisplayControl`, `ToolCall`. `DisplayControl` uses a session-grant model —
+approve once and subsequent display actions skip the prompt (revocable
+in-frontend).
 `HumanInput` and `LiveAudioSpawn` always require a human regardless of autonomy
 level or category rule.
 

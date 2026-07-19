@@ -713,6 +713,17 @@ pub(crate) async fn create_external_agent(
     let mcp_session_id = mcp_session_id.or_else(|| session_log_id(session_log));
     let mcp_auth_token =
         web_port.map(|_| crate::web_gateway::loopback_mcp_auth_token().to_string());
+    // Daemon-side MCP status ground truth: the gate reports this session's
+    // first `/mcp` serves (initialize, tools/list) into its timeline the
+    // moment they happen — the backend's own MCP status echo only arrives
+    // at turn boundaries. Registered before the spawn below so the
+    // client's very first request is attributable; a respawn re-registers
+    // and reports afresh.
+    if mcp_auth_token.is_some() {
+        if let Some(session_id) = mcp_session_id.as_deref() {
+            crate::web_gateway::register_supervised_mcp_session(session_id, session_log);
+        }
+    }
     // A spawn is the INITIAL fork of another thread exactly while the wrapper
     // still resumes the parent id recorded as `forked_from`; once the child's
     // own native id is persisted, resume moves to the child id and the same

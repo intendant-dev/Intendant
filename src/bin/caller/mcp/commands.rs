@@ -105,7 +105,7 @@ pub(crate) async fn start_task_with_state(
     s.session_cached_tokens = 0;
     s.session_cache_creation_tokens = 0;
     s.set_phase(Phase::Thinking);
-    s.pending_approval = None;
+    s.pending_approvals.clear();
     s.human_question = None;
     s.should_quit = false;
     s.next_task_orchestrate = orchestrate;
@@ -155,6 +155,7 @@ pub(crate) async fn handle_control_command_mcp(
             let mut s = state.write().await;
             let outcome = resolve_pending_approval(
                 &mut s,
+                id,
                 ApprovalResponse::Approve,
                 McpToolScope::Unrestricted,
             );
@@ -178,6 +179,7 @@ pub(crate) async fn handle_control_command_mcp(
             let mut s = state.write().await;
             let outcome = resolve_pending_approval(
                 &mut s,
+                id,
                 ApprovalResponse::Deny,
                 McpToolScope::Unrestricted,
             );
@@ -202,23 +204,29 @@ pub(crate) async fn handle_control_command_mcp(
             // structured answers straight to whichever waiter registered
             // this id (question prompts share the approval registry).
             let mut s = state.write().await;
-            resolve_approval(
+            let resolved = resolve_approval(
                 &s.approval_registry,
                 id,
                 ApprovalResponse::Answer { answers },
             );
-            s.set_phase(Phase::RunningAgent);
-            s.push_log(LogLevel::Info, "Question answered by MCP agent".to_string());
-            bus.send(AppEvent::ApprovalResolved {
-                session_id: None,
-                id,
-                action: "answer".to_string(),
-            });
+            if resolved {
+                s.set_phase(Phase::RunningAgent);
+                s.push_log(LogLevel::Info, "Question answered by MCP agent".to_string());
+                bus.send(AppEvent::ApprovalResolved {
+                    session_id: None,
+                    id,
+                    action: "answer".to_string(),
+                });
+            }
             emit_control_result(
                 control_tx,
                 "answer_question",
-                true,
-                "answers delivered".to_string(),
+                resolved,
+                if resolved {
+                    "answers delivered".to_string()
+                } else {
+                    format!("question {id} is not pending")
+                },
                 None,
             );
             Some(RESOURCE_APPROVAL_URI)
@@ -239,6 +247,7 @@ pub(crate) async fn handle_control_command_mcp(
             let mut s = state.write().await;
             let outcome = resolve_pending_approval(
                 &mut s,
+                id,
                 ApprovalResponse::Skip,
                 McpToolScope::Unrestricted,
             );
@@ -262,6 +271,7 @@ pub(crate) async fn handle_control_command_mcp(
             let mut s = state.write().await;
             let outcome = resolve_pending_approval(
                 &mut s,
+                id,
                 ApprovalResponse::ApproveAll,
                 McpToolScope::Unrestricted,
             );

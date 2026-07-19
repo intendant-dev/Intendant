@@ -1524,10 +1524,17 @@ impl CcReader {
         }
     }
 
-    /// Surface the injected Intendant MCP server's health from the init
-    /// message. A failed loopback connection was previously invisible: the
-    /// backend simply ran without display/CU tools and nobody could tell
-    /// why from a frontend.
+    /// Surface the injected Intendant MCP server's health as Claude Code
+    /// reports it in the init message — the client-side echo, phrased as
+    /// such. The daemon's gate reports its own serves firsthand and
+    /// immediately (`web_gateway::note_supervised_mcp_serve`); this
+    /// turn-boundary echo is the only authority on client-side
+    /// *registration* — the CLI can accept the transport yet reject the
+    /// served tool list (schema validation), so "connected" is reported
+    /// with the number of Intendant tools it actually registered. A failed
+    /// loopback connection was previously invisible: the backend simply
+    /// ran without display/CU tools and nobody could tell why from a
+    /// frontend.
     fn report_intendant_mcp_status(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         let status = msg
             .get("mcp_servers")
@@ -1545,14 +1552,38 @@ impl CcReader {
         }
         self.last_intendant_mcp_status = Some(status.clone());
         match status.as_str() {
-            "connected" => out.log("info", "Intendant MCP server connected"),
+            "connected" => {
+                // Registration truth: count the Intendant tools the CLI
+                // accepted into its tool set (`mcp__intendant__*` names).
+                // Transport-connected with zero registered tools is the
+                // client-side-rejection signature — the count keeps that
+                // visible.
+                let registered = msg.get("tools").and_then(|t| t.as_array()).map(|tools| {
+                    tools
+                        .iter()
+                        .filter(|tool| {
+                            tool.as_str()
+                                .is_some_and(|name| name.starts_with("mcp__intendant__"))
+                        })
+                        .count()
+                });
+                out.log(
+                    "info",
+                    match registered {
+                        Some(count) => format!(
+                            "Claude Code reports MCP: connected — {count} tools registered"
+                        ),
+                        None => "Claude Code reports MCP: connected".to_string(),
+                    },
+                );
+            }
             "missing" => out.log(
                 "warn",
-                "Intendant MCP server missing from Claude Code's MCP config — display/CU tools unavailable",
+                "Claude Code reports MCP: Intendant server missing from its MCP config — display/CU tools unavailable",
             ),
             other => out.log(
                 "warn",
-                format!("Intendant MCP server status: {other} — display/CU tools may be unavailable"),
+                format!("Claude Code reports MCP: {other} — display/CU tools may be unavailable"),
             ),
         }
     }
@@ -2805,7 +2836,9 @@ pub struct ClaudeCodeAgent {
     /// an idle goal update never burns a turn of its own (a mid-turn update
     /// is written immediately instead — the running turn absorbs it).
     pending_goal_notice: Option<String>,
-    /// Loopback MCP auth token from the daemon, baked into the injected URL.
+    /// Loopback MCP auth token from the daemon. The ctl URL carries it in
+    /// the child environment; Claude's argv contains only an environment
+    /// placeholder for the equivalent Authorization header.
     mcp_auth_token: Option<String>,
     /// Intendant session id scoping the injected MCP URL and ctl env.
     mcp_session_id: Option<String>,
@@ -2867,10 +2900,10 @@ impl ClaudeCodeAgent {
         self.max_budget_usd.filter(|b| !(b.is_finite() && *b > 0.0))
     }
 
-    /// The scoped loopback MCP URL injected into `--mcp-config` and the ctl
-    /// env. Claude Code has no managed-context mode, so the server treats the
-    /// session as vanilla; `tool_profile=core` keeps the advertised tool list
-    /// to the bootstrap set (full surface stays callable via `ctl tools`).
+    /// The scoped loopback MCP URL injected into the ctl env. Claude Code has
+    /// no managed-context mode, so the server treats the session as vanilla;
+    /// `tool_profile=core` keeps the advertised tool list to the bootstrap set
+    /// (full surface stays callable via `ctl tools`).
     fn intendant_mcp_url(&self, port: u16) -> String {
         super::intendant_bootstrap_mcp_url(
             port,
@@ -2878,6 +2911,39 @@ impl ClaudeCodeAgent {
             None,
             self.mcp_auth_token.as_deref(),
         )
+    }
+
+    /// Token-free endpoint placed in the inline MCP JSON on argv.
+    fn intendant_mcp_config_url(&self, port: u16) -> String {
+        super::intendant_bootstrap_mcp_url(port, self.mcp_session_id.as_deref(), None, None)
+    }
+
+    /// Inline Claude MCP config whose Authorization header expands from the
+    /// explicitly injected child environment. The serialized argv contains
+    /// `${INTENDANT_MCP_BEARER_TOKEN}`, never the credential value.
+    fn intendant_mcp_config(&self, port: u16) -> serde_json::Value {
+        let mut server = serde_json::json!({
+            "type": "http",
+            "url": self.intendant_mcp_config_url(port),
+        });
+        if super::intendant_mcp_bearer_token(
+            self.mcp_auth_token.as_deref(),
+            self.mcp_session_id.as_deref(),
+        )
+        .is_some()
+        {
+            server["headers"] = serde_json::json!({
+                "Authorization": format!(
+                    "Bearer ${{{}}}",
+                    super::INTENDANT_MCP_BEARER_TOKEN_ENV
+                )
+            });
+        }
+        serde_json::json!({
+            "mcpServers": {
+                "intendant": server
+            }
+        })
     }
 
     async fn write_line(&self, line: &str) -> Result<(), CallerError> {
@@ -3166,22 +3232,15 @@ impl ExternalAgent for ClaudeCodeAgent {
             args.push(self.allowed_tools.join(","));
         }
 
-        // MCP config for Intendant display/CU tools: the scoped bootstrap URL
-        // (session id + tool_profile=core + loopback auth token), same
-        // treatment as managed Codex.
+        // MCP config for Intendant display/CU tools: argv carries the scoped,
+        // token-free bootstrap URL and a header placeholder. The
+        // session-derived bearer itself is injected into the child env after
+        // the clear below, so local process listings cannot scrape it.
         let web_port = config.web_port.or(self.web_port);
         self.web_port = web_port;
         if let Some(port) = web_port {
-            let mcp_config = serde_json::json!({
-                "mcpServers": {
-                    "intendant": {
-                        "type": "http",
-                        "url": self.intendant_mcp_url(port)
-                    }
-                }
-            });
             args.push("--mcp-config".into());
-            args.push(mcp_config.to_string());
+            args.push(self.intendant_mcp_config(port).to_string());
         }
 
         // Spawn the process
@@ -3203,6 +3262,7 @@ impl ExternalAgent for ClaudeCodeAgent {
                 &mut command,
                 &self.intendant_mcp_url(port),
                 self.mcp_session_id.as_deref(),
+                self.mcp_auth_token.as_deref(),
             );
         }
         // An active oauth:claude-code lease materializes a synthesized
@@ -4925,7 +4985,7 @@ mod tests {
         let out = reader.process_line(init_failed);
         assert!(out.events.iter().any(|e| matches!(
             e,
-            AgentEvent::Log { level, message } if level == "warn" && message.contains("status: failed")
+            AgentEvent::Log { level, message } if level == "warn" && message.contains("Claude Code reports MCP: failed")
         )));
         // Same status again: quiet.
         let out = reader.process_line(init_failed);
@@ -4933,13 +4993,32 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, AgentEvent::Log { message, .. } if message.contains("failed"))));
-        // Recovery is reported.
+        // Recovery is reported, with the registered-tool count (zero here:
+        // the init lists no `mcp__intendant__*` tools — the client-side
+        // rejection signature stays visible even though the transport
+        // connected).
         let out = reader.process_line(
             r#"{"type":"system","subtype":"init","model":"m","tools":[],"mcp_servers":[{"name":"intendant","status":"connected"}],"session_id":"s1"}"#,
         );
         assert!(out.events.iter().any(|e| matches!(
             e,
-            AgentEvent::Log { level, message } if level == "info" && message.contains("connected")
+            AgentEvent::Log { level, message } if level == "info"
+                && message.contains("Claude Code reports MCP: connected — 0 tools registered")
+        )));
+    }
+
+    #[test]
+    fn reader_reports_intendant_registered_tool_count() {
+        let mut reader = test_reader();
+        // Only `mcp__intendant__*` names count as registered Intendant
+        // tools; built-ins and other MCP servers' tools do not.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"init","model":"m","tools":["Bash","mcp__intendant__take_screenshot","mcp__intendant__get_status","mcp__other__x"],"mcp_servers":[{"name":"intendant","status":"connected"}],"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message } if level == "info"
+                && message.contains("Claude Code reports MCP: connected — 2 tools registered")
         )));
     }
 
@@ -6453,6 +6532,35 @@ mod tests {
             format!(
                 "http://localhost:8765/mcp?session_id=session%20with%20spaces&tool_profile=core&mcp_token={expected_token}"
             )
+        );
+    }
+
+    #[test]
+    fn inline_mcp_config_uses_env_placeholder_not_bearer_value() {
+        let mut agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "default".into(),
+            None,
+            vec![],
+            Some(8765),
+        );
+        agent.mcp_session_id = Some("session-a".to_string());
+        agent.mcp_auth_token = Some("raw-process-secret".to_string());
+        let derived =
+            crate::web_gateway::session_scoped_mcp_token("raw-process-secret", "session-a");
+
+        let config = agent.intendant_mcp_config(8765);
+        let argv_value = config.to_string();
+        assert!(!argv_value.contains("raw-process-secret"));
+        assert!(!argv_value.contains(&derived));
+        assert_eq!(
+            config["mcpServers"]["intendant"]["url"],
+            "http://localhost:8765/mcp?session_id=session-a&tool_profile=core"
+        );
+        assert_eq!(
+            config["mcpServers"]["intendant"]["headers"]["Authorization"],
+            "Bearer ${INTENDANT_MCP_BEARER_TOKEN}"
         );
     }
 

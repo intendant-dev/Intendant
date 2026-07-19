@@ -21,7 +21,7 @@ Set with `--autonomy`, from the dashboard, or with
 | Level | Behavior |
 |-------|----------|
 | Low | Ask before every category except `FileRead` |
-| Medium (default) | Apply category rules; defaults ask for writes, deletes, and destructive actions (`network` defaults to auto) |
+| Medium (default) | Apply category rules; defaults ask for arbitrary shell execution, writes, deletes, and destructive actions (`network` defaults to auto for the structured `browse` tool) |
 | High | Auto-approve ordinary `ask` rules; native policy denials and hard gates remain |
 | Full | Native runtime and controller actions auto-approve except policy denials and the `HumanInput` / `LiveAudioSpawn` hard gates; see the external-agent caveat below |
 
@@ -38,6 +38,14 @@ their rule is `auto`, while High and Full auto-approve ordinary `ask` rules.
 None of these rules bypasses the human-input/live-audio hard gates or the
 separate user-display grant. External-agent requests take a separate path,
 described below.
+
+`CommandExec` is capability-composed rather than parser-composed. Its effective
+rule is the strictest of `command_exec`, `file_read`, `file_write`,
+`file_delete`, `network`, `destructive`, and `display_control` (`deny` >
+`ask` > `auto`). A shell can reach all of those effects through interpreters,
+subshells, variable expansion, or binaries the classifier has never seen, so
+setting only `command_exec = "auto"` cannot weaken a stricter effect rule. To
+auto-allow arbitrary shell execution, every reachable category must permit it.
 
 ## Layer 3 — per-action approval
 
@@ -115,10 +123,11 @@ The precise logic (`AutonomyState::needs_approval`) has nuances worth knowing:
   explicit-deny check.
 - **Low** — asks for everything except `FileRead` (a `deny` rule still blocks).
 - **Medium / High** — start from the per-category rule. For an `ask` rule,
-  Medium asks only for `FileWrite` / `FileDelete` / `Destructive` /
-  `NetworkRequest` / `ToolCall` (the last only under an explicit
-  `tool_call = "ask"` — its default rule is `auto`); High asks for none of
-  them.
+  Medium asks only for `CommandExec` / `FileWrite` / `FileDelete` /
+  `Destructive` / `NetworkRequest` / `ToolCall`; High asks for none of them.
+  `ToolCall` defaults to `ask`, so the shipped Medium posture prompts before
+  outbound MCP, skill invocation, orchestration spawns/checkpoints, and
+  external-agent MCP permission requests.
 
 ## Approval dedup (what "remembered" means)
 
@@ -133,8 +142,11 @@ not re-prompt. Two properties bound that memory:
   `writeFile`/`editFile` it includes a digest of the full command (minus the
   per-call `nonce`), so approving one edit of a path never covers different
   content aimed at the same path; controller-dispatched tool calls digest
-  their full arguments the same way. Exec commands keep exact-string matching
-  (with the display/nonce normalization that recognizes benign retries).
+  their full arguments the same way. Exec commands keep byte-exact string
+  matching. In particular, display selectors and `$NONCE[...]` process
+  references remain part of the identity because they change the target and
+  may contain executable shell syntax. Only the structured runtime call's
+  top-level JSON `nonce` is removed before hashing.
 
 ## Controller-dispatched tools
 
@@ -160,21 +172,23 @@ outcomes write the corresponding session-log rows (`waiting`, `approved`,
 | `shared_view` | dedicated `user_display_granted` opt-in for user-display show/capture |
 | `spawn_live_audio` | dedicated always-ask consent gate (never auto-approved) |
 
-Semantics at the gate: the default `tool_call = "auto"` dispatches without a
-prompt at Medium/High (orchestration and MCP stay usable at default
-autonomy) while still emitting `AutoApproved`; **Low always prompts**; an
-explicit `ask` rule prompts at Medium; `deny` refuses the call at every
+Semantics at the gate: the default `tool_call = "ask"` prompts at Medium and
+Low; High/Full auto-approve it. A user who deliberately trusts the configured
+tool boundary can set `tool_call = "auto"` to dispatch without a prompt at
+Medium (with an `AutoApproved` audit event). `deny` refuses the call at every
 level — absolute, like a runtime-batch deny rule — returning an error tool
 result with no dispatch. At the prompt, skip refuses just that call and the
 session continues; deny stops the task, exactly like a runtime-command deny.
-Headless with no approver surface fails closed. Calls are gated and
-dispatched strictly in order, so a later call never runs while an earlier
-prompt in the batch is unresolved.
+Headless with no approver surface fails closed. Calls are gated and dispatched
+strictly in order, so a later call never runs while an earlier prompt in the
+batch is unresolved.
 
 External-agent approval requests use the deliberately separate
 `external_approval_decision` path. Below Full, an explicit `deny` rejects,
-`ToolCall` plus an explicit/default `auto` auto-approves, and every other
-request is shown to the human even when the native category default is `auto`.
+`ToolCall` plus an explicit `auto` auto-approves, and every other request is
+shown to the human even when the native category default is `auto`. Because
+`ToolCall` defaults to `ask`, external-agent MCP/tool permission requests are
+shown at Medium unless the owner opts into auto.
 At Full, the current implementation returns `AutoApprove` **before** reading
 the category rule, so an external approval request bypasses an explicit
 `deny`; the `external_approval_full_overrides_deny` test codifies that
@@ -209,12 +223,15 @@ binary paths like `/bin/rm`, and `find … -delete`/`-exec rm`), network
 tools, and file writes (redirects, `tee`, `mv`, `cp`). A `sudo` prefix is
 flagged Destructive *and* the command after `sudo` is classified too. When
 multiple categories apply, the highest-severity one drives the prompt label.
+Every shell command also carries `CommandExec`, whose effective policy is the
+strictest reachable rule described above.
 
-The shell classifier is **best-effort keyword matching for approval
-prompting — UX, not a security boundary**: string matching cannot see
-through variable indirection, subshells, or novel spellings. The runtime's
-filesystem/exec sandbox is what actually confines commands; an evasion
-dodges the prompt, never the sandbox.
+The shell substring classifier is **display enrichment, not an authorization
+parser**: it cannot see through variable indirection, subshells, interpreters,
+or novel spellings. Missing one of those spellings no longer downgrades the
+decision because `CommandExec` governs the whole shell capability. The
+runtime's filesystem/exec sandbox remains an independent hard boundary on
+where an approved command can act.
 
 `ToolCall` is not produced by ordinary runtime `classify_command`; it governs
 [controller-dispatched tools](#controller-dispatched-tools) and

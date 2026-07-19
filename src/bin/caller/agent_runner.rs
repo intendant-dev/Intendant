@@ -9,6 +9,7 @@ use tokio::time::{timeout, Duration};
 
 /// Maximum bytes to read from agent stdout/stderr (64 MB).
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const RUNTIME_PROTOCOL_TOKEN_FIELD: &str = "runtime_protocol_token";
 
 /// Per-batch askHuman answer tokens, keyed by the batch's log dir. The
 /// runtime only accepts a `human_response` file whose first line matches
@@ -111,6 +112,25 @@ fn arm_human_response_token(
     )
 }
 
+/// Mint a per-spawn secret for authenticating the runtime's stdout
+/// protocol. Any model-supplied value is overwritten before the JSON is
+/// written to the runtime's one-shot stdin.
+fn arm_runtime_protocol_token(json_input: &str) -> (Option<String>, Option<String>) {
+    let mut parsed: serde_json::Value = match serde_json::from_str(json_input) {
+        Ok(value) => value,
+        Err(_) => return (None, None),
+    };
+    let Some(map) = parsed.as_object_mut() else {
+        return (None, None);
+    };
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    map.insert(
+        RUNTIME_PROTOCOL_TOKEN_FIELD.to_string(),
+        serde_json::Value::String(token.clone()),
+    );
+    (Some(parsed.to_string()), Some(token))
+}
+
 /// Write an askHuman answer the runtime will accept: the batch token (when
 /// one is armed for `log_dir`) on the first line, then the answer text.
 /// The single writer helper for every frontend answer path.
@@ -207,9 +227,11 @@ const EXTRA_PROVIDER_CREDENTIAL_ENV_VARS: &[&str] = &[
 ];
 
 /// True when `name` names a provider/model-API credential that must not
-/// reach the runtime. `INTENDANT_*` names are the controller→runtime
-/// control channel (the mock-provider e2e rig rides `PROVIDER` +
-/// `INTENDANT_MOCK_*` into children) and are never treated as credentials.
+/// reach model-driven children. This predicate reserves `INTENDANT_*`
+/// because legitimate controller control names may use credential-looking
+/// suffixes; it is not an admission rule. The native runtime's allowlist
+/// default-denies that namespace except for exact catalogued or spawn-injected
+/// controls.
 ///
 /// Classification is done on the ASCII-uppercased name: Windows environment
 /// names are case-insensitive (`%mistral_api_key%` and `%MISTRAL_API_KEY%`
@@ -231,68 +253,165 @@ pub(crate) fn is_provider_credential_env(name: &str) -> bool {
         || name.ends_with("_API_TOKEN")
 }
 
-/// Scrub provider credentials from the runtime child's environment.
+/// Controller variables that may cross into the native runtime by default.
 ///
-/// The controller loads `.env` provider keys into its own process env at
-/// startup, and a spawned child inherits that env wholesale — without this
-/// scrub the sandboxed runtime (and every exec/PTY shell it spawns) holds
-/// the model API keys, violating the founding runtime/controller boundary
-/// ("the runtime never holds API keys"): a model-invoked
-/// `echo $ANTHROPIC_API_KEY` in a PTY shell would exfiltrate the key into
-/// the conversation. This spawn boundary is the single enforcement point;
-/// `exec_as_agent`'s per-shell env_removes remain as defense in depth.
-/// `inherited_names` is the parent-process env view (injected by the caller
-/// so tests stay hermetic).
-fn scrub_provider_credential_env<'a>(
-    cmd: &mut Command,
-    inherited_names: impl IntoIterator<Item = &'a str>,
-) {
-    // The canonical names are removed unconditionally — even when absent
-    // from the inherited env view — so an explicit `.env()` set can never
-    // reintroduce them.
-    for name in crate::provider::PROVIDER_KEY_ENV_VARS
-        .iter()
-        .chain(EXTRA_PROVIDER_CREDENTIAL_ENV_VARS.iter())
-    {
-        cmd.env_remove(name);
+/// This is deliberately narrower than the external-agent allowlist:
+/// provider CLIs need their own config-home and proxy settings, while the
+/// runtime is the untrusted command executor and must not inherit either.
+/// Keep entries to OS/process essentials and non-secret toolchain controls.
+/// `RUSTC_WRAPPER` and `RUSTC` are load-bearing on developer/CI hosts where
+/// the compile governor is installed through those variables.
+const RUNTIME_CHILD_BASE_ENV: &[&str] = &[
+    // System basics (all platforms).
+    "PATH",
+    "HOME",
+    "USER",
+    "USERNAME",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "TERM",
+    "COLORTERM",
+    "TZ",
+    "LANG",
+    "NO_COLOR",
+    "CLICOLOR",
+    "CLICOLOR_FORCE",
+    "FORCE_COLOR",
+    // macOS.
+    "__CF_USER_TEXT_ENCODING",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "SDKROOT",
+    "DEVELOPER_DIR",
+    // Linux/Unix display and desktop session. The Linux spawn path also
+    // refreshes these explicitly through `linux_display_env`.
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "XDG_DATA_DIRS",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+    "DESKTOP_SESSION",
+    // Windows process/DLL/profile discovery.
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "OS",
+    "COMPUTERNAME",
+    "USERDOMAIN",
+    // Common language/build toolchain paths and non-secret controls.
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_JOBS",
+    "CARGO_INCREMENTAL",
+    "CARGO_TERM_COLOR",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "SCCACHE_DIR",
+    "SCCACHE_SERVER_PORT",
+    "SCCACHE_IDLE_TIMEOUT",
+    "SCCACHE_NO_DAEMON",
+    "JAVA_HOME",
+    "MAVEN_HOME",
+    "GRADLE_USER_HOME",
+    "GOPATH",
+    "GOROOT",
+    "GOMODCACHE",
+    "NVM_DIR",
+    "PNPM_HOME",
+    "BUN_INSTALL",
+    "VIRTUAL_ENV",
+    "UV_CACHE_DIR",
+    "CC",
+    "CXX",
+    "AR",
+    "CFLAGS",
+    "CPPFLAGS",
+    "CXXFLAGS",
+    "LDFLAGS",
+    "PKG_CONFIG_PATH",
+    "PKG_CONFIG_LIBDIR",
+    "PKG_CONFIG_SYSROOT_DIR",
+    // Exact controller→runtime path control; all other INTENDANT_* names
+    // default-deny and the spawn site injects its live controls explicitly.
+    "INTENDANT_HOME",
+];
+
+/// Whether a controller env name may be copied into the runtime's cleared
+/// environment. Matching is case-insensitive for Windows parity.
+///
+/// `passthrough` is the deliberate exact-name extension from
+/// `INTENDANT_ENV_PASSTHROUGH`. It can admit otherwise unknown or
+/// credential-like host variables, but provider/model API keys are an
+/// absolute deny even when named.
+fn runtime_child_env_allowed(name: &str, passthrough: &std::collections::HashSet<String>) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if is_provider_credential_env(&upper) {
+        return false;
     }
-    for name in inherited_names {
-        if is_provider_credential_env(name) {
-            cmd.env_remove(name);
-        }
-    }
+    passthrough.contains(&upper)
+        || RUNTIME_CHILD_BASE_ENV.contains(&upper.as_str())
+        || upper.starts_with("LC_")
 }
 
-/// Scrub ambient host credentials — agent sockets, cloud/forge tokens,
-/// credential-store pointers, the D-Bus session bus — from the runtime
-/// child's environment. The provider-key scrub protects the model API keys;
-/// this one removes the *rest* of the launching shell's ambient authority,
-/// which the model-driven shells the runtime spawns must not inherit.
-/// Mirrors the provider scrub's shape: the canonical names are removed
-/// unconditionally, then every inherited name the classifier matches.
+/// The exact inherited pairs admitted by [`runtime_child_env_allowed`].
+fn runtime_child_env_pairs(
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    passthrough: &std::collections::HashSet<String>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    inherited
+        .into_iter()
+        .filter(|(name, _)| {
+            name.to_str()
+                .is_some_and(|name| runtime_child_env_allowed(name, passthrough))
+        })
+        .collect()
+}
+
+/// Reset a native runtime child's environment to the explicit allowlist.
 ///
-/// `passthrough` holds ASCII-uppercased exact names the user deliberately
-/// exempted via `INTENDANT_ENV_PASSTHROUGH` (comma-separated,
-/// case-insensitive). It exempts names from THIS controller→runtime scrub
-/// only; the runtime's exec/PTY shell layer applies its own scrub without
-/// this exemption. Provider credentials are removed by
-/// `scrub_provider_credential_env` regardless.
-fn scrub_ambient_credential_env<'a>(
-    cmd: &mut Command,
-    inherited_names: impl IntoIterator<Item = &'a str>,
+/// Call before the spawn site's deliberate `.env()` injections so the log
+/// root, sandbox grants, user-display grant, and refreshed Linux GUI values
+/// are derived after the clear and cannot be supplied by ambient process
+/// state.
+fn apply_runtime_child_env_policy(command: &mut Command) {
+    let passthrough = intendant_core::env_scrub::env_passthrough_set(
+        std::env::var(intendant_core::env_scrub::ENV_PASSTHROUGH_VAR)
+            .ok()
+            .as_deref(),
+    );
+    apply_runtime_child_env_policy_from(command, std::env::vars_os(), &passthrough);
+}
+
+/// Testable core of [`apply_runtime_child_env_policy`].
+fn apply_runtime_child_env_policy_from(
+    command: &mut Command,
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     passthrough: &std::collections::HashSet<String>,
 ) {
-    for name in intendant_core::env_scrub::AMBIENT_CREDENTIAL_ENV_VARS {
-        if !passthrough.contains(*name) {
-            cmd.env_remove(name);
-        }
-    }
-    for name in inherited_names {
-        if intendant_core::env_scrub::is_ambient_credential_env(name)
-            && !passthrough.contains(&name.to_ascii_uppercase())
-        {
-            cmd.env_remove(name);
-        }
+    command.env_clear();
+    for (name, value) in runtime_child_env_pairs(inherited, passthrough) {
+        command.env(name, value);
     }
 }
 
@@ -324,6 +443,70 @@ fn is_runtime_protocol_line(line: &str) -> bool {
         .is_some()
 }
 
+/// Authenticate and normalize one runtime protocol line, stripping the
+/// internal token before the line can reach result mapping or session logs.
+fn authenticated_runtime_protocol_line(line: &str, expected_token: &str) -> Option<String> {
+    let mut parsed = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
+    if !matches!(
+        parsed.get("type").and_then(|value| value.as_str()),
+        Some("status" | "result")
+    ) || parsed
+        .get("nonce")
+        .and_then(|value| value.as_u64())
+        .is_none()
+        || parsed
+            .get(RUNTIME_PROTOCOL_TOKEN_FIELD)
+            .and_then(|value| value.as_str())
+            != Some(expected_token)
+    {
+        return None;
+    }
+    parsed.as_object_mut()?.remove(RUNTIME_PROTOCOL_TOKEN_FIELD);
+    Some(parsed.to_string())
+}
+
+/// Keep only complete, authenticated protocol records. Runtime stdout is
+/// otherwise untrusted: a model-driven descendant may find a writable
+/// alias for the controller pipe even though its ordinary stdout is a log
+/// file. With no expected token, retain the legacy behavior used only when
+/// the input was not a valid AgentInput object and no token could be armed.
+fn authenticate_runtime_stdout(stdout: Vec<u8>, expected_token: Option<&str>) -> (Vec<u8>, usize) {
+    let Some(expected_token) = expected_token else {
+        return (stdout, 0);
+    };
+
+    let mut authenticated = Vec::with_capacity(stdout.len().min(8192));
+    let mut rejected = 0usize;
+    for raw_line in stdout.split(|byte| *byte == b'\n') {
+        if raw_line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Some(line) = std::str::from_utf8(raw_line)
+            .ok()
+            .and_then(|line| authenticated_runtime_protocol_line(line, expected_token))
+        else {
+            rejected = rejected.saturating_add(1);
+            continue;
+        };
+        authenticated.extend_from_slice(line.as_bytes());
+        authenticated.push(b'\n');
+    }
+    (authenticated, rejected)
+}
+
+fn append_protocol_rejection_note(stderr: &mut Vec<u8>, rejected: usize) {
+    if rejected == 0 {
+        return;
+    }
+    if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+        stderr.push(b'\n');
+    }
+    stderr.extend_from_slice(
+        format!("discarded {rejected} unauthenticated or malformed runtime stdout line(s)")
+            .as_bytes(),
+    );
+}
+
 fn has_parseable_runtime_output(stdout: &[u8]) -> bool {
     String::from_utf8_lossy(stdout)
         .lines()
@@ -332,9 +515,26 @@ fn has_parseable_runtime_output(stdout: &[u8]) -> bool {
 
 fn output_with_exit_status(
     stdout_buf: Vec<u8>,
-    stderr_buf: Vec<u8>,
+    mut stderr_buf: Vec<u8>,
     status: ExitStatus,
+    expected_token: Option<&str>,
 ) -> Result<AgentOutput, CallerError> {
+    let raw_had_output = stdout_buf.iter().any(|byte| !byte.is_ascii_whitespace());
+    let (stdout_buf, rejected) = authenticate_runtime_stdout(stdout_buf, expected_token);
+    append_protocol_rejection_note(&mut stderr_buf, rejected);
+
+    if expected_token.is_some() && raw_had_output && !has_parseable_runtime_output(&stdout_buf) {
+        let stderr = output_buf_into_string(stderr_buf);
+        let detail = if stderr.trim().is_empty() {
+            String::new()
+        } else {
+            format!("; stderr: {}", stderr.trim())
+        };
+        return Err(CallerError::Agent(format!(
+            "sandboxed runtime produced no authenticated protocol output{detail}"
+        )));
+    }
+
     // Failure triage borrows the buffers; the success path then MOVES them
     // into the returned strings (this used to memcpy the full — up to 64 MB —
     // output through `from_utf8_lossy(..).to_string()` on every batch).
@@ -380,15 +580,6 @@ pub async fn run_agent(
     user_display_granted: bool,
     has_ask_human: bool,
 ) -> Result<AgentOutput, CallerError> {
-    // Arm the per-batch askHuman answer token before spawn so frontends'
-    // answers authenticate against a secret the batch's shells never see.
-    let (tokened_input, _token_guard) = if has_ask_human {
-        arm_human_response_token(json_input, log_dir)
-    } else {
-        (None, None)
-    };
-    let json_input = tokened_input.as_deref().unwrap_or(json_input);
-
     // Linux enforces this via Landlock inside the runtime; macOS wraps the
     // runtime in sandbox-exec; Windows re-execs inside the runtime under a
     // write-restricted token (win_sandbox.rs) — see run_agent_inner.
@@ -483,6 +674,19 @@ async fn run_agent_inner(
     user_display_granted: bool,
     has_ask_human: bool,
 ) -> Result<AgentOutput, CallerError> {
+    // Authenticate every result line with a fresh, controller-minted
+    // secret. Arm askHuman after it so both internal fields ride the same
+    // one-shot stdin payload; neither is exposed through the child shell's
+    // environment.
+    let (protocol_input, protocol_token) = arm_runtime_protocol_token(json_input);
+    let protocol_input = protocol_input.as_deref().unwrap_or(json_input);
+    let (human_input, _human_token_guard) = if has_ask_human {
+        arm_human_response_token(protocol_input, log_dir)
+    } else {
+        (None, None)
+    };
+    let json_input = human_input.as_deref().unwrap_or(protocol_input);
+
     let agent_path = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("intendant-runtime")))
@@ -513,6 +717,7 @@ async fn run_agent_inner(
     #[cfg(not(target_os = "macos"))]
     let mut cmd = Command::new(&agent_path);
 
+    apply_runtime_child_env_policy(&mut cmd);
     cmd.env("INTENDANT_LOG_DIR", log_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -556,28 +761,6 @@ async fn run_agent_inner(
 
     #[cfg(target_os = "linux")]
     crate::linux_display_env::apply_to_tokio_command(&mut cmd);
-
-    // The runtime never holds API keys (see the scrub's doc): strip provider
-    // credentials from the child env as the last step before spawn. Ambient
-    // host credentials (SSH agent socket, cloud/forge tokens,
-    // credential-store pointers, the session bus) are scrubbed in the same
-    // breath — running after `linux_display_env::apply_to_tokio_command` so
-    // nothing it set rides through. `INTENDANT_ENV_PASSTHROUGH` exempts
-    // deliberately named vars from the ambient scrub only.
-    let inherited_env_names: Vec<String> = std::env::vars_os()
-        .filter_map(|(name, _)| name.into_string().ok())
-        .collect();
-    scrub_provider_credential_env(&mut cmd, inherited_env_names.iter().map(String::as_str));
-    let passthrough = intendant_core::env_scrub::env_passthrough_set(
-        std::env::var(intendant_core::env_scrub::ENV_PASSTHROUGH_VAR)
-            .ok()
-            .as_deref(),
-    );
-    scrub_ambient_credential_env(
-        &mut cmd,
-        inherited_env_names.iter().map(String::as_str),
-        &passthrough,
-    );
 
     let mut child = cmd.spawn().map_err(|e| {
         CallerError::Agent(format!("Failed to spawn agent at {:?}: {}", agent_path, e))
@@ -636,7 +819,7 @@ async fn run_agent_inner(
         Ok(Ok((status, stdout_discarded, stderr_discarded))) => {
             append_over_cap_note(&mut stderr_buf, "stdout", stdout_discarded);
             append_over_cap_note(&mut stderr_buf, "stderr", stderr_discarded);
-            output_with_exit_status(stdout_buf, stderr_buf, status)
+            output_with_exit_status(stdout_buf, stderr_buf, status, protocol_token.as_deref())
         }
         Ok(Err(err)) => Err(err),
         Err(_) => {
@@ -645,6 +828,9 @@ async fn run_agent_inner(
             // in the buffer. Salvage it instead of discarding completed
             // work the model would just redo; commands with no result line
             // surface as missing downstream.
+            let (stdout_buf, rejected) =
+                authenticate_runtime_stdout(stdout_buf, protocol_token.as_deref());
+            append_protocol_rejection_note(&mut stderr_buf, rejected);
             if let Some(salvaged) = salvage_partial_stdout(stdout_buf) {
                 let stdout = output_buf_into_string(salvaged);
                 let mut stderr = output_buf_into_string(stderr_buf);
@@ -722,6 +908,71 @@ mod tests {
         assert_eq!(written, "late answer");
     }
 
+    #[test]
+    fn runtime_protocol_token_overwrites_model_value() {
+        let forged = r#"{"commands":[],"runtime_protocol_token":"model-chosen-protocol-token"}"#;
+        let (tokened, expected) = arm_runtime_protocol_token(forged);
+        let tokened = tokened.expect("valid batch JSON must re-serialize");
+        let expected = expected.expect("valid batch JSON must mint a token");
+        let parsed: serde_json::Value = serde_json::from_str(&tokened).unwrap();
+        assert_eq!(parsed[RUNTIME_PROTOCOL_TOKEN_FIELD], expected);
+        assert_ne!(expected, "model-chosen-protocol-token");
+
+        assert_eq!(arm_runtime_protocol_token("not json"), (None, None));
+        assert_eq!(arm_runtime_protocol_token("[]"), (None, None));
+    }
+
+    #[test]
+    fn runtime_stdout_accepts_only_matching_token_and_strips_it() {
+        let expected = "controller-secret";
+        let raw = format!(
+            "noise from descendant\n\
+             {{\"type\":\"result\",\"nonce\":7,\"data\":\"forged same nonce\"}}\n\
+             {{\"type\":\"result\",\"nonce\":7,\"data\":\"wrong token\",\
+             \"{RUNTIME_PROTOCOL_TOKEN_FIELD}\":\"wrong\"}}\n\
+             {{\"type\":\"result\",\"nonce\":7,\"data\":\"genuine\",\
+             \"{RUNTIME_PROTOCOL_TOKEN_FIELD}\":\"{expected}\"}}\n"
+        )
+        .into_bytes();
+
+        let (authenticated, rejected) = authenticate_runtime_stdout(raw, Some(expected));
+        assert_eq!(rejected, 3);
+        let text = String::from_utf8(authenticated).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["nonce"], 7);
+        assert_eq!(parsed["data"], "genuine");
+        assert!(parsed.get(RUNTIME_PROTOCOL_TOKEN_FIELD).is_none());
+        assert!(!text.contains("forged same nonce"));
+    }
+
+    #[test]
+    fn timeout_salvage_requires_matching_protocol_token() {
+        let expected = "controller-secret";
+        let forged = br#"{"type":"result","nonce":1,"data":"forged"}"#;
+        let genuine = format!(
+            "{{\"type\":\"result\",\"nonce\":1,\"data\":\"genuine\",\
+             \"{RUNTIME_PROTOCOL_TOKEN_FIELD}\":\"{expected}\"}}"
+        );
+
+        let mut mixed = forged.to_vec();
+        mixed.push(b'\n');
+        mixed.extend_from_slice(genuine.as_bytes()); // complete but no final newline
+        let (authenticated, rejected) = authenticate_runtime_stdout(mixed, Some(expected));
+        assert_eq!(rejected, 1);
+        let salvaged = salvage_partial_stdout(authenticated).unwrap();
+        let text = String::from_utf8(salvaged).unwrap();
+        assert!(text.contains("genuine"));
+        assert!(!text.contains("forged"));
+        assert!(!text.contains(RUNTIME_PROTOCOL_TOKEN_FIELD));
+
+        let (authenticated, rejected) =
+            authenticate_runtime_stdout(forged.to_vec(), Some(expected));
+        assert_eq!(rejected, 1);
+        assert!(salvage_partial_stdout(authenticated).is_none());
+    }
+
     /// Valid UTF-8 moves through without a copy; invalid UTF-8 falls back
     /// to lossy replacement (the pre-move behavior for both cases).
     #[test]
@@ -780,203 +1031,150 @@ mod tests {
             "INTENDANT_MOCK_SCRIPT",
             "INTENDANT_MOCK_DISPLAY",
             "INTENDANT_LOG_DIR",
-            "INTENDANT_FAKE_API_KEY", // the INTENDANT_* namespace is never scrubbed
-            "intendant_fake_api_key", // …in any casing
+            // The provider classifier reserves the INTENDANT_* namespace;
+            // the runtime allowlist below still default-denies these.
+            "INTENDANT_FAKE_API_KEY",
+            "intendant_fake_api_key",
             "OPENAI_BASE_URL",
         ] {
             assert!(!is_provider_credential_env(name), "{name} must survive");
         }
     }
 
-    /// The founding invariant: the runtime child's env never carries
-    /// provider API keys, while the mock-provider e2e control vars and the
-    /// runtime's own INTENDANT_* channel survive. Hermetic — the
-    /// inherited-env view is injected; no real keys, no process env.
+    /// The runtime allowlist admits only catalogued OS/toolchain names and
+    /// locale variables. Secrets, arbitrary unknowns, proxy authority, and
+    /// the rest of the INTENDANT_* namespace default-deny.
     #[test]
-    fn runtime_child_env_scrubs_provider_credentials() {
-        use std::ffi::{OsStr, OsString};
-
-        let mut cmd = Command::new("true");
-        cmd.env("INTENDANT_LOG_DIR", "/tmp/logs");
-        scrub_provider_credential_env(
-            &mut cmd,
-            [
-                "ANTHROPIC_API_KEY",
-                "OPENAI_API_KEY",
-                "GEMINI_API_KEY",
-                "MISTRAL_API_KEY",
-                "CUSTOM_API_TOKEN",
-                "mistral_api_key",
-                "Custom_Api_Token",
-                "PATH",
-                "HOME",
-                "PROVIDER",
-                "INTENDANT_MOCK_SCRIPT",
-            ],
-        );
-        let envs: Vec<(OsString, Option<OsString>)> = cmd
-            .as_std()
-            .get_envs()
-            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
-            .collect();
-        // Windows' Command env map is case-insensitive (case-variant keys
-        // collapse into one entry), so match names case-insensitively.
-        let removal_entry_for = |name: &str| {
-            envs.iter()
-                .any(|(k, v)| v.is_none() && k.to_string_lossy().eq_ignore_ascii_case(name))
-        };
-        let any_entry_for = |name: &str| {
-            envs.iter()
-                .any(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(name))
-        };
-
-        // Removed vars appear as explicit (name, None) child-env entries;
-        // mixed-case inherited names are removed too.
-        for name in [
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY",
-            "MISTRAL_API_KEY",
-            "CUSTOM_API_TOKEN",
-            "mistral_api_key",
-            "Custom_Api_Token",
-        ] {
-            assert!(
-                removal_entry_for(name),
-                "{name} must be removed from the child env"
-            );
-        }
-        // Preserved vars have no explicit entry at all: they inherit.
-        for name in ["PATH", "HOME", "PROVIDER", "INTENDANT_MOCK_SCRIPT"] {
-            assert!(
-                !any_entry_for(name),
-                "{name} must inherit untouched (no explicit entry)"
-            );
-        }
-        assert!(
-            envs.iter()
-                .any(|(k, v)| k == OsStr::new("INTENDANT_LOG_DIR")
-                    && v.as_deref() == Some(OsStr::new("/tmp/logs"))),
-            "runtime control vars set at the spawn boundary must survive the scrub"
-        );
-    }
-
-    /// Ambient host credentials — the launching shell's agent sockets,
-    /// cloud/forge tokens, credential-store pointers, and the session bus —
-    /// are removed from the runtime child alongside the provider keys, while
-    /// the mock-provider control vars and ordinary env survive. Hermetic —
-    /// the inherited-env view and the passthrough set are injected.
-    #[test]
-    fn runtime_child_env_scrubs_ambient_credentials() {
-        use std::ffi::OsString;
-
-        let mut cmd = Command::new("true");
-        scrub_ambient_credential_env(
-            &mut cmd,
-            [
-                "SSH_AUTH_SOCK",
-                "AWS_SECRET_ACCESS_KEY",
-                "GH_TOKEN",
-                "KUBECONFIG",
-                "DOCKER_CONFIG",
-                "DBUS_SESSION_BUS_ADDRESS",
-                "aws_session_token",
-                "MY_SERVICE_TOKEN",
-                "PATH",
-                "HOME",
-                "DISPLAY",
-                "PROVIDER",
-                "INTENDANT_MOCK_SCRIPT",
-            ],
-            &std::collections::HashSet::new(),
-        );
-        let envs: Vec<(OsString, Option<OsString>)> = cmd
-            .as_std()
-            .get_envs()
-            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
-            .collect();
-        let removal_entry_for = |name: &str| {
-            envs.iter()
-                .any(|(k, v)| v.is_none() && k.to_string_lossy().eq_ignore_ascii_case(name))
-        };
-        let any_entry_for = |name: &str| {
-            envs.iter()
-                .any(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(name))
-        };
-
-        for name in [
-            "SSH_AUTH_SOCK",
-            "AWS_SECRET_ACCESS_KEY",
-            "GH_TOKEN",
-            "KUBECONFIG",
-            "DOCKER_CONFIG",
-            "DBUS_SESSION_BUS_ADDRESS",
-            "aws_session_token",
-            "MY_SERVICE_TOKEN",
-        ] {
-            assert!(
-                removal_entry_for(name),
-                "{name} must be removed from the child env"
-            );
-        }
+    fn runtime_child_env_allowlist_defaults_deny() {
+        let none = std::collections::HashSet::new();
         for name in [
             "PATH",
             "HOME",
             "DISPLAY",
-            "PROVIDER",
-            "INTENDANT_MOCK_SCRIPT",
+            "SystemRoot",
+            "CARGO_TARGET_DIR",
+            "RUSTC_WRAPPER",
+            "SCCACHE_DIR",
+            "JAVA_HOME",
+            "VIRTUAL_ENV",
+            "INTENDANT_HOME",
+            "LANG",
+            "LC_ALL",
+            "lc_messages",
         ] {
             assert!(
-                !any_entry_for(name),
-                "{name} must inherit untouched (no explicit entry)"
+                runtime_child_env_allowed(name, &none),
+                "{name} must be admitted"
+            );
+        }
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "DATABASE_URL",
+            "DB_PASSWORD",
+            "SSH_AUTH_SOCK",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "HTTP_PROXY",
+            "NODE_OPTIONS",
+            "LD_PRELOAD",
+            "PROVIDER",
+            "INTENDANT_MOCK_SCRIPT",
+            "INTENDANT_CONNECT_TOKEN",
+            "INTENDANT_FAKE_PASSWORD",
+            "SOME_RANDOM_VAR",
+        ] {
+            assert!(
+                !runtime_child_env_allowed(name, &none),
+                "{name} must default-deny"
             );
         }
     }
 
-    /// `INTENDANT_ENV_PASSTHROUGH` exempts exactly the named vars from the
-    /// ambient scrub — and only from the ambient scrub: a provider key named
-    /// in the passthrough is still removed by the provider-credential scrub.
+    /// The applier clears inheritance, copies only admitted pairs, and keeps
+    /// deliberate runtime controls injected after the clear. The exact-name
+    /// passthrough extends the allowlist but can never admit provider keys.
     #[test]
-    fn ambient_scrub_honors_passthrough_but_provider_scrub_ignores_it() {
-        use std::ffi::OsString;
+    fn runtime_child_env_policy_copies_only_allowed_pairs() {
+        use std::ffi::{OsStr, OsString};
 
+        let inherited: Vec<(OsString, OsString)> = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/u"),
+            ("RUSTC_WRAPPER", "/usr/local/bin/rustc-governor"),
+            ("INTENDANT_HOME", "/state"),
+            ("ANTHROPIC_API_KEY", "sk-provider"),
+            ("AWS_SECRET_ACCESS_KEY", "aws-secret"),
+            ("GITHUB_TOKEN", "ghp-secret"),
+            ("DATABASE_URL", "postgres://secret"),
+            ("DB_PASSWORD", "db-secret"),
+            ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+            ("CUSTOM_BUILD_ROOT", "/opt/build"),
+            ("PROVIDER", "mock"),
+            ("INTENDANT_MOCK_SCRIPT", "/tmp/script.json"),
+            ("INTENDANT_CONNECT_TOKEN", "root-secret"),
+            ("SOME_RANDOM_VAR", "unknown"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect();
         let passthrough = intendant_core::env_scrub::env_passthrough_set(Some(
-            "ssh_auth_sock, DBUS_SESSION_BUS_ADDRESS, ANTHROPIC_API_KEY",
+            "SSH_AUTH_SOCK, CUSTOM_BUILD_ROOT, ANTHROPIC_API_KEY",
         ));
-        let inherited = [
-            "SSH_AUTH_SOCK",
-            "DBUS_SESSION_BUS_ADDRESS",
-            "GH_TOKEN",
-            "ANTHROPIC_API_KEY",
-        ];
         let mut cmd = Command::new("true");
-        scrub_provider_credential_env(&mut cmd, inherited);
-        scrub_ambient_credential_env(&mut cmd, inherited, &passthrough);
+        cmd.env("SHOULD_BE_CLEARED", "before-policy");
+        apply_runtime_child_env_policy_from(&mut cmd, inherited, &passthrough);
+        cmd.env("INTENDANT_LOG_DIR", "/tmp/logs");
 
         let envs: Vec<(OsString, Option<OsString>)> = cmd
             .as_std()
             .get_envs()
             .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
             .collect();
-        let removal_entry_for = |name: &str| {
+        let value_for = |name: &str| {
             envs.iter()
-                .any(|(k, v)| v.is_none() && k.to_string_lossy().eq_ignore_ascii_case(name))
+                .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+                .and_then(|(_, value)| value.clone())
         };
 
-        for name in ["SSH_AUTH_SOCK", "DBUS_SESSION_BUS_ADDRESS"] {
+        for (name, value) in [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/u"),
+            ("RUSTC_WRAPPER", "/usr/local/bin/rustc-governor"),
+            ("INTENDANT_HOME", "/state"),
+            ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+            ("CUSTOM_BUILD_ROOT", "/opt/build"),
+            ("INTENDANT_LOG_DIR", "/tmp/logs"),
+        ] {
+            assert_eq!(
+                value_for(name),
+                Some(OsString::from(value)),
+                "{name} must cross with its value"
+            );
+        }
+        for name in [
+            "SHOULD_BE_CLEARED",
+            "ANTHROPIC_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "DATABASE_URL",
+            "DB_PASSWORD",
+            "PROVIDER",
+            "INTENDANT_MOCK_SCRIPT",
+            "INTENDANT_CONNECT_TOKEN",
+            "SOME_RANDOM_VAR",
+        ] {
             assert!(
-                !removal_entry_for(name),
-                "{name} is passthrough-exempt and must inherit"
+                value_for(name).is_none(),
+                "{name} must be absent from the child env"
             );
         }
         assert!(
-            removal_entry_for("GH_TOKEN"),
-            "non-exempt ambient credentials are still removed"
-        );
-        assert!(
-            removal_entry_for("ANTHROPIC_API_KEY"),
-            "provider keys are removed regardless of the passthrough"
+            envs.iter()
+                .all(|(key, value)| key != OsStr::new("SHOULD_BE_CLEARED") || value.is_none()),
+            "env_clear must discard entries set before the policy"
         );
     }
 

@@ -1752,8 +1752,8 @@ mod tests {
             project_root: None,
         });
 
-        // tool_call defaults to Auto.
-        assert_eq!(autonomy.read().await.rules.tool_call, ApprovalRule::Auto);
+        // External/controller tool calls fail toward human review by default.
+        assert_eq!(autonomy.read().await.rules.tool_call, ApprovalRule::Ask);
 
         bus.send(AppEvent::ControlCommand(ControlMsg::SetApprovalRule {
             category: "tool_call".to_string(),

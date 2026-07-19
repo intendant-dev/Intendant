@@ -38,6 +38,14 @@ Each command produces one stdout line wrapped as:
 etc.) serialized into a string. The controller parses the outer envelope, matches
 on `nonce`, then parses `data`.
 
+For controller-launched batches, the controller also overwrites an internal
+`runtime_protocol_token` field with a fresh per-spawn secret. The runtime copies
+that token into every result envelope; the controller accepts only matching
+envelopes and strips the field before result mapping or logging. This prevents a
+model-driven descendant that finds an alias for the controller's stdout pipe from
+fabricating results. Direct command-line invocations such as the examples here
+omit the internal field and retain the tokenless envelope shown above.
+
 More examples:
 
 ```bash
@@ -56,14 +64,19 @@ echo '{"commands":[{"function":"execPty","nonce":1,"command":"cd /tmp"},{"functi
 
 ## The `AgentInput` Shape
 
-The entire stdin payload deserializes into `AgentInput` (`src/models.rs`), which
-has exactly one field:
+The entire stdin payload deserializes into `AgentInput` (`src/models.rs`). Its
+user-visible payload has one field:
 
 ```jsonc
 {
   "commands": [ /* array of Command objects, executed in order */ ]
 }
 ```
+
+The controller may add two optional internal fields before spawn:
+`runtime_protocol_token` authenticates result envelopes, and
+`human_response_token` authenticates the filesystem answer channel used by
+`askHuman`. Any model-supplied values are overwritten.
 
 There is no top-level `context` field at the runtime layer — conversation/context
 management is handled entirely on the controller side (see
@@ -124,7 +137,16 @@ These are the ~10 functions `intendant-runtime` actually implements:
 | `inspectPath` | Filesystem metadata (type, size, mtime; plus mode/uid/gid on Unix) | `path` |
 | `editFile` | Structured file editing without a shell | `file_path`, `operation`, `content`, `match_content`, `line_number`, `end_line` |
 | `writeFile` | Back-compat alias — rewritten to `editFile` with `operation:"write"` if unset | `file_path`, `content` |
-| `browse` | HTTP GET, HTML→text via `html2text` (50 KB cap, 15 s timeout, ≤5 redirects) | `url` |
+| `browse` | Public-internet HTTP GET, HTML→text via `html2text` (streamed 50 KiB hard cap, 15 s timeout, ≤5 validated redirects) | `url` |
+
+`browse` is not a LAN client: every initial URL and redirect hop is resolved
+before connecting, DNS is pinned to the checked answers, and any loopback,
+private, link-local, carrier-grade NAT, local-name, multicast, documentation,
+benchmark, or reserved address fails closed. Mixed public/private DNS answers
+are rejected as a unit. Ambient HTTP proxy variables are disabled for this
+path so they cannot bypass address validation or DNS pinning. The body reader
+stops and drops the response stream as soon as the 50 KiB prefix is full; it
+never buffers the remainder before truncating.
 | `askHuman` | Write a question to the log dir and **poll indefinitely** for a response file | `question` |
 | `execPty` | Run a command in a persistent PTY session for the life of this process | `command`, `shell_id` |
 
@@ -173,17 +195,21 @@ one. `replace_lines` errors if `end_line < line_number`.
 - **Shell**: `crate::utils::agent_shell_command()` picks `bash -c <cmd>` on Unix
   and `cmd.exe /C <cmd>` on Windows; the whole command is one argument so the
   shell does word-splitting. Exit semantics are identical across platforms.
-- **stdout/stderr** are streamed to `<log_dir>/<nonce>_stdout.log` /
-  `_stderr.log`; the result carries only the **last 10 KB** of each
-  (`LOG_TAIL_BYTES`).
-- **Credentials are stripped at two boundaries.** The controller removes
-  canonical provider names, inherited `*_API_KEY` / `*_API_TOKEN` names, and
-  ambient host-credential names (agent sockets, forge/cloud/registry tokens,
-  credential-store pointers) before spawning the runtime. The `INTENDANT_*`
-  namespace is reserved for controller→runtime control and is exempt. Both
-  `execAsAgent` and `execPty` independently repeat the provider and ambient
-  scrub before starting their model-driven shell; they do not merely trust the
-  runtime's inherited environment. See
+- **stdout/stderr** are streamed to unpredictable
+  `<log_dir>/<nonce>_<random>_stdout.log` /
+  `<nonce>_<random>_stderr.log` artifacts; the result carries only the
+  **last 10 KB** of each (`LOG_TAIL_BYTES`). Each artifact is atomically
+  created as a new file, and the runtime reads its tail through the original
+  open handle, so an existing or later-replaced symlink is never followed.
+- **The environment defaults closed at two boundaries.** Before spawning the
+  runtime, the controller clears inheritance and copies only catalogued
+  OS/process essentials, non-secret toolchain controls, locale variables, and
+  exact names deliberately granted through `INTENDANT_ENV_PASSTHROUGH`.
+  Provider/model API keys remain an absolute deny. Runtime controls such as the
+  log directory, sandbox paths, and user-display grant are injected individually
+  after the clear; unknown names, including unknown `INTENDANT_*` names, do not
+  inherit. `execAsAgent` and `execPty` independently repeat the provider and
+  ambient credential scrub before starting their model-driven shell. See
   [Configuration → Child-process environment](./configuration.md#child-process-environment)
   for the current passthrough limitation.
 - **Display gating**: `DISPLAY` is set to the chosen display. Access to the user's
@@ -206,8 +232,9 @@ A 30 s per-command deadline guarantees a quiet shell can't wedge the loop. (The
 reader thread also answers ConPTY's startup cursor-position query so Windows
 shells don't hang at launch.) The result carries at most the last 10 KiB and a
 `truncated` boolean. When output is larger, the runtime attempts to preserve the
-full transcript as `<nonce>_pty.log`; the returned truncation marker says where
-it was written or reports that preservation failed.
+full transcript as an atomically-created
+`<nonce>_<random>_pty.log`; the returned truncation marker says where it was
+written or reports that preservation failed.
 
 ### `askHuman`
 
@@ -271,10 +298,12 @@ Linux/X11) the merged `session.Xauthority` cookie file.
 
 On the controller side, stdout and stderr from the runtime process are each
 buffer-capped at 64 MiB while excess bytes are still drained to avoid pipe
-deadlock. An honest truncation note is appended when bytes were discarded. If
-the 120-second batch hard timeout fires, the controller kills the runtime but
-salvages every complete JSONL protocol line already flushed by commands that
-finished; an incomplete trailing line is discarded.
+deadlock. An honest truncation note is appended when bytes were discarded.
+Controller-launched batches discard every stdout line that lacks the per-spawn
+protocol token, then strip that token from accepted lines. If the 120-second
+batch hard timeout fires, the controller kills the runtime but salvages every
+complete, authenticated JSONL protocol line already flushed by commands that
+finished; an incomplete or unauthenticated trailing line is discarded.
 
 ## Filesystem Sandboxing
 

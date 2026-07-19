@@ -53,11 +53,12 @@ const AMBIENT_CREDENTIAL_ENV_SUFFIXES: &[&str] = &[
 ];
 
 /// True when `name` names ambient host-credential material that must not
-/// reach model-driven children. `INTENDANT_*` names are the
-/// controller→child control channel (the mock-provider e2e rig rides
-/// `INTENDANT_MOCK_*` into children) and are never classified as
-/// credentials. Matching is on the ASCII-uppercased name: Windows env
-/// names are case-insensitive, and `.env` files preserve arbitrary casing.
+/// reach model-driven children. `INTENDANT_*` names are reserved control
+/// vocabulary and are not classified here; this is not an admission rule.
+/// The native runtime spawn uses a default-deny allowlist and injects its
+/// exact control variables separately. Matching is on the ASCII-uppercased
+/// name: Windows env names are case-insensitive, and `.env` files preserve
+/// arbitrary casing.
 pub fn is_ambient_credential_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if upper.starts_with("INTENDANT_") {
@@ -71,10 +72,11 @@ pub fn is_ambient_credential_env(name: &str) -> bool {
 
 /// Controller-side env var holding comma-separated exact env names
 /// (case-insensitive) the user deliberately exempts from ambient scrubs at
-/// controller spawn boundaries. Supervised external CLIs receive these
-/// names; the native runtime process may inherit them, but its exec/PTY
-/// shell layer applies an independent scrub that currently does not honor
-/// this exemption. Provider/model-API keys are never exempted.
+/// controller spawn boundaries. Supervised external CLIs and the native
+/// runtime receive these exact names as deliberate allowlist extensions,
+/// but the runtime's exec/PTY shell layer applies an independent credential
+/// scrub that currently does not honor the exemption. Provider/model-API
+/// keys are never exempted.
 pub const ENV_PASSTHROUGH_VAR: &str = "INTENDANT_ENV_PASSTHROUGH";
 
 /// Parse a raw [`ENV_PASSTHROUGH_VAR`] value into the exemption set:

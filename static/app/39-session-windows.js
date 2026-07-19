@@ -945,7 +945,7 @@ const PERMISSION_KIND_COPY = {
 
 // Resolve a permission kind + raw mode into display copy. `autonomy` is
 // the native backend: the label reuses the sidebar's autonomy vocabulary
-// ("Medium · gate writes"), and the ungated Full level gets the same
+// ("Medium · review commands"), and the ungated Full level gets the same
 // quiet warning tint as bypass. Unknown kinds show the raw mode verbatim
 // — honest passthrough, never a guessed plain-language claim.
 function permissionDisplay(kind, mode) {
@@ -5183,4 +5183,3 @@ function sessionConfigApprovalPolicy(meta = {}) {
     'on-request'
   );
 }
-
