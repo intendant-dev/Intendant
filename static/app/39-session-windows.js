@@ -4361,6 +4361,7 @@ async function hydrateRestoredSessionWindow(win, record) {
     updateSessionWindowRemotePageState(targetWin, data, source, sid);
     const rendered = renderRestoredSessionWindowEntries(targetWin, entries, targetSid);
     clearSessionWindowHydrateError(targetWin || win);
+    fillRestoredSessionWindowTaskFromEntries(targetSid, entries);
     if (rendered > 0) {
       updateSessionWindow(targetSid, {
         phase: restoredSessionWindowPhaseFromEntries(entries, targetSid),
@@ -4411,6 +4412,37 @@ function restoredSessionWindowPhaseFromEntries(entries, fallbackSessionId) {
     }
   }
   return 'idle';
+}
+
+// Restored windows can show "initial message pending" forever: the
+// persisted record is identity/topology only (no task text), and a dead
+// task child is absent from the session registry, so nothing ever fills
+// the header. The hydrated transcript knows better — its first live user
+// prompt IS the task — so once hydration succeeds, fill the metadata
+// through the ordinary update path (normalize → merge → header render).
+// Anything already present wins: live SessionStarted metadata, registry
+// rows, and later fills all outrank this backstop, which only writes
+// into a blank.
+const SESSION_WINDOW_RESTORED_TASK_CHAR_LIMIT = 240;
+function fillRestoredSessionWindowTaskFromEntries(sessionId, entries) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !Array.isArray(entries) || !entries.length) return;
+  const meta = sessionMetadataById.get(sid) || {};
+  if (compactSessionText(meta.task)) return;
+  for (const entry of entries) {
+    const record = sessionWindowRecordFromReplayEntry(entry, sid);
+    if (!record || record.superseded) continue;
+    const source = String(record.source || '').trim().toLowerCase();
+    const level = String(record.level || '').trim().toLowerCase();
+    if (source !== 'user' && level !== 'user') continue;
+    const task = compactSessionTextBounded(
+      record.content,
+      SESSION_WINDOW_RESTORED_TASK_CHAR_LIMIT
+    );
+    if (!task) continue;
+    updateSessionWindow(sid, { task });
+    return;
+  }
 }
 
 function sessionWindowHydrationRecord(sessionId) {

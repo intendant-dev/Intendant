@@ -519,6 +519,18 @@ class PeerDisplayConnection {
     }
     container.style.display = 'block';
     const videoEl = container.querySelector('.peer-display-video');
+    // A daemons-list re-render that rebuilt the pane replaced the previous
+    // <video> while the live stream stayed attached to it — each stranded
+    // element keeps its own WebKit media player (and IOSurface frame
+    // pool) alive until reset, so long-lived tabs accumulated one per
+    // rebuild. The pause guard still points at the previous element right
+    // up to the re-arm below, which is how we find it; reset it once it
+    // is really detached. Tracks are NOT stopped — the stream lives on in
+    // the replacement element.
+    const replacedVideoEl = this._pauseGuard ? this._pauseGuard.videoEl : null;
+    if (replacedVideoEl && replacedVideoEl !== videoEl && !replacedVideoEl.isConnected) {
+      displayViewerResetMediaElement(replacedVideoEl);
+    }
     // WebKit pause guard (shared driver in 45-display-viewer-core): the
     // pane <video> is rebuilt on every daemons-list re-render, so every
     // pass re-arms the guard against the CURRENT element.
@@ -648,6 +660,23 @@ class PeerDisplayConnection {
     const attempts = (peerDisplayReconnectAttempts.get(key) || 0) + 1;
     peerDisplayReconnectAttempts.set(key, attempts);
     if (attempts > DISPLAY_VIEWER_RETRY_MAX_ATTEMPTS) {
+      // Dead end: keep the pane, the overlay (its Retry re-runs the full
+      // open path), and the registry entry — but release the failed
+      // transport and its media now. The park used to retain the failed
+      // pc, its ended stream, and the pane element's media player
+      // indefinitely, which is exactly the buffer-pool leak class the
+      // shared release helpers exist for. The best-effort close signal
+      // lets the peer drop its WebRtcPeer for this dead session; the
+      // Station source is dropped like the no-track verdict does, so the
+      // HUD stops drawing a frame that will never advance.
+      if (this._retryTimer) {
+        window.clearTimeout(this._retryTimer);
+        this._retryTimer = null;
+      }
+      this._sendSignal({ kind: 'close' }).catch(() => {});
+      this._releaseTransportAndMedia();
+      stationUnregisterVideoSource(`peer:${this.hostId}:${this.displayId}:${this.sessionId}`);
+      stationScheduleUpdate();
       this.setStatus(DISPLAY_VIEWER_RETRY_DEAD_END_STATUS, 'error');
       this._setStageOverlay('error', DISPLAY_VIEWER_RETRY_DEAD_END_OVERLAY, true);
       return;
@@ -1584,9 +1613,77 @@ class PeerDisplayConnection {
     return describePeerIceCandidateForLog(cand);
   }
 
-  async close() {
+  // Transport + media release shared by close() and the bounded-retry
+  // dead-end park (_scheduleAutoRetry). Closes the pc, stops the received
+  // tracks, resets every pane <video> this connection fed, and drops the
+  // tile compositor's canvas DOM — the release that stops WebKit
+  // retaining decoder pools for a stream that will never advance again.
+  // Idempotent; leaves the pane markup, the stage overlay, and the
+  // registry entry untouched (the dead-end park needs all three for its
+  // Retry affordance).
+  _releaseTransportAndMedia() {
     this._clearNoTrackWatchdog();
     displayViewerClearFreezeWatchdog(this);
+    // F-2: tear down input listeners FIRST. The `pc.close()` below would
+    // close the data channels anyway, but uninstalling listeners eagerly
+    // prevents a final mousemove from racing the close and landing on a
+    // half-closed channel.
+    this._exitInteractive();
+    this._stopDiagSampler();
+    if (this.pc) {
+      try { this.pc.close(); } catch {}
+      this.pc = null;
+    }
+    // F-1.3c + F-2: data channels close implicitly when `pc.close()`
+    // runs. Null the references so stale post-close calls fail the
+    // `readyState === 'open'` check rather than throwing on a freed
+    // channel.
+    this.authorityChannel = null;
+    this.controlChannel = null;
+    this.pointerChannel = null;
+    this.tileControlChannel = null;
+    this.tileSnapshotChannel = null;
+    this.tileDeltasChannel = null;
+    // Media release: stop the received tracks (closing the pc alone
+    // leaves receiver buffers alive) and reset every pane <video> this
+    // connection fed — current containers, plus the pause guard's
+    // element when a pane rebuild left it detached — so WebKit can drop
+    // the per-element media players and their frame pools. Skip a pane
+    // element that already carries a DIFFERENT live stream (defensive:
+    // containers are per host, and another connection may have attached
+    // its own stream to a rebuilt pane).
+    displayViewerStopStreamTracks(this.stream);
+    const guardVideoEl = this._pauseGuard ? this._pauseGuard.videoEl : null;
+    for (const container of stationPeerDisplayContainersForHost(this.hostId)) {
+      const videoEl = container.querySelector('.peer-display-video');
+      if (videoEl && (!videoEl.srcObject || videoEl.srcObject === this.stream)) {
+        displayViewerResetMediaElement(videoEl);
+      }
+    }
+    if (guardVideoEl && !guardVideoEl.isConnected) {
+      displayViewerResetMediaElement(guardVideoEl);
+    }
+    this._pauseGuard = null;
+    if (this.tileCompositor) {
+      // The compositor's frame/canvas DOM outlives the tileCompositor
+      // reference otherwise (the pane keeps it until the container is
+      // emptied — never, on the dead-end park). Zeroing the canvas
+      // releases its backing store.
+      try {
+        const frameEl = this.tileCompositor.frameEl;
+        if (frameEl && frameEl.parentNode) frameEl.parentNode.removeChild(frameEl);
+        const tileCanvas = this.tileCompositor.canvas;
+        if (tileCanvas) {
+          tileCanvas.width = 0;
+          tileCanvas.height = 0;
+        }
+      } catch (_) {}
+      this.tileCompositor = null;
+    }
+    this.stream = null;
+  }
+
+  async close() {
     // Stop every per-connection timer — no leaked intervals/timeouts
     // across close/retry cycles.
     if (this._retryTimer) {
@@ -1608,10 +1705,10 @@ class PeerDisplayConnection {
     // annotation edit or armed callout on this pane — lifecycle parity
     // with removeDisplaySlot on the local path.
     teardownLiveSurfaceForOwner(this);
-    // F-2: tear down input listeners FIRST. The `pc.close()` chain
-    // below would close the data channels anyway, but uninstalling
-    // listeners eagerly prevents a final mousemove from racing the
-    // close and landing on a half-closed channel.
+    // F-2: tear down input listeners EAGERLY (before the async close
+    // signal below; _releaseTransportAndMedia re-runs this idempotently)
+    // so a final mousemove can't race the close and land on a
+    // half-closed channel.
     this._exitInteractive();
     // Phase 0: stop the freshness sampler (if active) BEFORE closing
     // the pc / nulling the stream. stop() emits a `session_end`
@@ -1621,30 +1718,10 @@ class PeerDisplayConnection {
     // be cancelled by the browser; that's an acceptable Phase 0
     // limitation. Future: switch to navigator.sendBeacon for the
     // unload path.
-    if (this._diagSampler) {
-      try { this._diagSampler.stop(); } catch (e) {
-        this._log('warn', `[diag-vf] sampler stop failed: ${e.message}`);
-      }
-      this._diagSampler = null;
-    }
+    this._stopDiagSampler();
     // Best-effort tell peer to tear down its WebRtcPeer.
     await this._sendSignal({ kind: 'close' }).catch(() => {});
-    if (this.pc) {
-      try { this.pc.close(); } catch {}
-      this.pc = null;
-    }
-    // F-1.3c + F-2: data channels close implicitly when `pc.close()`
-    // runs. Null the references so stale post-close calls fail the
-    // `readyState === 'open'` check rather than throwing on a freed
-    // channel.
-    this.authorityChannel = null;
-    this.controlChannel = null;
-    this.pointerChannel = null;
-    this.tileControlChannel = null;
-    this.tileSnapshotChannel = null;
-    this.tileDeltasChannel = null;
-    this.tileCompositor = null;
-    this.stream = null;
+    this._releaseTransportAndMedia();
   }
 
   async _sendSignal(signal) {
@@ -1800,6 +1877,98 @@ window.qa = Object.assign(window.qa || {}, {
         authority: conn.peerAuthorityState,
       };
     });
+  },
+
+  // Active DOM-level exercise of the FEDERATED viewer's teardown paths:
+  // builds a real PeerDisplayConnection with a real pane, a real
+  // canvas.captureStream() MediaStream, and a real (unsignaled)
+  // RTCPeerConnection, exercises the pane-rebuild element churn (the
+  // replaced <video> must be reset while the stream lives on in the
+  // replacement), then closes through closePeerDisplaysForHost — the
+  // exact routine the Close button, peer_display_removed, and the
+  // peer-sent close signal run — and reports what was released.
+  // Effect-free on the daemon beyond two best-effort peer-signal POSTs
+  // for a peer id that does not exist (both error and are swallowed).
+  async displayViewerPeerTeardownProbe() {
+    const hostId = 'qa-teardown-probe';
+    for (const existing of peerDisplayConnections.values()) {
+      if (existing.hostId === hostId) return { error: 'probe connection already exists' };
+    }
+    const source = document.createElement('canvas');
+    source.width = 320;
+    source.height = 180;
+    const sctx = source.getContext('2d');
+    sctx.fillStyle = '#334455';
+    sctx.fillRect(0, 0, source.width, source.height);
+    if (typeof source.captureStream !== 'function') {
+      return { error: 'canvas.captureStream unavailable in this browser' };
+    }
+    let container = document.getElementById(`peer-display-${hostId}`);
+    const createdContainer = !container;
+    if (!container) {
+      container = document.createElement('div');
+      container.id = `peer-display-${hostId}`;
+      container.style.display = 'none';
+      document.body.appendChild(container);
+    }
+    try {
+      const stream = source.captureStream(5);
+      const conn = new PeerDisplayConnection(hostId, 1, 'qa-probe-session', '');
+      peerDisplayConnections.set(conn.sessionKey(), conn);
+      conn.stream = stream;
+      conn.pc = new RTCPeerConnection({ iceServers: [] });
+      conn.attachToDom();
+      const firstVideoEl = container.querySelector('.peer-display-video');
+      // Pane-rebuild churn: a daemons-list re-render wipes and rebuilds
+      // the pane DOM while the connection (and its stream) live on.
+      container.innerHTML = '';
+      conn.attachToDom();
+      const secondVideoEl = container.querySelector('.peer-display-video');
+      const churn = {
+        distinctElements: Boolean(firstVideoEl && secondVideoEl && firstVideoEl !== secondVideoEl),
+        // The replaced element must be reset (srcObject dropped) …
+        replacedReleased: Boolean(firstVideoEl) && !firstVideoEl.srcObject,
+        // … while the stream stays live on the replacement.
+        replacementAttached: Boolean(secondVideoEl && secondVideoEl.srcObject === stream),
+        streamStillLive: stream.getTracks().some(track => track.readyState === 'live'),
+      };
+      const pc = conn.pc;
+      await closePeerDisplaysForHost(hostId);
+      const after = {
+        pcState: pc.connectionState,
+        trackStates: stream.getTracks().map(track => track.readyState),
+        streamRef: Boolean(conn.stream),
+        registered: Array.from(peerDisplayConnections.values())
+          .some(existing => existing.hostId === hostId),
+        paneVideoSrcObject: Boolean(secondVideoEl && secondVideoEl.srcObject),
+        paneCleared: container.childElementCount === 0,
+        pauseGuardArmed: Boolean(conn._pauseGuard),
+        inputListeners: Object.keys(conn._boundHandlers || {}).length,
+        statsSampler: Boolean(conn._statsTimer),
+        tileCompositor: Boolean(conn.tileCompositor),
+      };
+      const pass =
+        churn.distinctElements &&
+        churn.replacedReleased &&
+        churn.replacementAttached &&
+        churn.streamStillLive &&
+        after.pcState === 'closed' &&
+        after.trackStates.length > 0 &&
+        after.trackStates.every(state => state === 'ended') &&
+        !after.streamRef &&
+        !after.registered &&
+        !after.paneVideoSrcObject &&
+        after.paneCleared &&
+        !after.pauseGuardArmed &&
+        after.inputListeners === 0 &&
+        !after.statsSampler &&
+        !after.tileCompositor;
+      return { pass, churn, after };
+    } finally {
+      if (createdContainer && container.parentNode) {
+        container.parentNode.removeChild(container);
+      }
+    }
   },
 });
 
