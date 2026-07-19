@@ -57,6 +57,11 @@ pub const REQUEST_CREDIT_WINDOW_BYTES: u64 = 1024 * 1024;
 /// starts only at `egress_request_end`) — so a minute of ack silence
 /// means the page is gone or wedged, not a model thinking.
 const REQUEST_ACK_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// At most one ack per in-flight request chunk can be legitimate. Keeping
+/// the channel to that window prevents malformed relay frames from building
+/// an unbounded side queue while the request sender is descheduled.
+const REQUEST_ACK_CHANNEL_CAPACITY: usize =
+    REQUEST_CREDIT_WINDOW_BYTES as usize / REQUEST_CHUNK_BYTES;
 /// Body channel capacity in chunks. Kept above the credit window so an
 /// honest relay can never observe a full channel; hitting it means the
 /// relay ignored its window and the request is killed.
@@ -88,7 +93,7 @@ struct PendingEgress {
     /// Request-side credit refills (`egress_request_ack` bytes) back to
     /// the windowed sender in `fetch`. Dropped with the entry, which is
     /// how a parked sender learns the request died mid-ship.
-    request_ack_tx: mpsc::UnboundedSender<u64>,
+    request_ack_tx: mpsc::Sender<u64>,
 }
 
 fn relays() -> &'static RwLock<HashMap<String, RelayEntry>> {
@@ -280,6 +285,8 @@ enum RequestShipError {
     /// `egress_error` — and the concrete reason is already queued on the
     /// head channel.
     Aborted,
+    /// The relay acknowledged bytes that were not currently in flight.
+    InvalidAck,
 }
 
 /// Send the request body under the request credit window: chunks go out
@@ -291,21 +298,27 @@ async fn ship_request_windowed(
     frames_tx: &mpsc::UnboundedSender<serde_json::Value>,
     id: &str,
     body: &[u8],
-    ack_rx: &mut mpsc::UnboundedReceiver<u64>,
+    ack_rx: &mut mpsc::Receiver<u64>,
 ) -> Result<(), RequestShipError> {
     let mut credit = REQUEST_CREDIT_WINDOW_BYTES;
+    let mut outstanding = 0u64;
     for chunk in body.chunks(REQUEST_CHUNK_BYTES) {
         while credit < chunk.len() as u64 {
             match tokio::time::timeout(REQUEST_ACK_IDLE_TIMEOUT, ack_rx.recv()).await {
                 Err(_) => return Err(RequestShipError::Stalled),
                 Ok(None) => return Err(RequestShipError::Aborted),
-                Ok(Some(bytes)) => credit = credit.saturating_add(bytes),
+                Ok(Some(bytes)) if bytes > 0 && bytes <= outstanding => {
+                    outstanding -= bytes;
+                    credit += bytes;
+                }
+                Ok(Some(_)) => return Err(RequestShipError::InvalidAck),
             }
         }
         frames_tx
             .send(serde_json::json!({ "t": "egress_request_chunk", "id": id, "data": b64(chunk) }))
             .map_err(|_| RequestShipError::ChannelClosed)?;
         credit -= chunk.len() as u64;
+        outstanding += chunk.len() as u64;
     }
     frames_tx
         .send(serde_json::json!({ "t": "egress_request_end", "id": id }))
@@ -336,7 +349,7 @@ pub async fn fetch(
     let id = format!("egr_{}", uuid::Uuid::new_v4().simple());
     let (head_tx, head_rx) = oneshot::channel();
     let (body_tx, body_rx) = mpsc::channel(BODY_CHANNEL_CHUNKS);
-    let (request_ack_tx, mut request_ack_rx) = mpsc::unbounded_channel();
+    let (request_ack_tx, mut request_ack_rx) = mpsc::channel(REQUEST_ACK_CHANNEL_CAPACITY);
     pending().write().expect("egress pending poisoned").insert(
         id.clone(),
         PendingEgress {
@@ -407,6 +420,11 @@ pub async fn fetch(
         Err(RequestShipError::Aborted) => {
             // Fall through to the head await: `fail_pending` already
             // queued the real reason (detach, relay error) there.
+        }
+        Err(RequestShipError::InvalidAck) => {
+            let reason = "egress relay sent an invalid request credit acknowledgement".to_string();
+            fail_pending(&id, reason.clone());
+            return Err(reason);
         }
     }
 
@@ -609,12 +627,27 @@ pub fn handle_browser_frame(session_id: &str, t: &str, frame: &serde_json::Value
             // finished or legacy request — the sender's receiver is gone
             // and the send fails silently.
             let bytes = frame.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-            let pend = pending().read().expect("egress pending poisoned");
-            let Some(entry) = pend.get(id) else { return };
-            if entry.session_id != session_id {
+            let request_ack_tx = {
+                let pend = pending().read().expect("egress pending poisoned");
+                let Some(entry) = pend.get(id) else { return };
+                if entry.session_id != session_id {
+                    return;
+                }
+                entry.request_ack_tx.clone()
+            };
+            if bytes == 0 || bytes > REQUEST_CREDIT_WINDOW_BYTES {
+                fail_pending(
+                    id,
+                    "egress relay sent an invalid request credit acknowledgement".to_string(),
+                );
                 return;
             }
-            let _ = entry.request_ack_tx.send(bytes);
+            if let Err(mpsc::error::TrySendError::Full(_)) = request_ack_tx.try_send(bytes) {
+                fail_pending(
+                    id,
+                    "egress relay exceeded the request credit acknowledgement window".to_string(),
+                );
+            }
         }
         _ => {}
     }
@@ -915,6 +948,44 @@ mod tests {
         assert!(response.status_success());
         handle_browser_frame("s1", "egress_end", &serde_json::json!({"id": id}));
         assert_eq!(response.body_text().await.unwrap(), "");
+        reset();
+    }
+
+    #[tokio::test]
+    async fn oversized_request_ack_fails_without_releasing_more_chunks() {
+        let _guard = lock();
+        reset();
+        let (tx, mut relay_rx) = mpsc::unbounded_channel();
+        register("s1", "Tab A", "local", &kinds(&[KIND_ANTHROPIC]), true, tx).unwrap();
+        let fetch_task = spawn_oversized_fetch(1);
+
+        let head = relay_rx.recv().await.unwrap();
+        let id = head["id"].as_str().unwrap().to_string();
+        for _ in 0..WINDOW_CHUNKS {
+            assert_eq!(relay_rx.recv().await.unwrap()["t"], "egress_request_chunk");
+        }
+
+        handle_browser_frame(
+            "s1",
+            "egress_request_ack",
+            &serde_json::json!({"id": id, "bytes": u64::MAX}),
+        );
+
+        let error = fetch_task.await.unwrap().err().unwrap();
+        assert!(
+            error.contains("invalid request credit acknowledgement"),
+            "{error}"
+        );
+        let cancel = relay_rx.recv().await.unwrap();
+        assert_eq!(cancel["t"], "egress_cancel");
+        assert_eq!(cancel["id"], id);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), relay_rx.recv())
+                .await
+                .is_err(),
+            "invalid credit released additional request chunks"
+        );
+        assert!(pending().read().unwrap().is_empty());
         reset();
     }
 

@@ -2205,8 +2205,12 @@ function renderSessionDetailEntries(entries, el, statusEl = null, pagerControls 
   }
   el._sessionDetailScrollHandler = () => handleSessionDetailLogScroll(view);
   el.addEventListener('scroll', el._sessionDetailScrollHandler);
-  renderSessionDetailRange(view, 0);
-  el.scrollTop = 0;
+  // Open at the newest window, scrolled to the tail — the latest state is
+  // what a detail open asks for (chat mental model), and the fork/lineage
+  // affordances live there (the active chain's newest era; on a compacted
+  // transcript the older 90%+ is off-chain history with no anchors). The
+  // First button serves read-from-the-start replays.
+  setSessionDetailLogRange(view, sessionDetailMaxRenderStart(view), 'bottom');
 }
 
 function sessionDetailMaxRenderStart(view) {
