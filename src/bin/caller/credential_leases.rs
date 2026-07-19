@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 pub const DEFAULT_TTL_MS: u64 = 15 * 60 * 1000;
@@ -212,9 +213,232 @@ pub fn known_kind(kind: &str) -> bool {
         "api_key:anthropic"
             | "api_key:openai"
             | "api_key:gemini"
+            | "dns:cloudflare"
+            | "dns:rfc2136"
             | "oauth:codex"
             | "oauth:claude-code"
     )
+}
+
+pub(crate) const DNS_CREDENTIAL_ENV_VARS: &[&str] =
+    &["CLOUDFLARE_API_TOKEN", "INTENDANT_RFC2136_TSIG_SECRET"];
+
+pub(crate) fn is_dns_credential_env(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    DNS_CREDENTIAL_ENV_VARS.contains(&name.as_str())
+        || name.ends_with("_API_TOKEN")
+        || name.ends_with("_TSIG_SECRET")
+}
+
+#[derive(Clone, Debug)]
+enum PendingDnsCredentialScrub {
+    Exact(String),
+    /// A durable journal exists but cannot be parsed safely. In that state,
+    /// remove every DNS-shaped credential inherited by a supervised child.
+    AllDnsCredentials,
+}
+
+#[derive(Default)]
+struct DnsCredentialChildScrubState {
+    configured: Option<String>,
+    pending_by_store: HashMap<PathBuf, PendingDnsCredentialScrub>,
+}
+
+fn child_dns_credential_scrub_state() -> &'static RwLock<DnsCredentialChildScrubState> {
+    static STATE: OnceLock<RwLock<DnsCredentialChildScrubState>> = OnceLock::new();
+    STATE.get_or_init(|| RwLock::new(DnsCredentialChildScrubState::default()))
+}
+
+/// Set the daemon-level DNS fallback that supervised coding-agent children
+/// must not inherit. Main initializes this even without a web gateway;
+/// runtime Connect configuration changes replace it before later spawns.
+pub(crate) fn configure_dns_credential_child_scrub(config: &crate::project::CustomDomainConfig) {
+    child_dns_credential_scrub_state()
+        .write()
+        .expect("DNS credential child scrub state poisoned")
+        .configured = config.dns_credential_env_for_child_scrub();
+}
+
+pub(crate) fn configured_dns_credential_child_scrub() -> Option<String> {
+    child_dns_credential_scrub_state()
+        .read()
+        .expect("DNS credential child scrub state poisoned")
+        .configured
+        .clone()
+}
+
+/// Retain the credential named by a durable DNS cleanup journal in the child
+/// scrub even when the live custom-domain config is disabled or changes its
+/// fallback. A malformed journal is fail-closed because its exact name cannot
+/// be trusted.
+pub(crate) fn configure_pending_dns_credential_child_scrub(
+    cert_dir: &Path,
+    env_name: Result<Option<String>, String>,
+) {
+    let mut state = child_dns_credential_scrub_state()
+        .write()
+        .expect("DNS credential child scrub state poisoned");
+    match env_name {
+        Ok(Some(name)) => {
+            state.pending_by_store.insert(
+                cert_dir.to_path_buf(),
+                PendingDnsCredentialScrub::Exact(name),
+            );
+        }
+        Ok(None) => {
+            state.pending_by_store.remove(cert_dir);
+        }
+        Err(_) => {
+            state.pending_by_store.insert(
+                cert_dir.to_path_buf(),
+                PendingDnsCredentialScrub::AllDnsCredentials,
+            );
+        }
+    }
+}
+
+/// Remove the live and cleanup-journal fallbacks used by custom-domain DNS
+/// from a supervised coding-agent child. Other API-token variables remain
+/// available unless an unreadable cleanup journal requires the fail-closed
+/// all-DNS scrub.
+#[cfg(test)]
+pub(crate) fn scrub_dns_credential_env_name(
+    command: &mut tokio::process::Command,
+    active_name: Option<&str>,
+    pending_store: Option<&Path>,
+) {
+    if let Some(cert_dir) = pending_store {
+        crate::custom_domain::refresh_pending_credential_child_scrub_in(cert_dir);
+    }
+    apply_dns_credential_env_scrub(command, active_name);
+}
+
+fn apply_dns_credential_env_scrub(
+    command: &mut tokio::process::Command,
+    active_name: Option<&str>,
+) {
+    let state = child_dns_credential_scrub_state()
+        .read()
+        .expect("DNS credential child scrub state poisoned");
+    let mut names = state.configured.iter().cloned().collect::<Vec<_>>();
+    let mut scrub_all = false;
+    for pending in state.pending_by_store.values() {
+        match pending {
+            PendingDnsCredentialScrub::Exact(name) => names.push(name.clone()),
+            PendingDnsCredentialScrub::AllDnsCredentials => scrub_all = true,
+        }
+    }
+    drop(state);
+    if let Some(name) = active_name {
+        names.push(name.to_string());
+    }
+    if scrub_all {
+        names.extend(
+            std::env::vars_os()
+                .filter_map(|(name, _)| name.into_string().ok())
+                .filter(|name| is_dns_credential_env(name)),
+        );
+        names.extend(
+            command
+                .as_std()
+                .get_envs()
+                .filter_map(|(name, _)| name.to_str().map(str::to_string))
+                .filter(|name| is_dns_credential_env(name)),
+        );
+    }
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        command.env_remove(name);
+    }
+}
+
+/// Spawn a supervised coding-agent process with durable DNS cleanup authority
+/// and its environment snapshot serialized under the shared authority lock.
+/// Lock/read failures set the conservative all-DNS scrub before spawning.
+pub(crate) fn spawn_with_dns_credential_scrub(
+    command: &mut tokio::process::Command,
+    active_name: Option<&str>,
+    pending_store: Option<&Path>,
+) -> std::io::Result<tokio::process::Child> {
+    match pending_store {
+        Some(cert_dir) => {
+            crate::custom_domain::with_pending_credential_child_scrub_in(cert_dir, || {
+                apply_dns_credential_env_scrub(command, active_name);
+                command.spawn()
+            })
+        }
+        None => {
+            apply_dns_credential_env_scrub(command, active_name);
+            command.spawn()
+        }
+    }
+}
+
+fn dns_credential_grant_notify() -> &'static tokio::sync::Notify {
+    static NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+fn dns_credential_grant_generation_counter() -> &'static AtomicU64 {
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    &GENERATION
+}
+
+/// Snapshot the monotonic DNS-lease grant generation immediately before a
+/// provider attempt. A later wait compares against this value so a grant
+/// racing the provider error cannot be lost before the waiter parks.
+pub(crate) fn dns_credential_grant_generation() -> u64 {
+    dns_credential_grant_generation_counter().load(Ordering::SeqCst)
+}
+
+/// Wait until either the retry horizon passes or a DNS credential lease is
+/// granted after `observed_generation`. Enabling the waiter before the second
+/// generation read closes both sides of the grant-before-park race.
+pub(crate) async fn wait_for_dns_credential_grant_after(
+    observed_generation: u64,
+    timeout: std::time::Duration,
+) -> bool {
+    let notified = dns_credential_grant_notify().notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if dns_credential_grant_generation() != observed_generation {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(timeout) => false,
+        _ = notified => true,
+    }
+}
+
+pub(crate) fn dns_credential_env_name(
+    configured: Option<&str>,
+    default: &str,
+    required_suffix: &str,
+) -> Result<String, String> {
+    let name = configured
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(default);
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err("custom-domain credential environment name is invalid".to_string());
+    }
+    let upper = name.to_ascii_uppercase();
+    if upper.starts_with("INTENDANT_") && !upper.eq_ignore_ascii_case(default) {
+        return Err(
+            "custom-domain credential environment names in the INTENDANT_ namespace must use the documented default"
+                .to_string(),
+        );
+    }
+    if !upper.ends_with(required_suffix) || !is_dns_credential_env(&upper) {
+        return Err(format!(
+            "custom-domain credential environment name must end in {required_suffix}"
+        ));
+    }
+    Ok(name.to_string())
 }
 
 fn env_kind(env_name: &str) -> Option<&'static str> {
@@ -373,11 +597,29 @@ fn kind_has_env_fallback(kind: &str) -> bool {
         // lease always means dry.
         _ => &[],
     };
-    names.iter().any(|name| {
+    if names.iter().any(|name| {
         std::env::var(name)
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false)
-    })
+    }) {
+        return true;
+    }
+    dns_kind_has_env_fallback_with(
+        kind,
+        crate::connect_rendezvous::active_custom_domain_dns_fallback(),
+        |name| std::env::var(name).ok(),
+    )
+}
+
+fn dns_kind_has_env_fallback_with(
+    kind: &str,
+    fallback: Option<(&str, String)>,
+    lookup: impl FnOnce(&str) -> Option<String>,
+) -> bool {
+    let Some((fallback_kind, env_name)) = fallback else {
+        return false;
+    };
+    fallback_kind == kind && lookup(&env_name).is_some_and(|value| !value.trim().is_empty())
 }
 
 fn queue_dry_notice(kind: &str, label: &str) {
@@ -1004,6 +1246,10 @@ pub fn grant(
     // The sweep's filesystem half (staging + deletion of whatever this
     // grant's own sweep expired) runs only after the store lock is gone.
     run_deferred_cleanup(cleanup);
+    if result.is_ok() && kind.starts_with("dns:") {
+        dns_credential_grant_generation_counter().fetch_add(1, Ordering::SeqCst);
+        dns_credential_grant_notify().notify_waiters();
+    }
     result
 }
 
@@ -1233,7 +1479,201 @@ mod tests {
         store().write().unwrap().clear();
         tombstones().write().unwrap().clear();
         pending_materialization_cleanup().write().unwrap().clear();
+        *child_dns_credential_scrub_state().write().unwrap() =
+            DnsCredentialChildScrubState::default();
         leased_home_sessions().write().unwrap().clear();
+    }
+
+    #[test]
+    fn supervised_children_drop_only_the_active_dns_credential() {
+        let _guard = lock();
+        reset();
+        let mut command = tokio::process::Command::new("never-spawned");
+        command
+            .env("CLOUDFLARE_API_TOKEN", "default")
+            .env("OWNER_DNS_API_TOKEN", "custom")
+            .env("OTHER_TOOL_API_TOKEN", "unrelated")
+            .env("ORDINARY_CHILD_SETTING", "kept");
+        scrub_dns_credential_env_name(&mut command, Some("OWNER_DNS_API_TOKEN"), None);
+        let changes = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_os_string(),
+                    value.map(std::ffi::OsStr::to_os_string),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            changes.get(std::ffi::OsStr::new("CLOUDFLARE_API_TOKEN")),
+            Some(&Some(std::ffi::OsString::from("default")))
+        );
+        assert_eq!(
+            changes.get(std::ffi::OsStr::new("OWNER_DNS_API_TOKEN")),
+            Some(&None)
+        );
+        assert_eq!(
+            changes.get(std::ffi::OsStr::new("OTHER_TOOL_API_TOKEN")),
+            Some(&Some(std::ffi::OsString::from("unrelated")))
+        );
+        assert_eq!(
+            changes
+                .get(std::ffi::OsStr::new("ORDINARY_CHILD_SETTING"))
+                .and_then(Option::as_deref),
+            Some(std::ffi::OsStr::new("kept"))
+        );
+    }
+
+    #[test]
+    fn durable_dns_cleanup_credentials_remain_scrubbed_until_retired() {
+        let _guard = lock();
+        reset();
+        let dir = tempfile::tempdir().unwrap();
+        configure_pending_dns_credential_child_scrub(
+            dir.path(),
+            Ok(Some("OLD_DNS_API_TOKEN".to_string())),
+        );
+        configure_dns_credential_child_scrub(&crate::project::CustomDomainConfig::default());
+
+        let mut command = tokio::process::Command::new("never-spawned");
+        command
+            .env("OLD_DNS_API_TOKEN", "pending cleanup")
+            .env("CURRENT_DNS_API_TOKEN", "current")
+            .env("ORDINARY_CHILD_SETTING", "kept");
+        scrub_dns_credential_env_name(&mut command, Some("CURRENT_DNS_API_TOKEN"), None);
+        let changes = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_os_string(),
+                    value.map(std::ffi::OsStr::to_os_string),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            changes.get(std::ffi::OsStr::new("OLD_DNS_API_TOKEN")),
+            Some(&None)
+        );
+        assert_eq!(
+            changes.get(std::ffi::OsStr::new("CURRENT_DNS_API_TOKEN")),
+            Some(&None)
+        );
+        assert_eq!(
+            changes
+                .get(std::ffi::OsStr::new("ORDINARY_CHILD_SETTING"))
+                .and_then(Option::as_deref),
+            Some(std::ffi::OsStr::new("kept"))
+        );
+
+        configure_pending_dns_credential_child_scrub(dir.path(), Ok(None));
+        let mut after_cleanup = tokio::process::Command::new("never-spawned");
+        after_cleanup.env("OLD_DNS_API_TOKEN", "available again");
+        scrub_dns_credential_env_name(&mut after_cleanup, None, None);
+        assert_eq!(
+            after_cleanup
+                .as_std()
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new("OLD_DNS_API_TOKEN"))
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("available again"))
+        );
+
+        configure_pending_dns_credential_child_scrub(
+            dir.path(),
+            Err("journal is unreadable".to_string()),
+        );
+        let mut unreadable = tokio::process::Command::new("never-spawned");
+        unreadable.env("UNLISTED_DNS_API_TOKEN", "fail closed");
+        scrub_dns_credential_env_name(&mut unreadable, None, None);
+        assert_eq!(
+            unreadable
+                .as_std()
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new("UNLISTED_DNS_API_TOKEN"))
+                .and_then(|(_, value)| value),
+            None
+        );
+        configure_pending_dns_credential_child_scrub(dir.path(), Ok(None));
+    }
+
+    #[tokio::test]
+    async fn dns_lease_grant_wakes_waiting_certificate_work() {
+        let _guard = lock();
+        reset();
+        let observed_generation = dns_credential_grant_generation();
+        let waiter = tokio::spawn(wait_for_dns_credential_grant_after(
+            observed_generation,
+            std::time::Duration::from_secs(60),
+        ));
+        tokio::task::yield_now().await;
+        grant(
+            "dns:cloudflare",
+            "DNS",
+            "lease material",
+            None,
+            "owner",
+            "test",
+            Some(MIN_TTL_MS),
+            Some(0),
+        )
+        .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        reset();
+    }
+
+    #[tokio::test]
+    async fn dns_lease_grant_before_wait_registration_is_observed() {
+        let _guard = lock();
+        reset();
+        let observed_generation = dns_credential_grant_generation();
+        grant(
+            "dns:cloudflare",
+            "DNS",
+            "lease material",
+            None,
+            "owner",
+            "test",
+            Some(MIN_TTL_MS),
+            Some(0),
+        )
+        .unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_dns_credential_grant_after(
+                observed_generation,
+                std::time::Duration::from_secs(60),
+            ),
+        )
+        .await
+        .unwrap());
+        reset();
+    }
+
+    #[test]
+    fn dns_dry_notice_depends_on_the_exact_configured_fallback() {
+        let fallback = Some(("dns:cloudflare", "OWNER_DNS_API_TOKEN".to_string()));
+        assert!(dns_kind_has_env_fallback_with(
+            "dns:cloudflare",
+            fallback.clone(),
+            |name| (name == "OWNER_DNS_API_TOKEN").then(|| "token".to_string()),
+        ));
+        assert!(!dns_kind_has_env_fallback_with(
+            "dns:cloudflare",
+            fallback.clone(),
+            |_| Some("  ".to_string()),
+        ));
+        assert!(!dns_kind_has_env_fallback_with(
+            "dns:rfc2136",
+            fallback,
+            |_| Some("token".to_string()),
+        ));
     }
 
     /// Build a lease whose expiry anchor the test controls directly.

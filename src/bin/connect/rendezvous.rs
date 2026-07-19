@@ -696,6 +696,8 @@ fn apply_daemon_registration(
             last_registration_proof_unix_ms: registration_proof_unix_ms,
             route_link_revision: 0,
             last_unclaim_proof_unix_ms: None,
+            last_dns_mutation_unix_ms: None,
+            last_dns_mutation_fingerprint: None,
             registered_unix_ms: now,
             last_seen_unix_ms: now,
             updated_unix_ms: now,
@@ -2155,29 +2157,23 @@ pub(crate) async fn dns_publish(
     let name = zone
         .daemon_fqdn(&daemon_id)
         .ok_or_else(|| ApiError::bad_request("daemon id does not derive a DNS label"))?;
-    zone.set_daemon_addresses(&daemon_id, &addresses)
-        .map_err(ApiError::bad_request)?;
-    let now = now_unix_ms();
-    {
-        let mut store = state.store.lock().await;
-        store.dns_records.retain(|r| r.daemon_id != daemon_id);
-        if !addresses.is_empty() {
-            store.dns_records.push(DnsRecordEntry {
-                daemon_id: daemon_id.clone(),
-                addresses: addresses.iter().map(|ip| ip.to_string()).collect(),
-                updated_unix_ms: now,
-                via_relay: false,
-            });
-        }
-        audit(
-            &mut store,
-            "dns_publish",
-            daemon.owner_user_id,
-            Some(daemon_id.clone()),
-            json!({ "name": name, "addresses": addresses.len() }),
-        );
-        persist_locked(&state, &store).await?;
-    }
+    commit_dns_record_update(
+        Arc::clone(&state),
+        Arc::clone(&zone),
+        DnsRecordMutation {
+            daemon_id: daemon_id.clone(),
+            addresses: addresses.clone(),
+            via_relay: false,
+            issued_at_unix_ms: body.issued_at_unix_ms,
+            request_fingerprint: dns_mutation_fingerprint(DNS_PUBLISH_PROTOCOL, &addresses_csv),
+            audit: DnsRecordAudit {
+                event: "dns_publish",
+                user_id: daemon.owner_user_id,
+                detail: json!({ "name": name, "addresses": addresses.len() }),
+            },
+        },
+    )
+    .await?;
     Ok(Json(json!({
         "ok": true,
         "zone": zone.origin_utf8(),
@@ -2375,6 +2371,8 @@ mod tests {
             last_registration_proof_unix_ms: None,
             route_link_revision: 0,
             last_unclaim_proof_unix_ms: None,
+            last_dns_mutation_unix_ms: None,
+            last_dns_mutation_fingerprint: None,
             registered_unix_ms: 1,
             last_seen_unix_ms: 1,
             updated_unix_ms: 1,

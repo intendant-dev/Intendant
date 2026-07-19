@@ -33,6 +33,24 @@ pub(crate) use transcripts::*;
 
 pub(crate) static SESSION_SEARCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// Holds the process-wide deep-search admission slot until the blocking scan
+/// itself exits. Keeping the reset guard inside the blocking closure prevents
+/// aborting an async response wrapper from either leaking the slot forever or
+/// releasing it while detached scan work is still running.
+pub(crate) struct SessionSearchInFlightGuard;
+
+impl SessionSearchInFlightGuard {
+    pub(crate) fn try_acquire() -> Option<Self> {
+        (!SESSION_SEARCH_IN_FLIGHT.swap(true, Ordering::SeqCst)).then_some(Self)
+    }
+}
+
+impl Drop for SessionSearchInFlightGuard {
+    fn drop(&mut self) {
+        SESSION_SEARCH_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
+
 pub(crate) static EXTERNAL_TRANSCRIPT_CACHE: OnceLock<
     Mutex<HashMap<String, ExternalTranscriptCacheEntry>>,
 > = OnceLock::new();
@@ -2623,6 +2641,7 @@ pub(crate) fn send_session_stream_rows(
 pub(crate) fn stream_sessions_lines(
     requested_limit: Option<usize>,
     tx: tokio::sync::mpsc::Sender<String>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) {
     stream_sessions_lines_from_home(
         &crate::platform::home_dir(),
@@ -2633,6 +2652,7 @@ pub(crate) fn stream_sessions_lines(
                 .unwrap_or_else(cached_list_sessions)
         },
         tx,
+        cancellation,
     )
 }
 
@@ -2646,7 +2666,11 @@ pub(crate) fn stream_sessions_lines_from_home(
     requested_limit: Option<usize>,
     hydrated_body: impl FnOnce() -> Arc<str>,
     tx: tokio::sync::mpsc::Sender<String>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) {
+    if cancellation.is_cancelled() {
+        return;
+    }
     let quick_limit = requested_limit
         .unwrap_or(SESSION_LIST_LIMIT)
         .min(SESSION_LIST_STREAM_QUICK_LIMIT);
@@ -2666,11 +2690,20 @@ pub(crate) fn stream_sessions_lines_from_home(
         home,
         quick_limit,
     ));
+    if cancellation.is_cancelled() {
+        return;
+    }
     quick_rows.extend(list_codex_index_skeleton_sessions_with_limit(
         home,
         quick_limit,
     ));
+    if cancellation.is_cancelled() {
+        return;
+    }
     merge_quick_session_rows_with_wrapper_index(home, &mut quick_rows);
+    if cancellation.is_cancelled() {
+        return;
+    }
     sort_sessions_newest_first(&mut quick_rows);
     truncate_sessions_preserving_sources_to(&mut quick_rows, quick_limit);
     if !send_session_stream_rows(&tx, quick_rows, true) {
@@ -2686,7 +2719,13 @@ pub(crate) fn stream_sessions_lines_from_home(
         return;
     }
 
+    if cancellation.is_cancelled() {
+        return;
+    }
     let body = hydrated_body();
+    if cancellation.is_cancelled() {
+        return;
+    }
     let rows = serde_json::from_str::<Vec<serde_json::Value>>(&body).unwrap_or_default();
     let _ = send_session_stream_event(
         &tx,

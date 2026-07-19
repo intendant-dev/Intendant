@@ -24,6 +24,51 @@ function hostedControlB64u(bytes) {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
+function hostedControlB64uToBuffer(value) {
+  const text = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+  const padded = text.padEnd(Math.ceil(text.length / 4) * 4, '=');
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+function hostedControlPublicKeyOptions(start) {
+  const source = start?.options?.publicKey || start?.options;
+  if (!source) throw new Error('The daemon returned no WebAuthn options');
+  const options = structuredClone(source);
+  options.challenge = hostedControlB64uToBuffer(options.challenge);
+  if (options.user?.id) options.user.id = hostedControlB64uToBuffer(options.user.id);
+  for (const credential of options.excludeCredentials || []) {
+    credential.id = hostedControlB64uToBuffer(credential.id);
+  }
+  for (const credential of options.allowCredentials || []) {
+    credential.id = hostedControlB64uToBuffer(credential.id);
+  }
+  return options;
+}
+
+function hostedControlRegistrationCredential(credential) {
+  return {
+    id: credential.id,
+    clientDataJSON: hostedControlB64u(credential.response.clientDataJSON),
+    attestationObject: hostedControlB64u(credential.response.attestationObject),
+    transports: credential.response.getTransports ? credential.response.getTransports() : [],
+  };
+}
+
+function hostedControlAuthenticationCredential(credential) {
+  return {
+    id: credential.id,
+    clientDataJSON: hostedControlB64u(credential.response.clientDataJSON),
+    authenticatorData: hostedControlB64u(credential.response.authenticatorData),
+    signature: hostedControlB64u(credential.response.signature),
+    userHandle: credential.response.userHandle
+      ? hostedControlB64u(credential.response.userHandle)
+      : null,
+  };
+}
+
 function hostedControlRandomNonce() {
   const bytes = new Uint8Array(24);
   crypto.getRandomValues(bytes);
@@ -107,11 +152,12 @@ function hostedControlEnsureGate() {
           <input id="hosted-control-label" maxlength="96" autocomplete="off">
         </label>
       </div>
-      <p><strong>Confirm on a signed app, the direct-mTLS dashboard, or the
+      <p id="hosted-control-confirmation"><strong>Confirm on a signed app, the direct-mTLS dashboard, or the
       daemon's local console.</strong> A different device is recommended, not
       required. On borrowed hardware, use cross-device WebAuthn (QR/hybrid) so
       your passkey stays on your phone.</p>
       <div class="hosted-control-actions">
+        <button class="primary" id="hosted-control-passkey" type="button" hidden>Use passkey</button>
         <button class="primary" id="hosted-control-request" type="button">Request lease</button>
       </div>
       <div class="hosted-control-status" id="hosted-control-status" role="status"
@@ -227,7 +273,11 @@ function hostedControlPathNeedsProof(url) {
       || path === '/api/hosted-control/requests/poll'
       || path === '/api/hosted-control/anchor-decisions'
       || path === '/api/hosted-control/certificate-ledger'
-      || path === '/api/hosted-control/witness-reports') {
+      || path === '/api/hosted-control/witness-reports'
+      || path === '/api/hosted-control/passkey/start'
+      || path === '/api/hosted-control/passkey/finish'
+      || path === '/api/hosted-control/passkey/register/start'
+      || path === '/api/hosted-control/passkey/register/finish') {
     return false;
   }
   return true;
@@ -293,6 +343,55 @@ async function hostedControlPrepare() {
     await new Promise(() => {});
   }
   hostedControlBootstrap = body;
+  const enrollmentParams = new URLSearchParams(
+    location.hash.startsWith('#') ? location.hash.slice(1) : location.hash,
+  );
+  const enrollmentToken = enrollmentParams.get('passkey_enroll');
+  if (body.custom_domain && enrollmentToken) {
+    history.replaceState(null, '', `${location.pathname}${location.search}`);
+    const enrollmentGate = hostedControlEnsureGate();
+    enrollmentGate.hidden = false;
+    hostedControlSetGateStatus('Preparing passkey enrollment…');
+    try {
+      const startResponse = await hostedControlNativeFetch(
+        '/api/hosted-control/passkey/register/start',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ token: enrollmentToken }),
+          cache: 'no-store',
+        },
+      );
+      const start = await startResponse.json().catch(() => ({}));
+      if (!startResponse.ok) {
+        throw new Error(start.error || `Passkey enrollment failed (${startResponse.status})`);
+      }
+      hostedControlSetGateStatus('Waiting for the new passkey…');
+      const credential = await navigator.credentials.create({
+        publicKey: hostedControlPublicKeyOptions(start),
+      });
+      const finishResponse = await hostedControlNativeFetch(
+        '/api/hosted-control/passkey/register/finish',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            flow_id: start.flow_id,
+            credential: hostedControlRegistrationCredential(credential),
+          }),
+          cache: 'no-store',
+        },
+      );
+      const finish = await finishResponse.json().catch(() => ({}));
+      if (!finishResponse.ok) {
+        throw new Error(finish.error || `Passkey enrollment failed (${finishResponse.status})`);
+      }
+      body.passkey_available = true;
+      hostedControlSetGateStatus('Passkey registered. Choose the access you want to borrow.');
+    } catch (error) {
+      hostedControlSetGateStatus(error?.message || String(error), true);
+    }
+  }
   hostedControlKeyPair = await crypto.subtle.generateKey(
     { name: 'ECDSA', namedCurve: 'P-256' },
     false,
@@ -316,7 +415,13 @@ async function hostedControlPrepare() {
         : 'The owner kept the lane available for the currently displayed certificate evidence.';
   }
   document.getElementById('hosted-control-summary').textContent =
-    `Certificate witnesses shorten the detection window. The lease ceiling and immutable floor bound what the hosted lane can do. ${body.daemon_label || body.daemon_id} will mint only the preset you request, up to ${body.ceiling}.`;
+    body.custom_domain
+      ? `This user-owned name binds WebAuthn to ${body.rp_id}. The daemon will mint only the preset you request, up to ${body.ceiling}; the immutable floor remains unavailable on this public lane.`
+      : `Certificate witnesses shorten the detection window. The lease ceiling and immutable floor bound what the hosted lane can do. ${body.daemon_label || body.daemon_id} will mint only the preset you request, up to ${body.ceiling}.`;
+  if (body.custom_domain) {
+    document.getElementById('hosted-control-confirmation').innerHTML =
+      '<strong>Use your passkey for immediate bounded access.</strong> On borrowed hardware, choose cross-device WebAuthn (QR/hybrid) so the credential stays on your phone. The trusted direct dashboard remains the place for root administration.';
+  }
   document.getElementById('hosted-control-daemon').textContent =
     `daemon ${body.daemon_id}\nidentity ${body.daemon_public_key}`;
   if (guardStatus === 'suspended') {
@@ -351,22 +456,85 @@ async function hostedControlPrepare() {
   }
   ttlSelect.value = String(preferredTtl);
 
+  const buildInput = async () => {
+    const input = {
+      browser_public_key: publicKey,
+      requested_preset: presetSelect.value,
+      requested_ttl_secs: Number(ttlSelect.value),
+      requester_label: label.value.trim(),
+      nonce: hostedControlRandomNonce(),
+      timestamp_unix_ms: Date.now(),
+      signature: '',
+    };
+    if (!input.requester_label) throw new Error('Name this browser first');
+    input.signature = await hostedControlSign(hostedControlDoorbellPayload(input));
+    return input;
+  };
+  const activateLease = lease => {
+    hostedControlValidateLease(lease, publicKey);
+    hostedControlLease = lease;
+    hostedControlInstallFetch();
+    hostedControlApplySurface();
+    gate.hidden = true;
+  };
+
   await new Promise(resolve => {
-    document.getElementById('hosted-control-request').onclick = async event => {
+    const passkeyButton = document.getElementById('hosted-control-passkey');
+    passkeyButton.hidden = !(body.custom_domain && body.passkey_available);
+    passkeyButton.onclick = async event => {
       const button = event.currentTarget;
       button.disabled = true;
       try {
-        const input = {
-          browser_public_key: publicKey,
-          requested_preset: presetSelect.value,
-          requested_ttl_secs: Number(ttlSelect.value),
-          requester_label: label.value.trim(),
+        const input = await buildInput();
+        hostedControlSetGateStatus('Waiting for your passkey…');
+        const startResponse = await hostedControlNativeFetch('/api/hosted-control/passkey/start', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ request: input }),
+          cache: 'no-store',
+        });
+        const start = await startResponse.json().catch(() => ({}));
+        if (!startResponse.ok) {
+          throw new Error(start.error || `Passkey start failed (${startResponse.status})`);
+        }
+        const credential = await navigator.credentials.get({
+          publicKey: hostedControlPublicKeyOptions(start),
+        });
+        const refreshed = {
+          ...input,
           nonce: hostedControlRandomNonce(),
           timestamp_unix_ms: Date.now(),
           signature: '',
         };
-        if (!input.requester_label) throw new Error('Name this browser first');
-        input.signature = await hostedControlSign(hostedControlDoorbellPayload(input));
+        refreshed.signature = await hostedControlSign(hostedControlDoorbellPayload(refreshed));
+        const finishResponse = await hostedControlNativeFetch('/api/hosted-control/passkey/finish', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            flow_id: start.flow_id,
+            credential: hostedControlAuthenticationCredential(credential),
+            nonce: refreshed.nonce,
+            timestamp_unix_ms: refreshed.timestamp_unix_ms,
+            signature: refreshed.signature,
+          }),
+          cache: 'no-store',
+        });
+        const finish = await finishResponse.json().catch(() => ({}));
+        if (!finishResponse.ok || !finish.lease) {
+          throw new Error(finish.error || `Passkey finish failed (${finishResponse.status})`);
+        }
+        activateLease(finish.lease);
+        resolve();
+      } catch (error) {
+        hostedControlSetGateStatus(error?.message || String(error), true);
+        button.disabled = false;
+      }
+    };
+    document.getElementById('hosted-control-request').onclick = async event => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const input = await buildInput();
         const create = await hostedControlNativeFetch('/api/hosted-control/requests', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -380,11 +548,7 @@ async function hostedControlPrepare() {
         key.textContent = `request ${request.request_id}\nkey ${request.browser_key_fingerprint}\npreset ${request.requested_preset} · ${request.requested_ttl_secs}s`;
         hostedControlSetGateStatus('Awaiting confirmation on a trusted surface…');
         const lease = await hostedControlPoll(request);
-        hostedControlValidateLease(lease, publicKey);
-        hostedControlLease = lease;
-        hostedControlInstallFetch();
-        hostedControlApplySurface();
-        gate.hidden = true;
+        activateLease(lease);
         resolve();
       } catch (error) {
         hostedControlSetGateStatus(error?.message || String(error), true);
@@ -514,6 +678,19 @@ function hostedControlRenderManagementCard() {
       return;
     }
     mount.dataset.hostedControlRenderKey = renderKey;
+    const custom = state.custom_domain || null;
+    if (!state.policy) {
+      mount.innerHTML = `<div class="acc-section-head">
+        <div class="acc-section-title">Hosted control</div>
+        <div class="acc-section-sub">The custom-domain configuration could not initialize.</div>
+      </div><div class="hosted-control-mgmt-section">
+        <strong>Your fleet, your name</strong>
+        <div class="hosted-control-status error">${hostedControlEscape(
+          custom?.initialization_error || 'Hosted control is unavailable',
+        )}</div>
+      </div>`;
+      return;
+    }
     const presetRank = { view: 0, tasks: 1, operate: 2 };
     const pending = (state.pending_requests || []).map(request => {
       const options = ['view', 'tasks', 'operate']
@@ -592,6 +769,38 @@ function hostedControlRenderManagementCard() {
         <time>${hostedControlEscape(new Date(Number(record.received_unix_ms)).toLocaleString())}</time>
       </div>`;
     }).join('') || '<p>No witness reports.</p>';
+    const customPasskeys = (custom?.passkeys || []).map(passkey =>
+      `<div class="hosted-control-mgmt-row">
+        <span><strong>${hostedControlEscape(passkey.label)}</strong>
+        · ${hostedControlEscape(passkey.credential_id.slice(0, 16))}…</span>
+        <button data-custom-passkey-revoke="${hostedControlEscape(passkey.credential_id)}">Revoke</button>
+      </div>`).join('') || '<p>No passkeys registered.</p>';
+    const customExpiry = custom?.certificate_not_after_unix_ms
+      ? new Date(Number(custom.certificate_not_after_unix_ms)).toLocaleString()
+      : 'Not issued';
+    const customSection = custom?.configured ? `<div class="hosted-control-mgmt-section">
+      <strong>Your fleet, your name</strong>
+      <div><strong>Name:</strong> ${hostedControlEscape(custom.name || 'Invalid configuration')}</div>
+      <div><strong>WebAuthn rp_id:</strong> ${hostedControlEscape(custom.rp_id || 'Unavailable')}</div>
+      <div><strong>DNS provider:</strong> ${hostedControlEscape(custom.dns_provider || 'Not configured')}</div>
+      <div><strong>ACME issuance:</strong>
+        ${custom.acme_issuance_enabled ? 'enabled' : 'waiting for CAA confirmation in config'}</div>
+      <div><strong>Certificate:</strong> ${hostedControlEscape(custom.certificate_state)}
+        · ${hostedControlEscape(customExpiry)}</div>
+      ${custom.initialization_error
+        ? `<div class="hosted-control-status error">${hostedControlEscape(custom.initialization_error)}</div>`
+        : ''}
+      <div><strong>ACME account URI:</strong>
+        <code>${hostedControlEscape(custom.acme_account_uri || 'Pending first certificate check')}</code></div>
+      <p>After the account URI appears, pin CAA to that account with DNS-01 before relying on
+      this lane. The custom-domain guide includes the exact record.</p>
+      <div><strong>Passkeys</strong>${customPasskeys}</div>
+      <div class="hosted-control-mgmt-row">
+        <input id="custom-passkey-label" maxlength="96" placeholder="Passkey label">
+        <button class="primary" id="custom-passkey-add"
+          ${custom.certificate_state === 'valid' ? '' : 'disabled'}>Add passkey</button>
+      </div>
+    </div>` : '';
     mount.innerHTML = `<div class="acc-section-head">
       <div class="acc-section-title">Hosted control</div>
       <div class="acc-section-sub">Daemon-minted, browser-key-bound leases. Feature:
@@ -599,6 +808,7 @@ function hostedControlRenderManagementCard() {
       Signed-app confirmation and witnessing are unavailable until a qualifying signed distribution ships.</div>
     </div>
     <div class="hosted-control-mgmt">
+      ${customSection}
       <div class="hosted-control-mgmt-section hosted-control-guard-section ${hostedControlEscape(guardStatus)}">
         <div class="hosted-control-guard-heading">
           <strong>Certificate guard</strong>
@@ -681,6 +891,49 @@ function hostedControlRenderManagementCard() {
       override.onclick = () => hostedControlManagementPost(
         '/api/access/hosted-control/witnesses/override',
         { evidence_sha256: guard.evidence_sha256 },
+      ).then(hostedControlRenderManagementCard)
+        .catch(error => showControlToast?.('error', error.message));
+    }
+    const addPasskey = mount.querySelector('#custom-passkey-add');
+    if (addPasskey) {
+      addPasskey.onclick = async () => {
+        addPasskey.disabled = true;
+        const enrollmentWindow = window.open('about:blank', '_blank');
+        if (enrollmentWindow) enrollmentWindow.opener = null;
+        try {
+          const label = mount.querySelector('#custom-passkey-label').value.trim();
+          const invitationResponse = await fetch(
+            '/api/access/hosted-control/passkeys/enrollment',
+            {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ label }),
+            },
+          );
+          const invitation = await invitationResponse.json().catch(() => ({}));
+          if (!invitationResponse.ok || !invitation.enrollment_url) {
+            throw new Error(
+              invitation.error || `Passkey enrollment failed (${invitationResponse.status})`,
+            );
+          }
+          if (enrollmentWindow) {
+            enrollmentWindow.location.replace(invitation.enrollment_url);
+          } else {
+            await navigator.clipboard.writeText(invitation.enrollment_url);
+            showControlToast?.('info', 'Enrollment link copied. Open it before it expires.');
+          }
+          addPasskey.disabled = false;
+        } catch (error) {
+          enrollmentWindow?.close();
+          showControlToast?.('error', error?.message || String(error));
+          addPasskey.disabled = false;
+        }
+      };
+    }
+    for (const button of mount.querySelectorAll('[data-custom-passkey-revoke]')) {
+      button.onclick = () => hostedControlManagementPost(
+        '/api/access/hosted-control/passkeys/revoke',
+        { credential_id: button.dataset.customPasskeyRevoke },
       ).then(hostedControlRenderManagementCard)
         .catch(error => showControlToast?.('error', error.message));
     }

@@ -16,6 +16,9 @@
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+
+const MAX_REMEMBERED_FLEET_SERVER_NAMES: usize =
+    crate::fleet_cert::FLEET_ORIGIN_PROVENANCE_MAX_NAMES;
 use std::task::{Context, Poll};
 
 use rustls::{RootCertStore, ServerConfig};
@@ -256,9 +259,7 @@ fn server_config_from(
         // fleet certificate (fleet_cert.rs) can be installed LIVE for its
         // SNI name — first issuance and every renewal apply without a daemon
         // restart.
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-            .map_err(|e| format!("rustls server key unusable: {e}"))?;
-        let base = Arc::new(rustls::sign::CertifiedKey::new(cert_chain, signing_key));
+        let base = checked_certified_key(cert_chain, key, "rustls server")?;
         fleet_sni_resolver().set_base(base);
         builder.with_cert_resolver(fleet_sni_resolver())
     } else {
@@ -281,6 +282,20 @@ fn server_config_from(
     Ok(config)
 }
 
+fn checked_certified_key(
+    cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+    description: &str,
+) -> Result<Arc<rustls::sign::CertifiedKey>, String> {
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+        .map_err(|e| format!("{description} key unusable: {e}"))?;
+    let certified_key = rustls::sign::CertifiedKey::new(cert_chain, signing_key);
+    certified_key
+        .keys_match()
+        .map_err(|e| format!("{description} certificate and key do not match: {e}"))?;
+    Ok(Arc::new(certified_key))
+}
+
 /// SNI-aware certificate resolver: the daemon's base certificate by
 /// default; the fleet certificate for requests naming the fleet name.
 /// Process-global so `fleet_cert.rs` can hot-swap certificates into the
@@ -289,11 +304,16 @@ fn server_config_from(
 pub struct FleetSniResolver {
     base: std::sync::RwLock<Option<Arc<rustls::sign::CertifiedKey>>>,
     fleet: std::sync::RwLock<Option<(String, Arc<rustls::sign::CertifiedKey>)>>,
+    custom: std::sync::RwLock<std::collections::HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
     // Never forget a name during this process. Accepted connections keep
     // their SNI for HTTP/1 keep-alive, and a hot fleet-name replacement must
     // not reclassify an already-open old-name connection as a pinned/direct
     // authority-bearing origin.
     fleet_names: std::sync::RwLock<std::collections::HashSet<String>>,
+    // User-owned names are a separate provenance class. Keep their history
+    // sticky for the same keep-alive/hot-reload reason as fleet names, without
+    // ever folding them into the service-controlled fleet-name set.
+    custom_names: std::sync::RwLock<std::collections::HashSet<String>>,
 }
 
 impl FleetSniResolver {
@@ -301,24 +321,65 @@ impl FleetSniResolver {
         *self.base.write().expect("tls resolver poisoned") = Some(key);
     }
 
-    fn set_fleet(&self, name: String, key: Arc<rustls::sign::CertifiedKey>) {
-        self.register_fleet_name(&name);
+    fn set_fleet(&self, name: String, key: Arc<rustls::sign::CertifiedKey>) -> Result<(), String> {
+        if !self.register_fleet_name(&name) {
+            return Err(
+                "fleet server-name history is full; refusing an unclassified certificate name"
+                    .to_string(),
+            );
+        }
         *self.fleet.write().expect("tls resolver poisoned") = Some((name, key));
+        Ok(())
     }
 
-    fn register_fleet_name(&self, name: &str) {
-        self.fleet_names
-            .write()
-            .expect("tls resolver poisoned")
-            .insert(name.trim().trim_end_matches('.').to_ascii_lowercase());
+    fn register_fleet_name(&self, name: &str) -> bool {
+        let normalized = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        let mut names = self.fleet_names.write().expect("tls resolver poisoned");
+        if names.contains(&normalized) {
+            return true;
+        }
+        if names.len() >= MAX_REMEMBERED_FLEET_SERVER_NAMES {
+            return false;
+        }
+        names.insert(normalized);
+        true
     }
 
     fn is_fleet_name(&self, name: &str) -> bool {
+        self.fleet_name(name).is_some()
+    }
+
+    fn fleet_name(&self, name: &str) -> Option<String> {
         let normalized = name.trim().trim_end_matches('.').to_ascii_lowercase();
         self.fleet_names
             .read()
             .expect("tls resolver poisoned")
             .contains(&normalized)
+            .then_some(normalized)
+    }
+
+    fn set_custom(&self, name: String, key: Arc<rustls::sign::CertifiedKey>) {
+        self.register_custom_name(&name);
+        self.custom
+            .write()
+            .expect("tls resolver poisoned")
+            .insert(name, key);
+    }
+
+    fn register_custom_name(&self, name: &str) {
+        self.custom_names
+            .write()
+            .expect("tls resolver poisoned")
+            .insert(name.trim().trim_end_matches('.').to_ascii_lowercase());
+    }
+
+    fn custom_name(&self, name: &str) -> Option<String> {
+        let normalized = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        self.custom_names
+            .read()
+            .expect("tls resolver poisoned")
+            .contains(&normalized)
+            .then_some(normalized)
     }
 }
 
@@ -328,6 +389,15 @@ impl rustls::server::ResolvesServerCert for FleetSniResolver {
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         if let Some(server_name) = client_hello.server_name() {
+            let normalized = server_name.trim_end_matches('.').to_ascii_lowercase();
+            if let Some(key) = self
+                .custom
+                .read()
+                .expect("tls resolver poisoned")
+                .get(&normalized)
+            {
+                return Some(key.clone());
+            }
             let fleet = self.fleet.read().expect("tls resolver poisoned");
             if let Some((name, key)) = fleet.as_ref() {
                 if server_name.eq_ignore_ascii_case(name) {
@@ -357,11 +427,31 @@ pub fn is_fleet_server_name(name: Option<&str>) -> bool {
     name.is_some_and(|name| fleet_sni_resolver().is_fleet_name(name))
 }
 
+/// Return the exact normalized public fleet/WebPKI SNI captured at the TLS
+/// boundary. HTTP authority checks retain the name, not just its class, so a
+/// mutable `Host` header cannot move a lease between public-origin lanes.
+pub fn fleet_server_name(name: Option<&str>) -> Option<String> {
+    name.and_then(|name| fleet_sni_resolver().fleet_name(name))
+}
+
 /// Remember a rendezvous-assigned fleet route before certificate issuance.
 /// Classification follows service-controlled name provenance, not whichever
 /// certificate happens to be active at the moment.
-pub fn register_fleet_server_name(name: &str) {
-    fleet_sni_resolver().register_fleet_name(name);
+pub fn register_fleet_server_name(name: &str) -> bool {
+    fleet_sni_resolver().register_fleet_name(name)
+}
+
+/// Whether an accepted TLS connection named a configured user-owned origin.
+/// The exact SNI captured at the TLS boundary is returned for the HTTP
+/// Host/Origin match; no mutable HTTP header can create this provenance.
+pub fn custom_domain_server_name(name: Option<&str>) -> Option<String> {
+    name.and_then(|name| fleet_sni_resolver().custom_name(name))
+}
+
+/// Remember a configured user-owned name before certificate issuance. This
+/// keeps the name in its own public-origin class while ACME is pending.
+pub fn register_custom_domain_server_name(name: &str) {
+    fleet_sni_resolver().register_custom_name(name);
 }
 
 /// Install (or replace) the fleet certificate served for `name` —
@@ -372,6 +462,17 @@ pub fn install_fleet_certificate(
     cert_chain_pem: &str,
     key_pem: &str,
 ) -> Result<(), String> {
+    let certified_key = checked_fleet_certificate(cert_chain_pem, key_pem)?;
+    fleet_sni_resolver().set_fleet(
+        name.trim().trim_end_matches('.').to_ascii_lowercase(),
+        certified_key,
+    )
+}
+
+fn checked_fleet_certificate(
+    cert_chain_pem: &str,
+    key_pem: &str,
+) -> Result<Arc<rustls::sign::CertifiedKey>, String> {
     use rustls::pki_types::pem::PemObject;
     let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
         rustls::pki_types::CertificateDer::pem_slice_iter(cert_chain_pem.as_bytes())
@@ -382,13 +483,53 @@ pub fn install_fleet_certificate(
     }
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
         .map_err(|e| format!("parse fleet key: {e}"))?;
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-        .map_err(|e| format!("fleet key unusable: {e}"))?;
-    fleet_sni_resolver().set_fleet(
+    checked_certified_key(cert_chain, key, "fleet")
+}
+
+pub(crate) fn validate_fleet_certificate_key_pair(
+    cert_chain_pem: &str,
+    key_pem: &str,
+) -> Result<(), String> {
+    checked_fleet_certificate(cert_chain_pem, key_pem).map(|_| ())
+}
+
+/// Install (or replace) the certificate for one exact user-owned name. Custom
+/// names use a separate resolver map and provenance set from fleet names.
+pub fn install_custom_domain_certificate(
+    name: &str,
+    cert_chain_pem: &str,
+    key_pem: &str,
+) -> Result<(), String> {
+    let certified_key = checked_custom_domain_certificate(cert_chain_pem, key_pem)?;
+    fleet_sni_resolver().set_custom(
         name.trim().trim_end_matches('.').to_ascii_lowercase(),
-        Arc::new(rustls::sign::CertifiedKey::new(cert_chain, signing_key)),
+        certified_key,
     );
     Ok(())
+}
+
+fn checked_custom_domain_certificate(
+    cert_chain_pem: &str,
+    key_pem: &str,
+) -> Result<Arc<rustls::sign::CertifiedKey>, String> {
+    use rustls::pki_types::pem::PemObject;
+    let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_slice_iter(cert_chain_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("parse custom-domain certificate: {e}"))?;
+    if cert_chain.is_empty() {
+        return Err("custom-domain certificate PEM holds no certificates".to_string());
+    }
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+        .map_err(|e| format!("parse custom-domain key: {e}"))?;
+    checked_certified_key(cert_chain, key, "custom-domain")
+}
+
+pub(crate) fn validate_custom_domain_certificate_key_pair(
+    cert_chain_pem: &str,
+    key_pem: &str,
+) -> Result<(), String> {
+    checked_custom_domain_certificate(cert_chain_pem, key_pem).map(|_| ())
 }
 
 pub fn load_ca_roots(ca_path: &std::path::Path) -> Result<RootCertStore, String> {
@@ -624,6 +765,93 @@ mod tests {
         assert!(is_fleet_server_name(Some(second_name)));
         assert!(is_fleet_server_name(Some("OLD-FLEET-ORIGIN.TEST.")));
         assert!(!is_fleet_server_name(Some("direct-daemon.test")));
+        assert_eq!(
+            fleet_server_name(Some("OLD-FLEET-ORIGIN.TEST.")),
+            Some(first_name.to_string())
+        );
+        assert_eq!(fleet_server_name(Some("direct-daemon.test")), None);
+    }
+
+    #[test]
+    fn fleet_origin_classification_history_is_bounded() {
+        let resolver = FleetSniResolver::default();
+        for index in 0..MAX_REMEMBERED_FLEET_SERVER_NAMES {
+            assert!(resolver.register_fleet_name(&format!("d-{index:020x}.fleet.example.test")));
+        }
+        assert_eq!(
+            resolver
+                .fleet_names
+                .read()
+                .expect("tls resolver poisoned")
+                .len(),
+            MAX_REMEMBERED_FLEET_SERVER_NAMES
+        );
+        assert!(!resolver.register_fleet_name("d-ffffffffffffffffffff.overflow.fleet.example.test"));
+        assert_eq!(
+            resolver
+                .fleet_names
+                .read()
+                .expect("tls resolver poisoned")
+                .len(),
+            MAX_REMEMBERED_FLEET_SERVER_NAMES
+        );
+        assert!(
+            resolver.register_fleet_name("D-00000000000000000000.FLEET.EXAMPLE.TEST."),
+            "an already remembered name remains admissible at the cap"
+        );
+    }
+
+    #[test]
+    fn custom_and_fleet_origin_classes_remain_distinct_and_sticky() {
+        let fleet = "d-separate.fleet.example.test";
+        let custom = "box.owner.example";
+        register_fleet_server_name(fleet);
+        register_custom_domain_server_name(custom);
+
+        assert!(is_fleet_server_name(Some(fleet)));
+        assert!(!is_fleet_server_name(Some(custom)));
+        assert_eq!(
+            custom_domain_server_name(Some("BOX.OWNER.EXAMPLE.")),
+            Some(custom.to_string())
+        );
+        assert_eq!(custom_domain_server_name(Some(fleet)), None);
+    }
+
+    #[test]
+    fn custom_domain_certificate_must_match_its_private_key() {
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["mismatch.example.test".to_string()]).unwrap();
+        let other =
+            rcgen::generate_simple_self_signed(vec!["other.example.test".to_string()]).unwrap();
+        let error = install_custom_domain_certificate(
+            "mismatch.example.test",
+            &certificate.cert.pem(),
+            &other.signing_key.serialize_pem(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("custom-domain certificate and key do not match"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn fleet_certificate_must_match_its_private_key() {
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["d-mismatch.fleet.example.test".to_string()])
+                .unwrap();
+        let other =
+            rcgen::generate_simple_self_signed(vec!["other.example.test".to_string()]).unwrap();
+        let error = install_fleet_certificate(
+            "d-mismatch.fleet.example.test",
+            &certificate.cert.pem(),
+            &other.signing_key.serialize_pem(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("fleet certificate and key do not match"),
+            "{error}"
+        );
     }
 
     #[test]

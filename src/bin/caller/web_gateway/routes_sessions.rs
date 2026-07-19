@@ -4014,10 +4014,16 @@ pub(crate) async fn handle_mc_fission(
 /// CORS echo at render time; nothing is baked here.
 pub(crate) fn sessions_stream_api_response(requested_limit: Option<usize>) -> ApiResponse {
     let (tx, lines) = tokio::sync::mpsc::channel::<String>(64);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let producer_cancellation = cancellation.clone();
     let source = tokio::task::spawn_blocking(move || {
-        stream_sessions_lines(requested_limit, tx);
+        stream_sessions_lines(requested_limit, tx, producer_cancellation);
     });
-    sessions_stream_api_response_from(LineStream { lines, source })
+    sessions_stream_api_response_from(LineStream {
+        lines,
+        source,
+        cancellation,
+    })
 }
 
 /// The stream envelope over an already-running line source — the
@@ -4103,8 +4109,9 @@ pub(crate) fn sessions_search_stream_api_response(
     cancel: tokio_util::sync::CancellationToken,
 ) -> ApiResponse {
     let (tx, lines) = tokio::sync::mpsc::channel::<String>(64);
+    let producer_cancellation = cancel.clone();
     let source = tokio::spawn(async move {
-        if SESSION_SEARCH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        let Some(in_flight) = SessionSearchInFlightGuard::try_acquire() else {
             let busy = serde_json::json!({
                 "error": "Another deep session search is already running. Wait for it to finish before starting a new one.",
                 "busy": true,
@@ -4112,9 +4119,10 @@ pub(crate) fn sessions_search_stream_api_response(
             .to_string();
             let _ = tx.send(busy + "\n").await;
             return;
-        }
+        };
         let progress_tx = tx.clone();
         let join = tokio::task::spawn_blocking(move || {
+            let _in_flight = in_flight;
             let home_path = crate::platform::home_dir();
             let mut on_progress = |progress: DeepSearchProgress| {
                 let line = serde_json::json!({
@@ -4127,7 +4135,7 @@ pub(crate) fn sessions_search_stream_api_response(
                     + "\n";
                 if progress_tx.blocking_send(line).is_err() {
                     // Receiver gone (client hung up): stop scanning.
-                    cancel.cancel();
+                    producer_cancellation.cancel();
                 }
             };
             session_log_search_from_home_with_progress(
@@ -4136,12 +4144,11 @@ pub(crate) fn sessions_search_stream_api_response(
                 &source_filter,
                 &mode,
                 &project_filter,
-                &cancel,
+                &producer_cancellation,
                 &mut on_progress,
             )
         })
         .await;
-        SESSION_SEARCH_IN_FLIGHT.store(false, Ordering::SeqCst);
         let body = match join {
             Ok(body) => body,
             Err(e) => serde_json::json!({
@@ -4158,7 +4165,11 @@ pub(crate) fn sessions_search_stream_api_response(
             ("Cache-Control", "no-cache".to_string()),
             ("Connection", "close".to_string()),
         ],
-        stream: LineStream { lines, source },
+        stream: LineStream {
+            lines,
+            source,
+            cancellation: cancel,
+        },
     }
 }
 

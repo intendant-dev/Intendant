@@ -23,8 +23,8 @@
 //! fleet SNI to a daemon does not change how the daemon classifies that
 //! connection — it still arrives bearing the fleet SNI, which the daemon
 //! gateway treats as discovery-only exactly as it does today. Abuse is bounded
-//! by per-source-IP and per-tunnel connection caps, a per-connection byte cap,
-//! and idle teardown.
+//! by pre-demux global and per-source-IP connection caps, a per-tunnel
+//! connection cap, a per-connection byte cap, and idle teardown.
 //!
 //! All of this is dark by default and gated behind the `--relay-*` config
 //! group (all-or-nothing, mirroring the `--dns-*` group).
@@ -33,13 +33,19 @@ use super::*;
 
 use std::net::IpAddr;
 use std::sync::Mutex as StdMutex;
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
 /// Daemon-signed control-channel protocol tag. The daemon long-polls this
 /// endpoint to receive dial-back requests; the signature proves the poll comes
 /// from the registered identity key, mirroring the fleet-DNS publish auth.
-pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v1";
+pub(crate) const RELAY_CONTROL_PROTOCOL_V1: &str = "intendant-connect-relay-control-v1";
+pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v2";
+pub(crate) const RELAY_DISCONNECT_PROTOCOL: &str = "intendant-connect-relay-disconnect-v1";
+const RELAY_NAME_PROOF_PROTOCOL: &str = "intendant-connect-relay-name-proof-v1";
+const RELAY_MAX_SERVER_NAMES: usize = 8;
+const RELAY_NAME_PROOF_CHAIN_MAX_BYTES: usize = 128 * 1024;
+const RELAY_NAME_PROOF_CHAIN_MAX_CERTS: usize = 8;
 /// Daemon-signed DNS relay-mode protocol tag: "answer my fleet label with the
 /// relay's address instead of my own".
 pub(crate) const DNS_RELAY_PROTOCOL: &str = "intendant-connect-dns-relay-v1";
@@ -57,16 +63,22 @@ const DIALBACK_HELLO_MAX_BYTES: usize = 160;
 /// one deadline for the whole read — a per-read timeout resets on every
 /// byte, so a byte-at-a-time writer could otherwise hold the connection for
 /// timeout × byte cap.
+#[cfg(test)]
 const DIALBACK_HELLO_DEADLINE: Duration = RELAY_DIALBACK_TIMEOUT;
 
-/// Max concurrent relay connections accepted from one source IP (browser
-/// side). Bounds a single abusive client; daemon dial-back connections are
-/// nonce-gated and exempt.
+/// Max concurrent relay connections accepted in total. Admission happens
+/// before the first byte is inspected, so silent and malformed sockets count.
+pub(crate) const RELAY_MAX_CONNS_GLOBAL: u32 = 4096;
+/// Max concurrent relay connections accepted from one source IP. Browser,
+/// daemon dial-back, silent, and malformed sockets all count.
 pub(crate) const RELAY_MAX_CONNS_PER_IP: u32 = 64;
 /// Max concurrent spliced browser connections routed into one daemon tunnel.
 pub(crate) const RELAY_MAX_CONNS_PER_TUNNEL: u32 = 128;
 /// Max unclaimed dial-back nonces queued for one tunnel's control poll.
 pub(crate) const RELAY_MAX_PENDING_PER_TUNNEL: usize = 64;
+/// Max independently proved v2 pollers retained for one daemon label. Poller
+/// state is process-scoped, so bound it separately from the daemon registry.
+const RELAY_MAX_EXACT_POLLERS_PER_TUNNEL: usize = 16;
 /// Idle teardown: a spliced connection with no bytes in either direction for
 /// this long is closed.
 pub(crate) const RELAY_SPLICE_IDLE: Duration = Duration::from_secs(120);
@@ -250,11 +262,54 @@ fn sni_route_label(sni: &str) -> Option<String> {
 
 // ── Relay state ─────────────────────────────────────────────────────────────
 
-/// A daemon's live control-channel presence plus its queue of unclaimed
-/// dial-back nonces.
-struct TunnelEntry {
+struct ExactTunnelSession {
     last_seen_unix_ms: u64,
-    pending: VecDeque<String>,
+    pending: VecDeque<PendingDialback>,
+    notify: Arc<Notify>,
+    server_names: Vec<String>,
+}
+
+/// A daemon label's legacy-v1 fallback presence plus independently proved v2
+/// pollers. Exact pollers can also serve the daemon-label fallback, but their
+/// liveness must not overwrite the legacy timestamp: a signed v2 disconnect
+/// removes only that exact session while a rolling v1 sibling remains live.
+struct TunnelEntry {
+    legacy_fallback_last_seen_unix_ms: Option<u64>,
+    fallback_pending: VecDeque<PendingDialback>,
+    fallback_notify: Arc<Notify>,
+    exact_sessions: HashMap<String, ExactTunnelSession>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingDialback {
+    nonce: String,
+    source_bucket: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TunnelRoute {
+    Fallback {
+        label: String,
+    },
+    Exact {
+        label: String,
+        poller_id: String,
+        server_name: String,
+    },
+}
+
+impl TunnelRoute {
+    fn label(&self) -> &str {
+        match self {
+            Self::Fallback { label } | Self::Exact { label, .. } => label,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConnectionAdmission {
+    total: u32,
+    by_ip: HashMap<IpAddr, u32>,
 }
 
 /// Shared relay state, hung off `AppState` (None when the relay is disabled),
@@ -267,25 +322,47 @@ pub(crate) struct RelayState {
     /// label -> control-channel presence.
     tunnels: StdMutex<HashMap<String, TunnelEntry>>,
     /// nonce -> the browser splicer waiting for the daemon's dial-back.
-    pending_dialbacks: StdMutex<HashMap<String, oneshot::Sender<TcpStream>>>,
-    /// Wakes parked control polls when a nonce is enqueued for them.
-    control_notify: Notify,
-    /// Per-source-IP concurrent browser connections.
-    ip_conns: StdMutex<HashMap<IpAddr, u32>>,
+    pending_dialbacks: StdMutex<HashMap<String, oneshot::Sender<(TcpStream, ConnectionGuard)>>>,
+    /// Per-process salt for availability-only source buckets returned to a
+    /// daemon. The opaque value is used only for admission fairness.
+    source_bucket_salt: String,
+    /// Global and per-source-IP raw-socket admission, taken before protocol
+    /// demux and retained for the physical connection's lifetime.
+    connection_admission: StdMutex<ConnectionAdmission>,
     /// Per-tunnel concurrent spliced browser connections.
     tunnel_splices: StdMutex<HashMap<String, u32>>,
+    /// Trust roots used to validate exact-name certificate ownership proofs.
+    name_proof_roots: Arc<rustls::RootCertStore>,
+}
+
+enum PendingPoll {
+    Dialback(PendingDialback),
+    Woken,
+    TimedOut,
+    RegistrationRejected,
 }
 
 impl RelayState {
     pub(crate) fn new(listen: SocketAddr, advertise_addrs: Vec<IpAddr>) -> Self {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Self::new_with_name_proof_roots(listen, advertise_addrs, Arc::new(roots))
+    }
+
+    fn new_with_name_proof_roots(
+        listen: SocketAddr,
+        advertise_addrs: Vec<IpAddr>,
+        name_proof_roots: Arc<rustls::RootCertStore>,
+    ) -> Self {
         Self {
             listen,
             advertise_addrs,
             tunnels: StdMutex::new(HashMap::new()),
             pending_dialbacks: StdMutex::new(HashMap::new()),
-            control_notify: Notify::new(),
-            ip_conns: StdMutex::new(HashMap::new()),
+            source_bucket_salt: random_b64u(32),
+            connection_admission: StdMutex::new(ConnectionAdmission::default()),
             tunnel_splices: StdMutex::new(HashMap::new()),
+            name_proof_roots,
         }
     }
 
@@ -297,48 +374,440 @@ impl RelayState {
         self.listen
     }
 
-    /// Refresh a tunnel's control-channel presence on each poll.
-    fn touch_tunnel(&self, label: &str, now: u64) {
+    fn fallback_is_live(entry: &TunnelEntry, now: u64) -> bool {
+        entry
+            .legacy_fallback_last_seen_unix_ms
+            .is_some_and(|last_seen| now.saturating_sub(last_seen) <= RELAY_TUNNEL_LIVENESS_MS)
+            || entry.exact_sessions.values().any(|session| {
+                now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+            })
+    }
+
+    /// Register one control poll and return its keyed wake token. Replacing an
+    /// exact poller's token fences an older overlapping request without
+    /// dropping queued work; a signed disconnect removes the token entirely.
+    /// Exact names have one live incumbent: a second daemon is rejected at
+    /// admission so the incumbent retains one unambiguous route. Resolution
+    /// still retains its ambiguity check as defense in depth for rolling
+    /// state.
+    fn register_tunnel(
+        &self,
+        label: &str,
+        now: u64,
+        poller_id: Option<&str>,
+        server_names: Option<&[String]>,
+    ) -> Option<Arc<Notify>> {
+        debug_assert_eq!(poller_id.is_some(), server_names.is_some());
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
-        tunnels
+        let conflicts = server_names.into_iter().flatten().any(|name| {
+            tunnels.iter().any(|(other_label, entry)| {
+                other_label != label
+                    && entry.exact_sessions.values().any(|session| {
+                        now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+                            && session.server_names.iter().any(|claimed| claimed == name)
+                    })
+            })
+        });
+        if conflicts {
+            return None;
+        }
+        let entry = tunnels
             .entry(label.to_string())
             .or_insert_with(|| TunnelEntry {
-                last_seen_unix_ms: now,
-                pending: VecDeque::new(),
-            })
-            .last_seen_unix_ms = now;
+                legacy_fallback_last_seen_unix_ms: None,
+                fallback_pending: VecDeque::new(),
+                fallback_notify: Arc::new(Notify::new()),
+                exact_sessions: HashMap::new(),
+            });
+        entry.exact_sessions.retain(|_, session| {
+            now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+        });
+        if let Some(poller_id) = poller_id {
+            if !entry.exact_sessions.contains_key(poller_id)
+                && entry.exact_sessions.len() >= RELAY_MAX_EXACT_POLLERS_PER_TUNNEL
+            {
+                return None;
+            }
+        }
+        // Exact-name ownership and its nonce queue belong to the v2 poller
+        // that supplied the certificate proof. A v1 sibling may refresh only
+        // the fleet-label fallback and can never keep or consume this state.
+        if let (Some(poller_id), Some(server_names)) = (poller_id, server_names) {
+            let notify = Arc::new(Notify::new());
+            let session = entry
+                .exact_sessions
+                .entry(poller_id.to_string())
+                .or_insert_with(|| ExactTunnelSession {
+                    last_seen_unix_ms: now,
+                    pending: VecDeque::new(),
+                    notify: Arc::clone(&notify),
+                    server_names: Vec::new(),
+                });
+            let previous_notify = std::mem::replace(&mut session.notify, Arc::clone(&notify));
+            session.last_seen_unix_ms = now;
+            let cancelled = if session.server_names != server_names {
+                session.pending.drain(..).collect()
+            } else {
+                Vec::new()
+            };
+            session.server_names = server_names.to_vec();
+            drop(tunnels);
+            previous_notify.notify_waiters();
+            self.cancel_browser_waiters(cancelled);
+            Some(notify)
+        } else {
+            entry.legacy_fallback_last_seen_unix_ms = Some(now);
+            Some(Arc::clone(&entry.fallback_notify))
+        }
+    }
+
+    #[cfg(test)]
+    fn touch_tunnel(
+        &self,
+        label: &str,
+        now: u64,
+        poller_id: Option<&str>,
+        server_names: Option<&[String]>,
+    ) -> bool {
+        self.register_tunnel(label, now, poller_id, server_names)
+            .is_some()
+    }
+
+    /// Refresh only the registration that supplied `notify`. This never
+    /// creates state: disconnect, expiry, or a newer poll makes the token
+    /// unusable, so a stale waiter cannot resurrect or overwrite a route.
+    fn refresh_registered_tunnel(
+        &self,
+        label: &str,
+        now: u64,
+        poller_id: Option<&str>,
+        server_names: Option<&[String]>,
+        notify: &Arc<Notify>,
+    ) -> bool {
+        debug_assert_eq!(poller_id.is_some(), server_names.is_some());
+        let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+        let Some(entry) = tunnels.get_mut(label) else {
+            return false;
+        };
+        if let (Some(poller_id), Some(server_names)) = (poller_id, server_names) {
+            let Some(session) = entry.exact_sessions.get_mut(poller_id) else {
+                return false;
+            };
+            if !Arc::ptr_eq(&session.notify, notify)
+                || session.server_names != server_names
+                || now.saturating_sub(session.last_seen_unix_ms) > RELAY_TUNNEL_LIVENESS_MS
+            {
+                return false;
+            }
+            session.last_seen_unix_ms = now;
+        } else {
+            if !Arc::ptr_eq(&entry.fallback_notify, notify)
+                || !entry
+                    .legacy_fallback_last_seen_unix_ms
+                    .is_some_and(|last_seen| {
+                        now.saturating_sub(last_seen) <= RELAY_TUNNEL_LIVENESS_MS
+                    })
+            {
+                return false;
+            }
+            entry.legacy_fallback_last_seen_unix_ms = Some(now);
+        }
+        true
+    }
+
+    fn cancel_browser_waiters(&self, dialbacks: impl IntoIterator<Item = PendingDialback>) {
+        let mut pending = self
+            .pending_dialbacks
+            .lock()
+            .expect("relay dialbacks poisoned");
+        for dialback in dialbacks {
+            pending.remove(&dialback.nonce);
+        }
+    }
+
+    fn remove_tunnel(&self, label: &str, poller_id: &str, now: u64) {
+        let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+        let mut cancelled = Vec::new();
+        let mut notifies = Vec::new();
+        let mut remove_entry = false;
+        if let Some(entry) = tunnels.get_mut(label) {
+            if let Some(mut removed) = entry.exact_sessions.remove(poller_id) {
+                cancelled.extend(removed.pending.drain(..));
+                notifies.push(removed.notify);
+            }
+            if !Self::fallback_is_live(entry, now) {
+                remove_entry = true;
+            }
+        }
+        if remove_entry {
+            if let Some(mut removed) = tunnels.remove(label) {
+                cancelled.extend(removed.fallback_pending.drain(..));
+                notifies.push(removed.fallback_notify);
+                for (_, mut session) in removed.exact_sessions {
+                    cancelled.extend(session.pending.drain(..));
+                    notifies.push(session.notify);
+                }
+            }
+        }
+        drop(tunnels);
+        for notify in notifies {
+            notify.notify_waiters();
+        }
+        self.cancel_browser_waiters(cancelled);
     }
 
     /// Pop the next unclaimed dial-back nonce for a tunnel, if any.
-    fn pop_pending(&self, label: &str) -> Option<String> {
+    #[cfg(test)]
+    fn pop_pending(&self, label: &str, poller_id: Option<&str>) -> Option<PendingDialback> {
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
-        tunnels.get_mut(label)?.pending.pop_front()
+        let entry = tunnels.get_mut(label)?;
+        if let Some(poller_id) = poller_id {
+            if let Some(nonce) = entry
+                .exact_sessions
+                .get_mut(poller_id)
+                .and_then(|session| session.pending.pop_front())
+            {
+                return Some(nonce);
+            }
+        }
+        entry.fallback_pending.pop_front()
+    }
+
+    #[cfg(test)]
+    fn pending_notify(&self, label: &str, poller_id: Option<&str>) -> Option<Arc<Notify>> {
+        let tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+        let entry = tunnels.get(label)?;
+        poller_id
+            .and_then(|poller_id| {
+                entry
+                    .exact_sessions
+                    .get(poller_id)
+                    .map(|session| Arc::clone(&session.notify))
+            })
+            .or_else(|| Some(Arc::clone(&entry.fallback_notify)))
+    }
+
+    fn pop_pending_for_registration(
+        &self,
+        label: &str,
+        poller_id: Option<&str>,
+        notify: &Arc<Notify>,
+    ) -> Result<Option<PendingDialback>, ()> {
+        let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+        let entry = tunnels.get_mut(label).ok_or(())?;
+        if let Some(poller_id) = poller_id {
+            let session = entry.exact_sessions.get_mut(poller_id).ok_or(())?;
+            if !Arc::ptr_eq(&session.notify, notify) {
+                return Err(());
+            }
+            if let Some(dialback) = session.pending.pop_front() {
+                return Ok(Some(dialback));
+            }
+        } else if !Arc::ptr_eq(&entry.fallback_notify, notify)
+            || entry.legacy_fallback_last_seen_unix_ms.is_none()
+        {
+            return Err(());
+        }
+        Ok(entry.fallback_pending.pop_front())
+    }
+
+    async fn pop_pending_or_wait(
+        &self,
+        label: &str,
+        poller_id: Option<&str>,
+        notify: &Arc<Notify>,
+        remaining: Duration,
+        before_park: impl FnOnce() -> bool,
+    ) -> PendingPoll {
+        let notify = Arc::clone(notify);
+        // Enable the keyed waiter before observing the queue and before
+        // refreshing registration so an enqueue at either boundary cannot
+        // strand this poll. `notify_one` also retains one permit.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        match self.pop_pending_for_registration(label, poller_id, &notify) {
+            Ok(Some(dialback)) => return PendingPoll::Dialback(dialback),
+            Ok(None) => {}
+            Err(()) => return PendingPoll::RegistrationRejected,
+        }
+        if !before_park() {
+            return PendingPoll::RegistrationRejected;
+        }
+        match tokio::time::timeout(remaining, notified).await {
+            Ok(()) => PendingPoll::Woken,
+            Err(_) => PendingPoll::TimedOut,
+        }
     }
 
     /// Whether a tunnel has an active (recently polled) control channel.
+    #[cfg(test)]
     fn tunnel_active(&self, label: &str, now: u64) -> bool {
         let tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
-        tunnels.get(label).is_some_and(|entry| {
-            now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+        tunnels
+            .get(label)
+            .is_some_and(|entry| Self::fallback_is_live(entry, now))
+    }
+
+    /// Resolve an SNI to one active daemon tunnel. Exact v2 registrations take
+    /// precedence. If more than one live daemon claims the same exact name,
+    /// refuse rather than choosing one. With no exact registration, retain the
+    /// v1 fleet-label route for rolling upgrades.
+    fn resolve_tunnel(&self, sni: &str, now: u64) -> Option<TunnelRoute> {
+        let normalized = normalize_server_name(sni)?;
+        let tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+        let mut exact = tunnels
+            .iter()
+            .flat_map(|(label, entry)| {
+                entry
+                    .exact_sessions
+                    .iter()
+                    .filter(|(_, session)| {
+                        now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+                            && session.server_names.iter().any(|name| name == &normalized)
+                    })
+                    .map(move |(poller_id, session)| {
+                        (
+                            label.as_str(),
+                            poller_id.as_str(),
+                            session.last_seen_unix_ms,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        exact.sort_by(|left, right| {
+            right
+                .2
+                .cmp(&left.2)
+                .then_with(|| left.0.cmp(right.0))
+                .then_with(|| left.1.cmp(right.1))
+        });
+        let first = exact.first().copied();
+        if first.is_some_and(|(label, _, _)| {
+            exact
+                .iter()
+                .skip(1)
+                .any(|(other_label, _, _)| *other_label != label)
+        }) {
+            return None;
+        }
+        if let Some((label, poller_id, _)) = first {
+            return Some(TunnelRoute::Exact {
+                label: label.to_string(),
+                poller_id: poller_id.to_string(),
+                server_name: normalized.clone(),
+            });
+        }
+        let label = sni_route_label(&normalized)?;
+        tunnels.get(&label).and_then(|entry| {
+            Self::fallback_is_live(entry, now).then_some(TunnelRoute::Fallback { label })
         })
     }
 
     /// Queue a dial-back nonce for a tunnel's control poll. Fails closed if the
     /// tunnel is not active or its queue is at capacity.
-    fn enqueue_dialback(&self, label: &str, nonce: String, now: u64) -> bool {
+    fn enqueue_dialback(
+        &self,
+        route: &TunnelRoute,
+        nonce: String,
+        source_ip: IpAddr,
+        now: u64,
+    ) -> bool {
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
-        let Some(entry) = tunnels.get_mut(label) else {
+        let Some(entry) = tunnels.get_mut(route.label()) else {
             return false;
         };
-        if now.saturating_sub(entry.last_seen_unix_ms) > RELAY_TUNNEL_LIVENESS_MS
-            || entry.pending.len() >= RELAY_MAX_PENDING_PER_TUNNEL
-        {
+        let source_bucket = self.source_bucket(route.label(), source_ip);
+        let dialback = PendingDialback {
+            nonce,
+            source_bucket,
+        };
+        let notifies = match route {
+            TunnelRoute::Fallback { .. } => {
+                if !Self::fallback_is_live(entry, now)
+                    || entry.fallback_pending.len() >= RELAY_MAX_PENDING_PER_TUNNEL
+                {
+                    None
+                } else {
+                    entry.fallback_pending.push_back(dialback);
+                    // A v2 poller consumes both its exact-name queue and the
+                    // daemon-label fallback queue. Wake every eligible poller
+                    // for this one daemon, while keeping unrelated tunnels
+                    // fully isolated.
+                    let mut notifies = Vec::with_capacity(1 + entry.exact_sessions.len());
+                    notifies.push(Arc::clone(&entry.fallback_notify));
+                    notifies.extend(
+                        entry
+                            .exact_sessions
+                            .values()
+                            .map(|session| Arc::clone(&session.notify)),
+                    );
+                    Some(notifies)
+                }
+            }
+            TunnelRoute::Exact {
+                poller_id,
+                server_name,
+                ..
+            } => {
+                let Some(session) = entry.exact_sessions.get_mut(poller_id) else {
+                    return false;
+                };
+                if now.saturating_sub(session.last_seen_unix_ms) > RELAY_TUNNEL_LIVENESS_MS
+                    || !session.server_names.iter().any(|name| name == server_name)
+                    || session.pending.len() >= RELAY_MAX_PENDING_PER_TUNNEL
+                {
+                    None
+                } else {
+                    session.pending.push_back(dialback);
+                    Some(vec![Arc::clone(&session.notify)])
+                }
+            }
+        };
+        let Some(notifies) = notifies else {
             return false;
-        }
-        entry.pending.push_back(nonce);
+        };
         drop(tunnels);
-        self.control_notify.notify_waiters();
+        for notify in notifies {
+            notify.notify_one();
+        }
         true
+    }
+
+    /// Reclaim a browser request from both the route queue and the global
+    /// nonce waiter. The route lookup is exact to the registration selected
+    /// for that browser, so a timeout cannot consume capacity in another
+    /// poller's queue.
+    fn cancel_queued_dialback(&self, route: &TunnelRoute, nonce: &str) {
+        {
+            let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+            if let Some(entry) = tunnels.get_mut(route.label()) {
+                let queue = match route {
+                    TunnelRoute::Fallback { .. } => Some(&mut entry.fallback_pending),
+                    TunnelRoute::Exact { poller_id, .. } => entry
+                        .exact_sessions
+                        .get_mut(poller_id)
+                        .map(|session| &mut session.pending),
+                };
+                if let Some(queue) = queue {
+                    queue.retain(|dialback| dialback.nonce != nonce);
+                }
+            }
+        }
+        self.pending_dialbacks
+            .lock()
+            .expect("relay dialbacks poisoned")
+            .remove(nonce);
+    }
+
+    fn source_bucket(&self, label: &str, source_ip: IpAddr) -> String {
+        sha256_b64u(
+            format!(
+                "intendant-relay-source-v1\n{}\n{label}\n{source_ip}\n",
+                self.source_bucket_salt
+            )
+            .as_bytes(),
+        )
     }
 
     /// Drop tunnels whose control channel has gone quiet, and reap any nonces
@@ -349,29 +818,41 @@ impl RelayState {
             .lock()
             .expect("relay tunnels poisoned")
             .retain(|_, entry| {
-                now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+                entry.exact_sessions.retain(|_, session| {
+                    now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+                });
+                Self::fallback_is_live(entry, now)
             });
     }
 
-    fn acquire_ip_conn(self: &Arc<Self>, ip: IpAddr) -> Option<IpConnGuard> {
-        let mut map = self.ip_conns.lock().expect("relay ip conns poisoned");
-        let count = map.entry(ip).or_insert(0);
-        if *count >= RELAY_MAX_CONNS_PER_IP {
+    fn acquire_connection(self: &Arc<Self>, ip: IpAddr) -> Option<ConnectionGuard> {
+        let mut admission = self
+            .connection_admission
+            .lock()
+            .expect("relay connection admission poisoned");
+        if admission.total >= RELAY_MAX_CONNS_GLOBAL
+            || admission.by_ip.get(&ip).copied().unwrap_or(0) >= RELAY_MAX_CONNS_PER_IP
+        {
             return None;
         }
-        *count += 1;
-        Some(IpConnGuard {
+        admission.total += 1;
+        *admission.by_ip.entry(ip).or_insert(0) += 1;
+        Some(ConnectionGuard {
             relay: self.clone(),
             ip,
         })
     }
 
-    fn release_ip_conn(&self, ip: IpAddr) {
-        let mut map = self.ip_conns.lock().expect("relay ip conns poisoned");
-        if let Some(count) = map.get_mut(&ip) {
+    fn release_connection(&self, ip: IpAddr) {
+        let mut admission = self
+            .connection_admission
+            .lock()
+            .expect("relay connection admission poisoned");
+        admission.total = admission.total.saturating_sub(1);
+        if let Some(count) = admission.by_ip.get_mut(&ip) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                map.remove(&ip);
+                admission.by_ip.remove(&ip);
             }
         }
     }
@@ -400,14 +881,14 @@ impl RelayState {
     }
 }
 
-struct IpConnGuard {
+struct ConnectionGuard {
     relay: Arc<RelayState>,
     ip: IpAddr,
 }
 
-impl Drop for IpConnGuard {
+impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.relay.release_ip_conn(self.ip);
+        self.relay.release_connection(self.ip);
     }
 }
 
@@ -432,15 +913,239 @@ pub(crate) struct RelayNextRequest {
     issued_at_unix_ms: u64,
     signature: String,
     #[serde(default)]
+    poller_id: Option<String>,
+    #[serde(default)]
+    server_names: Vec<String>,
+    #[serde(default)]
+    server_name_proofs: Vec<RelayServerNameProof>,
+    #[serde(default)]
     timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RelayServerNameProof {
+    server_name: String,
+    certificate_chain_pem: String,
+    signature: String,
+}
+
 fn relay_control_signing_payload(
+    protocol: &str,
     daemon_id: &str,
     daemon_public_key: &str,
     issued_at_unix_ms: u64,
-) -> String {
-    format!("{RELAY_CONTROL_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n")
+    poller_id: Option<&str>,
+    server_names: &[String],
+) -> Vec<u8> {
+    let mut payload =
+        format!("{protocol}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n").into_bytes();
+    if matches!(protocol, RELAY_CONTROL_PROTOCOL | RELAY_DISCONNECT_PROTOCOL) {
+        let poller_id = poller_id.unwrap_or_default();
+        payload.extend_from_slice(poller_id.len().to_string().as_bytes());
+        payload.push(b'\n');
+        payload.extend_from_slice(poller_id.as_bytes());
+        payload.push(b'\n');
+    }
+    for name in server_names {
+        payload.extend_from_slice(name.len().to_string().as_bytes());
+        payload.push(b'\n');
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(b'\n');
+    }
+    payload
+}
+
+fn canonical_poller_id(value: Option<&str>) -> Result<String, ApiError> {
+    let value = value.unwrap_or_default().trim();
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request(
+            "relay control v2 requires a 32-character poller id",
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn relay_name_proof_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+    server_name: &str,
+) -> Vec<u8> {
+    format!(
+        "{RELAY_NAME_PROOF_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{}\n{server_name}\n",
+        server_name.len(),
+    )
+    .into_bytes()
+}
+
+fn normalize_server_name(name: &str) -> Option<String> {
+    let normalized = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = normalized.split('.').collect();
+    if normalized.is_empty()
+        || normalized.len() > 253
+        || !normalized.is_ascii()
+        || normalized.parse::<std::net::IpAddr>().is_ok()
+        || labels.len() < 2
+        || labels
+            .last()
+            .is_some_and(|label| label.bytes().all(|byte| byte.is_ascii_digit()))
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return None;
+    }
+    let parsed = url::Url::parse(&format!("https://{normalized}")).ok()?;
+    if parsed.host_str() != Some(normalized.as_str()) {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn canonical_server_names(names: &[String]) -> Result<Vec<String>, ApiError> {
+    if names.len() > RELAY_MAX_SERVER_NAMES {
+        return Err(ApiError::bad_request("too many relay server names"));
+    }
+    let mut normalized = names
+        .iter()
+        .map(|name| {
+            normalize_server_name(name)
+                .ok_or_else(|| ApiError::bad_request("invalid relay server name"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    normalized.sort();
+    normalized.dedup();
+    if normalized.len() != names.len() || normalized != names {
+        return Err(ApiError::bad_request(
+            "relay server names must be normalized, sorted, and unique",
+        ));
+    }
+    if normalized.iter().any(|name| {
+        name.split_once('.')
+            .map(|(label, _)| is_derived_fleet_label(label))
+            .unwrap_or(false)
+    }) {
+        return Err(ApiError::bad_request(
+            "exact relay names cannot use the derived fleet-label form",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn verify_server_name_proofs(
+    relay: &RelayState,
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+    server_names: &[String],
+    proofs: &[RelayServerNameProof],
+) -> Result<(), ApiError> {
+    use rustls::client::danger::ServerCertVerifier as _;
+    use rustls::pki_types::pem::PemObject as _;
+
+    if proofs.len() != server_names.len() {
+        return Err(ApiError::forbidden(
+            "each exact relay name requires one certificate ownership proof",
+        ));
+    }
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        relay.name_proof_roots.clone(),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .build()
+    .map_err(|error| ApiError::internal(format!("build relay name verifier: {error}")))?;
+
+    for (name, proof) in server_names.iter().zip(proofs) {
+        if proof.server_name != *name {
+            return Err(ApiError::forbidden(
+                "relay certificate proof does not match its exact server name",
+            ));
+        }
+        if proof.certificate_chain_pem.len() > RELAY_NAME_PROOF_CHAIN_MAX_BYTES {
+            return Err(ApiError::forbidden(
+                "relay certificate proof chain is too large",
+            ));
+        }
+        let certs = rustls::pki_types::CertificateDer::pem_slice_iter(
+            proof.certificate_chain_pem.as_bytes(),
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ApiError::forbidden("relay certificate proof chain is invalid"))?;
+        if certs.is_empty() || certs.len() > RELAY_NAME_PROOF_CHAIN_MAX_CERTS {
+            return Err(ApiError::forbidden(
+                "relay certificate proof chain has an invalid length",
+            ));
+        }
+        let server_name = rustls::pki_types::ServerName::try_from(name.clone())
+            .map_err(|_| ApiError::forbidden("relay certificate proof name is invalid"))?;
+        verifier
+            .verify_server_cert(
+                &certs[0],
+                &certs[1..],
+                &server_name,
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .map_err(|_| {
+                ApiError::forbidden(
+                    "relay certificate proof is not valid for the exact server name",
+                )
+            })?;
+
+        let (_, parsed) = x509_parser::parse_x509_certificate(certs[0].as_ref())
+            .map_err(|_| ApiError::forbidden("relay certificate proof leaf is invalid"))?;
+        let san = parsed
+            .subject_alternative_name()
+            .map_err(|_| ApiError::forbidden("relay certificate proof SAN is invalid"))?
+            .ok_or_else(|| ApiError::forbidden("relay certificate proof has no DNS SAN"))?;
+        let dns_names = san
+            .value
+            .general_names
+            .iter()
+            .filter_map(|entry| match entry {
+                x509_parser::extensions::GeneralName::DNSName(value) => {
+                    Some(value.trim().trim_end_matches('.').to_ascii_lowercase())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if dns_names.as_slice() != [name.as_str()] {
+            return Err(ApiError::forbidden(
+                "relay certificate proof must contain only the exact server-name SAN",
+            ));
+        }
+        let signature = b64u_decode(proof.signature.trim())
+            .map_err(|_| ApiError::forbidden("relay certificate proof signature is invalid"))?;
+        let payload =
+            relay_name_proof_signing_payload(daemon_id, daemon_public_key, issued_at_unix_ms, name);
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_ASN1,
+            parsed.public_key().subject_public_key.data.as_ref(),
+        )
+        .verify(&payload, &signature)
+        .map_err(|_| ApiError::forbidden("relay certificate ownership proof is invalid"))?;
+    }
+    Ok(())
+}
+
+fn is_derived_fleet_label(label: &str) -> bool {
+    label.strip_prefix("d-").is_some_and(|digest| {
+        digest.len() == 20 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn server_name_overlaps_zone(name: &str, zone: &str) -> bool {
+    let zone = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+    name == zone
+        || name
+            .strip_suffix(zone.as_str())
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 /// Require the relay to be enabled, then run the shared daemon-signed
@@ -482,26 +1187,72 @@ pub(crate) async fn relay_next(
     Json(body): Json<RelayNextRequest>,
 ) -> ApiResult<Response> {
     let daemon_id = body.daemon_id.trim().to_string();
+    let (poller_id, server_names, disconnect) = match body.protocol.as_str() {
+        RELAY_CONTROL_PROTOCOL => (
+            Some(canonical_poller_id(body.poller_id.as_deref())?),
+            Some(canonical_server_names(&body.server_names)?),
+            false,
+        ),
+        RELAY_DISCONNECT_PROTOCOL
+            if body.server_names.is_empty() && body.server_name_proofs.is_empty() =>
+        {
+            (
+                Some(canonical_poller_id(body.poller_id.as_deref())?),
+                Some(Vec::new()),
+                true,
+            )
+        }
+        RELAY_DISCONNECT_PROTOCOL => {
+            return Err(ApiError::bad_request(
+                "relay disconnect cannot register server names or proofs",
+            ));
+        }
+        RELAY_CONTROL_PROTOCOL_V1
+            if body.poller_id.is_none()
+                && body.server_names.is_empty()
+                && body.server_name_proofs.is_empty() =>
+        {
+            (None, None, false)
+        }
+        RELAY_CONTROL_PROTOCOL_V1 => {
+            return Err(ApiError::bad_request(
+                "relay control v1 cannot register a poller id, server names, or proofs",
+            ));
+        }
+        _ => {
+            return Err(ApiError::bad_request("relay control protocol mismatch"));
+        }
+    };
+    if let Some(zone) = state.dns_zone.as_ref().map(|zone| zone.origin_utf8()) {
+        if server_names
+            .iter()
+            .flatten()
+            .any(|name| server_name_overlaps_zone(name, &zone))
+        {
+            return Err(ApiError::bad_request(
+                "exact relay names cannot overlap the service fleet zone",
+            ));
+        }
+    }
     let daemon = relay_request_daemon(
         &state,
         &headers,
         "relay_next",
-        (&body.protocol, RELAY_CONTROL_PROTOCOL),
+        (&body.protocol, &body.protocol),
         &daemon_id,
         &body.daemon_public_key,
         body.issued_at_unix_ms,
     )
     .await?;
     let payload = relay_control_signing_payload(
+        &body.protocol,
         &daemon_id,
         &daemon.daemon_public_key,
         body.issued_at_unix_ms,
+        poller_id.as_deref(),
+        server_names.as_deref().unwrap_or_default(),
     );
-    if !verify_ed25519_b64u(
-        &daemon.daemon_public_key,
-        payload.as_bytes(),
-        body.signature.trim(),
-    ) {
+    if !verify_ed25519_b64u(&daemon.daemon_public_key, &payload, body.signature.trim()) {
         return Err(ApiError::bad_request("relay control signature invalid"));
     }
     let relay = state
@@ -509,12 +1260,43 @@ pub(crate) async fn relay_next(
         .as_ref()
         .expect("relay presence checked in relay_request_daemon")
         .clone();
+    if !disconnect {
+        if let Some(server_names) = server_names.as_deref() {
+            verify_server_name_proofs(
+                &relay,
+                &daemon_id,
+                &daemon.daemon_public_key,
+                body.issued_at_unix_ms,
+                server_names,
+                &body.server_name_proofs,
+            )?;
+        }
+    }
     let Some(label) = daemon_label(&daemon_id) else {
         return Err(ApiError::bad_request(
             "daemon id does not derive a fleet label",
         ));
     };
-    relay.touch_tunnel(&label, now_unix_ms());
+    if disconnect {
+        relay.remove_tunnel(
+            &label,
+            poller_id
+                .as_deref()
+                .expect("disconnect requires a canonical poller id"),
+            now_unix_ms(),
+        );
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    let Some(registration_notify) = relay.register_tunnel(
+        &label,
+        now_unix_ms(),
+        poller_id.as_deref(),
+        server_names.as_deref(),
+    ) else {
+        return Err(ApiError::conflict(
+            "relay exact-name registration conflicts with live ownership or exceeds its poller bound",
+        ));
+    };
 
     let timeout = Duration::from_millis(
         body.timeout_ms
@@ -523,25 +1305,47 @@ pub(crate) async fn relay_next(
     );
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Some(nonce) = relay.pop_pending(&label) {
-            return Ok(Json(json!({
-                "ok": true,
-                "dialback": { "nonce": nonce },
-            }))
-            .into_response());
-        }
         let now = tokio::time::Instant::now();
         if now >= deadline {
             return Ok(StatusCode::NO_CONTENT.into_response());
         }
         let remaining = deadline.saturating_duration_since(now);
-        // Re-touch keeps the tunnel live across a full parked poll.
-        relay.touch_tunnel(&label, now_unix_ms());
-        if tokio::time::timeout(remaining, relay.control_notify.notified())
+        match relay
+            .pop_pending_or_wait(
+                &label,
+                poller_id.as_deref(),
+                &registration_notify,
+                remaining,
+                || {
+                    // Re-touch keeps the tunnel live across a full parked poll.
+                    relay.refresh_registered_tunnel(
+                        &label,
+                        now_unix_ms(),
+                        poller_id.as_deref(),
+                        server_names.as_deref(),
+                        &registration_notify,
+                    )
+                },
+            )
             .await
-            .is_err()
         {
-            return Ok(StatusCode::NO_CONTENT.into_response());
+            PendingPoll::Dialback(dialback) => {
+                return Ok(Json(json!({
+                    "ok": true,
+                    "dialback": {
+                        "nonce": dialback.nonce,
+                        "source_bucket": dialback.source_bucket,
+                    },
+                }))
+                .into_response());
+            }
+            PendingPoll::Woken => {}
+            PendingPoll::TimedOut => return Ok(StatusCode::NO_CONTENT.into_response()),
+            PendingPoll::RegistrationRejected => {
+                return Err(ApiError::conflict(
+                    "relay exact-name registration conflicts with live ownership or exceeds its poller bound",
+                ));
+            }
         }
     }
 }
@@ -632,29 +1436,26 @@ pub(crate) async fn dns_relay(
     } else {
         Vec::new()
     };
-    zone.set_daemon_addresses(&daemon_id, &addresses)
-        .map_err(ApiError::bad_request)?;
-    let now = now_unix_ms();
-    {
-        let mut store = state.store.lock().await;
-        store.dns_records.retain(|r| r.daemon_id != daemon_id);
-        if body.enable {
-            store.dns_records.push(DnsRecordEntry {
-                daemon_id: daemon_id.clone(),
-                addresses: advertise.iter().map(|ip| ip.to_string()).collect(),
-                updated_unix_ms: now,
-                via_relay: true,
-            });
-        }
-        audit(
-            &mut store,
-            "dns_relay",
-            daemon.owner_user_id,
-            Some(daemon_id.clone()),
-            json!({ "name": name, "enable": body.enable }),
-        );
-        persist_locked(&state, &store).await?;
-    }
+    commit_dns_record_update(
+        Arc::clone(&state),
+        Arc::clone(&zone),
+        DnsRecordMutation {
+            daemon_id: daemon_id.clone(),
+            addresses: addresses.clone(),
+            via_relay: body.enable,
+            issued_at_unix_ms: body.issued_at_unix_ms,
+            request_fingerprint: dns_mutation_fingerprint(
+                DNS_RELAY_PROTOCOL,
+                if body.enable { "1" } else { "0" },
+            ),
+            audit: DnsRecordAudit {
+                event: "dns_relay",
+                user_id: daemon.owner_user_id,
+                detail: json!({ "name": name, "enable": body.enable }),
+            },
+        },
+    )
+    .await?;
     Ok(Json(json!({
         "ok": true,
         "zone": zone.origin_utf8(),
@@ -704,54 +1505,68 @@ async fn run_relay_accept_loop(
                 continue;
             }
         };
+        let Some(connection_guard) = relay.acquire_connection(peer.ip()) else {
+            continue;
+        };
         let relay = relay.clone();
         tokio::spawn(async move {
-            handle_relay_connection(relay, stream, peer.ip()).await;
+            handle_relay_connection(relay, stream, connection_guard).await;
         });
     }
 }
 
-async fn handle_relay_connection(relay: Arc<RelayState>, stream: TcpStream, peer_ip: IpAddr) {
+async fn handle_relay_connection(
+    relay: Arc<RelayState>,
+    stream: TcpStream,
+    connection_guard: ConnectionGuard,
+) {
     // One peeked byte disambiguates a browser TLS ClientHello (0x16) from a
     // daemon dial-back hello (ASCII magic). `peek` leaves the bytes in the
     // kernel buffer so the browser path can forward the ClientHello verbatim.
-    let mut first = [0u8; 1];
-    match stream.peek(&mut first).await {
-        Ok(0) | Err(_) => return,
-        Ok(_) => {}
-    }
-    if first[0] == 0x16 {
-        handle_browser_connection(relay, stream, peer_ip).await;
+    // The same absolute deadline covers this peek and the entire dial-back
+    // hello, so a trickle cannot renew its budget byte by byte.
+    let preamble_deadline = tokio::time::Instant::now() + RELAY_DIALBACK_TIMEOUT;
+    let Some(first) = peek_first_byte_until(&stream, preamble_deadline).await else {
+        return;
+    };
+    if first == 0x16 {
+        handle_browser_connection(relay, stream, connection_guard).await;
     } else {
-        handle_dialback_connection(relay, stream).await;
+        handle_dialback_connection(relay, stream, connection_guard, preamble_deadline).await;
+    }
+}
+
+async fn peek_first_byte_until(stream: &TcpStream, deadline: tokio::time::Instant) -> Option<u8> {
+    let mut first = [0u8; 1];
+    match tokio::time::timeout_at(deadline, stream.peek(&mut first)).await {
+        Ok(Ok(1..)) => Some(first[0]),
+        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => None,
     }
 }
 
 /// A browser TLS connection: peek the ClientHello for its SNI (no
 /// termination), route to the matching active tunnel, and splice.
-async fn handle_browser_connection(relay: Arc<RelayState>, stream: TcpStream, peer_ip: IpAddr) {
-    let Some(_ip_guard) = relay.acquire_ip_conn(peer_ip) else {
-        return; // per-source-IP cap
-    };
+async fn handle_browser_connection(
+    relay: Arc<RelayState>,
+    stream: TcpStream,
+    connection_guard: ConnectionGuard,
+) {
     let sni = match peek_sni(&stream).await {
         Some(sni) => sni,
         None => return, // fragmented-forever, oversized, non-TLS, or no-SNI: refuse
     };
-    let Some(label) = sni_route_label(&sni) else {
-        return;
-    };
     let now = now_unix_ms();
-    if !relay.tunnel_active(&label, now) {
-        return; // no active tunnel for this fleet name
-    }
-    let Some(_splice_guard) = relay.acquire_tunnel_splice(&label) else {
+    let Some(route) = relay.resolve_tunnel(&sni, now) else {
+        return; // no unique active tunnel for this exact or fleet-label name
+    };
+    let Some(_splice_guard) = relay.acquire_tunnel_splice(route.label()) else {
         return; // per-tunnel cap
     };
 
     // Mint a single-use nonce, register the browser waiter, and ask the daemon
     // to dial back.
     let nonce = random_b64u(32);
-    let (tx, rx) = oneshot::channel::<TcpStream>();
+    let (tx, rx) = oneshot::channel::<(TcpStream, ConnectionGuard)>();
     {
         let mut pending = relay
             .pending_dialbacks
@@ -759,27 +1574,21 @@ async fn handle_browser_connection(relay: Arc<RelayState>, stream: TcpStream, pe
             .expect("relay dialbacks poisoned");
         pending.insert(nonce.clone(), tx);
     }
-    if !relay.enqueue_dialback(&label, nonce.clone(), now) {
-        relay
-            .pending_dialbacks
-            .lock()
-            .expect("relay dialbacks poisoned")
-            .remove(&nonce);
+    if !relay.enqueue_dialback(&route, nonce.clone(), connection_guard.ip, now) {
+        relay.cancel_queued_dialback(&route, &nonce);
         return;
     }
 
-    let data_stream = match tokio::time::timeout(RELAY_DIALBACK_TIMEOUT, rx).await {
-        Ok(Ok(data_stream)) => data_stream,
-        _ => {
-            // Timed out or the waiter was dropped: reclaim the nonce slot.
-            relay
-                .pending_dialbacks
-                .lock()
-                .expect("relay dialbacks poisoned")
-                .remove(&nonce);
-            return;
-        }
-    };
+    let (data_stream, _dialback_guard) =
+        match tokio::time::timeout(RELAY_DIALBACK_TIMEOUT, rx).await {
+            Ok(Ok(data_stream)) => data_stream,
+            _ => {
+                // Timed out or the waiter was dropped: reclaim both the
+                // browser waiter and its bounded per-route queue slot.
+                relay.cancel_queued_dialback(&route, &nonce);
+                return;
+            }
+        };
     // Pure ciphertext splice: the browser's TLS records flow to the daemon,
     // whose fleet certificate completes the handshake. This service never sees
     // plaintext.
@@ -794,8 +1603,13 @@ async fn handle_browser_connection(relay: Arc<RelayState>, stream: TcpStream, pe
 
 /// A daemon dial-back data connection: read `ITRLY1 <nonce>\n`, hand this
 /// stream to the waiting browser splicer.
-async fn handle_dialback_connection(relay: Arc<RelayState>, mut stream: TcpStream) {
-    let Some(nonce) = read_dialback_nonce(&mut stream).await else {
+async fn handle_dialback_connection(
+    relay: Arc<RelayState>,
+    mut stream: TcpStream,
+    connection_guard: ConnectionGuard,
+    preamble_deadline: tokio::time::Instant,
+) {
+    let Some(nonce) = read_dialback_nonce_until(&mut stream, preamble_deadline).await else {
         return;
     };
     let sender = relay
@@ -807,15 +1621,26 @@ async fn handle_dialback_connection(relay: Arc<RelayState>, mut stream: TcpStrea
         return; // unknown / expired / already-claimed nonce
     };
     // The browser splicer owns the splice; hand off this (post-hello) stream.
-    let _ = sender.send(stream);
+    let _ = sender.send((stream, connection_guard));
 }
 
-/// Read a bounded dial-back hello line and extract the nonce. Bounded in
-/// bytes by `DIALBACK_HELLO_MAX_BYTES` and in time by one overall
-/// `DIALBACK_HELLO_DEADLINE` across every read (dial-back connections are
-/// exempt from the per-IP cap, so the hello read must not be holdable).
+/// Test helper that starts a fresh overall dial-back hello deadline. The
+/// production demultiplexer passes its accept-time preamble deadline to
+/// `read_dialback_nonce_until` so the initial peek and every byte share one
+/// budget.
+#[cfg(test)]
 async fn read_dialback_nonce<S: AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
-    let deadline = tokio::time::Instant::now() + DIALBACK_HELLO_DEADLINE;
+    read_dialback_nonce_until(
+        stream,
+        tokio::time::Instant::now() + DIALBACK_HELLO_DEADLINE,
+    )
+    .await
+}
+
+async fn read_dialback_nonce_until<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
     let mut buf = Vec::with_capacity(64);
     let mut byte = [0u8; 1];
     loop {
@@ -880,47 +1705,22 @@ async fn peek_sni(stream: &TcpStream) -> Option<String> {
 }
 
 /// Bidirectional byte splice with a per-direction byte cap and idle teardown.
-/// When either direction finishes (EOF, error, cap, or idle) both halves drop
-/// and the connection closes.
 async fn splice(browser: TcpStream, daemon: TcpStream, max_bytes: u64, idle: Duration) {
-    let (browser_r, browser_w) = browser.into_split();
-    let (daemon_r, daemon_w) = daemon.into_split();
-    let to_daemon = copy_half(browser_r, daemon_w, max_bytes, idle);
-    let to_browser = copy_half(daemon_r, browser_w, max_bytes, idle);
-    tokio::select! {
-        _ = to_daemon => {}
-        _ = to_browser => {}
-    }
-}
-
-async fn copy_half<R, W>(mut reader: R, mut writer: W, max_bytes: u64, idle: Duration)
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = vec![0u8; 16 * 1024];
-    let mut total: u64 = 0;
-    loop {
-        let n = match tokio::time::timeout(idle, reader.read(&mut buf)).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-            Ok(Ok(n)) => n,
-        };
-        total = total.saturating_add(n as u64);
-        if total > max_bytes {
-            break;
-        }
-        if writer.write_all(&buf[..n]).await.is_err() {
-            break;
-        }
-    }
-    let _ = writer.shutdown().await;
+    intendant_core::net::splice_bidirectional_bounded(browser, daemon, max_bytes, idle).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    use tokio::io::AsyncWriteExt as _;
     use tokio::net::{TcpListener, TcpStream};
+
+    const TEST_POLLER_ID: &str = "11111111111111111111111111111111";
+
+    fn resolved_label(route: Option<TunnelRoute>) -> Option<String> {
+        route.map(|route| route.label().to_string())
+    }
 
     // ── ClientHello builder + SNI parser units ──────────────────────────────
 
@@ -1072,19 +1872,88 @@ mod tests {
         ))
     }
 
+    fn relay_state_and_name_proof(
+        name: &str,
+        daemon_id: &str,
+        daemon_public_key: &str,
+        issued_at_unix_ms: u64,
+    ) -> (Arc<RelayState>, RelayServerNameProof) {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_issuer = rcgen::Issuer::from_ca_cert_pem(&ca_cert.pem(), ca_key).unwrap();
+
+        let mut leaf_params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer).unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_cert.der().clone()).unwrap();
+        let relay = Arc::new(RelayState::new_with_name_proof_roots(
+            "127.0.0.1:0".parse().unwrap(),
+            vec!["203.0.113.10".parse().unwrap()],
+            Arc::new(roots),
+        ));
+
+        let key = rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der()).unwrap();
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).unwrap();
+        let signer = signing_key
+            .choose_scheme(&[rustls::SignatureScheme::ECDSA_NISTP256_SHA256])
+            .unwrap();
+        let payload =
+            relay_name_proof_signing_payload(daemon_id, daemon_public_key, issued_at_unix_ms, name);
+        let signature = signer.sign(&payload).unwrap();
+        (
+            relay,
+            RelayServerNameProof {
+                server_name: name.to_string(),
+                certificate_chain_pem: leaf_cert.pem(),
+                signature: crate::b64u(&signature),
+            },
+        )
+    }
+
     #[test]
     fn per_ip_connection_cap_is_enforced_and_released() {
         let relay = relay_state();
         let ip: IpAddr = "198.51.100.7".parse().unwrap();
         let mut guards = Vec::new();
         for _ in 0..RELAY_MAX_CONNS_PER_IP {
-            guards.push(relay.acquire_ip_conn(ip).expect("under cap"));
+            guards.push(relay.acquire_connection(ip).expect("under cap"));
         }
-        assert!(relay.acquire_ip_conn(ip).is_none(), "at cap, refuse");
+        assert!(relay.acquire_connection(ip).is_none(), "at cap, refuse");
         drop(guards.pop());
         assert!(
-            relay.acquire_ip_conn(ip).is_some(),
+            relay.acquire_connection(ip).is_some(),
             "a freed slot admits the next connection"
+        );
+    }
+
+    #[test]
+    fn global_connection_cap_is_enforced_and_released() {
+        let relay = relay_state();
+        let mut guards = Vec::new();
+        for index in 0..RELAY_MAX_CONNS_GLOBAL {
+            let ip = IpAddr::V6(std::net::Ipv6Addr::from(index as u128 + 1));
+            guards.push(relay.acquire_connection(ip).expect("under global cap"));
+        }
+        let overflow: IpAddr = "2001:db8::ffff".parse().unwrap();
+        assert!(
+            relay.acquire_connection(overflow).is_none(),
+            "all sources are refused at the global cap"
+        );
+        drop(guards.pop());
+        assert!(
+            relay.acquire_connection(overflow).is_some(),
+            "a freed global slot admits the next connection"
         );
     }
 
@@ -1108,19 +1977,513 @@ mod tests {
     fn dialback_queue_only_grows_for_an_active_tunnel_and_is_bounded() {
         let relay = relay_state();
         let now = crate::now_unix_ms();
+        let route = TunnelRoute::Fallback {
+            label: "d-live".to_string(),
+        };
         // No tunnel yet: enqueue refuses.
-        assert!(!relay.enqueue_dialback("d-none", "n0".to_string(), now));
-        relay.touch_tunnel("d-live", now);
+        let source_ip = "198.51.100.10".parse().unwrap();
+        assert!(!relay.enqueue_dialback(&route, "n0".to_string(), source_ip, now));
+        assert!(relay.touch_tunnel("d-live", now, None, None));
         assert!(relay.tunnel_active("d-live", now));
         for i in 0..RELAY_MAX_PENDING_PER_TUNNEL {
-            assert!(relay.enqueue_dialback("d-live", format!("n{i}"), now));
+            assert!(relay.enqueue_dialback(&route, format!("n{i}"), source_ip, now));
         }
         assert!(
-            !relay.enqueue_dialback("d-live", "overflow".to_string(), now),
+            !relay.enqueue_dialback(&route, "overflow".to_string(), source_ip, now),
             "the pending queue is capped"
         );
         // A stale tunnel is inactive and unroutable.
         assert!(!relay.tunnel_active("d-live", now + RELAY_TUNNEL_LIVENESS_MS + 1));
+    }
+
+    #[test]
+    fn exact_server_name_routes_and_collisions_fail_closed() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        let name = "box.example.test".to_string();
+        assert!(relay.touch_tunnel(
+            "d-first",
+            now,
+            Some(TEST_POLLER_ID),
+            Some(std::slice::from_ref(&name))
+        ));
+        assert_eq!(
+            resolved_label(relay.resolve_tunnel("BOX.EXAMPLE.TEST.", now)).as_deref(),
+            Some("d-first"),
+        );
+
+        assert!(
+            !relay.touch_tunnel(
+                "d-second",
+                now,
+                Some("22222222222222222222222222222222"),
+                Some(std::slice::from_ref(&name))
+            ),
+            "a conflicting live claim must be rejected at admission"
+        );
+        assert_eq!(
+            resolved_label(relay.resolve_tunnel("box.example.test", now)).as_deref(),
+            Some("d-first"),
+            "the incumbent remains routable after a rejected collision"
+        );
+    }
+
+    #[test]
+    fn exact_server_names_cannot_enter_the_service_fleet_zone() {
+        assert!(server_name_overlaps_zone(
+            "box.fleet.example.test",
+            "fleet.example.test"
+        ));
+        assert!(server_name_overlaps_zone(
+            "fleet.example.test",
+            "fleet.example.test."
+        ));
+        assert!(!server_name_overlaps_zone(
+            "notfleet.example.test",
+            "fleet.example.test"
+        ));
+        assert!(
+            canonical_server_names(&["d-30a08371a38c1b447038.example.test".to_string()]).is_err()
+        );
+    }
+
+    #[test]
+    fn fleet_label_route_survives_v1_registration() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        assert!(relay.touch_tunnel("d-rolling", now, None, None));
+        assert_eq!(
+            resolved_label(relay.resolve_tunnel("d-rolling.fleet.example.test", now)).as_deref(),
+            Some("d-rolling")
+        );
+    }
+
+    #[tokio::test]
+    async fn control_waiter_cannot_lose_an_enqueue_after_the_empty_pop() {
+        let relay = relay_state();
+        let label = "d-11111111111111111111";
+        let now = now_unix_ms();
+        assert!(relay.touch_tunnel(label, now, None, None));
+        let route = TunnelRoute::Fallback {
+            label: label.to_string(),
+        };
+        let outcome = relay
+            .pop_pending_or_wait(
+                label,
+                None,
+                &relay.pending_notify(label, None).unwrap(),
+                Duration::from_millis(20),
+                || {
+                    assert!(relay.enqueue_dialback(
+                        &route,
+                        "nonce-after-pop".to_string(),
+                        "198.51.100.10".parse().unwrap(),
+                        now,
+                    ));
+                    true
+                },
+            )
+            .await;
+        assert!(matches!(outcome, PendingPoll::Woken));
+        assert_eq!(
+            relay
+                .pop_pending(label, None)
+                .as_ref()
+                .map(|dialback| dialback.nonce.as_str()),
+            Some("nonce-after-pop")
+        );
+    }
+
+    #[tokio::test]
+    async fn dialback_wakes_only_the_target_tunnel_queue() {
+        let relay = relay_state();
+        let now = now_unix_ms();
+        let first = "d-11111111111111111111";
+        let second = "d-22222222222222222222";
+        assert!(relay.touch_tunnel(first, now, None, None));
+        assert!(relay.touch_tunnel(second, now, None, None));
+        let second_notify = relay.pending_notify(second, None).unwrap();
+        let unrelated = second_notify.notified();
+        tokio::pin!(unrelated);
+        unrelated.as_mut().enable();
+
+        assert!(relay.enqueue_dialback(
+            &TunnelRoute::Fallback {
+                label: first.to_string(),
+            },
+            "target-nonce".to_string(),
+            "198.51.100.10".parse().unwrap(),
+            now,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), unrelated)
+                .await
+                .is_err(),
+            "an unrelated tunnel poll must remain parked"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_dialback_wakes_an_exact_poller_for_the_same_tunnel() {
+        let relay = relay_state();
+        let now = now_unix_ms();
+        let label = "d-11111111111111111111";
+        let poller = "11111111111111111111111111111111";
+        let names = ["box.example.test".to_string()];
+        assert!(relay.touch_tunnel(label, now, Some(poller), Some(&names)));
+        let exact_notify = relay.pending_notify(label, Some(poller)).unwrap();
+        let notified = exact_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        assert!(relay.enqueue_dialback(
+            &TunnelRoute::Fallback {
+                label: label.to_string(),
+            },
+            "fallback-nonce".to_string(),
+            "198.51.100.10".parse().unwrap(),
+            now,
+        ));
+        tokio::time::timeout(Duration::from_millis(20), notified)
+            .await
+            .expect("the exact poller also serves its daemon-label fallback");
+        assert_eq!(
+            relay
+                .pop_pending(label, Some(poller))
+                .map(|dialback| dialback.nonce),
+            Some("fallback-nonce".to_string())
+        );
+    }
+
+    #[test]
+    fn relay_source_buckets_are_stable_per_route_and_source() {
+        let relay = relay_state();
+        let first = relay.source_bucket("d-11111111111111111111", "198.51.100.10".parse().unwrap());
+        assert_eq!(
+            first,
+            relay.source_bucket("d-11111111111111111111", "198.51.100.10".parse().unwrap())
+        );
+        assert_ne!(
+            first,
+            relay.source_bucket("d-11111111111111111111", "198.51.100.11".parse().unwrap())
+        );
+        assert_eq!(first.len(), 43);
+    }
+
+    #[test]
+    fn v1_refresh_cannot_extend_or_consume_a_v2_exact_registration() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        let name = "box.example.test".to_string();
+        assert!(relay.touch_tunnel(
+            "d-rolling",
+            now,
+            Some(TEST_POLLER_ID),
+            Some(std::slice::from_ref(&name))
+        ));
+        let exact = relay.resolve_tunnel(&name, now).unwrap();
+        assert!(relay.enqueue_dialback(
+            &exact,
+            "exact-nonce".to_string(),
+            "198.51.100.10".parse().unwrap(),
+            now,
+        ));
+        assert!(relay.touch_tunnel("d-rolling", now + RELAY_TUNNEL_LIVENESS_MS, None, None));
+        assert_eq!(relay.pop_pending("d-rolling", None), None);
+        assert_eq!(
+            relay.pop_pending("d-rolling", Some("22222222222222222222222222222222")),
+            None,
+            "a different v2 poller cannot consume the proved route"
+        );
+        assert_eq!(
+            relay
+                .pop_pending("d-rolling", Some(TEST_POLLER_ID))
+                .map(|dialback| dialback.nonce),
+            Some("exact-nonce".to_string())
+        );
+        assert_eq!(
+            relay.resolve_tunnel(&name, now + RELAY_TUNNEL_LIVENESS_MS + 1),
+            None,
+            "v1 liveness must not extend the exact registration"
+        );
+        assert_eq!(
+            resolved_label(relay.resolve_tunnel(
+                "d-rolling.fleet.example.test",
+                now + RELAY_TUNNEL_LIVENESS_MS + 1
+            ))
+            .as_deref(),
+            Some("d-rolling"),
+            "the v1 fleet-label fallback remains live"
+        );
+    }
+
+    #[test]
+    fn a_v2_empty_set_clears_only_its_own_exact_names() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        let name = "box.example.test".to_string();
+        assert!(relay.touch_tunnel(
+            "d-rolling",
+            now,
+            Some(TEST_POLLER_ID),
+            Some(std::slice::from_ref(&name))
+        ));
+        assert!(relay.touch_tunnel("d-rolling", now + 1, Some(TEST_POLLER_ID), Some(&[])));
+        assert_eq!(relay.resolve_tunnel(&name, now + 1), None);
+    }
+
+    #[tokio::test]
+    async fn exact_name_change_cancels_queued_waiters_and_stale_routes() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        let label = "d-rolling";
+        let old_name = "old.example.test".to_string();
+        let new_name = "new.example.test".to_string();
+        assert!(relay.touch_tunnel(
+            label,
+            now,
+            Some(TEST_POLLER_ID),
+            Some(std::slice::from_ref(&old_name))
+        ));
+        let old_route = relay.resolve_tunnel(&old_name, now).unwrap();
+        let nonce = "withdrawn-name-nonce".to_string();
+        let (sender, receiver) = oneshot::channel();
+        relay
+            .pending_dialbacks
+            .lock()
+            .unwrap()
+            .insert(nonce.clone(), sender);
+        assert!(relay.enqueue_dialback(
+            &old_route,
+            nonce.clone(),
+            "198.51.100.10".parse().unwrap(),
+            now,
+        ));
+
+        assert!(relay.touch_tunnel(
+            label,
+            now + 1,
+            Some(TEST_POLLER_ID),
+            Some(std::slice::from_ref(&new_name))
+        ));
+
+        assert!(relay.resolve_tunnel(&old_name, now + 1).is_none());
+        assert!(relay.resolve_tunnel(&new_name, now + 1).is_some());
+        assert!(relay
+            .pending_dialbacks
+            .lock()
+            .unwrap()
+            .get(&nonce)
+            .is_none());
+        assert!(
+            receiver.await.is_err(),
+            "withdrawing the name must close its queued browser waiter"
+        );
+        assert!(
+            !relay.enqueue_dialback(
+                &old_route,
+                "stale-route-nonce".to_string(),
+                "198.51.100.10".parse().unwrap(),
+                now + 1,
+            ),
+            "a route resolved before the name change must not enqueue afterward"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_timeout_cleanup_releases_exact_queue_capacity() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        let label = "d-timeout";
+        let name = "box.example.test".to_string();
+        assert!(relay.touch_tunnel(
+            label,
+            now,
+            Some(TEST_POLLER_ID),
+            Some(std::slice::from_ref(&name))
+        ));
+        let route = relay.resolve_tunnel(&name, now).unwrap();
+        let source_ip = "198.51.100.10".parse().unwrap();
+        let (sender, receiver) = oneshot::channel();
+        relay
+            .pending_dialbacks
+            .lock()
+            .unwrap()
+            .insert("n0".to_string(), sender);
+        for index in 0..RELAY_MAX_PENDING_PER_TUNNEL {
+            assert!(relay.enqueue_dialback(&route, format!("n{index}"), source_ip, now));
+        }
+        assert!(!relay.enqueue_dialback(&route, "before-cleanup".to_string(), source_ip, now));
+
+        relay.cancel_queued_dialback(&route, "n0");
+
+        assert!(
+            receiver.await.is_err(),
+            "timeout cleanup must close the browser waiter"
+        );
+        assert!(relay.enqueue_dialback(&route, "after-cleanup".to_string(), source_ip, now));
+    }
+
+    #[test]
+    fn exact_poller_sessions_are_bounded_and_stale_slots_are_reclaimed() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        for index in 0..RELAY_MAX_EXACT_POLLERS_PER_TUNNEL {
+            let poller_id = format!("{index:032x}");
+            assert!(relay.touch_tunnel("d-bounded", now, Some(&poller_id), Some(&[])));
+        }
+        let overflow = format!("{:032x}", RELAY_MAX_EXACT_POLLERS_PER_TUNNEL);
+        assert!(!relay.touch_tunnel("d-bounded", now, Some(&overflow), Some(&[])));
+        let existing = format!("{:032x}", 0);
+        assert!(
+            relay.touch_tunnel("d-bounded", now, Some(&existing), Some(&[])),
+            "an existing poller can refresh while the set is full"
+        );
+        assert!(relay.touch_tunnel(
+            "d-bounded",
+            now + RELAY_TUNNEL_LIVENESS_MS + 1,
+            Some(&overflow),
+            Some(&[])
+        ));
+    }
+
+    #[test]
+    fn signed_disconnect_withdraws_exact_and_fallback_routes_immediately() {
+        let relay = RelayState::new(
+            "127.0.0.1:443".parse().unwrap(),
+            vec!["203.0.113.10".parse().unwrap()],
+        );
+        let poller = "11111111111111111111111111111111";
+        let names = vec!["box.example.test".to_string()];
+        let now = now_unix_ms();
+        assert!(relay.touch_tunnel("d-disconnect", now, Some(poller), Some(&names)));
+        assert!(relay.resolve_tunnel("box.example.test", now).is_some());
+        assert!(relay
+            .resolve_tunnel("d-disconnect.fleet.example.test", now)
+            .is_some());
+
+        relay.remove_tunnel("d-disconnect", poller, now);
+
+        assert!(relay.resolve_tunnel("box.example.test", now).is_none());
+        assert!(relay
+            .resolve_tunnel("d-disconnect.fleet.example.test", now)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn signed_disconnect_fences_an_in_flight_exact_poll_generation() {
+        let relay = relay_state();
+        let label = "d-disconnect-race";
+        let poller = "11111111111111111111111111111111";
+        let old_names = vec!["old.example.test".to_string()];
+        let new_names = vec!["new.example.test".to_string()];
+        let now = now_unix_ms();
+        let old_notify = relay
+            .register_tunnel(label, now, Some(poller), Some(&old_names))
+            .unwrap();
+        let mut replacement_notify = None;
+
+        let outcome = relay
+            .pop_pending_or_wait(
+                label,
+                Some(poller),
+                &old_notify,
+                Duration::from_millis(20),
+                || {
+                    // This is the cancellation edge from the production
+                    // handler: disconnect lands after its waiter was enabled
+                    // but before the handler refreshes and parks.
+                    relay.remove_tunnel(label, poller, now + 1);
+                    replacement_notify =
+                        relay.register_tunnel(label, now + 2, Some(poller), Some(&new_names));
+                    relay.refresh_registered_tunnel(
+                        label,
+                        now + 3,
+                        Some(poller),
+                        Some(&old_names),
+                        &old_notify,
+                    )
+                },
+            )
+            .await;
+        assert!(matches!(outcome, PendingPoll::RegistrationRejected));
+        let replacement_notify = replacement_notify.unwrap();
+        assert!(!Arc::ptr_eq(&old_notify, &replacement_notify));
+        assert!(relay.resolve_tunnel(&old_names[0], now + 3).is_none());
+        let replacement_route = relay.resolve_tunnel(&new_names[0], now + 3).unwrap();
+        assert!(relay.enqueue_dialback(
+            &replacement_route,
+            "replacement-nonce".to_string(),
+            "198.51.100.10".parse().unwrap(),
+            now + 3,
+        ));
+
+        let stale = relay
+            .pop_pending_or_wait(
+                label,
+                Some(poller),
+                &old_notify,
+                Duration::from_millis(20),
+                || panic!("a stale generation must fail before refresh"),
+            )
+            .await;
+        assert!(matches!(stale, PendingPoll::RegistrationRejected));
+        let replacement = relay
+            .pop_pending_or_wait(
+                label,
+                Some(poller),
+                &replacement_notify,
+                Duration::from_millis(20),
+                || {
+                    relay.refresh_registered_tunnel(
+                        label,
+                        now + 4,
+                        Some(poller),
+                        Some(&new_names),
+                        &replacement_notify,
+                    )
+                },
+            )
+            .await;
+        assert!(matches!(
+            replacement,
+            PendingPoll::Dialback(PendingDialback { ref nonce, .. })
+                if nonce == "replacement-nonce"
+        ));
+    }
+
+    #[test]
+    fn v2_disconnect_preserves_a_live_v1_fallback_and_its_queue() {
+        let relay = relay_state();
+        let label = "d-rolling";
+        let poller = "11111111111111111111111111111111";
+        let names = vec!["box.example.test".to_string()];
+        let now = now_unix_ms();
+        assert!(relay.touch_tunnel(label, now, None, None));
+        assert!(relay.touch_tunnel(label, now + 1, Some(poller), Some(&names)));
+        let fallback = TunnelRoute::Fallback {
+            label: label.to_string(),
+        };
+        assert!(relay.enqueue_dialback(
+            &fallback,
+            "legacy-fallback-nonce".to_string(),
+            "198.51.100.10".parse().unwrap(),
+            now + 1,
+        ));
+
+        relay.remove_tunnel(label, poller, now + 2);
+
+        assert!(relay.resolve_tunnel("box.example.test", now + 2).is_none());
+        assert_eq!(
+            relay.resolve_tunnel("d-rolling.fleet.example.test", now + 2),
+            Some(fallback)
+        );
+        assert_eq!(
+            relay
+                .pop_pending(label, None)
+                .map(|dialback| dialback.nonce),
+            Some("legacy-fallback-nonce".to_string())
+        );
     }
 
     // ── Dial-back framing ───────────────────────────────────────────────────
@@ -1178,6 +2541,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn silent_socket_uses_one_bounded_preamble_deadline() {
+        let (_client, server) = connected_pair().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+        assert_eq!(peek_first_byte_until(&server, deadline).await, None);
+    }
+
+    #[tokio::test]
+    async fn dialback_trickle_cannot_renew_the_preamble_deadline() {
+        let (mut client, mut server) = connected_pair().await;
+        tokio::spawn(async move {
+            for byte in b"ITRLY1 a-deliberately-slow-nonce\n" {
+                if client.write_all(std::slice::from_ref(byte)).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                read_dialback_nonce_until(&mut server, deadline)
+            )
+            .await
+            .expect("absolute deadline completes"),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn peek_sni_reassembles_a_fragmented_client_hello() {
         let (mut client, server) = connected_pair().await;
         let hello = build_client_hello(Some("d-frag.fleet.example.test"));
@@ -1222,6 +2615,8 @@ mod tests {
             last_registration_proof_unix_ms: None,
             route_link_revision: 0,
             last_unclaim_proof_unix_ms: None,
+            last_dns_mutation_unix_ms: None,
+            last_dns_mutation_fingerprint: None,
             registered_unix_ms: now,
             last_seen_unix_ms: now,
             updated_unix_ms: now,
@@ -1244,13 +2639,24 @@ mod tests {
             },
         );
         let issued = crate::now_unix_ms();
-        let payload = relay_control_signing_payload(daemon_id, &public, issued);
+        let server_names = Vec::new();
+        let payload = relay_control_signing_payload(
+            RELAY_CONTROL_PROTOCOL,
+            daemon_id,
+            &public,
+            issued,
+            Some(TEST_POLLER_ID),
+            &server_names,
+        );
         let body = RelayNextRequest {
             protocol: RELAY_CONTROL_PROTOCOL.to_string(),
             daemon_id: daemon_id.to_string(),
             daemon_public_key: public.clone(),
             issued_at_unix_ms: issued,
-            signature: crate::b64u(key.sign(payload.as_bytes()).as_ref()),
+            signature: crate::b64u(key.sign(&payload).as_ref()),
+            poller_id: Some(TEST_POLLER_ID.to_string()),
+            server_names,
+            server_name_proofs: Vec::new(),
             timeout_ms: Some(10),
         };
         let err = relay_next(
@@ -1259,8 +2665,7 @@ mod tests {
             axum::Json(body),
         )
         .await
-        .err()
-        .expect("relay disabled must reject");
+        .expect_err("relay disabled must reject");
         assert_eq!(err.status, StatusCode::NOT_FOUND);
     }
 
@@ -1286,6 +2691,9 @@ mod tests {
             daemon_public_key: public.clone(),
             issued_at_unix_ms: issued,
             signature: crate::b64u(&[0u8; 64]),
+            poller_id: Some(TEST_POLLER_ID.to_string()),
+            server_names: Vec::new(),
+            server_name_proofs: Vec::new(),
             timeout_ms: Some(10),
         };
         let err = relay_next(
@@ -1294,9 +2702,223 @@ mod tests {
             axum::Json(body),
         )
         .await
-        .err()
-        .expect("a bad signature must reject");
+        .expect_err("a bad signature must reject");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn relay_v2_signature_binds_exact_server_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, public) = test_identity();
+        let daemon_id = "relay-name-binding";
+        let relay = relay_state();
+        let state = crate::build_test_state(
+            dir.path(),
+            registered_store(daemon_id, &public),
+            crate::TestStateOverrides {
+                open_daemon_registration: true,
+                relay: Some(relay),
+                ..Default::default()
+            },
+        );
+        let issued = crate::now_unix_ms();
+        let signed_names = vec!["box.example.test".to_string()];
+        let payload = relay_control_signing_payload(
+            RELAY_CONTROL_PROTOCOL,
+            daemon_id,
+            &public,
+            issued,
+            Some(TEST_POLLER_ID),
+            &signed_names,
+        );
+        let body = RelayNextRequest {
+            protocol: RELAY_CONTROL_PROTOCOL.to_string(),
+            daemon_id: daemon_id.to_string(),
+            daemon_public_key: public,
+            issued_at_unix_ms: issued,
+            signature: crate::b64u(key.sign(&payload).as_ref()),
+            poller_id: Some(TEST_POLLER_ID.to_string()),
+            server_names: vec!["other.example.test".to_string()],
+            server_name_proofs: Vec::new(),
+            timeout_ms: Some(1),
+        };
+        let err = relay_next(
+            axum::extract::State(state),
+            HeaderMap::new(),
+            axum::Json(body),
+        )
+        .await
+        .expect_err("changing the exact names must invalidate the signature");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn relay_v2_rejects_an_exact_name_without_certificate_possession() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, public) = test_identity();
+        let daemon_id = "relay-name-unproved";
+        let relay = relay_state();
+        let state = crate::build_test_state(
+            dir.path(),
+            registered_store(daemon_id, &public),
+            crate::TestStateOverrides {
+                open_daemon_registration: true,
+                relay: Some(relay),
+                ..Default::default()
+            },
+        );
+        let issued = crate::now_unix_ms();
+        let server_names = vec!["box.example.test".to_string()];
+        let payload = relay_control_signing_payload(
+            RELAY_CONTROL_PROTOCOL,
+            daemon_id,
+            &public,
+            issued,
+            Some(TEST_POLLER_ID),
+            &server_names,
+        );
+        let body = RelayNextRequest {
+            protocol: RELAY_CONTROL_PROTOCOL.to_string(),
+            daemon_id: daemon_id.to_string(),
+            daemon_public_key: public,
+            issued_at_unix_ms: issued,
+            signature: crate::b64u(key.sign(&payload).as_ref()),
+            poller_id: Some(TEST_POLLER_ID.to_string()),
+            server_names,
+            server_name_proofs: Vec::new(),
+            timeout_ms: Some(1),
+        };
+        let err = relay_next(
+            axum::extract::State(state),
+            HeaderMap::new(),
+            axum::Json(body),
+        )
+        .await
+        .expect_err("an unproved exact name must reject");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn relay_accepts_v2_exact_names_and_v1_fleet_fallback() {
+        for (protocol, server_names) in [
+            (RELAY_CONTROL_PROTOCOL, vec!["box.example.test".to_string()]),
+            (RELAY_CONTROL_PROTOCOL_V1, Vec::new()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (key, public) = test_identity();
+            let daemon_id = format!("relay-{}", protocol.rsplit('-').next().unwrap());
+            let issued = crate::now_unix_ms();
+            let (relay, server_name_proofs) = if protocol == RELAY_CONTROL_PROTOCOL {
+                let (relay, proof) =
+                    relay_state_and_name_proof(&server_names[0], &daemon_id, &public, issued);
+                (relay, vec![proof])
+            } else {
+                (relay_state(), Vec::new())
+            };
+            let state = crate::build_test_state(
+                dir.path(),
+                registered_store(&daemon_id, &public),
+                crate::TestStateOverrides {
+                    open_daemon_registration: true,
+                    relay: Some(relay.clone()),
+                    ..Default::default()
+                },
+            );
+            let poller_id = (protocol == RELAY_CONTROL_PROTOCOL).then_some(TEST_POLLER_ID);
+            let payload = relay_control_signing_payload(
+                protocol,
+                &daemon_id,
+                &public,
+                issued,
+                poller_id,
+                &server_names,
+            );
+            let body = RelayNextRequest {
+                protocol: protocol.to_string(),
+                daemon_id: daemon_id.clone(),
+                daemon_public_key: public,
+                issued_at_unix_ms: issued,
+                signature: crate::b64u(key.sign(&payload).as_ref()),
+                poller_id: poller_id.map(str::to_string),
+                server_names: server_names.clone(),
+                server_name_proofs,
+                timeout_ms: Some(1),
+            };
+            let response = relay_next(
+                axum::extract::State(state),
+                HeaderMap::new(),
+                axum::Json(body),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            let label = daemon_label(&daemon_id).unwrap();
+            let routed = if protocol == RELAY_CONTROL_PROTOCOL {
+                relay.resolve_tunnel(&server_names[0], issued)
+            } else {
+                relay.resolve_tunnel(&format!("{label}.fleet.example.test"), issued)
+            };
+            assert_eq!(resolved_label(routed).as_deref(), Some(label.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_disconnect_request_withdraws_the_registered_poller() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, public) = test_identity();
+        let daemon_id = "relay-disconnect";
+        let label = daemon_label(daemon_id).unwrap();
+        let relay = relay_state();
+        let issued = crate::now_unix_ms();
+        let exact_name = "disconnect.example.test";
+        assert!(relay.touch_tunnel(
+            &label,
+            issued,
+            Some(TEST_POLLER_ID),
+            Some(&[exact_name.to_string()])
+        ));
+        let state = crate::build_test_state(
+            dir.path(),
+            registered_store(daemon_id, &public),
+            crate::TestStateOverrides {
+                open_daemon_registration: true,
+                relay: Some(relay.clone()),
+                ..Default::default()
+            },
+        );
+        let payload = relay_control_signing_payload(
+            RELAY_DISCONNECT_PROTOCOL,
+            daemon_id,
+            &public,
+            issued,
+            Some(TEST_POLLER_ID),
+            &[],
+        );
+        let body = RelayNextRequest {
+            protocol: RELAY_DISCONNECT_PROTOCOL.to_string(),
+            daemon_id: daemon_id.to_string(),
+            daemon_public_key: public,
+            issued_at_unix_ms: issued,
+            signature: crate::b64u(key.sign(&payload).as_ref()),
+            poller_id: Some(TEST_POLLER_ID.to_string()),
+            server_names: Vec::new(),
+            server_name_proofs: Vec::new(),
+            timeout_ms: None,
+        };
+
+        let response = relay_next(
+            axum::extract::State(state),
+            HeaderMap::new(),
+            axum::Json(body),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(relay.resolve_tunnel(exact_name, issued).is_none());
+        assert!(relay
+            .resolve_tunnel(&format!("{label}.fleet.example.test"), issued)
+            .is_none());
     }
 
     #[tokio::test]
@@ -1315,7 +2937,6 @@ mod tests {
                 open_daemon_registration: true,
                 dns_zone: Some(zone.clone()),
                 relay: Some(relay),
-                ..Default::default()
             },
         );
         let issued = crate::now_unix_ms();
@@ -1486,10 +3107,19 @@ mod tests {
     ) {
         tokio::spawn(async move {
             let client = reqwest::Client::new();
+            let poller_id = uuid::Uuid::new_v4().simple().to_string();
             loop {
                 let issued = crate::now_unix_ms();
-                let payload = relay_control_signing_payload(&daemon_id, &public, issued);
-                let signature = crate::b64u(key.sign(payload.as_bytes()).as_ref());
+                let server_names = Vec::<String>::new();
+                let payload = relay_control_signing_payload(
+                    RELAY_CONTROL_PROTOCOL,
+                    &daemon_id,
+                    &public,
+                    issued,
+                    Some(&poller_id),
+                    &server_names,
+                );
+                let signature = crate::b64u(key.sign(&payload).as_ref());
                 let request = client
                     .post(format!("{connect_base}/api/relay/next"))
                     .json(&serde_json::json!({
@@ -1498,6 +3128,8 @@ mod tests {
                         "daemon_public_key": public,
                         "issued_at_unix_ms": issued,
                         "signature": signature,
+                        "poller_id": poller_id,
+                        "server_names": server_names,
                         "timeout_ms": 1000,
                     }))
                     .send()

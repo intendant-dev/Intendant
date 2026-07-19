@@ -5,6 +5,103 @@
 
 use tokio::net::TcpListener;
 
+/// Bidirectionally splice two byte streams under one shared inactivity window
+/// and an independent byte ceiling for each direction.
+///
+/// Progress in either direction keeps the connection alive. Reads and each
+/// partial write both count, so an asymmetric active stream is not closed by
+/// a quiet reverse direction, while a backpressured write becomes idle once
+/// neither half can make further progress. The first EOF, I/O error, or cap
+/// completion closes the whole splice, matching the relay's fail-closed
+/// connection lifetime.
+pub async fn splice_bidirectional_bounded<A, B>(
+    left: A,
+    right: B,
+    max_bytes_per_direction: u64,
+    idle: std::time::Duration,
+) where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    async fn copy_direction<R, W>(
+        mut reader: R,
+        mut writer: W,
+        max_bytes: u64,
+        activity: tokio::sync::mpsc::Sender<()>,
+    ) where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let note_progress = || {
+            // One queued notification is enough: consuming it resets the
+            // watchdog no earlier than the progress it represents.
+            let _ = activity.try_send(());
+        };
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            note_progress();
+            total = total.saturating_add(n as u64);
+            if total > max_bytes {
+                return;
+            }
+            let mut written = 0usize;
+            while written < n {
+                match writer.write(&buf[written..n]).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(count) => {
+                        written += count;
+                        note_progress();
+                    }
+                }
+            }
+        }
+    }
+
+    async fn wait_for_idle(
+        mut activity: tokio::sync::mpsc::Receiver<()>,
+        idle: std::time::Duration,
+    ) {
+        let timer = tokio::time::sleep(idle);
+        tokio::pin!(timer);
+        loop {
+            tokio::select! {
+                biased;
+                event = activity.recv() => match event {
+                    Some(()) => timer.as_mut().reset(tokio::time::Instant::now() + idle),
+                    None => return,
+                },
+                _ = &mut timer => return,
+            }
+        }
+    }
+
+    let (left_read, left_write) = tokio::io::split(left);
+    let (right_read, right_write) = tokio::io::split(right);
+    let (activity_tx, activity_rx) = tokio::sync::mpsc::channel(1);
+    let left_to_right = copy_direction(
+        left_read,
+        right_write,
+        max_bytes_per_direction,
+        activity_tx.clone(),
+    );
+    let right_to_left =
+        copy_direction(right_read, left_write, max_bytes_per_direction, activity_tx);
+    let watchdog = wait_for_idle(activity_rx, idle);
+    tokio::pin!(left_to_right, right_to_left, watchdog);
+    tokio::select! {
+        _ = &mut left_to_right => {}
+        _ = &mut right_to_left => {}
+        _ = &mut watchdog => {}
+    }
+}
+
 /// Default TCP port for the daemon's web gateway (dashboard + API).
 /// Canonical here so access/ and peer/ can name it without reaching
 /// upward into the gateway module.
@@ -152,7 +249,101 @@ pub fn rebind_dead_tcp_listener(addr: std::net::SocketAddr) -> std::io::Result<T
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_splice_keeps_one_way_progress_alive() {
+        let idle = std::time::Duration::from_secs(10);
+        let (mut left_peer, left_splice) = tokio::io::duplex(64);
+        let (right_splice, mut right_peer) = tokio::io::duplex(64);
+        let splice = tokio::spawn(splice_bidirectional_bounded(
+            left_splice,
+            right_splice,
+            1024,
+            idle,
+        ));
+
+        for byte in [b'a', b'b', b'c'] {
+            left_peer.write_all(&[byte]).await.unwrap();
+            let mut received = [0u8; 1];
+            right_peer.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, [byte]);
+            tokio::time::advance(std::time::Duration::from_secs(9)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !splice.is_finished(),
+                "progress in one direction must refresh the shared idle window"
+            );
+        }
+        splice.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_splice_ends_when_backpressure_stops_all_progress() {
+        let idle = std::time::Duration::from_secs(10);
+        let (mut left_peer, left_splice) = tokio::io::duplex(1);
+        let (right_splice, _right_peer) = tokio::io::duplex(1);
+        let splice = tokio::spawn(splice_bidirectional_bounded(
+            left_splice,
+            right_splice,
+            1024,
+            idle,
+        ));
+
+        left_peer.write_all(b"a").await.unwrap();
+        tokio::task::yield_now().await;
+        left_peer.write_all(b"b").await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!splice.is_finished());
+
+        tokio::time::advance(idle + std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            splice.is_finished(),
+            "a blocked write and quiet reverse direction must share one idle deadline"
+        );
+        splice.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_splice_ends_on_first_eof() {
+        let (left_peer, left_splice) = tokio::io::duplex(16);
+        let (right_splice, _right_peer) = tokio::io::duplex(16);
+        let splice = tokio::spawn(splice_bidirectional_bounded(
+            left_splice,
+            right_splice,
+            1024,
+            std::time::Duration::from_secs(60),
+        ));
+        drop(left_peer);
+        tokio::time::timeout(std::time::Duration::from_secs(1), splice)
+            .await
+            .expect("EOF must end the whole splice")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_splice_enforces_each_direction_byte_cap() {
+        let (mut left_peer, left_splice) = tokio::io::duplex(16);
+        let (right_splice, mut right_peer) = tokio::io::duplex(16);
+        let splice = tokio::spawn(splice_bidirectional_bounded(
+            left_splice,
+            right_splice,
+            2,
+            std::time::Duration::from_secs(60),
+        ));
+
+        left_peer.write_all(b"ab").await.unwrap();
+        let mut accepted = [0u8; 2];
+        right_peer.read_exact(&mut accepted).await.unwrap();
+        assert_eq!(&accepted, b"ab");
+        left_peer.write_all(b"c").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), splice)
+            .await
+            .expect("crossing the direction cap must end the splice")
+            .unwrap();
+    }
 
     #[test]
     fn interface_filter_preserves_encounter_order_and_duplicates() {

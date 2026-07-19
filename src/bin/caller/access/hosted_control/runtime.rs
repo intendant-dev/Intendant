@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::access::iam::{
@@ -106,14 +107,6 @@ pub struct HostedControlRuntime {
     pub(super) daemon_id: String,
     daemon_label: String,
     display_media_relay_configured: bool,
-    /// Replay window for authority-free doorbell creation and polling.
-    replay: Arc<Mutex<ReplayState>>,
-    /// Independent replay window for active lease proofs. Public polling must
-    /// never consume the capacity that protects authenticated control.
-    lease_replay: Arc<Mutex<ReplayState>>,
-    tickets: Arc<Mutex<HashMap<String, WsTicketRecord>>>,
-    doorbell_rate: Arc<Mutex<DoorbellRateState>>,
-    poll_rate: Arc<Mutex<PollRateState>>,
     pub(super) witness_rate: Arc<Mutex<WitnessRateState>>,
 }
 
@@ -134,12 +127,20 @@ impl std::fmt::Debug for HostedControlRuntime {
     }
 }
 
-#[derive(Default)]
-struct ReplayState {
-    by_authority: HashMap<String, VecDeque<(String, i64)>>,
+const SHARED_TRANSIENT_FILE: &str = "hosted-control-transient.json";
+const SHARED_TRANSIENT_SCHEMA_VERSION: u32 = 2;
+const SHARED_TRANSIENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayRecord {
+    authority_digest: String,
+    nonce_digest: String,
+    timestamp_unix_ms: i64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WsTicketRecord {
     lease_id: String,
     grant_id: String,
@@ -147,14 +148,48 @@ struct WsTicketRecord {
     expires_unix_ms: u64,
 }
 
-#[derive(Default)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SharedTransientState {
+    schema_version: u32,
+    public_replay: Vec<ReplayRecord>,
+    lease_replay: Vec<ReplayRecord>,
+    tickets: HashMap<String, WsTicketRecord>,
+    #[serde(default)]
+    doorbell_rate: DoorbellRateState,
+    #[serde(default)]
+    poll_rate: PollRateState,
+}
+
+impl Default for SharedTransientState {
+    fn default() -> Self {
+        Self {
+            schema_version: SHARED_TRANSIENT_SCHEMA_VERSION,
+            public_replay: Vec::new(),
+            lease_replay: Vec::new(),
+            tickets: HashMap::new(),
+            doorbell_rate: DoorbellRateState::default(),
+            poll_rate: PollRateState::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReplayLane {
+    Public,
+    Lease,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DoorbellRateState {
     global: VecDeque<i64>,
     by_key: HashMap<String, VecDeque<i64>>,
     by_source: HashMap<String, VecDeque<i64>>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PollRateState {
     global: VecDeque<i64>,
     by_request: HashMap<String, VecDeque<i64>>,
@@ -214,11 +249,6 @@ impl HostedControlRuntime {
             daemon_id,
             daemon_label,
             display_media_relay_configured,
-            replay: Arc::new(Mutex::new(ReplayState::default())),
-            lease_replay: Arc::new(Mutex::new(ReplayState::default())),
-            tickets: Arc::new(Mutex::new(HashMap::new())),
-            doorbell_rate: Arc::new(Mutex::new(DoorbellRateState::default())),
-            poll_rate: Arc::new(Mutex::new(PollRateState::default())),
             witness_rate: Arc::new(Mutex::new(WitnessRateState::default())),
         }
     }
@@ -257,6 +287,9 @@ impl HostedControlRuntime {
             request_ttl_ms: PENDING_REQUEST_TTL_MS,
             display_media_relay_configured: self.display_media_relay_configured,
             lane_guard,
+            custom_domain: false,
+            rp_id: None,
+            passkey_available: false,
         })
     }
 
@@ -537,85 +570,119 @@ impl HostedControlRuntime {
                     "approved TTL may not exceed the request or daemon limit".to_string(),
                 ));
             }
-            let stable = stable_id_digest(&format!(
-                "{}\n{}",
-                request.request_id, request.browser_key_fingerprint
-            ));
-            let lease_id = format!("lease:{stable}");
-            let principal_id = format!("principal:hosted-lease:{stable}");
-            let grant_id = format!("grant:hosted-lease:{stable}");
-            let expires = now.saturating_add(ttl.saturating_mul(1000));
-            let principal = IamPrincipal {
-                id: principal_id.clone(),
-                kind: HOSTED_PRINCIPAL_KIND.to_string(),
-                label: format!("Hosted lease {}", &stable[..12]),
-                status: "active".to_string(),
-                source: HOSTED_SOURCE.to_string(),
-                account: None,
-                organization: None,
-                authn: vec![json!({
-                    "kind": HOSTED_AUTHN_KIND,
-                    "fingerprint": request.browser_key_fingerprint,
-                    "public_key": request.browser_public_key,
-                })],
-                notes: None,
-                created_at_unix_ms: Some(now),
-            };
-            let grant = IamGrant {
-                id: grant_id.clone(),
-                principal_id: principal_id.clone(),
-                target_id: "daemon:self".to_string(),
-                role_id: preset.role_id().to_string(),
-                policy_id: "policy:hosted-control-compiled".to_string(),
-                status: "active".to_string(),
-                source: HOSTED_SOURCE.to_string(),
-                reason: "daemon-local hosted lease approval".to_string(),
-                created_at_unix_ms: Some(now),
-                revoked_at_unix_ms: None,
-                expires_at_unix_ms: Some(expires),
-                issued_via: None,
-                fs_scope: None,
-            };
-            let mut document = HostedLeaseDocument {
-                protocol: LEASE_PROTOCOL.to_string(),
-                lease_id: lease_id.clone(),
-                request_id: request.request_id.clone(),
-                daemon_id: self.daemon_id.clone(),
-                daemon_public_key: identity.public_key_b64u(),
-                fleet_origin: request.fleet_origin.clone(),
-                browser_public_key: request.browser_public_key.clone(),
-                browser_key_fingerprint: request.browser_key_fingerprint.clone(),
+            let document = issue_lease_record(
+                state,
+                &request,
                 preset,
-                issued_unix_ms: now,
-                expires_unix_ms: expires,
-                principal_id: principal_id.clone(),
-                grant_id: grant_id.clone(),
-                document_sha256: String::new(),
-                signature: String::new(),
-            };
-            document.document_sha256 = document.expected_document_sha256();
-            document.signature = identity.sign_b64u(document.signing_payload().as_bytes());
-            state.principals.push(principal);
-            state.grants.push(grant);
-            state.hosted_control.leases.push(HostedLeaseRecord {
-                document: document.clone(),
-                status: HostedLeaseStatus::Active,
-                revoked_at_unix_ms: None,
-                revoked_by: None,
-            });
+                ttl,
+                actor,
+                identity,
+                &self.daemon_id,
+            )?;
             state.hosted_control.requests[request_index].status =
                 HostedLeaseRequestStatus::Approved;
-            state.hosted_control.requests[request_index].approved_lease_id = Some(lease_id.clone());
-            push_audit(
-                state,
-                &actor.id,
-                "hosted_lease_issue",
-                &lease_id,
-                format!("Issued {} lease for {} seconds", preset.as_str(), ttl),
-            );
+            state.hosted_control.requests[request_index].approved_lease_id =
+                Some(document.lease_id.clone());
             Ok((Some(document), true))
         })
         .map_err(|error| format!("decide hosted lease request: {error}"))
+    }
+
+    /// Issue a lease after a successful custom-domain passkey ceremony.
+    ///
+    /// This path validates the browser-key proof and the exact same daemon
+    /// ceiling/TTL/guard invariants as a doorbell approval, but deliberately
+    /// does not consume anonymous doorbell rate or pending-request capacity.
+    pub(crate) fn issue_passkey_lease(
+        &self,
+        mut input: HostedLeaseRequestInput,
+        fleet_origin: &str,
+        actor: &AccessPrincipal,
+    ) -> Result<HostedLeaseDocument, String> {
+        self.ensure_enabled()?;
+        self.ensure_lane_available()?;
+        let identity = self.identity()?;
+        let fleet_origin = validate_fleet_origin(fleet_origin)?;
+        let (public_key, fingerprint) = validate_browser_public_key(&input.browser_public_key)?;
+        let label = input.requester_label.trim().to_string();
+        if label.is_empty() || label.len() > 96 || label.chars().any(char::is_control) {
+            return Err("requester_label must contain 1 to 96 printable characters".to_string());
+        }
+        if !valid_id_component(&input.nonce) {
+            return Err("doorbell proof nonce is invalid".to_string());
+        }
+        verify_timestamp(input.timestamp_unix_ms)?;
+        if !(MIN_LEASE_TTL_SECS..=HARD_MAX_LEASE_TTL_SECS).contains(&input.requested_ttl_secs) {
+            return Err(format!(
+                "requested_ttl_secs must be between {MIN_LEASE_TTL_SECS} and {HARD_MAX_LEASE_TTL_SECS}"
+            ));
+        }
+        input.browser_public_key = public_key.clone();
+        input.requester_label = label.clone();
+        verify_p256_signature(
+            &public_key,
+            input
+                .proof_payload(&self.daemon_id, &fleet_origin)
+                .as_bytes(),
+            &input.signature,
+        )?;
+        self.record_nonce(
+            &format!("passkey:{}:{fingerprint}", actor.id),
+            &input.nonce,
+            input.timestamp_unix_ms,
+        )?;
+        let now = now_ms().max(0) as u64;
+        let mut request = HostedLeaseRequest {
+            protocol: DOORBELL_PROTOCOL.to_string(),
+            request_id: format!("passkey-request:{}", uuid::Uuid::new_v4().simple()),
+            request_nonce: random_b64u(32)?,
+            browser_public_key: public_key,
+            browser_key_fingerprint: fingerprint,
+            requested_preset: input.requested_preset,
+            requested_ttl_secs: input.requested_ttl_secs,
+            requester_label: label,
+            fleet_origin,
+            daemon_id: self.daemon_id.clone(),
+            daemon_label: self.daemon_label.clone(),
+            daemon_public_key: identity.public_key_b64u(),
+            created_unix_ms: now,
+            expires_unix_ms: now.saturating_add(PENDING_REQUEST_TTL_MS),
+            status: HostedLeaseRequestStatus::Pending,
+            approved_lease_id: None,
+            doorbell_signature: String::new(),
+        };
+        request.doorbell_signature = identity.sign_b64u(request.signing_payload().as_bytes());
+        iam::transact_state(&self.cert_dir, |state, _| {
+            if compute_current_lane_guard(state).status == HostedLaneGuardStatus::Suspended {
+                return Err(AccessError(
+                    "hosted control is suspended by the certificate guard".to_string(),
+                ));
+            }
+            if request.requested_preset > state.hosted_control.policy.ceiling {
+                return Err(AccessError(
+                    "requested preset exceeds the daemon ceiling".to_string(),
+                ));
+            }
+            if !(MIN_LEASE_TTL_SECS..=state.hosted_control.policy.max_ttl_secs)
+                .contains(&request.requested_ttl_secs)
+            {
+                return Err(AccessError(format!(
+                    "requested_ttl_secs must be between {MIN_LEASE_TTL_SECS} and {}",
+                    state.hosted_control.policy.max_ttl_secs
+                )));
+            }
+            let document = issue_lease_record(
+                state,
+                &request,
+                request.requested_preset,
+                request.requested_ttl_secs,
+                actor,
+                identity,
+                &self.daemon_id,
+            )?;
+            Ok((document, true))
+        })
+        .map_err(|error| format!("issue passkey-authorized hosted lease: {error}"))
     }
 
     pub fn verify_request_proof(
@@ -655,6 +722,27 @@ impl HostedControlRuntime {
         Ok(verified)
     }
 
+    /// Refresh an already-authenticated request's lease and IAM snapshot
+    /// without consuming another proof nonce. Long request-body reads must
+    /// call this again before dispatching side effects so expiry, revocation,
+    /// ceiling changes, and the certificate guard take effect within the
+    /// same HTTP exchange.
+    pub fn revalidate_verified_lease(
+        &self,
+        verified: &VerifiedHostedLease,
+    ) -> Result<VerifiedHostedLease, String> {
+        self.ensure_enabled()?;
+        let current = self.load_verified_lease(
+            &verified.document.lease_id,
+            &verified.document.fleet_origin,
+            &verified.principal.transport,
+        )?;
+        if current.document != verified.document {
+            return Err("hosted lease document changed during the request".to_string());
+        }
+        Ok(current)
+    }
+
     pub fn mint_ws_ticket(&self, verified: &VerifiedHostedLease) -> Result<HostedWsTicket, String> {
         self.ensure_enabled()?;
         self.ensure_lane_available()?;
@@ -666,16 +754,20 @@ impl HostedControlRuntime {
             fleet_origin: verified.document.fleet_origin.clone(),
             expires_unix_ms: expires,
         };
-        let mut tickets = self
-            .tickets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let now = now_ms() as u64;
-        tickets.retain(|_, record| record.expires_unix_ms > now);
-        if tickets.len() >= WS_TICKETS_GLOBAL_CAP {
-            return Err("too many outstanding hosted WebSocket tickets".to_string());
-        }
-        tickets.insert(ticket.clone(), record);
+        mutate_shared_transient(&self.cert_dir, |state| {
+            let now = now_ms().max(0) as u64;
+            state
+                .tickets
+                .retain(|_, record| record.expires_unix_ms > now);
+            if state.tickets.len() >= WS_TICKETS_GLOBAL_CAP {
+                return Err("too many outstanding hosted WebSocket tickets".to_string());
+            }
+            if state.tickets.contains_key(&ticket) {
+                return Err("generated a duplicate hosted WebSocket ticket".to_string());
+            }
+            state.tickets.insert(ticket.clone(), record);
+            Ok(())
+        })?;
         Ok(HostedWsTicket {
             ticket,
             expires_unix_ms: expires,
@@ -690,14 +782,14 @@ impl HostedControlRuntime {
     ) -> Result<VerifiedHostedLease, String> {
         self.ensure_enabled()?;
         let fleet_origin = validate_fleet_origin(fleet_origin)?;
-        let record = self
-            .tickets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(ticket)
-            .ok_or_else(|| {
+        if !valid_id_component(ticket) {
+            return Err("hosted WebSocket ticket is invalid".to_string());
+        }
+        let record = mutate_shared_transient(&self.cert_dir, |state| {
+            state.tickets.remove(ticket).ok_or_else(|| {
                 "hosted WebSocket ticket was not found or was already used".to_string()
-            })?;
+            })
+        })?;
         if record.expires_unix_ms <= now_ms() as u64 {
             return Err("hosted WebSocket ticket has expired".to_string());
         }
@@ -935,23 +1027,6 @@ impl HostedControlRuntime {
                     expired_requests.push(request.request_id.clone());
                 }
             }
-            let mut expired_leases = Vec::new();
-            for lease in &mut state.hosted_control.leases {
-                if lease.status == HostedLeaseStatus::Active
-                    && lease.document.expires_unix_ms <= now
-                {
-                    lease.status = HostedLeaseStatus::Expired;
-                    expired_leases.push((
-                        lease.document.lease_id.clone(),
-                        lease.document.grant_id.clone(),
-                    ));
-                }
-            }
-            for (_, grant_id) in &expired_leases {
-                if let Some(grant) = state.grants.iter_mut().find(|grant| grant.id == *grant_id) {
-                    grant.status = "expired".to_string();
-                }
-            }
             for request_id in &expired_requests {
                 push_audit(
                     state,
@@ -961,16 +1036,8 @@ impl HostedControlRuntime {
                     "Observed expired hosted lease request".to_string(),
                 );
             }
-            for (lease_id, _) in &expired_leases {
-                push_audit(
-                    state,
-                    actor,
-                    "hosted_lease_expire",
-                    lease_id,
-                    "Observed expired hosted lease".to_string(),
-                );
-            }
-            let changed = !expired_requests.is_empty() || !expired_leases.is_empty();
+            let expired_leases = materialize_hosted_lease_expirations(state, now, actor);
+            let changed = !expired_requests.is_empty() || expired_leases > 0;
             Ok(((), changed))
         })
     }
@@ -1092,7 +1159,13 @@ impl HostedControlRuntime {
         nonce: &str,
         timestamp_unix_ms: i64,
     ) -> Result<(), String> {
-        record_nonce_in(&self.replay, authority, nonce, timestamp_unix_ms)
+        record_nonce_in(
+            &self.cert_dir,
+            ReplayLane::Public,
+            authority,
+            nonce,
+            timestamp_unix_ms,
+        )
     }
 
     fn record_lease_nonce(
@@ -1101,7 +1174,13 @@ impl HostedControlRuntime {
         nonce: &str,
         timestamp_unix_ms: i64,
     ) -> Result<(), String> {
-        record_nonce_in(&self.lease_replay, authority, nonce, timestamp_unix_ms)
+        record_nonce_in(
+            &self.cert_dir,
+            ReplayLane::Lease,
+            authority,
+            nonce,
+            timestamp_unix_ms,
+        )
     }
 
     fn check_doorbell_rate(
@@ -1110,94 +1189,380 @@ impl HostedControlRuntime {
         source_bucket: Option<&str>,
         now: i64,
     ) -> Result<(), String> {
-        let cutoff = now.saturating_sub(60_000);
-        let mut rate = self
-            .doorbell_rate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        retain_recent(&mut rate.global, cutoff);
-        rate.by_key.retain(|_, entries| {
-            retain_recent(entries, cutoff);
-            !entries.is_empty()
-        });
-        rate.by_source.retain(|_, entries| {
-            retain_recent(entries, cutoff);
-            !entries.is_empty()
-        });
-        if rate.global.len() >= DOORBELL_GLOBAL_PER_MINUTE {
-            return Err("hosted lease request rate limit reached".to_string());
-        }
-        let key_entries = rate.by_key.entry(fingerprint.to_string()).or_default();
-        if key_entries.len() >= DOORBELL_PER_KEY_PER_MINUTE {
-            return Err("hosted lease request key rate limit reached".to_string());
-        }
-        if let Some(source) = source_bucket.filter(|source| !source.trim().is_empty()) {
-            let source_entries = rate.by_source.entry(source.to_string()).or_default();
-            if source_entries.len() >= 30 {
-                return Err("hosted lease request source rate limit reached".to_string());
+        let fingerprint = stable_id_digest(fingerprint);
+        let source_bucket = source_bucket
+            .filter(|source| !source.trim().is_empty())
+            .map(stable_id_digest);
+        mutate_shared_transient(&self.cert_dir, |state| {
+            let cutoff = now.saturating_sub(60_000);
+            let rate = &mut state.doorbell_rate;
+            retain_recent(&mut rate.global, cutoff);
+            rate.by_key.retain(|_, entries| {
+                retain_recent(entries, cutoff);
+                !entries.is_empty()
+            });
+            rate.by_source.retain(|_, entries| {
+                retain_recent(entries, cutoff);
+                !entries.is_empty()
+            });
+            if rate.global.len() >= DOORBELL_GLOBAL_PER_MINUTE {
+                return Err("hosted lease request rate limit reached".to_string());
             }
-            source_entries.push_back(now);
-        }
-        rate.global.push_back(now);
-        rate.by_key
-            .entry(fingerprint.to_string())
-            .or_default()
-            .push_back(now);
-        Ok(())
+            if rate.by_key.get(&fingerprint).map_or(0, VecDeque::len) >= DOORBELL_PER_KEY_PER_MINUTE
+            {
+                return Err("hosted lease request key rate limit reached".to_string());
+            }
+            if let Some(source) = source_bucket.as_ref() {
+                let source_entries = rate.by_source.entry(source.clone()).or_default();
+                if source_entries.len() >= 30 {
+                    return Err("hosted lease request source rate limit reached".to_string());
+                }
+                source_entries.push_back(now);
+            }
+            rate.global.push_back(now);
+            rate.by_key.entry(fingerprint).or_default().push_back(now);
+            Ok(())
+        })
     }
 
     fn check_poll_rate(&self, request_id: &str, now: i64) -> Result<(), String> {
-        let cutoff = now.saturating_sub(60_000);
-        let mut rate = self
-            .poll_rate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        retain_recent(&mut rate.global, cutoff);
-        rate.by_request.retain(|_, entries| {
-            retain_recent(entries, cutoff);
-            !entries.is_empty()
-        });
-        if rate.global.len() >= POLL_GLOBAL_PER_MINUTE {
-            return Err("hosted lease poll global rate limit reached".to_string());
-        }
-        let request_entries = rate.by_request.entry(request_id.to_string()).or_default();
-        if request_entries.len() >= POLL_PER_REQUEST_PER_MINUTE {
-            return Err("hosted lease poll request rate limit reached".to_string());
-        }
-        request_entries.push_back(now);
-        rate.global.push_back(now);
-        Ok(())
+        let request_id = stable_id_digest(request_id);
+        mutate_shared_transient(&self.cert_dir, |state| {
+            let cutoff = now.saturating_sub(60_000);
+            let rate = &mut state.poll_rate;
+            retain_recent(&mut rate.global, cutoff);
+            rate.by_request.retain(|_, entries| {
+                retain_recent(entries, cutoff);
+                !entries.is_empty()
+            });
+            if rate.global.len() >= POLL_GLOBAL_PER_MINUTE {
+                return Err("hosted lease poll global rate limit reached".to_string());
+            }
+            if rate.by_request.get(&request_id).map_or(0, VecDeque::len)
+                >= POLL_PER_REQUEST_PER_MINUTE
+            {
+                return Err("hosted lease poll request rate limit reached".to_string());
+            }
+            rate.by_request
+                .entry(request_id)
+                .or_default()
+                .push_back(now);
+            rate.global.push_back(now);
+            Ok(())
+        })
     }
 }
 
+fn materialize_hosted_lease_expirations(state: &mut LocalIamState, now: u64, actor: &str) -> usize {
+    let mut expired_leases = Vec::new();
+    for lease in &mut state.hosted_control.leases {
+        if lease.status == HostedLeaseStatus::Active && lease.document.expires_unix_ms <= now {
+            lease.status = HostedLeaseStatus::Expired;
+            expired_leases.push((
+                lease.document.lease_id.clone(),
+                lease.document.grant_id.clone(),
+            ));
+        }
+    }
+    for (_, grant_id) in &expired_leases {
+        if let Some(grant) = state.grants.iter_mut().find(|grant| grant.id == *grant_id) {
+            grant.status = "expired".to_string();
+        }
+    }
+    for (lease_id, _) in &expired_leases {
+        push_audit(
+            state,
+            actor,
+            "hosted_lease_expire",
+            lease_id,
+            "Observed expired hosted lease".to_string(),
+        );
+    }
+    expired_leases.len()
+}
+
+fn issue_lease_record(
+    state: &mut LocalIamState,
+    request: &HostedLeaseRequest,
+    preset: HostedPreset,
+    ttl_secs: u64,
+    actor: &AccessPrincipal,
+    identity: &DaemonIdentity,
+    daemon_id: &str,
+) -> AccessResult<HostedLeaseDocument> {
+    let now = now_ms().max(0) as u64;
+    materialize_hosted_lease_expirations(state, now, &actor.id);
+    iam::normalize_hosted_lease_bindings(state);
+    let active_leases = state
+        .hosted_control
+        .leases
+        .iter()
+        .filter(|lease| {
+            lease.status == HostedLeaseStatus::Active && lease.document.expires_unix_ms > now
+        })
+        .count();
+    if active_leases >= HOSTED_LEASES_CAP {
+        return Err(AccessError(
+            "hosted lease capacity is full; retry after an active lease expires or is revoked"
+                .to_string(),
+        ));
+    }
+    let stable = stable_id_digest(&format!(
+        "{}\n{}",
+        request.request_id, request.browser_key_fingerprint
+    ));
+    let lease_id = format!("lease:{stable}");
+    let principal_id = format!("principal:hosted-lease:{stable}");
+    let grant_id = format!("grant:hosted-lease:{stable}");
+    let expires = now.saturating_add(ttl_secs.saturating_mul(1000));
+    let principal = IamPrincipal {
+        id: principal_id.clone(),
+        kind: HOSTED_PRINCIPAL_KIND.to_string(),
+        label: format!("Hosted lease {}", &stable[..12]),
+        status: "active".to_string(),
+        source: HOSTED_SOURCE.to_string(),
+        account: None,
+        organization: None,
+        authn: vec![json!({
+            "kind": HOSTED_AUTHN_KIND,
+            "fingerprint": request.browser_key_fingerprint,
+            "public_key": request.browser_public_key,
+        })],
+        notes: None,
+        created_at_unix_ms: Some(now),
+    };
+    let grant = IamGrant {
+        id: grant_id.clone(),
+        principal_id: principal_id.clone(),
+        target_id: "daemon:self".to_string(),
+        role_id: preset.role_id().to_string(),
+        policy_id: "policy:hosted-control-compiled".to_string(),
+        status: "active".to_string(),
+        source: HOSTED_SOURCE.to_string(),
+        reason: "daemon-local hosted lease approval".to_string(),
+        created_at_unix_ms: Some(now),
+        revoked_at_unix_ms: None,
+        expires_at_unix_ms: Some(expires),
+        issued_via: None,
+        fs_scope: None,
+    };
+    let mut document = HostedLeaseDocument {
+        protocol: LEASE_PROTOCOL.to_string(),
+        lease_id: lease_id.clone(),
+        request_id: request.request_id.clone(),
+        daemon_id: daemon_id.to_string(),
+        daemon_public_key: identity.public_key_b64u(),
+        fleet_origin: request.fleet_origin.clone(),
+        browser_public_key: request.browser_public_key.clone(),
+        browser_key_fingerprint: request.browser_key_fingerprint.clone(),
+        preset,
+        issued_unix_ms: now,
+        expires_unix_ms: expires,
+        principal_id: principal_id.clone(),
+        grant_id: grant_id.clone(),
+        document_sha256: String::new(),
+        signature: String::new(),
+    };
+    document.document_sha256 = document.expected_document_sha256();
+    document.signature = identity.sign_b64u(document.signing_payload().as_bytes());
+    state.principals.push(principal);
+    state.grants.push(grant);
+    state.hosted_control.leases.push(HostedLeaseRecord {
+        document: document.clone(),
+        status: HostedLeaseStatus::Active,
+        revoked_at_unix_ms: None,
+        revoked_by: None,
+    });
+    iam::normalize_hosted_lease_bindings(state);
+    push_audit(
+        state,
+        &actor.id,
+        "hosted_lease_issue",
+        &lease_id,
+        format!("Issued {} lease for {} seconds", preset.as_str(), ttl_secs),
+    );
+    Ok(document)
+}
+
 fn record_nonce_in(
-    replay: &Arc<Mutex<ReplayState>>,
+    cert_dir: &Path,
+    lane: ReplayLane,
     authority: &str,
     nonce: &str,
     timestamp_unix_ms: i64,
 ) -> Result<(), String> {
-    let cutoff = now_ms().saturating_sub(REQUEST_PROOF_MAX_SKEW_MS);
-    let mut replay = replay.lock().unwrap_or_else(|error| error.into_inner());
-    replay.by_authority.retain(|_, entries| {
-        entries.retain(|(_, timestamp)| *timestamp >= cutoff);
+    let authority_digest = stable_id_digest(authority);
+    let nonce_digest = stable_id_digest(nonce);
+    mutate_shared_transient(cert_dir, |state| {
+        let replay = match lane {
+            ReplayLane::Public => &mut state.public_replay,
+            ReplayLane::Lease => &mut state.lease_replay,
+        };
+        if replay.len() >= PROOF_NONCES_GLOBAL_CAP {
+            return Err("hosted proof replay window is full".to_string());
+        }
+        if replay.iter().any(|record| {
+            record.authority_digest == authority_digest && record.nonce_digest == nonce_digest
+        }) {
+            return Err("hosted proof nonce was already used".to_string());
+        }
+        if replay
+            .iter()
+            .filter(|record| record.authority_digest == authority_digest)
+            .count()
+            >= PROOF_NONCES_PER_LEASE_CAP
+        {
+            return Err("hosted proof nonce window is full for this authority".to_string());
+        }
+        replay.push(ReplayRecord {
+            authority_digest,
+            nonce_digest,
+            timestamp_unix_ms,
+        });
+        Ok(())
+    })
+}
+
+fn shared_transient_path(cert_dir: &Path) -> PathBuf {
+    cert_dir.join(SHARED_TRANSIENT_FILE)
+}
+
+fn valid_rate_digest(value: &str) -> bool {
+    value.len() == 43 && valid_id_component(value)
+}
+
+fn doorbell_rate_state_is_valid(rate: &DoorbellRateState) -> bool {
+    rate.global.len() <= DOORBELL_GLOBAL_PER_MINUTE
+        && rate.by_key.len() <= DOORBELL_GLOBAL_PER_MINUTE
+        && rate.by_source.len() <= DOORBELL_GLOBAL_PER_MINUTE
+        && rate.by_key.iter().all(|(key, entries)| {
+            valid_rate_digest(key) && entries.len() <= DOORBELL_PER_KEY_PER_MINUTE
+        })
+        && rate
+            .by_source
+            .iter()
+            .all(|(source, entries)| valid_rate_digest(source) && entries.len() <= 30)
+        && rate.by_key.values().map(VecDeque::len).sum::<usize>() <= rate.global.len()
+        && rate.by_source.values().map(VecDeque::len).sum::<usize>() <= rate.global.len()
+}
+
+fn poll_rate_state_is_valid(rate: &PollRateState) -> bool {
+    rate.global.len() <= POLL_GLOBAL_PER_MINUTE
+        && rate.by_request.len() <= POLL_GLOBAL_PER_MINUTE
+        && rate.by_request.iter().all(|(request, entries)| {
+            valid_rate_digest(request) && entries.len() <= POLL_PER_REQUEST_PER_MINUTE
+        })
+        && rate.by_request.values().map(VecDeque::len).sum::<usize>() <= rate.global.len()
+}
+
+fn load_shared_transient_locked(cert_dir: &Path) -> Result<SharedTransientState, String> {
+    use std::io::Read as _;
+
+    let path = shared_transient_path(cert_dir);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SharedTransientState::default());
+        }
+        Err(error) => return Err(format!("open {}: {error}", path.display())),
+    };
+    let mut bytes = Vec::new();
+    file.take(SHARED_TRANSIENT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > SHARED_TRANSIENT_MAX_BYTES {
+        return Err(format!(
+            "{} exceeds the hosted transient-state size cap",
+            path.display()
+        ));
+    }
+    let mut state: SharedTransientState = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if state.schema_version == 1 {
+        state.schema_version = SHARED_TRANSIENT_SCHEMA_VERSION;
+    }
+    if state.schema_version != SHARED_TRANSIENT_SCHEMA_VERSION
+        || state.public_replay.len() > PROOF_NONCES_GLOBAL_CAP
+        || state.lease_replay.len() > PROOF_NONCES_GLOBAL_CAP
+        || state.tickets.len() > WS_TICKETS_GLOBAL_CAP
+        || !doorbell_rate_state_is_valid(&state.doorbell_rate)
+        || !poll_rate_state_is_valid(&state.poll_rate)
+        || state
+            .public_replay
+            .iter()
+            .chain(&state.lease_replay)
+            .any(|record| {
+                record.authority_digest.len() != 43
+                    || record.nonce_digest.len() != 43
+                    || !valid_id_component(&record.authority_digest)
+                    || !valid_id_component(&record.nonce_digest)
+            })
+        || state.tickets.iter().any(|(ticket, record)| {
+            !valid_id_component(ticket)
+                || !valid_id_component(&record.lease_id)
+                || !valid_id_component(&record.grant_id)
+                || validate_fleet_origin(&record.fleet_origin).is_err()
+        })
+    {
+        return Err(format!(
+            "{} contains invalid hosted transient state",
+            path.display()
+        ));
+    }
+    let replay_cutoff = now_ms().saturating_sub(REQUEST_PROOF_MAX_SKEW_MS);
+    state
+        .public_replay
+        .retain(|record| record.timestamp_unix_ms >= replay_cutoff);
+    state
+        .lease_replay
+        .retain(|record| record.timestamp_unix_ms >= replay_cutoff);
+    let rate_cutoff = now_ms().saturating_sub(60_000);
+    retain_recent(&mut state.doorbell_rate.global, rate_cutoff);
+    state.doorbell_rate.by_key.retain(|_, entries| {
+        retain_recent(entries, rate_cutoff);
         !entries.is_empty()
     });
-    let total: usize = replay.by_authority.values().map(VecDeque::len).sum();
-    if total >= PROOF_NONCES_GLOBAL_CAP {
-        return Err("hosted proof replay window is full".to_string());
+    state.doorbell_rate.by_source.retain(|_, entries| {
+        retain_recent(entries, rate_cutoff);
+        !entries.is_empty()
+    });
+    retain_recent(&mut state.poll_rate.global, rate_cutoff);
+    state.poll_rate.by_request.retain(|_, entries| {
+        retain_recent(entries, rate_cutoff);
+        !entries.is_empty()
+    });
+    Ok(state)
+}
+
+fn write_shared_transient_locked(
+    cert_dir: &Path,
+    state: &SharedTransientState,
+) -> AccessResult<()> {
+    let bytes = serde_json::to_vec(state)
+        .map_err(|error| AccessError(format!("serialize hosted transient state: {error}")))?;
+    if bytes.len() as u64 > SHARED_TRANSIENT_MAX_BYTES {
+        return Err(AccessError(
+            "hosted transient state exceeds its size cap".to_string(),
+        ));
     }
-    let entries = replay
-        .by_authority
-        .entry(authority.to_string())
-        .or_default();
-    if entries.iter().any(|(candidate, _)| candidate == nonce) {
-        return Err("hosted proof nonce was already used".to_string());
-    }
-    if entries.len() >= PROOF_NONCES_PER_LEASE_CAP {
-        return Err("hosted proof nonce window is full for this authority".to_string());
-    }
-    entries.push_back((nonce.to_string(), timestamp_unix_ms));
-    Ok(())
+    crate::access::authority_store::atomic_write_private_locked(
+        &shared_transient_path(cert_dir),
+        &bytes,
+    )
+}
+
+fn mutate_shared_transient<T>(
+    cert_dir: &Path,
+    update: impl FnOnce(&mut SharedTransientState) -> Result<T, String>,
+) -> Result<T, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let mut state =
+            load_shared_transient_locked(cert_dir).map_err(crate::access::AccessError)?;
+        let result = update(&mut state).map_err(crate::access::AccessError)?;
+        write_shared_transient_locked(cert_dir, &state)?;
+        Ok(result)
+    })
+    .map_err(|error| error.to_string())
 }
 
 fn project_request_status(mut request: HostedLeaseRequest, now_unix_ms: u64) -> HostedLeaseRequest {
@@ -1369,6 +1734,26 @@ mod tests {
         )
     }
 
+    fn shared_transient(runtime: &HostedControlRuntime) -> SharedTransientState {
+        crate::access::authority_store::with_lock(&runtime.cert_dir, || {
+            load_shared_transient_locked(&runtime.cert_dir).map_err(crate::access::AccessError)
+        })
+        .unwrap()
+    }
+
+    fn replace_shared_transient(
+        runtime: &HostedControlRuntime,
+        update: impl FnOnce(&mut SharedTransientState),
+    ) {
+        crate::access::authority_store::with_lock(&runtime.cert_dir, || {
+            let mut state = load_shared_transient_locked(&runtime.cert_dir)
+                .map_err(crate::access::AccessError)?;
+            update(&mut state);
+            write_shared_transient_locked(&runtime.cert_dir, &state)
+        })
+        .unwrap();
+    }
+
     fn owner() -> AccessPrincipal {
         AccessPrincipal::root_dashboard_session("test", "test")
     }
@@ -1487,6 +1872,42 @@ mod tests {
             .is_ok());
         assert!(runtime
             .verify_request_proof("GET", path, "https://laptop.example.test", &proof, "relay")
+            .unwrap_err()
+            .contains("already used"));
+    }
+
+    #[test]
+    fn hosted_request_proof_replay_is_shared_across_daemon_processes() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = runtime(&temp);
+        let second = runtime(&temp);
+        let key = browser_key();
+        let (_, document) = issue_lease(&first, &key, HostedPreset::Tasks, 3600);
+        let proof = request_proof(
+            &key,
+            &document,
+            "POST",
+            "/api/sessions",
+            "cross-process-replay",
+            now_ms(),
+        );
+        first
+            .verify_request_proof(
+                "POST",
+                "/api/sessions",
+                "https://laptop.example.test",
+                &proof,
+                "relay",
+            )
+            .unwrap();
+        assert!(second
+            .verify_request_proof(
+                "POST",
+                "/api/sessions",
+                "https://laptop.example.test",
+                &proof,
+                "relay",
+            )
             .unwrap_err()
             .contains("already used"));
     }
@@ -1706,12 +2127,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let runtime = runtime(&temp);
         let now = now_ms();
-        runtime
-            .doorbell_rate
-            .lock()
-            .unwrap()
-            .global
-            .extend(std::iter::repeat_n(now, DOORBELL_GLOBAL_PER_MINUTE));
+        replace_shared_transient(&runtime, |state| {
+            state
+                .doorbell_rate
+                .global
+                .extend(std::iter::repeat_n(now, DOORBELL_GLOBAL_PER_MINUTE));
+        });
         let key = browser_key();
         let error = runtime
             .create_request(
@@ -1722,9 +2143,208 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("rate limit"));
         assert!(
-            runtime.replay.lock().unwrap().by_authority.is_empty(),
+            shared_transient(&runtime).public_replay.is_empty(),
             "rate-limited doorbells must not consume the shared proof nonce window"
         );
+    }
+
+    #[test]
+    fn passkey_authorized_issuance_ignores_anonymous_queue_and_rate_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let seed_key = browser_key();
+        let seed = runtime
+            .create_request(
+                doorbell_input(&seed_key, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+        iam::transact_state(&runtime.cert_dir, |state, _| {
+            state.hosted_control.requests = (0..HOSTED_REQUESTS_CAP)
+                .map(|index| {
+                    let mut request = seed.clone();
+                    request.request_id = format!("request:anonymous-capacity-{index}");
+                    request.request_nonce = format!("pending-{index}");
+                    request.created_unix_ms = now_ms().max(0) as u64;
+                    request.expires_unix_ms = request
+                        .created_unix_ms
+                        .saturating_add(PENDING_REQUEST_TTL_MS);
+                    request.status = HostedLeaseRequestStatus::Pending;
+                    request.approved_lease_id = None;
+                    request.doorbell_signature = runtime
+                        .identity()
+                        .unwrap()
+                        .sign_b64u(request.signing_payload().as_bytes());
+                    request
+                })
+                .collect();
+            Ok(((), true))
+        })
+        .unwrap();
+        replace_shared_transient(&runtime, |state| {
+            state.doorbell_rate.global =
+                std::iter::repeat_n(now_ms(), DOORBELL_GLOBAL_PER_MINUTE).collect();
+            state.doorbell_rate.by_key.clear();
+            state.doorbell_rate.by_source.clear();
+        });
+
+        let passkey_browser = browser_key();
+        let lease = runtime
+            .issue_passkey_lease(
+                doorbell_input(&passkey_browser, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                &owner(),
+            )
+            .unwrap();
+        assert_eq!(lease.preset, HostedPreset::Tasks);
+        let state = iam::load_state_cached_arc(&runtime.cert_dir).unwrap();
+        assert_eq!(
+            state.hosted_control.requests.len(),
+            HOSTED_REQUESTS_CAP,
+            "passkey issuance must not enqueue an anonymous request"
+        );
+        assert!(state
+            .hosted_control
+            .leases
+            .iter()
+            .any(|record| record.document.lease_id == lease.lease_id));
+    }
+
+    #[test]
+    fn full_active_lease_capacity_refuses_new_issuance_without_eviction() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let key = browser_key();
+        let seed = runtime
+            .create_request(
+                doorbell_input(&key, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+        let actor = owner();
+        let identity = runtime.identity().unwrap();
+        let mut state = LocalIamState::default();
+        let mut first_lease_id = String::new();
+        for index in 0..HOSTED_LEASES_CAP {
+            let mut request = seed.clone();
+            request.request_id = format!("request:active-capacity-{index}");
+            request.browser_key_fingerprint = format!("fingerprint-{index}");
+            let document = issue_lease_record(
+                &mut state,
+                &request,
+                HostedPreset::Tasks,
+                3600,
+                &actor,
+                identity,
+                "daemon-test",
+            )
+            .unwrap();
+            if index == 0 {
+                first_lease_id = document.lease_id;
+            }
+        }
+
+        let mut overflow = seed;
+        overflow.request_id = "request:active-capacity-overflow".to_string();
+        overflow.browser_key_fingerprint = "fingerprint-overflow".to_string();
+        let error = issue_lease_record(
+            &mut state,
+            &overflow,
+            HostedPreset::Tasks,
+            3600,
+            &actor,
+            identity,
+            "daemon-test",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("capacity is full"));
+        assert_eq!(state.hosted_control.leases.len(), HOSTED_LEASES_CAP);
+        assert!(state
+            .hosted_control
+            .leases
+            .iter()
+            .any(|lease| lease.document.lease_id == first_lease_id));
+        assert_eq!(
+            state
+                .principals
+                .iter()
+                .filter(|principal| principal.source == HOSTED_SOURCE)
+                .count(),
+            HOSTED_LEASES_CAP
+        );
+        assert_eq!(
+            state
+                .grants
+                .iter()
+                .filter(|grant| grant.source == HOSTED_SOURCE)
+                .count(),
+            HOSTED_LEASES_CAP
+        );
+    }
+
+    #[test]
+    fn sustained_lease_turnover_keeps_records_and_iam_bindings_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let key = browser_key();
+        let seed = runtime
+            .create_request(
+                doorbell_input(&key, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+        let actor = owner();
+        let identity = runtime.identity().unwrap();
+        let mut state = LocalIamState::default();
+        let mut newest_lease_id = String::new();
+
+        for index in 0..(HOSTED_LEASES_CAP + 32) {
+            for lease in &mut state.hosted_control.leases {
+                if lease.status == HostedLeaseStatus::Active {
+                    lease.document.expires_unix_ms = 0;
+                }
+            }
+            let mut request = seed.clone();
+            request.request_id = format!("request:turnover-{index}");
+            request.browser_key_fingerprint = format!("turnover-fingerprint-{index}");
+            newest_lease_id = issue_lease_record(
+                &mut state,
+                &request,
+                HostedPreset::Tasks,
+                3600,
+                &actor,
+                identity,
+                "daemon-test",
+            )
+            .unwrap()
+            .lease_id;
+
+            assert!(state.hosted_control.leases.len() <= HOSTED_LEASES_CAP);
+            assert_eq!(
+                state
+                    .principals
+                    .iter()
+                    .filter(|principal| principal.source == HOSTED_SOURCE)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                state
+                    .grants
+                    .iter()
+                    .filter(|grant| grant.source == HOSTED_SOURCE)
+                    .count(),
+                1
+            );
+        }
+
+        assert_eq!(state.hosted_control.leases.len(), HOSTED_LEASES_CAP);
+        assert!(state.hosted_control.leases.iter().any(|lease| {
+            lease.document.lease_id == newest_lease_id && lease.status == HostedLeaseStatus::Active
+        }));
     }
 
     #[test]
@@ -1747,7 +2367,7 @@ mod tests {
             .unwrap_err()
             .contains("key rate limit"));
         assert!(
-            runtime.replay.lock().unwrap().by_authority.is_empty(),
+            shared_transient(&runtime).public_replay.is_empty(),
             "invalid signatures must not enter the replay cache"
         );
     }
@@ -1759,15 +2379,15 @@ mod tests {
         let key = browser_key();
         let (_, document) = issue_lease(&runtime, &key, HostedPreset::Tasks, 3600);
         let now = now_ms();
-        let mut public_replay = runtime.replay.lock().unwrap();
-        public_replay.by_authority.clear();
-        public_replay.by_authority.insert(
-            "poll:public-capacity".to_string(),
-            (0..PROOF_NONCES_GLOBAL_CAP)
-                .map(|index| (format!("public-{index}"), now))
-                .collect(),
-        );
-        drop(public_replay);
+        replace_shared_transient(&runtime, |state| {
+            state.public_replay = (0..PROOF_NONCES_GLOBAL_CAP)
+                .map(|index| ReplayRecord {
+                    authority_digest: stable_id_digest(&format!("public-authority-{index}")),
+                    nonce_digest: stable_id_digest(&format!("public-nonce-{index}")),
+                    timestamp_unix_ms: now,
+                })
+                .collect();
+        });
 
         let proof = request_proof(
             &key,
@@ -1786,17 +2406,7 @@ mod tests {
                 "relay",
             )
             .is_ok());
-        assert_eq!(
-            runtime
-                .lease_replay
-                .lock()
-                .unwrap()
-                .by_authority
-                .values()
-                .map(VecDeque::len)
-                .sum::<usize>(),
-            1
-        );
+        assert_eq!(shared_transient(&runtime).lease_replay.len(), 1);
     }
 
     #[test]
@@ -1812,12 +2422,12 @@ mod tests {
             )
             .unwrap();
         let now = now_ms();
-        runtime
-            .poll_rate
-            .lock()
-            .unwrap()
-            .global
-            .extend(std::iter::repeat_n(now, POLL_GLOBAL_PER_MINUTE));
+        replace_shared_transient(&runtime, |state| {
+            state
+                .poll_rate
+                .global
+                .extend(std::iter::repeat_n(now, POLL_GLOBAL_PER_MINUTE));
+        });
         let proof = HostedLeasePollProof {
             request_id: request.request_id,
             nonce: "poll-rate-limit".to_string(),
@@ -1829,17 +2439,54 @@ mod tests {
             .unwrap_err()
             .contains("global rate limit"));
         assert_eq!(
-            runtime
-                .replay
-                .lock()
-                .unwrap()
-                .by_authority
-                .values()
-                .map(VecDeque::len)
-                .sum::<usize>(),
+            shared_transient(&runtime).public_replay.len(),
             1,
             "the rejected poll must not consume replay capacity"
         );
+    }
+
+    #[test]
+    fn public_admission_rate_windows_are_shared_between_runtime_instances() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = runtime(&temp);
+        let sibling = runtime(&temp);
+        let now = now_ms();
+        replace_shared_transient(&first, |state| {
+            state
+                .doorbell_rate
+                .global
+                .extend(std::iter::repeat_n(now, DOORBELL_GLOBAL_PER_MINUTE));
+            state
+                .poll_rate
+                .global
+                .extend(std::iter::repeat_n(now, POLL_GLOBAL_PER_MINUTE));
+        });
+
+        assert!(sibling
+            .check_doorbell_rate("sibling-key", Some("sibling-source"), now)
+            .unwrap_err()
+            .contains("rate limit"));
+        assert!(sibling
+            .check_poll_rate("request:sibling", now)
+            .unwrap_err()
+            .contains("global rate limit"));
+    }
+
+    #[test]
+    fn legacy_shared_transient_state_migrates_with_empty_rate_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        std::fs::create_dir_all(&runtime.cert_dir).unwrap();
+        std::fs::write(
+            shared_transient_path(&runtime.cert_dir),
+            br#"{"schema_version":1,"public_replay":[],"lease_replay":[],"tickets":{}}"#,
+        )
+        .unwrap();
+
+        let migrated = shared_transient(&runtime);
+        assert_eq!(migrated.schema_version, SHARED_TRANSIENT_SCHEMA_VERSION);
+        assert!(migrated.doorbell_rate.global.is_empty());
+        assert!(migrated.poll_rate.global.is_empty());
     }
 
     #[test]
@@ -2280,7 +2927,12 @@ mod tests {
         let runtime = runtime(&temp);
         let key = browser_key();
         let (_, revoked) = issue_lease(&runtime, &key, HostedPreset::Tasks, 3600);
+        let opening = runtime
+            .load_verified_lease(&revoked.lease_id, "https://laptop.example.test", "relay")
+            .unwrap();
+        assert!(runtime.revalidate_verified_lease(&opening).is_ok());
         assert!(runtime.revoke_lease(&revoked.lease_id, &owner()).unwrap());
+        assert!(runtime.revalidate_verified_lease(&opening).is_err());
         assert!(runtime
             .load_verified_lease(&revoked.lease_id, "https://laptop.example.test", "relay")
             .is_err());
@@ -2451,13 +3103,13 @@ mod tests {
         );
 
         let expired = runtime.mint_ws_ticket(&verified).unwrap();
-        runtime
-            .tickets
-            .lock()
-            .unwrap()
-            .get_mut(&expired.ticket)
-            .unwrap()
-            .expires_unix_ms = now_ms().saturating_sub(1) as u64;
+        replace_shared_transient(&runtime, |state| {
+            state
+                .tickets
+                .get_mut(&expired.ticket)
+                .unwrap()
+                .expires_unix_ms = now_ms().saturating_sub(1) as u64;
+        });
         assert!(runtime
             .consume_ws_ticket(&expired.ticket, "https://laptop.example.test", "relay")
             .unwrap_err()
@@ -2471,6 +3123,26 @@ mod tests {
                 .is_err(),
             "ticket consumption must recheck the live lease and grant"
         );
+    }
+
+    #[test]
+    fn websocket_ticket_can_be_consumed_once_by_a_sibling_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = runtime(&temp);
+        let second = runtime(&temp);
+        let key = browser_key();
+        let (_, document) = issue_lease(&first, &key, HostedPreset::View, 3600);
+        let verified = first
+            .load_verified_lease(&document.lease_id, "https://laptop.example.test", "relay")
+            .unwrap();
+        let ticket = first.mint_ws_ticket(&verified).unwrap();
+        second
+            .consume_ws_ticket(&ticket.ticket, "https://laptop.example.test", "relay")
+            .unwrap();
+        assert!(first
+            .consume_ws_ticket(&ticket.ticket, "https://laptop.example.test", "relay")
+            .unwrap_err()
+            .contains("already used"));
     }
 
     #[test]

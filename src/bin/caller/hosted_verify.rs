@@ -7,7 +7,8 @@
 //! hashes them, and compares against the logged manifest — then verifies
 //! the manifest's inclusion proof against the signed tree head and the
 //! tree head's consistency against a locally pinned one under the daemon
-//! state root (`~/.intendant/hosted-verify/`, honoring `$INTENDANT_HOME`).
+//! state root (`~/.intendant/hosted-verify/`, honoring `$INTENDANT_HOME`),
+//! and rejects artifact-manifest rollback below the highest verified index.
 //!
 //! Deliberately OUT of band: page JS served by the origin can never
 //! honestly self-verify, so the checking happens from a vantage point the
@@ -31,9 +32,21 @@
 //! precedent); golden tests below twin the service's constants.
 
 use sha2::{Digest as _, Sha256};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use url::Url;
+
+const METADATA_RESPONSE_BYTE_CAP: usize = 2 * 1024 * 1024;
+const LOG_LEAF_BYTE_CAP: usize = 1024 * 1024;
+const LOG_PROOF_HASH_CAP: usize = 128;
+const MANIFEST_ARTIFACT_CAP: usize = 1024;
+const RELEASE_PLATFORM_CAP: usize = 64;
+const GITHUB_ASSET_CAP: usize = 4096;
+const ARTIFACT_PATH_BYTE_CAP: usize = 2048;
+const ARTIFACT_NAME_BYTE_CAP: usize = 512;
+const METADATA_STRING_BYTE_CAP: usize = 512;
 
 // ── Status registry (the tripwire's verdict; fleet_cert.rs pattern) ──
 
@@ -46,6 +59,9 @@ pub(crate) struct HostedBundleStatus {
     pub last_error: Option<String>,
     /// The per-artifact diff behind an `alert` (or a proof-level summary).
     pub mismatches: Vec<String>,
+    /// Normalized Connect URL this verdict belongs to. Never display a
+    /// completed verdict after live configuration points at another service.
+    pub rendezvous_url: Option<String>,
 }
 
 fn registry() -> &'static Mutex<HostedBundleStatus> {
@@ -56,6 +72,7 @@ fn registry() -> &'static Mutex<HostedBundleStatus> {
             checked_unix_ms: None,
             last_error: None,
             mismatches: Vec::new(),
+            rendezvous_url: None,
         })
     })
 }
@@ -67,9 +84,55 @@ pub(crate) fn status_snapshot() -> HostedBundleStatus {
         .clone()
 }
 
-fn with_status(update: impl FnOnce(&mut HostedBundleStatus)) {
+fn with_status<T>(update: impl FnOnce(&mut HostedBundleStatus) -> T) -> T {
     let mut status = registry().lock().expect("hosted bundle status poisoned");
-    update(&mut status);
+    update(&mut status)
+}
+
+fn verifier_url_key(value: Option<&str>) -> Option<String> {
+    let mut url = Url::parse(value?.trim()).ok()?;
+    url.set_fragment(None);
+    let normalized = url.as_str().trim_end_matches('/').to_string();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn bind_status_to_url(status: &mut HostedBundleStatus, rendezvous_url: Option<String>) {
+    if status.rendezvous_url == rendezvous_url {
+        return;
+    }
+    status.state = "unchecked".to_string();
+    status.checked_unix_ms = None;
+    status.last_error = None;
+    status.mismatches.clear();
+    status.rendezvous_url = rendezvous_url;
+}
+
+fn update_status_for_url(
+    status: &mut HostedBundleStatus,
+    rendezvous_url: &str,
+    update: impl FnOnce(&mut HostedBundleStatus),
+) -> bool {
+    if status.rendezvous_url.as_deref() != Some(rendezvous_url) {
+        return false;
+    }
+    update(status);
+    true
+}
+
+/// Reset a completed verdict when the live Connect destination changes.
+pub(crate) fn note_connect_config(enabled: bool, rendezvous_url: Option<&str>) {
+    let key = enabled.then(|| verifier_url_key(rendezvous_url)).flatten();
+    with_status(|status| bind_status_to_url(status, key));
+}
+
+/// Runtime settings changes do not wait for the next daily tick.
+pub(crate) fn spawn_check_now() {
+    tokio::spawn(check_once());
+}
+
+fn daemon_check_lock() -> &'static tokio::sync::Mutex<()> {
+    static CHECK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    CHECK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn now_unix_ms() -> u64 {
@@ -228,6 +291,24 @@ fn b64u_decode_hash(value: &str) -> Result<[u8; 32], String> {
     <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| "hash is not 32 bytes".to_string())
 }
 
+fn bounded_string(value: &str, label: &str, byte_cap: usize) -> Result<String, String> {
+    if value.len() > byte_cap || value.chars().any(char::is_control) {
+        return Err(format!("{label} exceeds its string bounds"));
+    }
+    Ok(value.to_string())
+}
+
+fn bounded_sha256(value: &str, label: &str) -> Result<String, String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(format!("{label} is not a hexadecimal sha256 digest"));
+    }
+    Ok(value.to_string())
+}
+
 // ── Wire shapes ──
 
 /// The service's signed tree head, as fetched.
@@ -248,26 +329,35 @@ impl Sth {
             .get("size")
             .and_then(|v| v.as_u64())
             .ok_or("sth missing size")?;
-        let root_b64u = value
-            .get("root")
-            .and_then(|v| v.as_str())
-            .ok_or("sth missing root")?
-            .to_string();
+        let root_b64u = bounded_string(
+            value
+                .get("root")
+                .and_then(|v| v.as_str())
+                .ok_or("sth missing root")?,
+            "sth root",
+            64,
+        )?;
         let unix_ms = value
             .get("unix_ms")
             .and_then(|v| v.as_u64())
             .ok_or("sth missing unix_ms")?;
-        let signature = b64u_decode(
+        let signature_text = bounded_string(
             value
                 .get("signature")
                 .and_then(|v| v.as_str())
                 .ok_or("sth missing signature")?,
+            "sth signature",
+            256,
         )?;
-        let public_key_b64u = value
-            .get("public_key")
-            .and_then(|v| v.as_str())
-            .ok_or("sth missing public_key")?
-            .to_string();
+        let signature = b64u_decode(&signature_text)?;
+        let public_key_b64u = bounded_string(
+            value
+                .get("public_key")
+                .and_then(|v| v.as_str())
+                .ok_or("sth missing public_key")?,
+            "sth public key",
+            256,
+        )?;
         Ok(Self {
             size,
             root: b64u_decode_hash(&root_b64u)?,
@@ -298,6 +388,21 @@ struct ManifestArtifact {
     sha256: String,
 }
 
+/// Stable executable entrypoints that every Connect bundle manifest must
+/// cover. Additional embedded assets may evolve, but omitting one of these
+/// paths can never turn a smaller declaration into a successful check.
+const REQUIRED_BUNDLE_PATHS: &[&str] = &[
+    "/",
+    "/access",
+    "/connect",
+    "/favicon.png",
+    "/install.ps1",
+    "/install.sh",
+    "/logo.svg",
+    "/sw.js",
+    "/trust",
+];
+
 /// The parsed `artifact_manifest` leaf, self-integrity verified (the
 /// carried `manifest_hash` recomputes from the carried list).
 #[derive(Clone, Debug)]
@@ -310,53 +415,87 @@ struct ManifestLeaf {
 }
 
 fn parse_manifest_leaf(leaf_json: &str) -> Result<ManifestLeaf, String> {
+    if leaf_json.len() > LOG_LEAF_BYTE_CAP {
+        return Err("manifest leaf exceeds its size cap".to_string());
+    }
     let leaf: serde_json::Value =
         serde_json::from_str(leaf_json).map_err(|e| format!("manifest leaf is not JSON: {e}"))?;
     if leaf.get("kind").and_then(|v| v.as_str()) != Some("artifact_manifest") {
         return Err("leaf is not an artifact_manifest entry".to_string());
     }
-    let artifacts: Vec<ManifestArtifact> = leaf
+    let artifact_values = leaf
         .get("artifacts")
         .and_then(|v| v.as_array())
-        .ok_or("manifest leaf missing artifacts")?
+        .ok_or("manifest leaf missing artifacts")?;
+    if artifact_values.len() > MANIFEST_ARTIFACT_CAP {
+        return Err("manifest leaf lists too many artifacts".to_string());
+    }
+    let artifacts: Vec<ManifestArtifact> = artifact_values
         .iter()
         .map(|entry| {
-            let path = entry
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or("artifact missing path")?
-                .to_string();
-            let sha256 = entry
-                .get("sha256")
-                .and_then(|v| v.as_str())
-                .ok_or("artifact missing sha256")?
-                .to_string();
+            let path = bounded_string(
+                entry
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("artifact missing path")?,
+                "artifact path",
+                ARTIFACT_PATH_BYTE_CAP,
+            )?;
+            let sha256 = bounded_sha256(
+                entry
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .ok_or("artifact missing sha256")?,
+                "artifact sha256",
+            )?;
             if !path.starts_with('/') {
                 return Err(format!("artifact path {path:?} is not absolute"));
             }
             Ok(ManifestArtifact { path, sha256 })
         })
         .collect::<Result<_, String>>()?;
-    let manifest_hash = leaf
-        .get("manifest_hash")
-        .and_then(|v| v.as_str())
-        .ok_or("manifest leaf missing manifest_hash")?
-        .to_string();
+    if artifacts
+        .windows(2)
+        .any(|pair| pair[0].path >= pair[1].path)
+    {
+        return Err("manifest artifact paths are not unique and strictly sorted".to_string());
+    }
+    let missing_required = REQUIRED_BUNDLE_PATHS
+        .iter()
+        .copied()
+        .filter(|required| !artifacts.iter().any(|artifact| artifact.path == *required))
+        .collect::<Vec<_>>();
+    if !missing_required.is_empty() {
+        return Err(format!(
+            "manifest omits required served paths: {}",
+            missing_required.join(", ")
+        ));
+    }
+    let manifest_hash = bounded_sha256(
+        leaf.get("manifest_hash")
+            .and_then(|v| v.as_str())
+            .ok_or("manifest leaf missing manifest_hash")?,
+        "manifest hash",
+    )?;
     if manifest_hash_hex(&artifacts) != manifest_hash {
         return Err("manifest_hash does not recompute from the carried artifact list".to_string());
     }
     Ok(ManifestLeaf {
         unix_ms: leaf.get("unix_ms").and_then(|v| v.as_u64()).unwrap_or(0),
-        bundle_version: leaf
-            .get("bundle_version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        git_sha: leaf
-            .get("git_sha")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
+        bundle_version: bounded_string(
+            leaf.get("bundle_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+            "bundle version",
+            METADATA_STRING_BYTE_CAP,
+        )?,
+        git_sha: bounded_string(
+            leaf.get("git_sha")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+            "git sha",
+            METADATA_STRING_BYTE_CAP,
+        )?,
         manifest_hash,
         artifacts,
     })
@@ -364,12 +503,23 @@ fn parse_manifest_leaf(leaf_json: &str) -> Result<ManifestLeaf, String> {
 
 // ── The pinned tree head (TOFU, then consistency forever) ──
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SthPin {
     size: u64,
     /// b64u, as the service reports it.
     root: String,
     public_key: String,
+    pinned_unix_ms: u64,
+}
+
+/// Highest artifact-manifest observation accepted for one rendezvous. The
+/// tree-head pin proves append-only history; this companion pin prevents a
+/// server from selecting an older, still-included bundle leaf after a newer
+/// bundle has already been verified.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ArtifactManifestPin {
+    index: u64,
+    manifest_hash: String,
     pinned_unix_ms: u64,
 }
 
@@ -396,17 +546,145 @@ fn pin_path(state_root: &Path, base: &Url) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
-fn load_pin(path: &Path) -> Option<SthPin> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+fn artifact_manifest_pin_path(state_root: &Path, base: &Url) -> PathBuf {
+    pin_path(state_root, base).with_extension("artifact-manifest.json")
 }
 
-fn save_pin(path: &Path, pin: &SthPin) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+fn load_pin(path: &Path) -> Result<Option<SthPin>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|error| format!("parse {}: {error}", path.display()))
+}
+
+fn load_artifact_manifest_pin(path: &Path) -> Result<Option<ArtifactManifestPin>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|error| format!("parse {}: {error}", path.display()))
+}
+
+fn check_artifact_manifest_high_water(
+    pin: Option<&ArtifactManifestPin>,
+    index: u64,
+    manifest_hash: &str,
+) -> Result<(), String> {
+    let Some(pin) = pin else {
+        return Ok(());
+    };
+    if index < pin.index {
+        return Err(format!(
+            "artifact manifest index regressed from pinned {} to {index}",
+            pin.index
+        ));
     }
-    let text = serde_json::to_string_pretty(pin).map_err(|e| e.to_string())?;
-    std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
+    if index == pin.index && manifest_hash != pin.manifest_hash {
+        return Err(format!(
+            "artifact manifest changed at pinned index {}",
+            pin.index
+        ));
+    }
+    Ok(())
+}
+
+fn commit_artifact_manifest_pin(
+    path: &Path,
+    index: u64,
+    manifest_hash: &str,
+) -> Result<(), String> {
+    let lock_dir = pin_lock_dir(path)?;
+    crate::access::authority_store::with_lock(&lock_dir, || {
+        let current = load_artifact_manifest_pin(path).map_err(crate::access::AccessError)?;
+        check_artifact_manifest_high_water(current.as_ref(), index, manifest_hash)
+            .map_err(crate::access::AccessError)?;
+        if current
+            .as_ref()
+            .is_some_and(|pin| pin.index == index && pin.manifest_hash == manifest_hash)
+        {
+            return Ok(());
+        }
+        let pin = ArtifactManifestPin {
+            index,
+            manifest_hash: manifest_hash.to_string(),
+            pinned_unix_ms: current
+                .as_ref()
+                .map(|pin| pin.pinned_unix_ms)
+                .unwrap_or_else(now_unix_ms),
+        };
+        let text = serde_json::to_string_pretty(&pin)
+            .map_err(|error| crate::access::AccessError(error.to_string()))?;
+        crate::access::authority_store::atomic_write_private_locked(path, text.as_bytes())
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn same_tree_head(left: &SthPin, right: &SthPin) -> bool {
+    left.size == right.size && left.root == right.root && left.public_key == right.public_key
+}
+
+fn pin_lock_dir(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("pin path has no parent: {}", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("pin path has no file name: {}", path.display()))?;
+    Ok(parent.join(".pin-locks").join(name))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PinCommit {
+    Committed,
+    /// Another verifier advanced or replaced the basis while this verifier
+    /// was checking. The caller must reconcile this exact observation now.
+    Changed(Option<SthPin>),
+}
+
+/// Commit a verified tree head without letting an older concurrent check
+/// overwrite a newer observation. A changed basis is returned as typed data
+/// so the caller can reconcile it immediately rather than suppressing the
+/// observation as an availability error until the next daily run.
+fn commit_pin(
+    path: &Path,
+    basis: Option<&SthPin>,
+    candidate: &SthPin,
+) -> Result<PinCommit, String> {
+    let lock_dir = pin_lock_dir(path)?;
+    crate::access::authority_store::with_lock(&lock_dir, || {
+        let current = load_pin(path).map_err(crate::access::AccessError)?;
+        if current
+            .as_ref()
+            .is_some_and(|pin| same_tree_head(pin, candidate))
+        {
+            return Ok(PinCommit::Committed);
+        }
+        let basis_is_current = match (basis, current.as_ref()) {
+            (None, None) => true,
+            (Some(basis), Some(current)) => same_tree_head(basis, current),
+            _ => false,
+        };
+        if !basis_is_current {
+            return Ok(PinCommit::Changed(current));
+        }
+
+        let mut committed = candidate.clone();
+        if let Some(current) = current {
+            committed.pinned_unix_ms = current.pinned_unix_ms;
+        }
+        let text = serde_json::to_string_pretty(&committed)
+            .map_err(|error| crate::access::AccessError(error.to_string()))?;
+        crate::access::authority_store::atomic_write_private_locked(path, text.as_bytes())?;
+        Ok(PinCommit::Committed)
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// What the pinned tree head demands of the fetched one. Pure — the
@@ -455,26 +733,31 @@ fn pin_decision(pin: Option<&SthPin>, sth: &Sth) -> Result<PinDecision, String> 
 /// Bundle artifacts are ≤ a few MB; anything past this cap is already a
 /// divergence, not a download worth finishing.
 const ARTIFACT_BYTE_CAP: usize = 64 * 1024 * 1024;
+/// Bound a whole manifest independently of its artifact count.
+const BUNDLE_TOTAL_BYTE_CAP: usize = 256 * 1024 * 1024;
+const BUNDLE_TOTAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const ARTIFACT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const ARTIFACT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 enum ArtifactFetch {
-    Hashed { sha256_hex: String },
+    Hashed { sha256_hex: String, bytes: usize },
     HttpStatus(u16),
-    TooLarge,
+    TooLarge { bytes: usize },
 }
 
 /// The per-artifact verdict: `None` = matches the log.
 fn artifact_mismatch(artifact: &ManifestArtifact, fetched: &ArtifactFetch) -> Option<String> {
     match fetched {
-        ArtifactFetch::Hashed { sha256_hex } if *sha256_hex == artifact.sha256 => None,
-        ArtifactFetch::Hashed { sha256_hex } => Some(format!(
+        ArtifactFetch::Hashed { sha256_hex, .. } if *sha256_hex == artifact.sha256 => None,
+        ArtifactFetch::Hashed { sha256_hex, .. } => Some(format!(
             "{}: manifest {} · served {}",
             artifact.path,
             short_hash(&artifact.sha256),
             short_hash(sha256_hex),
         )),
         ArtifactFetch::HttpStatus(status) => Some(format!("{}: HTTP {status}", artifact.path)),
-        ArtifactFetch::TooLarge => Some(format!(
+        ArtifactFetch::TooLarge { .. } => Some(format!(
             "{}: response exceeded {} MiB",
             artifact.path,
             ARTIFACT_BYTE_CAP / (1024 * 1024)
@@ -520,9 +803,27 @@ fn http_client() -> Result<reqwest::Client, String> {
     // and the body bytes hashed are the bytes the origin serves.
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        // Verification fetches never follow origin-controlled redirects.
+        // A redirect is a distinct response to verify, not permission to
+        // reach a different host (including loopback, link-local, or LAN).
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("intendant-hosted-verify")
         .build()
         .map_err(|e| e.to_string())
+}
+
+fn release_download_client() -> Result<reqwest::Client, String> {
+    // GitHub release assets normally redirect to its object store. This
+    // client is used only for a URL returned by the separately fetched
+    // GitHub release API, never for Connect-controlled metadata. Large
+    // artifacts have no short total timeout; the fetcher below separately
+    // bounds connection/header wait and idle time between body chunks.
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent("intendant-hosted-verify")
+        .build()
+        .map_err(|error| error.to_string())
 }
 
 async fn fetch_json(client: &reqwest::Client, url: Url) -> Result<serde_json::Value, String> {
@@ -535,10 +836,83 @@ async fn fetch_json(client: &reqwest::Client, url: Url) -> Result<serde_json::Va
     if !status.is_success() {
         return Err(format!("GET {url}: HTTP {status}"));
     }
-    response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| format!("GET {url}: {e}"))
+    response_json_limited(response, &url).await
+}
+
+async fn response_json_limited(
+    response: reqwest::Response,
+    url: &Url,
+) -> Result<serde_json::Value, String> {
+    use futures_util::StreamExt as _;
+
+    if response
+        .content_length()
+        .is_some_and(|length| length > METADATA_RESPONSE_BYTE_CAP as u64)
+    {
+        return Err(format!(
+            "GET {url}: metadata response exceeds {} bytes",
+            METADATA_RESPONSE_BYTE_CAP
+        ));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("GET {url}: {error}"))?;
+        if body.len().saturating_add(chunk.len()) > METADATA_RESPONSE_BYTE_CAP {
+            return Err(format!(
+                "GET {url}: metadata response exceeds {} bytes",
+                METADATA_RESPONSE_BYTE_CAP
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|error| format!("GET {url}: {error}"))
+}
+
+async fn verify_consistency_extension(
+    client: &reqwest::Client,
+    base: &Url,
+    old_size: u64,
+    old_root: &[u8; 32],
+    new_size: u64,
+    new_root: &[u8; 32],
+) -> Result<(), VerifyFailure> {
+    use VerifyFailure::{Unavailable, Verification};
+    let url = crate::connect_rendezvous::join_url(base, "api/log/consistency")
+        .map_err(Unavailable)
+        .map(|mut url| {
+            url.set_query(Some(&format!("old={old_size}&new={new_size}")));
+            url
+        })?;
+    let consistency = fetch_json(client, url).await.map_err(Unavailable)?;
+    let proof_values = consistency
+        .get("proof")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| Unavailable("consistency response missing proof".to_string()))?;
+    if proof_values.len() > LOG_PROOF_HASH_CAP {
+        return Err(Unavailable(
+            "consistency response proof exceeds its element cap".to_string(),
+        ));
+    }
+    let consistency_proof: Vec<[u8; 32]> = proof_values
+        .iter()
+        .map(|hash| b64u_decode_hash(hash.as_str().unwrap_or_default()))
+        .collect::<Result<_, String>>()
+        .map_err(Unavailable)?;
+    if !verify_consistency(
+        old_size as usize,
+        new_size as usize,
+        old_root,
+        new_root,
+        &consistency_proof,
+    ) {
+        return Err(Verification {
+            summary: "consistency proof failed — history was rewritten since a verified tree head"
+                .to_string(),
+            mismatches: Vec::new(),
+        });
+    }
+    Ok(())
 }
 
 /// Fetch one artifact, hashing as it streams. Transport errors bubble as
@@ -549,43 +923,152 @@ async fn fetch_artifact(
     url: Url,
     byte_cap: usize,
 ) -> Result<ArtifactFetch, String> {
+    fetch_artifact_with_timeouts(
+        client,
+        url,
+        byte_cap,
+        ARTIFACT_RESPONSE_TIMEOUT,
+        ARTIFACT_IDLE_TIMEOUT,
+    )
+    .await
+}
+
+async fn fetch_artifact_with_timeouts(
+    client: &reqwest::Client,
+    url: Url,
+    byte_cap: usize,
+    response_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<ArtifactFetch, String> {
     use futures_util::StreamExt as _;
-    let response = client
-        .get(url.clone())
-        .send()
+    let response = tokio::time::timeout(response_timeout, client.get(url.clone()).send())
         .await
+        .map_err(|_| format!("GET {url}: response headers timed out"))?
         .map_err(|e| format!("GET {url}: {e}"))?;
     let status = response.status();
     if !status.is_success() {
         return Ok(ArtifactFetch::HttpStatus(status.as_u16()));
     }
+    if response
+        .content_length()
+        .is_some_and(|length| length > byte_cap as u64)
+    {
+        return Ok(ArtifactFetch::TooLarge { bytes: 0 });
+    }
     let mut hasher = Sha256::new();
     let mut total = 0usize;
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = tokio::time::timeout(idle_timeout, stream.next())
+            .await
+            .map_err(|_| format!("GET {url}: response body became idle"))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
         let chunk = chunk.map_err(|e| format!("GET {url}: {e}"))?;
-        total += chunk.len();
+        total = total.saturating_add(chunk.len());
         if total > byte_cap {
-            return Ok(ArtifactFetch::TooLarge);
+            return Ok(ArtifactFetch::TooLarge { bytes: total });
         }
         hasher.update(&chunk);
     }
     let digest: [u8; 32] = hasher.finalize().into();
     Ok(ArtifactFetch::Hashed {
         sha256_hex: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        bytes: total,
     })
+}
+
+#[derive(Clone, Copy)]
+struct BundleFetchLimits {
+    per_artifact_bytes: usize,
+    total_bytes: usize,
+    total_timeout: Duration,
+    response_timeout: Duration,
+    idle_timeout: Duration,
+}
+
+const BUNDLE_FETCH_LIMITS: BundleFetchLimits = BundleFetchLimits {
+    per_artifact_bytes: ARTIFACT_BYTE_CAP,
+    total_bytes: BUNDLE_TOTAL_BYTE_CAP,
+    total_timeout: BUNDLE_TOTAL_TIMEOUT,
+    response_timeout: ARTIFACT_RESPONSE_TIMEOUT,
+    idle_timeout: ARTIFACT_IDLE_TIMEOUT,
+};
+
+async fn compare_live_artifacts(
+    client: &reqwest::Client,
+    base: &Url,
+    artifacts: &[ManifestArtifact],
+    limits: BundleFetchLimits,
+) -> Result<Vec<String>, VerifyFailure> {
+    use VerifyFailure::Unavailable;
+
+    let compare = async {
+        let mut mismatches = Vec::new();
+        let mut fetched_bytes = 0usize;
+        for artifact in artifacts {
+            let remaining = limits
+                .total_bytes
+                .checked_sub(fetched_bytes)
+                .filter(|n| *n > 0)
+                .ok_or_else(|| {
+                    Unavailable(
+                        "hosted bundle verification reached its aggregate byte budget".to_string(),
+                    )
+                })?;
+            let fetch_cap = limits.per_artifact_bytes.min(remaining);
+            let url =
+                crate::connect_rendezvous::join_url(base, &artifact.path).map_err(Unavailable)?;
+            let fetched = fetch_artifact_with_timeouts(
+                client,
+                url,
+                fetch_cap,
+                limits.response_timeout,
+                limits.idle_timeout,
+            )
+            .await
+            .map_err(Unavailable)?;
+            match &fetched {
+                ArtifactFetch::Hashed { bytes, .. } => {
+                    fetched_bytes = fetched_bytes.saturating_add(*bytes);
+                }
+                ArtifactFetch::TooLarge { bytes } => {
+                    fetched_bytes = fetched_bytes.saturating_add(*bytes);
+                    if fetch_cap < limits.per_artifact_bytes || fetched_bytes > limits.total_bytes {
+                        return Err(Unavailable(
+                            "hosted bundle verification reached its aggregate byte budget"
+                                .to_string(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            if let Some(diff) = artifact_mismatch(artifact, &fetched) {
+                mismatches.push(diff);
+            }
+        }
+        Ok(mismatches)
+    };
+
+    tokio::time::timeout(limits.total_timeout, compare)
+        .await
+        .map_err(|_| {
+            Unavailable("hosted bundle verification reached its aggregate time budget".to_string())
+        })?
 }
 
 /// A log-endpoint response carried through the shared first half of the
 /// ritual: the tree head stands on its signature, the leaf is IN the
 /// tree the head signs, and the head extends the pinned one. The caller
-/// finishes its own artifact comparison, then advances the pin by
-/// writing `pin_candidate` to `pin_file` — only after everything held.
+/// finishes its own artifact comparison, then advances or reconciles
+/// `pin_candidate` against `pin_file` — only after everything held.
 struct VerifiedLogEntry {
     index: u64,
     leaf_json: String,
     sth: Sth,
     pin_file: PathBuf,
+    pin_basis: Option<SthPin>,
     pinned_from_size: Option<u64>,
     pin_candidate: SthPin,
 }
@@ -616,10 +1099,21 @@ async fn verify_logged_entry(
         .get("leaf_json")
         .and_then(|v| v.as_str())
         .ok_or_else(|| Unavailable("response missing leaf_json".to_string()))?;
-    let proof: Vec<[u8; 32]> = response
+    if leaf_json.len() > LOG_LEAF_BYTE_CAP {
+        return Err(Unavailable(
+            "response leaf exceeds its size cap".to_string(),
+        ));
+    }
+    let proof_values = response
         .get("proof")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| Unavailable("response missing proof".to_string()))?
+        .ok_or_else(|| Unavailable("response missing proof".to_string()))?;
+    if proof_values.len() > LOG_PROOF_HASH_CAP {
+        return Err(Unavailable(
+            "response inclusion proof exceeds its element cap".to_string(),
+        ));
+    }
+    let proof: Vec<[u8; 32]> = proof_values
         .iter()
         .map(|hash| b64u_decode_hash(hash.as_str().unwrap_or_default()))
         .collect::<Result<_, String>>()
@@ -638,38 +1132,13 @@ async fn verify_logged_entry(
 
     // 3. The tree head extends the one pinned last time (append-only).
     let pin_file = pin_path(state_root, base);
-    let pin = load_pin(&pin_file);
+    let pin = load_pin(&pin_file).map_err(Unavailable)?;
     let pinned_from_size = pin.as_ref().map(|p| p.size);
     match pin_decision(pin.as_ref(), &sth).map_err(verification)? {
         PinDecision::FirstContact | PinDecision::Unchanged => {}
         PinDecision::NeedConsistency { old_size, old_root } => {
-            let url = crate::connect_rendezvous::join_url(base, "api/log/consistency")
-                .map_err(Unavailable)
-                .map(|mut url| {
-                    url.set_query(Some(&format!("old={old_size}&new={}", sth.size)));
-                    url
-                })?;
-            let consistency = fetch_json(client, url).await.map_err(Unavailable)?;
-            let consistency_proof: Vec<[u8; 32]> = consistency
-                .get("proof")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| Unavailable("consistency response missing proof".to_string()))?
-                .iter()
-                .map(|hash| b64u_decode_hash(hash.as_str().unwrap_or_default()))
-                .collect::<Result<_, String>>()
-                .map_err(Unavailable)?;
-            if !verify_consistency(
-                old_size as usize,
-                sth.size as usize,
-                &old_root,
-                &sth.root,
-                &consistency_proof,
-            ) {
-                return Err(verification(
-                    "consistency proof failed — history was rewritten since the pinned tree head"
-                        .to_string(),
-                ));
-            }
+            verify_consistency_extension(client, base, old_size, &old_root, sth.size, &sth.root)
+                .await?;
         }
     }
 
@@ -677,16 +1146,142 @@ async fn verify_logged_entry(
         size: sth.size,
         root: sth.root_b64u.clone(),
         public_key: sth.public_key_b64u.clone(),
-        pinned_unix_ms: pin.map(|p| p.pinned_unix_ms).unwrap_or_else(now_unix_ms),
+        pinned_unix_ms: pin
+            .as_ref()
+            .map(|p| p.pinned_unix_ms)
+            .unwrap_or_else(now_unix_ms),
     };
     Ok(VerifiedLogEntry {
         index,
         leaf_json: leaf_json.to_string(),
         sth,
         pin_file,
+        pin_basis: pin,
         pinned_from_size,
         pin_candidate,
     })
+}
+
+const PIN_RECONCILE_ATTEMPTS: usize = 4;
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConcurrentPinOrder {
+    Same,
+    CandidateExtendsCurrent,
+    CurrentExtendsCandidate,
+}
+
+fn concurrent_pin_order(
+    candidate: &SthPin,
+    current: &SthPin,
+) -> Result<ConcurrentPinOrder, VerifyFailure> {
+    use VerifyFailure::Verification;
+    if candidate.public_key != current.public_key {
+        return Err(Verification {
+            summary: "concurrent transparency observations use different log signing keys"
+                .to_string(),
+            mismatches: Vec::new(),
+        });
+    }
+    match candidate.size.cmp(&current.size) {
+        std::cmp::Ordering::Equal if candidate.root == current.root => Ok(ConcurrentPinOrder::Same),
+        std::cmp::Ordering::Equal => Err(Verification {
+            summary: format!(
+                "concurrent transparency observations have different roots at tree size {}",
+                candidate.size
+            ),
+            mismatches: Vec::new(),
+        }),
+        std::cmp::Ordering::Greater => Ok(ConcurrentPinOrder::CandidateExtendsCurrent),
+        std::cmp::Ordering::Less => Ok(ConcurrentPinOrder::CurrentExtendsCandidate),
+    }
+}
+
+fn decoded_verified_pin_root(pin: &SthPin, label: &str) -> Result<[u8; 32], VerifyFailure> {
+    b64u_decode_hash(&pin.root).map_err(|error| VerifyFailure::Verification {
+        summary: format!("{label} transparency pin has an invalid tree root: {error}"),
+        mismatches: Vec::new(),
+    })
+}
+
+/// Finish a successful artifact check by advancing the pin. If another
+/// verifier observed a head meanwhile, compare the two observations now:
+/// same-size disagreement is an immediate verification result; differing
+/// sizes must carry a valid consistency proof before either head is accepted.
+async fn commit_verified_pin(
+    client: &reqwest::Client,
+    base: &Url,
+    entry: &VerifiedLogEntry,
+) -> Result<(), VerifyFailure> {
+    use VerifyFailure::Unavailable;
+    let mut basis = entry.pin_basis.clone();
+    for _ in 0..PIN_RECONCILE_ATTEMPTS {
+        match commit_pin(&entry.pin_file, basis.as_ref(), &entry.pin_candidate)
+            .map_err(Unavailable)?
+        {
+            PinCommit::Committed => return Ok(()),
+            PinCommit::Changed(None) => {
+                return Err(Unavailable(
+                    "transparency pin was removed while verification was running; retrying from a fresh observation is required"
+                        .to_string(),
+                ));
+            }
+            PinCommit::Changed(Some(current)) => {
+                match concurrent_pin_order(&entry.pin_candidate, &current)? {
+                    ConcurrentPinOrder::Same => return Ok(()),
+                    ConcurrentPinOrder::CandidateExtendsCurrent => {
+                        let old_root = decoded_verified_pin_root(&current, "current")?;
+                        let new_root =
+                            decoded_verified_pin_root(&entry.pin_candidate, "candidate")?;
+                        verify_consistency_extension(
+                            client,
+                            base,
+                            current.size,
+                            &old_root,
+                            entry.pin_candidate.size,
+                            &new_root,
+                        )
+                        .await?;
+                        basis = Some(current);
+                    }
+                    ConcurrentPinOrder::CurrentExtendsCandidate => {
+                        let old_root =
+                            decoded_verified_pin_root(&entry.pin_candidate, "candidate")?;
+                        let new_root = decoded_verified_pin_root(&current, "current")?;
+                        verify_consistency_extension(
+                            client,
+                            base,
+                            entry.pin_candidate.size,
+                            &old_root,
+                            current.size,
+                            &new_root,
+                        )
+                        .await?;
+                        // Do not regress the pin. Confirm under the lock that
+                        // the reconciled newer head is still current.
+                        match commit_pin(&entry.pin_file, Some(&current), &current)
+                            .map_err(Unavailable)?
+                        {
+                            PinCommit::Committed => return Ok(()),
+                            PinCommit::Changed(Some(_)) => {
+                                basis = entry.pin_basis.clone();
+                            }
+                            PinCommit::Changed(None) => {
+                                return Err(Unavailable(
+                                    "transparency pin was removed during immediate reconciliation; retrying from a fresh observation is required"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err(Unavailable(
+        "transparency pin kept changing during immediate reconciliation; retry the check"
+            .to_string(),
+    ))
 }
 
 /// The full out-of-band check against one rendezvous origin. On success
@@ -722,16 +1317,12 @@ pub(crate) async fn verify_hosted_bundle(
 
     // The manifest self-verifies, then the live bytes match it.
     let leaf = parse_manifest_leaf(&entry.leaf_json).map_err(verification)?;
-    let mut mismatches = Vec::new();
-    for artifact in &leaf.artifacts {
-        let url = crate::connect_rendezvous::join_url(base, &artifact.path).map_err(Unavailable)?;
-        let fetched = fetch_artifact(&client, url, ARTIFACT_BYTE_CAP)
-            .await
-            .map_err(Unavailable)?;
-        if let Some(diff) = artifact_mismatch(artifact, &fetched) {
-            mismatches.push(diff);
-        }
-    }
+    let manifest_pin_file = artifact_manifest_pin_path(state_root, base);
+    let manifest_pin = load_artifact_manifest_pin(&manifest_pin_file).map_err(verification)?;
+    check_artifact_manifest_high_water(manifest_pin.as_ref(), entry.index, &leaf.manifest_hash)
+        .map_err(verification)?;
+    let mismatches =
+        compare_live_artifacts(&client, base, &leaf.artifacts, BUNDLE_FETCH_LIMITS).await?;
     if !mismatches.is_empty() {
         return Err(Verification {
             summary: format!(
@@ -743,8 +1334,12 @@ pub(crate) async fn verify_hosted_bundle(
         });
     }
 
-    // Everything held — advance the pin.
-    save_pin(&entry.pin_file, &entry.pin_candidate).map_err(Unavailable)?;
+    // Everything held. Advance the selected-manifest high-water mark before
+    // the tree head: a crash between the writes may cause an extra
+    // consistency check, but can never reopen an older bundle observation.
+    commit_artifact_manifest_pin(&manifest_pin_file, entry.index, &leaf.manifest_hash)
+        .map_err(verification)?;
+    commit_verified_pin(&client, base, &entry).await?;
 
     Ok(VerifyReport {
         log_size: entry.sth.size,
@@ -819,34 +1414,48 @@ struct ReleaseLeaf {
 }
 
 fn parse_release_leaf(leaf_json: &str) -> Result<ReleaseLeaf, String> {
+    if leaf_json.len() > LOG_LEAF_BYTE_CAP {
+        return Err("release leaf exceeds its size cap".to_string());
+    }
     let leaf: serde_json::Value =
         serde_json::from_str(leaf_json).map_err(|e| format!("release leaf is not JSON: {e}"))?;
     if leaf.get("kind").and_then(|v| v.as_str()) != Some("release_manifest") {
         return Err("leaf is not a release_manifest entry".to_string());
     }
-    let tag = leaf
-        .get("tag")
-        .and_then(|v| v.as_str())
-        .filter(|t| !t.is_empty())
-        .ok_or("release leaf missing tag")?
-        .to_string();
-    let artifacts: Vec<ReleaseArtifact> = leaf
+    let tag = bounded_string(
+        leaf.get("tag")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+            .ok_or("release leaf missing tag")?,
+        "release tag",
+        METADATA_STRING_BYTE_CAP,
+    )?;
+    let artifact_values = leaf
         .get("artifacts")
         .and_then(|v| v.as_array())
-        .ok_or("release leaf missing artifacts")?
+        .ok_or("release leaf missing artifacts")?;
+    if artifact_values.len() > MANIFEST_ARTIFACT_CAP {
+        return Err("release leaf lists too many artifacts".to_string());
+    }
+    let artifacts: Vec<ReleaseArtifact> = artifact_values
         .iter()
         .map(|entry| {
-            let name = entry
-                .get("name")
-                .and_then(|v| v.as_str())
-                .filter(|n| !n.is_empty())
-                .ok_or("artifact missing name")?
-                .to_string();
-            let sha256 = entry
-                .get("sha256")
-                .and_then(|v| v.as_str())
-                .ok_or("artifact missing sha256")?
-                .to_string();
+            let name = bounded_string(
+                entry
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|n| !n.is_empty())
+                    .ok_or("artifact missing name")?,
+                "release artifact name",
+                ARTIFACT_NAME_BYTE_CAP,
+            )?;
+            let sha256 = bounded_sha256(
+                entry
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .ok_or("artifact missing sha256")?,
+                "release artifact sha256",
+            )?;
             let size = entry
                 .get("size")
                 .and_then(|v| v.as_u64())
@@ -857,32 +1466,45 @@ fn parse_release_leaf(leaf_json: &str) -> Result<ReleaseLeaf, String> {
     if artifacts.is_empty() {
         return Err("release leaf lists no artifacts".to_string());
     }
-    let manifest_hash = leaf
-        .get("manifest_hash")
-        .and_then(|v| v.as_str())
-        .ok_or("release leaf missing manifest_hash")?
-        .to_string();
+    let manifest_hash = bounded_sha256(
+        leaf.get("manifest_hash")
+            .and_then(|v| v.as_str())
+            .ok_or("release leaf missing manifest_hash")?,
+        "release manifest hash",
+    )?;
     if release_manifest_hash_hex(&tag, &artifacts) != manifest_hash {
         return Err("manifest_hash does not recompute from the carried artifact list".to_string());
     }
     Ok(ReleaseLeaf {
         unix_ms: leaf.get("unix_ms").and_then(|v| v.as_u64()).unwrap_or(0),
         tag,
-        version: leaf
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        platforms: leaf
-            .get("platforms")
-            .and_then(|v| v.as_array())
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        version: bounded_string(
+            leaf.get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+            "release version",
+            METADATA_STRING_BYTE_CAP,
+        )?,
+        platforms: {
+            let values = leaf
+                .get("platforms")
+                .and_then(|v| v.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if values.len() > RELEASE_PLATFORM_CAP {
+                return Err("release leaf lists too many platforms".to_string());
+            }
+            values
+                .iter()
+                .map(|value| {
+                    bounded_string(
+                        value.as_str().ok_or("release platform is not a string")?,
+                        "release platform",
+                        METADATA_STRING_BYTE_CAP,
+                    )
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        },
         manifest_hash,
         artifacts,
     })
@@ -900,18 +1522,25 @@ struct GithubAsset {
 }
 
 fn parse_github_assets(release: &serde_json::Value) -> Result<Vec<GithubAsset>, String> {
-    release
+    let values = release
         .get("assets")
         .and_then(|v| v.as_array())
-        .ok_or("GitHub release response missing assets")?
+        .ok_or("GitHub release response missing assets")?;
+    if values.len() > GITHUB_ASSET_CAP {
+        return Err("GitHub release response lists too many assets".to_string());
+    }
+    values
         .iter()
         .map(|asset| {
-            let name = asset
-                .get("name")
-                .and_then(|v| v.as_str())
-                .filter(|n| !n.is_empty())
-                .ok_or("GitHub asset missing name")?
-                .to_string();
+            let name = bounded_string(
+                asset
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|n| !n.is_empty())
+                    .ok_or("GitHub asset missing name")?,
+                "GitHub asset name",
+                ARTIFACT_NAME_BYTE_CAP,
+            )?;
             let size = asset
                 .get("size")
                 .and_then(|v| v.as_u64())
@@ -920,11 +1549,13 @@ fn parse_github_assets(release: &serde_json::Value) -> Result<Vec<GithubAsset>, 
                 .get("digest")
                 .and_then(|v| v.as_str())
                 .and_then(|digest| digest.strip_prefix("sha256:"))
-                .map(str::to_string);
+                .map(|digest| bounded_sha256(digest, "GitHub asset digest"))
+                .transpose()?;
             let download_url = asset
                 .get("browser_download_url")
                 .and_then(|v| v.as_str())
-                .map(str::to_string);
+                .map(|url| bounded_string(url, "GitHub asset download URL", ARTIFACT_PATH_BYTE_CAP))
+                .transpose()?;
             Ok(GithubAsset {
                 name,
                 size,
@@ -1001,7 +1632,7 @@ async fn fetch_github_json(
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;
     let status = response.status().as_u16();
-    let body = response.json::<serde_json::Value>().await.ok();
+    let body = response_json_limited(response, &url).await.ok();
     Ok((status, body))
 }
 
@@ -1023,6 +1654,15 @@ pub(crate) struct ReleaseVerifyReport {
     pub downloaded: usize,
     /// `None` = first contact (this run created the pin).
     pub pinned_from_size: Option<u64>,
+}
+
+fn github_release_tag_url(github_api: &Url, repo: &str, tag: &str) -> Result<Url, String> {
+    let mut url =
+        crate::connect_rendezvous::join_url(github_api, &format!("repos/{repo}/releases/tags"))?;
+    url.path_segments_mut()
+        .map_err(|_| "GitHub API URL cannot carry path segments".to_string())?
+        .push(tag);
+    Ok(url)
 }
 
 /// The out-of-band release check: the logged manifest (latest, or for
@@ -1089,11 +1729,7 @@ pub(crate) async fn verify_hosted_release(
     }
 
     // GitHub's view of the same release.
-    let release_url = crate::connect_rendezvous::join_url(
-        github_api,
-        &format!("repos/{repo}/releases/tags/{}", leaf.tag),
-    )
-    .map_err(Unavailable)?;
+    let release_url = github_release_tag_url(github_api, repo, &leaf.tag).map_err(Unavailable)?;
     let release_url_display = release_url.to_string();
     let (status, release) = fetch_github_json(&client, release_url)
         .await
@@ -1133,6 +1769,7 @@ pub(crate) async fn verify_hosted_release(
     mismatches.extend(unlogged_assets(&leaf.artifacts, &assets));
 
     if download {
+        let download_client = release_download_client().map_err(Unavailable)?;
         for artifact in &leaf.artifacts {
             let Some(asset) = assets.iter().find(|a| a.name == artifact.name) else {
                 continue; // already a mismatch above
@@ -1146,14 +1783,14 @@ pub(crate) async fn verify_hosted_release(
             };
             let url = Url::parse(download_url)
                 .map_err(|e| Unavailable(format!("asset URL {download_url}: {e}")))?;
-            match fetch_artifact(&client, url, RELEASE_DOWNLOAD_BYTE_CAP)
+            match fetch_artifact(&download_client, url, RELEASE_DOWNLOAD_BYTE_CAP)
                 .await
                 .map_err(Unavailable)?
             {
-                ArtifactFetch::Hashed { sha256_hex } if sha256_hex == artifact.sha256 => {
+                ArtifactFetch::Hashed { sha256_hex, .. } if sha256_hex == artifact.sha256 => {
                     downloaded += 1;
                 }
-                ArtifactFetch::Hashed { sha256_hex } => mismatches.push(format!(
+                ArtifactFetch::Hashed { sha256_hex, .. } => mismatches.push(format!(
                     "{}: logged sha256 {} · downloaded {}",
                     artifact.name,
                     short_hash(&artifact.sha256),
@@ -1162,7 +1799,7 @@ pub(crate) async fn verify_hosted_release(
                 ArtifactFetch::HttpStatus(status) => {
                     mismatches.push(format!("{}: download HTTP {status}", artifact.name))
                 }
-                ArtifactFetch::TooLarge => mismatches.push(format!(
+                ArtifactFetch::TooLarge { .. } => mismatches.push(format!(
                     "{}: download exceeded {} GiB",
                     artifact.name,
                     RELEASE_DOWNLOAD_BYTE_CAP / (1024 * 1024 * 1024),
@@ -1184,7 +1821,7 @@ pub(crate) async fn verify_hosted_release(
     }
 
     // Everything held — advance the pin.
-    save_pin(&entry.pin_file, &entry.pin_candidate).map_err(Unavailable)?;
+    commit_verified_pin(&client, base, &entry).await?;
 
     Ok(ReleaseVerifyReport {
         log_size: entry.sth.size,
@@ -1207,68 +1844,95 @@ pub(crate) async fn verify_hosted_release(
 /// One check against the configured rendezvous. Skips quietly when the
 /// Connect client is not enabled.
 pub(crate) async fn check_once() {
+    let _single_flight = daemon_check_lock().lock().await;
+    check_once_inner().await;
+}
+
+async fn check_once_inner() {
     let status = crate::connect_rendezvous::status_snapshot();
     if !status.configured {
+        note_connect_config(false, None);
         return;
     }
-    let Some(base) = status
+    let Some(base_text) = status
         .rendezvous_url
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .and_then(|s| Url::parse(s).ok())
     else {
         return;
     };
+    let Some(key) = verifier_url_key(Some(base_text)) else {
+        return;
+    };
+    let Ok(base) = Url::parse(base_text) else {
+        return;
+    };
+    with_status(|status| bind_status_to_url(status, Some(key.clone())));
     let now = now_unix_ms();
     match verify_hosted_bundle(&base, &crate::platform::intendant_home()).await {
         Ok(_) => with_status(|s| {
-            s.state = "ok".to_string();
-            s.checked_unix_ms = Some(now);
-            s.last_error = None;
-            s.mismatches = Vec::new();
+            update_status_for_url(s, &key, |s| {
+                s.state = "ok".to_string();
+                s.checked_unix_ms = Some(now);
+                s.last_error = None;
+                s.mismatches = Vec::new();
+            });
         }),
         Err(VerifyFailure::Unavailable(error)) => with_status(|s| {
-            s.last_error = Some(error);
+            update_status_for_url(s, &key, |s| {
+                s.last_error = Some(error);
+            });
         }),
         Err(VerifyFailure::Verification {
             summary,
             mismatches,
         }) => {
-            with_status(|s| {
-                s.state = "alert".to_string();
-                s.checked_unix_ms = Some(now);
-                s.last_error = None;
-                s.mismatches = if mismatches.is_empty() {
-                    vec![summary.clone()]
-                } else {
-                    mismatches.clone()
-                };
+            let applied = with_status(|s| {
+                update_status_for_url(s, &key, |s| {
+                    s.state = "alert".to_string();
+                    s.checked_unix_ms = Some(now);
+                    s.last_error = None;
+                    s.mismatches = if mismatches.is_empty() {
+                        vec![summary.clone()]
+                    } else {
+                        mismatches.clone()
+                    };
+                })
             });
-            eprintln!(
-                "[hosted-verify] HOSTED BUNDLE ALERT: {} is serving Connect code/assets that do \
-                 not match its public transparency log ({summary}): {:?} — treat hosted tabs \
-                 against this rendezvous as compromised until the operator explains; direct \
-                 and fleet-name dashboards are unaffected",
-                base, mismatches,
-            );
+            if applied {
+                eprintln!(
+                    "[hosted-verify] HOSTED BUNDLE ALERT: {} is serving Connect code/assets that do \
+                     not match its public transparency log ({summary}): {:?} — stop trusting hosted \
+                     tabs against this rendezvous until the operator explains; direct and fleet-name \
+                     dashboards are unaffected",
+                    base, mismatches,
+                );
+            }
         }
     }
 }
 
-/// First tick shortly after startup (registration needs a moment), then
-/// twice daily — the CT tripwire's cadence. Spawned once at gateway
-/// startup, beside `fleet_cert::spawn_renewal_loop`.
+const HOSTED_BUNDLE_MONITOR_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+async fn run_hosted_bundle_monitor<F, Fut>(mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    loop {
+        // This verifier does not depend on daemon registration. Running
+        // before the first sleep gives every daemon boot an immediate
+        // out-of-band observation of its configured Connect origin.
+        check().await;
+        tokio::time::sleep(HOSTED_BUNDLE_MONITOR_INTERVAL).await;
+    }
+}
+
+/// Check on boot, then daily. Spawned once at gateway startup, beside
+/// `fleet_cert::spawn_renewal_loop`.
 pub(crate) fn spawn_hosted_bundle_monitor() {
-    tokio::spawn(async move {
-        let mut first = true;
-        loop {
-            let delay = if first { 7 * 60 } else { 12 * 60 * 60 };
-            first = false;
-            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-            check_once().await;
-        }
-    });
+    tokio::spawn(run_hosted_bundle_monitor(check_once));
 }
 
 // ── The CLI front door: `intendant hosted-verify` ──
@@ -1308,8 +1972,9 @@ Usage: intendant hosted-verify [--connect <url>]
 Without --releases: fetches the logged artifact manifest with its
 inclusion proof and signed tree head, verifies the tree head extends the
 one pinned under the daemon state root (~/.intendant/hosted-verify/,
-honoring $INTENDANT_HOME — releases share the same pin), then downloads
-every listed artifact exactly as a browser would and compares hashes.
+honoring $INTENDANT_HOME — releases share the same tree-head pin), rejects
+rollback below the highest artifact-manifest index already verified, then
+downloads every listed artifact exactly as a browser would and compares hashes.
 Exit codes: 0 verified · 1 divergence or proof failure · 2 usage ·
 3 could not check (network / older service).";
 
@@ -1412,8 +2077,8 @@ pub(crate) async fn run_cli(args: Vec<String>) -> i32 {
         }
         Err(failure) => print_failure(
             failure,
-            "If you did not expect a deploy just now, treat hosted tabs against this \
-             rendezvous as compromised and reach your daemons directly.",
+            "If you did not expect a deploy just now, stop trusting hosted tabs against this \
+             rendezvous and reach your daemons directly.",
         ),
     }
 }
@@ -1532,6 +2197,194 @@ async fn run_release_cli(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn required_manifest_artifacts(bytes: &[u8]) -> Vec<ManifestArtifact> {
+        REQUIRED_BUNDLE_PATHS
+            .iter()
+            .map(|path| ManifestArtifact {
+                path: (*path).to_string(),
+                sha256: sha256_hex(bytes),
+            })
+            .collect()
+    }
+
+    fn manifest_leaf_json(artifacts: &[ManifestArtifact]) -> String {
+        serde_json::json!({
+            "kind": "artifact_manifest",
+            "unix_ms": 42,
+            "bundle_version": "0.1.0",
+            "git_sha": "abc1234",
+            "manifest_hash": manifest_hash_hex(artifacts),
+            "artifacts": artifacts
+                .iter()
+                .map(|artifact| serde_json::json!({
+                    "path": artifact.path,
+                    "sha256": artifact.sha256,
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_monitor_checks_on_boot_then_daily() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_hosted_bundle_monitor(move || {
+            let tx = tx.clone();
+            async move {
+                tx.send(()).unwrap();
+            }
+        }));
+
+        rx.recv().await.expect("boot check");
+        tokio::time::advance(HOSTED_BUNDLE_MONITOR_INTERVAL - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the daily check must not run early"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        rx.recv().await.expect("daily check");
+        handle.abort();
+    }
+
+    #[test]
+    fn completed_verdict_is_bound_to_one_rendezvous_url() {
+        let mut status = HostedBundleStatus {
+            state: "unchecked".to_string(),
+            checked_unix_ms: None,
+            last_error: None,
+            mismatches: Vec::new(),
+            rendezvous_url: None,
+        };
+        let first = verifier_url_key(Some("https://first.example/")).unwrap();
+        bind_status_to_url(&mut status, Some(first.clone()));
+        assert!(update_status_for_url(&mut status, &first, |status| {
+            status.state = "ok".to_string();
+            status.checked_unix_ms = Some(7);
+        }));
+
+        let second = verifier_url_key(Some("https://second.example")).unwrap();
+        bind_status_to_url(&mut status, Some(second.clone()));
+        assert_eq!(status.state, "unchecked");
+        assert_eq!(status.checked_unix_ms, None);
+        assert!(!update_status_for_url(&mut status, &first, |status| {
+            status.state = "alert".to_string();
+        }));
+        assert!(update_status_for_url(&mut status, &second, |status| {
+            status.state = "ok".to_string();
+        }));
+    }
+
+    #[tokio::test]
+    async fn metadata_fetch_does_not_follow_a_cross_origin_loopback_redirect() {
+        let target_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let target_hits_for_route = std::sync::Arc::clone(&target_hits);
+        let target_router = axum::Router::new().route(
+            "/private",
+            axum::routing::get(move || {
+                let target_hits = std::sync::Arc::clone(&target_hits_for_route);
+                async move {
+                    target_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"secret": true}))
+                }
+            }),
+        );
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/private", target_listener.local_addr().unwrap());
+        let target_server = tokio::spawn(async move {
+            axum::serve(target_listener, target_router).await.ok();
+        });
+
+        let source_router = axum::Router::new().route(
+            "/metadata",
+            axum::routing::get(move || {
+                let target_url = target_url.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, target_url)],
+                    )
+                }
+            }),
+        );
+        let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_url = Url::parse(&format!(
+            "http://{}/metadata",
+            source_listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let source_server = tokio::spawn(async move {
+            axum::serve(source_listener, source_router).await.ok();
+        });
+
+        let error = fetch_json(&http_client().unwrap(), source_url)
+            .await
+            .unwrap_err();
+        assert!(error.contains("302"), "error was {error}");
+        assert_eq!(target_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        source_server.abort();
+        target_server.abort();
+    }
+
+    #[tokio::test]
+    async fn metadata_fetch_and_manifest_structures_are_bounded() {
+        let oversized = vec![b'x'; METADATA_RESPONSE_BYTE_CAP + 1];
+        let router = axum::Router::new().route(
+            "/metadata",
+            axum::routing::get(move || {
+                let oversized = oversized.clone();
+                async move { oversized }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/metadata",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        assert!(fetch_json(&http_client().unwrap(), url)
+            .await
+            .unwrap_err()
+            .contains("exceeds"));
+        server.abort();
+
+        let artifacts = (0..=MANIFEST_ARTIFACT_CAP)
+            .map(|index| {
+                serde_json::json!({
+                    "path": format!("/artifact-{index}"),
+                    "sha256": "0".repeat(64),
+                })
+            })
+            .collect::<Vec<_>>();
+        let leaf = serde_json::json!({
+            "kind": "artifact_manifest",
+            "artifacts": artifacts,
+            "manifest_hash": "0".repeat(64),
+        })
+        .to_string();
+        assert!(parse_manifest_leaf(&leaf)
+            .unwrap_err()
+            .contains("too many artifacts"));
+
+        let overlong_path = format!("/{}", "a".repeat(ARTIFACT_PATH_BYTE_CAP));
+        let leaf = serde_json::json!({
+            "kind": "artifact_manifest",
+            "artifacts": [{"path": overlong_path, "sha256": "0".repeat(64)}],
+            "manifest_hash": "0".repeat(64),
+        })
+        .to_string();
+        assert!(parse_manifest_leaf(&leaf)
+            .unwrap_err()
+            .contains("string bounds"));
+    }
 
     // ── Local producers (RFC 6962 §2.1) so the replicated verifiers are
     // exercised against real trees, mirroring the service's tests. ──
@@ -1699,21 +2552,10 @@ mod tests {
 
     #[test]
     fn manifest_leaf_parses_and_self_verifies() {
-        let artifacts = vec![ManifestArtifact {
-            path: "/app.html".to_string(),
-            sha256: sha256_hex(b"bundle"),
-        }];
-        let good = serde_json::json!({
-            "kind": "artifact_manifest",
-            "unix_ms": 42,
-            "bundle_version": "0.1.0",
-            "git_sha": "abc1234",
-            "manifest_hash": manifest_hash_hex(&artifacts),
-            "artifacts": [{ "path": "/app.html", "sha256": sha256_hex(b"bundle") }],
-        })
-        .to_string();
+        let artifacts = required_manifest_artifacts(b"bundle");
+        let good = manifest_leaf_json(&artifacts);
         let leaf = parse_manifest_leaf(&good).unwrap();
-        assert_eq!(leaf.artifacts.len(), 1);
+        assert_eq!(leaf.artifacts.len(), REQUIRED_BUNDLE_PATHS.len());
         assert_eq!(leaf.bundle_version, "0.1.0");
         assert_eq!(leaf.git_sha, "abc1234");
         assert_eq!(leaf.unix_ms, 42);
@@ -1731,6 +2573,22 @@ mod tests {
         })
         .to_string();
         assert!(parse_manifest_leaf(&relative).is_err());
+
+        let empty = manifest_leaf_json(&[]);
+        assert!(parse_manifest_leaf(&empty)
+            .unwrap_err()
+            .contains("omits required served paths"));
+
+        let subset = manifest_leaf_json(&required_manifest_artifacts(b"bundle")[..1]);
+        assert!(parse_manifest_leaf(&subset)
+            .unwrap_err()
+            .contains("/connect"));
+
+        let mut duplicate = required_manifest_artifacts(b"bundle");
+        duplicate.insert(1, duplicate[0].clone());
+        assert!(parse_manifest_leaf(&manifest_leaf_json(&duplicate))
+            .unwrap_err()
+            .contains("not unique"));
     }
 
     /// The golden mismatch case: a fabricated manifest against fabricated
@@ -1746,7 +2604,8 @@ mod tests {
             artifact_mismatch(
                 &expected,
                 &ArtifactFetch::Hashed {
-                    sha256_hex: sha256_hex(b"the logged bundle")
+                    sha256_hex: sha256_hex(b"the logged bundle"),
+                    bytes: b"the logged bundle".len(),
                 }
             ),
             None
@@ -1755,6 +2614,7 @@ mod tests {
             &expected,
             &ArtifactFetch::Hashed {
                 sha256_hex: sha256_hex(b"a different bundle"),
+                bytes: b"a different bundle".len(),
             },
         )
         .unwrap();
@@ -1765,9 +2625,160 @@ mod tests {
             artifact_mismatch(&expected, &ArtifactFetch::HttpStatus(404)).unwrap(),
             "/app.html: HTTP 404"
         );
-        assert!(artifact_mismatch(&expected, &ArtifactFetch::TooLarge)
-            .unwrap()
-            .contains("exceeded"));
+        assert!(
+            artifact_mismatch(&expected, &ArtifactFetch::TooLarge { bytes: 17 })
+                .unwrap()
+                .contains("exceeded")
+        );
+    }
+
+    async fn spawn_artifact_budget_server() -> (Url, tokio::task::JoinHandle<()>) {
+        let router = axum::Router::new()
+            .route(
+                "/one",
+                axum::routing::get(|| async { axum::body::Bytes::from_static(b"abc") }),
+            )
+            .route(
+                "/two",
+                axum::routing::get(|| async { axum::body::Bytes::from_static(b"def") }),
+            )
+            .route(
+                "/slow",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    axum::body::Bytes::from_static(b"x")
+                }),
+            )
+            .route(
+                "/stream",
+                axum::routing::get(|| async {
+                    let stream = futures_util::stream::unfold(0usize, |index| async move {
+                        if index == 6 {
+                            return None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(15)).await;
+                        Some((
+                            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"x")),
+                            index + 1,
+                        ))
+                    });
+                    axum::body::Body::from_stream(stream)
+                }),
+            )
+            .route(
+                "/oversized",
+                axum::routing::get(|| async {
+                    let stream = futures_util::stream::once(async {
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"abcdef"))
+                    });
+                    axum::body::Body::from_stream(stream)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (Url::parse(&format!("http://{address}/")).unwrap(), server)
+    }
+
+    #[tokio::test]
+    async fn bundle_fetch_enforces_aggregate_byte_and_time_budgets() {
+        let (base, server) = spawn_artifact_budget_server().await;
+        let client = http_client().unwrap();
+        let artifacts = [
+            ManifestArtifact {
+                path: "/one".to_string(),
+                sha256: sha256_hex(b"abc"),
+            },
+            ManifestArtifact {
+                path: "/two".to_string(),
+                sha256: sha256_hex(b"def"),
+            },
+        ];
+        let limits = BundleFetchLimits {
+            per_artifact_bytes: 64,
+            total_bytes: 5,
+            total_timeout: Duration::from_secs(1),
+            response_timeout: Duration::from_secs(1),
+            idle_timeout: Duration::from_secs(1),
+        };
+        match compare_live_artifacts(&client, &base, &artifacts, limits).await {
+            Err(VerifyFailure::Unavailable(error)) => {
+                assert!(error.contains("aggregate byte budget"), "{error}");
+            }
+            other => panic!("aggregate byte budget must stop the fetch, got {other:?}"),
+        }
+
+        let oversized = [
+            ManifestArtifact {
+                path: "/oversized".to_string(),
+                sha256: sha256_hex(b"abcdef"),
+            },
+            ManifestArtifact {
+                path: "/oversized".to_string(),
+                sha256: sha256_hex(b"abcdef"),
+            },
+        ];
+        let limits = BundleFetchLimits {
+            per_artifact_bytes: 4,
+            total_bytes: 8,
+            total_timeout: Duration::from_secs(1),
+            response_timeout: Duration::from_secs(1),
+            idle_timeout: Duration::from_secs(1),
+        };
+        match compare_live_artifacts(&client, &base, &oversized, limits).await {
+            Err(VerifyFailure::Unavailable(error)) => {
+                assert!(error.contains("aggregate byte budget"), "{error}");
+            }
+            other => {
+                panic!("oversized streams must count against the aggregate budget, got {other:?}")
+            }
+        }
+
+        let slow = [ManifestArtifact {
+            path: "/slow".to_string(),
+            sha256: sha256_hex(b"x"),
+        }];
+        let limits = BundleFetchLimits {
+            total_bytes: 64,
+            total_timeout: Duration::from_millis(10),
+            ..limits
+        };
+        match compare_live_artifacts(&client, &base, &slow, limits).await {
+            Err(VerifyFailure::Unavailable(error)) => {
+                assert!(error.contains("aggregate time budget"), "{error}");
+            }
+            other => panic!("aggregate time budget must stop the fetch, got {other:?}"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn release_download_accepts_a_progressing_stream_without_a_short_total_timeout() {
+        let (base, server) = spawn_artifact_budget_server().await;
+        let client = release_download_client().unwrap();
+        let url = base.join("stream").unwrap();
+        let fetched = fetch_artifact_with_timeouts(
+            &client,
+            url,
+            64,
+            Duration::from_secs(1),
+            Duration::from_millis(40),
+        )
+        .await
+        .unwrap();
+        match fetched {
+            ArtifactFetch::Hashed {
+                sha256_hex: digest,
+                bytes,
+            } => {
+                assert_eq!(bytes, 6);
+                assert_eq!(digest, sha256_hex(b"xxxxxx"));
+            }
+            other => panic!("progressing stream must hash successfully, got {other:?}"),
+        }
+        server.abort();
     }
 
     #[test]
@@ -2102,6 +3113,16 @@ mod tests {
         serde_json::json!({ "tag_name": "v1.2.3", "assets": assets })
     }
 
+    #[test]
+    fn github_release_tag_is_one_percent_encoded_path_segment() {
+        let github_api = Url::parse("https://api.github.test/v3/").unwrap();
+        let url = github_release_tag_url(&github_api, "owner/repo", "release/1.2").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api.github.test/v3/repos/owner/repo/releases/tags/release%2F1.2"
+        );
+    }
+
     #[tokio::test]
     async fn release_flow_verifies_and_advances_pin_end_to_end() {
         let bytes = b"app bytes v1".to_vec();
@@ -2151,7 +3172,9 @@ mod tests {
         assert_eq!(report.presence_only, 0);
         assert_eq!(report.downloaded, 0);
         assert_eq!(report.pinned_from_size, None);
-        let pin = load_pin(&pin_path(state_root.path(), &base)).expect("pin created");
+        let pin = load_pin(&pin_path(state_root.path(), &base))
+            .expect("pin readable")
+            .expect("pin created");
         assert_eq!(pin.size, 2);
 
         // The log grows: the rerun must fetch and verify consistency
@@ -2175,7 +3198,10 @@ mod tests {
         assert_eq!(report.log_size, 3);
         assert_eq!(report.pinned_from_size, Some(2));
         assert_eq!(
-            load_pin(&pin_path(state_root.path(), &base)).unwrap().size,
+            load_pin(&pin_path(state_root.path(), &base))
+                .unwrap()
+                .unwrap()
+                .size,
             3
         );
 
@@ -2240,7 +3266,9 @@ mod tests {
             other => panic!("divergence must fail verification, got {other:?}"),
         }
         // A verification failure must NOT advance (or create) the pin.
-        assert!(load_pin(&pin_path(state_root.path(), &base)).is_none());
+        assert!(load_pin(&pin_path(state_root.path(), &base))
+            .unwrap()
+            .is_none());
 
         // GitHub not having the release at all is a verdict, not an
         // availability problem: the log commits something GitHub denies.
@@ -2369,15 +3397,15 @@ mod tests {
             path.file_name().and_then(|n| n.to_str()),
             Some("connect.example.test_8443.json")
         );
-        assert!(load_pin(&path).is_none());
+        assert!(load_pin(&path).unwrap().is_none());
         let pin = SthPin {
             size: 12,
             root: "cm9vdA".to_string(),
             public_key: "a2V5".to_string(),
             pinned_unix_ms: 77,
         };
-        save_pin(&path, &pin).unwrap();
-        let loaded = load_pin(&path).unwrap();
+        commit_pin(&path, None, &pin).unwrap();
+        let loaded = load_pin(&path).unwrap().unwrap();
         assert_eq!(loaded.size, 12);
         assert_eq!(loaded.root, "cm9vdA");
         assert_eq!(loaded.public_key, "a2V5");
@@ -2388,5 +3416,225 @@ mod tests {
             &Url::parse("https://other.example.test").unwrap(),
         );
         assert_ne!(path, other);
+    }
+
+    #[test]
+    fn artifact_manifest_high_water_rejects_rollback_and_same_index_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = Url::parse("https://connect.example.test").unwrap();
+        let path = artifact_manifest_pin_path(dir.path(), &base);
+        commit_artifact_manifest_pin(&path, 7, "newer-hash").unwrap();
+        commit_artifact_manifest_pin(&path, 7, "newer-hash").unwrap();
+
+        let rollback = commit_artifact_manifest_pin(&path, 3, "older-hash").unwrap_err();
+        assert!(rollback.contains("regressed"), "error was {rollback}");
+        let replacement = commit_artifact_manifest_pin(&path, 7, "different-hash").unwrap_err();
+        assert!(
+            replacement.contains("changed at pinned index"),
+            "error was {replacement}"
+        );
+
+        commit_artifact_manifest_pin(&path, 9, "latest-hash").unwrap();
+        let pin = load_artifact_manifest_pin(&path).unwrap().unwrap();
+        assert_eq!(pin.index, 9);
+        assert_eq!(pin.manifest_hash, "latest-hash");
+    }
+
+    #[test]
+    fn malformed_pin_never_becomes_first_contact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = pin_path(
+            dir.path(),
+            &Url::parse("https://connect.example.test").unwrap(),
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not-json").unwrap();
+        assert!(load_pin(&path).unwrap_err().contains("parse"));
+
+        let candidate = SthPin {
+            size: 1,
+            root: "cm9vdA".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 77,
+        };
+        assert!(commit_pin(&path, None, &candidate)
+            .unwrap_err()
+            .contains("parse"));
+    }
+
+    #[test]
+    fn stale_pin_commit_cannot_regress_a_newer_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = pin_path(
+            dir.path(),
+            &Url::parse("https://connect.example.test").unwrap(),
+        );
+        let old = SthPin {
+            size: 1,
+            root: "b2xk".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 77,
+        };
+        commit_pin(&path, None, &old).unwrap();
+        let newer = SthPin {
+            size: 3,
+            root: "bmV3ZXI".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 99,
+        };
+        commit_pin(&path, Some(&old), &newer).unwrap();
+
+        let stale_candidate = SthPin {
+            size: 2,
+            root: "c3RhbGU".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 77,
+        };
+        let PinCommit::Changed(Some(observed)) =
+            commit_pin(&path, Some(&old), &stale_candidate).unwrap()
+        else {
+            panic!("stale commit must return the current pin");
+        };
+        assert!(same_tree_head(&observed, &newer));
+        assert_eq!(observed.pinned_unix_ms, old.pinned_unix_ms);
+        let committed = load_pin(&path).unwrap().unwrap();
+        assert!(same_tree_head(&committed, &newer));
+        assert_eq!(committed.pinned_unix_ms, old.pinned_unix_ms);
+    }
+
+    #[tokio::test]
+    async fn concurrent_pin_growth_is_reconciled_immediately_in_both_directions() {
+        use ring::signature::KeyPair as _;
+
+        let fixture = std::sync::Arc::new(std::sync::Mutex::new(Fixture {
+            log: FixtureLog::new(vec![
+                serde_json::json!({ "kind": "one" }).to_string(),
+                serde_json::json!({ "kind": "two" }).to_string(),
+                serde_json::json!({ "kind": "three" }).to_string(),
+            ]),
+            manifest_index: 0,
+            release_status: 404,
+            release_body: serde_json::Value::Null,
+            downloads: std::collections::HashMap::new(),
+        }));
+        let (base, server) = spawn_fixture_server(fixture.clone()).await;
+        let (smaller, larger, sth) = {
+            let fixture = fixture.lock().unwrap();
+            let leaves = fixture.log.leaves();
+            let public_key =
+                crate::daemon_identity::b64u(fixture.log.keypair.public_key().as_ref());
+            let pin = |size: usize| SthPin {
+                size: size as u64,
+                root: crate::daemon_identity::b64u(&tree_root(&leaves[..size])),
+                public_key: public_key.clone(),
+                pinned_unix_ms: 1,
+            };
+            (pin(2), pin(3), Sth::parse(&fixture.log.sth_json()).unwrap())
+        };
+        let client = http_client().unwrap();
+
+        // A size-2 verifier finishing after another process pinned size 3
+        // proves 2 -> 3 and keeps the newer pin.
+        let newer_root = tempfile::tempdir().unwrap();
+        let newer_path = pin_path(newer_root.path(), &base);
+        commit_pin(&newer_path, None, &larger).unwrap();
+        let older_entry = VerifiedLogEntry {
+            index: 0,
+            leaf_json: String::new(),
+            sth: sth.clone(),
+            pin_file: newer_path.clone(),
+            pin_basis: None,
+            pinned_from_size: None,
+            pin_candidate: smaller.clone(),
+        };
+        commit_verified_pin(&client, &base, &older_entry)
+            .await
+            .unwrap();
+        assert!(same_tree_head(
+            &load_pin(&newer_path).unwrap().unwrap(),
+            &larger
+        ));
+
+        // A size-3 verifier finishing after another process pinned size 2
+        // proves the same extension and advances without waiting for a later
+        // scheduled check.
+        let older_root = tempfile::tempdir().unwrap();
+        let older_path = pin_path(older_root.path(), &base);
+        commit_pin(&older_path, None, &smaller).unwrap();
+        let newer_entry = VerifiedLogEntry {
+            index: 0,
+            leaf_json: String::new(),
+            sth,
+            pin_file: older_path.clone(),
+            pin_basis: None,
+            pinned_from_size: None,
+            pin_candidate: larger.clone(),
+        };
+        commit_verified_pin(&client, &base, &newer_entry)
+            .await
+            .unwrap();
+        assert!(same_tree_head(
+            &load_pin(&older_path).unwrap().unwrap(),
+            &larger
+        ));
+        server.abort();
+    }
+
+    #[test]
+    fn concurrent_same_size_root_disagreement_is_a_verification_result() {
+        let candidate = SthPin {
+            size: 7,
+            root: "Y2FuZGlkYXRl".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 1,
+        };
+        let current = SthPin {
+            size: 7,
+            root: "Y3VycmVudA".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 1,
+        };
+        match concurrent_pin_order(&candidate, &current) {
+            Err(VerifyFailure::Verification { summary, .. }) => {
+                assert!(summary.contains("different roots"), "{summary}");
+            }
+            other => panic!("same-size disagreement must alarm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_different_sizes_require_directional_reconciliation() {
+        let smaller = SthPin {
+            size: 7,
+            root: "c21hbGxlcg".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 1,
+        };
+        let larger = SthPin {
+            size: 9,
+            root: "bGFyZ2Vy".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 1,
+        };
+        assert_eq!(
+            concurrent_pin_order(&larger, &smaller).unwrap(),
+            ConcurrentPinOrder::CandidateExtendsCurrent
+        );
+        assert_eq!(
+            concurrent_pin_order(&smaller, &larger).unwrap(),
+            ConcurrentPinOrder::CurrentExtendsCandidate
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_checks_are_single_flight() {
+        let first = daemon_check_lock().lock().await;
+        let waiting = tokio::spawn(async {
+            let _second = daemon_check_lock().lock().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(first);
+        waiting.await.unwrap();
     }
 }

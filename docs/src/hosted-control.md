@@ -5,6 +5,12 @@ reaches a daemon at its fleet name. It is off by default. When off, the
 fleet-name and reachability-relay surfaces retain their discovery-only
 `role:none` behavior.
 
+The separate [user-owned custom-domain lane](./custom-domain.md) uses the same
+compiled presets, immutable floor, proof-bound HTTP, and one-use WebSocket
+tickets. Its exact-name WebAuthn ceremony can approve the signed tab request
+directly; it does not widen the fleet-name lane or turn the passkey into a
+general IAM/root principal.
+
 The lane does not turn a Connect account, passkey assertion, fleet route, or
 browser origin into daemon authority. A trusted owner surface approves a
 short-lived lease, the daemon materializes that lease in local IAM, and the
@@ -52,11 +58,24 @@ compiled maximum of 24 hours. Request creation, anonymous polling, proof
 nonces, and outstanding tickets all have per-key or per-request and global
 bounds. Anonymous doorbell and poll proofs use replay capacity separate from
 active lease proofs, so public traffic cannot consume the authenticated
-request window. Pending requests are not displaced by newer requests; a full
-pending queue refuses another doorbell until an owner decides one or one
-expires. The relay's loopback last hop is not treated as a distinct
-remote-client address, so public availability is globally bounded rather than
-promised fairly among anonymous callers.
+request window. Doorbell and anonymous-poll rate windows, both replay lanes,
+and one-use tickets are stored under the cross-process authority lock, so
+independently load-balanced relay connections cannot multiply an admission
+budget, replay one proof, or spend one ticket once per daemon process. Pending
+requests are not displaced by newer requests; a full pending queue refuses
+another doorbell until an owner decides one or one expires. The relay's
+loopback last hop carries a process-salted opaque bucket derived from the route
+and the browser connection's source address. The bucket separates anonymous
+admission windows for availability but is never treated as an identity,
+credential, or authority input; the shared global bounds remain the backstop.
+Public request and poll documents cap at 64 KiB and have a 15-second total
+read deadline at that cap. Larger authenticated request classes receive a
+bounded size-derived extension. Durable public hosted-control operations run
+through a fixed-capacity blocking boundary, so authority-store contention
+cannot occupy async gateway workers; excess work receives a retryable HTTP
+429. Concurrent active leases have a fixed cap. A full active set refuses new
+issuance without displacing an existing lease; expiry or revocation retires the
+corresponding IAM binding, and inactive lease history remains bounded.
 
 ## Trust anchors
 
@@ -258,7 +277,7 @@ recorded renewal as unexpected.
 | Reused proof nonce or WebSocket ticket | Refused by replay/one-use state. |
 | Anonymous replay window or poll budget is exhausted | Public proof is refused without consuming active-lease replay capacity. |
 | Wrong daemon, origin, method, path, key, or time window | Proof is refused. |
-| Expired or revoked lease | New requests fail and live authority rechecks close the socket. |
+| Expired or revoked lease | New requests fail; every live HTTP socket write and response-producer wait rechecks authority, closes the transport, and cancels stream producers. |
 | Ceiling lowered below a lease | The lease is revoked in the policy transaction. |
 | Ceiling raised | Existing leases are unchanged; a new approval is required. |
 | Persisted hosted role edited | Compiled preset evaluation preserves the operation set. |

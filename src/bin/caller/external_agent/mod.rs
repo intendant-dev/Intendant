@@ -256,16 +256,16 @@ fn external_child_env_allowed(name: &str, passthrough: &HashSet<String>) -> bool
     ) {
         return false;
     }
+    // Credential names always lose to the control-channel allowlist. This
+    // includes explicitly catalogued `INTENDANT_*` DNS credentials: the
+    // namespace alone must never make authority inheritable by a child.
+    if crate::agent_runner::is_provider_credential_env(&upper) {
+        return false;
+    }
     // Controller→child control channel: `INTENDANT` + `INTENDANT_*`
     // bootstrap vars and the mock-provider rig's `PROVIDER` always ride.
     if upper == "INTENDANT" || upper.starts_with("INTENDANT_") || upper == "PROVIDER" {
         return true;
-    }
-    // Provider/model-API keys never pass, passthrough or not: a supervised
-    // CLI authenticates with its own auth under HOME (or an explicitly
-    // injected leased home), never with the controller's keys.
-    if crate::agent_runner::is_provider_credential_env(&upper) {
-        return false;
     }
     if passthrough.contains(&upper) {
         return true;
@@ -1461,6 +1461,14 @@ pub struct AgentConfig {
     /// Shared secret required by the web gateway's secured loopback MCP
     /// exception. Only managed child processes receive it.
     pub mcp_auth_token: Option<String>,
+    /// Exact daemon DNS fallback environment entry to remove from this
+    /// supervised child. Derived before gateway startup as well as on live
+    /// settings changes; the credential value is never copied here.
+    pub dns_credential_env: Option<String>,
+    /// Shared daemon authority store whose durable DNS cleanup journal is
+    /// re-read fail-closed immediately before this supervised child spawns.
+    /// `None` is reserved for hermetic agent-wrapper tests.
+    pub dns_credential_store: Option<PathBuf>,
     /// Intendant session id to include in the injected MCP URL so tool
     /// exposure can be scoped to the Codex process that is calling.
     pub mcp_session_id: Option<String>,
@@ -2004,6 +2012,8 @@ mod tests {
             "anthropic_api_key",
             "ANTHROPIC_AUTH_TOKEN",
             "SOME_SERVICE_API_TOKEN",
+            "INTENDANT_RFC2136_TSIG_SECRET",
+            "intendant_rfc2136_tsig_secret",
             // Ambient host credentials.
             "SSH_AUTH_SOCK",
             "AWS_ACCESS_KEY_ID",
@@ -2044,6 +2054,10 @@ mod tests {
         assert!(
             !external_child_env_allowed("ANTHROPIC_API_KEY", &passthrough),
             "provider keys must not pass even when named in the passthrough"
+        );
+        assert!(
+            !external_child_env_allowed("INTENDANT_RFC2136_TSIG_SECRET", &passthrough),
+            "DNS credentials must not pass even when named in the passthrough"
         );
         assert!(
             !external_child_env_allowed("GH_TOKEN", &passthrough),

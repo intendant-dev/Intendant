@@ -1157,6 +1157,12 @@ function renderAccessConnectCard() {
       + (status.hosted_bundle_checked_unix_ms ? ` (checked ${new Date(Number(status.hosted_bundle_checked_unix_ms)).toLocaleString()})` : '')
       + (status.hosted_bundle_last_error ? `. Last attempt failed: ${status.hosted_bundle_last_error} — the verdict shown is from the last completed check.` : '')
       + '. Verified out of band by this daemon (page JS can never honestly verify the origin serving it).'));
+  } else if (status.hosted_bundle_last_error) {
+    headRow.appendChild(accessRouteChip('remembered', 'hosted check unavailable',
+      `This daemon could not complete its latest out-of-band Connect code check: ${status.hosted_bundle_last_error}. No completed verdict is available yet; it will retry daily, and you can retry now with: intendant hosted-verify.`));
+  } else if (status.configured) {
+    headRow.appendChild(accessRouteChip('remembered', 'hosted check pending',
+      'This daemon has not completed its first out-of-band Connect code check yet. It checks on boot and then daily.'));
   }
   card.appendChild(headRow);
 

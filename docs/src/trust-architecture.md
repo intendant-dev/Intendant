@@ -178,7 +178,7 @@ rows explicitly marked future remain design constraints:
 | TURN relay | Denial of service; traffic analysis | Media remains separate from the Connect SNI relay; any deployment must use short-lived credentials and preserve authenticated, end-to-end encrypted daemon channels |
 | Fleet metadata store | Denial of service; false labels/routes or a substituted self-signed record on a new device | Private fields are encrypted; the current browser detects same-key alteration; records carry no daemon authority. An owner/device signer trust set is not shipped yet. |
 | Name directory | Handle confusion at first introduction | Key-first identity; handles are labels; org keys sign membership; append-only transparency log over all name bindings (STH pinned + consistency-verified by browsers; inclusion proofs on claims), optional DNS/GitHub attestation badges, invite-gated registration + reserved handles + dormant-handle reclamation |
-| Fleet DNS zone + WebPKI (fleet-name route) | Controls the endpoint and origin-scoped code reached through the fleet name | With hosted control off, the route is discovery-only. With it on, unproved traffic is still anonymous `role:none`; protected routes require a short-lived daemon-minted lease bound to a tab key and exact compiled preset. The immutable floor and trusted confirmation cap same-origin authority. Shipped peer witnesses shorten the detection window; the signed-application protocol is present but no current unsigned development artifact qualifies, and CT remains the slower fallback. No detection path mints authority. |
+| Fleet DNS zone + WebPKI (fleet-name route) | Controls the endpoint and origin-scoped code reached through the fleet name | With hosted control off, the route is discovery-only. With it on, unproved traffic is still anonymous `role:none`; protected routes require a short-lived daemon-minted lease bound to a tab key and exact compiled preset. The immutable floor and trusted confirmation cap same-origin authority. Shipped peer witnesses and an eligible signed-application witness shorten the detection window; the signed-application protocol accepts only a qualifying distribution anchor, never the current unsigned development artifact. CT is the slower fallback. No detection path mints authority. |
 | Hosted Connect origin (directory lane) | Controls account/route/presence metadata, page-visible or unlocked state, navigation, and served installers | Claims, passkeys, and account assertions grant nothing, and raw hosted provenance remains immutable `role:none`. The optional navigation hint is daemon-signed and leads only to the daemon's lease doorbell. Served artifacts are transparency-logged (evidence, not prevention); installers remain a real software-supply-chain trust boundary. |
 | Foreign browser origin / DNS rebinding | Drive a browser-held mTLS certificate or loopback root fallback cross-site | Every non-public HTTP route, direct dashboard signaling, and `/ws` reject foreign browser Origins before resolving transport authority; cross-/same-site Fetch Metadata closes navigation and subresource requests that omit `Origin`. Explicit authority-free shell/assets/discovery/signed-document doorbells run as anonymous `role:none`. Cleartext "own origin" is limited to `localhost` or a literal loopback address, so matching attacker-controlled Origin and Host values do not bypass the gate; non-loopback browser administration uses HTTPS/mTLS. |
 
@@ -608,15 +608,23 @@ The pieces that implement the model, mapped to the codebase:
   exercise only the compiled preset. Generic IAM APIs cannot create, assign,
   or reactivate hosted principals, grants, or roles, and the lane's dedicated
   ceiling ceremony cannot lift its immutable floor.
+  The optional [user-owned custom-domain lane](./custom-domain.md) is a
+  separate TLS provenance class: exact SNI, Host, Origin, and WebAuthn rp_id
+  agree on the configured name. Its passkey ceremony approves only the signed
+  tab request and mints the same bounded lease; it creates no ambient IAM or
+  root principal.
   The local IAM write boundary also refuses an active pure browser-key grant
   whose recorded origin is hosted, under the currently learned fleet zone, or
   an exact fleet name the daemon learned previously. Fleet-name provenance is
   retained in `fleet-origin-provenance.json` beside the access certificates so
   offline or Connect-disabled startup cannot reclassify an old service-named
-  route as a direct anchor. On upgrade, an older `fleet-cert.pem` backfills its
-  exact DNS SANs before the gateway accepts requests. If that provenance is
-  malformed or cannot be recovered completely, unknown DNS browser-key origins
-  fail closed as fleet provenance until the local authority store is repaired.
+  route as a direct anchor. When Connect is enabled, custom-name control also
+  waits for the current registration's fleet-zone observation before opening.
+  On upgrade, an older `fleet-cert.pem` backfills both canonical exact DNS SANs
+  and their derived fleet zones before the gateway accepts requests. If that
+  provenance is malformed or cannot be recovered completely, unknown DNS
+  browser-key origins fail closed as fleet provenance until the local authority
+  store is repaired.
   A `human_user` label is not a bypass. A valid
   independently verified browser mTLS binding may carry that key as metadata.
   Legacy browser-key records are displayed as inactive bindings with

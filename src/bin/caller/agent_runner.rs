@@ -226,12 +226,12 @@ const EXTRA_PROVIDER_CREDENTIAL_ENV_VARS: &[&str] = &[
     "GEMINI",
 ];
 
-/// True when `name` names a provider/model-API credential that must not
-/// reach model-driven children. This predicate reserves `INTENDANT_*`
-/// because legitimate controller control names may use credential-looking
-/// suffixes; it is not an admission rule. The native runtime's allowlist
-/// default-denies that namespace except for exact catalogued or spawn-injected
-/// controls.
+/// True when `name` names a provider/model-API or DNS credential that must
+/// not reach model-driven children. This predicate otherwise reserves
+/// `INTENDANT_*` because legitimate controller control names may use
+/// credential-looking suffixes; it is not an admission rule. The native
+/// runtime's allowlist default-denies that namespace except for exact
+/// catalogued or spawn-injected controls.
 ///
 /// Classification is done on the ASCII-uppercased name: Windows environment
 /// names are case-insensitive (`%mistral_api_key%` and `%MISTRAL_API_KEY%`
@@ -244,6 +244,9 @@ const EXTRA_PROVIDER_CREDENTIAL_ENV_VARS: &[&str] = &[
 /// never-pass rule for supervised CLIs.
 pub(crate) fn is_provider_credential_env(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
+    if crate::credential_leases::is_dns_credential_env(&name) {
+        return true;
+    }
     if name.starts_with("INTENDANT_") {
         return false;
     }
@@ -1011,6 +1014,9 @@ mod tests {
             "MISTRAL_API_KEY",
             "SOME_SERVICE_API_TOKEN",
             "ANTHROPIC_AUTH_TOKEN",
+            "CLOUDFLARE_API_TOKEN",
+            "INTENDANT_RFC2136_TSIG_SECRET",
+            "OWNER_DNS_TSIG_SECRET",
             // Windows env names are case-insensitive and dotenvy preserves
             // the .env file's casing — %mistral_api_key% resolves as
             // %MISTRAL_API_KEY% inside the runtime, so casing must not
@@ -1106,6 +1112,8 @@ mod tests {
             ("RUSTC_WRAPPER", "/usr/local/bin/rustc-governor"),
             ("INTENDANT_HOME", "/state"),
             ("ANTHROPIC_API_KEY", "sk-provider"),
+            ("CLOUDFLARE_API_TOKEN", "dns-provider"),
+            ("INTENDANT_RFC2136_TSIG_SECRET", "dns-tsig"),
             ("AWS_SECRET_ACCESS_KEY", "aws-secret"),
             ("GITHUB_TOKEN", "ghp-secret"),
             ("DATABASE_URL", "postgres://secret"),
@@ -1121,7 +1129,8 @@ mod tests {
         .map(|(name, value)| (OsString::from(name), OsString::from(value)))
         .collect();
         let passthrough = intendant_core::env_scrub::env_passthrough_set(Some(
-            "SSH_AUTH_SOCK, CUSTOM_BUILD_ROOT, ANTHROPIC_API_KEY",
+            "SSH_AUTH_SOCK, CUSTOM_BUILD_ROOT, ANTHROPIC_API_KEY, \
+             CLOUDFLARE_API_TOKEN, INTENDANT_RFC2136_TSIG_SECRET",
         ));
         let mut cmd = Command::new("true");
         cmd.env("SHOULD_BE_CLEARED", "before-policy");
@@ -1157,6 +1166,8 @@ mod tests {
         for name in [
             "SHOULD_BE_CLEARED",
             "ANTHROPIC_API_KEY",
+            "CLOUDFLARE_API_TOKEN",
+            "INTENDANT_RFC2136_TSIG_SECRET",
             "AWS_SECRET_ACCESS_KEY",
             "GITHUB_TOKEN",
             "DATABASE_URL",

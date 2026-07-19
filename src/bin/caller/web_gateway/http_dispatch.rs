@@ -15,6 +15,8 @@ pub(crate) struct HttpRequestCtx {
     /// runner's real account.
     pub(crate) access_cert_dir: PathBuf,
     pub(crate) hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
+    pub(crate) custom_domain: Arc<crate::custom_domain::CustomDomainRuntime>,
+    pub(crate) fleet_hosted_control_enabled: bool,
     pub(crate) bus: EventBus,
     pub(crate) config_json: String,
     pub(crate) session_provider: String,
@@ -67,6 +69,17 @@ fn session_token_api_response(result: Result<String, String>) -> ApiResponse {
     }
 }
 
+fn retain_custom_domain_http_authority(
+    stream: &mut DemuxStream,
+    custom_domain: &Arc<crate::custom_domain::CustomDomainRuntime>,
+    selected: bool,
+) {
+    if selected {
+        let live_custom_domain = Arc::clone(custom_domain);
+        stream.retain_http_write_authority(Arc::new(move || live_custom_domain.enabled()));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_http_request(
     ctx: HttpRequestCtx,
@@ -76,7 +89,9 @@ pub(crate) async fn serve_http_request(
     peer_addr: std::net::SocketAddr,
     source_hint: String,
     is_tls: bool,
-    tls_fleet_origin: bool,
+    tls_server_name: Option<String>,
+    tls_fleet_origin: Option<String>,
+    tls_custom_domain: Option<String>,
     tls_client_cert_present: bool,
     tls_client_cert_fingerprint: Option<String>,
     peer_connection_identity: Option<PeerConnectionIdentity>,
@@ -85,6 +100,8 @@ pub(crate) async fn serve_http_request(
     let HttpRequestCtx {
         access_cert_dir,
         hosted_control,
+        custom_domain,
+        fleet_hosted_control_enabled,
         bus,
         config_json,
         session_provider,
@@ -301,14 +318,43 @@ pub(crate) async fn serve_http_request(
     // IAM, loopback, browser-mTLS, process-token `/mcp`, or signaling context
     // is resolved. SNI provenance comes from rustls certificate selection,
     // never this request's mutable Host header.
-    let discovery_only_ingress = gateway_ingress.is_reachability_relay()
-        || tls_fleet_origin
+    let base_discovery_only_ingress = gateway_ingress.is_reachability_relay()
+        || tls_fleet_origin.is_some()
         || request_names_known_fleet_origin(header_text);
-    if is_fleet_only_hosted_control_path(req_method, req_path) && !discovery_only_ingress {
+    let custom_domain_selected = tls_custom_domain.is_some();
+    let public_lane = classify_public_control_lane(
+        base_discovery_only_ingress,
+        tls_custom_domain.as_deref(),
+        custom_domain.enabled(),
+        fleet_hosted_control_enabled,
+    );
+    let public_lease_ingress = public_lane.public_lease_ingress;
+    let configured_public_control_lane = public_lane.configured;
+    let tls_custom_domain = public_lane.live_custom_domain;
+    // A custom-domain TLS name is itself a live authority decision even
+    // before a passkey endpoint mints a lease. Retain that decision at the
+    // transport edge now, so body reads, authority-worker awaits, and
+    // backpressured responses all stop when owner-name eligibility closes.
+    retain_custom_domain_http_authority(&mut stream, &custom_domain, tls_custom_domain.is_some());
+    if is_custom_domain_only_hosted_control_path(req_method, req_path)
+        && tls_custom_domain.is_none()
+    {
         use tokio::io::AsyncWriteExt;
         let response = json_error(
             "404 Not Found",
-            "hosted-control browser entry points are served only on the fleet-name lane",
+            "custom-domain passkey endpoint is unavailable on this TLS name",
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        finalize_http_stream(&mut stream).await;
+        return;
+    }
+    if is_fleet_only_hosted_control_path(req_method, req_path)
+        && (!public_lease_ingress || !configured_public_control_lane)
+    {
+        use tokio::io::AsyncWriteExt;
+        let response = json_error(
+            "404 Not Found",
+            "hosted-control browser entry points require a configured public TLS lane",
         );
         let _ = stream.write_all(response.as_bytes()).await;
         finalize_http_stream(&mut stream).await;
@@ -320,31 +366,63 @@ pub(crate) async fn serve_http_request(
     // the live runtime before disclosing or mutating hosted-control state.
     let authority_free_request = allows_remote_certless_http(request_line, req_method, req_path)
         || is_public_hosted_control_path(req_method, req_path);
-    let hosted_verified = if discovery_only_ingress
+    let cross_origin_exempt_request =
+        authority_free_request && !is_custom_domain_only_hosted_control_path(req_method, req_path);
+    let hosted_verified = if configured_public_control_lane
         && !authority_free_request
         && hosted_control.enabled()
         && req_path != "/mcp"
         && http_header_value(header_text, "x-intendant-hosted-lease").is_some()
     {
-        let result = hosted_request_proof_from_headers(header_text).and_then(|proof| {
-            let fleet_origin = fleet_origin_from_request(header_text, is_tls)?;
-            hosted_control.verify_request_proof(
-                req_method,
-                request_line.split_whitespace().nth(1).unwrap_or(req_path),
-                &fleet_origin,
-                &proof,
-                if gateway_ingress.is_reachability_relay() {
+        let proof = hosted_request_proof_from_headers(header_text).and_then(|proof| {
+            let fleet_origin = public_origin_from_request(
+                header_text,
+                is_tls,
+                tls_server_name.as_deref(),
+                tls_fleet_origin.as_deref(),
+                tls_custom_domain,
+            )?;
+            Ok((proof, fleet_origin))
+        });
+        let result = match proof {
+            Ok((proof, fleet_origin)) => {
+                let runtime = Arc::clone(&hosted_control);
+                let method = req_method.to_string();
+                let raw_path_and_query = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or(req_path)
+                    .to_string();
+                let transport = if tls_custom_domain.is_some() {
+                    "custom-domain-https"
+                } else if gateway_ingress.is_reachability_relay() {
                     "hosted-relay-https"
                 } else {
                     "hosted-fleet-https"
-                },
-            )
-        });
+                };
+                run_hosted_authority_io(move || {
+                    runtime.verify_request_proof(
+                        &method,
+                        &raw_path_and_query,
+                        &fleet_origin,
+                        &proof,
+                        transport,
+                    )
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
         match result {
             Ok(verified) => Some(verified),
             Err(error) => {
                 use tokio::io::AsyncWriteExt;
-                let response = json_error("401 Unauthorized", error);
+                let status = if error == HOSTED_AUTHORITY_BUSY_ERROR {
+                    "429 Too Many Requests"
+                } else {
+                    "401 Unauthorized"
+                };
+                let response = json_error(status, error);
                 let _ = stream.write_all(response.as_bytes()).await;
                 finalize_http_stream(&mut stream).await;
                 return;
@@ -353,10 +431,15 @@ pub(crate) async fn serve_http_request(
     } else {
         None
     };
-    if discovery_only_ingress && !authority_free_request && hosted_verified.is_none() {
+    if public_lease_ingress && !authority_free_request && hosted_verified.is_none() {
         use tokio::io::AsyncWriteExt;
+        let error = if custom_domain_selected {
+            "this public endpoint requires a valid bounded lease; use a trusted direct surface for root administration"
+        } else {
+            "the public fleet-name endpoint is discovery-only without a valid bounded lease; use loopback or the independently fingerprint-verified direct mTLS address for control"
+        };
         let body = serde_json::json!({
-            "error": "the public fleet-name endpoint is discovery-only; use loopback or the independently fingerprint-verified direct mTLS address for control"
+            "error": error
         })
         .to_string();
         let response = json_response("403 Forbidden", body);
@@ -378,7 +461,7 @@ pub(crate) async fn serve_http_request(
         match cross_origin_request_decision(
             origin,
             req_path,
-            authority_free_request,
+            cross_origin_exempt_request,
             peer_addr,
             is_tls,
             header_text,
@@ -402,7 +485,7 @@ pub(crate) async fn serve_http_request(
                 return;
             }
         }
-    } else if !authority_free_request
+    } else if !cross_origin_exempt_request
         && matches!(
             http_header_value(header_text, "sec-fetch-site")
                 .map(str::trim)
@@ -453,12 +536,38 @@ pub(crate) async fn serve_http_request(
         return;
     }
 
-    let hosted_verified_for_handler = hosted_verified.clone();
-    let http_access_context = if let Some(verified) = hosted_verified.as_ref() {
-        HttpAccessContext {
-            principal: verified.principal.clone(),
-            iam_state: Some(Arc::clone(&verified.iam_state)),
-        }
+    // Lease verification runs on the authority-store worker and can outlive
+    // the custom-domain lane decision above. Do not convert a valid proof
+    // into request authority if the live owner-name gate closed meanwhile.
+    if custom_domain_hosted_authority_revoked(
+        custom_domain_selected,
+        hosted_verified.is_some(),
+        || custom_domain.enabled(),
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let response = json_error(
+            "403 Forbidden",
+            "custom-domain control became unavailable while request authority was being verified",
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        finalize_http_stream(&mut stream).await;
+        return;
+    }
+
+    let mut hosted_http_authority = hosted_verified.clone().map(|verified| {
+        HostedHttpAuthority::new(
+            Arc::clone(&hosted_control),
+            custom_domain_selected.then(|| Arc::clone(&custom_domain)),
+            cert_dir.clone(),
+            verified,
+        )
+    });
+    if let Some(authority) = hosted_http_authority.as_ref() {
+        stream.retain_hosted_http_authority(authority.clone());
+    }
+    let mut hosted_verified_for_handler = hosted_verified.clone();
+    let mut http_access_context = if let Some(authority) = hosted_http_authority.as_ref() {
+        authority.access_context()
     } else if authority_free_request {
         authority_free_http_access_context(is_tls)
     } else {
@@ -624,7 +733,15 @@ pub(crate) async fn serve_http_request(
                     BodyPolicy::Capped(cap) => cap,
                     _ => crate::gateway_routes::DEFAULT_BODY_CAP_BYTES,
                 };
-                match read_request_body_capped(&mut stream, header_text, cap).await {
+                let body_authority = stream.http_write_authority();
+                let body = read_request_body_capped_with_authority(
+                    &mut stream,
+                    header_text,
+                    cap,
+                    body_authority,
+                )
+                .await;
+                match body {
                     Ok(body) => {
                         // Keep-alive body leg: dispatch consumed exactly
                         // the declared body (`read_request_body_capped`
@@ -661,6 +778,97 @@ pub(crate) async fn serve_http_request(
                 }
             }
         };
+        // Authority-free custom-domain routes do not have a hosted lease to
+        // refresh below. Recheck the owner-name gate after the body await and
+        // before any handler can persist a ceremony or other public-lane
+        // state. Protected custom-domain routes repeat this in revalidate().
+        if custom_domain_selected && !custom_domain.enabled() {
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
+        // Proof verification precedes the body read, which can last many
+        // minutes on the largest capped route. Refresh the lease, IAM
+        // snapshot, certificate guard, and custom-name gate after that await
+        // and repeat the route gates before any handler can apply an effect.
+        // The streaming transfer row performs the same refresh again after
+        // its handler finishes spooling the body.
+        if let Some(authority) = hosted_http_authority.as_ref() {
+            let refreshed = match authority.revalidate().await {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    use tokio::io::AsyncWriteExt;
+                    let status = hosted_authority_error_status(&error);
+                    let response = apply_cors_posture(
+                        HttpResponse::json(
+                            status_reason(status),
+                            serde_json::json!({ "error": error }).to_string(),
+                        ),
+                        route.cors,
+                        fleet_cors_origin.as_deref(),
+                    );
+                    let _ = stream.write_all(&response.into_bytes()).await;
+                    finalize_http_stream(&mut stream).await;
+                    return;
+                }
+            };
+            http_access_context = refreshed.access_context();
+            hosted_verified_for_handler = Some(refreshed.verified().clone());
+            stream.retain_hosted_http_authority(refreshed.clone());
+            hosted_http_authority = Some(refreshed);
+
+            if let Some(op) = dashboard_http_operation(req_method, req_path)
+                .or_else(|| legacy_protected_http_operation(req_path))
+            {
+                let decision = http_access_context.decision(op);
+                if !decision.allowed {
+                    use tokio::io::AsyncWriteExt;
+                    let response = http_access_forbidden_response(&http_access_context, decision);
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    finalize_http_stream(&mut stream).await;
+                    return;
+                }
+            }
+            if let Some((op, kind)) = peer_filesystem_query_request(req_method, req_path) {
+                let path = query_param(request_line, "path").unwrap_or_default();
+                if let Err(message) = authorize_http_filesystem_access(
+                    &http_access_context,
+                    peer_connection_identity.as_ref(),
+                    op,
+                    kind,
+                    &path,
+                    &bus,
+                ) {
+                    use tokio::io::AsyncWriteExt;
+                    let response = json_error("403 Forbidden", message);
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    finalize_http_stream(&mut stream).await;
+                    return;
+                }
+            }
+            let verified = hosted_verified_for_handler
+                .as_ref()
+                .expect("hosted authority refresh keeps a verified lease");
+            let preset = crate::access::hosted_control::hosted_preset_for_principal(
+                &verified.iam_state,
+                &verified.principal,
+            );
+            if !matches!(
+                preset,
+                Ok(preset)
+                    if crate::access::hosted_control::hosted_http_route_allowed(
+                        preset, req_method, req_path,
+                    )
+            ) {
+                use tokio::io::AsyncWriteExt;
+                let response = json_error(
+                    "403 Forbidden",
+                    "route is outside the current hosted lease HTTP projection",
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
+        }
         // The transfer rows' `{id}` capture (both delete shapes capture
         // exactly the id — the literal segments don't capture).
         let transfer_job_id = || {
@@ -721,6 +929,7 @@ pub(crate) async fn serve_http_request(
                     bus,
                     route.cors,
                     fleet_cors_origin.as_deref(),
+                    hosted_http_authority,
                 )
                 .await;
             }
@@ -1379,21 +1588,32 @@ pub(crate) async fn serve_http_request(
                 return handle_hosted_control_bootstrap(
                     stream,
                     hosted_control,
+                    custom_domain,
                     header_text,
                     is_tls,
+                    tls_server_name.as_deref(),
+                    tls_fleet_origin.as_deref(),
+                    tls_custom_domain,
                     route.cors,
                 )
                 .await;
             }
             RouteHandlerId::HostedControlRequestCreate => {
-                let source_bucket =
-                    (!gateway_ingress.is_reachability_relay()).then_some(source_hint.as_str());
+                // Direct ingress supplies the peer IP; relay ingress supplies
+                // an opaque, relay-salted source bucket. Both are
+                // availability hints only and never participate in authority.
+                let source_bucket = Some(source_hint.as_str());
                 return handle_hosted_control_request_create(
                     stream,
                     route_body,
                     hosted_control,
-                    header_text,
-                    is_tls,
+                    public_origin_from_request(
+                        header_text,
+                        is_tls,
+                        tls_server_name.as_deref(),
+                        tls_fleet_origin.as_deref(),
+                        tls_custom_domain,
+                    ),
                     source_bucket,
                     route.cors,
                 )
@@ -1427,6 +1647,23 @@ pub(crate) async fn serve_http_request(
                     hosted_control,
                     header_text,
                     is_tls,
+                    route.cors,
+                )
+                .await;
+            }
+            RouteHandlerId::CustomDomainPasskey => {
+                let source_bucket = Some(source_hint.as_str());
+                return handle_custom_domain_passkey(
+                    stream,
+                    req_path,
+                    route_body,
+                    custom_domain,
+                    header_text,
+                    is_tls,
+                    tls_server_name.as_deref(),
+                    tls_fleet_origin.as_deref(),
+                    tls_custom_domain,
+                    source_bucket,
                     route.cors,
                 )
                 .await;
@@ -1589,6 +1826,7 @@ pub(crate) async fn serve_http_request(
                     req_path,
                     route_body,
                     hosted_control,
+                    custom_domain,
                     http_access_context,
                     route.cors,
                     fleet_cors_origin.as_deref(),
@@ -2367,11 +2605,73 @@ pub(crate) fn stream_response_http_head(
 /// NEVER parks — its body is EOF-delimited by design (`Connection:
 /// close` is pinned in its golden head), so it always finalizes.
 pub(crate) async fn write_api_response(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     response: ApiResponse,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
+    let authority = stream.http_write_authority();
+    let guarded = authority.is_some();
+    write_api_response_inner(stream, response, cors, fleet_origin, guarded, || {
+        authority.as_ref().is_none_or(|authority| authority())
+    })
+    .await;
+}
+
+enum LiveAuthorityAwait<T> {
+    Ready(T),
+    AuthorityLost,
+}
+
+/// Await transport or producer progress without letting a pending future
+/// postpone recurring authority checks. The future is dropped immediately
+/// when the opening authority is no longer current.
+async fn await_with_live_authority<F, G>(
+    future: F,
+    guarded: bool,
+    authority_is_current: &mut G,
+) -> LiveAuthorityAwait<F::Output>
+where
+    F: std::future::Future,
+    G: FnMut() -> bool,
+{
+    if !guarded {
+        return LiveAuthorityAwait::Ready(future.await);
+    }
+    if !authority_is_current() {
+        return LiveAuthorityAwait::AuthorityLost;
+    }
+    tokio::pin!(future);
+    let first_tick =
+        tokio::time::Instant::now() + crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL;
+    let mut authority_tick = tokio::time::interval_at(
+        first_tick,
+        crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+    );
+    authority_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = authority_tick.tick() => {
+                if !authority_is_current() {
+                    return LiveAuthorityAwait::AuthorityLost;
+                }
+            }
+            output = &mut future => return LiveAuthorityAwait::Ready(output),
+        }
+    }
+}
+
+async fn write_api_response_inner<G>(
+    mut stream: DemuxStream,
+    response: ApiResponse,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+    guarded: bool,
+    mut authority_is_current: G,
+) where
+    G: FnMut() -> bool,
+{
     use tokio::io::AsyncWriteExt;
     match response {
         ApiResponse::Stream {
@@ -2385,21 +2685,80 @@ pub(crate) async fn write_api_response(
             let LineStream {
                 lines: mut line_rx,
                 source,
+                cancellation,
             } = line_stream;
-            if stream.write_all(&head).await.is_ok() {
-                while let Some(line) = line_rx.recv().await {
-                    if stream.write_all(line.as_bytes()).await.is_err() {
-                        break;
+            let mut completed = false;
+            let mut authority_lost = false;
+            match await_with_live_authority(
+                stream.write_all(&head),
+                guarded,
+                &mut authority_is_current,
+            )
+            .await
+            {
+                LiveAuthorityAwait::Ready(Ok(())) => loop {
+                    let line = match await_with_live_authority(
+                        line_rx.recv(),
+                        guarded,
+                        &mut authority_is_current,
+                    )
+                    .await
+                    {
+                        LiveAuthorityAwait::Ready(Some(line)) => line,
+                        LiveAuthorityAwait::Ready(None) => {
+                            completed = true;
+                            break;
+                        }
+                        LiveAuthorityAwait::AuthorityLost => {
+                            authority_lost = true;
+                            break;
+                        }
+                    };
+                    match await_with_live_authority(
+                        stream.write_all(line.as_bytes()),
+                        guarded,
+                        &mut authority_is_current,
+                    )
+                    .await
+                    {
+                        LiveAuthorityAwait::Ready(Ok(())) => {}
+                        LiveAuthorityAwait::Ready(Err(_)) => break,
+                        LiveAuthorityAwait::AuthorityLost => {
+                            authority_lost = true;
+                            break;
+                        }
                     }
-                }
+                },
+                LiveAuthorityAwait::Ready(Err(_)) => {}
+                LiveAuthorityAwait::AuthorityLost => authority_lost = true,
             }
             // Hang up before joining: after an early exit above (client
             // gone) the source may still be sending into the channel;
             // dropping the receiver fails those sends so the producer
             // finishes instead of deadlocking the join.
             drop(line_rx);
-            let _ = source.await;
-            finalize_http_stream(&mut stream).await;
+            if completed {
+                let _ = source.await;
+            } else {
+                cancellation.cancel();
+                source.abort();
+                // Do not join an aborted spawn_blocking producer: Tokio
+                // cannot stop one after it has begun. The cancellation
+                // token and dropped receiver stop its useful work at the
+                // next producer boundary while this transport closes now.
+            }
+            if authority_lost {
+                // A graceful TLS flush can itself be backpressured. Give it
+                // one authority beat, then drop the transport rather than
+                // letting a revoked response remain live indefinitely.
+                let _ = tokio::time::timeout(
+                    crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+                    finalize_http_stream(&mut stream),
+                )
+                .await;
+            } else {
+                finalize_http_stream(&mut stream).await;
+            }
         }
         mut buffered => {
             let keep = stream.exchange_reusable();
@@ -2428,14 +2787,45 @@ pub(crate) async fn write_api_response(
                 ),
                 other => (api_response_http_bytes(other, cors, fleet_origin), None),
             };
-            let mut write_ok = stream.write_all(&bytes).await.is_ok();
+            let mut authority_lost = false;
+            let mut write_ok = match await_with_live_authority(
+                stream.write_all(&bytes),
+                guarded,
+                &mut authority_is_current,
+            )
+            .await
+            {
+                LiveAuthorityAwait::Ready(result) => result.is_ok(),
+                LiveAuthorityAwait::AuthorityLost => {
+                    authority_lost = true;
+                    false
+                }
+            };
             if write_ok {
                 if let Some(body) = &shared_body {
-                    write_ok = stream.write_all(body.as_bytes()).await.is_ok();
+                    write_ok = match await_with_live_authority(
+                        stream.write_all(body.as_bytes()),
+                        guarded,
+                        &mut authority_is_current,
+                    )
+                    .await
+                    {
+                        LiveAuthorityAwait::Ready(result) => result.is_ok(),
+                        LiveAuthorityAwait::AuthorityLost => {
+                            authority_lost = true;
+                            false
+                        }
+                    };
                 }
             }
             if keep && write_ok {
                 stream.park().await;
+            } else if authority_lost {
+                let _ = tokio::time::timeout(
+                    crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+                    finalize_http_stream(&mut stream),
+                )
+                .await;
             } else {
                 finalize_http_stream(&mut stream).await;
             }
@@ -2447,6 +2837,45 @@ pub(crate) async fn write_api_response(
 mod tests {
     use super::*;
     use crate::gateway_routes::CorsPosture;
+
+    struct NeverWritable {
+        write_polled: Arc<tokio::sync::Notify>,
+    }
+
+    impl tokio::io::AsyncRead for NeverWritable {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for NeverWritable {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.write_polled.notify_one();
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn api_json_render_matches_legacy_json_response() {
@@ -2667,6 +3096,7 @@ mod tests {
         } = crate::web_gateway::sessions_stream_api_response_from(crate::web_gateway::LineStream {
             lines,
             source: tokio::spawn(async {}),
+            cancellation: tokio_util::sync::CancellationToken::new(),
         })
         else {
             panic!("sessions stream core must answer on the Stream lane");
@@ -2681,5 +3111,152 @@ mod tests {
             String::from_utf8(head).unwrap(),
             SESSIONS_STREAM_HEAD_GOLDEN
         );
+    }
+
+    #[tokio::test]
+    async fn live_authority_interrupts_backpressured_stream_and_cancels_source() {
+        // Model a custom-domain eligibility loss after the response writer
+        // has entered a socket write that can never make progress. The
+        // recurring authority beat must drop that future, cancel/abort the
+        // producer, and return without waiting for client backpressure.
+        let write_polled = Arc::new(tokio::sync::Notify::new());
+        let transport = NeverWritable {
+            write_polled: Arc::clone(&write_polled),
+        };
+        let (line_tx, lines) = tokio::sync::mpsc::channel::<String>(1);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancellation_observer = cancellation.clone();
+        let producer_wait = cancellation.clone();
+        let source = tokio::spawn(async move {
+            let _ = line_tx.send("{\"type\":\"pending\"}\n".to_string()).await;
+            producer_wait.cancelled().await;
+        });
+        let response = ApiResponse::Stream {
+            status: 200,
+            content_type: "application/x-ndjson".to_string(),
+            headers: vec![("Connection", "close".to_string())],
+            stream: LineStream {
+                lines,
+                source,
+                cancellation,
+            },
+        };
+        let authority_live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer_authority = Arc::clone(&authority_live);
+        let mut stream = DemuxStream::new(Box::pin(transport));
+        stream.retain_http_write_authority(Arc::new(move || {
+            writer_authority.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+        let writer = tokio::spawn(async move {
+            write_api_response(stream, response, CorsPosture::OwnOrigin, None).await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), write_polled.notified())
+            .await
+            .expect("response writer must reach the backpressured transport");
+        authority_live.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("authority loss must interrupt backpressure")
+            .expect("response writer task");
+        assert!(
+            cancellation_observer.is_cancelled(),
+            "the line producer must be cancelled with the response pump"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_custom_domain_installs_a_live_transport_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hosted = Arc::new(crate::access::hosted_control::HostedControlRuntime::new(
+            false,
+            dir.path().to_path_buf(),
+            None,
+            None,
+            String::new(),
+            false,
+        ));
+        let custom_domain = Arc::new(crate::custom_domain::CustomDomainRuntime::new(
+            &crate::project::CustomDomainConfig {
+                enabled: true,
+                name: Some("owner.example.test".to_string()),
+                ..Default::default()
+            },
+            dir.path().to_path_buf(),
+            hosted,
+            Some(Arc::clone(&observed)),
+        ));
+        assert!(custom_domain.enabled());
+
+        let write_polled = Arc::new(tokio::sync::Notify::new());
+        let transport = NeverWritable {
+            write_polled: Arc::clone(&write_polled),
+        };
+        let mut stream = DemuxStream::new(Box::pin(transport));
+        retain_custom_domain_http_authority(&mut stream, &custom_domain, true);
+        assert!(
+            stream.http_write_authority().is_some(),
+            "a selected custom SNI must bind its live gate before dispatch"
+        );
+        let writer = tokio::spawn(async move {
+            write_api_response(
+                stream,
+                ApiResponse::json(200, JsonBody::Value(serde_json::json!({"ok": true}))),
+                CorsPosture::OwnOrigin,
+                None,
+            )
+            .await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), write_polled.notified())
+            .await
+            .expect("response writer must reach the backpressured transport");
+        observed.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("custom-domain eligibility loss must interrupt backpressure")
+            .expect("response writer task");
+    }
+
+    #[tokio::test]
+    async fn retained_authority_interrupts_direct_backpressured_http_write() {
+        use tokio::io::AsyncWriteExt;
+
+        // Direct-write handlers (context snapshots and other legacy shims)
+        // do not pass through `write_api_response`. The DemuxStream edge
+        // itself must therefore wake and fail a stalled write when the exact
+        // hosted opening authority becomes stale.
+        let write_polled = Arc::new(tokio::sync::Notify::new());
+        let transport = NeverWritable {
+            write_polled: Arc::clone(&write_polled),
+        };
+        let authority_live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer_authority = Arc::clone(&authority_live);
+        let mut stream = DemuxStream::new(Box::pin(transport));
+        stream.retain_http_write_authority(Arc::new(move || {
+            writer_authority.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+        let writer = tokio::spawn(async move { stream.write_all(b"response").await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), write_polled.notified())
+            .await
+            .expect("direct writer must reach the backpressured transport");
+        tokio::time::sleep(
+            crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL
+                + std::time::Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            !writer.is_finished(),
+            "a current authority must survive the first recurring beat"
+        );
+        authority_live.store(false, std::sync::atomic::Ordering::SeqCst);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("authority loss must interrupt the direct write")
+            .expect("direct writer task")
+            .expect_err("stale hosted authority must fail the write");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

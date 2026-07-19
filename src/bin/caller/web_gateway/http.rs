@@ -20,6 +20,9 @@ use super::*;
 pub(crate) trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
+/// Cloneable recurring predicate retained by one hosted HTTP exchange.
+pub(crate) type HttpWriteAuthority = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Demuxed connection (plain TCP or TLS) used for all post-demux
 /// HTTP/WebSocket handling, plus the per-exchange keep-alive state the
 /// request loop and the write edges share (see the `keep_alive` module
@@ -29,12 +32,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 /// follow-up request's already-captured segment there so dispatch (and a
 /// WebSocket upgrade arriving on a kept-alive connection) see the request
 /// from byte zero, exactly as the first request is delivered (kernel
-/// buffer on the plain path, `PrefixedStream` on TLS). Writes delegate
-/// straight to the inner stream.
+/// buffer on the plain path, `PrefixedStream` on TLS). Hosted HTTP writes
+/// retain a recurring opening-authority predicate at this lowest shared
+/// transport edge, so direct handler writes and response helpers have the
+/// same revocation/backpressure behavior.
 pub(crate) struct DemuxStream {
     inner: std::pin::Pin<Box<dyn AsyncReadWrite>>,
     replay: Vec<u8>,
     replay_pos: usize,
+    /// Present only after a hosted request proof has admitted this exact
+    /// exchange. Every write/flush/shutdown polls the predicate on a bounded
+    /// beat, including while the underlying socket is backpressured.
+    http_write_authority: Option<HttpWriteAuthority>,
+    http_write_authority_tick: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    http_write_authority_invalid: bool,
     /// Request leg of the keep-alive verdict (client headers + loop
     /// budget + segment framing); set by the request loop per request.
     client_allows_reuse: bool,
@@ -62,6 +73,9 @@ impl DemuxStream {
             inner,
             replay: Vec::new(),
             replay_pos: 0,
+            http_write_authority: None,
+            http_write_authority_tick: None,
+            http_write_authority_invalid: false,
             client_allows_reuse: false,
             request_consumed: false,
             parked: std::sync::Weak::new(),
@@ -76,12 +90,39 @@ impl DemuxStream {
         self.parked = Arc::downgrade(slot);
     }
 
+    /// Retain the exact hosted opening authority at the socket edge. The
+    /// response pump also clones this predicate to cover time spent waiting
+    /// for a producer, when no socket future exists to drive `poll_write`.
+    pub(crate) fn retain_hosted_http_authority(&mut self, authority: HostedHttpAuthority) {
+        self.retain_http_write_authority(Arc::new(move || {
+            authority.opening_authority_is_current()
+        }));
+    }
+
+    /// Retain an arbitrary live HTTP authority at the transport edge. Public
+    /// custom-domain entry points use this before they mint a lease, while a
+    /// verified hosted request replaces it with the stricter opening-grant
+    /// predicate above.
+    pub(crate) fn retain_http_write_authority(&mut self, authority: HttpWriteAuthority) {
+        self.http_write_authority = Some(authority);
+        self.http_write_authority_tick = None;
+        self.http_write_authority_invalid = false;
+    }
+
+    pub(crate) fn http_write_authority(&self) -> Option<HttpWriteAuthority> {
+        self.http_write_authority.clone()
+    }
+
     /// Begin one request/response exchange: record the request leg's
-    /// verdict and reset the body leg (fail-closed until dispatch proves
-    /// the body was consumed).
+    /// verdict and reset the body and authority legs (fail-closed until
+    /// dispatch proves body consumption and, for a hosted request, retains
+    /// that request's newly verified authority).
     pub(crate) fn begin_request(&mut self, client_allows_reuse: bool) {
         self.client_allows_reuse = client_allows_reuse;
         self.request_consumed = false;
+        self.http_write_authority = None;
+        self.http_write_authority_tick = None;
+        self.http_write_authority_invalid = false;
     }
 
     /// Body leg: dispatch proved this request's body is fully consumed
@@ -127,6 +168,54 @@ impl DemuxStream {
         };
         *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(self);
     }
+
+    /// Register this task's waker with the recurring authority timer and
+    /// fail the current transport operation on the first expired beat whose
+    /// predicate is no longer current. The initial transport operation checks
+    /// immediately; subsequent checks are at the same bounded interval used
+    /// by WebSocket and dashboard-control live authority.
+    fn poll_http_write_authority(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::io::Result<()> {
+        if self.http_write_authority.is_none() {
+            return Ok(());
+        }
+        let invalid_error = || {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "hosted HTTP opening authority is no longer current",
+            )
+        };
+        if self.http_write_authority_invalid {
+            return Err(invalid_error());
+        }
+        use std::future::Future as _;
+        let first_check = self.http_write_authority_tick.is_none();
+        let tick = self.http_write_authority_tick.get_or_insert_with(|| {
+            Box::pin(tokio::time::sleep(
+                crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+            ))
+        });
+        let elapsed = tick.as_mut().poll(cx).is_ready();
+        if elapsed {
+            tick.as_mut().reset(
+                tokio::time::Instant::now()
+                    + crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+            );
+            let _ = tick.as_mut().poll(cx);
+        }
+        if (first_check || elapsed)
+            && self
+                .http_write_authority
+                .as_ref()
+                .is_some_and(|authority| !authority())
+        {
+            self.http_write_authority_invalid = true;
+            return Err(invalid_error());
+        }
+        Ok(())
+    }
 }
 
 impl AsyncRead for DemuxStream {
@@ -156,21 +245,33 @@ impl AsyncWrite for DemuxStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.get_mut().inner.as_mut().poll_write(cx, buf)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_http_write_authority(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        this.inner.as_mut().poll_write(cx, buf)
     }
 
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.get_mut().inner.as_mut().poll_flush(cx)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_http_write_authority(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        this.inner.as_mut().poll_flush(cx)
     }
 
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.get_mut().inner.as_mut().poll_shutdown(cx)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_http_write_authority(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        this.inner.as_mut().poll_shutdown(cx)
     }
 
     fn poll_write_vectored(
@@ -178,7 +279,11 @@ impl AsyncWrite for DemuxStream {
         cx: &mut std::task::Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.get_mut().inner.as_mut().poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_http_write_authority(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        this.inner.as_mut().poll_write_vectored(cx, bufs)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -470,9 +575,114 @@ pub(crate) async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
     stream: &mut S,
     max_bytes: usize,
 ) -> Result<SpooledBody, String> {
+    stream_body_to_tempfile_with_deadline_and_guard(
+        header_text,
+        initial_request_bytes,
+        stream,
+        max_bytes,
+        request_body_read_timeout(max_bytes),
+        false,
+        || Ok(()),
+    )
+    .await
+}
+
+/// Spool a streaming request body under the transport's retained live
+/// authority, when present. The caller still performs its authoritative
+/// post-body refresh before committing the upload.
+pub(crate) async fn stream_body_to_tempfile_with_authority<S: AsyncRead + Unpin>(
+    header_text: &str,
+    initial_request_bytes: &[u8],
+    stream: &mut S,
+    max_bytes: usize,
+    authority: Option<HttpWriteAuthority>,
+) -> Result<SpooledBody, String> {
+    if let Some(authority) = authority {
+        stream_body_to_tempfile_with_guard(
+            header_text,
+            initial_request_bytes,
+            stream,
+            max_bytes,
+            move || {
+                if authority() {
+                    Ok(())
+                } else {
+                    Err(HOSTED_BODY_AUTHORITY_LOST_ERROR.to_string())
+                }
+            },
+        )
+        .await
+    } else {
+        stream_body_to_tempfile(header_text, initial_request_bytes, stream, max_bytes).await
+    }
+}
+
+pub(crate) async fn stream_body_to_tempfile_with_guard<
+    S: AsyncRead + Unpin,
+    G: FnMut() -> Result<(), String>,
+>(
+    header_text: &str,
+    initial_request_bytes: &[u8],
+    stream: &mut S,
+    max_bytes: usize,
+    guard: G,
+) -> Result<SpooledBody, String> {
+    stream_body_to_tempfile_with_deadline_and_guard(
+        header_text,
+        initial_request_bytes,
+        stream,
+        max_bytes,
+        request_body_read_timeout(max_bytes),
+        true,
+        guard,
+    )
+    .await
+}
+
+async fn stream_body_to_tempfile_with_deadline_and_guard<
+    S: AsyncRead + Unpin,
+    G: FnMut() -> Result<(), String>,
+>(
+    header_text: &str,
+    initial_request_bytes: &[u8],
+    stream: &mut S,
+    max_bytes: usize,
+    deadline: std::time::Duration,
+    poll_guard: bool,
+    guard: G,
+) -> Result<SpooledBody, String> {
+    match tokio::time::timeout(
+        deadline,
+        stream_body_to_tempfile_inner(
+            header_text,
+            initial_request_bytes,
+            stream,
+            max_bytes,
+            poll_guard,
+            guard,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("request body read timed out".to_string()),
+    }
+}
+
+async fn stream_body_to_tempfile_inner<S: AsyncRead + Unpin, G: FnMut() -> Result<(), String>>(
+    header_text: &str,
+    initial_request_bytes: &[u8],
+    stream: &mut S,
+    max_bytes: usize,
+    poll_guard: bool,
+    mut guard: G,
+) -> Result<SpooledBody, String> {
     use std::io::Write;
     use tokio::io::AsyncReadExt;
 
+    if poll_guard {
+        guard()?;
+    }
     let content_length: usize = header_text
         .lines()
         .find(|l| l.to_lowercase().starts_with("content-length:"))
@@ -507,7 +717,15 @@ pub(crate) async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
     let mut buf = vec![0u8; 64 * 1024];
     while written < content_length {
         let want = (content_length - written).min(buf.len());
-        match stream.read(&mut buf[..want]).await {
+        let read = if poll_guard {
+            poll_guarded_read(stream, &mut buf[..want], &mut guard).await?
+        } else {
+            stream.read(&mut buf[..want]).await
+        };
+        if poll_guard {
+            guard()?;
+        }
+        match read {
             Ok(0) => {
                 return Err(format!(
                     "connection closed mid-upload at {} / {} bytes",
@@ -522,6 +740,9 @@ pub(crate) async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
             }
             Err(e) => return Err(format!("socket read: {e}")),
         }
+    }
+    if poll_guard {
+        guard()?;
     }
     tmp.as_file_mut()
         .flush()
@@ -941,13 +1162,140 @@ pub(crate) fn with_allowed_origin_cors(response: String, origin: Option<&str>) -
 /// and ICE batches stay far below this; authentication must not turn a
 /// malformed request into an unbounded allocation.
 pub(crate) const CONNECT_SIGNALING_BODY_CAP_BYTES: usize = 256 * 1024;
+const REQUEST_BODY_BASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const REQUEST_BODY_READ_CHUNK_BYTES: usize = 16 * 1024;
+const REQUEST_BODY_TIMEOUT_FREE_BYTES: usize = 64 * 1024;
+const REQUEST_BODY_TIMEOUT_BYTES_PER_SEC: usize = 128 * 1024;
+const LIVE_BODY_GUARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+pub(crate) const HOSTED_BODY_AUTHORITY_LOST_ERROR: &str =
+    "hosted request authority became unavailable during body read";
+
+async fn poll_guarded_read<S, G, E>(
+    stream: &mut S,
+    buffer: &mut [u8],
+    guard: &mut G,
+) -> Result<std::io::Result<usize>, E>
+where
+    S: AsyncRead + Unpin,
+    G: FnMut() -> Result<(), E>,
+{
+    use tokio::io::AsyncReadExt;
+    guard()?;
+    let read = stream.read(buffer);
+    tokio::pin!(read);
+    let start = tokio::time::Instant::now() + LIVE_BODY_GUARD_POLL_INTERVAL;
+    let mut interval = tokio::time::interval_at(start, LIVE_BODY_GUARD_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            result = &mut read => return Ok(result),
+            _ = interval.tick() => guard()?,
+        }
+    }
+}
+
+fn request_body_read_timeout(max_bytes: usize) -> std::time::Duration {
+    let excess = max_bytes.saturating_sub(REQUEST_BODY_TIMEOUT_FREE_BYTES);
+    let extra_secs = excess.div_ceil(REQUEST_BODY_TIMEOUT_BYTES_PER_SEC) as u64;
+    REQUEST_BODY_BASE_TIMEOUT.saturating_add(std::time::Duration::from_secs(extra_secs))
+}
 
 pub(crate) async fn read_request_body_capped<S: AsyncRead + Unpin>(
     stream: &mut S,
     header_text: &str,
     max_bytes: usize,
 ) -> Result<String, (u16, String)> {
+    read_request_body_capped_with_timeout_and_guard(
+        stream,
+        header_text,
+        max_bytes,
+        request_body_read_timeout(max_bytes),
+        false,
+        || Ok(()),
+    )
+    .await
+}
+
+/// Read a capped request body under the exact live authority already retained
+/// by the HTTP transport. Fleet leases and public custom-domain entry points
+/// therefore share one selection rule instead of each call site deciding
+/// which part of authority deserves a recurring guard.
+pub(crate) async fn read_request_body_capped_with_authority<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    header_text: &str,
+    max_bytes: usize,
+    authority: Option<HttpWriteAuthority>,
+) -> Result<String, (u16, String)> {
+    if let Some(authority) = authority {
+        read_request_body_capped_with_guard(stream, header_text, max_bytes, move || {
+            if authority() {
+                Ok(())
+            } else {
+                Err((
+                    403,
+                    serde_json::json!({ "error": HOSTED_BODY_AUTHORITY_LOST_ERROR }).to_string(),
+                ))
+            }
+        })
+        .await
+    } else {
+        read_request_body_capped(stream, header_text, max_bytes).await
+    }
+}
+
+pub(crate) async fn read_request_body_capped_with_guard<
+    S: AsyncRead + Unpin,
+    G: FnMut() -> Result<(), (u16, String)>,
+>(
+    stream: &mut S,
+    header_text: &str,
+    max_bytes: usize,
+    guard: G,
+) -> Result<String, (u16, String)> {
+    read_request_body_capped_with_timeout_and_guard(
+        stream,
+        header_text,
+        max_bytes,
+        request_body_read_timeout(max_bytes),
+        true,
+        guard,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn read_request_body_capped_with_timeout<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    header_text: &str,
+    max_bytes: usize,
+    timeout: std::time::Duration,
+) -> Result<String, (u16, String)> {
+    read_request_body_capped_with_timeout_and_guard(
+        stream,
+        header_text,
+        max_bytes,
+        timeout,
+        false,
+        || Ok(()),
+    )
+    .await
+}
+
+async fn read_request_body_capped_with_timeout_and_guard<
+    S: AsyncRead + Unpin,
+    G: FnMut() -> Result<(), (u16, String)>,
+>(
+    stream: &mut S,
+    header_text: &str,
+    max_bytes: usize,
+    timeout: std::time::Duration,
+    poll_guard: bool,
+    mut guard: G,
+) -> Result<String, (u16, String)> {
     use tokio::io::AsyncReadExt;
+    if poll_guard {
+        guard()?;
+    }
     let content_length: usize = header_text
         .lines()
         .find(|l| l.to_lowercase().starts_with("content-length:"))
@@ -965,15 +1313,69 @@ pub(crate) async fn read_request_body_capped<S: AsyncRead + Unpin>(
     }
     let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
     if peeked_body.len() >= content_length {
+        if poll_guard {
+            guard()?;
+        }
         return Ok(crate::types::truncate_str(peeked_body, content_length).to_string());
     }
-    let remaining = content_length.saturating_sub(peeked_body.len());
-    let mut full = peeked_body.to_string();
-    let mut rest = vec![0u8; remaining];
-    if stream.read_exact(&mut rest).await.is_ok() {
-        full.push_str(&String::from_utf8_lossy(&rest));
+    let mut full = Vec::with_capacity(
+        peeked_body
+            .len()
+            .saturating_add(REQUEST_BODY_READ_CHUNK_BYTES)
+            .min(content_length),
+    );
+    full.extend_from_slice(peeked_body.as_bytes());
+    let read = tokio::time::timeout(timeout, async {
+        let mut chunk = [0u8; REQUEST_BODY_READ_CHUNK_BYTES];
+        while full.len() < content_length {
+            let remaining = content_length - full.len();
+            let read = if poll_guard {
+                poll_guarded_read(
+                    stream,
+                    &mut chunk[..remaining.min(REQUEST_BODY_READ_CHUNK_BYTES)],
+                    &mut guard,
+                )
+                .await?
+            } else {
+                stream
+                    .read(&mut chunk[..remaining.min(REQUEST_BODY_READ_CHUNK_BYTES)])
+                    .await
+            };
+            if poll_guard {
+                guard()?;
+            }
+            let n = read.map_err(|error| {
+                (
+                    400,
+                    serde_json::json!({
+                        "error": format!("read request body: {error}")
+                    })
+                    .to_string(),
+                )
+            })?;
+            if n == 0 {
+                return Err((
+                    400,
+                    serde_json::json!({"error": "request body ended before Content-Length"})
+                        .to_string(),
+                ));
+            }
+            full.extend_from_slice(&chunk[..n]);
+        }
+        if poll_guard {
+            guard()?;
+        }
+        Ok::<(), (u16, String)>(())
+    })
+    .await;
+    match read {
+        Ok(Ok(())) => Ok(String::from_utf8_lossy(&full).into_owned()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err((
+            408,
+            serde_json::json!({"error": "request body read timed out"}).to_string(),
+        )),
     }
-    Ok(full)
 }
 
 /// Numeric code of a status line (`"404 Not Found"` → 404); unparseable
@@ -997,6 +1399,7 @@ pub(crate) fn status_reason(status: u16) -> &'static str {
         403 => "403 Forbidden",
         404 => "404 Not Found",
         405 => "405 Method Not Allowed",
+        408 => "408 Request Timeout",
         409 => "409 Conflict",
         413 => "413 Payload Too Large",
         416 => "416 Range Not Satisfiable",
@@ -1170,7 +1573,13 @@ mod tests {
         let mut stream = DemuxStream::new(Box::pin(server));
         // Fail-closed defaults: no verdict, no armed slot.
         assert!(!stream.exchange_reusable());
+        stream.retain_http_write_authority(Arc::new(|| false));
+        assert!(stream.http_write_authority().is_some());
         stream.begin_request(true);
+        assert!(
+            stream.http_write_authority().is_none(),
+            "a kept-alive exchange must not inherit the prior request's authority"
+        );
         stream.mark_request_body_consumed();
         // Still not reusable: the parked slot was never armed (the
         // fixture / one-shot shape), so a park would just close.
@@ -1215,6 +1624,135 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body, "");
+    }
+
+    #[tokio::test]
+    async fn read_request_body_capped_times_out_without_preallocating_the_declared_body() {
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        let header_text =
+            "POST /api/hosted-control/requests HTTP/1.1\r\nContent-Length: 65536\r\n\r\n";
+        let error = read_request_body_capped_with_timeout(
+            &mut reader,
+            header_text,
+            64 * 1024,
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, 408);
+        let response = HttpResponse::json(status_reason(error.0), error.1).into_bytes();
+        assert!(
+            response.starts_with(b"HTTP/1.1 408 Request Timeout\r\n"),
+            "the rendered response must preserve the body-timeout status"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_authority_stops_a_stalled_capped_body_read() {
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let close = std::sync::Arc::clone(&live);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            close.store(false, std::sync::atomic::Ordering::Release);
+        });
+        let header_text = "POST /api/fs/write HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        let body_authority: HttpWriteAuthority =
+            Arc::new(move || live.load(std::sync::atomic::Ordering::Acquire));
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_request_body_capped_with_authority(
+                &mut reader,
+                header_text,
+                4,
+                Some(body_authority),
+            ),
+        )
+        .await
+        .expect("the live guard must interrupt a stalled capped-body read")
+        .unwrap_err();
+        assert_eq!(error.0, 403);
+        assert!(error.1.contains(HOSTED_BODY_AUTHORITY_LOST_ERROR));
+    }
+
+    #[tokio::test]
+    async fn retained_authority_stops_a_stalled_tempfile_body_read() {
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let close = std::sync::Arc::clone(&live);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            close.store(false, std::sync::atomic::Ordering::Release);
+        });
+        let header_text = "POST /api/transfers/job/chunk HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        let body_authority: HttpWriteAuthority =
+            Arc::new(move || live.load(std::sync::atomic::Ordering::Acquire));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream_body_to_tempfile_with_authority(
+                header_text,
+                header_text.as_bytes(),
+                &mut reader,
+                4,
+                Some(body_authority),
+            ),
+        )
+        .await
+        .expect("the live guard must interrupt a stalled streaming-body read");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("the streaming body unexpectedly completed"),
+        };
+        assert_eq!(error, HOSTED_BODY_AUTHORITY_LOST_ERROR);
+    }
+
+    #[tokio::test]
+    async fn tempfile_stream_has_a_bounded_body_read_deadline() {
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        let header_text = "POST /api/transfers/job/chunk HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        let result = stream_body_to_tempfile_with_deadline_and_guard(
+            header_text,
+            header_text.as_bytes(),
+            &mut reader,
+            4,
+            std::time::Duration::from_millis(20),
+            false,
+            || Ok(()),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("the streaming body unexpectedly completed"),
+        };
+        assert_eq!(error, "request body read timed out");
+    }
+
+    #[test]
+    fn request_body_deadline_scales_only_above_the_public_proof_cap() {
+        assert_eq!(
+            request_body_read_timeout(64 * 1024),
+            REQUEST_BODY_BASE_TIMEOUT
+        );
+        assert!(
+            request_body_read_timeout(crate::gateway_routes::MCP_BODY_CAP_BYTES)
+                > REQUEST_BODY_BASE_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn read_request_body_capped_rejects_an_early_eof() {
+        let mut reader = tokio::io::empty();
+        let header_text =
+            "POST /api/hosted-control/requests HTTP/1.1\r\nContent-Length: 65536\r\n\r\n";
+        let error = read_request_body_capped_with_timeout(
+            &mut reader,
+            header_text,
+            64 * 1024,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, 400);
     }
 
     #[test]
