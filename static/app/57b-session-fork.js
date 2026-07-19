@@ -338,6 +338,12 @@ function sessionForkRowHint(point) {
   if (point.kind === 'head') {
     return 'Fork at the current head (the child keeps the full history).';
   }
+  if (point.kind === 'item-anchor') {
+    return 'Fork at this anchor: the child keeps history through this item (vanilla codex rounds to the containing turn).';
+  }
+  if (point.kind === 'message' && point.message_uuid && !point.at_message_uuid) {
+    return 'Fork here: the child keeps history through this row and continues fresh from it.';
+  }
   return 'Fork from before this message: the child keeps everything above and redoes from here.';
 }
 
@@ -408,6 +414,71 @@ function sessionForkToggleRowForm(entry, btn, source, sessionId, point) {
     sessionForkDispatch(source, sessionId, point, nameInput.value.trim(), taskInput.value.trim(), status);
   });
   entry.appendChild(host);
+}
+
+// ── "Anything labeled anchor forks" ──
+// The ⑂ that rides every minted anchor label (the `log-anchor-btn` on
+// item rows, live lane and detail alike, plus the Managed pane's Recent
+// anchors list). Codex rows fork at the item anchor itself (the managed
+// binary cuts exactly; vanilla rounds down to the containing turn — the
+// engine labels the rounding); claude-code rows fork at the row's
+// transcript message uuid (hydrated detail rows carry it; live rows
+// without one get no button — a cut is never guessed).
+
+function anchorForkPointForRecord(source, record) {
+  if (!record) return null;
+  if (source === 'codex' && record.item_id) {
+    return { kind: 'item-anchor', item_id: record.item_id, position: 'after' };
+  }
+  if (source === 'claude-code' && record.message_uuid) {
+    return { kind: 'message', message_uuid: record.message_uuid };
+  }
+  return null;
+}
+
+function appendAnchorForkAffordance(entry, record, sessionId) {
+  const sid = String(sessionId || (record && record.session_id) || '').trim();
+  if (!sid || !entry) return;
+  const meta = typeof sessionConfigMetadata === 'function' ? sessionConfigMetadata(sid) : null;
+  const source = typeof sessionConfigSource === 'function' ? sessionConfigSource(meta) : '';
+  const point = anchorForkPointForRecord(source, record);
+  if (!point) return;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'log-fork-entry log-fork-inline';
+  btn.textContent = '⑂';
+  btn.title =
+    source === 'codex'
+      ? 'Fork the session at this anchor (the vanilla codex binary rounds to the containing turn)'
+      : 'Fork the session: the child keeps history through this row';
+  btn.setAttribute('aria-label', 'Fork the session at this anchor');
+  btn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    sessionForkToggleRowForm(entry, btn, source, sid, point);
+  });
+  entry.appendChild(btn);
+}
+
+// Managed pane Recent-anchors rows: same rule, list-shaped. Only codex
+// anchors dispatch (item ids from other backends' tool rows are not fork
+// keys); the status lands inline in the row.
+function managedContextForkFromAnchor(row, itemId, sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !itemId || !row) return;
+  const meta = typeof sessionConfigMetadata === 'function' ? sessionConfigMetadata(sid) : null;
+  // Item anchors are codex vocabulary — when the metadata row has not
+  // hydrated yet, codex is the only source this list can belong to.
+  const source =
+    (typeof sessionConfigSource === 'function' ? sessionConfigSource(meta) : '') || 'codex';
+  const point = anchorForkPointForRecord(source, { item_id: itemId });
+  if (!point) return;
+  let status = row.querySelector('.sd-fork-status');
+  if (!status) {
+    status = document.createElement('span');
+    status.className = 'sd-fork-status';
+    row.appendChild(status);
+  }
+  sessionForkDispatch(source, sid, point, '', '', status);
 }
 
 function anchorSummaryForUi(anchor) {

@@ -1843,6 +1843,8 @@ function createLogScaffold(c, extraClass) {
       fillManagedContextAnchor(c.item_id, sid);
     });
     entry.appendChild(anchor);
+    // Everything labeled anchor forks: the ⑂ rides the label itself.
+    appendAnchorForkAffordance(entry, c, sid);
   }
   return { entry, hostId };
 }

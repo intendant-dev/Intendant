@@ -3434,6 +3434,12 @@ html.ui-v2[data-theme="light"] .control-toast {
 @media (pointer: coarse) {
   .log-entry .log-fork-entry { opacity: 1; pointer-events: auto; }
 }
+/* The anchor-label companion is always visible — it rides a label that is
+   itself always visible, in the live lane and detail alike. */
+.log-entry .log-fork-entry.log-fork-inline {
+  opacity: 1;
+  pointer-events: auto;
+}
 .log-entry.has-fork-form { flex-wrap: wrap; }
 .log-fork-form-host {
   flex: 1 1 100%;

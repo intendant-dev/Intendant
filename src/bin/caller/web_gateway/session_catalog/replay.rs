@@ -902,16 +902,30 @@ pub(crate) fn annotate_replay_user_turns_from_external_transcript(
     };
     let user_turns: Vec<serde_json::Value> = transcript
         .iter()
-        .filter(|entry| entry.get("source").and_then(|v| v.as_str()) == Some("user"))
         .filter(|entry| {
             entry
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(|source| source.trim().eq_ignore_ascii_case("user"))
+                .unwrap_or(false)
+        })
+        .filter(|entry| {
+            // Codex turns carry the revision projection; claude turns carry
+            // the transcript message uuid (the inline fork join key). Either
+            // identity makes a transcript user turn worth stamping onto its
+            // daemon-log twin — a fully supervised session's detail view
+            // renders ONLY daemon-log rows, so without this stamp the
+            // claude fork affordances never appear there.
+            let has_revision = entry
                 .get("user_turn_index")
                 .and_then(|v| v.as_u64())
                 .is_some()
                 && entry
                     .get("user_turn_revision")
                     .and_then(|v| v.as_u64())
-                    .is_some()
+                    .is_some();
+            let has_uuid = entry.get("message_uuid").and_then(|v| v.as_str()).is_some();
+            has_revision || has_uuid
         })
         // Clone only the matched user turns; the shared transcript
         // snapshot itself is never deep-cloned on this path anymore.
@@ -969,6 +983,8 @@ pub(crate) fn annotate_replay_user_turns_from_external_transcript(
                 "replacement_for_user_turn_index",
                 "superseded",
                 "superseded_reason",
+                "message_uuid",
+                "off_active_chain",
             ] {
                 if let Some(value) = turn.get(key) {
                     obj.insert(key.to_string(), value.clone());
@@ -1933,5 +1949,44 @@ mod tests {
             context.pointer("/raw/0/role").and_then(|v| v.as_str()),
             Some("user")
         );
+    }
+
+    /// A fully supervised claude session's detail view renders ONLY
+    /// daemon-log rows, which carry no transcript uuids — the inline fork
+    /// join keys on `message_uuid`, so without stamping, those views show
+    /// zero fork affordances (found live 2026-07-19). The annotator maps
+    /// daemon user rows onto transcript user turns in order (duplicate
+    /// prose maps sequentially, never globally) and stamps the uuid.
+    #[test]
+    fn claude_daemon_rows_get_transcript_uuids_stamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let project = home.join(".claude").join("projects").join("p1");
+        std::fs::create_dir_all(&project).unwrap();
+        let sid = "cc-stamp-test";
+        let lines = [
+            r#"{"uuid":"u1","parentUuid":null,"type":"user","timestamp":"2026-07-19T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"continue"}]}}"#,
+            r#"{"uuid":"a1","parentUuid":"u1","type":"assistant","timestamp":"2026-07-19T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok one"}]}}"#,
+            r#"{"uuid":"u2","parentUuid":"a1","type":"user","timestamp":"2026-07-19T00:00:03.000Z","message":{"role":"user","content":[{"type":"text","text":"continue"}]}}"#,
+            r#"{"uuid":"a2","parentUuid":"u2","type":"assistant","timestamp":"2026-07-19T00:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ok two"}]}}"#,
+        ];
+        std::fs::write(project.join(format!("{sid}.jsonl")), lines.join("\n")).unwrap();
+
+        let mut entries = vec![
+            serde_json::json!({"event":"log_entry","session_id":sid,"source":"User","content":"continue"}),
+            serde_json::json!({"event":"log_entry","session_id":sid,"source":"Claude Code","content":"ok one"}),
+            serde_json::json!({"event":"log_entry","session_id":sid,"source":"User","content":"continue"}),
+        ];
+        annotate_replay_user_turns_from_external_transcript(&mut entries, home, "claude-code", sid);
+        assert_eq!(entries[0]["message_uuid"], "u1");
+        assert!(
+            entries[0].get("user_turn_index").is_none(),
+            "claude stamps carry no codex revision fields"
+        );
+        assert_eq!(
+            entries[2]["message_uuid"], "u2",
+            "duplicate prose maps in order, not to the first global match"
+        );
+        assert!(entries[1].get("message_uuid").is_none());
     }
 }
