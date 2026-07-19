@@ -1581,6 +1581,16 @@ html.ui-v2 #question-panel .approval-card {
   padding: 14px 16px;
 }
 html.ui-v2 #question-panel .approval-icon { display: none; }
+/* Preview-bearing questions escape the reading-column measure: the
+   side-by-side comparison IS the content, so the card owns the pane.
+   Explicit width, not just max-width — the dock is a flex column whose
+   auto inline margins make the body fit-content, and a fit-content
+   container lets the preview grid collapse to one column. */
+html.ui-v2 #activity-log-pane #question-panel.has-previews .panel-body,
+html.ui-v2 #activity-log-pane #question-panel.has-previews .panel-header {
+  width: min(1560px, 96%);
+  max-width: none;
+}
 html.ui-v2 #question-panel .question-text { color: var(--text); font-size: 13px; }
 html.ui-v2 #question-panel .question-header-chip {
   font-family: var(--mono);
