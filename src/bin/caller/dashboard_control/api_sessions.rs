@@ -3268,14 +3268,24 @@ mod tests {
         }
         let text = String::from_utf8(raw).unwrap();
         let head_end = text.find("\r\n\r\n").expect("head/body split") + 4;
+        // The build stamp is an HTTP-lane-only header (the serialization
+        // seam prepends it to every rendered head); the tunnel lane below
+        // has no HTTP head at all — its frames are datachannel JSON, and
+        // its stale-build signal is the tunnel handshake's own
+        // `app_build` check — so the lanes' parity contract stays the
+        // event-line sequence, unaffected by the header.
         assert_eq!(
             &text[..head_end],
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: application/x-ndjson\r\n\
-             Cache-Control: no-cache\r\n\
-             Connection: close\r\n\
-             Vary: Origin\r\n\
-             \r\n"
+            format!(
+                "HTTP/1.1 200 OK\r\n\
+                 x-intendant-app-build: {}\r\n\
+                 Content-Type: application/x-ndjson\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Connection: close\r\n\
+                 Vary: Origin\r\n\
+                 \r\n",
+                crate::web_gateway::app_build()
+            )
         );
         assert_eq!(&text[head_end..], lines.concat());
 

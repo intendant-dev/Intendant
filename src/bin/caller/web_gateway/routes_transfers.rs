@@ -1673,6 +1673,9 @@ mod tests {
     /// dispatch arms use.
     #[tokio::test]
     async fn golden_http_transcripts_pin_download_and_commit_shapes() {
+        // The serialization seam prepends the embedded bundle's build
+        // stamp to every rendered head.
+        let stamp = crate::web_gateway::static_assets::app_build();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         let dest_dir = dir.path().join("dest");
@@ -1708,6 +1711,7 @@ mod tests {
         let sha = fs_sha256_hex(b"hello transfer");
         let expected_full = format!(
             "HTTP/1.1 200 OK\r\n\
+             x-intendant-app-build: {stamp}\r\n\
              Content-Type: text/plain; charset=utf-8\r\n\
              Content-Length: 14\r\n\
              Accept-Ranges: bytes\r\n\
@@ -1733,7 +1737,9 @@ mod tests {
             )
             .await,
         );
-        let expected_partial = "HTTP/1.1 206 Partial Content\r\n\
+        let expected_partial = format!(
+            "HTTP/1.1 206 Partial Content\r\n\
+             x-intendant-app-build: {stamp}\r\n\
              Content-Type: text/plain; charset=utf-8\r\n\
              Content-Length: 8\r\n\
              Accept-Ranges: bytes\r\n\
@@ -1746,7 +1752,8 @@ mod tests {
              Cache-Control: no-cache\r\n\
              Connection: close\r\n\
              \r\n\
-             transfer";
+             transfer"
+        );
         assert_eq!(partial, expected_partial);
 
         // Unsatisfiable header: 416 with the probing Content-Range tail.
@@ -1758,7 +1765,9 @@ mod tests {
             )
             .await,
         );
-        let expected_416 = "HTTP/1.1 416 Range Not Satisfiable\r\n\
+        let expected_416 = format!(
+            "HTTP/1.1 416 Range Not Satisfiable\r\n\
+             x-intendant-app-build: {stamp}\r\n\
              Content-Type: application/json\r\n\
              Content-Length: 51\r\n\
              Content-Range: bytes */14\r\n\
@@ -1766,7 +1775,8 @@ mod tests {
              Cache-Control: no-cache\r\n\
              Connection: close\r\n\
              \r\n\
-             {\"error\":\"range is not satisfiable\",\"ok\":false}";
+             {{\"error\":\"range is not satisfiable\",\"ok\":false}}"
+        );
         // serde_json object key order is alphabetical for json! literals
         // built in one shot; compute the length from the actual body to
         // keep the pin honest.
@@ -1807,13 +1817,16 @@ mod tests {
         );
         assert_eq!(
             mismatch,
-            "HTTP/1.1 409 Conflict\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: 45\r\n\
-             Cache-Control: no-cache\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {\"error\":\"upload sha256 mismatch\",\"ok\":false}"
+            format!(
+                "HTTP/1.1 409 Conflict\r\n\
+                 x-intendant-app-build: {stamp}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: 45\r\n\
+                 Cache-Control: no-cache\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {{\"error\":\"upload sha256 mismatch\",\"ok\":false}}"
+            )
         );
     }
 

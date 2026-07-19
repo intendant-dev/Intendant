@@ -4533,10 +4533,12 @@ mod tests {
     }
 
     /// The canonical JSON framing (`Cache-Control` + `Connection` tail),
-    /// spelled out literally.
+    /// spelled out literally (the serialization seam prepends the
+    /// embedded bundle's build stamp).
     fn golden_access_canonical_json_transcript(status_line: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            crate::web_gateway::static_assets::app_build(),
             body.len()
         )
     }
@@ -4554,7 +4556,8 @@ mod tests {
             None => String::new(),
         };
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n{echo}Vary: Origin\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n{echo}Vary: Origin\r\n\r\n{body}",
+            crate::web_gateway::static_assets::app_build(),
             body.len()
         )
     }
@@ -4572,7 +4575,8 @@ mod tests {
             None => String::new(),
         };
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n{echo}Vary: Origin\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n{echo}Vary: Origin\r\n\r\n{body}",
+            crate::web_gateway::static_assets::app_build(),
             body.len()
         )
     }
@@ -5425,7 +5429,8 @@ mod tests {
     /// The public-CORS JSON framing: canonical tail, wildcard ACAO last.
     fn golden_access_public_json_transcript(status_line: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{body}",
+            crate::web_gateway::static_assets::app_build(),
             body.len()
         )
     }
