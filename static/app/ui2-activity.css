@@ -126,7 +126,12 @@ html.ui-v2 #activity-subtabs .ui2-activity-tools {
   margin-left: auto;
   flex-shrink: 0;
 }
-html.ui-v2 #activity-subtabs:has(.subtab-btn[data-activity-tab="log"].active) .ui2-activity-tools {
+/* Gated on the switcher's stamped data-active-subtab (48-router-settings.js
+   switchActivitySubtab; HTML default "log") rather than
+   `:has(.subtab-btn[data-activity-tab="log"].active)`: the subtabs bar sits
+   beside the per-second-ticking Activity panes, and a `:has()` registration
+   here taxed every DOM mutation's style-invalidation walk. */
+html.ui-v2 #activity-subtabs[data-active-subtab="log"] .ui2-activity-tools {
   display: inline-flex;
 }
 
@@ -239,7 +244,9 @@ html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-arrange-btn { di
    the log sub-tab active — so a stale .open can never surface the menu
    in Focus or on another sub-tab. */
 html.ui-v2 #ui2-arrange-menu { display: none; }
-html.ui-v2[data-ui2-layout="grid"] #activity-subtabs:has(.subtab-btn[data-activity-tab="log"].active) #ui2-arrange-menu.open {
+/* data-active-subtab replaces the former `:has(.subtab-btn…)` gate — same
+   condition, derived from the switcher's stamp (see the tools rule above). */
+html.ui-v2[data-ui2-layout="grid"] #activity-subtabs[data-active-subtab="log"] #ui2-arrange-menu.open {
   display: flex;
   flex-direction: column;
   align-items: stretch;
