@@ -120,9 +120,10 @@
     <div id="tab-activity" class="tab-pane active">
       <!-- Activity v3 view header: the five views as one segmented switch
            on the left; the Log view's tools on the right (session switcher,
-           Focus/Grid, minimize-done, and the Options popover holding
-           verbosity + host filter). The tools are CSS-gated to the log
-           sub-tab (#activity-subtabs:has([data-activity-tab="log"].active))
+           Focus/Grid, the Arrange menu holding the bulk window sweeps, and
+           the Options popover holding verbosity + host filter). The tools
+           are CSS-gated to the log sub-tab
+           (#activity-subtabs:has([data-activity-tab="log"].active))
            — every element keeps its id, so ui2-chrome.js / ui2-activity.js
            wiring is untouched by the move out of the oversight bar. -->
       <div class="subtabs" id="activity-subtabs">
@@ -142,23 +143,55 @@
             <button type="button" id="ui2-layout-grid-btn" data-layout="grid"
                     title="Grid — session windows with the concurrent stream below">Grid</button>
           </div>
-          <button type="button" class="ui2-minimize-done" id="ui2-minimize-done-btn" hidden
-                  title="Minimize every finished sub-agent window">
-            Minimize done<span class="ui2-minimize-done-count" id="ui2-minimize-done-count">0</span>
+          <!-- One compact menu button consolidating the bulk window sweeps
+               (it replaced five standalone pills: Minimize done, Hide done,
+               Collapse all/Expand all, Expand/Collapse details).
+               ui2-activity.js unhides it while session windows exist and
+               derives every menu row in one pass (ui2RefreshArrangeMenu). -->
+          <button type="button" class="ui2-arrange-btn" id="ui2-arrange-btn" hidden
+                  aria-haspopup="true" aria-expanded="false"
+                  title="Arrange session windows — bulk expand, collapse, and cleanup sweeps">
+            Arrange<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
           </button>
-          <button type="button" class="ui2-hide-done" id="ui2-hide-done-btn" hidden
-                  title="Hide every finished session card (sessions stay in Sessions)">
-            Hide done<span class="ui2-hide-done-count" id="ui2-hide-done-count">0</span>
-          </button>
-          <button type="button" class="ui2-collapse-all" id="ui2-collapse-all-btn" hidden
-                  title="Minimize every session window to its header bar">Collapse all</button>
-          <button type="button" class="ui2-header-details" id="ui2-header-details-btn" hidden
-                  title="Expand header details on every session window">Expand details</button>
           <!-- vertical sliders, NOT the Control tab's horizontal pair —
                two adjacent controls must not share a glyph -->
           <button type="button" class="ui2-view-options-btn" id="ui2-view-options-btn"
                   aria-haspopup="true" aria-expanded="false" title="Timeline display options">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4v6"/><path d="M6 14v6"/><circle cx="6" cy="12" r="2"/><path d="M12 4v2"/><path d="M12 10v10"/><circle cx="12" cy="8" r="2"/><path d="M18 4v8"/><path d="M18 16v4"/><circle cx="18" cy="14" r="2"/></svg>Options
+          </button>
+        </div>
+        <!-- The Arrange menu panel: the bulk session-window sweeps as menu
+             rows, every action reusing 41-session-window-actions.js's sweep
+             functions verbatim. Same popover mechanics as the Options panel
+             below (position:fixed stamped from the trigger; .open toggled by
+             ui2WireArrangeMenu), but the display gate lives in the
+             stylesheet: the menu can only render under grid layout with the
+             log sub-tab active — the same conditions its trigger lives
+             under — so a stale .open can never surface it elsewhere. -->
+        <div class="ui2-arrange-menu" id="ui2-arrange-menu" role="group" aria-label="Arrange session windows">
+          <button type="button" class="ui2-arrange-item" id="ui2-arrange-expand-all" data-arrange-action="expand-all"
+                  title="Restore every minimized session window">
+            <span class="ui2-arrange-item-label">Expand all windows</span><span class="ui2-arrange-count" hidden>0</span>
+          </button>
+          <button type="button" class="ui2-arrange-item" id="ui2-arrange-collapse-all" data-arrange-action="collapse-all"
+                  title="Minimize every session window to its header bar">
+            <span class="ui2-arrange-item-label">Collapse all windows</span><span class="ui2-arrange-count" hidden>0</span>
+          </button>
+          <button type="button" class="ui2-arrange-item" id="ui2-arrange-collapse-subs" data-arrange-action="collapse-subs" hidden
+                  title="Minimize every sub-agent window — working or finished — leaving top-level sessions in place">
+            <span class="ui2-arrange-item-label">Collapse sub-agents</span><span class="ui2-arrange-count" hidden>0</span>
+          </button>
+          <button type="button" class="ui2-arrange-item" id="ui2-arrange-minimize-done" data-arrange-action="minimize-done" hidden
+                  title="Minimize every finished sub-agent window">
+            <span class="ui2-arrange-item-label">Minimize finished sub-agents</span><span class="ui2-arrange-count" hidden>0</span>
+          </button>
+          <button type="button" class="ui2-arrange-item" id="ui2-arrange-hide-done" data-arrange-action="hide-done" hidden
+                  title="Hide every finished session card (their sessions stay in Sessions)">
+            <span class="ui2-arrange-item-label">Hide finished</span><span class="ui2-arrange-count" hidden>0</span>
+          </button>
+          <button type="button" class="ui2-arrange-item" id="ui2-arrange-details" data-arrange-action="details" data-direction="expand"
+                  title="Expand header details on every session window">
+            <span class="ui2-arrange-item-label">Expand all details</span>
           </button>
         </div>
         <!-- The Options popover panel: still #activity-log-controls, still
