@@ -976,6 +976,15 @@ fn spawn_cache_vitals_listener(
                     main,
                     ..
                 }) => {
+                    // Sticky: rate limits move slowly and not every usage
+                    // emission re-states them. Routed through the account
+                    // fold so one session's report reaches every session
+                    // sharing the backend account — and folded FIRST, so
+                    // the cache apply below emits one complete snapshot
+                    // (limits + cache) rather than a cache-only interim.
+                    if !main.limits.is_empty() {
+                        hub.apply_rate_limit_windows(&session_id, main.limits.clone());
+                    }
                     hub.apply(&session_id, |vitals| {
                         let previous_ttl = vitals.cache.as_ref().and_then(|c| c.ttl_seconds);
                         if let Some(cache) =
@@ -984,13 +993,6 @@ fn spawn_cache_vitals_listener(
                             vitals.cache = Some(cache);
                         }
                     });
-                    // Sticky: rate limits move slowly and not every usage
-                    // emission re-states them. Routed through the account
-                    // fold so one session's report reaches every session
-                    // sharing the backend account.
-                    if !main.limits.is_empty() {
-                        hub.apply_rate_limit_windows(&session_id, main.limits.clone());
-                    }
                 }
                 // Rate-limit windows at the report itself — the carrier
                 // for updates with no usage to ride (a rejected turn, a
@@ -2927,11 +2929,17 @@ mod tests {
             main: with_limits,
             presence: None,
         });
+        // The limits fold may emit a limits-only snapshot first (the
+        // account fan-out); the cache apply that follows emits the
+        // complete one — scan for it. Frontends merge per section, so the
+        // interim emission blanks nothing.
         let vitals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
                     assert_eq!(session_id, "s7");
-                    return vitals;
+                    if vitals.cache.is_some() {
+                        return vitals;
+                    }
                 }
             }
         })
@@ -3164,10 +3172,7 @@ mod tests {
         assert_eq!(legacy["5h"].status.as_deref(), Some("allowed_warning"));
 
         // Unlabeled windows are dropped, never folded under "".
-        fold_limit_windows(
-            &mut legacy,
-            &[crate::types::SessionLimitWindow::default()],
-        );
+        fold_limit_windows(&mut legacy, &[crate::types::SessionLimitWindow::default()]);
         assert!(!legacy.contains_key(""));
     }
 

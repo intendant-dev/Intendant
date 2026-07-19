@@ -3480,9 +3480,10 @@ pub(crate) fn handle_idle_codex_subagent_event(
             });
         }
         external_agent::AgentEvent::RateLimitWindows { windows } => {
-            config
-                .bus
-                .send(AppEvent::SessionRateLimits { session_id, windows });
+            config.bus.send(AppEvent::SessionRateLimits {
+                session_id,
+                windows,
+            });
         }
         external_agent::AgentEvent::ActivityUpdate { activity } => {
             // Side/child-thread activity rides the child's session id into

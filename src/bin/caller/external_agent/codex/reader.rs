@@ -337,10 +337,8 @@ pub(crate) async fn reader_task(
         }
 
         if method == "account/rateLimits/updated" {
-            let windows = codex_rate_limit_windows(
-                &params,
-                crate::session_activity::epoch_seconds(),
-            );
+            let windows =
+                codex_rate_limit_windows(&params, crate::session_activity::epoch_seconds());
             if !windows.is_empty() {
                 notification_state.limit_windows = windows.clone();
                 // Deliver the report itself (dedicated vitals event, never
