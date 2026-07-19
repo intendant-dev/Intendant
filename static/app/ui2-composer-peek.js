@@ -123,7 +123,16 @@
     if (!peekBoundLog) return 'No transcript yet — send a message below.';
     const ph = peekBoundLog.querySelector('.session-window-empty');
     if (ph && ph.classList.contains('session-window-empty-loading')) return 'Loading transcript…';
-    if (ph && ph.classList.contains('session-window-empty-error')) return 'Transcript failed to load — open Activity to retry.';
+    if (ph && ph.classList.contains('session-window-empty-error')) {
+      // Same visibility rule as the window placeholder: name the reason
+      // (win.hydrateError, the source the placeholder rendered from)
+      // instead of a generic line.
+      const win = peekTargetWindow(peekBoundSid);
+      const reason = String((win && win.hydrateError) || '').trim();
+      return reason
+        ? `Transcript failed to load — ${reason} (open Activity to retry)`
+        : 'Transcript failed to load — open Activity to retry.';
+    }
     return 'No output yet';
   }
 

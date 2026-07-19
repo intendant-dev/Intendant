@@ -153,6 +153,14 @@ function renderSessionWindowLogPlaceholder(win) {
       }
     });
     box.appendChild(retry);
+    // The reason itself, visible — "session not found (404)" beats a
+    // generic line whose cause hides in a tooltip nobody hovers. Quiet
+    // full-width secondary line; the tooltip keeps the untruncated text.
+    const reason = document.createElement('span');
+    reason.className = 'session-window-empty-reason';
+    reason.textContent = errorText;
+    reason.title = errorText;
+    box.appendChild(reason);
   } else if (hydrating) {
     box.classList.add('session-window-empty-loading');
     box.textContent = 'Loading transcript…';
