@@ -14,7 +14,8 @@
 //! walks plus one tiny JSON read per meta — transcripts are never opened
 //! here. Codex sub-threads need no counterpart: they get first-class
 //! rollout files under their own thread ids, so the ordinary finder
-//! already resolves them.
+//! already resolves them (their completed-terminal synthesis lives in
+//! the ordinary codex parse — see `parse_codex_session_entries`).
 
 use super::*;
 
@@ -174,11 +175,13 @@ fn subagent_meta_task_tool_use_id(meta_path: &Path, session_id: &str) -> Option<
 // DONE the live window showed.
 // ---------------------------------------------------------------------
 
-/// `kind` marker of the synthesized completed-terminal row. The dashboard
+/// `kind` marker of the synthesized completed-terminal row — shared by
+/// this Claude Code lane and the Codex twin
+/// (`codex_subagent_terminal_entry` in `transcripts.rs`). The dashboard
 /// counts it as done-evidence during hydration and dedupes it against the
 /// live "Task complete" log line (which carries a different timestamp and
 /// event id, so signature dedupe never pairs them).
-pub(crate) const CLAUDE_TASK_TERMINAL_KIND: &str = "subagent_terminal";
+pub(crate) const SUBAGENT_TERMINAL_KIND: &str = "subagent_terminal";
 
 const TASK_NOTIFICATION_OPEN: &str = "<task-notification>";
 const TASK_NOTIFICATION_CLOSE: &str = "</task-notification>";
@@ -310,8 +313,10 @@ fn xml_tag_text(block: &str, tag: &str) -> Option<String> {
 
 /// One-line, bounded summary — the same shaping the live emit applies
 /// (`claude_code::task_summary_snippet`), so hydrated rows read like the
-/// live "Task complete" line byte-for-byte.
-fn task_terminal_summary_snippet(text: &str) -> Option<String> {
+/// live "Task complete" line byte-for-byte. Shared with the Codex
+/// terminal synthesis (`codex_subagent_terminal_entry`), which bounds the
+/// child's full `last_agent_message` the same way.
+pub(crate) fn task_terminal_summary_snippet(text: &str) -> Option<String> {
     let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = joined.trim();
     if trimmed.is_empty() {
@@ -369,7 +374,7 @@ pub(crate) fn claude_task_terminal_entry(
     let mut entry = serde_json::json!({
         "level": "info",
         "source": label,
-        "kind": CLAUDE_TASK_TERMINAL_KIND,
+        "kind": SUBAGENT_TERMINAL_KIND,
         "content": content,
     });
     if let Some(ts) = notification.ts {
@@ -753,14 +758,14 @@ mod tests {
         let terminals: Vec<_> = entries
             .iter()
             .filter(|entry| {
-                entry.get("kind").and_then(|v| v.as_str()) == Some(CLAUDE_TASK_TERMINAL_KIND)
+                entry.get("kind").and_then(|v| v.as_str()) == Some(SUBAGENT_TERMINAL_KIND)
             })
             .collect();
         assert_eq!(terminals.len(), 1);
         let terminal = entries.last().expect("entries end with the terminal row");
         assert_eq!(
             terminal.get("kind").and_then(|v| v.as_str()),
-            Some(CLAUDE_TASK_TERMINAL_KIND)
+            Some(SUBAGENT_TERMINAL_KIND)
         );
         assert_eq!(
             terminal.get("content").and_then(|v| v.as_str()),
@@ -800,7 +805,7 @@ mod tests {
         );
         assert_eq!(
             last.get("kind").and_then(|v| v.as_str()),
-            Some(CLAUDE_TASK_TERMINAL_KIND)
+            Some(SUBAGENT_TERMINAL_KIND)
         );
     }
 
@@ -947,7 +952,7 @@ mod tests {
         let terminal = entries.last().expect("terminal row");
         assert_eq!(
             terminal.get("kind").and_then(|v| v.as_str()),
-            Some(CLAUDE_TASK_TERMINAL_KIND)
+            Some(SUBAGENT_TERMINAL_KIND)
         );
         assert_eq!(
             terminal.get("content").and_then(|v| v.as_str()),
@@ -1020,7 +1025,7 @@ mod tests {
             .expect("task child entries");
         assert_eq!(entries.len(), 2);
         assert!(!entries.iter().any(|entry| {
-            entry.get("kind").and_then(|v| v.as_str()) == Some(CLAUDE_TASK_TERMINAL_KIND)
+            entry.get("kind").and_then(|v| v.as_str()) == Some(SUBAGENT_TERMINAL_KIND)
         }));
     }
 
@@ -1056,7 +1061,7 @@ mod tests {
         let entries = external_session_entries_from_home(home.path(), "claude-code", TASK_ID)
             .expect("task child entries");
         assert!(!entries.iter().any(|entry| {
-            entry.get("kind").and_then(|v| v.as_str()) == Some(CLAUDE_TASK_TERMINAL_KIND)
+            entry.get("kind").and_then(|v| v.as_str()) == Some(SUBAGENT_TERMINAL_KIND)
         }));
     }
 
@@ -1159,7 +1164,7 @@ mod tests {
         let terminals = third
             .iter()
             .filter(|entry| {
-                entry.get("kind").and_then(|v| v.as_str()) == Some(CLAUDE_TASK_TERMINAL_KIND)
+                entry.get("kind").and_then(|v| v.as_str()) == Some(SUBAGENT_TERMINAL_KIND)
             })
             .count();
         assert_eq!(terminals, 1);
@@ -1177,8 +1182,8 @@ mod tests {
         )
         .expect("dashboard fragment 39-session-windows.js");
         assert!(
-            fragment.contains(&format!("'{CLAUDE_TASK_TERMINAL_KIND}'")),
-            "the merge guard must key on kind '{CLAUDE_TASK_TERMINAL_KIND}'"
+            fragment.contains(&format!("'{SUBAGENT_TERMINAL_KIND}'")),
+            "the merge guard must key on kind '{SUBAGENT_TERMINAL_KIND}'"
         );
         assert!(
             fragment.contains("startsWith('Task complete:')"),

@@ -75,6 +75,16 @@ pub(crate) fn codex_line_may_affect_replay(line: &str) -> bool {
         // their anchor — including non-message items (function_call, reasoning) that
         // render no transcript entry but are the usual targets of a noise-trim rewind.
         (Some("response_item"), _) => true,
+        // Turn-boundary event_msgs are subagent-terminal evidence: a child
+        // thread's rollout ends at `task_complete` (with the final message
+        // in `last_agent_message`) and the catalog parser synthesizes the
+        // completed-terminal row from the LAST such boundary
+        // (`parse_codex_session_entries`); `turn_aborted` retracts it.
+        // `task_started` stays filtered: the parser's turn-id branch for
+        // it has never received lines through this filter, and admitting
+        // it would silently swap hydrated turn ids from the user-row
+        // synthetic ones to rollout turn ids — a separate decision.
+        (Some("event_msg"), Some("task_complete" | "turn_aborted")) => true,
         (Some("event_msg"), None) => true,
         (None, _) => true,
         _ => false,
