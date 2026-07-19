@@ -77,6 +77,7 @@ impl SessionSupervisor {
                         &anchor,
                         name,
                         task,
+                        Vec::new(),
                         project_root.or(parent_project_root),
                         request_id,
                         child_uuid,
@@ -374,14 +375,6 @@ impl SessionSupervisor {
                 return;
             }
         };
-        if !request.attachments.is_empty() {
-            self.emit_edit_user_message_status(
-                sid.clone(),
-                turn,
-                "running",
-                "attachments are not carried into an edit branch yet — the edited text runs without them",
-            );
-        }
         match self.fork_claude_session(&token, &anchor).await {
             Ok((resolved_backend_id, child_uuid, kept_lines, parent_project_root)) => {
                 let child_short: String = child_uuid.chars().take(8).collect();
@@ -391,6 +384,7 @@ impl SessionSupervisor {
                     &anchor,
                     None,
                     Some(request.text.clone()),
+                    request.attachments.clone(),
                     parent_project_root,
                     Some(format!("edit-{}", request.requested_id)),
                     child_uuid,
@@ -463,7 +457,11 @@ impl SessionSupervisor {
     /// surgery, so both edge and result carry it immediately) and activate
     /// the child through the resume funnel — a PLAIN resume of the child's
     /// own id; `forked_from` rides the internal overrides so the identity
-    /// announce emits the `anchor-fork` edge durably.
+    /// announce emits the `anchor-fork` edge durably. `attachments` are
+    /// the caller's raw attachment ids (`upload:`/`frame:` refs), handed
+    /// to the resume funnel verbatim — resolution happens at delivery
+    /// time against the child's own session dir and project scopes,
+    /// exactly like a plain resume-with-task.
     #[allow(clippy::too_many_arguments)]
     async fn announce_claude_fork(
         &self,
@@ -472,6 +470,7 @@ impl SessionSupervisor {
         anchor: &ForkAnchorSpec,
         name: Option<String>,
         task: Option<String>,
+        attachments: Vec<String>,
         project_root: Option<String>,
         request_id: Option<String>,
         child_uuid: String,
@@ -518,7 +517,7 @@ impl SessionSupervisor {
             project_root,
             task,
             Some(true),
-            Vec::new(),
+            attachments,
             false,
             None,
             overrides,
@@ -526,5 +525,152 @@ impl SessionSupervisor {
             false,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session_supervisor::tests::{managed_session, test_supervisor};
+
+    fn claude_fixture_line(uuid: &str, parent: Option<&str>, kind: &str, text: &str) -> String {
+        serde_json::json!({
+            "uuid": uuid,
+            "parentUuid": parent,
+            "type": kind,
+            "timestamp": "2026-07-19T00:00:00.000Z",
+            "message": {"role": kind, "content": [{"type": "text", "text": text}]},
+        })
+        .to_string()
+    }
+
+    /// The edit-as-branch path must hand the request's attachment ids to
+    /// the child's resume call (they used to be dropped with a "not
+    /// carried yet" notice). The child uuid is minted inside the fork
+    /// surgery, so the test learns it from the `SessionForkResult` event
+    /// while the resume body is held at the launch gate, registers a
+    /// managed child under that uuid, and opens the gate: the resume
+    /// funnel then routes the edited prompt as a follow-up to the child,
+    /// where the staged upload must arrive resolved.
+    #[tokio::test]
+    async fn edit_branch_fork_carries_attachments_into_child_first_task() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let parent_id = "3b8e2a51-0000-4000-8000-0000000000aa";
+
+        // Parent transcript in the hermetic claude store: the edited row
+        // ("do the thing") is the unique non-first user turn.
+        let project_dir = home.path().join(".claude").join("projects").join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let lines = [
+            claude_fixture_line("u1", None, "user", "first prompt"),
+            claude_fixture_line("a1", Some("u1"), "assistant", "reply one"),
+            claude_fixture_line("u2", Some("a1"), "user", "do the thing"),
+            claude_fixture_line("a2", Some("u2"), "assistant", "done"),
+        ];
+        std::fs::write(
+            project_dir.join(format!("{parent_id}.jsonl")),
+            lines.join("\n"),
+        )
+        .unwrap();
+
+        // A real staged upload in the project-scoped store, so delivery
+        // resolves the ref exactly as a plain dashboard message would.
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), b"attached notes").unwrap();
+        let descriptor = crate::upload_store::commit_upload(
+            temp,
+            "notes.txt",
+            "text/plain",
+            14,
+            crate::upload_store::UploadDestination::Task,
+            &project.path().join("unused-session-dir"),
+            "staging-session",
+            &crate::global_store::StoreScope::Project(project.path().to_path_buf()),
+        )
+        .unwrap();
+        let upload_ref = format!("upload:{}", descriptor.id);
+
+        let bus = EventBus::new();
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let mut config =
+            (*test_supervisor(project.path().to_path_buf(), bus.clone()).config).clone();
+        config.logs_home_override = Some(home.path().to_path_buf());
+        config.launch_gate_for_tests = Some(gate_rx);
+        let supervisor = SessionSupervisor::new(config);
+
+        let (dummy_tx, _dummy_rx) = mpsc::channel(1);
+        let target = super::super::EditRouteTarget {
+            managed_id: parent_id.to_string(),
+            source: "claude-code".to_string(),
+            project_root: project.path().to_path_buf(),
+            session_dir: project.path().join("unused-session-dir"),
+            follow_up_tx: dummy_tx,
+        };
+        let request = super::super::EditUserMessageRequest {
+            requested_id: "edit-req-1".to_string(),
+            user_turn_index: 2,
+            user_turn_revision: None,
+            original_text: Some("do the thing".to_string()),
+            text: "do the thing with the attachment".to_string(),
+            attachments: vec![upload_ref],
+        };
+
+        let mut bus_rx = bus.subscribe();
+        let fork_task = {
+            let supervisor = supervisor.clone();
+            tokio::spawn(async move { supervisor.fork_claude_edit_branch(request, target).await })
+        };
+
+        // The announce emits the child uuid before resume hits the gate.
+        let child_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match bus_rx.recv().await.expect("bus open") {
+                    AppEvent::SessionForkResult {
+                        child_session_id: Some(child),
+                        error: None,
+                        ..
+                    } => break child,
+                    AppEvent::SessionForkResult { error: Some(e), .. } => {
+                        panic!("fork failed: {e}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("fork result before the gate");
+
+        let (follow_tx, mut follow_rx) = mpsc::channel(4);
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut session = managed_session(&child_id, "claude-code");
+            session.project_root = project.path().to_path_buf();
+            session.session_dir = project.path().join("child-session-dir");
+            session.follow_up_tx = follow_tx;
+            state.sessions.insert(child_id.clone(), session);
+        }
+        gate_tx.send(true).unwrap();
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), follow_rx.recv())
+            .await
+            .expect("edited prompt delivered to the child")
+            .expect("child follow-up channel open");
+        assert_eq!(msg.text, "do the thing with the attachment");
+        assert_eq!(
+            msg.attachments.len(),
+            1,
+            "the request's attachment must reach the child's first task resolved"
+        );
+        assert_eq!(msg.attachments.refs.len(), 1);
+        assert_eq!(msg.attachments.refs[0].upload_id, descriptor.id);
+        match &msg.attachments.items[0] {
+            external_agent::AgentAttachment::File(file) => {
+                assert_eq!(file.name, "notes.txt");
+            }
+            other => panic!("expected a file attachment, got {other:?}"),
+        }
+
+        fork_task.await.expect("edit-branch fork task completes");
     }
 }
