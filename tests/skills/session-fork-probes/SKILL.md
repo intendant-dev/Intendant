@@ -84,3 +84,24 @@ What these pin (CC 2.1.211 semantics the surgery engine assumes):
 
 The script exits non-zero on any unexpected verdict and prints the exact
 cleanup command for the scratch project dir.
+
+## Tripwire — the claude rewind wire surface (checked against 2.1.215)
+
+The claude TUI's `/rewind` is real, and as of CC **2.1.215** part of it
+reached the headless control wire: the stream-json control request
+`{subtype: "rewind_files", user_message_id, dry_run}` restores checkpoint
+**file state** to a given user message (SDK method `rewindFiles`).
+**Conversation** rewind remains TUI-internal (`repl_rewind_conversation`;
+internal contract names a `target_message_uuid`) — there is **no**
+stream-json subtype for it, which is why a supervisor edit of a claude
+message is serviced as an anchor-fork *branch*, never an in-place rewind.
+
+Watch on every CC upgrade (grep the versioned binary under
+`~/.local/share/claude/versions/` for `subtype:"rewind`):
+- `rewind_conversation` (or similar) appearing as a wire subtype → claude
+  edits can graduate from branch-on-edit to true in-place rewind; revisit
+  `session_supervisor/fork.rs::fork_claude_edit_branch` and the
+  `supports_user_message_rewind()` gate.
+- `rewind_files` semantics vs forked children: a chain-slice child keeps
+  parent-era `user_message_id`s — whether the child can restore the
+  parent's file checkpoints is unprobed. Probe before building on it.
