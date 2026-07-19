@@ -1256,6 +1256,14 @@ pub enum AgentEvent {
     /// drain forwards it as `AppEvent::SessionFileActivity` for the
     /// git-vitals activity-locus tracker.
     FileActivity { paths: Vec<String> },
+    /// The backend's own first-hand statement of the working directory it
+    /// operates in (Claude Code's `system:init` `cwd` field, Codex's
+    /// `thread/settings/updated` effective settings). The drain forwards
+    /// it as `AppEvent::SessionCwdAnnounced`, which seeds the git-vitals
+    /// probe locus immediately — authoritative, unlike the
+    /// [`AgentEvent::FileActivity`] write-path heuristic. Ambient
+    /// bookkeeping: implies no turn.
+    CwdAnnounced { cwd: String },
     /// Incremental output from a running tool.
     ToolOutputDelta { item_id: String, text: String },
     /// A tool execution completed.

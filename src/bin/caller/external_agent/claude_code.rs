@@ -1067,6 +1067,10 @@ struct CcReader {
     /// The CLI's last effort echo (2.1.2xx never states one; kept as the
     /// change edge if a future protocol does).
     effort_echo: Option<String>,
+    /// The last `system:init` `cwd` a `CwdAnnounced` was emitted for.
+    /// Init re-fires after every user message, so the git-vitals locus
+    /// seed fires once per distinct working directory, not per init.
+    cwd_echo: Option<String>,
     announced_session_id: Option<String>,
 }
 
@@ -1098,6 +1102,7 @@ impl CcReader {
             init_logged: false,
             permission_mode_warned: None,
             effort_echo: None,
+            cwd_echo: None,
             announced_session_id: None,
         }
     }
@@ -1498,6 +1503,24 @@ impl CcReader {
         }
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
             self.note_model_echo(model, out);
+        }
+        // The CLI's own statement of the directory it operates in — the
+        // authoritative confirmation for the git-vitals locus (a resumed
+        // session can work in a checkout the registered project root
+        // knows nothing about). Emitted once per distinct value: init
+        // re-fires after every user message.
+        if let Some(cwd) = msg
+            .get("cwd")
+            .and_then(|c| c.as_str())
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            if self.cwd_echo.as_deref() != Some(cwd) {
+                self.cwd_echo = Some(cwd.to_string());
+                out.events.push(AgentEvent::CwdAnnounced {
+                    cwd: cwd.to_string(),
+                });
+            }
         }
         // First-hand effort: adopt the CLI's own echo if an init ever
         // states one (2.1.2xx doesn't; the launch `--effort` value seeds
@@ -4195,6 +4218,51 @@ mod tests {
             !background_tasks::session_known(sid),
             "re-adoption clears a previous process's records"
         );
+    }
+
+    /// The `system:init` `cwd` echo emits ONE `CwdAnnounced` per distinct
+    /// value — the authoritative git-vitals locus confirmation. Init
+    /// re-fires after every user message, so an unchanged re-echo stays
+    /// silent until the directory actually changes.
+    #[test]
+    fn init_cwd_echo_announces_once_per_distinct_value() {
+        let mut reader = test_reader();
+        fn announced(out: &CcLineOutcome) -> Vec<String> {
+            out.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::CwdAnnounced { cwd } => Some(cwd.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"init","cwd":"/repo/.claude/worktrees/wt","session_id":"s1","model":"claude-fable-5"}"#,
+        );
+        assert_eq!(
+            announced(&out),
+            vec!["/repo/.claude/worktrees/wt".to_string()]
+        );
+
+        // The next init re-states the same cwd: silence.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"init","cwd":"/repo/.claude/worktrees/wt","session_id":"s1"}"#,
+        );
+        assert!(
+            announced(&out).is_empty(),
+            "unchanged cwd re-echo stays silent"
+        );
+
+        // A changed cwd announces again; blank or absent cwd never does.
+        let out = reader
+            .process_line(r#"{"type":"system","subtype":"init","cwd":"/repo","session_id":"s1"}"#);
+        assert_eq!(announced(&out), vec!["/repo".to_string()]);
+        let out = reader
+            .process_line(r#"{"type":"system","subtype":"init","cwd":"  ","session_id":"s1"}"#);
+        assert!(announced(&out).is_empty());
+        let out = reader.process_line(r#"{"type":"system","subtype":"init","session_id":"s1"}"#);
+        assert!(announced(&out).is_empty());
     }
 
     /// Write-ish tool_use blocks emit their structured paths alongside

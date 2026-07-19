@@ -2107,6 +2107,19 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     });
                 }
             }
+            external_agent::AgentEvent::CwdAnnounced { cwd } => {
+                // The backend's first-hand working-directory statement —
+                // seeds the git-vitals locus immediately. Same
+                // primary-conversation gate as FileActivity: a side
+                // thread's cwd must not retarget the supervising
+                // session's git chip.
+                if event_is_primary && !cwd.trim().is_empty() {
+                    config.bus.send(AppEvent::SessionCwdAnnounced {
+                        session_id: config.session_id.clone(),
+                        cwd,
+                    });
+                }
+            }
             external_agent::AgentEvent::FileApprovalRequest {
                 request_id,
                 path,
