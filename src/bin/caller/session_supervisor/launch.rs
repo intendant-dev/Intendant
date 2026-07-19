@@ -2149,6 +2149,11 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let supervisor =
             test_supervisor_with_mock_provider(project_dir.path().to_path_buf(), bus.clone());
+        // This fixture exercises orchestration delivery with no frontend or
+        // approver. Opt into trusted controller tool dispatch explicitly so
+        // the test does not weaken the shipped fail-closed `Ask` default.
+        supervisor.config.autonomy.write().await.rules.tool_call =
+            crate::autonomy::ApprovalRule::Auto;
 
         let log_root = tempfile::tempdir().unwrap();
         let parent_log_dir = log_root.path().join("parent-session");

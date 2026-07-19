@@ -1970,7 +1970,7 @@ args = ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
         );
         assert_eq!(
             config.approval.tool_call,
-            crate::autonomy::ApprovalRule::Auto
+            crate::autonomy::ApprovalRule::Ask
         );
     }
 

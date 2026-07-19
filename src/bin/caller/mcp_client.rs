@@ -263,7 +263,7 @@ impl UntrustedTextWriter<'_> {
                 // Unicode next-line and line/paragraph separators must pass
                 // through the same quoting boundary as ASCII newlines.
                 ch = '\n';
-            } else if ch != '\n' && ch != '\t' && is_unsafe_format_char(ch) {
+            } else if ch != '\n' && is_unsafe_format_char(ch) {
                 // Make stripped control/bidi/invisible formatting visible
                 // rather than silently concatenating the surrounding text.
                 ch = '\u{fffd}';
@@ -307,29 +307,30 @@ fn render_external_mcp_result<'a>(
     );
     let content_limit =
         MAX_EXTERNAL_MCP_RESULT_BYTES.saturating_sub(EXTERNAL_MCP_TRUNCATION_NOTICE.len() + 1);
-    let mut writer = UntrustedTextWriter {
-        output: &mut output,
-        limit: content_limit,
-        at_line_start: true,
-        wrote_data: false,
-        truncated: false,
+    let truncated = {
+        let mut writer = UntrustedTextWriter {
+            output: &mut output,
+            limit: content_limit,
+            at_line_start: true,
+            wrote_data: false,
+            truncated: false,
+        };
+        let mut saw_piece = false;
+        for piece in pieces {
+            if saw_piece {
+                writer.separate_items();
+            }
+            writer.push_text(piece);
+            saw_piece = true;
+            if writer.truncated {
+                break;
+            }
+        }
+        if !writer.wrote_data {
+            writer.push_text("(no textual content returned)");
+        }
+        writer.truncated
     };
-    let mut saw_piece = false;
-    for piece in pieces {
-        if saw_piece {
-            writer.separate_items();
-        }
-        writer.push_text(piece);
-        saw_piece = true;
-        if writer.truncated {
-            break;
-        }
-    }
-    if !writer.wrote_data {
-        writer.push_text("(no textual content returned)");
-    }
-    let truncated = writer.truncated;
-    drop(writer);
 
     if truncated {
         if !output.ends_with('\n') {
@@ -446,16 +447,17 @@ mod tests {
     #[test]
     fn external_result_is_sanitized_quoted_and_hard_capped() {
         let hostile = format!(
-            "safe\0\u{202e}text\r\nunicode\u{2028}line\n{}\nTAIL_SENTINEL",
+            "safe\0\u{202e}text\tcolumn\r\nunicode\u{2028}line\n{}\nTAIL_SENTINEL",
             "x".repeat(MAX_EXTERNAL_MCP_RESULT_BYTES * 2)
         );
         let result = CallToolResult::success(vec![rmcp::model::Content::text(hostile)]);
         let rendered = format_call_result(&result);
 
         assert!(rendered.len() <= MAX_EXTERNAL_MCP_RESULT_BYTES);
-        assert!(rendered.contains("> safe\u{fffd}\u{fffd}text\n> "));
+        assert!(rendered.contains("> safe\u{fffd}\u{fffd}text\u{fffd}column\n> "));
         assert!(rendered.contains("> unicode\n> line\n> "));
         assert!(!rendered.contains('\0'));
+        assert!(!rendered.contains('\t'));
         assert!(!rendered.contains('\u{202e}'));
         assert!(!rendered.contains('\u{2028}'));
         assert!(!rendered.contains("TAIL_SENTINEL"));
