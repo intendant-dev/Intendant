@@ -39,6 +39,34 @@ pub(crate) fn claude_user_turn_state_from_history(
     Some(user_turn_state_from_transcript_entries(entries.iter()))
 }
 
+/// User-turn state for a `--fork-session` resume, counted at spawn from
+/// the FORK SOURCE's transcript. A fork starts on the placeholder id —
+/// the forked child announces its own id only mid-turn, after the first
+/// prompt has already been numbered and emitted — so the canonical-id
+/// seed arm can never see the child's transcript in time. The child
+/// copies the source's history, so the source transcript IS the copied
+/// span, and spawn is the one race-free seed point.
+///
+/// Parsed with an EMPTY steer ledger, deliberately unlike the source's
+/// own seed: steer-ledger discovery is wrapper-index-keyed by session id
+/// (there is no fork-lineage join), so the CHILD's replay lane can never
+/// prove the source's mid-turn steers and numbers those copied rows as
+/// full prompt ordinals — the seed must count them identically to agree
+/// with the lane that will hydrate this session once the child id is
+/// announced. Bypasses the catalog cache on purpose: the cached parse
+/// under the source id carries the source's own ledger view.
+pub(crate) fn claude_user_turn_state_from_fork_source(
+    home: &Path,
+    fork_source_session_id: &str,
+) -> Option<UserTurnRevisionState> {
+    let path = crate::web_gateway::find_claude_session_file(home, fork_source_session_id)?;
+    let entries = crate::web_gateway::parse_claude_session_entries(
+        &path,
+        &crate::web_gateway::ExternalSteerLedger::default(),
+    )?;
+    Some(user_turn_state_from_transcript_entries(entries.iter()))
+}
+
 /// Seed a fresh state to the highest `user_turn_index` any transcript
 /// entry carries. Max — not row count — so turnless user rows (mid-turn
 /// steers) and non-user rows can never skew the seed off the transcript
@@ -219,5 +247,106 @@ mod tests {
         // The live lane's next prompt continues the transcript numbering.
         let mut live = seed;
         assert_eq!(live.record_next_turn(), (4, 1));
+    }
+
+    /// Fixture fork layout: a `--fork-session` child copies the source's
+    /// history, so the fork seed counts the SOURCE transcript — but under
+    /// the CHILD's ledger view (empty: ledger discovery is
+    /// wrapper-index-keyed, so the child lane can never prove the
+    /// source's mid-turn steers and numbers those copied rows). The same
+    /// fixture pins the contrast with the source's own seed, which does
+    /// prove its steer and renders it turnless.
+    #[test]
+    fn fork_source_seed_counts_child_lane_view_of_the_copied_span() {
+        let home = tempfile::tempdir().unwrap();
+        let source_id = "0197feed-aaaa-bbbb-cccc-forksrc00001";
+        let wrapper_id = "wrapper-cc-fork-source";
+        let steer_text = "also update the changelog";
+
+        // The SOURCE session's wrapper log proves its mid-turn steer.
+        let wrapper_dir = home.path().join(".intendant").join("logs").join(wrapper_id);
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        let requested_ts_ms = rfc3339_ms("2026-07-15T10:00:29Z");
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "10:00:29", "ts_ms": requested_ts_ms,
+                    "event": "steer_requested", "level": "info",
+                    "message": format!("Steer requested: {steer_text}"),
+                    "data": { "session_id": source_id, "id": "steer-1", "status": "pending", "text": steer_text },
+                }),
+                serde_json::json!({
+                    "ts": "10:00:29", "ts_ms": requested_ts_ms + 150,
+                    "event": "steer_accepted", "level": "info",
+                    "message": "Steer accepted",
+                    "data": { "session_id": source_id, "id": "steer-1", "status": "accepted" },
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        crate::external_wrapper_index::upsert(
+            home.path(),
+            "claude-code",
+            source_id,
+            wrapper_id,
+            &wrapper_dir,
+            None,
+        )
+        .unwrap();
+
+        let project_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-tmp-fork-source-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-07-15T10:00:00.000Z","message":{"role":"user","content":"fix the flaky test"}}"#.to_string(),
+            r#"{"type":"assistant","timestamp":"2026-07-15T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"On it."}]}}"#.to_string(),
+            // Injected shape: no row in either lane.
+            r#"{"type":"user","timestamp":"2026-07-15T10:00:20.000Z","message":{"role":"user","content":"<task-notification>build finished</task-notification>"}}"#.to_string(),
+            // The source's mid-turn steer: turnless in the SOURCE lane,
+            // a counted prompt in the child's copied span.
+            format!(
+                r#"{{"type":"user","timestamp":"2026-07-15T10:00:30.000Z","message":{{"role":"user","content":"{steer_text}"}}}}"#
+            ),
+            r#"{"type":"user","timestamp":"2026-07-15T10:01:00.000Z","message":{"role":"user","content":"now fix the docs"}}"#.to_string(),
+        ];
+        std::fs::write(
+            project_dir.join(format!("{source_id}.jsonl")),
+            lines.join("\n"),
+        )
+        .unwrap();
+
+        let source_seed = claude_user_turn_state_from_history(home.path(), source_id)
+            .expect("source transcript should seed its own resume");
+        assert_eq!(
+            source_seed.active_count(),
+            2,
+            "the source's own lane proves its steer and renders it turnless"
+        );
+
+        let fork_seed = claude_user_turn_state_from_fork_source(home.path(), source_id)
+            .expect("fork source transcript should seed the forked child");
+        assert_eq!(
+            fork_seed.active_count(),
+            3,
+            "the child lane cannot prove the source's steer, so the copied row is a counted prompt"
+        );
+
+        // The forked child's first prompt continues the copied span.
+        let mut live = fork_seed;
+        assert_eq!(live.record_next_turn(), (4, 1));
+
+        // A missing source transcript seeds nothing (the loop falls back
+        // to a fresh state).
+        assert!(
+            claude_user_turn_state_from_fork_source(home.path(), "no-such-source").is_none()
+        );
     }
 }

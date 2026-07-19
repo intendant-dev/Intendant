@@ -346,13 +346,21 @@ pub(crate) async fn run_external_agent_mode(
             codex_user_turn_state_from_history(&platform::home_dir(), session_id)
                 .unwrap_or_default()
         }
-        // A `--fork-session` resume starts on the placeholder id (the
-        // forked child announces its own id mid-turn), so only a
-        // canonical id — a plain resume, whose id stays stable — seeds.
+        // A canonical id here is a plain resume (the id stays stable
+        // across respawns), so the thread's own transcript seeds it.
         (external_agent::AgentBackend::ClaudeCode, Some(_), session_id)
             if backend.thread_id_is_canonical(session_id) =>
         {
             claude_user_turn_state_from_history(&platform::home_dir(), session_id)
+                .unwrap_or_default()
+        }
+        // A `--fork-session` resume starts on the placeholder id — the
+        // forked child announces its own id only mid-turn, after the
+        // first prompt is numbered — so spawn is the one race-free seed
+        // point, and the fork source's transcript is the copied span the
+        // child continues (empty-ledger rationale on the helper).
+        (external_agent::AgentBackend::ClaudeCode, Some(fork_source), _) => {
+            claude_user_turn_state_from_fork_source(&platform::home_dir(), fork_source)
                 .unwrap_or_default()
         }
         _ => UserTurnRevisionState::default(),
