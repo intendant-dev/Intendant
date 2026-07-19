@@ -250,8 +250,10 @@ pub(crate) fn codex_user_turn_state_from_history_file(
                     "user_message" => {
                         saw_user_message_event = true;
                         let Some(text) =
-                            crate::external_agent::codex::rollout::codex_event_message_text(payload)
-                                .map(|(_, text)| text)
+                            crate::external_agent::codex::rollout::codex_event_message_text(
+                                payload,
+                            )
+                            .map(|(_, text)| text)
                         else {
                             continue;
                         };
@@ -500,8 +502,7 @@ mod tests {
         let live_user_rows: Vec<(&str, Option<u64>, Option<u64>)> = entries
             .iter()
             .filter(|e| {
-                e["source"] == "user"
-                    && e.get("superseded").and_then(|v| v.as_bool()) != Some(true)
+                e["source"] == "user" && e.get("superseded").and_then(|v| v.as_bool()) != Some(true)
             })
             .map(|e| {
                 (

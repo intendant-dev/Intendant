@@ -915,7 +915,10 @@ mod tests {
                 assert_eq!((user_turn_index, user_turn_revision), (None, None));
             }
         }
-        assert!(saw_turnless_user_message, "expected turnless UserMessageLog");
+        assert!(
+            saw_turnless_user_message,
+            "expected turnless UserMessageLog"
+        );
 
         let mut failing_agent: Box<dyn external_agent::ExternalAgent> =
             Box::new(RecordingExternalAgent {

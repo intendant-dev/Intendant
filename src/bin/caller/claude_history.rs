@@ -345,8 +345,6 @@ mod tests {
 
         // A missing source transcript seeds nothing (the loop falls back
         // to a fresh state).
-        assert!(
-            claude_user_turn_state_from_fork_source(home.path(), "no-such-source").is_none()
-        );
+        assert!(claude_user_turn_state_from_fork_source(home.path(), "no-such-source").is_none());
     }
 }
