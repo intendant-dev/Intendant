@@ -684,11 +684,20 @@ function ui2StampApprovalSession() {
 function ui2RailSetRow(id, text, titleLines, state) {
   const row = document.getElementById(id);
   if (!row) return;
+  // Write-guarded: the 1 Hz tick mostly re-derives identical values, and
+  // unconditional textContent/attribute assignment churns text nodes and
+  // feeds every style-invalidation pass (the `:has()` before-mutation
+  // walk) once per row per second for nothing.
   const value = row.querySelector('.ui2-rail-value');
-  if (value) value.textContent = text || '—';
-  row.title = Array.isArray(titleLines) ? titleLines.join('\n') : '';
-  if (state) row.dataset.state = state;
-  else delete row.dataset.state;
+  const nextText = text || '—';
+  if (value && value.textContent !== nextText) value.textContent = nextText;
+  const nextTitle = Array.isArray(titleLines) ? titleLines.join('\n') : '';
+  if (row.title !== nextTitle) row.title = nextTitle;
+  if (state) {
+    if (row.dataset.state !== state) row.dataset.state = state;
+  } else if ('state' in row.dataset) {
+    delete row.dataset.state;
+  }
 }
 
 function ui2BuildVitalsRail() {
@@ -811,8 +820,8 @@ function ui2RailTick(force) {
         label = parts.name || parts.shortId || label;
       }
     }
-    sessionEl.textContent = label;
-    sessionEl.title = sid;
+    if (sessionEl.textContent !== label) sessionEl.textContent = label;
+    if (sessionEl.title !== sid) sessionEl.title = sid;
   }
 
   const meta = (sid && typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(sid)) || {};
@@ -841,7 +850,10 @@ function ui2RailTick(force) {
   const pctText = pctSrc ? (pctSrc.textContent || '').trim() : '';
   ui2RailSetRow('ui2-rail-ctx', pctText || '—', null, null);
   const fill = document.getElementById('ui2-rail-ctx-fill');
-  if (fill) fill.style.width = Math.max(0, Math.min(100, parseFloat(pctText) || 0)) + '%';
+  if (fill) {
+    const width = Math.max(0, Math.min(100, parseFloat(pctText) || 0)) + '%';
+    if (fill.style.width !== width) fill.style.width = width;
+  }
 
   // Changes count mirrors the sub-tab badge.
   const badge = document.getElementById('badge-changes');
@@ -858,7 +870,16 @@ function ui2RailTick(force) {
     ui2DressComposer();
     ui2BuildVitalsRail();
     ui2RailTick(true);
-    setInterval(() => ui2RailTick(), 1000);
+    // Pane-gated 1 Hz repaint: the offsetParent check inside ui2RailTick
+    // already skips hidden sub-tab/layout states, but with the Activity
+    // tab parked (another tab active, or the page backgrounded —
+    // document.hidden) the rail kept writing per second into a display:none
+    // subtree. renderOrDefer keeps the visible cadence identical and, while
+    // parked, retains only the LATEST repaint thunk, which flushPaneRenders
+    // runs synchronously on pane re-entry — fresh values with zero hidden
+    // writes. (31-init-identity-fleet.js declares the deferral state, so it
+    // must only be reached from this async callback, never module-eval.)
+    setInterval(() => renderOrDefer('activity', 'ui2-rail-tick', () => ui2RailTick()), 1000);
     // Focus surface: follow stream appends, target changes (the chip
     // re-renders on every change), layout flips, and the session-window
     // grid's own MEMBERSHIP — a session resumed from the Sessions tab
