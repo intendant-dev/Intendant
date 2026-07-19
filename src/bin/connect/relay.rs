@@ -1330,10 +1330,10 @@ pub(crate) async fn dns_relay(
         Vec::new()
     };
     commit_dns_record_update(
-        &state,
-        &zone,
-        &daemon_id,
-        &addresses,
+        Arc::clone(&state),
+        Arc::clone(&zone),
+        daemon_id.clone(),
+        addresses.clone(),
         body.enable,
         DnsRecordAudit {
             event: "dns_relay",

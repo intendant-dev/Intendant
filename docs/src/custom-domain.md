@@ -120,7 +120,11 @@ environment-variable fallback but never embeds the secret. While a cleanup
 journal is being reaped, its mutation-completion generation is compared again
 before removal. Lookup-based cleanup accepts absence only from a complete,
 bounded first-page result with explicit result and pagination metadata;
-incomplete provider responses retain the cleanup obligation. If a newer
+incomplete provider responses retain the cleanup obligation. A Cloudflare
+create-response record id is retained only when the returned type, name, and
+content match the requested TXT record; a mismatched success remains ambiguous
+and falls back to exact name/value cleanup instead of deleting by the
+untrusted id. If a newer
 challenge already owns the primary journal, the
 secondary reservation retains the older exact cleanup independently and
 blocks further challenge creation until it is drained. A late TXT write

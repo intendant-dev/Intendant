@@ -121,8 +121,10 @@ Address records persist in the state file and follow the daemon-record
 lifecycle (they survive link/release; the stale-unlinked sweep drops
 them). Each address generation is serialized per daemon, persisted before it
 replaces the live zone answer, and leaves both memory and the live answer on
-the prior generation if persistence fails. ACME TXT challenges are in-memory
-and self-expire. Posture:
+the prior generation if persistence fails. The commit runs as an owned
+transaction, so an HTTP deadline or disconnected caller cannot stop it between
+durable persistence and in-memory/live-zone publication. ACME TXT challenges
+are in-memory and self-expire. Posture:
 authoritative-only, `Refused` outside the zone, no AXFR, RFC 8482
 minimal `ANY`, 60 s TTLs. Daemons validating against Let's Encrypt
 *staging* set `INTENDANT_ACME_DIRECTORY` to the staging directory URL.
@@ -650,7 +652,8 @@ per-host pin), then compares the logged artifact list against the
 GitHub release's asset *metadata* — names, sizes, and the sha256
 digests the API reports — without downloading multi-hundred-MB
 artifacts; assets on the release that the log never blessed are flagged
-too. `--download` upgrades to fetching every artifact and hashing it
+too. Release tags are encoded as one GitHub API path segment (including tags
+that contain `/`). `--download` upgrades to fetching every artifact and hashing it
 against the log — the strongest check. Release downloads permit progressing
 large transfers up to the per-artifact cap instead of imposing the metadata
 client's short total timeout; connection, response-header, and between-chunk

@@ -2156,10 +2156,10 @@ pub(crate) async fn dns_publish(
         .daemon_fqdn(&daemon_id)
         .ok_or_else(|| ApiError::bad_request("daemon id does not derive a DNS label"))?;
     commit_dns_record_update(
-        &state,
-        &zone,
-        &daemon_id,
-        &addresses,
+        Arc::clone(&state),
+        Arc::clone(&zone),
+        daemon_id.clone(),
+        addresses.clone(),
         false,
         DnsRecordAudit {
             event: "dns_publish",

@@ -1656,6 +1656,15 @@ pub(crate) struct ReleaseVerifyReport {
     pub pinned_from_size: Option<u64>,
 }
 
+fn github_release_tag_url(github_api: &Url, repo: &str, tag: &str) -> Result<Url, String> {
+    let mut url =
+        crate::connect_rendezvous::join_url(github_api, &format!("repos/{repo}/releases/tags"))?;
+    url.path_segments_mut()
+        .map_err(|_| "GitHub API URL cannot carry path segments".to_string())?
+        .push(tag);
+    Ok(url)
+}
+
 /// The out-of-band release check: the logged manifest (latest, or for
 /// one tag) against the log's proofs and the GitHub release. Shares the
 /// per-host tree-head pin with the bundle check — one log, one pin.
@@ -1720,11 +1729,7 @@ pub(crate) async fn verify_hosted_release(
     }
 
     // GitHub's view of the same release.
-    let release_url = crate::connect_rendezvous::join_url(
-        github_api,
-        &format!("repos/{repo}/releases/tags/{}", leaf.tag),
-    )
-    .map_err(Unavailable)?;
+    let release_url = github_release_tag_url(github_api, repo, &leaf.tag).map_err(Unavailable)?;
     let release_url_display = release_url.to_string();
     let (status, release) = fetch_github_json(&client, release_url)
         .await
@@ -3106,6 +3111,16 @@ mod tests {
 
     fn release_json(assets: Vec<serde_json::Value>) -> serde_json::Value {
         serde_json::json!({ "tag_name": "v1.2.3", "assets": assets })
+    }
+
+    #[test]
+    fn github_release_tag_is_one_percent_encoded_path_segment() {
+        let github_api = Url::parse("https://api.github.test/v3/").unwrap();
+        let url = github_release_tag_url(&github_api, "owner/repo", "release/1.2").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api.github.test/v3/repos/owner/repo/releases/tags/release%2F1.2"
+        );
     }
 
     #[tokio::test]

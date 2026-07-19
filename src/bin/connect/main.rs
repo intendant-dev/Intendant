@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -444,10 +445,10 @@ fn connect_router(state: Arc<AppState>) -> Router {
 }
 
 /// Wrap a router so every request is answered within `timeout`, with 408 on
-/// expiry. The handler future is dropped at an await point on timeout; every
-/// store mutation in this binary is awaitpoint-free from first write through
-/// its mark/persist (locks are acquired before, I/O helpers are synchronous),
-/// so cancellation can never publish a half-applied mutation.
+/// expiry. The handler future is dropped at an await point on timeout, so an
+/// operation that awaits I/O after beginning a critical transaction must run
+/// that transaction in an owned cancellation-shielded task (the durable/live
+/// fleet-DNS commit is the exemplar).
 fn with_request_timeout(router: Router, timeout: Duration) -> Router {
     router.layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| async move {
@@ -1725,8 +1726,8 @@ async fn update_store_transaction<R>(
     Ok(result)
 }
 
-struct DnsRecordAudit<'a> {
-    event: &'a str,
+struct DnsRecordAudit {
+    event: &'static str,
     user_id: Option<Uuid>,
     detail: serde_json::Value,
 }
@@ -1737,7 +1738,7 @@ async fn update_dns_record_transaction(
     daemon_id: &str,
     addresses: &[IpAddr],
     via_relay: bool,
-    record_audit: DnsRecordAudit<'_>,
+    record_audit: DnsRecordAudit,
     persist: impl AsyncFnOnce(&Store) -> ApiResult<()>,
 ) -> ApiResult<()> {
     // Validate before the durable commit. `set_daemon_addresses` has the same
@@ -1747,13 +1748,11 @@ async fn update_dns_record_transaction(
     let stored_addresses: Vec<String> = addresses.iter().map(ToString::to_string).collect();
     let now = now_unix_ms();
     let mut store = store.lock().await;
-    let prior_dns_records = store.dns_records.clone();
-    let prior_audit = store.audit.clone();
-    store
-        .dns_records
+    let mut next = store.clone();
+    next.dns_records
         .retain(|record| record.daemon_id != daemon_id);
     if !addresses.is_empty() {
-        store.dns_records.push(DnsRecordEntry {
+        next.dns_records.push(DnsRecordEntry {
             daemon_id: daemon_id.to_string(),
             addresses: stored_addresses,
             updated_unix_ms: now,
@@ -1761,17 +1760,14 @@ async fn update_dns_record_transaction(
         });
     }
     audit(
-        &mut store,
+        &mut next,
         record_audit.event,
         record_audit.user_id,
         Some(daemon_id.to_string()),
         record_audit.detail,
     );
-    if let Err(error) = persist(&store).await {
-        store.dns_records = prior_dns_records;
-        store.audit = prior_audit;
-        return Err(error);
-    }
+    persist(&next).await?;
+    *store = next;
     zone.set_daemon_addresses(daemon_id, addresses)
         .map_err(|error| {
             ApiError::internal(format!(
@@ -1780,23 +1776,38 @@ async fn update_dns_record_transaction(
         })
 }
 
-async fn commit_dns_record_update(
-    state: &AppState,
-    zone: &FleetZone,
-    daemon_id: &str,
-    addresses: &[IpAddr],
-    via_relay: bool,
-    record_audit: DnsRecordAudit<'_>,
+/// Await an owned DNS update without tying its lifetime to the request future.
+/// The global HTTP deadline may drop the waiter, but Tokio keeps the spawned
+/// transaction running so its durable, in-memory, and live-zone generations
+/// still converge.
+async fn cancellation_shielded_dns_update(
+    update: impl Future<Output = ApiResult<()>> + Send + 'static,
 ) -> ApiResult<()> {
-    update_dns_record_transaction(
-        &state.store,
-        zone,
-        daemon_id,
-        addresses,
-        via_relay,
-        record_audit,
-        async |next| persist_locked(state, next).await,
-    )
+    tokio::spawn(update).await.map_err(|error| {
+        ApiError::internal(format!("fleet DNS transaction task failed: {error}"))
+    })?
+}
+
+async fn commit_dns_record_update(
+    state: Arc<AppState>,
+    zone: Arc<FleetZone>,
+    daemon_id: String,
+    addresses: Vec<IpAddr>,
+    via_relay: bool,
+    record_audit: DnsRecordAudit,
+) -> ApiResult<()> {
+    cancellation_shielded_dns_update(async move {
+        update_dns_record_transaction(
+            &state.store,
+            &zone,
+            &daemon_id,
+            &addresses,
+            via_relay,
+            record_audit,
+            async |next| persist_locked(&state, next).await,
+        )
+        .await
+    })
     .await
 }
 
@@ -2153,6 +2164,89 @@ mod tests {
             zone.daemon_addresses_for_test("daemon-1"),
             vec![old_address]
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_dns_request_still_converges_disk_memory_and_live_zone() {
+        let old_address: IpAddr = "192.0.2.12".parse().unwrap();
+        let new_address: IpAddr = "192.0.2.13".parse().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let data_file = root.path().join("state.json");
+        let initial = Store {
+            dns_records: vec![DnsRecordEntry {
+                daemon_id: "daemon-1".to_string(),
+                addresses: vec![old_address.to_string()],
+                updated_unix_ms: 1,
+                via_relay: false,
+            }],
+            ..Store::default()
+        };
+        save_store(&data_file, &initial).unwrap();
+        let store = Arc::new(Mutex::new(initial));
+        let zone = Arc::new(FleetZone::new("fleet.example.test", "ns.fleet.example.test").unwrap());
+        zone.set_daemon_addresses("daemon-1", &[old_address])
+            .unwrap();
+        let (persist_started_tx, persist_started_rx) = oneshot::channel();
+        let (release_persist_tx, release_persist_rx) = oneshot::channel();
+        let caller_store = Arc::clone(&store);
+        let caller_zone = Arc::clone(&zone);
+        let caller = tokio::spawn(async move {
+            cancellation_shielded_dns_update(async move {
+                update_dns_record_transaction(
+                    &caller_store,
+                    &caller_zone,
+                    "daemon-1",
+                    &[new_address],
+                    true,
+                    DnsRecordAudit {
+                        event: "dns_relay",
+                        user_id: None,
+                        detail: json!({ "generation": 2 }),
+                    },
+                    async move |next| {
+                        let _ = persist_started_tx.send(());
+                        let _ = release_persist_rx.await;
+                        save_store(&data_file, next).map_err(ApiError::internal)
+                    },
+                )
+                .await
+            })
+            .await
+        });
+        persist_started_rx.await.unwrap();
+
+        // Model the global request timeout dropping only the waiter. The
+        // owned transaction remains alive while its durable write is parked.
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release_persist_tx.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let memory_matches = {
+                    let store = store.lock().await;
+                    store.dns_records.len() == 1
+                        && store.dns_records[0].addresses == [new_address.to_string()]
+                        && store.dns_records[0].via_relay
+                        && store.audit.len() == 1
+                };
+                let disk_matches = load_store(&root.path().join("state.json"))
+                    .ok()
+                    .is_some_and(|store| {
+                        store.dns_records.len() == 1
+                            && store.dns_records[0].addresses == [new_address.to_string()]
+                            && store.dns_records[0].via_relay
+                            && store.audit.len() == 1
+                    });
+                let live_matches = zone.daemon_addresses_for_test("daemon-1") == [new_address];
+                if memory_matches && disk_matches && live_matches {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("detached DNS transaction did not converge all generations");
     }
 
     #[tokio::test]

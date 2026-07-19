@@ -1871,15 +1871,39 @@ async fn cloudflare_create(
             ),
         ));
     }
-    envelope
-        .result
-        .map(|record| record.id)
-        .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
-        .ok_or_else(|| {
-            ProviderMutationError::ambiguous(
-                "Cloudflare DNS create returned no record id".to_string(),
-            )
-        })
+    cloudflare_created_record_id(envelope.result, name, value)
+}
+
+fn cloudflare_created_record_id(
+    record: Option<CloudflareRecord>,
+    requested_name: &str,
+    requested_value: &str,
+) -> Result<String, ProviderMutationError> {
+    let record = record.ok_or_else(|| {
+        ProviderMutationError::ambiguous(
+            "Cloudflare DNS create returned no record result".to_string(),
+        )
+    })?;
+    if record.record_type != "TXT"
+        || !record
+            .name
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(requested_name.trim_end_matches('.'))
+        || record.content != requested_value
+    {
+        // A successful but mismatched response does not establish that this
+        // id belongs to our mutation. Leave the id out of the journal so the
+        // ambiguous-result path cleans up only an exact name/value match.
+        return Err(ProviderMutationError::ambiguous(
+            "Cloudflare DNS create result did not match the requested TXT record".to_string(),
+        ));
+    }
+    if record.id.is_empty() || !record.id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(ProviderMutationError::ambiguous(
+            "Cloudflare DNS create returned no valid record id".to_string(),
+        ));
+    }
+    Ok(record.id)
 }
 
 fn cloudflare_create_send_error(error: reqwest::Error) -> ProviderMutationError {
@@ -2245,6 +2269,41 @@ mod tests {
             ),
             ProviderMutationError::ResultAmbiguous(_)
         ));
+    }
+
+    #[test]
+    fn cloudflare_create_id_is_trusted_only_for_the_requested_txt_record() {
+        let record = |record_type: &str, name: &str, content: &str| CloudflareRecord {
+            id: "record123".to_string(),
+            name: name.to_string(),
+            content: content.to_string(),
+            record_type: record_type.to_string(),
+        };
+        let requested_name = "_acme-challenge.box.example.test";
+        let requested_value = "challenge-value";
+        let trusted = match cloudflare_created_record_id(
+            Some(record(
+                "TXT",
+                "_ACME-CHALLENGE.BOX.EXAMPLE.TEST.",
+                requested_value,
+            )),
+            requested_name,
+            requested_value,
+        ) {
+            Ok(record_id) => record_id,
+            Err(_) => panic!("matching Cloudflare create result must be trusted"),
+        };
+        assert_eq!(trusted, "record123");
+        for mismatched in [
+            record("A", requested_name, requested_value),
+            record("TXT", "_acme-challenge.other.example.test", requested_value),
+            record("TXT", requested_name, "other-challenge-value"),
+        ] {
+            assert!(matches!(
+                cloudflare_created_record_id(Some(mismatched), requested_name, requested_value,),
+                Err(ProviderMutationError::ResultAmbiguous(_))
+            ));
+        }
     }
 
     #[test]
