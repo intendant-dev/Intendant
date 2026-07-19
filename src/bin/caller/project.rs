@@ -733,6 +733,17 @@ fn default_custom_dns_ttl_secs() -> u32 {
     60
 }
 
+const MAX_CUSTOM_DNS_PROPAGATION_DELAY_SECS: u64 = 60 * 60;
+
+fn validate_custom_dns_propagation_delay(delay_secs: u64) -> Result<(), String> {
+    if delay_secs > MAX_CUSTOM_DNS_PROPAGATION_DELAY_SECS {
+        return Err(format!(
+            "custom_domain.dns.propagation_delay_secs must be at most {MAX_CUSTOM_DNS_PROPAGATION_DELAY_SECS} seconds"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedCustomDomain {
     pub name: String,
@@ -803,14 +814,24 @@ impl CustomDomainConfig {
         }
         if let Some(dns) = &self.dns {
             match dns {
-                CustomDomainDnsConfig::Cloudflare { token_env, .. } => {
+                CustomDomainDnsConfig::Cloudflare {
+                    token_env,
+                    propagation_delay_secs,
+                    ..
+                } => {
+                    validate_custom_dns_propagation_delay(*propagation_delay_secs)?;
                     crate::credential_leases::dns_credential_env_name(
                         token_env.as_deref(),
                         "CLOUDFLARE_API_TOKEN",
                         "_API_TOKEN",
                     )?;
                 }
-                CustomDomainDnsConfig::Rfc2136 { secret_env, .. } => {
+                CustomDomainDnsConfig::Rfc2136 {
+                    secret_env,
+                    propagation_delay_secs,
+                    ..
+                } => {
+                    validate_custom_dns_propagation_delay(*propagation_delay_secs)?;
                     crate::credential_leases::dns_credential_env_name(
                         secret_env.as_deref(),
                         "INTENDANT_RFC2136_TSIG_SECRET",
@@ -2770,6 +2791,52 @@ zone_id = "zone-id"
                 .as_deref(),
             Some("OWNER_DNS_API_TOKEN")
         );
+    }
+
+    #[test]
+    fn custom_domain_propagation_delay_is_bounded_for_each_provider() {
+        let base = CustomDomainConfig {
+            enabled: true,
+            name: Some("box.example.com".to_string()),
+            ..Default::default()
+        };
+        for (delay_secs, should_pass) in [
+            (0, true),
+            (MAX_CUSTOM_DNS_PROPAGATION_DELAY_SECS, true),
+            (u64::MAX, false),
+        ] {
+            for dns in [
+                CustomDomainDnsConfig::Cloudflare {
+                    zone_id: "zone-id".to_string(),
+                    token_env: None,
+                    propagation_delay_secs: delay_secs,
+                },
+                CustomDomainDnsConfig::Rfc2136 {
+                    server: "ns1.example.com:53".to_string(),
+                    zone: "example.com".to_string(),
+                    key_name: "intendant-acme.".to_string(),
+                    secret_env: None,
+                    ttl_secs: 60,
+                    propagation_delay_secs: delay_secs,
+                },
+            ] {
+                let config = CustomDomainConfig {
+                    dns: Some(dns),
+                    ..base.clone()
+                };
+                let result = config.validated();
+                assert_eq!(
+                    result.is_ok(),
+                    should_pass,
+                    "delay {delay_secs} validation result: {result:?}"
+                );
+                if !should_pass {
+                    assert!(result
+                        .unwrap_err()
+                        .contains("propagation_delay_secs must be at most 3600 seconds"));
+                }
+            }
+        }
     }
 
     #[test]

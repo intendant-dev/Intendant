@@ -191,6 +191,9 @@ ttl_secs = 60
 propagation_delay_secs = 2
 ```
 
+The propagation delay accepts 0 through 3600 seconds; larger values are
+rejected before the certificate worker starts.
+
 The RFC2136 secret is the base64 TSIG key. Updates use TCP, HMAC-SHA256, an
 exact-value append, and exact-value cleanup; unrelated TXT records are not
 replaced. Alternate credential environment names must end in `_API_TOKEN`

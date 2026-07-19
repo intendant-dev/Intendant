@@ -437,12 +437,13 @@ without changing that refusal or the Connect account's `role:none` posture.
 
 `[connect.custom_domain.dns]` selects the DNS-01 provider. `provider =
 "cloudflare"` requires `zone_id`, with optional `token_env` (default
-`CLOUDFLARE_API_TOKEN`) and `propagation_delay_secs` (default 10).
+`CLOUDFLARE_API_TOKEN`) and `propagation_delay_secs` (default 10, maximum
+3600).
 `provider = "rfc2136"` requires `server`, `zone`, and `key_name`, with optional
 `secret_env` (default `INTENDANT_RFC2136_TSIG_SECRET`), `ttl_secs` (default
-60), and `propagation_delay_secs` (default 2). Provider secrets come from the
-`dns:cloudflare` / `dns:rfc2136` daemon credential lease or the named
-environment fallback, never this table. Alternate names must end in
+60), and `propagation_delay_secs` (default 2, maximum 3600). Provider secrets
+come from the `dns:cloudflare` / `dns:rfc2136` daemon credential lease or the
+named environment fallback, never this table. Alternate names must end in
 `_API_TOKEN` or `_TSIG_SECRET` respectively so they remain excluded from
 runtime children; custom names cannot occupy the reserved `INTENDANT_`
 namespace. See
