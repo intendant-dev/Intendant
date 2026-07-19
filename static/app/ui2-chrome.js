@@ -224,7 +224,7 @@ function ui2WireMirrors() {
   const ui2WireSwitcher = () => {
   const switcher = document.getElementById('ui2-session-switcher');
   const rebuildSwitcher = () => {
-    if (!switcher || typeof sessionWindows === 'undefined') return;
+    if (!switcher) return;
     // Must be the SAME selector Focus promotes with (ui2ApplyFocusSurface),
     // or the switcher reads "all sessions" while Focus is showing exactly one
     // session's transcript.
@@ -232,14 +232,19 @@ function ui2WireMirrors() {
       ? (ui2FocusSessionId() || '')
       : (typeof resolvePromptTargetSessionId === 'function'
         ? (resolvePromptTargetSessionId() || '') : '');
+    // Always at least the "all sessions" option: an option-less select
+    // renders as a bare ~40px chevron with no label at all (the pre-wire
+    // boot state), and the control's whole job is showing the selection.
     const options = [['', 'all sessions']];
-    for (const [sid] of sessionWindows) {
-      let label = sid.slice(0, 8);
-      if (typeof sessionIdentityParts === 'function') {
-        const parts = sessionIdentityParts(sid) || {};
-        label = parts.name || parts.shortId || label;
+    if (typeof sessionWindows !== 'undefined') {
+      for (const [sid] of sessionWindows) {
+        let label = sid.slice(0, 8);
+        if (typeof sessionIdentityParts === 'function') {
+          const parts = sessionIdentityParts(sid) || {};
+          label = parts.name || parts.shortId || label;
+        }
+        options.push([sid, label]);
       }
-      options.push([sid, label]);
     }
     const sig = options.map((o) => o[0]).join(',') + '|' + target;
     if (switcher.dataset.sig === sig) return;
@@ -252,10 +257,15 @@ function ui2WireMirrors() {
     }));
     switcher.value = target;
     if (switcher.value !== target) switcher.value = '';
+    // The visible label doubles as the tooltip once it ellipsizes.
+    const selected = switcher.selectedOptions && switcher.selectedOptions[0];
+    switcher.title = 'Focused session — Focus shows this session’s timeline; the composer targets it'
+      + (selected && selected.value ? ` (${selected.textContent})` : '');
   };
   if (switcher) {
     switcher.addEventListener('change', () => {
       const sid = switcher.value;
+      const gridLayout = document.documentElement.dataset.ui2Layout === 'grid';
       if (sid && typeof focusSessionWindow === 'function') focusSessionWindow(sid);
       else if (!sid && typeof discardPromptTargetReference === 'function') {
         const current = typeof resolvePromptTargetSessionId === 'function'
@@ -263,7 +273,27 @@ function ui2WireMirrors() {
         if (current) discardPromptTargetReference(current);
         if (typeof updatePromptTargetSessionHighlight === 'function') updatePromptTargetSessionHighlight();
       }
+      // Picking a SESSION while on Grid means "show me that one" — enter
+      // Focus through the same path the Focus button takes (ui2ApplyLayout
+      // keeps the toggle's aria-pressed pair correct); picking
+      // "all sessions" is the inverse gesture and returns to Grid. Within
+      // Focus, picking a session just promotes it (today's behavior);
+      // ui2ApplyLayout already ends with ui2ApplyFocusSurface, so the
+      // explicit call below only covers the no-layout-change paths.
+      if (typeof ui2ApplyLayout === 'function') {
+        if (sid && gridLayout) ui2ApplyLayout('focus');
+        else if (!sid) ui2ApplyLayout('grid');
+      }
       if (typeof ui2ApplyFocusSurface === 'function') ui2ApplyFocusSurface();
+      // Change feedback: the target-chip brightness-pulse idiom
+      // (39's updatePromptTargetChip), sized for a form control.
+      try {
+        switcher.animate([
+          { transform: 'scale(1)', filter: 'brightness(1)' },
+          { transform: 'scale(1.06)', filter: 'brightness(1.45)', offset: 0.35 },
+          { transform: 'scale(1)', filter: 'brightness(1)' },
+        ], { duration: 450, easing: 'ease-in-out' });
+      } catch (_) { /* Web Animations unavailable — selection change stays silent */ }
     });
     ui2Mirror('task-target-chip', rebuildSwitcher);
     const grid = document.getElementById('session-window-grid');
