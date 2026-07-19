@@ -3821,8 +3821,7 @@ function sessionWindowTranscriptSignaturesFromParts(parts, options = {}) {
       signatures.push(['exact-ms', String(parts.tsMs), ...textParts].join('\u001f'));
     }
     if (isUserMessage && options.includeUserNearTime) {
-      const timeBucket = sessionWindowTranscriptTimeBucket(parts.ts);
-      if (timeBucket) {
+      for (const timeBucket of sessionWindowTranscriptTimeBuckets(parts.ts)) {
         signatures.push([
           'user-near-time-text',
           parts.sessionId,
@@ -3990,10 +3989,21 @@ function sessionWindowTranscriptTimestampForHistoryItem(item) {
   return sessionWindowTranscriptTimestampMs(record?.ts_ms ?? record?.tsMs ?? record?.ts ?? record?.timestamp ?? '');
 }
 
-function sessionWindowTranscriptTimeBucket(value) {
+// Near-time buckets for the turn-agnostic user-row bridge: the primary 5s
+// floor lattice PLUS a half-offset (2.5s) lattice, so two copies of one
+// prompt that straddle a primary floor boundary (observed live: live-lane
+// dispatch ts vs transcript-lane backend ts, 2s apart across a boundary)
+// still share the offset bucket — any pair within 2.5s provably shares at
+// least one bucket. The lattices are namespaced ('a'/'b') so a primary
+// bucket number never collides with an offset bucket number: matches stay
+// within one lattice, which caps the pairable spread at <5s exactly like
+// the single-bucket window did (deliberately NOT ±1-neighbor probing,
+// which would let identical-text prompts up to ~15s apart collapse — the
+// distinct-repeated-prompts safety bar).
+function sessionWindowTranscriptTimeBuckets(value) {
   const ms = sessionWindowTranscriptTimestampMs(value);
-  if (ms === null) return '';
-  return String(Math.floor(ms / 5000));
+  if (ms === null) return [];
+  return ['a' + Math.floor(ms / 5000), 'b' + Math.floor((ms + 2500) / 5000)];
 }
 
 // Timestamp lookups for the insert-position scan cost a querySelector +
