@@ -3250,12 +3250,15 @@ pub(crate) async fn run_with_presence(
                         combined_images,
                     )
                 };
+                // Presence-lane attachments are frame-registry grabs, which
+                // mint no upload refs — nothing renderable to persist.
                 slog(&session_log, |l| {
                     let _ = l.conversation_message_user(
                         task_seq,
                         MessageProvenance::Task,
                         &task_text,
                         None,
+                        &[],
                     );
                 });
 
@@ -3298,6 +3301,7 @@ pub(crate) async fn run_with_presence(
                         MessageProvenance::FollowUp,
                         &task_text,
                         None,
+                        &[],
                     );
                 });
             }
@@ -3528,12 +3532,17 @@ pub(crate) async fn run_direct_mode(
                         attachment_images.clone(),
                     )
                 };
+                // Same dispatch as the fresh-task sites below: the refs for
+                // the delivered attachments ride the canonical record
+                // (external-lane parity — the resumed images entered the
+                // conversation above).
                 slog(&session_log, |l| {
                     let _ = l.conversation_message_user(
                         resume_seq,
                         MessageProvenance::ResumeTask,
                         &task,
                         None,
+                        &attachments.refs,
                     );
                 });
                 conv
@@ -3566,8 +3575,13 @@ pub(crate) async fn run_direct_mode(
                     attachment_images.clone(),
                 );
                 slog(&session_log, |l| {
-                    let _ =
-                        l.conversation_message_user(task_seq, MessageProvenance::Task, &task, None);
+                    let _ = l.conversation_message_user(
+                        task_seq,
+                        MessageProvenance::Task,
+                        &task,
+                        None,
+                        &attachments.refs,
+                    );
                 });
                 conv
             }
@@ -3580,8 +3594,16 @@ pub(crate) async fn run_direct_mode(
             &attachments.text_with_file_prelude(&task),
             attachment_images.clone(),
         );
+        // The canonical record carries the renderable upload refs delivered
+        // with the task (external-lane parity with the `[user]` rows).
         slog(&session_log, |l| {
-            let _ = l.conversation_message_user(task_seq, MessageProvenance::Task, &task, None);
+            let _ = l.conversation_message_user(
+                task_seq,
+                MessageProvenance::Task,
+                &task,
+                None,
+                &attachments.refs,
+            );
         });
         conv
     };
