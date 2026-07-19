@@ -574,9 +574,10 @@ const JUMP_BUTTON_PROBE_EXPRESSION = `(async () => {
       out.failures.push('probe window DOM (log / jump button) missing');
       return out;
     }
-    // Deterministic scroll geometry regardless of grid auto-fit sizing.
-    log.style.height = '120px';
-    log.style.minHeight = '120px';
+    // Deterministic scroll geometry: max-height caps the flex-stretched log
+    // (header-collapsed windows have no stylesheet max-height), so 40 seed
+    // entries always overflow.
+    log.style.maxHeight = '120px';
     log.style.overflowY = 'auto';
     const visible = () => !button.classList.contains('hidden');
     const atTail = () => {
@@ -586,7 +587,15 @@ const JUMP_BUTTON_PROBE_EXPRESSION = `(async () => {
     for (let i = 0; i < 40; i += 1) qa.append(sid, 'probe seed ' + i + ' ' + 'x'.repeat(48));
     await settle();
     check(log.scrollHeight > log.clientHeight + 60, 'probe window is scrollable');
-    check(!visible(), 'seeded at tail: button hidden');
+    // Anchor at the tail through the scroller itself (a user drag to the
+    // bottom). The seed burst compresses create+append into one task, so
+    // the SPA's follow flush can race the grid-fit rAF that first gives the
+    // log its overflow — live sessions re-arm the flush on every later
+    // append, but the probe must not depend on that ordering.
+    log.scrollTop = log.scrollHeight;
+    await settle();
+    check(atTail(), 'seeded and anchored at the tail');
+    check(!visible(), 'at tail: button hidden');
     // (1) QUIET window scrolled up: nothing appends afterwards — the scroll
     // recompute alone must reveal the button.
     log.scrollTop = 0;
@@ -802,15 +811,23 @@ async function main() {
 
     // Assertion (d): drive the jump-button state machine on a synthetic
     // window. Runs before the ledger verdict so any page error the probe
-    // provokes also fails the smoke.
-    const jump = await evaluate(JUMP_BUTTON_PROBE_EXPRESSION, { awaitPromise: true });
-    const jumpSteps = Array.isArray(jump && jump.steps) ? jump.steps : [];
-    const jumpFailures = Array.isArray(jump && jump.failures) ? jump.failures : ['probe returned no result'];
-    console.log(`jump-button probe: ${jumpSteps.length} steps, ${jumpFailures.length} failures`);
-    for (const line of jumpSteps.slice(0, MAX_REPORT_LINES)) console.log(`  ${line}`);
-    if (jumpFailures.length > 0) {
-      for (const line of jumpFailures) ledger.record('jump-button', line, { fatal: true });
-      throw new Error(`jump-button probe failed ${jumpFailures.length} assertion(s)`);
+    // provokes also fails the smoke. Plain boots only: the probe needs real
+    // scroll geometry from the Activity pane, and a deep-link boot
+    // (#stats / #files legs) routes to a tab that leaves that pane
+    // display:none — the hash-less leg hard-asserts the geometry, so an
+    // activity-pane regression still fails loudly there.
+    if (new URL(opts.url).hash) {
+      console.log('jump-button probe: skipped (deep-link boot, activity pane not routed)');
+    } else {
+      const jump = await evaluate(JUMP_BUTTON_PROBE_EXPRESSION, { awaitPromise: true });
+      const jumpSteps = Array.isArray(jump && jump.steps) ? jump.steps : [];
+      const jumpFailures = Array.isArray(jump && jump.failures) ? jump.failures : ['probe returned no result'];
+      console.log(`jump-button probe: ${jumpSteps.length} steps, ${jumpFailures.length} failures`);
+      for (const line of jumpSteps.slice(0, MAX_REPORT_LINES)) console.log(`  ${line}`);
+      if (jumpFailures.length > 0) {
+        for (const line of jumpFailures) ledger.record('jump-button', line, { fatal: true });
+        throw new Error(`jump-button probe failed ${jumpFailures.length} assertion(s)`);
+      }
     }
 
     if (ledger.allowed.length > 0) {
