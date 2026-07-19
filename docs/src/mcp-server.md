@@ -90,12 +90,15 @@ wired up by the owner's own client config, always counts as an owner surface. Se
 [Computer Use](./computer-use-and-audio.md#display-targets). Binding order:
 
 1. **Peer daemons** (mTLS peer identity) use their peer-profile principal.
-2. **Supervised backends** present the token in their injected
-   `INTENDANT_MCP_URL`. It is *session-scoped* — derived from the daemon's
-   per-process token and the `session_id` — so it authenticates exactly that
-   agent session (`principal:agent-session:<id>`). Possession of the raw
-   per-process token remains root-equivalent. Explicit-but-wrong tokens are
-   refused with 401. A session whose binding is known but whose grant has
+2. **Supervised backends** receive a bearer only in their cleared child
+   environment and send it in the `Authorization` header. Their argv-visible
+   MCP config contains the environment-variable name, never the value.
+   `INTENDANT_MCP_URL` remains the private environment bootstrap for `ctl`.
+   The bearer is *session-scoped* — derived from the daemon's per-process token
+   and the `session_id` — so it authenticates exactly that agent session
+   (`principal:agent-session:<id>`). Possession of the raw per-process token
+   remains root-equivalent. Explicit-but-wrong tokens are refused with 401. A
+   session whose binding is known but whose grant has
    *lapsed* (expired or revoked) binds the scoped principal and is denied
    with the real reason — it does not fall back to default trust; only
    sessions with no binding at all do.
