@@ -1299,16 +1299,66 @@ pub(crate) fn external_session_entries_from_home_arc(
         "codex" => find_codex_session_file(home, session_id),
         // Task-tool sub-threads have no transcript keyed by their
         // synthetic `task-*` id; after the ordinary lookup misses, fall
-        // back to the parent's persisted subagent artifacts (Codex
-        // sub-threads need no fallback — they get first-class rollouts
-        // under their own thread ids).
-        "claude-code" => find_claude_session_file_for_transcript(home, session_id)
-            .or_else(|| find_claude_task_subagent_transcript(home, session_id)),
+        // back to the parent's persisted subagent artifacts through the
+        // task-aware lane, which also appends the completed-terminal row
+        // the subagent file itself never carries (Codex sub-threads need
+        // no fallback — they get first-class rollouts under their own
+        // thread ids).
+        "claude-code" => match find_claude_session_file_for_transcript(home, session_id) {
+            Some(path) => Some(path),
+            None => {
+                let artifacts = find_claude_task_subagent_artifacts(home, session_id)?;
+                return claude_task_child_entries_arc(home, session_id, &artifacts);
+            }
+        },
         "gemini" => find_gemini_session_file_for_transcript(home, session_id),
         _ => None,
     }?;
 
     external_session_entries_from_file_arc(home, &source, session_id, &path)
+}
+
+/// Task-child serving: the subagent transcript's rows plus — once the
+/// PARENT transcript carries the child's completed `<task-notification>`
+/// — a synthesized terminal row, so hydration and replay read DONE the
+/// way the live window did. The live "Task complete" LogEntry is
+/// bus-only and the subagent transcript just ends, so after a tab reload
+/// or daemon restart this lane is the only completion evidence
+/// (see `claude_task_terminal_entry`).
+///
+/// Cache rule: entries WITH the terminal row are final — a completed
+/// child's transcript only changes on a resume, which re-keys the
+/// (len, mtime) cache entry — so they cache like any other transcript.
+/// Entries WITHOUT it stay suspect: the notification lands in the
+/// PARENT file strictly after the subagent's last write, so a cached
+/// no-terminal parse is re-derived on every hit until the terminal
+/// appears (a still-running child churns its cache key anyway, so this
+/// forgoes no real reuse).
+fn claude_task_child_entries_arc(
+    home: &Path,
+    session_id: &str,
+    artifacts: &ClaudeTaskSubagentArtifacts,
+) -> Option<std::sync::Arc<Vec<serde_json::Value>>> {
+    let source = "claude-code";
+    let key = external_transcript_cache_key(source, session_id, &artifacts.transcript)?;
+    if let Some(entries) = cached_external_transcript_entries(&key) {
+        let has_terminal = entries.iter().any(|entry| {
+            entry.get("kind").and_then(|v| v.as_str()) == Some(CLAUDE_TASK_TERMINAL_KIND)
+        });
+        if has_terminal {
+            return Some(entries);
+        }
+    }
+
+    let steers = external_mid_turn_steer_ledger(home, source, session_id);
+    let mut entries = parse_claude_session_entries(&artifacts.transcript, &steers)?;
+    if let Some(terminal) = claude_task_terminal_entry(artifacts, &entries) {
+        entries.push(terminal);
+    }
+    annotate_external_transcript_entries(source, session_id, &mut entries);
+    let entries = std::sync::Arc::new(entries);
+    store_external_transcript_entries(key, &entries);
+    Some(entries)
 }
 
 pub(crate) fn external_session_entries_from_home(

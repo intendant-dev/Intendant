@@ -3627,6 +3627,17 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
     content = content ? `Done signal: ${content}` : 'Done signal';
     return { ...base, level: 'detail', source: source || 'worker', content, kind };
   }
+  if (event === 'task_complete') {
+    // Live grammar (the WASM task_complete handler): reason, em-dash,
+    // summary — so a replay-served completion reads (and derives phase)
+    // like the live row did.
+    const reason = String(entry.reason || '').trim() || 'done';
+    const summary = String(entry.summary || '').trim();
+    content = summary
+      ? `Task complete: ${reason} — ${summary}`
+      : `Task complete: ${reason}`;
+    return { ...base, level: 'info', source: source || 'worker', content, kind };
+  }
   if (event === 'session_started') {
     return { ...base, level: 'info', source: 'system', content: `Session started: ${sessionId}`, kind };
   }
@@ -4089,6 +4100,16 @@ function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSession
   for (const record of records) {
     const signatures = sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId);
     if (signatures.length > 0 && signatures.some(signature => existing.has(signature))) continue;
+    // The synthesized completed-terminal row (kind subagent_terminal,
+    // served by the task-child hydration lane) and the live "Task
+    // complete" LogEntry describe the same completion with different
+    // timestamps and event ids, so signatures never pair them — content
+    // is the identity here. A window that already shows a terminal row
+    // must not gain a second one from a merge fetch.
+    if (
+      record.kind === 'subagent_terminal' &&
+      sessionWindowHistoryHasTaskCompleteRow(win)
+    ) continue;
     missing.push(record);
     for (const signature of signatures) {
       existing.add(signature);
@@ -4097,6 +4118,21 @@ function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSession
   if (!missing.length) return removedDuplicates;
   insertSessionWindowHistoryRecords(win, missing, sessionWindowShouldFollowNextOutput(win));
   return missing.length + removedDuplicates;
+}
+
+// Does this window already render a "Task complete" line (live LogEntry
+// or a previously merged terminal row)? Content-prefix identity — the
+// only stable key both copies share (see the merge guard above).
+function sessionWindowHistoryHasTaskCompleteRow(win) {
+  return ensureSessionWindowHistory(win).some(item => {
+    const node = sessionWindowHistoryNode(item);
+    if (node) {
+      const content = node.querySelector?.('.log-content');
+      return String((content || node).textContent || '').startsWith('Task complete:');
+    }
+    const record = sessionWindowHistoryRecord(item);
+    return String(record?.content || '').startsWith('Task complete:');
+  });
 }
 
 function externalSessionWindowSyncRecord(sessionId) {
@@ -4247,7 +4283,10 @@ async function hydrateRestoredSessionWindow(win, record) {
     const rendered = renderRestoredSessionWindowEntries(targetWin, entries, targetSid);
     clearSessionWindowHydrateError(targetWin || win);
     if (rendered > 0) {
-      updateSessionWindow(targetSid, { phase: 'idle', ended: false });
+      updateSessionWindow(targetSid, {
+        phase: restoredSessionWindowPhaseFromEntries(entries, targetSid),
+        ended: false,
+      });
       stationScheduleUpdate();
     }
   } catch (err) {
@@ -4259,6 +4298,40 @@ async function hydrateRestoredSessionWindow(win, record) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+// Hydration phase from the restored transcript's own evidence, mirroring
+// inferSessionPhaseFromLog's terminal prefixes: the LAST phase-relevant
+// row decides, so a completed Task child (whose hydration lane serves the
+// synthesized terminal row) or an ended session rehydrates as done, while
+// anything with activity after its last terminal — a resumed child —
+// stays the historical blanket 'idle' and lets live events drive.
+// Active states are deliberately NOT restored: a fetched transcript
+// cannot prove a live turn or a live approval.
+function restoredSessionWindowPhaseFromEntries(entries, fallbackSessionId) {
+  if (!Array.isArray(entries)) return 'idle';
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const record = sessionWindowRecordFromReplayEntry(entries[i], fallbackSessionId);
+    if (!record) continue;
+    const content = String(record.content || '');
+    if (content.startsWith('Task complete:') || content.startsWith('Session ended:')) {
+      return 'done';
+    }
+    if (content.startsWith('Agent interrupted:')) return 'interrupted';
+    const level = String(record.level || '').toLowerCase();
+    if (
+      level === 'model' ||
+      level === 'agent' ||
+      content.startsWith('Turn ') ||
+      content.startsWith('Running on display') ||
+      content.startsWith('Approval required') ||
+      content.startsWith('Question:') ||
+      (content.startsWith('Round ') && content.includes(' complete'))
+    ) {
+      return 'idle';
+    }
+  }
+  return 'idle';
 }
 
 function sessionWindowHydrationRecord(sessionId) {
