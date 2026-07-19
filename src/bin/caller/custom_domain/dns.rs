@@ -2003,17 +2003,26 @@ fn cloudflare_exact_record_ids(
             "Cloudflare DNS cleanup lookup did not return one complete bounded page".to_string(),
         );
     }
-    Ok(records
-        .into_iter()
-        .filter(|record| {
-            record.record_type == "TXT"
-                && record.name.trim_end_matches('.').eq_ignore_ascii_case(name)
-                && record.content == value
-                && !record.id.is_empty()
-                && record.id.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        })
-        .map(|record| record.id)
-        .collect())
+    let mut exact_ids = Vec::new();
+    for record in records {
+        if record.record_type != "TXT"
+            || !record
+                .name
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(name.trim_end_matches('.'))
+            || record.content != value
+        {
+            continue;
+        }
+        if record.id.is_empty() || !record.id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(
+                "Cloudflare DNS cleanup lookup returned an exact record with an unusable id"
+                    .to_string(),
+            );
+        }
+        exact_ids.push(record.id);
+    }
+    Ok(exact_ids)
 }
 
 fn cloudflare_client() -> Result<reqwest::Client, String> {
@@ -2581,6 +2590,29 @@ mod tests {
         )
         .unwrap_err()
         .contains("complete bounded page"));
+
+        for unusable_id in ["", "record/123"] {
+            let mut unusable = exact.clone();
+            unusable["result"][0]["id"] = serde_json::json!(unusable_id);
+            assert!(cloudflare_exact_record_ids(
+                parse(unusable).unwrap(),
+                "_acme-challenge.box.example.test",
+                "challenge-value",
+            )
+            .unwrap_err()
+            .contains("unusable id"));
+        }
+
+        let mut unrelated_unusable = exact.clone();
+        unrelated_unusable["result"][0]["id"] = serde_json::json!("");
+        unrelated_unusable["result"][0]["content"] = serde_json::json!("another-value");
+        assert!(cloudflare_exact_record_ids(
+            parse(unrelated_unusable).unwrap(),
+            "_acme-challenge.box.example.test",
+            "challenge-value",
+        )
+        .unwrap()
+        .is_empty());
 
         let mut missing_total_pages = exact;
         missing_total_pages["result_info"]

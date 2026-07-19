@@ -383,17 +383,20 @@ impl RelayState {
             })
     }
 
-    /// Refresh a tunnel's control-channel presence on each poll. Exact names
-    /// have one live incumbent: a second daemon is rejected at admission so
-    /// the incumbent retains one unambiguous route. Resolution still retains
-    /// its ambiguity check as defense in depth for rolling state.
-    fn touch_tunnel(
+    /// Register one control poll and return its keyed wake token. Replacing an
+    /// exact poller's token fences an older overlapping request without
+    /// dropping queued work; a signed disconnect removes the token entirely.
+    /// Exact names have one live incumbent: a second daemon is rejected at
+    /// admission so the incumbent retains one unambiguous route. Resolution
+    /// still retains its ambiguity check as defense in depth for rolling
+    /// state.
+    fn register_tunnel(
         &self,
         label: &str,
         now: u64,
         poller_id: Option<&str>,
         server_names: Option<&[String]>,
-    ) -> bool {
+    ) -> Option<Arc<Notify>> {
         debug_assert_eq!(poller_id.is_some(), server_names.is_some());
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
         let conflicts = server_names.into_iter().flatten().any(|name| {
@@ -406,7 +409,7 @@ impl RelayState {
             })
         });
         if conflicts {
-            return false;
+            return None;
         }
         let entry = tunnels
             .entry(label.to_string())
@@ -423,22 +426,24 @@ impl RelayState {
             if !entry.exact_sessions.contains_key(poller_id)
                 && entry.exact_sessions.len() >= RELAY_MAX_EXACT_POLLERS_PER_TUNNEL
             {
-                return false;
+                return None;
             }
         }
         // Exact-name ownership and its nonce queue belong to the v2 poller
         // that supplied the certificate proof. A v1 sibling may refresh only
         // the fleet-label fallback and can never keep or consume this state.
         if let (Some(poller_id), Some(server_names)) = (poller_id, server_names) {
+            let notify = Arc::new(Notify::new());
             let session = entry
                 .exact_sessions
                 .entry(poller_id.to_string())
                 .or_insert_with(|| ExactTunnelSession {
                     last_seen_unix_ms: now,
                     pending: VecDeque::new(),
-                    notify: Arc::new(Notify::new()),
+                    notify: Arc::clone(&notify),
                     server_names: Vec::new(),
                 });
+            let previous_notify = std::mem::replace(&mut session.notify, Arc::clone(&notify));
             session.last_seen_unix_ms = now;
             let cancelled = if session.server_names != server_names {
                 session.pending.drain(..).collect()
@@ -447,8 +452,64 @@ impl RelayState {
             };
             session.server_names = server_names.to_vec();
             drop(tunnels);
+            previous_notify.notify_waiters();
             self.cancel_browser_waiters(cancelled);
+            Some(notify)
         } else {
+            entry.legacy_fallback_last_seen_unix_ms = Some(now);
+            Some(Arc::clone(&entry.fallback_notify))
+        }
+    }
+
+    #[cfg(test)]
+    fn touch_tunnel(
+        &self,
+        label: &str,
+        now: u64,
+        poller_id: Option<&str>,
+        server_names: Option<&[String]>,
+    ) -> bool {
+        self.register_tunnel(label, now, poller_id, server_names)
+            .is_some()
+    }
+
+    /// Refresh only the registration that supplied `notify`. This never
+    /// creates state: disconnect, expiry, or a newer poll makes the token
+    /// unusable, so a stale waiter cannot resurrect or overwrite a route.
+    fn refresh_registered_tunnel(
+        &self,
+        label: &str,
+        now: u64,
+        poller_id: Option<&str>,
+        server_names: Option<&[String]>,
+        notify: &Arc<Notify>,
+    ) -> bool {
+        debug_assert_eq!(poller_id.is_some(), server_names.is_some());
+        let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+        let Some(entry) = tunnels.get_mut(label) else {
+            return false;
+        };
+        if let (Some(poller_id), Some(server_names)) = (poller_id, server_names) {
+            let Some(session) = entry.exact_sessions.get_mut(poller_id) else {
+                return false;
+            };
+            if !Arc::ptr_eq(&session.notify, notify)
+                || session.server_names != server_names
+                || now.saturating_sub(session.last_seen_unix_ms) > RELAY_TUNNEL_LIVENESS_MS
+            {
+                return false;
+            }
+            session.last_seen_unix_ms = now;
+        } else {
+            if !Arc::ptr_eq(&entry.fallback_notify, notify)
+                || !entry
+                    .legacy_fallback_last_seen_unix_ms
+                    .is_some_and(|last_seen| {
+                        now.saturating_sub(last_seen) <= RELAY_TUNNEL_LIVENESS_MS
+                    })
+            {
+                return false;
+            }
             entry.legacy_fallback_last_seen_unix_ms = Some(now);
         }
         true
@@ -466,24 +527,37 @@ impl RelayState {
 
     fn remove_tunnel(&self, label: &str, poller_id: &str, now: u64) {
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+        let mut cancelled = Vec::new();
+        let mut notifies = Vec::new();
         let mut remove_entry = false;
         if let Some(entry) = tunnels.get_mut(label) {
-            entry.exact_sessions.retain(|_, session| {
-                now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
-            });
-            entry.exact_sessions.remove(poller_id);
+            if let Some(mut removed) = entry.exact_sessions.remove(poller_id) {
+                cancelled.extend(removed.pending.drain(..));
+                notifies.push(removed.notify);
+            }
             if !Self::fallback_is_live(entry, now) {
-                entry.fallback_pending.clear();
-                entry.fallback_notify.notify_waiters();
                 remove_entry = true;
             }
         }
         if remove_entry {
-            tunnels.remove(label);
+            if let Some(mut removed) = tunnels.remove(label) {
+                cancelled.extend(removed.fallback_pending.drain(..));
+                notifies.push(removed.fallback_notify);
+                for (_, mut session) in removed.exact_sessions {
+                    cancelled.extend(session.pending.drain(..));
+                    notifies.push(session.notify);
+                }
+            }
         }
+        drop(tunnels);
+        for notify in notifies {
+            notify.notify_waiters();
+        }
+        self.cancel_browser_waiters(cancelled);
     }
 
     /// Pop the next unclaimed dial-back nonce for a tunnel, if any.
+    #[cfg(test)]
     fn pop_pending(&self, label: &str, poller_id: Option<&str>) -> Option<PendingDialback> {
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
         let entry = tunnels.get_mut(label)?;
@@ -499,6 +573,7 @@ impl RelayState {
         entry.fallback_pending.pop_front()
     }
 
+    #[cfg(test)]
     fn pending_notify(&self, label: &str, poller_id: Option<&str>) -> Option<Arc<Notify>> {
         let tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
         let entry = tunnels.get(label)?;
@@ -512,24 +587,49 @@ impl RelayState {
             .or_else(|| Some(Arc::clone(&entry.fallback_notify)))
     }
 
+    fn pop_pending_for_registration(
+        &self,
+        label: &str,
+        poller_id: Option<&str>,
+        notify: &Arc<Notify>,
+    ) -> Result<Option<PendingDialback>, ()> {
+        let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+        let entry = tunnels.get_mut(label).ok_or(())?;
+        if let Some(poller_id) = poller_id {
+            let session = entry.exact_sessions.get_mut(poller_id).ok_or(())?;
+            if !Arc::ptr_eq(&session.notify, notify) {
+                return Err(());
+            }
+            if let Some(dialback) = session.pending.pop_front() {
+                return Ok(Some(dialback));
+            }
+        } else if !Arc::ptr_eq(&entry.fallback_notify, notify)
+            || entry.legacy_fallback_last_seen_unix_ms.is_none()
+        {
+            return Err(());
+        }
+        Ok(entry.fallback_pending.pop_front())
+    }
+
     async fn pop_pending_or_wait(
         &self,
         label: &str,
         poller_id: Option<&str>,
+        notify: &Arc<Notify>,
         remaining: Duration,
         before_park: impl FnOnce() -> bool,
     ) -> PendingPoll {
-        let Some(notify) = self.pending_notify(label, poller_id) else {
-            return PendingPoll::RegistrationRejected;
-        };
+        let notify = Arc::clone(notify);
         // Enable the keyed waiter before observing the queue and before
         // refreshing registration so an enqueue at either boundary cannot
         // strand this poll. `notify_one` also retains one permit.
         let notified = notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if let Some(dialback) = self.pop_pending(label, poller_id) {
-            return PendingPoll::Dialback(dialback);
+        match self.pop_pending_for_registration(label, poller_id, &notify) {
+            Ok(Some(dialback)) => return PendingPoll::Dialback(dialback),
+            Ok(None) => {}
+            Err(()) => return PendingPoll::RegistrationRejected,
         }
         if !before_park() {
             return PendingPoll::RegistrationRejected;
@@ -1187,16 +1287,16 @@ pub(crate) async fn relay_next(
         );
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    if !relay.touch_tunnel(
+    let Some(registration_notify) = relay.register_tunnel(
         &label,
         now_unix_ms(),
         poller_id.as_deref(),
         server_names.as_deref(),
-    ) {
+    ) else {
         return Err(ApiError::conflict(
             "relay exact-name registration conflicts with live ownership or exceeds its poller bound",
         ));
-    }
+    };
 
     let timeout = Duration::from_millis(
         body.timeout_ms
@@ -1211,15 +1311,22 @@ pub(crate) async fn relay_next(
         }
         let remaining = deadline.saturating_duration_since(now);
         match relay
-            .pop_pending_or_wait(&label, poller_id.as_deref(), remaining, || {
-                // Re-touch keeps the tunnel live across a full parked poll.
-                relay.touch_tunnel(
-                    &label,
-                    now_unix_ms(),
-                    poller_id.as_deref(),
-                    server_names.as_deref(),
-                )
-            })
+            .pop_pending_or_wait(
+                &label,
+                poller_id.as_deref(),
+                &registration_notify,
+                remaining,
+                || {
+                    // Re-touch keeps the tunnel live across a full parked poll.
+                    relay.refresh_registered_tunnel(
+                        &label,
+                        now_unix_ms(),
+                        poller_id.as_deref(),
+                        server_names.as_deref(),
+                        &registration_notify,
+                    )
+                },
+            )
             .await
         {
             PendingPoll::Dialback(dialback) => {
@@ -1985,15 +2092,21 @@ mod tests {
             label: label.to_string(),
         };
         let outcome = relay
-            .pop_pending_or_wait(label, None, Duration::from_millis(20), || {
-                assert!(relay.enqueue_dialback(
-                    &route,
-                    "nonce-after-pop".to_string(),
-                    "198.51.100.10".parse().unwrap(),
-                    now,
-                ));
-                true
-            })
+            .pop_pending_or_wait(
+                label,
+                None,
+                &relay.pending_notify(label, None).unwrap(),
+                Duration::from_millis(20),
+                || {
+                    assert!(relay.enqueue_dialback(
+                        &route,
+                        "nonce-after-pop".to_string(),
+                        "198.51.100.10".parse().unwrap(),
+                        now,
+                    ));
+                    true
+                },
+            )
             .await;
         assert!(matches!(outcome, PendingPoll::Woken));
         assert_eq!(
@@ -2279,6 +2392,88 @@ mod tests {
         assert!(relay
             .resolve_tunnel("d-disconnect.fleet.example.test", now)
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn signed_disconnect_fences_an_in_flight_exact_poll_generation() {
+        let relay = relay_state();
+        let label = "d-disconnect-race";
+        let poller = "11111111111111111111111111111111";
+        let old_names = vec!["old.example.test".to_string()];
+        let new_names = vec!["new.example.test".to_string()];
+        let now = now_unix_ms();
+        let old_notify = relay
+            .register_tunnel(label, now, Some(poller), Some(&old_names))
+            .unwrap();
+        let mut replacement_notify = None;
+
+        let outcome = relay
+            .pop_pending_or_wait(
+                label,
+                Some(poller),
+                &old_notify,
+                Duration::from_millis(20),
+                || {
+                    // This is the cancellation edge from the production
+                    // handler: disconnect lands after its waiter was enabled
+                    // but before the handler refreshes and parks.
+                    relay.remove_tunnel(label, poller, now + 1);
+                    replacement_notify =
+                        relay.register_tunnel(label, now + 2, Some(poller), Some(&new_names));
+                    relay.refresh_registered_tunnel(
+                        label,
+                        now + 3,
+                        Some(poller),
+                        Some(&old_names),
+                        &old_notify,
+                    )
+                },
+            )
+            .await;
+        assert!(matches!(outcome, PendingPoll::RegistrationRejected));
+        let replacement_notify = replacement_notify.unwrap();
+        assert!(!Arc::ptr_eq(&old_notify, &replacement_notify));
+        assert!(relay.resolve_tunnel(&old_names[0], now + 3).is_none());
+        let replacement_route = relay.resolve_tunnel(&new_names[0], now + 3).unwrap();
+        assert!(relay.enqueue_dialback(
+            &replacement_route,
+            "replacement-nonce".to_string(),
+            "198.51.100.10".parse().unwrap(),
+            now + 3,
+        ));
+
+        let stale = relay
+            .pop_pending_or_wait(
+                label,
+                Some(poller),
+                &old_notify,
+                Duration::from_millis(20),
+                || panic!("a stale generation must fail before refresh"),
+            )
+            .await;
+        assert!(matches!(stale, PendingPoll::RegistrationRejected));
+        let replacement = relay
+            .pop_pending_or_wait(
+                label,
+                Some(poller),
+                &replacement_notify,
+                Duration::from_millis(20),
+                || {
+                    relay.refresh_registered_tunnel(
+                        label,
+                        now + 4,
+                        Some(poller),
+                        Some(&new_names),
+                        &replacement_notify,
+                    )
+                },
+            )
+            .await;
+        assert!(matches!(
+            replacement,
+            PendingPoll::Dialback(PendingDialback { ref nonce, .. })
+                if nonce == "replacement-nonce"
+        ));
     }
 
     #[test]

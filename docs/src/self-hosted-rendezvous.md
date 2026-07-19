@@ -332,7 +332,10 @@ Connect ever terminating TLS or seeing plaintext:
   derived fleet-label fallback. An exact SNI claim routes only when one daemon
   identity owns it; competing live claims fail closed. A separate
   daemon-signed disconnect protocol removes that poller's exact and fallback
-  registration immediately instead of waiting for the liveness timeout.
+  registration immediately instead of waiting for the liveness timeout. Each
+  accepted exact poll has a keyed generation: disconnect or a superseding poll
+  wakes and invalidates the prior generation, which can neither recreate the
+  withdrawn route nor consume dialbacks queued for its replacement.
 - The browser's TLS handshake therefore completes end-to-end against the
   **daemon's own fleet certificate**. Connect moves only ciphertext.
 

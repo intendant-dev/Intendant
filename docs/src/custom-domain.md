@@ -124,8 +124,9 @@ incomplete provider responses retain the cleanup obligation. A Cloudflare
 create-response record id is retained only when the returned type, name, and
 content match the requested TXT record; a mismatched success remains ambiguous
 and falls back to exact name/value cleanup instead of deleting by the
-untrusted id. If a newer
-challenge already owns the primary journal, the
+untrusted id. An exact cleanup match with a missing or malformed provider id
+also retains the cleanup obligation instead of being treated as absence. If a
+newer challenge already owns the primary journal, the
 secondary reservation retains the older exact cleanup independently and
 blocks further challenge creation until it is drained. A late TXT write
 therefore cannot land after the last durable cleanup record disappeared. While
