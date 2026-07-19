@@ -4046,15 +4046,13 @@ pub(crate) async fn handle_sessions_stream(
     request_line: &str,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
-    hosted_authority: Option<HostedHttpAuthority>,
 ) {
     let requested_limit = session_list_limit_from_request(request_line);
-    write_api_response_with_authority(
+    write_api_response(
         stream,
         sessions_stream_api_response(requested_limit),
         cors,
         fleet_origin,
-        hosted_authority.as_ref(),
     )
     .await;
 }
@@ -4180,7 +4178,6 @@ pub(crate) async fn handle_sessions_search(
     request_line: &str,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
-    hosted_authority: Option<HostedHttpAuthority>,
 ) {
     let query = query_param(request_line, "q").unwrap_or_default();
     let source_filter = query_param(request_line, "source").unwrap_or_else(|| "all".to_string());
@@ -4194,14 +4191,7 @@ pub(crate) async fn handle_sessions_search(
             project_filter,
             tokio_util::sync::CancellationToken::new(),
         );
-        return write_api_response_with_authority(
-            stream,
-            response,
-            cors,
-            fleet_origin,
-            hosted_authority.as_ref(),
-        )
-        .await;
+        return write_api_response(stream, response, cors, fleet_origin).await;
     }
     let response = sessions_search_api_response(
         query,
@@ -4211,14 +4201,7 @@ pub(crate) async fn handle_sessions_search(
         tokio_util::sync::CancellationToken::new(),
     )
     .await;
-    write_api_response_with_authority(
-        stream,
-        response,
-        cors,
-        fleet_origin,
-        hosted_authority.as_ref(),
-    )
-    .await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 /// Transport-neutral core of `GET /api/sessions/message-search` (tunnel
@@ -6924,7 +6907,6 @@ mod tests {
                 request_line,
                 crate::gateway_routes::CorsPosture::OwnOrigin,
                 None,
-                None,
             )
         })
         .await;
@@ -6958,7 +6940,6 @@ mod tests {
                 stream,
                 request_line,
                 crate::gateway_routes::CorsPosture::OwnOrigin,
-                None,
                 None,
             )
         })

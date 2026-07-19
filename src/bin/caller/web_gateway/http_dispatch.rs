@@ -546,6 +546,9 @@ pub(crate) async fn serve_http_request(
             verified,
         )
     });
+    if let Some(authority) = hosted_http_authority.as_ref() {
+        stream.retain_hosted_http_authority(authority.clone());
+    }
     let mut hosted_verified_for_handler = hosted_verified.clone();
     let mut http_access_context = if let Some(authority) = hosted_http_authority.as_ref() {
         authority.access_context()
@@ -791,6 +794,7 @@ pub(crate) async fn serve_http_request(
             };
             http_access_context = refreshed.access_context();
             hosted_verified_for_handler = Some(refreshed.verified().clone());
+            stream.retain_hosted_http_authority(refreshed.clone());
             hosted_http_authority = Some(refreshed);
 
             if let Some(op) = dashboard_http_operation(req_method, req_path)
@@ -1359,7 +1363,6 @@ pub(crate) async fn serve_http_request(
                     request_line,
                     route.cors,
                     fleet_cors_origin.as_deref(),
-                    hosted_http_authority,
                 )
                 .await;
             }
@@ -1369,7 +1372,6 @@ pub(crate) async fn serve_http_request(
                     request_line,
                     route.cors,
                     fleet_cors_origin.as_deref(),
-                    hosted_http_authority,
                 )
                 .await;
             }
@@ -2589,22 +2591,10 @@ pub(crate) async fn write_api_response(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    write_api_response_inner(stream, response, cors, fleet_origin, false, || true).await;
-}
-
-/// Hosted response edge: retain the opening lease/custom-domain predicate
-/// for the entire write, including time blocked on a line producer or socket
-/// backpressure. Unguarded local/mTLS callers keep the historical writer.
-pub(crate) async fn write_api_response_with_authority(
-    stream: DemuxStream,
-    response: ApiResponse,
-    cors: crate::gateway_routes::CorsPosture,
-    fleet_origin: Option<&str>,
-    authority: Option<&HostedHttpAuthority>,
-) {
+    let authority = stream.http_write_authority();
     let guarded = authority.is_some();
     write_api_response_inner(stream, response, cors, fleet_origin, guarded, || {
-        authority.is_none_or(HostedHttpAuthority::opening_authority_is_current)
+        authority.as_ref().is_none_or(|authority| authority())
     })
     .await;
 }
@@ -3134,16 +3124,12 @@ mod tests {
         };
         let authority_live = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let writer_authority = Arc::clone(&authority_live);
+        let mut stream = DemuxStream::new(Box::pin(transport));
+        stream.retain_http_write_authority_for_test(Arc::new(move || {
+            writer_authority.load(std::sync::atomic::Ordering::SeqCst)
+        }));
         let writer = tokio::spawn(async move {
-            write_api_response_inner(
-                DemuxStream::new(Box::pin(transport)),
-                response,
-                CorsPosture::OwnOrigin,
-                None,
-                true,
-                || writer_authority.load(std::sync::atomic::Ordering::SeqCst),
-            )
-            .await;
+            write_api_response(stream, response, CorsPosture::OwnOrigin, None).await;
         });
 
         tokio::time::timeout(std::time::Duration::from_secs(1), write_polled.notified())
@@ -3158,5 +3144,46 @@ mod tests {
             cancellation_observer.is_cancelled(),
             "the line producer must be cancelled with the response pump"
         );
+    }
+
+    #[tokio::test]
+    async fn retained_authority_interrupts_direct_backpressured_http_write() {
+        use tokio::io::AsyncWriteExt;
+
+        // Direct-write handlers (context snapshots and other legacy shims)
+        // do not pass through `write_api_response`. The DemuxStream edge
+        // itself must therefore wake and fail a stalled write when the exact
+        // hosted opening authority becomes stale.
+        let write_polled = Arc::new(tokio::sync::Notify::new());
+        let transport = NeverWritable {
+            write_polled: Arc::clone(&write_polled),
+        };
+        let authority_live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer_authority = Arc::clone(&authority_live);
+        let mut stream = DemuxStream::new(Box::pin(transport));
+        stream.retain_http_write_authority_for_test(Arc::new(move || {
+            writer_authority.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+        let writer = tokio::spawn(async move { stream.write_all(b"response").await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), write_polled.notified())
+            .await
+            .expect("direct writer must reach the backpressured transport");
+        tokio::time::sleep(
+            crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL
+                + std::time::Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            !writer.is_finished(),
+            "a current authority must survive the first recurring beat"
+        );
+        authority_live.store(false, std::sync::atomic::Ordering::SeqCst);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("authority loss must interrupt the direct write")
+            .expect("direct writer task")
+            .expect_err("stale hosted authority must fail the write");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

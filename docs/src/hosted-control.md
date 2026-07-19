@@ -277,7 +277,7 @@ recorded renewal as unexpected.
 | Reused proof nonce or WebSocket ticket | Refused by replay/one-use state. |
 | Anonymous replay window or poll budget is exhausted | Public proof is refused without consuming active-lease replay capacity. |
 | Wrong daemon, origin, method, path, key, or time window | Proof is refused. |
-| Expired or revoked lease | New requests fail; live socket and response-pump rechecks close the transport and cancel stream producers. |
+| Expired or revoked lease | New requests fail; every live HTTP socket write and response-producer wait rechecks authority, closes the transport, and cancels stream producers. |
 | Ceiling lowered below a lease | The lease is revoked in the policy transaction. |
 | Ceiling raised | Existing leases are unchanged; a new approval is required. |
 | Persisted hosted role edited | Compiled preset evaluation preserves the operation set. |

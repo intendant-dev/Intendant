@@ -20,6 +20,9 @@ use super::*;
 pub(crate) trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
+/// Cloneable recurring predicate retained by one hosted HTTP exchange.
+pub(crate) type HttpWriteAuthority = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Demuxed connection (plain TCP or TLS) used for all post-demux
 /// HTTP/WebSocket handling, plus the per-exchange keep-alive state the
 /// request loop and the write edges share (see the `keep_alive` module
@@ -29,12 +32,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 /// follow-up request's already-captured segment there so dispatch (and a
 /// WebSocket upgrade arriving on a kept-alive connection) see the request
 /// from byte zero, exactly as the first request is delivered (kernel
-/// buffer on the plain path, `PrefixedStream` on TLS). Writes delegate
-/// straight to the inner stream.
+/// buffer on the plain path, `PrefixedStream` on TLS). Hosted HTTP writes
+/// retain a recurring opening-authority predicate at this lowest shared
+/// transport edge, so direct handler writes and response helpers have the
+/// same revocation/backpressure behavior.
 pub(crate) struct DemuxStream {
     inner: std::pin::Pin<Box<dyn AsyncReadWrite>>,
     replay: Vec<u8>,
     replay_pos: usize,
+    /// Present only after a hosted request proof has admitted this exact
+    /// exchange. Every write/flush/shutdown polls the predicate on a bounded
+    /// beat, including while the underlying socket is backpressured.
+    http_write_authority: Option<HttpWriteAuthority>,
+    http_write_authority_tick: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    http_write_authority_invalid: bool,
     /// Request leg of the keep-alive verdict (client headers + loop
     /// budget + segment framing); set by the request loop per request.
     client_allows_reuse: bool,
@@ -62,6 +73,9 @@ impl DemuxStream {
             inner,
             replay: Vec::new(),
             replay_pos: 0,
+            http_write_authority: None,
+            http_write_authority_tick: None,
+            http_write_authority_invalid: false,
             client_allows_reuse: false,
             request_consumed: false,
             parked: std::sync::Weak::new(),
@@ -76,12 +90,37 @@ impl DemuxStream {
         self.parked = Arc::downgrade(slot);
     }
 
+    /// Retain the exact hosted opening authority at the socket edge. The
+    /// response pump also clones this predicate to cover time spent waiting
+    /// for a producer, when no socket future exists to drive `poll_write`.
+    pub(crate) fn retain_hosted_http_authority(&mut self, authority: HostedHttpAuthority) {
+        self.http_write_authority =
+            Some(Arc::new(move || authority.opening_authority_is_current()));
+        self.http_write_authority_tick = None;
+        self.http_write_authority_invalid = false;
+    }
+
+    pub(crate) fn http_write_authority(&self) -> Option<HttpWriteAuthority> {
+        self.http_write_authority.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_http_write_authority_for_test(&mut self, authority: HttpWriteAuthority) {
+        self.http_write_authority = Some(authority);
+        self.http_write_authority_tick = None;
+        self.http_write_authority_invalid = false;
+    }
+
     /// Begin one request/response exchange: record the request leg's
-    /// verdict and reset the body leg (fail-closed until dispatch proves
-    /// the body was consumed).
+    /// verdict and reset the body and authority legs (fail-closed until
+    /// dispatch proves body consumption and, for a hosted request, retains
+    /// that request's newly verified authority).
     pub(crate) fn begin_request(&mut self, client_allows_reuse: bool) {
         self.client_allows_reuse = client_allows_reuse;
         self.request_consumed = false;
+        self.http_write_authority = None;
+        self.http_write_authority_tick = None;
+        self.http_write_authority_invalid = false;
     }
 
     /// Body leg: dispatch proved this request's body is fully consumed
@@ -127,6 +166,54 @@ impl DemuxStream {
         };
         *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(self);
     }
+
+    /// Register this task's waker with the recurring authority timer and
+    /// fail the current transport operation on the first expired beat whose
+    /// predicate is no longer current. The initial transport operation checks
+    /// immediately; subsequent checks are at the same bounded interval used
+    /// by WebSocket and dashboard-control live authority.
+    fn poll_http_write_authority(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::io::Result<()> {
+        if self.http_write_authority.is_none() {
+            return Ok(());
+        }
+        let invalid_error = || {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "hosted HTTP opening authority is no longer current",
+            )
+        };
+        if self.http_write_authority_invalid {
+            return Err(invalid_error());
+        }
+        use std::future::Future as _;
+        let first_check = self.http_write_authority_tick.is_none();
+        let tick = self.http_write_authority_tick.get_or_insert_with(|| {
+            Box::pin(tokio::time::sleep(
+                crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+            ))
+        });
+        let elapsed = tick.as_mut().poll(cx).is_ready();
+        if elapsed {
+            tick.as_mut().reset(
+                tokio::time::Instant::now()
+                    + crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+            );
+            let _ = tick.as_mut().poll(cx);
+        }
+        if (first_check || elapsed)
+            && self
+                .http_write_authority
+                .as_ref()
+                .is_some_and(|authority| !authority())
+        {
+            self.http_write_authority_invalid = true;
+            return Err(invalid_error());
+        }
+        Ok(())
+    }
 }
 
 impl AsyncRead for DemuxStream {
@@ -156,21 +243,33 @@ impl AsyncWrite for DemuxStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.get_mut().inner.as_mut().poll_write(cx, buf)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_http_write_authority(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        this.inner.as_mut().poll_write(cx, buf)
     }
 
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.get_mut().inner.as_mut().poll_flush(cx)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_http_write_authority(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        this.inner.as_mut().poll_flush(cx)
     }
 
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.get_mut().inner.as_mut().poll_shutdown(cx)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_http_write_authority(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        this.inner.as_mut().poll_shutdown(cx)
     }
 
     fn poll_write_vectored(
@@ -178,7 +277,11 @@ impl AsyncWrite for DemuxStream {
         cx: &mut std::task::Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.get_mut().inner.as_mut().poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_http_write_authority(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        this.inner.as_mut().poll_write_vectored(cx, bufs)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -1409,7 +1512,13 @@ mod tests {
         let mut stream = DemuxStream::new(Box::pin(server));
         // Fail-closed defaults: no verdict, no armed slot.
         assert!(!stream.exchange_reusable());
+        stream.retain_http_write_authority_for_test(Arc::new(|| false));
+        assert!(stream.http_write_authority().is_some());
         stream.begin_request(true);
+        assert!(
+            stream.http_write_authority().is_none(),
+            "a kept-alive exchange must not inherit the prior request's authority"
+        );
         stream.mark_request_body_consumed();
         // Still not reusable: the parked slot was never armed (the
         // fixture / one-shot shape), so a park would just close.
