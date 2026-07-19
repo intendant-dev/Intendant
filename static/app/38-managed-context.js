@@ -1789,7 +1789,6 @@ function resetSessionWindowLog(win) {
     win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
   }
   win.followOutput = true;
-  win.pendingOutput = false;
   updateSessionWindowJumpButton(win);
   scheduleSessionWindowGridFit();
 }

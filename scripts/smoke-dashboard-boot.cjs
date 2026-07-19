@@ -23,6 +23,17 @@
 //       20-shell.html).
 //   (bonus) if `window.__intendantModuleAlive` exists it must be truthy;
 //       its absence is fine — assertion (a) stands alone.
+//   (d) the session-window jump-to-bottom button is state-derived: on a
+//       synthetic window it must appear whenever the reader is scrolled
+//       off the tail (including on a QUIET window with no appends in
+//       flight), stay put without flicker while output streams in, and
+//       hide at the tail / while minimized / after a restore-from-minimize
+//       rebuild. This is the one interaction-state assertion in the smoke:
+//       the visibility predicate regressed silently in production
+//       (2026-07-19 — event-starved by an append-only flag) because no CI
+//       harness executes SPA interaction paths; the probe is keyless,
+//       deterministic (synthetic DOM only, no daemon sessions), and adds
+//       one Runtime.evaluate.
 //
 // This script builds and launches NOTHING but the browser: point it at a
 // running daemon. Keyless local recipe:
@@ -520,6 +531,115 @@ class BootLedger {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Session-window jump-button behavior probe (assertion (d)).
+//
+// Runs entirely inside the page against a synthetic session window built
+// through the SPA's own creation/append paths — no daemon session exists on
+// the keyless smoke daemon, and none is needed: the probe pins the
+// client-side visibility state machine (scroll → follow recompute → button)
+// that broke silently when it was keyed on an append-only flag. Module-scope
+// SPA functions are unreachable from page evals (one shared module scope),
+// so state mutations go through the window.qa.sessionWindowSweeps facade
+// (41-session-window-actions.js) and everything else is plain DOM. Every
+// wait is a double-rAF settle (scroll events from programmatic scrollTop
+// writes and the SPA's rAF-coalesced follow scroll both land within one
+// frame).
+const JUMP_BUTTON_PROBE_EXPRESSION = `(async () => {
+  const out = { failures: [], steps: [] };
+  const check = (cond, label) => {
+    out.steps.push((cond ? 'pass' : 'FAIL') + ' ' + label);
+    if (!cond) out.failures.push(label);
+  };
+  const settle = () => new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  });
+  const sid = 'boot-smoke-jump-probe';
+  const qa = window.qa && window.qa.sessionWindowSweeps;
+  for (const name of ['build', 'append', 'remove', 'setMinimized', 'windowState']) {
+    if (!qa || typeof qa[name] !== 'function') {
+      out.failures.push('window.qa.sessionWindowSweeps.' + name + ' missing');
+      return out;
+    }
+  }
+  try {
+    if (!qa.build(sid, { task: 'jump-button smoke probe' })) {
+      out.failures.push('synthetic session window did not materialize');
+      return out;
+    }
+    const root = document.querySelector('.session-window[data-session-id="' + sid + '"]');
+    const log = root && root.querySelector('.session-window-log');
+    const button = root && root.querySelector('.session-window-jump-bottom');
+    if (!root || !log || !button) {
+      out.failures.push('probe window DOM (log / jump button) missing');
+      return out;
+    }
+    // Deterministic scroll geometry regardless of grid auto-fit sizing.
+    log.style.height = '120px';
+    log.style.minHeight = '120px';
+    log.style.overflowY = 'auto';
+    const visible = () => !button.classList.contains('hidden');
+    const atTail = () => {
+      const state = qa.windowState(sid);
+      return !!(state && state.logAtBottom);
+    };
+    for (let i = 0; i < 40; i += 1) qa.append(sid, 'probe seed ' + i + ' ' + 'x'.repeat(48));
+    await settle();
+    check(log.scrollHeight > log.clientHeight + 60, 'probe window is scrollable');
+    check(!visible(), 'seeded at tail: button hidden');
+    // (1) QUIET window scrolled up: nothing appends afterwards — the scroll
+    // recompute alone must reveal the button.
+    log.scrollTop = 0;
+    await settle();
+    check(visible(), 'scrolled-up quiet window: button visible');
+    // (4) streaming appends while scrolled up: stays visible with no
+    // hidden-flicker (any class mutation whose OLD value contains "hidden"
+    // means the button was hidden at some point mid-burst) and no follow
+    // steal of the reader's scroll position.
+    let flickered = false;
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        if (/(^|\\s)hidden(\\s|$)/.test(record.oldValue || '')) flickered = true;
+      }
+    });
+    observer.observe(button, { attributes: true, attributeFilter: ['class'], attributeOldValue: true });
+    const heldScrollTop = log.scrollTop;
+    for (let i = 0; i < 12; i += 1) qa.append(sid, 'probe stream ' + i + ' ' + 'y'.repeat(48));
+    await settle();
+    observer.disconnect();
+    check(visible(), 'streaming append while scrolled up: button still visible');
+    check(!flickered, 'no hidden-flicker during streamed appends');
+    check(Math.abs(log.scrollTop - heldScrollTop) < 1, 'no follow steal while scrolled up');
+    // (2) the button's own click path returns to the tail and hides it.
+    button.click();
+    await settle();
+    check(atTail(), 'jump click landed at the tail');
+    check(!visible(), 'at tail after jump click: button hidden');
+    // (3) restore-from-minimize: minimize unmounts the transcript; restore
+    // re-materializes the tail and lands at the bottom by design, so the
+    // button must be hidden after the rebuild — and a fresh scroll-up on the
+    // rebuilt DOM must reveal it again.
+    log.scrollTop = 0;
+    await settle();
+    check(visible(), 'scrolled up before minimize: button visible');
+    qa.setMinimized(sid, true);
+    await settle();
+    check(!visible(), 'minimized: button hidden');
+    qa.setMinimized(sid, false);
+    await settle();
+    check(atTail(), 'restore-from-minimize landed at the tail');
+    check(!visible(), 'restored at tail: button hidden');
+    log.scrollTop = 0;
+    await settle();
+    check(visible(), 'scrolled up after restore rebuild: button visible');
+  } catch (error) {
+    out.failures.push('probe threw: ' + (error && error.message ? error.message : String(error)));
+  } finally {
+    try { qa.remove(sid); } catch (_) {}
+  }
+  return out;
+})()`;
+
 function remoteObjectText(arg) {
   if (!arg || typeof arg !== 'object') return '';
   if (arg.value !== undefined) {
@@ -612,8 +732,8 @@ async function main() {
     const nav = await cdp.send('Page.navigate', { url: opts.url }, sessionId);
     if (nav.errorText) throw new Error(`navigation failed: ${nav.errorText}`);
 
-    const evaluate = async (expression) => {
-      const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId);
+    const evaluate = async (expression, { awaitPromise = false } = {}) => {
+      const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise }, sessionId);
       if (result.exceptionDetails) throw new Error(`evaluate failed: ${exceptionText(result.exceptionDetails)}`);
       return result.result ? result.result.value : undefined;
     };
@@ -679,6 +799,19 @@ async function main() {
     }
 
     await delay(POST_BOOT_SETTLE_MS);
+
+    // Assertion (d): drive the jump-button state machine on a synthetic
+    // window. Runs before the ledger verdict so any page error the probe
+    // provokes also fails the smoke.
+    const jump = await evaluate(JUMP_BUTTON_PROBE_EXPRESSION, { awaitPromise: true });
+    const jumpSteps = Array.isArray(jump && jump.steps) ? jump.steps : [];
+    const jumpFailures = Array.isArray(jump && jump.failures) ? jump.failures : ['probe returned no result'];
+    console.log(`jump-button probe: ${jumpSteps.length} steps, ${jumpFailures.length} failures`);
+    for (const line of jumpSteps.slice(0, MAX_REPORT_LINES)) console.log(`  ${line}`);
+    if (jumpFailures.length > 0) {
+      for (const line of jumpFailures) ledger.record('jump-button', line, { fatal: true });
+      throw new Error(`jump-button probe failed ${jumpFailures.length} assertion(s)`);
+    }
 
     if (ledger.allowed.length > 0) {
       console.log(`allowed network-level noise (${ledger.allowed.length} entries):`);
