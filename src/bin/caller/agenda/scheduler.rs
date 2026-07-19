@@ -75,11 +75,17 @@ pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task
                 _ = tokio::time::sleep(sleep_for) => {}
                 event = events.recv() => match event {
                     Ok(event) => observe_event(&handle, &mut journal, &mut state, &event),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Missed events: receipts/completions may be gone.
-                        // The journal keeps ground truth; a restart (or the
-                        // next boot pass) resolves stragglers to Unknown.
-                        eprintln!("[agenda] scheduler lagged on the event bus");
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Receipts and terminal events cannot be reconstructed
+                        // from the broadcast stream. Apply the same fail-closed
+                        // terminal state as restart recovery so an occurrence
+                        // cannot remain excluded from planning indefinitely.
+                        let resolved =
+                            resolve_lagged_occurrences(&handle, &mut journal, &mut state);
+                        eprintln!(
+                            "[agenda] scheduler lagged on the event bus \
+                             (skipped {skipped}, resolved {resolved} in-flight occurrences)"
+                        );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },
@@ -144,6 +150,75 @@ fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal)
             session_id.as_deref().unwrap_or("?")
         );
     }
+}
+
+/// A broadcast lag means one or more launch receipts or terminal events may
+/// be unrecoverable. Resolve every in-memory occurrence to `Unknown`, just as
+/// restart recovery does, and remove it from the in-flight set only after the
+/// terminal journal row is durable.
+fn resolve_lagged_occurrences(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    state: &mut SchedulerState,
+) -> usize {
+    let now = now_ms();
+    let mut resolved = 0;
+
+    let awaiting: Vec<(String, SpawnOccurrence)> = state
+        .awaiting
+        .iter()
+        .map(|(occurrence_id, spawn)| (occurrence_id.clone(), spawn.clone()))
+        .collect();
+    for (occurrence_id, spawn) in awaiting {
+        if resolve_lagged_occurrence(handle, journal, &spawn, None, now) {
+            state.awaiting.remove(&occurrence_id);
+            resolved += 1;
+        }
+    }
+
+    let running: Vec<(String, SpawnOccurrence)> = state
+        .running
+        .iter()
+        .map(|(session_id, spawn)| (session_id.clone(), spawn.clone()))
+        .collect();
+    for (session_id, spawn) in running {
+        if resolve_lagged_occurrence(handle, journal, &spawn, Some(session_id.clone()), now) {
+            state.running.remove(&session_id);
+            resolved += 1;
+        }
+    }
+
+    resolved
+}
+
+fn resolve_lagged_occurrence(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    spawn: &SpawnOccurrence,
+    session_id: Option<String>,
+    now: u64,
+) -> bool {
+    if !session_record(
+        journal,
+        spawn,
+        now,
+        OccurrenceState::Unknown,
+        session_id.clone(),
+    ) {
+        return false;
+    }
+    let why =
+        "scheduler lost event continuity — outcome unknown; check the session log".to_string();
+    record_on_item(handle, spawn, "unknown", session_id, Some(why.clone()));
+    handle.bus().send(AppEvent::UserNotification {
+        session_id: None,
+        id: format!("agenda-session-unknown-{}", spawn.occurrence_id),
+        title: Some("Scheduled session outcome unknown".to_string()),
+        text: format!("{} — {}", spawn.goal, why),
+        urgency: crate::types::NotificationUrgency::Attention,
+        ts: now,
+    });
+    true
 }
 
 /// One plan-and-act pass. Returns the next wake instant, if any.
@@ -959,6 +1034,91 @@ mod tests {
         assert_eq!(run.state, "completed");
         assert_eq!(run.note.as_deref(), Some("rev 2 done"));
         assert_eq!(run.session_id.as_deref(), Some("sess-run-2"));
+    }
+
+    #[tokio::test]
+    async fn event_lag_resolves_awaiting_and_running_occurrences_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = Arc::new(AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus,
+            dir.path(),
+        ));
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        approved_effect_item(&handle, now_ms() - 60_000);
+        approved_effect_item(&handle, now_ms() - 60_000);
+
+        run_pass(&handle, &mut journal, &mut state).await;
+        assert_eq!(state.awaiting.len(), 2);
+        let running_occurrence = state.awaiting.keys().next().unwrap().clone();
+        let running_item = state.awaiting[&running_occurrence].item_id.clone();
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id: format!("{DELEGATION_PREFIX}{running_occurrence}"),
+                session_id: "sess-lagged".into(),
+            },
+        );
+        let awaiting_occurrence = state.awaiting.keys().next().unwrap().clone();
+        let awaiting_item = state.awaiting[&awaiting_occurrence].item_id.clone();
+
+        assert_eq!(
+            resolve_lagged_occurrences(&handle, &mut journal, &mut state),
+            2
+        );
+        assert!(state.awaiting.is_empty());
+        assert!(state.running.is_empty());
+        assert_eq!(
+            journal.progress(&running_occurrence).terminal,
+            Some(OccurrenceState::Unknown)
+        );
+        assert_eq!(
+            journal.progress(&awaiting_occurrence).terminal,
+            Some(OccurrenceState::Unknown)
+        );
+
+        let (items, _, _) = handle.snapshot();
+        let running = items.iter().find(|item| item.id == running_item).unwrap();
+        assert_eq!(
+            running.effects[0].last_run.as_ref().unwrap().state,
+            "unknown"
+        );
+        assert_eq!(
+            running.effects[0]
+                .last_run
+                .as_ref()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("sess-lagged")
+        );
+        let awaiting = items.iter().find(|item| item.id == awaiting_item).unwrap();
+        assert_eq!(
+            awaiting.effects[0].last_run.as_ref().unwrap().state,
+            "unknown"
+        );
+        assert!(awaiting.effects[0]
+            .last_run
+            .as_ref()
+            .unwrap()
+            .session_id
+            .is_none());
+
+        let mut events = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    AppEvent::ControlCommand(ControlMsg::StartTask { .. })
+                ),
+                "unknown occurrences must not be dispatched again"
+            );
+        }
     }
 
     /// A session that stops or errors before finishing records `failed`;
