@@ -1187,11 +1187,28 @@ disable-auto-invocation: true
 ```
 
 Frontmatter fields: `name` (required), `description` (required), `autonomy`
-(override session autonomy when active), `disable-auto-invocation` (only the
-user can trigger it), `disable-model-invocation` (run without LLM calls),
-`sandbox` (override the session sandbox setting), `compatibility` (required
-system tools), `allowed-tools` (restrict the available tool set). Project skills
-take precedence over personal skills of the same name.
+and `sandbox` (parsed, reserved — not yet enforced), `disable-auto-invocation`
+(only the user can trigger it; splits the injected catalog's auto vs manual
+sections). `disable-model-invocation`, `compatibility`, and `allowed-tools`
+are accepted in frontmatter for forward compatibility but are **not yet
+interpreted** by the parser. Project skills take precedence over personal
+skills of the same name.
+
+### Materialization for supervised external agents
+
+On every supervised external spawn, the daemon materializes the effective
+skill catalog into the session project's standard scan paths so Claude
+Code (`<project>/.claude/skills/`) and Codex (`<project>/.agents/skills/`)
+discover the same skills native sessions do. Materialized directories are
+derived copies: each carries an `.intendant-materialized` marker, is
+refreshed (swept and rewritten) on the next spawn, is skipped by
+Intendant's own discovery so a copy never shadows its source, and is
+hidden from `git status` through a managed block in the checkout's shared
+`.git/info/exclude` — never a committed ignore file. A user-authored
+directory with the same name in a target path always wins; the copy is
+skipped. Per-skill copies are capped at 4 MB; symlinked entries are never
+followed. Set `INTENDANT_SKIP_SKILL_PROVISION=1` to disable
+materialization entirely.
 
 ## INTENDANT.md project instructions
 
