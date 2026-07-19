@@ -3074,13 +3074,20 @@ mod tests {
     // exactly like `/api/sessions`.
 
     /// The posture-rendered head with no validated cross-origin caller,
-    /// byte for byte.
-    pub(super) const SESSIONS_STREAM_HEAD_GOLDEN: &str = "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/x-ndjson\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         Vary: Origin\r\n\
-         \r\n";
+    /// byte for byte (the serialization seam prepends the build stamp of
+    /// the embedded dashboard bundle to every rendered head).
+    pub(super) fn sessions_stream_head_golden() -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\n\
+             x-intendant-app-build: {}\r\n\
+             Content-Type: application/x-ndjson\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n\
+             Vary: Origin\r\n\
+             \r\n",
+            crate::web_gateway::static_assets::app_build()
+        )
+    }
 
     #[tokio::test]
     async fn golden_sessions_stream_http_head_is_pinned() {
@@ -3109,7 +3116,7 @@ mod tests {
         let head = stream_response_http_head(status, &content_type, headers, row_cors, None);
         assert_eq!(
             String::from_utf8(head).unwrap(),
-            SESSIONS_STREAM_HEAD_GOLDEN
+            sessions_stream_head_golden()
         );
     }
 
