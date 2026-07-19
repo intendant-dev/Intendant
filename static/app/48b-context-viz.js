@@ -964,15 +964,47 @@ function contextResetPointerState() {
   contextViz.canvas?.classList.remove('dragging');
 }
 
+// WebGL-less degrade note (headless/GPU-less browsers, some remote
+// desktops). contextBuildThree re-hides #context-scene-empty on every
+// call before init, so the unavailable path must re-show it every time.
+function contextShowWebglUnavailableNote() {
+  const empty = document.getElementById('context-scene-empty');
+  if (!empty) return;
+  empty.textContent = '3D context view is unavailable: this browser could not create a WebGL context. The context details, legend, and raw views still work.';
+  empty.style.display = 'flex';
+}
+
 function contextInitThree() {
   const canvas = document.getElementById('context-scene');
   if (!canvas) return false;
   if (contextViz.renderer) return true;
+  if (contextViz.webglUnavailable) {
+    contextShowWebglUnavailableNote();
+    return false;
+  }
+  // Probe the context BEFORE handing the canvas to THREE: WebGLRenderer
+  // console.error()s and then THROWS when WebGL is unavailable, and that
+  // throw used to escape renderContextPane into whatever UI action focused
+  // the session (e.g. a transcript jump-to-bottom click died before it
+  // scrolled). A null getContext is silent — degrade to the empty-state
+  // note and keep the rest of the pane working. WebGL2 only: the vendored
+  // THREE (r165) no longer accepts WebGL1 contexts.
+  let gl = null;
+  try {
+    gl = canvas.getContext('webgl2', { antialias: true, alpha: true });
+  } catch (_) {
+    gl = null;
+  }
+  if (!gl) {
+    contextViz.webglUnavailable = true;
+    contextShowWebglUnavailableNote();
+    return false;
+  }
   contextViz.canvas = canvas;
   contextViz.scene = new THREE.Scene();
   contextViz.camera = new THREE.PerspectiveCamera(42, 1, 0.1, 1000);
   contextViz.camera.position.set(0, 18, contextViz.zoom);
-  contextViz.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  contextViz.renderer = new THREE.WebGLRenderer({ canvas, context: gl, antialias: true, alpha: true });
   contextViz.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
   contextViz.root = new THREE.Group();
   contextViz.scene.add(contextViz.root);

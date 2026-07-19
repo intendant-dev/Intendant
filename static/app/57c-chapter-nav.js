@@ -303,6 +303,10 @@ function chapterNavJumpPane(win, mode, dir) {
   win.followOutput = false;
   win.log.scrollTop = chapterNavJumpScrollTop(win.log, node);
   ix.cursor = { mark: target, scrollTop: win.log.scrollTop };
+  // Deterministic jump-button recompute: the scrollTop write above fires a
+  // scroll event only when the position actually changed, so a jump onto
+  // the current position would otherwise leave the button stale.
+  updateSessionWindowJumpButton(win);
   chapterNavHighlightRow(node, mode);
   const cluster = chapterNavClusterForPane(win);
   chapterNavUpdateCount(cluster, mode, marks, target);
@@ -340,6 +344,7 @@ function chapterNavPaneHistoryLoaded(win) {
   win.followOutput = false;
   win.log.scrollTop = chapterNavJumpScrollTop(win.log, node);
   ix.cursor = { mark: target, scrollTop: win.log.scrollTop };
+  updateSessionWindowJumpButton(win);
   chapterNavHighlightRow(node, pending.mode);
   const cluster = chapterNavClusterForPane(win);
   chapterNavUpdateCount(cluster, pending.mode, marks, target);

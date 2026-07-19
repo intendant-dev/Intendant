@@ -1540,9 +1540,20 @@ function loadNewerSessionWindowEntries(win) {
   return true;
 }
 
+// State-derived visibility: the button shows whenever the reader is off
+// the tail. win.followOutput is the maintained at-tail state — recomputed
+// from real geometry on every scroll (updateSessionWindowFollowFromScroll),
+// set true by every follow/jump/restore path, cleared by scroll-away,
+// append-while-scrolled-up, and chapter jumps. The retired predicate
+// additionally required the old win.pendingOutput "new output arrived
+// below" flag, which only the append paths set — so scrolling up in a
+// quiet session never revealed the button until output happened to stream
+// in (intermittently-missing jump button, fixed 2026-07-19). Deliberately
+// NO layout reads here: this runs per appended chunk per window (see the
+// rAF-coalescing note below for why that path must not force layout).
 function updateSessionWindowJumpButton(win) {
   if (!win || !win.jumpBottom) return;
-  const show = !!win.pendingOutput && !win.followOutput && !win.minimized;
+  const show = !win.followOutput && !win.minimized;
   win.jumpBottom.classList.toggle('hidden', !show);
   win.jumpBottom.setAttribute('aria-hidden', show ? 'false' : 'true');
 }
@@ -1572,7 +1583,6 @@ function scrollSessionWindowToBottom(win) {
     renderSessionWindowTail(win);
   }
   win.followOutput = true;
-  win.pendingOutput = false;
   updateSessionWindowJumpButton(win);
   scheduleSessionWindowScrollToBottom(win);
 }
@@ -1583,7 +1593,6 @@ function applySessionWindowOutputScroll(win, shouldFollow) {
     scrollSessionWindowToBottom(win);
   } else {
     win.followOutput = false;
-    win.pendingOutput = true;
     updateSessionWindowJumpButton(win);
   }
 }
@@ -1592,12 +1601,7 @@ function updateSessionWindowFollowFromScroll(win) {
   if (!win || !win.log) return;
   loadOlderSessionWindowEntries(win);
   loadNewerSessionWindowEntries(win);
-  if (sessionWindowIsRenderingTail(win) && sessionWindowLogIsAtBottom(win.log)) {
-    win.followOutput = true;
-    win.pendingOutput = false;
-  } else {
-    win.followOutput = false;
-  }
+  win.followOutput = sessionWindowIsRenderingTail(win) && sessionWindowLogIsAtBottom(win.log);
   updateSessionWindowJumpButton(win);
 }
 
