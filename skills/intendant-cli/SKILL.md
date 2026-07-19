@@ -25,6 +25,7 @@ Quick recipes — the highest-traffic one-liners; everything else is one `--help
 "${INTENDANT:-intendant}" ctl session note "Milestone: tests green"   # display-only note in your transcript
 "${INTENDANT:-intendant}" ctl session note "Before/after" --image before.png --image after.png
 "${INTENDANT:-intendant}" ctl ask "Which database?" --option "postgres:Existing infra" --option sqlite   # BLOCKS; prints the answer
+"${INTENDANT:-intendant}" ctl ask "Which landing page?" --option A --option B --preview-html A=a.html --preview-html B=b.html   # show, then ask: rendered prototype/before-after cards (see show-then-ask)
 "${INTENDANT:-intendant}" ctl notify "Long build finished — opening the PR" --title CI   # fire-and-forget
 "${INTENDANT:-intendant}" ctl peer list                               # federated peers + their displays
 "${INTENDANT:-intendant}" ctl peer task <peer-id> "instructions"      # the peer's own agent executes
