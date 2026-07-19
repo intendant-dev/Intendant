@@ -2149,21 +2149,20 @@ pub(crate) async fn handle_parent_undo_thread_action(
     config: &DrainConfig<'_>,
 ) {
     let turns = undo_turns_from_params(&params);
-    let result = match parent_rewind_first_turn_for_undo(
-        user_turn_revisions.active_count() as usize,
-        turns,
-    ) {
-        Ok(first_user_turn_index) => rollback_parent_thread_from_turn(
-            agent,
-            round,
-            user_turn_revisions,
-            first_user_turn_index,
-            config,
-        )
-        .await
-        .map(|turns_removed| format!("rolled back {} turn(s)", turns_removed)),
-        Err(message) => Err(message),
-    };
+    let result =
+        match parent_rewind_first_turn_for_undo(user_turn_revisions.active_count() as usize, turns)
+        {
+            Ok(first_user_turn_index) => rollback_parent_thread_from_turn(
+                agent,
+                round,
+                user_turn_revisions,
+                first_user_turn_index,
+                config,
+            )
+            .await
+            .map(|turns_removed| format!("rolled back {} turn(s)", turns_removed)),
+            Err(message) => Err(message),
+        };
 
     let (success, message) = match result {
         Ok(message) => (true, message),

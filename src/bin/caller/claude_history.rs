@@ -78,7 +78,8 @@ mod tests {
         let state = user_turn_state_from_transcript_entries(entries.iter());
         assert_eq!(state.active_count(), 2);
 
-        let empty = user_turn_state_from_transcript_entries(std::iter::empty::<&serde_json::Value>());
+        let empty =
+            user_turn_state_from_transcript_entries(std::iter::empty::<&serde_json::Value>());
         assert_eq!(empty.active_count(), 0);
     }
 
