@@ -195,10 +195,10 @@ pub struct ApprovalConfig {
     pub destructive: ApprovalRule,
     #[serde(default)]
     pub display_control: ApprovalRule,
-    /// External-agent tool / MCP calls (e.g. Codex invoking Intendant's
-    /// own MCP server tools). Defaults to `Auto` so users can auto-allow
-    /// these without going Full autonomy.
-    #[serde(default = "default_auto")]
+    /// Controller-dispatched and external-agent tool / MCP calls. Defaults
+    /// to `Ask`: external MCP servers are an untrusted instruction/data
+    /// boundary, so Medium autonomy must not silently cross it.
+    #[serde(default)]
     pub tool_call: ApprovalRule,
 }
 
@@ -216,7 +216,7 @@ impl Default for ApprovalConfig {
             network: ApprovalRule::Auto,
             destructive: ApprovalRule::Ask,
             display_control: ApprovalRule::Ask,
-            tool_call: ApprovalRule::Auto,
+            tool_call: ApprovalRule::Ask,
         }
     }
 }
@@ -384,10 +384,8 @@ impl AutonomyState {
                 // Apply global autonomy level
                 match self.level {
                     AutonomyLevel::Medium => {
-                        // Ask for shell execution and Ask-ruled effects.
-                        // ToolCall is here too, but its default rule is
-                        // Auto — this arm is reached only under an
-                        // explicit `tool_call = "ask"`.
+                        // Ask for shell execution and Ask-ruled effects,
+                        // including controller/external-agent tool calls.
                         matches!(
                             category,
                             ActionCategory::CommandExec
@@ -454,10 +452,10 @@ impl AutonomyState {
     /// - an explicit `Deny` rule refuses at every level, matching the
     ///   runtime batch consult (where a Deny rule is absolute);
     /// - otherwise [`Self::needs_approval`] for [`ActionCategory::ToolCall`]
-    ///   decides: Low always prompts, the default `Auto` rule dispatches
-    ///   without a prompt at Medium/High (orchestration and MCP stay usable
-    ///   at default autonomy), an explicit `Ask` rule prompts at Medium,
-    ///   and Full never asks.
+    ///   decides: Low always prompts, the default `Ask` rule prompts at
+    ///   Medium, High auto-approves ordinary Ask rules, and Full never asks.
+    ///   Users who deliberately trust their configured servers can opt into
+    ///   `tool_call = "auto"`.
     pub fn controller_tool_decision(&self) -> ControllerToolDecision {
         let rule = self.rules.rule_for(ActionCategory::ToolCall);
         if rule == ApprovalRule::Deny {
@@ -844,7 +842,7 @@ mod tests {
         assert_eq!(config.command_exec, ApprovalRule::Auto);
         assert_eq!(config.network, ApprovalRule::Auto);
         assert_eq!(config.destructive, ApprovalRule::Ask);
-        assert_eq!(config.tool_call, ApprovalRule::Auto);
+        assert_eq!(config.tool_call, ApprovalRule::Ask);
         // The configured command-only field is Auto, but arbitrary shell
         // execution inherits the stricter reachable-effect defaults.
         assert_eq!(
@@ -905,6 +903,7 @@ destructive = "deny"
         assert_eq!(config.file_read, ApprovalRule::Auto);
         assert_eq!(config.file_write, ApprovalRule::Deny);
         assert_eq!(config.command_exec, ApprovalRule::Ask);
+        assert_eq!(config.tool_call, ApprovalRule::Ask);
     }
 
     #[test]
@@ -1088,15 +1087,15 @@ destructive = "deny"
 
     #[test]
     fn controller_tool_decision_honors_rules_and_levels() {
-        // Default (Medium + tool_call = auto): dispatch without prompting,
-        // so MCP and orchestration stay usable at default autonomy.
+        // The shipped Medium default prompts before crossing a controller
+        // or external-agent tool boundary.
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
         assert_eq!(
             state.controller_tool_decision(),
-            ControllerToolDecision::AutoApprove
+            ControllerToolDecision::Ask
         );
 
-        // Low always prompts.
+        // Low also prompts.
         let state = AutonomyState::new(AutonomyLevel::Low, ApprovalConfig::default());
         assert_eq!(
             state.controller_tool_decision(),
@@ -1110,15 +1109,17 @@ destructive = "deny"
             ControllerToolDecision::AutoApprove
         );
 
-        // An explicit ask rule prompts at Medium, not at High (High
-        // auto-approves ordinary Ask rules).
+        // Users can deliberately opt into auto dispatch at Medium.
         let mut rules = ApprovalConfig::default();
-        rules.tool_call = ApprovalRule::Ask;
+        rules.tool_call = ApprovalRule::Auto;
         let state = AutonomyState::new(AutonomyLevel::Medium, rules.clone());
         assert_eq!(
             state.controller_tool_decision(),
-            ControllerToolDecision::Ask
+            ControllerToolDecision::AutoApprove
         );
+
+        // The default Ask rule is auto-approved at High.
+        rules.tool_call = ApprovalRule::Ask;
         let state = AutonomyState::new(AutonomyLevel::High, rules);
         assert_eq!(
             state.controller_tool_decision(),
@@ -1205,15 +1206,15 @@ destructive = "deny"
     }
 
     #[test]
-    fn medium_asks_for_tool_call_only_under_explicit_ask_rule() {
-        // Default Auto: no prompt at Medium.
+    fn medium_asks_for_tool_call_by_default_and_auto_is_explicit() {
+        // Default Ask: prompt at Medium.
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
-        assert!(!state.needs_approval(ActionCategory::ToolCall));
-        // Explicit ask rule: prompt at Medium.
-        let mut rules = ApprovalConfig::default();
-        rules.tool_call = ApprovalRule::Ask;
-        let state = AutonomyState::new(AutonomyLevel::Medium, rules);
         assert!(state.needs_approval(ActionCategory::ToolCall));
+        // Explicit auto rule: no prompt at Medium.
+        let mut rules = ApprovalConfig::default();
+        rules.tool_call = ApprovalRule::Auto;
+        let state = AutonomyState::new(AutonomyLevel::Medium, rules);
+        assert!(!state.needs_approval(ActionCategory::ToolCall));
     }
 
     #[test]
@@ -1601,11 +1602,17 @@ destructive = "deny"
     }
 
     #[test]
-    fn external_approval_tool_call_auto_approves() {
-        // ToolCall honors an explicit Auto rule (the default) without Full
-        // autonomy, so Intendant's own MCP tools can be auto-allowed.
+    fn external_approval_tool_call_asks_by_default_and_honors_explicit_auto() {
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
-        assert_eq!(state.rules.tool_call, ApprovalRule::Auto);
+        assert_eq!(state.rules.tool_call, ApprovalRule::Ask);
+        assert_eq!(
+            state.external_approval_decision(ActionCategory::ToolCall),
+            ExternalApprovalDecision::Ask
+        );
+
+        let mut rules = ApprovalConfig::default();
+        rules.tool_call = ApprovalRule::Auto;
+        let state = AutonomyState::new(AutonomyLevel::Medium, rules);
         assert_eq!(
             state.external_approval_decision(ActionCategory::ToolCall),
             ExternalApprovalDecision::AutoApprove

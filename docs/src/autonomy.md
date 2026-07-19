@@ -124,9 +124,10 @@ The precise logic (`AutonomyState::needs_approval`) has nuances worth knowing:
 - **Low** — asks for everything except `FileRead` (a `deny` rule still blocks).
 - **Medium / High** — start from the per-category rule. For an `ask` rule,
   Medium asks only for `CommandExec` / `FileWrite` / `FileDelete` /
-  `Destructive` / `NetworkRequest` / `ToolCall` (the last only under an explicit
-  `tool_call = "ask"` — its default rule is `auto`); High asks for none of
-  them.
+  `Destructive` / `NetworkRequest` / `ToolCall`; High asks for none of them.
+  `ToolCall` defaults to `ask`, so the shipped Medium posture prompts before
+  outbound MCP, skill invocation, orchestration spawns/checkpoints, and
+  external-agent MCP permission requests.
 
 ## Approval dedup (what "remembered" means)
 
@@ -171,21 +172,23 @@ outcomes write the corresponding session-log rows (`waiting`, `approved`,
 | `shared_view` | dedicated `user_display_granted` opt-in for user-display show/capture |
 | `spawn_live_audio` | dedicated always-ask consent gate (never auto-approved) |
 
-Semantics at the gate: the default `tool_call = "auto"` dispatches without a
-prompt at Medium/High (orchestration and MCP stay usable at default
-autonomy) while still emitting `AutoApproved`; **Low always prompts**; an
-explicit `ask` rule prompts at Medium; `deny` refuses the call at every
+Semantics at the gate: the default `tool_call = "ask"` prompts at Medium and
+Low; High/Full auto-approve it. A user who deliberately trusts the configured
+tool boundary can set `tool_call = "auto"` to dispatch without a prompt at
+Medium (with an `AutoApproved` audit event). `deny` refuses the call at every
 level — absolute, like a runtime-batch deny rule — returning an error tool
 result with no dispatch. At the prompt, skip refuses just that call and the
 session continues; deny stops the task, exactly like a runtime-command deny.
-Headless with no approver surface fails closed. Calls are gated and
-dispatched strictly in order, so a later call never runs while an earlier
-prompt in the batch is unresolved.
+Headless with no approver surface fails closed. Calls are gated and dispatched
+strictly in order, so a later call never runs while an earlier prompt in the
+batch is unresolved.
 
 External-agent approval requests use the deliberately separate
 `external_approval_decision` path. Below Full, an explicit `deny` rejects,
-`ToolCall` plus an explicit/default `auto` auto-approves, and every other
-request is shown to the human even when the native category default is `auto`.
+`ToolCall` plus an explicit `auto` auto-approves, and every other request is
+shown to the human even when the native category default is `auto`. Because
+`ToolCall` defaults to `ask`, external-agent MCP/tool permission requests are
+shown at Medium unless the owner opts into auto.
 At Full, the current implementation returns `AutoApprove` **before** reading
 the category rule, so an external approval request bypasses an explicit
 `deny`; the `external_approval_full_overrides_deny` test codifies that
