@@ -6,7 +6,13 @@ use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 const INDEX_FILE: &str = "external_wrapper_index.json";
-const INDEX_VERSION: u32 = 1;
+/// Version 2 marks indexes whose active selection was repaired by
+/// [`migrate_index`] after the era when the session-catalog list scan
+/// shared the ACTIVATING [`upsert`] (it now uses the non-activating
+/// [`backfill`]). Older binaries round-trip the version field they parsed,
+/// so a migrated file is not downgraded by their rewrites; fresh indexes
+/// are born at the current version and never migrate.
+const INDEX_VERSION: u32 = 2;
 
 static INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -111,7 +117,10 @@ pub struct ExternalWrapperRecord {
     /// there), which sorts them behind every live row. Never "fix" a zero
     /// by re-stamping it with a fresh mtime — that resurrects a demoted
     /// row. [`WrapperState`] carries the same fact explicitly; the sentinel
-    /// stays written for older readers.
+    /// stays written for older readers. (The one sanctioned exception is
+    /// the versioned [`migrate_index`] repair, which re-derives every
+    /// group's whole selection from log-dir activity rather than patching
+    /// individual zeros.)
     #[serde(default)]
     pub updated_at_secs: u64,
     /// Explicit lifecycle state (defaults to `Active` so pre-`state` index
@@ -189,14 +198,24 @@ pub fn upsert_from_log_dir(
     )
 }
 
-pub fn upsert(
-    home: &Path,
+/// The normalized identity for a wrapper-index write, shared by the
+/// activating [`upsert`] and the non-activating [`backfill`] so their input
+/// guards cannot drift.
+struct WrapperWriteIdentity {
+    source: String,
+    backend_session_id: String,
+    stored_intendant_session_id: String,
+}
+
+/// Normalize and vet a wrapper-index write. `None` means the write must be
+/// skipped: non-external or non-canonical identities, and the attribution
+/// guard for callers holding someone else's log dir.
+fn validated_write_identity(
     source: &str,
     backend_session_id: &str,
     intendant_session_id: &str,
     log_dir: &Path,
-    project_root: Option<&Path>,
-) -> Result<(), String> {
+) -> Option<WrapperWriteIdentity> {
     let source = crate::session_names::normalize_source(source);
     let backend_session_id = backend_session_id.trim();
     let intendant_session_id = intendant_session_id.trim();
@@ -213,7 +232,7 @@ pub fn upsert(
         || backend_session_id == stored_intendant_session_id
         || !crate::external_agent::source_session_id_is_canonical(&source, backend_session_id)
     {
-        return Ok(());
+        return None;
     }
     // Attribution guard: the record is stored under the log dir's identity,
     // so the caller's wrapper id must actually name that dir (directly, or
@@ -226,8 +245,33 @@ pub fn upsert(
         && crate::session_identity::canonical_session_id_from_meta(log_dir).as_deref()
             != Some(intendant_session_id)
     {
-        return Ok(());
+        return None;
     }
+    Some(WrapperWriteIdentity {
+        source,
+        backend_session_id: backend_session_id.to_string(),
+        stored_intendant_session_id: stored_intendant_session_id.to_string(),
+    })
+}
+
+pub fn upsert(
+    home: &Path,
+    source: &str,
+    backend_session_id: &str,
+    intendant_session_id: &str,
+    log_dir: &Path,
+    project_root: Option<&Path>,
+) -> Result<(), String> {
+    let Some(identity) =
+        validated_write_identity(source, backend_session_id, intendant_session_id, log_dir)
+    else {
+        return Ok(());
+    };
+    let WrapperWriteIdentity {
+        source,
+        backend_session_id,
+        stored_intendant_session_id,
+    } = identity;
 
     let _guard = INDEX_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -336,6 +380,304 @@ pub fn upsert(
     write_index_unlocked(home, &index)?;
     note_index_written(home, &index);
     Ok(())
+}
+
+/// Non-activating twin of [`upsert`] for scan-shaped writers (the session
+/// catalog's list pass, `web_gateway/session_catalog/external_rows.rs`):
+/// it may only insert missing history and refresh a row's own fields — it
+/// NEVER flips lifecycle state, never runs the demotion loop, and never
+/// resurrects a superseded row's recency.
+///
+/// The activating [`upsert`] is reserved for the single writer at
+/// identity-commit (`session_log/bus_events.rs`): activation asserts "this
+/// wrapper is the live one", which only the session that just committed
+/// the identity can truthfully say. A list scan re-visits every historical
+/// wrapper row and makes no such assertion — while it shared `upsert`,
+/// each uncapped pass re-activated rows in directory-scan order and the
+/// last-visited group member clobbered the real active wrapper (observed
+/// live 2026-07-19: 90 of 165 multi-wrapper `(source, backend)` groups
+/// inverted), the demotion loop zeroed every other row's recency, and each
+/// visited non-active row forced a full index rewrite.
+///
+/// Semantics:
+/// - exact identity triple present: refresh `log_path` / `project_root`;
+///   refresh `updated_at_secs` only when the row is already `Active` — a
+///   superseded row's zero sentinel stays (re-stamping it would resurrect
+///   the row for legacy readers). State is never touched.
+/// - triple absent: insert. `Active` only when the `(source, backend)`
+///   group has no row at all AND no active row of this source already
+///   carries the wrapper id (the at-most-one-active-per-wrapper-id
+///   invariant the reverse lookup in `session_supervisor/launch.rs`
+///   depends on); otherwise `Superseded` with the legacy zero sentinel.
+/// - nothing changed: no write.
+pub fn backfill(
+    home: &Path,
+    source: &str,
+    backend_session_id: &str,
+    intendant_session_id: &str,
+    log_dir: &Path,
+    project_root: Option<&Path>,
+) -> Result<(), String> {
+    let Some(identity) =
+        validated_write_identity(source, backend_session_id, intendant_session_id, log_dir)
+    else {
+        return Ok(());
+    };
+    let WrapperWriteIdentity {
+        source,
+        backend_session_id,
+        stored_intendant_session_id,
+    } = identity;
+
+    let _guard = INDEX_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let log_path = log_dir.to_string_lossy().to_string();
+    let updated_at_secs =
+        file_mtime_secs(&log_dir.join("session.jsonl")).max(file_mtime_secs(log_dir));
+    let project_root = project_root.map(|path| path.to_string_lossy().to_string());
+
+    let is_exact_identity = |record: &ExternalWrapperRecord| {
+        record.source == source
+            && record.backend_session_id == backend_session_id
+            && record.intendant_session_id == stored_intendant_session_id
+    };
+
+    // Decide against the cached index in place and clone only when a write
+    // will follow (mirrors `upsert`). A row that already carries exactly
+    // this data — including a superseded row whose stale `log_path` fields
+    // match — costs no rewrite, which is what keeps an uncapped list pass
+    // from rewriting the whole index once per visited non-active row.
+    let dirty = with_index_unlocked(home, |index| {
+        match index
+            .wrappers
+            .iter()
+            .find(|record| is_exact_identity(record))
+        {
+            Some(existing) => {
+                existing.log_path != log_path
+                    || existing.project_root != project_root
+                    || (existing.state == WrapperState::Active
+                        && existing.updated_at_secs != updated_at_secs)
+            }
+            None => true,
+        }
+    });
+    if !dirty {
+        return Ok(());
+    }
+
+    let mut index = with_index_unlocked(home, |index| index.clone());
+    let group_has_rows = index
+        .wrappers
+        .iter()
+        .any(|record| record.source == source && record.backend_session_id == backend_session_id);
+    let wrapper_active_elsewhere = index.wrappers.iter().any(|record| {
+        record.source == source
+            && record.intendant_session_id == stored_intendant_session_id
+            && record.state == WrapperState::Active
+    });
+    if let Some(existing) = index
+        .wrappers
+        .iter_mut()
+        .find(|record| is_exact_identity(record))
+    {
+        existing.log_path = log_path;
+        existing.project_root = project_root;
+        if existing.state == WrapperState::Active {
+            existing.updated_at_secs = updated_at_secs;
+        }
+    } else if !group_has_rows && !wrapper_active_elsewhere {
+        // First record of its backend session, and its wrapper is not the
+        // active wrapper of anything else: safe to register as active —
+        // there is no selection to change.
+        index.wrappers.push(ExternalWrapperRecord {
+            source,
+            backend_session_id: backend_session_id.to_string(),
+            intendant_session_id: stored_intendant_session_id.to_string(),
+            log_path,
+            project_root,
+            updated_at_secs,
+            state: WrapperState::Active,
+            rollout_path: None,
+        });
+    } else {
+        // Some row already holds this backend session, or this wrapper is
+        // already active for another backend: record the history, but only
+        // the activating writer may change what is current.
+        index.wrappers.push(ExternalWrapperRecord {
+            source,
+            backend_session_id: backend_session_id.to_string(),
+            intendant_session_id: stored_intendant_session_id.to_string(),
+            log_path,
+            project_root,
+            updated_at_secs: 0,
+            state: WrapperState::Superseded,
+            rollout_path: None,
+        });
+    }
+
+    write_index_unlocked(home, &index)?;
+    note_index_written(home, &index);
+    Ok(())
+}
+
+/// One-time repair (index version 1 → 2) for indexes damaged while the
+/// session-catalog list scan shared the ACTIVATING [`upsert`] (it now uses
+/// [`backfill`]): each list pass re-activated historical rows in
+/// directory-scan order, leaving most multi-wrapper groups with "active"
+/// pointing at a stale wrapper and the real wrapper's recency zeroed.
+///
+/// The index is derived data, so the repair recomputes activity from the
+/// log dirs themselves: per `(source, backend_session_id)` group the row
+/// with the freshest log-dir activity mtime becomes the single `Active`
+/// row and has its `updated_at_secs` restamped from that mtime; every
+/// other group member becomes `Superseded` with the legacy zero sentinel.
+/// A group with no surviving log dir keeps no active row (readers already
+/// drop rows whose dir is gone). A second pass enforces AT MOST ONE ACTIVE
+/// ROW PER `(source, wrapper id)` — the state-independent reverse lookup
+/// (wrapper id → backend session, `session_supervisor/launch.rs`) must not
+/// resolve a stale backend binding — keeping the freshest row, with the
+/// lexically greatest backend session id as the tie-break (time-ordered
+/// for Codex UUIDv7 ids, deterministic for the rest).
+///
+/// Runs only while the on-disk index version is below [`INDEX_VERSION`]
+/// and stamps the new version on completion, so it is idempotent: later
+/// startups (and fresh indexes, which are born at the current version)
+/// skip without touching the file. Returns `None` when skipped, otherwise
+/// the number of groups whose active selection changed.
+pub fn migrate_index(home: &Path) -> Result<Option<usize>, String> {
+    let _guard = INDEX_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let needs_migration = with_index_unlocked(home, |index| index.version < INDEX_VERSION);
+    if !needs_migration {
+        return Ok(None);
+    }
+    let mut index = with_index_unlocked(home, |index| index.clone());
+    let repaired = repair_active_selection(&mut index.wrappers);
+    index.version = INDEX_VERSION;
+    write_index_unlocked(home, &index)?;
+    note_index_written(home, &index);
+    Ok(Some(repaired))
+}
+
+/// Startup edge for [`migrate_index`]: resolves the daemon's own home and
+/// logs what the one-time repair did (mirrors
+/// `global_store::prune_at_daemon_startup`).
+pub fn migrate_at_daemon_startup() {
+    match migrate_index(&crate::platform::home_dir()) {
+        Ok(None) => {}
+        Ok(Some(repaired)) => eprintln!(
+            "[wrapper-index] migrated external wrapper index to v{INDEX_VERSION} \
+             (active selection repaired in {repaired} group(s))"
+        ),
+        Err(err) => eprintln!("[wrapper-index] external wrapper index migration failed: {err}"),
+    }
+}
+
+/// The [`migrate_index`] repair pass over the raw rows. Returns the number
+/// of `(source, backend_session_id)` groups whose set of active wrapper
+/// ids changed.
+fn repair_active_selection(wrappers: &mut [ExternalWrapperRecord]) -> usize {
+    let activity: Vec<u64> = wrappers
+        .iter()
+        .map(|record| {
+            let dir = Path::new(&record.log_path);
+            file_mtime_secs(&dir.join("session.jsonl")).max(file_mtime_secs(dir))
+        })
+        .collect();
+    let before = active_wrapper_ids_by_group(wrappers);
+
+    // Pass 1: per (source, backend session) group, the freshest surviving
+    // log dir wins; a group whose dirs are all gone keeps no active row.
+    let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    for (i, record) in wrappers.iter().enumerate() {
+        groups
+            .entry((record.source.clone(), record.backend_session_id.clone()))
+            .or_default()
+            .push(i);
+    }
+    for indices in groups.values() {
+        let winner = indices
+            .iter()
+            .copied()
+            .filter(|&i| activity[i] > 0)
+            .max_by(|&a, &b| {
+                activity[a].cmp(&activity[b]).then_with(|| {
+                    wrappers[a]
+                        .intendant_session_id
+                        .cmp(&wrappers[b].intendant_session_id)
+                })
+            });
+        for &i in indices {
+            if Some(i) == winner {
+                wrappers[i].state = WrapperState::Active;
+                wrappers[i].updated_at_secs = activity[i];
+            } else {
+                wrappers[i].state = WrapperState::Superseded;
+                wrappers[i].updated_at_secs = 0;
+            }
+        }
+    }
+
+    // Pass 2: at most one active row per (source, wrapper id).
+    let mut best_by_wrapper: HashMap<(&str, &str), usize> = HashMap::new();
+    for (i, record) in wrappers.iter().enumerate() {
+        if record.state != WrapperState::Active {
+            continue;
+        }
+        let key = (record.source.as_str(), record.intendant_session_id.as_str());
+        let replace = match best_by_wrapper.get(&key) {
+            Some(&current) => {
+                (activity[i], record.backend_session_id.as_str())
+                    > (
+                        activity[current],
+                        wrappers[current].backend_session_id.as_str(),
+                    )
+            }
+            None => true,
+        };
+        if replace {
+            best_by_wrapper.insert(key, i);
+        }
+    }
+    let keep: std::collections::HashSet<usize> = best_by_wrapper.into_values().collect();
+    for (i, record) in wrappers.iter_mut().enumerate() {
+        if record.state == WrapperState::Active && !keep.contains(&i) {
+            record.state = WrapperState::Superseded;
+            record.updated_at_secs = 0;
+        }
+    }
+
+    let after = active_wrapper_ids_by_group(wrappers);
+    before
+        .iter()
+        .filter(|(group, active_ids)| after.get(*group) != Some(*active_ids))
+        .count()
+}
+
+/// The sorted active wrapper ids of every `(source, backend_session_id)`
+/// group — the "active selection" [`repair_active_selection`] reports
+/// changes against.
+fn active_wrapper_ids_by_group(
+    wrappers: &[ExternalWrapperRecord],
+) -> HashMap<(String, String), Vec<String>> {
+    let mut map: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for record in wrappers {
+        let ids = map
+            .entry((record.source.clone(), record.backend_session_id.clone()))
+            .or_default();
+        if record.state == WrapperState::Active {
+            ids.push(record.intendant_session_id.clone());
+        }
+    }
+    for ids in map.values_mut() {
+        ids.sort();
+    }
+    map
 }
 
 /// The "active wins" preference order — the single definition every
@@ -946,6 +1288,416 @@ mod tests {
                 .map(|record| record.intendant_session_id),
             Some("eeee0000-0000-4000-8000-000000000005".to_string())
         );
+    }
+
+    /// A full session-catalog list pass — [`backfill`] over every
+    /// historical row of a multi-wrapper group, in arbitrary order —
+    /// changes no active selection and writes nothing. Under the old
+    /// shared `upsert` the last-visited group member won "active",
+    /// clobbering the resume's correct flip within one pass.
+    #[test]
+    fn backfill_full_list_pass_preserves_active_selection() {
+        let home = tempfile::tempdir().unwrap();
+        let old_wrapper = "1a6f0000-0000-4000-8000-000000000a01";
+        let new_wrapper = "2b7f0000-0000-4000-8000-000000000a02";
+        let logs = home.path().join(".intendant").join("logs");
+        let old_dir = logs.join(old_wrapper);
+        let new_dir = logs.join(new_wrapper);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let backend_id = "019ea8b9-0000-7000-8000-00000000ee01";
+
+        upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            old_wrapper,
+            &old_dir,
+            None,
+        )
+        .unwrap();
+        upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            new_wrapper,
+            &new_dir,
+            None,
+        )
+        .unwrap();
+        let bytes_before = std::fs::read(index_path(home.path())).unwrap();
+
+        // Worst-case order first (stale row visited last), then the other.
+        for pass in [[&new_dir, &old_dir], [&old_dir, &new_dir]] {
+            for dir in pass {
+                let wrapper_id = dir.file_name().unwrap().to_str().unwrap();
+                backfill(home.path(), "codex", backend_id, wrapper_id, dir, None).unwrap();
+            }
+        }
+
+        let wrappers = wrappers_for(home.path(), "codex", backend_id);
+        assert_eq!(
+            active_wrapper_in(&wrappers).map(|record| record.intendant_session_id.as_str()),
+            Some(new_wrapper)
+        );
+        let old_row = wrappers
+            .iter()
+            .find(|record| record.intendant_session_id == old_wrapper)
+            .unwrap();
+        assert_eq!(old_row.state, WrapperState::Superseded);
+        assert_eq!(old_row.updated_at_secs, 0);
+        // Nothing changed, so the passes wrote nothing at all.
+        assert_eq!(
+            std::fs::read(index_path(home.path())).unwrap(),
+            bytes_before
+        );
+
+        // A real field refresh on a superseded row updates the row's own
+        // data without resurrecting it.
+        let project_root = home.path().join("proj");
+        backfill(
+            home.path(),
+            "codex",
+            backend_id,
+            old_wrapper,
+            &old_dir,
+            Some(project_root.as_path()),
+        )
+        .unwrap();
+        let wrappers = wrappers_for(home.path(), "codex", backend_id);
+        assert_eq!(
+            active_wrapper_in(&wrappers).map(|record| record.intendant_session_id.as_str()),
+            Some(new_wrapper)
+        );
+        let old_row = wrappers
+            .iter()
+            .find(|record| record.intendant_session_id == old_wrapper)
+            .unwrap();
+        assert_eq!(old_row.state, WrapperState::Superseded);
+        assert_eq!(old_row.updated_at_secs, 0);
+        assert_eq!(
+            old_row.project_root.as_deref(),
+            Some(project_root.to_string_lossy().as_ref())
+        );
+    }
+
+    /// [`backfill`] inserts a missing triple as `Active` only when there is
+    /// no selection to change: the backend-session group must be empty and
+    /// the wrapper must not be active for another backend session.
+    #[test]
+    fn backfill_insert_is_active_only_when_group_is_empty() {
+        let home = tempfile::tempdir().unwrap();
+        let wrapper_one = "3c8f0000-0000-4000-8000-000000000b01";
+        let wrapper_two = "4d9f0000-0000-4000-8000-000000000b02";
+        let logs = home.path().join(".intendant").join("logs");
+        let dir_one = logs.join(wrapper_one);
+        let dir_two = logs.join(wrapper_two);
+        std::fs::create_dir_all(&dir_one).unwrap();
+        std::fs::create_dir_all(&dir_two).unwrap();
+        let backend_x = "019ea8b9-0000-7000-8000-00000000ee11";
+        let backend_y = "019ea8b9-0000-7000-8000-00000000ee12";
+
+        // Empty group: the insert may claim active.
+        backfill(home.path(), "codex", backend_x, wrapper_one, &dir_one, None).unwrap();
+        let wrappers = wrappers_for(home.path(), "codex", backend_x);
+        assert_eq!(wrappers.len(), 1);
+        assert_eq!(wrappers[0].state, WrapperState::Active);
+        assert!(wrappers[0].updated_at_secs > 0);
+
+        // Populated group: history only — sentinel and superseded.
+        backfill(home.path(), "codex", backend_x, wrapper_two, &dir_two, None).unwrap();
+        let wrappers = wrappers_for(home.path(), "codex", backend_x);
+        assert_eq!(wrappers.len(), 2);
+        assert_eq!(
+            active_wrapper_in(&wrappers).map(|record| record.intendant_session_id.as_str()),
+            Some(wrapper_one)
+        );
+        let second = wrappers
+            .iter()
+            .find(|record| record.intendant_session_id == wrapper_two)
+            .unwrap();
+        assert_eq!(second.state, WrapperState::Superseded);
+        assert_eq!(second.updated_at_secs, 0);
+
+        // Empty group, but the wrapper is already active for backend_x: the
+        // insert must not mint a second active row for the wrapper id — the
+        // state-independent reverse lookup (wrapper id -> backend session)
+        // must keep resolving the original binding.
+        backfill(home.path(), "codex", backend_y, wrapper_one, &dir_one, None).unwrap();
+        let inserted = wrappers_for(home.path(), "codex", backend_y);
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].state, WrapperState::Superseded);
+        assert_eq!(inserted[0].updated_at_secs, 0);
+        let by_wrapper = wrappers_for_source(home.path(), "codex")
+            .into_iter()
+            .find(|record| record.intendant_session_id == wrapper_one)
+            .unwrap();
+        assert_eq!(by_wrapper.backend_session_id, backend_x);
+    }
+
+    /// The not-dirty fast path: re-backfilling rows that already carry the
+    /// visited data — active or superseded — leaves the index file
+    /// untouched (no rewrite churn from list passes).
+    #[test]
+    fn backfill_unchanged_rows_do_not_rewrite_the_index_file() {
+        let home = tempfile::tempdir().unwrap();
+        let old_wrapper = "5e1f0000-0000-4000-8000-000000000c01";
+        let new_wrapper = "6f2f0000-0000-4000-8000-000000000c02";
+        let logs = home.path().join(".intendant").join("logs");
+        let old_dir = logs.join(old_wrapper);
+        let new_dir = logs.join(new_wrapper);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let backend_id = "019ea8b9-0000-7000-8000-00000000ee21";
+        upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            old_wrapper,
+            &old_dir,
+            None,
+        )
+        .unwrap();
+        upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            new_wrapper,
+            &new_dir,
+            None,
+        )
+        .unwrap();
+
+        let path = index_path(home.path());
+        let bytes = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // Active row with an unchanged activity mtime, then a superseded
+        // row whose sentinel deliberately differs from the dir's live
+        // mtime: neither is dirty.
+        backfill(
+            home.path(),
+            "codex",
+            backend_id,
+            new_wrapper,
+            &new_dir,
+            None,
+        )
+        .unwrap();
+        backfill(
+            home.path(),
+            "codex",
+            backend_id,
+            old_wrapper,
+            &old_dir,
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+
+    fn set_file_mtime(path: &Path, mtime: std::time::SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    fn secs_since_epoch(time: std::time::SystemTime) -> u64 {
+        time.duration_since(UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    /// The v1 -> v2 migration re-derives each group's active row from
+    /// log-dir activity: the freshest surviving wrapper wins and gets its
+    /// recency restamped, stale "actives" are demoted to the sentinel, and
+    /// groups with no surviving log dir keep no active row. Already-current
+    /// indexes are skipped byte-for-byte.
+    #[test]
+    fn migration_repairs_inverted_groups_and_restamps_recency() {
+        let home = tempfile::tempdir().unwrap();
+        let logs = home.path().join(".intendant").join("logs");
+        let stale_wrapper = "7a3f0000-0000-4000-8000-000000000d01";
+        let fresh_wrapper = "8b4f0000-0000-4000-8000-000000000d02";
+        let backend_id = "019ea8b9-0000-7000-8000-00000000ee31";
+        let dead_wrapper = "9c5f0000-0000-4000-8000-000000000d03";
+        let dead_backend = "019ea8b9-0000-7000-8000-00000000ee32";
+
+        // Future mtimes make the ordering independent of the dirs' own
+        // creation times (activity = max(session.jsonl, dir)).
+        let base = std::time::SystemTime::now() + std::time::Duration::from_secs(1_000_000);
+        let fresh_time = base + std::time::Duration::from_secs(500);
+        for (wrapper, mtime) in [(stale_wrapper, base), (fresh_wrapper, fresh_time)] {
+            let dir = logs.join(wrapper);
+            std::fs::create_dir_all(&dir).unwrap();
+            let log = dir.join("session.jsonl");
+            std::fs::write(&log, "{}\n").unwrap();
+            set_file_mtime(&log, mtime);
+        }
+
+        let row = |wrapper: &str, backend: &str, updated: u64, state: &str| {
+            serde_json::json!({
+                "source": "codex",
+                "backend_session_id": backend,
+                "intendant_session_id": wrapper,
+                "log_path": logs.join(wrapper).to_string_lossy(),
+                "updated_at_secs": updated,
+                "state": state,
+            })
+        };
+        let path = index_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 1,
+                "wrappers": [
+                    // Inverted group: the stale wrapper holds "active", the
+                    // fresh one was demoted to the sentinel by a list pass.
+                    row(stale_wrapper, backend_id, 1_000, "active"),
+                    row(fresh_wrapper, backend_id, 0, "superseded"),
+                    // Dead group: its "active" row's log dir is gone.
+                    row(dead_wrapper, dead_backend, 2_000, "active"),
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(migrate_index(home.path()).unwrap(), Some(2));
+
+        let wrappers = wrappers_for(home.path(), "codex", backend_id);
+        assert_eq!(wrappers.len(), 2);
+        assert_eq!(wrappers[0].intendant_session_id, fresh_wrapper);
+        assert_eq!(wrappers[0].state, WrapperState::Active);
+        assert_eq!(wrappers[0].updated_at_secs, secs_since_epoch(fresh_time));
+        assert_eq!(wrappers[1].intendant_session_id, stale_wrapper);
+        assert_eq!(wrappers[1].state, WrapperState::Superseded);
+        assert_eq!(wrappers[1].updated_at_secs, 0);
+
+        // On disk: version stamped, and the dead group's row was demoted
+        // (its dir being gone hides it from `wrappers_for`).
+        let disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk["version"], 2);
+        let dead_row = disk["wrappers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["intendant_session_id"] == dead_wrapper)
+            .unwrap();
+        assert_eq!(dead_row["state"], "superseded");
+        assert_eq!(dead_row["updated_at_secs"], 0);
+
+        // Idempotent: a second run skips without touching the file.
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(migrate_index(home.path()).unwrap(), None);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    /// The migration's second pass: a wrapper id may keep at most one
+    /// active row across backend-session groups, so the state-independent
+    /// reverse lookup (wrapper id -> backend session) cannot resolve a
+    /// stale backend binding. On equal activity the lexically greatest
+    /// backend session id wins (time-ordered for Codex UUIDv7 ids).
+    #[test]
+    fn migration_enforces_at_most_one_active_row_per_wrapper_id() {
+        let home = tempfile::tempdir().unwrap();
+        let logs = home.path().join(".intendant").join("logs");
+        let wrapper_id = "1d6f0000-0000-4000-8000-000000000e01";
+        let old_backend = "019ea8b9-0000-7000-8000-00000000ee41";
+        let new_backend = "019ea8b9-0000-7000-8000-00000000ee42";
+        let dir = logs.join(wrapper_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("session.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        set_file_mtime(
+            &log,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(1_000_000),
+        );
+
+        let row = |backend: &str| {
+            serde_json::json!({
+                "source": "codex",
+                "backend_session_id": backend,
+                "intendant_session_id": wrapper_id,
+                "log_path": dir.to_string_lossy(),
+                "updated_at_secs": 100,
+                "state": "active",
+            })
+        };
+        let path = index_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({ "version": 1, "wrappers": [row(old_backend), row(new_backend)] })
+                .to_string(),
+        )
+        .unwrap();
+
+        // One group's selection changes (the old backend loses its active).
+        assert_eq!(migrate_index(home.path()).unwrap(), Some(1));
+
+        let records = wrappers_for_source(home.path(), "codex");
+        let active: Vec<_> = records
+            .iter()
+            .filter(|record| record.state == WrapperState::Active)
+            .collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].backend_session_id, new_backend);
+        // The preference-ordered reverse lookup resolves the kept binding.
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.intendant_session_id == wrapper_id)
+                .map(|record| record.backend_session_id.as_str()),
+            Some(new_backend)
+        );
+    }
+
+    /// An index already at the current version is never rewritten — the
+    /// migration must not re-litigate selections the activating writer has
+    /// made since.
+    #[test]
+    fn migration_skips_index_already_at_current_version() {
+        let home = tempfile::tempdir().unwrap();
+        let logs = home.path().join(".intendant").join("logs");
+        let wrapper_id = "2e7f0000-0000-4000-8000-000000000f01";
+        let dir = logs.join(wrapper_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = index_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 2,
+                "wrappers": [{
+                    "source": "codex",
+                    "backend_session_id": "019ea8b9-0000-7000-8000-00000000ee51",
+                    "intendant_session_id": wrapper_id,
+                    "log_path": dir.to_string_lossy(),
+                    // Deliberately odd (sentinel recency on an active row):
+                    // even a repair-shaped file is left alone once stamped.
+                    "updated_at_secs": 0,
+                    "state": "active",
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(migrate_index(home.path()).unwrap(), None);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        // A missing index is equally a no-op — nothing is created.
+        let empty_home = tempfile::tempdir().unwrap();
+        assert_eq!(migrate_index(empty_home.path()).unwrap(), None);
+        assert!(!index_path(empty_home.path()).exists());
     }
 
     #[test]
