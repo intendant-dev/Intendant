@@ -427,10 +427,17 @@ function renderEditMessageChip() {
     return;
   }
   const sid = shortSessionId(editMessageDraft.sessionId);
-  const action = editMessageDraft.historical ? 'Branching' : 'Editing';
+  // Claude Code has no in-place rewind on the supervision wire: an edit
+  // there is serviced as an anchor-fork branch, so label it honestly.
+  const meta = typeof sessionConfigMetadata === 'function'
+    ? sessionConfigMetadata(editMessageDraft.sessionId)
+    : null;
+  const source = typeof sessionConfigSource === 'function' ? sessionConfigSource(meta) : '';
+  const branching = editMessageDraft.historical || source === 'claude-code';
+  const action = branching ? 'Branching' : 'Editing';
   label.textContent = `${action} ${sid} #${editMessageDraft.userTurnIndex}`;
-  chip.title = editMessageDraft.historical
-    ? `Creating a managed branch from user turn ${editMessageDraft.userTurnIndex} in session ${editMessageDraft.sessionId}`
+  chip.title = branching
+    ? `Branching from user turn ${editMessageDraft.userTurnIndex} in session ${editMessageDraft.sessionId} — the edited prompt runs in a new session`
     : `Replacing user turn ${editMessageDraft.userTurnIndex} in session ${editMessageDraft.sessionId}`;
 }
 
