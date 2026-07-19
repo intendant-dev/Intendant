@@ -3349,6 +3349,10 @@ pub(crate) fn handle_idle_codex_subagent_event(
             // writes must not retarget any supervising session's git chip
             // (mirrors the drain's primary-conversation-only gating).
         }
+        external_agent::AgentEvent::CwdAnnounced { .. } => {
+            // Same gating as FileActivity: a subagent thread's working
+            // directory is not the supervising session's locus.
+        }
         external_agent::AgentEvent::ToolOutputDelta { item_id, text } => {
             let tool_output_limiter = stats
                 .codex_subagent_tool_output_limiters

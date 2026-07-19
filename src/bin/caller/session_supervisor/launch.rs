@@ -30,9 +30,45 @@ impl SessionSupervisor {
     /// Register a launched session's effective project root as its
     /// git-vitals probe target (worktree sessions pass their checkout).
     /// No-op when the daemon runs without the vitals producer.
+    ///
+    /// Fresh launches need nothing more: the backend is spawned with the
+    /// registered root as its working directory, so registration IS the
+    /// launch-time cwd seed. Resumes additionally seed the activity locus
+    /// from the resumed transcript (see
+    /// [`Self::seed_resumed_git_vitals_locus`]).
     fn register_git_vitals(&self, session_id: &str, root: &std::path::Path) {
         if let Some(targets) = self.config.git_vitals_targets.as_ref() {
             targets.register(session_id, root.to_path_buf());
+        }
+    }
+
+    /// Seed a just-registered git-vitals target with the working directory
+    /// the resumed backend session records ([`resumed_transcript_cwd`]),
+    /// BEFORE the backend spawns: the first probe tick then measures the
+    /// checkout the session actually works in instead of waiting on
+    /// write-activity heuristics (or affirming the registered root's
+    /// state). The backend's own live cwd echo (`system:init`, applied
+    /// thread settings) confirms or corrects the seed once it speaks.
+    fn seed_resumed_git_vitals_locus(
+        &self,
+        session_id: &str,
+        backend: Option<&external_agent::AgentBackend>,
+        resume_token: &str,
+        codex_home: Option<&str>,
+    ) {
+        let Some(backend) = backend else {
+            return;
+        };
+        let Some(targets) = self.config.git_vitals_targets.as_ref() else {
+            return;
+        };
+        if let Some(cwd) = resumed_transcript_cwd(
+            &self.logs_home(),
+            backend,
+            resume_token,
+            codex_home.map(std::path::Path::new),
+        ) {
+            targets.seed_locus(session_id, &cwd);
         }
     }
 
@@ -838,6 +874,12 @@ impl SessionSupervisor {
                 let codex_home = effective_session_agent_config
                     .as_ref()
                     .and_then(|config| config.codex_home.clone());
+                self.seed_resumed_git_vitals_locus(
+                    &session_id,
+                    external_backend.as_ref(),
+                    &resume_token,
+                    codex_home.as_deref(),
+                );
                 let intendant_session_id = session_log
                     .lock()
                     .map(|log| log.session_id().to_string())
@@ -972,6 +1014,18 @@ impl SessionSupervisor {
         let codex_home = effective_session_agent_config
             .as_ref()
             .and_then(|config| config.codex_home.clone());
+        // Same id keying as the registration above: the seed must land on
+        // the entry just registered.
+        self.seed_resumed_git_vitals_locus(
+            if fork {
+                &intendant_session_id
+            } else {
+                &live_session_id
+            },
+            external_backend.as_ref(),
+            &resume_token,
+            codex_home.as_deref(),
+        );
         self.activate_shared_session(session_log.clone()).await;
         self.config.bus.send(AppEvent::SessionStarted {
             // A fork materializes a NEW wrapper session: announce it under
@@ -1784,6 +1838,138 @@ pub(crate) fn external_attach_dedupe_keys(
         ids.push(id.to_string());
     }
     ids.into_iter().map(|id| format!("{source}:{id}")).collect()
+}
+
+/// Byte windows for the resumed-transcript cwd scan. The latest recorded
+/// cwd is nearly always inside the tail window (Claude Code stamps `cwd`
+/// on every record; Codex re-states it per `turn_context`); the head
+/// window is the fallback for a tail filled by cwd-less oversized records
+/// (one huge tool result) — short openers (Codex `session_meta`, a
+/// transcript's first records) live there.
+const TRANSCRIPT_CWD_TAIL_BYTES: u64 = 256 * 1024;
+const TRANSCRIPT_CWD_HEAD_BYTES: u64 = 64 * 1024;
+
+/// The LAST cwd `extract` finds among the complete JSONL lines of one
+/// chunk. `skip_first_line` drops the leading partial line of a
+/// mid-file read; a trailing partial line simply fails its JSON parse.
+fn latest_cwd_in_lines(
+    chunk: &str,
+    skip_first_line: bool,
+    extract: &impl Fn(&serde_json::Value) -> Option<String>,
+) -> Option<String> {
+    let mut lines = chunk.lines();
+    if skip_first_line {
+        let _ = lines.next();
+    }
+    let mut latest = None;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(cwd) = extract(&obj) {
+            latest = Some(cwd);
+        }
+    }
+    latest
+}
+
+/// The most recent working directory a backend transcript records,
+/// through per-format `extract`, in two bounded reads (tail, then head
+/// fallback) — a resume must not pay a full parse of a multi-megabyte
+/// transcript for one field. `None` when no scanned window states a cwd.
+pub(crate) fn latest_recorded_cwd(
+    path: &Path,
+    extract: impl Fn(&serde_json::Value) -> Option<String>,
+) -> Option<PathBuf> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let tail_start = len.saturating_sub(TRANSCRIPT_CWD_TAIL_BYTES);
+    file.seek(SeekFrom::Start(tail_start)).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    // Lossy: a mid-file seek can split a multi-byte character; the
+    // replacement bytes only ever corrupt the partial line the scan
+    // skips anyway.
+    let tail = String::from_utf8_lossy(&tail);
+    if let Some(cwd) = latest_cwd_in_lines(&tail, tail_start > 0, &extract) {
+        return Some(PathBuf::from(cwd));
+    }
+    if tail_start == 0 {
+        // The tail window covered the whole file — nothing else to scan.
+        return None;
+    }
+    let mut head = vec![0u8; TRANSCRIPT_CWD_HEAD_BYTES.min(tail_start) as usize];
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.read_exact(&mut head).ok()?;
+    let head = String::from_utf8_lossy(&head);
+    latest_cwd_in_lines(&head, false, &extract).map(PathBuf::from)
+}
+
+fn non_empty_json_str(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// `cwd` as a Claude Code transcript line records it: a top-level field
+/// stamped on (nearly) every record — the field the session catalog's
+/// row fold reads (`ClaudeRowAccumulator`).
+pub(crate) fn claude_line_cwd(obj: &serde_json::Value) -> Option<String> {
+    non_empty_json_str(obj.get("cwd"))
+}
+
+/// `cwd` as a Codex rollout line records it: `session_meta` states the
+/// thread's launch cwd and each `turn_context` the turn's effective cwd
+/// — the fields the session catalog's accumulator reads
+/// (`CodexSessionListAccumulator`).
+pub(crate) fn codex_line_cwd(obj: &serde_json::Value) -> Option<String> {
+    match obj.get("type").and_then(|v| v.as_str())? {
+        "session_meta" | "turn_context" => non_empty_json_str(obj.get("payload")?.get("cwd")),
+        _ => None,
+    }
+}
+
+/// The working directory the resumed backend session actually RECORDS —
+/// the registration-time git-vitals locus seed. A session resumed by id
+/// can live in a checkout the registered project root knows nothing
+/// about (the observed shape: an externally created Claude Code session
+/// working in a worktree while the daemon registers the project root, so
+/// its git chip affirmed the wrong checkout's `+0/−0`). The transcript
+/// finders are the session catalog's own (`find_claude_session_file`,
+/// `find_codex_session_file_in`). `None` — no seed, the registered root
+/// stands — when the transcript can't be located or states no cwd.
+pub(crate) fn resumed_transcript_cwd(
+    home: &Path,
+    backend: &external_agent::AgentBackend,
+    resume_token: &str,
+    codex_home: Option<&Path>,
+) -> Option<PathBuf> {
+    let token = resume_token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    match backend {
+        external_agent::AgentBackend::ClaudeCode => {
+            let transcript = crate::web_gateway::find_claude_session_file(home, token)?;
+            latest_recorded_cwd(&transcript, claude_line_cwd)
+        }
+        external_agent::AgentBackend::Codex => {
+            let rollout = match codex_home {
+                Some(codex_root) => {
+                    crate::codex_history::find_codex_session_file_in(codex_root, home, token)
+                }
+                None => crate::codex_history::find_codex_session_file_for_main(home, token),
+            }?;
+            latest_recorded_cwd(&rollout, codex_line_cwd)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2652,5 +2838,165 @@ mod tests {
             }
             other => panic!("expected file attachment, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn latest_recorded_cwd_scans_tail_then_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+
+        // Claude shape: cwd stamped per record — the LAST one wins.
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"user\",\"cwd\":\"/repo\"}\n",
+                "{\"type\":\"assistant\",\"cwd\":\"/repo\"}\n",
+                "{\"type\":\"user\",\"cwd\":\"/repo/.claude/worktrees/wt\"}\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            latest_recorded_cwd(&path, claude_line_cwd),
+            Some(PathBuf::from("/repo/.claude/worktrees/wt"))
+        );
+
+        // A tail window filled by one huge cwd-less record (the oversized
+        // tool-result shape): the head window still yields the early cwd.
+        let mut contents = String::from("{\"type\":\"user\",\"cwd\":\"/repo\"}\n");
+        contents.push_str(&format!(
+            "{{\"type\":\"assistant\",\"blob\":\"{}\"}}\n",
+            "x".repeat((TRANSCRIPT_CWD_TAIL_BYTES + 4096) as usize)
+        ));
+        std::fs::write(&path, contents).unwrap();
+        assert_eq!(
+            latest_recorded_cwd(&path, claude_line_cwd),
+            Some(PathBuf::from("/repo")),
+            "head fallback covers a cwd-less tail window"
+        );
+
+        // No cwd anywhere / no file: no seed.
+        std::fs::write(&path, "{\"type\":\"user\"}\n").unwrap();
+        assert_eq!(latest_recorded_cwd(&path, claude_line_cwd), None);
+        assert_eq!(
+            latest_recorded_cwd(&dir.path().join("gone.jsonl"), claude_line_cwd),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_line_cwd_takes_turn_context_over_session_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        // `turn_context` re-states the effective cwd per turn and comes
+        // later, so it wins; a cwd inside an unrelated payload type (an
+        // exec command's workdir) must not.
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"t1\",\"cwd\":\"/launch\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"exec_command_begin\",\"cwd\":\"/decoy\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/effective\"}}\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            latest_recorded_cwd(&path, codex_line_cwd),
+            Some(PathBuf::from("/effective"))
+        );
+        // `session_meta` alone still states the launch cwd.
+        std::fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"t1\",\"cwd\":\"/launch\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            latest_recorded_cwd(&path, codex_line_cwd),
+            Some(PathBuf::from("/launch"))
+        );
+    }
+
+    /// The registration-time seed end-to-end: a resumed Claude Code
+    /// session whose transcript records a worktree cwd retargets the
+    /// git-vitals probe to that worktree — immediately, via
+    /// [`crate::session_vitals::GitVitalsTargets::seed_locus`], not via
+    /// write-activity heuristics.
+    #[test]
+    fn resumed_claude_transcript_cwd_seeds_the_vitals_locus() {
+        let home = tempfile::tempdir().unwrap();
+        // A real checkout shape in the temp home: repo (.git dir) with a
+        // nested linked worktree (.git file).
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let worktree = repo.join(".claude/worktrees/session-fork");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
+
+        let token = "0caf4660-7345-4f3b-b8e7-407e59aefa5d";
+        let project_dir = home.path().join(".claude").join("projects").join("-repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let record = |cwd: &Path| {
+            serde_json::json!({"type": "user", "cwd": cwd.to_string_lossy()}).to_string()
+        };
+        std::fs::write(
+            project_dir.join(format!("{token}.jsonl")),
+            format!("{}\n{}\n", record(&repo), record(&worktree)),
+        )
+        .unwrap();
+
+        let recorded = resumed_transcript_cwd(
+            home.path(),
+            &external_agent::AgentBackend::ClaudeCode,
+            token,
+            None,
+        )
+        .expect("transcript states the worktree cwd");
+        assert_eq!(recorded, worktree);
+
+        // Registered at the project root (what resume registration does),
+        // then seeded with the recorded cwd: the effective probe target is
+        // the worktree from the first tick.
+        let targets = crate::session_vitals::GitVitalsTargets::default();
+        targets.register(token, repo.clone());
+        targets.seed_locus(token, &recorded);
+        assert_eq!(targets.snapshot()[0].1, worktree);
+
+        // Unknown token: no transcript, no seed.
+        assert_eq!(
+            resumed_transcript_cwd(
+                home.path(),
+                &external_agent::AgentBackend::ClaudeCode,
+                "11111111-2222-3333-4444-555555555555",
+                None,
+            ),
+            None
+        );
+    }
+
+    /// Codex parity for the seed source: the rollout's recorded cwd
+    /// resolves through the catalog's finder under an explicit codex home
+    /// (the per-session `codex_home` lane — env-free).
+    #[test]
+    fn resumed_codex_rollout_cwd_resolves_under_explicit_codex_home() {
+        let home = tempfile::tempdir().unwrap();
+        let token = "019a4c2e-77aa-4bb0-9c11-2f5e8d3a6b41";
+        let codex_root = home.path().join("custom-codex");
+        let day_dir = codex_root.join("sessions").join("2026").join("07");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(
+            day_dir.join(format!("rollout-2026-07-18T10-00-00-{token}.jsonl")),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{token}\",\"cwd\":\"/work/thread\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed_transcript_cwd(
+                home.path(),
+                &external_agent::AgentBackend::Codex,
+                token,
+                Some(&codex_root),
+            ),
+            Some(PathBuf::from("/work/thread"))
+        );
     }
 }

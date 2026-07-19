@@ -28,6 +28,14 @@ pub struct SessionGitVitals {
     /// the primary branch itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_unpushed: Option<u32>,
+    /// Basename of the probed checkout's toplevel — names WHERE these
+    /// numbers were measured. A session's probe target can be an activity
+    /// locus (a worktree the backend actually works in) rather than its
+    /// registered project root, and the chip must say so instead of
+    /// letting the numbers pass as the root's. Wire-additive: empty on
+    /// emissions from daemons that predate the field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub checkout: String,
 }
 
 /// Prompt-cache lifecycle for the vitals chips: `hit_pct` is the share of
@@ -380,6 +388,36 @@ mod tests {
             }
         }
         assert!(PERMISSION_DISPLAY_KINDS.contains(&PERMISSION_KIND_AUTONOMY));
+    }
+
+    /// The git section's `checkout` field is wire-additive: serialized
+    /// when known, absent when empty, and a legacy emission without it
+    /// deserializes to the empty default (frontends then simply don't
+    /// name a checkout).
+    #[test]
+    fn git_vitals_checkout_round_trips_and_stays_wire_additive() {
+        let vitals = SessionGitVitals {
+            branch: "agent/fix".into(),
+            dirty_files: 1,
+            ahead: 2,
+            behind: 3,
+            primary_ref: "origin/main".into(),
+            checkout: "session-fork".into(),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&vitals).expect("serializes");
+        assert_eq!(wire["checkout"], "session-fork");
+        let back: SessionGitVitals = serde_json::from_value(wire).expect("deserializes");
+        assert_eq!(back, vitals);
+
+        // Legacy wire without the field: defaults to empty, and an empty
+        // checkout is not serialized (no noise on unknown).
+        let legacy: SessionGitVitals =
+            serde_json::from_str(r#"{"branch":"main","dirtyFiles":0,"ahead":0,"behind":0}"#)
+                .expect("legacy deserializes");
+        assert_eq!(legacy.checkout, "");
+        let rewire = serde_json::to_value(&legacy).expect("serializes");
+        assert!(rewire.get("checkout").is_none());
     }
 
     /// The config section's wire shape: camelCase fields, absent when

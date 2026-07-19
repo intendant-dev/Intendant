@@ -2966,6 +2966,18 @@ pub(crate) fn translate_notification_with_scope(
                         message: format!("Codex thread settings applied: cwd {cwd}"),
                     },
                 );
+                // The server's own statement of the thread's effective
+                // working directory — the authoritative git-vitals locus
+                // confirmation (mirrors Claude Code's `system:init` cwd
+                // echo).
+                send_scoped_agent_event(
+                    event_tx,
+                    thread_id,
+                    turn_id,
+                    AgentEvent::CwdAnnounced {
+                        cwd: cwd.to_string(),
+                    },
+                );
             }
             // The applied settings are the server's own config echo —
             // model / reasoning effort / approval+sandbox ride the
@@ -6240,6 +6252,14 @@ error: build failed
                 );
             }
             other => panic!("expected Log, got {:?}", other),
+        }
+        // The applied cwd also rides the authoritative git-vitals locus
+        // lane (the Claude Code `system:init` echo's Codex twin).
+        match rx.try_recv().unwrap() {
+            AgentEvent::CwdAnnounced { cwd } => {
+                assert_eq!(cwd, "/home/user/projects/intendant-original");
+            }
+            other => panic!("expected CwdAnnounced, got {:?}", other),
         }
     }
 }
