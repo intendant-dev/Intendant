@@ -438,19 +438,22 @@ pub(crate) async fn start_external_side_followup_turn(
         if state.has_side_thread(&session_id) {
             let side_round = state.side_rounds.entry(session_id.clone()).or_insert(0);
             *side_round += 1;
-            let user_turn_revision = state
+            // Prompt ordinal from the revision state (side rounds track
+            // it 1:1 today, but the ordinal is the emitted authority —
+            // see external_mode's primary emit site).
+            let (side_user_turn_index, user_turn_revision) = state
                 .side_turn_revisions
                 .entry(session_id.clone())
                 .or_default()
-                .record_active_turn(*side_round as u32);
-            Some((*side_round, user_turn_revision))
+                .record_next_turn();
+            Some((*side_round, side_user_turn_index, user_turn_revision))
         } else {
             None
         }
     } else {
         None
     };
-    let Some((side_round, user_turn_revision)) = side_turn else {
+    let Some((side_round, side_user_turn_index, user_turn_revision)) = side_turn else {
         return false;
     };
 
@@ -458,7 +461,7 @@ pub(crate) async fn start_external_side_followup_turn(
         config.bus,
         config.session_log,
         Some(&session_id),
-        Some(side_round as u32),
+        Some(side_user_turn_index),
         Some(user_turn_revision),
         None,
         &[],
