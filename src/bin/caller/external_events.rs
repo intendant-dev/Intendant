@@ -1111,9 +1111,10 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     agent.name(),
                 );
                 // Surface reasoning via ModelResponse with empty content +
-                // reasoning set.  WASM renders this at "detail" verbosity
-                // (visible in Verbose + Debug, hidden in Normal) via the
-                // existing reasoning_summary path in app_state.rs.
+                // reasoning set. WASM renders it as a first-class thinking
+                // row — level "model" (visible at Normal verbosity), kind
+                // "reasoning" — via the reasoning_summary path in
+                // app_state.rs.
                 persist_external_model_response_if_needed(config, "", Some(&text));
                 config.send_model_response(AppEvent::ModelResponse {
                     session_id: config.session_id.clone(),
@@ -2104,6 +2105,19 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     config.bus.send(AppEvent::SessionFileActivity {
                         session_id: config.session_id.clone(),
                         paths,
+                    });
+                }
+            }
+            external_agent::AgentEvent::CwdAnnounced { cwd } => {
+                // The backend's first-hand working-directory statement —
+                // seeds the git-vitals locus immediately. Same
+                // primary-conversation gate as FileActivity: a side
+                // thread's cwd must not retarget the supervising
+                // session's git chip.
+                if event_is_primary && !cwd.trim().is_empty() {
+                    config.bus.send(AppEvent::SessionCwdAnnounced {
+                        session_id: config.session_id.clone(),
+                        cwd,
                     });
                 }
             }

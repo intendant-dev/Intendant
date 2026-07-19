@@ -96,6 +96,12 @@ pub(crate) async fn run_daemon(
     // staged uploads / transfer jobs): prune entries idle past the
     // retention window so the store cannot grow unbounded across restarts.
     tokio::task::spawn_blocking(global_store::prune_at_daemon_startup);
+    // One-time external-wrapper-index repair (v1 -> v2): recompute each
+    // (source, backend session) group's active wrapper from log-dir
+    // activity, undoing the inversions written while the session-catalog
+    // list scan shared the activating `upsert` (see
+    // `external_wrapper_index::migrate_index`). No-op once migrated.
+    tokio::task::spawn_blocking(crate::external_wrapper_index::migrate_at_daemon_startup);
     let bus = EventBus::new();
     // No tick timer here: `AppEvent::Tick` is consumed only by the stdio
     // MCP event listener (stuck-phase warnings), which daemon mode never

@@ -330,6 +330,13 @@ pub(crate) async fn run_external_agent_mode(
     }
 
     // Event loop
+    //
+    // Resumed threads seed their user-turn state from the backend's own
+    // history: the transcript's prompt ordinal is the turn authority (the
+    // catalog's hydration lane and the reload annotator both count the
+    // WHOLE resumed transcript), so a live lane restarting at turn 1
+    // would double-render every prompt under disagreeing badges and
+    // reject edits of transcript-numbered turns.
     let mut user_turn_revisions = match (
         &backend,
         resumed_external_session.as_deref(),
@@ -337,6 +344,15 @@ pub(crate) async fn run_external_agent_mode(
     ) {
         (external_agent::AgentBackend::Codex, Some(_), session_id) => {
             codex_user_turn_state_from_history(session_id).unwrap_or_default()
+        }
+        // A `--fork-session` resume starts on the placeholder id (the
+        // forked child announces its own id mid-turn), so only a
+        // canonical id — a plain resume, whose id stays stable — seeds.
+        (external_agent::AgentBackend::ClaudeCode, Some(_), session_id)
+            if backend.thread_id_is_canonical(session_id) =>
+        {
+            claude_user_turn_state_from_history(&platform::home_dir(), session_id)
+                .unwrap_or_default()
         }
         _ => UserTurnRevisionState::default(),
     };
@@ -1495,15 +1511,18 @@ pub(crate) async fn run_external_agent_mode(
 
             let side_round = side_rounds.entry(side_thread_id.clone()).or_insert(0);
             *side_round += 1;
-            let user_turn_revision = side_turn_revisions
+            // Prompt ordinal from the revision state (side rounds track it
+            // 1:1 today, but the ordinal is the emitted authority — see
+            // the primary emit site).
+            let (side_user_turn_index, user_turn_revision) = side_turn_revisions
                 .entry(side_thread_id.clone())
                 .or_default()
-                .record_active_turn(*side_round as u32);
+                .record_next_turn();
             emit_user_message_log(
                 &bus,
                 &session_log,
                 Some(&side_thread_id),
-                Some(*side_round as u32),
+                Some(side_user_turn_index),
                 Some(user_turn_revision),
                 replacement_for_user_turn_index,
                 &attachments.refs,
@@ -1930,7 +1949,7 @@ pub(crate) async fn run_external_agent_mode(
                 );
                 continue;
             }
-            let active_edit_revision_ok = user_turn_index as usize <= round
+            let active_edit_revision_ok = user_turn_index <= user_turn_revisions.active_count()
                 && user_turn_revisions
                     .validate_expected_revision(user_turn_index, edit_user_turn_revision)
                     .is_ok();
@@ -1993,7 +2012,7 @@ pub(crate) async fn run_external_agent_mode(
                     }
                 }
             }
-            if user_turn_index as usize > round {
+            if user_turn_index > user_turn_revisions.active_count() {
                 let message = format!(
                     "Cannot edit user turn {} in {} session {}; current user turn count is {}",
                     user_turn_index,
@@ -2002,7 +2021,7 @@ pub(crate) async fn run_external_agent_mode(
                         .as_deref()
                         .map(|sid| sid.chars().take(8).collect::<String>())
                         .unwrap_or_else(|| "unknown".to_string()),
-                    round
+                    user_turn_revisions.active_count()
                 );
                 bus.send(AppEvent::UserMessageEditStatus {
                     session_id: live_session_id.clone(),
@@ -2044,7 +2063,10 @@ pub(crate) async fn run_external_agent_mode(
                 );
                 continue;
             }
-            let turns_to_drop = round as u32 - user_turn_index + 1;
+            // Rollback depth is counted in USER turns from the prompt
+            // ordinal state — `round` can exceed it (spontaneous backend
+            // rounds), and a round-based count over-rolls the backend.
+            let turns_to_drop = user_turn_revisions.active_count() - user_turn_index + 1;
             let mut rollback_result = agent.rollback_turns(turns_to_drop).await;
             if let Err(err) = rollback_result.as_ref() {
                 if backend == external_agent::AgentBackend::Codex
@@ -2312,7 +2334,15 @@ pub(crate) async fn run_external_agent_mode(
         }
 
         round += 1;
-        let user_turn_revision = user_turn_revisions.record_active_turn(round as u32);
+        // The emitted turn index is the PROMPT ORDINAL from the revision
+        // state — never `round`, which also counts spontaneous backend
+        // rounds (and restarts on resume for backends without a seed), so
+        // it drifts off the transcript lane's positional numbering.
+        // `round` stays the round counter for status lines/RoundComplete.
+        // After an edit rollback (`rewind_from_turn` above) this yields
+        // the edited index with a bumped revision, exactly like the old
+        // round-aligned bookkeeping.
+        let (user_turn_index, user_turn_revision) = user_turn_revisions.record_next_turn();
         stats.turns = 0;
         let attachment_count = attachments.len();
         let merged = drain_steer_queue_as_followup(
@@ -2332,7 +2362,7 @@ pub(crate) async fn run_external_agent_mode(
             &bus,
             &session_log,
             live_session_id.as_deref(),
-            Some(round as u32),
+            Some(user_turn_index),
             Some(user_turn_revision),
             replacement_for_user_turn_index,
             &attachments.refs,

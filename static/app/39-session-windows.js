@@ -1149,9 +1149,16 @@ const VITALS_SYMBOLS = {
     priority: 40,
     quiet: 'No primary branch to compare with.',
     chip: (v) => `+${v.ahead}/−${v.behind}`,
-    explain: (v) => [
-      `Compared with ${v.primaryRef}: this branch has ${v.ahead} commit${v.ahead === 1 ? '' : 's'} of its own and is missing ${v.behind} from there.`,
-    ],
+    explain: (v) => {
+      const lines = [
+        `Compared with ${v.primaryRef}: this branch has ${v.ahead} commit${v.ahead === 1 ? '' : 's'} of its own and is missing ${v.behind} from there.`,
+      ];
+      // Honesty line: WHERE the numbers were measured. The probe follows
+      // the checkout the agent actually works in (which can be a worktree,
+      // not the registered project root), and the popover says so.
+      if (v.checkout) lines.push(`vs ${v.primaryRef} · at ${v.checkout}`);
+      return lines;
+    },
   },
   parity: {
     label: 'Merge readiness',
@@ -1407,6 +1414,7 @@ function vitalsChipModels(vitals, meta, sessionId) {
         ahead: Number(git.ahead) || 0,
         behind: Number(git.behind) || 0,
         primaryRef,
+        checkout: String(git.checkout || '').trim(),
       });
     }
     const parity = String(git.mergeParity || '').trim();
@@ -3627,6 +3635,17 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
     content = content ? `Done signal: ${content}` : 'Done signal';
     return { ...base, level: 'detail', source: source || 'worker', content, kind };
   }
+  if (event === 'task_complete') {
+    // Live grammar (the WASM task_complete handler): reason, em-dash,
+    // summary — so a replay-served completion reads (and derives phase)
+    // like the live row did.
+    const reason = String(entry.reason || '').trim() || 'done';
+    const summary = String(entry.summary || '').trim();
+    content = summary
+      ? `Task complete: ${reason} — ${summary}`
+      : `Task complete: ${reason}`;
+    return { ...base, level: 'info', source: source || 'worker', content, kind };
+  }
   if (event === 'session_started') {
     return { ...base, level: 'info', source: 'system', content: `Session started: ${sessionId}`, kind };
   }
@@ -3813,8 +3832,7 @@ function sessionWindowTranscriptSignaturesFromParts(parts, options = {}) {
       signatures.push(['exact-ms', String(parts.tsMs), ...textParts].join('\u001f'));
     }
     if (isUserMessage && options.includeUserNearTime) {
-      const timeBucket = sessionWindowTranscriptTimeBucket(parts.ts);
-      if (timeBucket) {
+      for (const timeBucket of sessionWindowTranscriptTimeBuckets(parts.ts)) {
         signatures.push([
           'user-near-time-text',
           parts.sessionId,
@@ -3982,10 +4000,21 @@ function sessionWindowTranscriptTimestampForHistoryItem(item) {
   return sessionWindowTranscriptTimestampMs(record?.ts_ms ?? record?.tsMs ?? record?.ts ?? record?.timestamp ?? '');
 }
 
-function sessionWindowTranscriptTimeBucket(value) {
+// Near-time buckets for the turn-agnostic user-row bridge: the primary 5s
+// floor lattice PLUS a half-offset (2.5s) lattice, so two copies of one
+// prompt that straddle a primary floor boundary (observed live: live-lane
+// dispatch ts vs transcript-lane backend ts, 2s apart across a boundary)
+// still share the offset bucket — any pair within 2.5s provably shares at
+// least one bucket. The lattices are namespaced ('a'/'b') so a primary
+// bucket number never collides with an offset bucket number: matches stay
+// within one lattice, which caps the pairable spread at <5s exactly like
+// the single-bucket window did (deliberately NOT ±1-neighbor probing,
+// which would let identical-text prompts up to ~15s apart collapse — the
+// distinct-repeated-prompts safety bar).
+function sessionWindowTranscriptTimeBuckets(value) {
   const ms = sessionWindowTranscriptTimestampMs(value);
-  if (ms === null) return '';
-  return String(Math.floor(ms / 5000));
+  if (ms === null) return [];
+  return ['a' + Math.floor(ms / 5000), 'b' + Math.floor((ms + 2500) / 5000)];
 }
 
 // Timestamp lookups for the insert-position scan cost a querySelector +
@@ -4079,6 +4108,16 @@ function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSession
   for (const record of records) {
     const signatures = sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId);
     if (signatures.length > 0 && signatures.some(signature => existing.has(signature))) continue;
+    // The synthesized completed-terminal row (kind subagent_terminal,
+    // served by the task-child hydration lane) and the live "Task
+    // complete" LogEntry describe the same completion with different
+    // timestamps and event ids, so signatures never pair them — content
+    // is the identity here. A window that already shows a terminal row
+    // must not gain a second one from a merge fetch.
+    if (
+      record.kind === 'subagent_terminal' &&
+      sessionWindowHistoryHasTaskCompleteRow(win)
+    ) continue;
     missing.push(record);
     for (const signature of signatures) {
       existing.add(signature);
@@ -4087,6 +4126,21 @@ function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSession
   if (!missing.length) return removedDuplicates;
   insertSessionWindowHistoryRecords(win, missing, sessionWindowShouldFollowNextOutput(win));
   return missing.length + removedDuplicates;
+}
+
+// Does this window already render a "Task complete" line (live LogEntry
+// or a previously merged terminal row)? Content-prefix identity — the
+// only stable key both copies share (see the merge guard above).
+function sessionWindowHistoryHasTaskCompleteRow(win) {
+  return ensureSessionWindowHistory(win).some(item => {
+    const node = sessionWindowHistoryNode(item);
+    if (node) {
+      const content = node.querySelector?.('.log-content');
+      return String((content || node).textContent || '').startsWith('Task complete:');
+    }
+    const record = sessionWindowHistoryRecord(item);
+    return String(record?.content || '').startsWith('Task complete:');
+  });
 }
 
 function externalSessionWindowSyncRecord(sessionId) {
@@ -4237,7 +4291,10 @@ async function hydrateRestoredSessionWindow(win, record) {
     const rendered = renderRestoredSessionWindowEntries(targetWin, entries, targetSid);
     clearSessionWindowHydrateError(targetWin || win);
     if (rendered > 0) {
-      updateSessionWindow(targetSid, { phase: 'idle', ended: false });
+      updateSessionWindow(targetSid, {
+        phase: restoredSessionWindowPhaseFromEntries(entries, targetSid),
+        ended: false,
+      });
       stationScheduleUpdate();
     }
   } catch (err) {
@@ -4249,6 +4306,40 @@ async function hydrateRestoredSessionWindow(win, record) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+// Hydration phase from the restored transcript's own evidence, mirroring
+// inferSessionPhaseFromLog's terminal prefixes: the LAST phase-relevant
+// row decides, so a completed Task child (whose hydration lane serves the
+// synthesized terminal row) or an ended session rehydrates as done, while
+// anything with activity after its last terminal — a resumed child —
+// stays the historical blanket 'idle' and lets live events drive.
+// Active states are deliberately NOT restored: a fetched transcript
+// cannot prove a live turn or a live approval.
+function restoredSessionWindowPhaseFromEntries(entries, fallbackSessionId) {
+  if (!Array.isArray(entries)) return 'idle';
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const record = sessionWindowRecordFromReplayEntry(entries[i], fallbackSessionId);
+    if (!record) continue;
+    const content = String(record.content || '');
+    if (content.startsWith('Task complete:') || content.startsWith('Session ended:')) {
+      return 'done';
+    }
+    if (content.startsWith('Agent interrupted:')) return 'interrupted';
+    const level = String(record.level || '').toLowerCase();
+    if (
+      level === 'model' ||
+      level === 'agent' ||
+      content.startsWith('Turn ') ||
+      content.startsWith('Running on display') ||
+      content.startsWith('Approval required') ||
+      content.startsWith('Question:') ||
+      (content.startsWith('Round ') && content.includes(' complete'))
+    ) {
+      return 'idle';
+    }
+  }
+  return 'idle';
 }
 
 function sessionWindowHydrationRecord(sessionId) {
