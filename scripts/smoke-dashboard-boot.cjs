@@ -649,6 +649,154 @@ const JUMP_BUTTON_PROBE_EXPRESSION = `(async () => {
   return out;
 })()`;
 
+// ---------------------------------------------------------------------------
+// Chapter-jump landing probe (assertion (e)).
+//
+// Pins where chapter-nav jumps LAND in a real windowed pane transcript:
+// centered in the scroller for rows that fit, first line pinned just below
+// the top edge for rows taller than the viewport — measured in viewport
+// coordinates (rect deltas against the scroller), the coordinates a reader
+// actually sees. Regression bait: the landing math once used offsetTop,
+// which for pane rows is relative to the positioned .session-window (the
+// scroller itself is position: static), so every jump overshot by the
+// header chrome height — absorbed invisibly by centered landings in tall
+// maximized panes, but a card-sized grid scroller's taller-than-viewport
+// branch clipped the target's first line under the header (live user
+// report, 2026-07-19; the card-sized cap below is what makes that branch
+// fire — a tall probe pane would silently pass it). The transcript is
+// deeper than the 600-row render window so both jump targets start
+// UNMOUNTED, pinning materialize→measure→scroll ordering too, and the
+// tail asserts jump-then-append stability across both append lanes.
+const CHAPTER_JUMP_PROBE_EXPRESSION = `(async () => {
+  const out = { failures: [], steps: [] };
+  const check = (cond, label) => {
+    out.steps.push((cond ? 'pass' : 'FAIL') + ' ' + label);
+    if (!cond) out.failures.push(label);
+  };
+  const settle = () => new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 0)));
+  });
+  const sid = 'boot-smoke-chapter-probe';
+  const sweeps = window.qa && window.qa.sessionWindowSweeps;
+  const nav = window.qa && window.qa.chapterNav;
+  for (const [facade, name] of [
+    [sweeps, 'sessionWindowSweeps.build'],
+    [sweeps, 'sessionWindowSweeps.append'],
+    [sweeps, 'sessionWindowSweeps.remove'],
+    [nav, 'chapterNav.qaInsertRecords'],
+    [nav, 'chapterNav.qaScrollTail'],
+    [nav, 'chapterNav.jumpPane'],
+    [nav, 'chapterNav.paneState'],
+  ]) {
+    if (!facade || typeof facade[name.split('.')[1]] !== 'function') {
+      out.failures.push('window.qa.' + name + ' missing');
+      return out;
+    }
+  }
+  try {
+    if (!sweeps.build(sid, { task: 'chapter jump landing probe' })) {
+      out.failures.push('synthetic session window did not materialize');
+      return out;
+    }
+    const root = document.querySelector('.session-window[data-session-id="' + sid + '"]');
+    const log = root && root.querySelector('.session-window-log');
+    if (!root || !log) {
+      out.failures.push('probe window DOM missing');
+      return out;
+    }
+    // Grid-card scroll geometry: pin the stylesheet's card cap so the
+    // taller-than-viewport branch really fires (mirrors the jump-button
+    // probe's deterministic-geometry pin).
+    log.style.maxHeight = '220px';
+    log.style.overflowY = 'auto';
+    const geom = (mark) => {
+      const node = log.querySelector('[data-history-index="' + mark + '"]');
+      if (!node) return null;
+      const viewTop = log.getBoundingClientRect().top + log.clientTop;
+      const rect = node.getBoundingClientRect();
+      const nodeTop = rect.top - viewTop;
+      return {
+        nodeTop: Math.round(nodeTop),
+        nodeHeight: Math.round(rect.height),
+        viewHeight: log.clientHeight,
+        centerOffset: Math.round(nodeTop + rect.height / 2 - log.clientHeight / 2),
+      };
+    };
+    const SHORT_MARK = 60;
+    const TALL_MARK = 250;
+    const TOTAL = 900;
+    const base = Date.now() - 7200000;
+    const records = [];
+    for (let i = 0; i < TOTAL; i += 1) {
+      if (i === SHORT_MARK) {
+        records.push({ source: 'user', level: 'info', content: 'probe user target (short) ' + i, ts_ms: base + i * 1000 });
+      } else if (i === TALL_MARK) {
+        const lines = [];
+        for (let k = 0; k < 80; k += 1) lines.push('probe tall user line ' + k);
+        records.push({ source: 'user', level: 'info', content: lines.join('\\n'), ts_ms: base + i * 1000 });
+      } else {
+        records.push({ source: 'system', level: 'info', content: 'probe filler ' + i, ts_ms: base + i * 1000 });
+      }
+    }
+    nav.qaInsertRecords(sid, records);
+    nav.qaScrollTail(sid);
+    await settle();
+    const st0 = nav.paneState(sid);
+    check(!!st0 && st0.len === TOTAL, 'history holds all ' + TOTAL + ' records (got ' + (st0 && st0.len) + ')');
+    check(!!st0 && st0.user.length === 2 && st0.user[0] === SHORT_MARK && st0.user[1] === TALL_MARK,
+      'user marks indexed at ' + SHORT_MARK + '/' + TALL_MARK + ' (got ' + JSON.stringify(st0 && st0.user) + ')');
+    check(!!st0 && st0.renderStart > TALL_MARK,
+      'both targets start unmounted (renderStart ' + (st0 && st0.renderStart) + ')');
+    check(log.scrollHeight > log.clientHeight * 3, 'probe window is scrollable');
+
+    // (1) prev-jump onto the TALL unmounted target: materializes it, then
+    // top-aligns with the first line fully visible below the top edge.
+    check(nav.jumpPane(sid, 'user', -1) === true, 'tall jump dispatched');
+    await settle();
+    const tall = geom(TALL_MARK);
+    check(!!tall, 'tall target mounted after jump');
+    if (tall) {
+      out.steps.push('tall landing ' + JSON.stringify(tall));
+      check(tall.nodeHeight > tall.viewHeight,
+        'tall target overflows the viewport (' + tall.nodeHeight + ' > ' + tall.viewHeight + ')');
+      check(tall.nodeTop >= 0, 'tall target first line not clipped (nodeTop ' + tall.nodeTop + ')');
+      check(tall.nodeTop <= 20, 'tall target pinned near the top edge (nodeTop ' + tall.nodeTop + ')');
+    }
+
+    // (2) prev-jump onto the SHORT unmounted target: lands centered.
+    check(nav.jumpPane(sid, 'user', -1) === true, 'short jump dispatched');
+    await settle();
+    const centered = geom(SHORT_MARK);
+    check(!!centered, 'short target mounted after jump');
+    if (centered) {
+      out.steps.push('short landing ' + JSON.stringify(centered));
+      check(centered.nodeHeight <= centered.viewHeight, 'short target fits the viewport');
+      check(Math.abs(centered.centerOffset) <= 20,
+        'short target centered (centerOffset ' + centered.centerOffset + 'px)');
+    }
+
+    // (3) jump-then-append stability: appends on both lanes (live node
+    // lane, record insert lane) while parked on the jump cursor must not
+    // move the landing.
+    for (let i = 0; i < 3; i += 1) sweeps.append(sid, 'probe live append ' + i);
+    nav.qaInsertRecords(sid, [
+      { source: 'system', level: 'info', content: 'probe late insert', ts_ms: base + (TOTAL + 60) * 1000 },
+    ]);
+    await settle();
+    const after = geom(SHORT_MARK);
+    check(!!after, 'target still mounted after appends');
+    if (after && centered) {
+      check(Math.abs(after.nodeTop - centered.nodeTop) <= 2,
+        'landing stable across appends (drift ' + (after.nodeTop - centered.nodeTop) + 'px)');
+    }
+  } catch (error) {
+    out.failures.push('probe threw: ' + (error && error.message ? error.message : String(error)));
+  } finally {
+    try { sweeps.remove(sid); } catch (_) {}
+  }
+  return out;
+})()`;
+
 function remoteObjectText(arg) {
   if (!arg || typeof arg !== 'object') return '';
   if (arg.value !== undefined) {
@@ -827,6 +975,18 @@ async function main() {
       if (jumpFailures.length > 0) {
         for (const line of jumpFailures) ledger.record('jump-button', line, { fatal: true });
         throw new Error(`jump-button probe failed ${jumpFailures.length} assertion(s)`);
+      }
+
+      // Assertion (e): chapter-jump landings on a deep windowed transcript
+      // (same synthetic-pane technique and gating as (d) above).
+      const chapter = await evaluate(CHAPTER_JUMP_PROBE_EXPRESSION, { awaitPromise: true });
+      const chapterSteps = Array.isArray(chapter && chapter.steps) ? chapter.steps : [];
+      const chapterFailures = Array.isArray(chapter && chapter.failures) ? chapter.failures : ['probe returned no result'];
+      console.log(`chapter-jump probe: ${chapterSteps.length} steps, ${chapterFailures.length} failures`);
+      for (const line of chapterSteps.slice(0, MAX_REPORT_LINES)) console.log(`  ${line}`);
+      if (chapterFailures.length > 0) {
+        for (const line of chapterFailures) ledger.record('chapter-jump', line, { fatal: true });
+        throw new Error(`chapter-jump probe failed ${chapterFailures.length} assertion(s)`);
       }
     }
 
