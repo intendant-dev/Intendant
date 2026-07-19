@@ -341,7 +341,7 @@ pub enum AppEvent {
     ExternalFollowUpRequested {
         session_id: String,
         text: String,
-        attachments: Vec<crate::external_agent::AgentAttachment>,
+        attachments: crate::agent_loop::UserAttachments,
         follow_up_id: Option<String>,
     },
     SessionStarted {
@@ -985,6 +985,10 @@ pub enum AppEvent {
         user_turn_index: Option<u32>,
         user_turn_revision: Option<u32>,
         replacement_for_user_turn_index: Option<u32>,
+        /// Renderable upload refs for attachments delivered with this
+        /// message (upload-backed only; frame grabs mint no ref). Display
+        /// metadata: the dashboard shows a thumbnail strip on the row.
+        attachments: Vec<crate::types::SessionNoteAttachment>,
     },
 
     /// Display transport pipeline metrics snapshot.
@@ -3017,6 +3021,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             user_turn_index: None,
             user_turn_revision: None,
             replacement_for_user_turn_index: None,
+            attachments: Vec::new(),
         }),
         AppEvent::SessionNote {
             session_id,
@@ -3048,6 +3053,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             user_turn_index,
             user_turn_revision,
             replacement_for_user_turn_index,
+            attachments,
         } => Some(OutboundEvent::LogEntry {
             level: "info".to_string(),
             source: "User".to_string(),
@@ -3057,6 +3063,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             user_turn_index: *user_turn_index,
             user_turn_revision: *user_turn_revision,
             replacement_for_user_turn_index: *replacement_for_user_turn_index,
+            attachments: attachments.clone(),
         }),
         AppEvent::RecordingStarted { stream_name } => Some(OutboundEvent::RecordingStarted {
             stream_name: stream_name.clone(),
@@ -6101,6 +6108,7 @@ mod tests {
             user_turn_index: Some(4),
             user_turn_revision: Some(2),
             replacement_for_user_turn_index: Some(4),
+            attachments: Vec::new(),
         };
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
@@ -6108,6 +6116,30 @@ mod tests {
         assert!(json.contains("\"user_turn_index\":4"));
         assert!(json.contains("\"user_turn_revision\":2"));
         assert!(json.contains("\"replacement_for_user_turn_index\":4"));
+        // Empty attachments stay OFF the wire — the pre-field wire format.
+        assert!(!json.contains("\"attachments\""));
+    }
+
+    #[test]
+    fn outbound_user_message_log_carries_attachment_refs() {
+        let event = AppEvent::UserMessageLog {
+            session_id: Some("sess-1".to_string()),
+            content: "See the screenshot".to_string(),
+            user_turn_index: Some(2),
+            user_turn_revision: Some(1),
+            replacement_for_user_turn_index: None,
+            attachments: vec![crate::types::SessionNoteAttachment {
+                upload_id: "u-77".to_string(),
+                name: "screen.png".to_string(),
+                mime: "image/png".to_string(),
+                url: "/api/session/current/uploads/u-77/raw".to_string(),
+            }],
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"log_entry\""));
+        assert!(json.contains("\"upload_id\":\"u-77\""));
+        assert!(json.contains("\"url\":\"/api/session/current/uploads/u-77/raw\""));
     }
 
     #[test]

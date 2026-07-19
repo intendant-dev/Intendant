@@ -201,6 +201,7 @@ Per-category approval rules. Each value is `auto` (run without asking), `ask`
 | `network` | rule | `auto` | NetworkRequest |
 | `destructive` | rule | `ask` | Destructive |
 | `display_control` | rule | `ask` | DisplayControl |
+| `tool_call` | rule | `ask` | ToolCall (outbound MCP, skills/orchestration, and external-agent tool/MCP permission requests) |
 
 Arbitrary `CommandExec` is governed by the strictest configured rule among
 `command_exec` and every effect a shell can reach: `file_read`, `file_write`,
@@ -1025,6 +1026,7 @@ command_exec = "auto"
 network = "auto"
 destructive = "ask"
 display_control = "ask"
+tool_call = "ask"
 
 [presence]
 enabled = true
@@ -1140,17 +1142,19 @@ Approval is decided by a three-layer model (full UI details in
 
 1. **Global autonomy** — `--autonomy <low|medium|high|full>` (defaults to
    `medium`). `low` asks for everything except file reads; `full` keeps the
-   human entirely out of the loop (auto-approve) except for `HumanInput`.
+   human entirely out of the loop (auto-approve) except for `HumanInput` and
+   `LiveAudioSpawn`.
 2. **Category rules** — the `[approval]` section above (`auto`/`ask`/`deny`) per
    category. Arbitrary shell execution inherits the strictest rule of every
    effect it can reach.
 3. **Per-action approval** — `y` / `s` / `a` / `n` (approve / skip / approve-all
    / deny) prompts in any frontend.
 
-The nine action categories are: `FileRead`, `FileWrite`, `FileDelete`,
+The ten action categories are: `FileRead`, `FileWrite`, `FileDelete`,
 `CommandExec`, `NetworkRequest`, `Destructive`, `HumanInput`, `LiveAudioSpawn`,
-`DisplayControl`. `DisplayControl` uses a session-grant model — approve once and
-subsequent display actions skip the prompt (revocable in-frontend).
+`DisplayControl`, `ToolCall`. `DisplayControl` uses a session-grant model —
+approve once and subsequent display actions skip the prompt (revocable
+in-frontend).
 `HumanInput` and `LiveAudioSpawn` always require a human regardless of autonomy
 level or category rule.
 

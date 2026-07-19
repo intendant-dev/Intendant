@@ -3557,7 +3557,18 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
   if (event === 'replay_start' || event === 'context_snapshot') return null;
   if (event === 'log_entry' || !event) {
     if (!content) return null;
-    return { ...base, level: level || 'info', source: source || 'system', content, kind, output_id: entry.output_id || entry.outputId || '' };
+    return {
+      ...base,
+      level: level || 'info',
+      source: source || 'system',
+      content,
+      kind,
+      output_id: entry.output_id || entry.outputId || '',
+      // User rows served by the daemon can carry renderable upload refs
+      // (the UserMessageLog lane) — map them onto the same preview shape
+      // the record builders render as a thumbnail strip.
+      attachment_previews: userLogAttachmentPreviews(entry),
+    };
   }
   if (event === 'session_note') {
     const noteText = String(entry.text || content || '').trim();
@@ -3841,7 +3852,7 @@ function sessionWindowTranscriptContentForNode(node) {
   return sessionWindowTranscriptContentForElement(contentEl);
 }
 
-function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') {
+function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '', options = {}) {
   if (!node) return [];
   const isCommandOutput = !!node.dataset?.outputId || node.dataset?.kind === 'agent_output';
   // Reasoning rows render a label + elided summary and defer their body,
@@ -3869,7 +3880,7 @@ function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') 
     replacement_for_user_turn_index: node.dataset?.replacementForUserTurnIndex,
     content,
   }, fallbackSessionId);
-  return sessionWindowTranscriptSignaturesFromParts(parts);
+  return sessionWindowTranscriptSignaturesFromParts(parts, options);
 }
 
 // Per-item signature cache (log-append hot path). Computing a node item's
@@ -3878,12 +3889,15 @@ function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') 
 // the full-history signature scans. Signatures are stable for an item's
 // lifetime except for its session id, which retargets rewrite in place —
 // so entries are keyed by the effective session id and recomputed when it
-// changes. Node signatures ignore options (as before); record signatures
-// cache per options variant ('near' = includeUserNearTime dedup passes).
-// Item content mutations (live command-output summaries) intentionally do
-// not invalidate: their identity signatures (event/output/item ids) are
-// immutable and their summary-text signatures never matched replayed
-// records in the first place.
+// changes. Both lanes cache per options variant ('near' =
+// includeUserNearTime dedup passes): node-backed items honor options too,
+// so a LIVE user node emits the near-time/turn signatures during
+// hydration dedupe and pairs with its replayed copy (node signatures used
+// to ignore options, which left live user rows invisible to the
+// near-time bridge). Item content mutations (live command-output
+// summaries) intentionally do not invalidate: their identity signatures
+// (event/output/item ids) are immutable and their summary-text signatures
+// never matched replayed records in the first place.
 const _sessionWindowItemSignatureCache = new WeakMap();
 
 function sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId = '', options = {}) {
@@ -3895,9 +3909,10 @@ function sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId
     ? String(node.dataset?.sessionId || '').trim()
     : String(record.session_id || record.sessionId || '').trim();
   const sid = ownSid || String(fallbackSessionId || '').trim();
-  const variant = node
-    ? 'node'
-    : (options.includeUserNearTime ? 'near' : (options.includeText === false ? 'noText' : 'def'));
+  const optionsVariant = options.includeUserNearTime
+    ? 'near'
+    : (options.includeText === false ? 'noText' : 'def');
+  const variant = (node ? 'node-' : 'record-') + optionsVariant;
   let cached = _sessionWindowItemSignatureCache.get(item);
   if (cached && cached.sid === sid && cached[variant]) return cached[variant];
   if (!cached || cached.sid !== sid) {
@@ -3905,7 +3920,7 @@ function sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId
     _sessionWindowItemSignatureCache.set(item, cached);
   }
   const signatures = node
-    ? sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId)
+    ? sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId, options)
     : sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId, options);
   cached[variant] = signatures;
   return signatures;
@@ -4036,6 +4051,7 @@ function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
     renderSessionWindowRange(win, win.renderStart);
   }
   applySessionWindowOutputScroll(win, shouldFollow);
+  notifyMinimizedSessionWindowHistoryAppend(win);
 }
 
 function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSessionId) {

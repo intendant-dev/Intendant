@@ -148,12 +148,19 @@ pub(crate) async fn resolve_frame_attachments(
 ///
 /// Order is preserved from the input list so the prelude reads the files
 /// in the order the user selected them.
+///
+/// The returned [`UserAttachments`] additionally carries renderable
+/// upload refs (`refs`) for the upload-backed entries — the same
+/// `{upload_id, name, mime, url}` shape session notes use, pointing at
+/// the gateway's `/raw` route — so the canonical `UserMessageLog` row can
+/// persist and replay what the user attached. Frame entries mint no ref
+/// (no upload blob to serve).
 pub(crate) async fn resolve_attachments(
     ids: &[String],
     registry: &Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     session_dir: &std::path::Path,
     project_root: &std::path::Path,
-) -> Vec<external_agent::AgentAttachment> {
+) -> UserAttachments {
     resolve_attachments_with_scopes(
         ids,
         registry,
@@ -170,11 +177,12 @@ pub(crate) async fn resolve_attachments_with_scopes(
     registry: &Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     session_dir: &std::path::Path,
     scopes: &[crate::global_store::StoreScope],
-) -> Vec<external_agent::AgentAttachment> {
+) -> UserAttachments {
     if ids.is_empty() {
-        return Vec::new();
+        return UserAttachments::default();
     }
     let mut out: Vec<external_agent::AgentAttachment> = Vec::with_capacity(ids.len());
+    let mut refs: Vec<crate::types::SessionNoteAttachment> = Vec::new();
     for raw in ids {
         if let Some(upload_id) = raw.strip_prefix("upload:") {
             let Some(d) = scopes
@@ -213,6 +221,16 @@ pub(crate) async fn resolve_attachments_with_scopes(
                     },
                 ));
             }
+            // Same URL convention as session-note attachments
+            // (`mcp/tools_notes.rs`): the gateway's raw route resolves the
+            // id against the current-session upload scopes, in every
+            // browser, now and after replay.
+            refs.push(crate::types::SessionNoteAttachment {
+                url: format!("/api/session/current/uploads/{}/raw", d.id),
+                upload_id: d.id.clone(),
+                name: d.original_name.clone().unwrap_or_else(|| d.name.clone()),
+                mime: d.mime.clone(),
+            });
             continue;
         }
         // Frame resolution: accept both "frame:<id>" and bare ids for
@@ -239,7 +257,7 @@ pub(crate) async fn resolve_attachments_with_scopes(
             ),
         ));
     }
-    out
+    UserAttachments::from_resolved(out, refs)
 }
 
 /// Auto-attach the latest display frame(s) from the frame registry.
@@ -1856,7 +1874,7 @@ mod tests {
         let attachments = resolve_attachments(&ids, &registry, &session_dir, &project_root).await;
 
         assert_eq!(attachments.len(), 2);
-        match &attachments[0] {
+        match &attachments.items[0] {
             external_agent::AgentAttachment::File(file) => {
                 assert_eq!(file.name, "data.csv");
                 assert_eq!(file.mime_type, "text/csv");
@@ -1870,7 +1888,7 @@ mod tests {
             }
             other => panic!("expected file upload attachment, got {other:?}"),
         }
-        match &attachments[1] {
+        match &attachments.items[1] {
             external_agent::AgentAttachment::Image(image) => {
                 assert_eq!(image.mime_type, "image/png");
                 assert_eq!(image.local_path.as_ref(), Some(&image_upload.path));
@@ -1878,6 +1896,18 @@ mod tests {
             }
             other => panic!("expected image upload attachment, got {other:?}"),
         }
+        // Upload-backed entries mint renderable refs alongside the backend
+        // items — the canonical user row's replayable attachment metadata.
+        assert_eq!(attachments.refs.len(), 2);
+        assert_eq!(attachments.refs[0].upload_id, file_upload.id);
+        assert_eq!(attachments.refs[0].name, "data.csv");
+        assert_eq!(attachments.refs[0].mime, "text/csv");
+        assert_eq!(
+            attachments.refs[0].url,
+            format!("/api/session/current/uploads/{}/raw", file_upload.id)
+        );
+        assert_eq!(attachments.refs[1].upload_id, image_upload.id);
+        assert_eq!(attachments.refs[1].mime, "image/png");
     }
 
     #[tokio::test]
@@ -1927,7 +1957,7 @@ mod tests {
             resolve_attachments_with_scopes(&ids, &registry, &session_dir, &scopes).await;
 
         assert_eq!(attachments.len(), 1);
-        match &attachments[0] {
+        match &attachments.items[0] {
             external_agent::AgentAttachment::File(file) => {
                 assert_eq!(file.name, "pending.txt");
                 assert_eq!(file.local_path, upload.path);

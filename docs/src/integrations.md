@@ -39,6 +39,20 @@ registered to the agent under the name `mcp__<server>_<tool>` (e.g.
 `mcp__github_list_issues`). When the agent calls one of these, the client routes
 the call to the right server by parsing that prefix.
 
+Every outbound `mcp__*` call passes the controller's `tool_call` approval gate
+before dispatch. The shipped `tool_call = "ask"` rule therefore prompts at
+Medium autonomy; owners who deliberately trust their configured servers can
+set it to `auto`.
+
+Replies cross a separate context boundary. Intendant preserves the MCP
+`is_error` status and wraps text (including transport error text) as explicitly
+untrusted, quoted data before adding it to the model conversation. Control,
+invisible-format, and bidirectional-override characters are made visible;
+carriage returns are normalized; and the complete rendered result is capped at
+64 KiB with an explicit truncation marker. Non-text and structured payloads are
+not copied into this text bridge. These measures bound and label the input;
+they do not make an external server's claims trustworthy.
+
 ### Trust model
 
 This is a privileged integration with **no sandboxing**:

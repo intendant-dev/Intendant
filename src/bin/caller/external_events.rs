@@ -615,6 +615,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                     None,
                                     None,
                                     None,
+                                    &[],
                                     &text,
                                 );
                                 pending_runtime_steers.push_back(PendingRuntimeSteer {
@@ -733,7 +734,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                             &mut active_side_turns,
                             session_id,
                             text,
-                            UserAttachments::from_items(attachments),
+                            attachments,
                             follow_up_id,
                             None,
                         )

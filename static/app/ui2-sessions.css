@@ -1692,9 +1692,20 @@ html.ui-v2 #tab-sessions .session-card .sc-id { font-family: var(--mono); }
 /* ── Session-window log placeholder states (three-state contract) ── */
 .session-window-empty.session-window-empty-error {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   color: var(--red, #f38ba8);
+}
+/* the visible reason line: full-width, quiet, clipped to one line (the
+   tooltip keeps the untruncated text) */
+.session-window-empty-reason {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: var(--text-3, var(--overlay0));
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .session-window-empty-retry {
   border: 1px solid var(--line, rgba(127,127,127,.35));

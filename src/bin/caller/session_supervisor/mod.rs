@@ -676,9 +676,9 @@ impl SessionSupervisor {
         attachments: &[String],
         session_dir: &Path,
         primary_project_root: &Path,
-    ) -> Vec<external_agent::AgentAttachment> {
+    ) -> UserAttachments {
         if attachments.is_empty() {
-            return Vec::new();
+            return UserAttachments::default();
         }
         let scopes = self.attachment_store_scopes(primary_project_root);
         resolve_attachments_with_scopes(

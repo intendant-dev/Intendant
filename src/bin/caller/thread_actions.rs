@@ -2622,6 +2622,7 @@ pub(crate) fn emit_codex_subagent_transcript_entry(
                 entry,
                 "replacement_for_user_turn_index",
             ),
+            attachments: Vec::new(),
         });
         return;
     }
@@ -3220,6 +3221,7 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 user_turn_index: None,
                 user_turn_revision: None,
                 replacement_for_user_turn_index: None,
+                attachments: Vec::new(),
             });
         }
         external_agent::AgentEvent::Reasoning { text } => {

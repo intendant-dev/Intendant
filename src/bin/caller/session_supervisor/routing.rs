@@ -164,12 +164,9 @@ impl SessionSupervisor {
                     }
                     return;
                 }
-                let msg = FollowUpMessage::with_attachments(
-                    text.clone(),
-                    UserAttachments::from_items(resolved_attachments),
-                )
-                .for_target(Some(requested_id.clone()))
-                .with_follow_up_id(follow_up_id.clone());
+                let msg = FollowUpMessage::with_attachments(text.clone(), resolved_attachments)
+                    .for_target(Some(requested_id.clone()))
+                    .with_follow_up_id(follow_up_id.clone());
                 if tx.send(msg).await.is_err() {
                     emit_follow_up_status(
                         &self.config.bus,
@@ -536,7 +533,7 @@ impl SessionSupervisor {
             .map(|_| request.requested_id.clone());
         let msg = FollowUpMessage::edit_user_message(
             request.text,
-            UserAttachments::from_items(resolved_attachments),
+            resolved_attachments,
             request.user_turn_index,
             user_turn_revision,
             request.original_text,
@@ -1103,12 +1100,8 @@ impl SessionSupervisor {
                 short_session(&managed_id)
             ));
         }
-        let msg = FollowUpMessage::steer(
-            text,
-            UserAttachments::from_items(resolved_attachments),
-            steer_id.clone(),
-        )
-        .for_target(requested_id.clone().or(Some(managed_id.clone())));
+        let msg = FollowUpMessage::steer(text, resolved_attachments, steer_id.clone())
+            .for_target(requested_id.clone().or(Some(managed_id.clone())));
         if tx.send(msg).await.is_err() {
             self.warn(&format!(
                 "Steer dropped: {} session {} in {} is not accepting input",
