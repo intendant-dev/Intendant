@@ -74,6 +74,15 @@ pub struct SessionLimitWindow {
     /// utilization-less windows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// Unix seconds when the producer last saw a provider report for this
+    /// window. Providers announce window state only on model calls, so an
+    /// idle session's windows go stale — the stamp lets consumers prefer
+    /// the freshest report per window across a backend's sessions and lets
+    /// frontends say how old a claim is instead of presenting it as
+    /// current. Wire-additive: absent on emissions from daemons that
+    /// predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_epoch: Option<u64>,
 }
 
 /// What a session's model/backend is verifiably doing right now — the
@@ -418,6 +427,40 @@ mod tests {
         assert_eq!(legacy.checkout, "");
         let rewire = serde_json::to_value(&legacy).expect("serializes");
         assert!(rewire.get("checkout").is_none());
+    }
+
+    /// The limit window's `observed_at_epoch` is wire-additive: serialized
+    /// camelCase when known, absent otherwise, and legacy emissions
+    /// without it (or without `usedPct` — the no-synthesized-percentage
+    /// rule) deserialize losslessly.
+    #[test]
+    fn limit_window_observed_at_round_trips_and_stays_wire_additive() {
+        let window = SessionLimitWindow {
+            label: "5h".into(),
+            used_pct: None,
+            resets_at_epoch: Some(1_784_503_200),
+            status: Some("allowed_warning".into()),
+            observed_at_epoch: Some(1_784_499_000),
+        };
+        let wire = serde_json::to_value(&window).expect("serializes");
+        assert_eq!(wire["observedAtEpoch"], 1_784_499_000u64);
+        assert_eq!(wire["resetsAtEpoch"], 1_784_503_200u64);
+        assert_eq!(wire["status"], "allowed_warning");
+        assert!(
+            wire.get("usedPct").is_none(),
+            "an unreported percentage must not serialize as a number"
+        );
+        let back: SessionLimitWindow = serde_json::from_value(wire).expect("deserializes");
+        assert_eq!(back, window);
+
+        // Legacy wire without the stamp: defaults to None and never
+        // re-serializes as noise.
+        let legacy: SessionLimitWindow =
+            serde_json::from_str(r#"{"label":"7d","status":"allowed"}"#)
+                .expect("legacy deserializes");
+        assert_eq!(legacy.observed_at_epoch, None);
+        let rewire = serde_json::to_value(&legacy).expect("serializes");
+        assert!(rewire.get("observedAtEpoch").is_none());
     }
 
     /// The config section's wire shape: camelCase fields, absent when

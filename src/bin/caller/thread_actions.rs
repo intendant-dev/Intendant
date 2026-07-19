@@ -3479,6 +3479,11 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 presence: None,
             });
         }
+        external_agent::AgentEvent::RateLimitWindows { windows } => {
+            config
+                .bus
+                .send(AppEvent::SessionRateLimits { session_id, windows });
+        }
         external_agent::AgentEvent::ActivityUpdate { activity } => {
             // Side/child-thread activity rides the child's session id into
             // the vitals hub, same keying as its usage snapshots.

@@ -280,6 +280,7 @@ mod tests {
             used_pct: Some(42),
             resets_at_epoch: None,
             status: None,
+            observed_at_epoch: None,
         }];
         let second = rail
             .on_event(&response(Some("s1"), with_limits))

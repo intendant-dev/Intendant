@@ -3011,11 +3011,20 @@ impl CcReader {
         if !status.is_empty() {
             window.status = Some(status.to_string());
         }
+        window.observed_at_epoch = Some(crate::session_activity::epoch_seconds());
+        let resets_at_epoch = window.resets_at_epoch;
+        // Deliver the change NOW, not only on the next usage snapshot: a
+        // rejected turn produces no usage at all, and a warning arriving
+        // between calls would otherwise sit invisible while the chip keeps
+        // claiming the previous status. Same per-model-call cadence as the
+        // usage rail; the vitals hub emits only on actual change.
+        out.events.push(AgentEvent::RateLimitWindows {
+            windows: self.current_limit_windows(),
+        });
         // Activity: a non-allowed status while a turn runs is the honest
         // "rate-limited" claim (with the reset countdown when carried);
         // an explicit allowed status retires it. `allowed_warning` still
         // allows requests — the limits gauge carries the warning.
-        let resets_at_epoch = window.resets_at_epoch;
         match status {
             "" => {}
             "allowed" | "allowed_warning" => {
@@ -3096,11 +3105,16 @@ impl CcReader {
     }
 }
 
-/// Compact gauge label for a Claude Code `rateLimitType`.
+/// Compact gauge label for a Claude Code `rateLimitType`. The mapped
+/// types are the ones observed on the live wire (2.1.2xx announces
+/// `five_hour` on every call, and `seven_day` /
+/// `seven_day_overage_included` once those windows are elevated); unknown
+/// vocabulary passes through softened, never truncated.
 fn cc_rate_limit_label(kind: &str) -> String {
     match kind {
         "five_hour" => "5h".to_string(),
         "seven_day" => "7d".to_string(),
+        "seven_day_overage_included" => "7d-overage".to_string(),
         other => other.replace('_', " "),
     }
 }
@@ -7452,9 +7466,9 @@ mod tests {
     }
 
     /// 2.1.2xx dropped `utilization` from rate_limit_event in normal
-    /// operation (live wire probed on 2.1.207: status/resetsAt/
-    /// rateLimitType/overageStatus only). The window still feeds the gauge
-    /// — status and reset, no pct — instead of vanishing.
+    /// operation (live wire probed on 2.1.207 and re-verified on 2.1.215:
+    /// status/resetsAt/rateLimitType/overageStatus only). The window still
+    /// feeds the gauge — status and reset, no pct — instead of vanishing.
     #[test]
     fn utilization_less_rate_limit_event_still_builds_window() {
         let mut reader = test_reader();
@@ -7482,6 +7496,69 @@ mod tests {
         assert_eq!(windows[0].used_pct, Some(34));
         assert_eq!(windows[0].resets_at_epoch, Some(1_783_929_800));
         assert_eq!(windows[0].status.as_deref(), Some("allowed_warning"));
+    }
+
+    /// Window updates reach the vitals at the event itself, not only on
+    /// the next usage snapshot: a rejected turn produces NO usage (the
+    /// all-zero result is dropped), and a between-turns warning would
+    /// otherwise wait for the next call while the chip kept claiming the
+    /// previous status (the 2026-07-19 ok-vs-warning mismatch). Every
+    /// `rate_limit_event` must push a `RateLimitWindows` with the current
+    /// store, stamped with the observation time.
+    #[test]
+    fn rate_limit_events_deliver_windows_without_a_usage_snapshot() {
+        fn window_events(out: &CcLineOutcome) -> Vec<Vec<crate::types::SessionLimitWindow>> {
+            out.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::RateLimitWindows { windows } => Some(windows.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1783929600,"rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        let emitted = window_events(&out);
+        assert_eq!(emitted.len(), 1, "the event itself carries the windows");
+        assert_eq!(emitted[0].len(), 1);
+        assert_eq!(emitted[0][0].label, "5h");
+        assert_eq!(emitted[0][0].status.as_deref(), Some("allowed_warning"));
+        assert_eq!(emitted[0][0].resets_at_epoch, Some(1_783_929_600));
+        assert_eq!(
+            emitted[0][0].used_pct, None,
+            "no reported percentage, none synthesized"
+        );
+        assert!(
+            emitted[0][0].observed_at_epoch.is_some(),
+            "windows carry their observation stamp"
+        );
+
+        // The rejected case: no usage will follow this turn, so the event
+        // emission is the ONLY carrier.
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        let emitted = window_events(&out);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0][0].status.as_deref(), Some("rejected"));
+
+        // The weekly overage window observed live (2026-07-19 logs) maps
+        // to the chip grammar and joins the store alongside five_hour.
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1784716800,"rateLimitType":"seven_day_overage_included"},"session_id":"s1"}"#,
+        );
+        let emitted = window_events(&out);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].len(), 2, "windows union across types");
+        let overage = emitted[0]
+            .iter()
+            .find(|w| w.label == "7d-overage")
+            .expect("overage window labeled for the chip grammar");
+        assert_eq!(overage.status.as_deref(), Some("allowed_warning"));
+        assert_eq!(overage.resets_at_epoch, Some(1_784_716_800));
     }
 
     /// A resumed big-context session reports usage before the first result

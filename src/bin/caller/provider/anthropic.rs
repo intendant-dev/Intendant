@@ -2008,6 +2008,7 @@ mod tests {
             used_pct: Some(3),
             resets_at_epoch: None,
             status: None,
+            observed_at_epoch: None,
         }];
         let transcript = concat!(
             "data: not json at all\n\n",

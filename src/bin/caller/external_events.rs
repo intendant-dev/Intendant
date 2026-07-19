@@ -1299,6 +1299,14 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     presence: None,
                 });
             }
+            // Rate-limit windows at the report itself → the vitals hub
+            // (rejected turns produce no usage snapshot to ride).
+            external_agent::AgentEvent::RateLimitWindows { windows } => {
+                config.bus.send(AppEvent::SessionRateLimits {
+                    session_id: config.session_id.clone(),
+                    windows,
+                });
+            }
             external_agent::AgentEvent::ActivityUpdate { activity } => {
                 // Wire-fact activity snapshot → the vitals hub (keyed like
                 // usage; the hub's identity aliasing folds it into the

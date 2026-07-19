@@ -1208,6 +1208,17 @@ pub enum AgentEvent {
     ActivityUpdate {
         activity: crate::types::SessionActivityVitals,
     },
+    /// The backend's provider rate-limit windows changed (Claude Code
+    /// `rate_limit_event`, Codex `account/rateLimits/updated`). Emitted at
+    /// the change itself so status transitions reach the vitals limit
+    /// gauges immediately — the usage-snapshot attachment alone loses the
+    /// exact cases that matter most (a rejected turn produces no usage; a
+    /// warning arriving between turns waits for the next call). Drains
+    /// forward it as `AppEvent::SessionRateLimits` for the vitals hub.
+    /// Ambient bookkeeping — implies no turn.
+    RateLimitWindows {
+        windows: Vec<crate::types::SessionLimitWindow>,
+    },
     /// Partial session-config facts (model / effort / permission mode)
     /// observed at a protocol seam: launch config at spawn, the backend's
     /// own echoes (Claude Code `system:init` / `message_start`, Codex

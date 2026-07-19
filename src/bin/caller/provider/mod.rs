@@ -120,6 +120,12 @@ fn anthropic_rate_limit_windows_from_headers(
             used_pct: Some(used_pct),
             resets_at_epoch,
             status: None,
+            observed_at_epoch: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            ),
         });
     }
     windows

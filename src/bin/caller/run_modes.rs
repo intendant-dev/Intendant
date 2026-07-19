@@ -1618,6 +1618,12 @@ pub(crate) async fn run_with_presence(
                             presence: None,
                         });
                     }
+                    external_agent::AgentEvent::RateLimitWindows { windows } => {
+                        bus.send(AppEvent::SessionRateLimits {
+                            session_id: session_log_id(&session_log),
+                            windows,
+                        });
+                    }
                     // Ambient bookkeeping like Usage/Log: forward to the
                     // vitals hub and NEVER fall through to the observe
                     // drain — an idle activity snapshot (turn settle,

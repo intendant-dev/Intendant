@@ -685,6 +685,12 @@ pub(crate) async fn run_external_agent_mode(
                                             presence: None,
                                         });
                                     }
+                                    external_agent::AgentEvent::RateLimitWindows { windows } => {
+                                        bus.send(AppEvent::SessionRateLimits {
+                                            session_id: drain_config.session_id.clone(),
+                                            windows,
+                                        });
+                                    }
                                     // Ambient bookkeeping like Usage/Log:
                                     // forward to the vitals hub, never into
                                     // the observe drain (an idle activity
