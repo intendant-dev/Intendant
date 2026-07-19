@@ -256,6 +256,12 @@ pub(crate) fn try_buffered_idle_agent_event(
     }
 }
 
+/// Emit one canonical user-message row: a session-log `[user]` line that
+/// persists the turn metadata + renderable attachment refs in `data`, and
+/// the live `UserMessageLog` bus event carrying the same fields — so the
+/// live wire row and its replayed copy are identically tagged and the
+/// dashboard's transcript-signature dedupe collapses them across lanes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_user_message_log(
     bus: &EventBus,
     session_log: &SharedSessionLog,
@@ -263,19 +269,29 @@ pub(crate) fn emit_user_message_log(
     user_turn_index: Option<u32>,
     user_turn_revision: Option<u32>,
     replacement_for_user_turn_index: Option<u32>,
+    attachments: &[crate::types::SessionNoteAttachment],
     text: &str,
 ) {
     let text = text.trim();
     if text.is_empty() {
         return;
     }
-    slog(session_log, |l| l.info(&format!("[user] {}", text)));
+    slog(session_log, |l| {
+        l.user_message(
+            text,
+            user_turn_index,
+            user_turn_revision,
+            replacement_for_user_turn_index,
+            attachments,
+        )
+    });
     bus.send(AppEvent::UserMessageLog {
         session_id: session_id.map(str::to_string),
         content: text.to_string(),
         user_turn_index,
         user_turn_revision,
         replacement_for_user_turn_index,
+        attachments: attachments.to_vec(),
     });
 }
 

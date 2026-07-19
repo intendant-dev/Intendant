@@ -1122,12 +1122,9 @@ pub(crate) async fn run_external_agent_mode(
                                 &drain_config.alias_session_id,
                                 &open_side_threads,
                             ) => {
-                                let followup = FollowUpMessage::with_attachments(
-                                    text,
-                                    UserAttachments::from_items(attachments),
-                                )
-                                .for_target(Some(session_id))
-                                .with_follow_up_id(follow_up_id);
+                                let followup = FollowUpMessage::with_attachments(text, attachments)
+                                    .for_target(Some(session_id))
+                                    .with_follow_up_id(follow_up_id);
                                 if follow_up_message_was_cancelled(
                                     &mut cancelled_follow_ups,
                                     &followup,
@@ -1509,6 +1506,7 @@ pub(crate) async fn run_external_agent_mode(
                 Some(*side_round as u32),
                 Some(user_turn_revision),
                 replacement_for_user_turn_index,
+                &attachments.refs,
                 &turn_text,
             );
             let merged = drain_steer_queue_as_followup(
@@ -1627,6 +1625,7 @@ pub(crate) async fn run_external_agent_mode(
                 Some(*subagent_round as u32),
                 None,
                 None,
+                &attachments.refs,
                 &turn_text,
             );
             let merged = drain_steer_queue_as_followup(
@@ -2336,6 +2335,7 @@ pub(crate) async fn run_external_agent_mode(
             Some(round as u32),
             Some(user_turn_revision),
             replacement_for_user_turn_index,
+            &attachments.refs,
             user_log_text,
         );
         slog(&session_log, |l| {

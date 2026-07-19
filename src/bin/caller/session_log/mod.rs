@@ -1236,6 +1236,56 @@ impl SessionLog {
         });
     }
 
+    /// Log a user message row (`[user] …`) with the live lane's turn
+    /// metadata and renderable attachment refs in `data`, so replay can
+    /// serve the row tagged exactly like the live `UserMessageLog` wire
+    /// row (the cross-lane dedupe key). Stays an ordinary `info` event —
+    /// old readers that ignore `data` render it exactly as before — and
+    /// when there is no metadata at all the emitted line is byte-shaped
+    /// like a plain `info(&format!("[user] {msg}"))`.
+    pub fn user_message(
+        &mut self,
+        msg: &str,
+        user_turn_index: Option<u32>,
+        user_turn_revision: Option<u32>,
+        replacement_for_user_turn_index: Option<u32>,
+        attachments: &[crate::types::SessionNoteAttachment],
+    ) {
+        let mut data = serde_json::Map::new();
+        if let Some(index) = user_turn_index {
+            data.insert("user_turn_index".to_string(), index.into());
+        }
+        if let Some(revision) = user_turn_revision {
+            data.insert("user_turn_revision".to_string(), revision.into());
+        }
+        if let Some(replaced) = replacement_for_user_turn_index {
+            data.insert(
+                "replacement_for_user_turn_index".to_string(),
+                replaced.into(),
+            );
+        }
+        if !attachments.is_empty() {
+            if let Ok(refs) = serde_json::to_value(attachments) {
+                data.insert("attachments".to_string(), refs);
+            }
+        }
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
+            event: "info".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("[user] {}", msg)),
+            data: (!data.is_empty()).then_some(serde_json::Value::Object(data)),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log a voice transcript from the browser presence model.
     pub fn voice_log(&mut self, text: &str, seq: u64, tool_context: Option<&str>) {
         self.emit(LogEvent {

@@ -114,6 +114,9 @@ function appendSessionWindowActionMenuItem(parent, action, codex = false) {
 // fields; a no-op once real entries exist.
 function renderSessionWindowLogPlaceholder(win) {
   if (!win || !win.log) return;
+  // Minimized windows keep their transcript unmounted (data-only appends;
+  // see setSessionWindowMinimized) — the placeholder is transcript DOM too.
+  if (win.minimized) return;
   const existing = win.log.querySelector('.session-window-empty');
   // Real entries present: never stomp them (placeholder is gone already).
   if (win.log.childElementCount > (existing ? 1 : 0)) return;
@@ -150,6 +153,14 @@ function renderSessionWindowLogPlaceholder(win) {
       }
     });
     box.appendChild(retry);
+    // The reason itself, visible — "session not found (404)" beats a
+    // generic line whose cause hides in a tooltip nobody hovers. Quiet
+    // full-width secondary line; the tooltip keeps the untruncated text.
+    const reason = document.createElement('span');
+    reason.className = 'session-window-empty-reason';
+    reason.textContent = errorText;
+    reason.title = errorText;
+    box.appendChild(reason);
   } else if (hydrating) {
     box.classList.add('session-window-empty-loading');
     box.textContent = 'Loading transcript…';
@@ -683,16 +694,51 @@ function toggleSessionWindowHeaderCollapsed(sessionId) {
   setSessionWindowHeaderCollapsed(sid, !win.headerCollapsed);
 }
 
+// Minimize UNMOUNTS the transcript children — a minimized card used to
+// keep its whole rendered window (up to SESSION_WINDOW_RENDER_LIMIT
+// entries) mounted under display:none, so auto-minimized done sub-agents
+// and the Collapse-all sweep saved nothing. The data plane is untouched:
+// win.logHistory keeps accumulating through the ordinary append paths
+// (which go data-only via the win.minimized guards in
+// renderSessionWindowRange / renderSessionWindowTail /
+// appendSessionWindowRenderedTailItem(s)), so restore loses nothing —
+// it re-materializes the visible tail from the history records and lands
+// at the bottom (the existing jump-bottom behavior).
+function unmountSessionWindowTranscript(win) {
+  if (!win || !win.log) return;
+  win.log.replaceChildren();
+  // Nothing is mounted: an empty range at the head is the honest render
+  // state (restore re-renders via renderSessionWindowRange, which has no
+  // early-out, so there is no stale-match hazard).
+  win.renderStart = 0;
+  win.renderEnd = 0;
+}
+
+function restoreSessionWindowTranscript(win) {
+  if (!win || !win.log) return;
+  const history = ensureSessionWindowHistory(win);
+  renderSessionWindowRange(win, sessionWindowTailStart(history.length));
+  win.followOutput = true;
+  win.pendingOutput = false;
+  updateSessionWindowJumpButton(win);
+  scheduleSessionWindowScrollToBottom(win);
+}
+
 function setSessionWindowMinimized(sessionId, minimized) {
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win) return;
+  const wasMinimized = !!win.minimized;
   win.minimized = !!minimized;
   if (win.minimized && maximizedSessionWindowId === sid) {
     maximizedSessionWindowId = '';
     updateSessionWindowMaximizeState();
   }
   updateSessionWindowMinimizeState(sid);
+  if (win.minimized !== wasMinimized) {
+    if (win.minimized) unmountSessionWindowTranscript(win);
+    else restoreSessionWindowTranscript(win);
+  }
   refreshSessionWindowPathLabels(win);
   applySessionWindowGridHeight();
   scheduleSessionRelationshipRender();
@@ -2739,6 +2785,25 @@ function sessionNoteAttachmentPreviews(d) {
   }));
 }
 
+// User log_entry rows can carry the same upload-ref shape
+// ({upload_id, name, mime, url}) on `attachments` — the daemon's
+// UserMessageLog lane persists what the user attached. Same strip
+// renderer as session notes, but only image refs get a thumbnail src;
+// non-image files degrade straight to the named chip instead of an
+// <img> that errors into one.
+function userLogAttachmentPreviews(d) {
+  const attachments = Array.isArray(d?.attachments) ? d.attachments : [];
+  return attachments.map(att => {
+    const image = String(att?.mime || '').toLowerCase().startsWith('image/');
+    return {
+      dataUrl: image ? (att?.url || '') : '',
+      url: att?.url || '',
+      name: att?.name || 'attachment',
+      mime: att?.mime || '',
+    };
+  });
+}
+
 // Normalize a session_note wire event (live WS or a raw replay/session-
 // detail entry) into the log-command shape renderLogEntry consumes.
 function sessionNoteLogCommand(d) {
@@ -2899,7 +2964,6 @@ function renderLogEntry(c) {
     return;
   }
   finalizeSessionCommandOutputGroups(c);
-  if (shouldSuppressAttachmentReceiptDuplicate(c)) return;
   inferSessionPhaseFromLog(c);
 
   const { entry } = createLogScaffold(c, '');

@@ -2321,15 +2321,13 @@ pub(crate) async fn run_with_presence(
             let initial_attachments = if envelope.attachment_frame_ids.is_empty() {
                 UserAttachments::default()
             } else {
-                UserAttachments::from_items(
-                    resolve_attachments(
-                        &envelope.attachment_frame_ids,
-                        &frame_registry,
-                        &session_dir,
-                        &project.root,
-                    )
-                    .await,
+                resolve_attachments(
+                    &envelope.attachment_frame_ids,
+                    &frame_registry,
+                    &session_dir,
+                    &project.root,
                 )
+                .await
             };
             let mut initial_followup =
                 FollowUpMessage::with_attachments(task_text.clone(), initial_attachments);

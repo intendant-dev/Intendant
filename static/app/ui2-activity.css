@@ -130,13 +130,19 @@ html.ui-v2 #activity-subtabs:has(.subtab-btn[data-activity-tab="log"].active) .u
   display: inline-flex;
 }
 
-/* session switcher: a quiet ghost select. appearance:none suppresses the
-   UA arrow, so the data-URI chevron IS the dropdown affordance — it rides
+/* session switcher: a quiet ghost select showing the CURRENT selection's
+   label beside the chevron. appearance:none suppresses the UA arrow, so
+   the data-URI chevron IS the dropdown affordance — it rides
    background-image; keep it when touching `background` (the shorthand
-   would erase it). #6C7482 is the mid-gray that reads on both themes. */
+   would erase it). #6C7482 is the mid-gray that reads on both themes.
+   Width is FIXED, not intrinsic: a select sizes to its widest option, so
+   the control used to jump on every option rebuild (and collapsed to a
+   bare ~40px chevron while option-less); long labels ellipsize inside
+   the stable box instead. */
 html.ui-v2 #activity-subtabs .ui2-session-switcher {
   appearance: none;
   -webkit-appearance: none;
+  width: 156px;
   max-width: 210px;
   height: 28px;
   padding: 0 24px 0 9px;
@@ -150,6 +156,8 @@ html.ui-v2 #activity-subtabs .ui2-session-switcher {
   font-size: 12px;
   font-weight: 550;
   cursor: pointer;
+  overflow: hidden;
+  white-space: nowrap;
   text-overflow: ellipsis;
 }
 html.ui-v2 #activity-subtabs .ui2-session-switcher:hover { border-color: var(--line-2); color: var(--text); }
@@ -398,6 +406,12 @@ html.ui-v2 .log-entry.source-prsnc .log-level { color: var(--green); }
 html.ui-v2 .log-entry.source-prsnc .log-level::after { content: 'PRESENCE'; }
 html.ui-v2 .log-entry.source-live .log-level { color: var(--sky); }
 html.ui-v2 .log-entry.source-live .log-level::after { content: 'VOICE'; }
+/* local attachment echo (47's renderAttachmentReceipt): a status row, not
+   user speech — quiet eyebrow, and deliberately NOT source-user, so it
+   never reads as (or dedupes against) the canonical YOU row */
+html.ui-v2 .log-entry.source-attach .log-level { font-size: 0; letter-spacing: 0; color: var(--text-3); }
+html.ui-v2 .log-entry.source-attach .log-level::after { content: 'ATTACH'; }
+html.ui-v2 .log-entry.source-attach .log-content { color: var(--text-3); }
 /* role dot tints */
 html.ui-v2 .log-entry.level-model .log-icon { background: var(--iris); }
 html.ui-v2 .log-entry.level-agent .log-icon { background: var(--green); }

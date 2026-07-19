@@ -284,6 +284,54 @@ function ui2ApplyFocusSurface() {
   }
 }
 
+// QA drive hooks (window.qa convention): the dashboard validator runs
+// outside the module scope, so the timeline probes need window-visible
+// seams onto the transcript machinery — synthetic entries through the
+// REAL pipelines (processCommands / renderRestoredSessionWindowEntries),
+// plus the minimize/layout/placeholder controls the boot probe asserts.
+// Side-effect-free readback in windowState; the drive hooks mutate only
+// the session windows the probe itself seeds.
+window.qa = Object.assign(window.qa || {}, {
+  timeline: {
+    seedLog: (c) => { processCommands([{ cmd: 'add_log_entry', ...c }]); return true; },
+    seedReplay: (sid, entries) => {
+      const win = sessionWindows.get(sid) || ensureSessionWindow(sid);
+      if (!win) return -1;
+      return renderRestoredSessionWindowEntries(win, entries, sid);
+    },
+    ensureWindow: (sid) => !!ensureSessionWindow(sid),
+    windowState: (sid) => {
+      const win = sessionWindows.get(sid);
+      if (!win) return null;
+      return {
+        mounted: win.log ? win.log.childElementCount : -1,
+        history: Array.isArray(win.logHistory) ? win.logHistory.length : 0,
+        minimized: !!win.minimized,
+        text: win.log ? (win.log.textContent || '') : '',
+        rows: win.log
+          ? [...win.log.querySelectorAll('.log-entry')].map(r => ({
+              text: (r.textContent || '').slice(0, 160),
+              userTurnIndex: r.dataset.userTurnIndex || '',
+            }))
+          : [],
+      };
+    },
+    setMinimized: (sid, minimized) => { setSessionWindowMinimized(sid, minimized); return true; },
+    // try/catch: focus repaints the Context pane, whose three.js renderer
+    // throws in WebGL-less validator browsers — the focus/foreground state
+    // this hook exists for is set before that repaint.
+    focusSession: (sid) => { try { focusSessionWindow(sid); } catch (_) {} return true; },
+    applyLayout: (mode) => { ui2ApplyLayout(mode); return true; },
+    setHydrateError: (sid, message) => {
+      const win = sessionWindows.get(sid);
+      if (!win) return false;
+      win.hydrateError = String(message || '');
+      renderSessionWindowLogPlaceholder(win);
+      return true;
+    },
+  },
+});
+
 // QA readback (window.qa convention): the Focus surface's inputs and its
 // verdict. The interesting regression is silent — Focus renders an empty
 // page — so the probe exposes what it resolved and what it promoted.

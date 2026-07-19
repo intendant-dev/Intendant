@@ -461,6 +461,7 @@ pub(crate) async fn start_external_side_followup_turn(
         Some(side_round as u32),
         Some(user_turn_revision),
         None,
+        &[],
         &text,
     );
     let merged = drain_steer_queue_as_followup(
@@ -545,6 +546,7 @@ pub(crate) async fn start_external_primary_steer_followup_turn(
                 None,
                 None,
                 None,
+                &[],
                 &text,
             );
             slog(config.session_log, |l| l.info(&reason));

@@ -6,6 +6,15 @@
 // ids), so it never mutates session state; interactive affordances that
 // need the live wiring (collapse, copy, retry) are hidden by the peek
 // stylesheet in favor of "Open in Activity".
+// MINIMIZED target: a minimized window keeps its transcript UNMOUNTED
+// (data-only appends; 41's setSessionWindowMinimized), so the clone
+// mirror has nothing to mirror. The peek then materializes its tail
+// straight from win.logHistory via the record builder — the same nodes
+// restore would mount — and re-renders on the
+// 'ui2:session-window-history-append' signal the data-only append paths
+// dispatch (no DOM mutations means the MutationObserver never fires).
+// Chosen over "restore the window for the peek": peeking must not undo
+// the user's (or the auto-rule's) minimize.
 // Boot follows the ui2-chrome single-boot idiom; every entry point is a
 // no-op when the mount is missing so a stub build stays inert.
 {
@@ -79,11 +88,51 @@
     return out.reverse();
   }
 
+  // Minimized-target fallback: the bound log is unmounted, so build the
+  // tail from win.logHistory records — node-backed items clone their
+  // retained node, record-backed items go through the same record
+  // builder restore uses. Fresh nodes every render (no reconcile): the
+  // tail is ≤ PEEK_TAIL_CAP entries behind a 120ms throttle, and the
+  // surgical reconcile exists for aria-live continuity on the LIVE
+  // mirror, which this lane is not.
+  function peekMaterializedTail() {
+    const win = peekTargetWindow(peekBoundSid);
+    if (!win || !win.minimized || !Array.isArray(win.logHistory) || win.logHistory.length === 0) {
+      return [];
+    }
+    if (typeof buildSessionWindowLogEntry !== 'function') return [];
+    const out = [];
+    for (let i = win.logHistory.length - 1; i >= 0 && out.length < PEEK_TAIL_CAP; i--) {
+      const item = win.logHistory[i];
+      let node = null;
+      try {
+        if (typeof sessionWindowHistoryNode === 'function' && sessionWindowHistoryNode(item)) {
+          node = peekCloneEntry(sessionWindowHistoryNode(item));
+        } else {
+          const record = typeof sessionWindowHistoryRecord === 'function'
+            ? sessionWindowHistoryRecord(item) : null;
+          if (record) node = buildSessionWindowLogEntry(record);
+        }
+      } catch (_) { node = null; }
+      if (node) out.push(node);
+    }
+    return out.reverse();
+  }
+
   function peekEmptyText() {
     if (!peekBoundLog) return 'No transcript yet — send a message below.';
     const ph = peekBoundLog.querySelector('.session-window-empty');
     if (ph && ph.classList.contains('session-window-empty-loading')) return 'Loading transcript…';
-    if (ph && ph.classList.contains('session-window-empty-error')) return 'Transcript failed to load — open Activity to retry.';
+    if (ph && ph.classList.contains('session-window-empty-error')) {
+      // Same visibility rule as the window placeholder: name the reason
+      // (win.hydrateError, the source the placeholder rendered from)
+      // instead of a generic line.
+      const win = peekTargetWindow(peekBoundSid);
+      const reason = String((win && win.hydrateError) || '').trim();
+      return reason
+        ? `Transcript failed to load — ${reason} (open Activity to retry)`
+        : 'Transcript failed to load — open Activity to retry.';
+    }
     return 'No output yet';
   }
 
@@ -103,6 +152,13 @@
     if (sources.length === 0) {
       peekRendered = [];
       peekPendingDirty.clear();
+      const materialized = peekMaterializedTail();
+      if (materialized.length > 0) {
+        peekList.replaceChildren(...materialized);
+        if (peekFollow) peekList.scrollTop = peekList.scrollHeight;
+        peekSyncMoreBelow();
+        return;
+      }
       const empty = document.createElement('div');
       empty.className = 'ui2-peek-empty';
       empty.textContent = peekEmptyText();
@@ -515,6 +571,16 @@
     // Open-in-Activity label honest for wherever the user now is.
     window.addEventListener('ui2:tab-changed', () => {
       if (peekIsOpen()) peekSyncOpenLabel();
+    });
+
+    // Minimized-target appends are data-only (no DOM mutations for the
+    // log observer to see) — the append paths dispatch this instead;
+    // re-render the materialized tail through the same throttle.
+    window.addEventListener('ui2:session-window-history-append', (e) => {
+      const sid = (e && e.detail && e.detail.sessionId) || '';
+      if (!peekIsOpen() || !sid || sid !== peekBoundSid) return;
+      peekPendingStructural = true;
+      peekSchedule();
     });
 
     if (typeof ui2Mirror === 'function') {
