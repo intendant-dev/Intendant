@@ -585,6 +585,18 @@ impl CodexAgent {
         )
     }
 
+    /// Token-free URL placed in Codex's `-c` MCP config override. Codex
+    /// reads the bearer from [`super::INTENDANT_MCP_BEARER_TOKEN_ENV`], so
+    /// `ps` exposes only a variable name and never the session credential.
+    fn intendant_mcp_config_url(&self, port: u16) -> String {
+        super::intendant_bootstrap_mcp_url(
+            port,
+            self.mcp_session_id.as_deref(),
+            Some(self.intendant_managed_context_mode()),
+            None,
+        )
+    }
+
     #[allow(dead_code)]
     fn intendant_mcp_base_url(port: u16) -> String {
         format!("http://localhost:{port}/mcp")
@@ -603,6 +615,7 @@ impl CodexAgent {
             command,
             &self.intendant_mcp_url(port),
             self.mcp_session_id.as_deref(),
+            self.mcp_auth_token.as_deref(),
         );
         command.env(
             "INTENDANT_MANAGED_CONTEXT",
@@ -628,7 +641,7 @@ impl CodexAgent {
         effective_web_port: u16,
         inherit_configured_mcp_servers: bool,
     ) -> Vec<String> {
-        let mcp_url = self.intendant_mcp_url(effective_web_port);
+        let mcp_url = self.intendant_mcp_config_url(effective_web_port);
         let mut args: Vec<String> = Vec::new();
         if self.sandbox.trim() == CODEX_DANGER_FULL_ACCESS_SANDBOX {
             args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
@@ -648,6 +661,18 @@ impl CodexAgent {
             "-c".to_string(),
             format!("mcp_servers.intendant.url=\"{}\"", mcp_url),
         ]);
+        if super::intendant_mcp_bearer_token(
+            self.mcp_auth_token.as_deref(),
+            self.mcp_session_id.as_deref(),
+        )
+        .is_some()
+        {
+            args.push("-c".to_string());
+            args.push(format!(
+                "mcp_servers.intendant.bearer_token_env_var=\"{}\"",
+                super::INTENDANT_MCP_BEARER_TOKEN_ENV
+            ));
+        }
         if self.sandbox.trim() == CODEX_DANGER_FULL_ACCESS_SANDBOX {
             args.push("-c".to_string());
             args.push(format!(
@@ -1269,9 +1294,10 @@ impl ExternalAgent for CodexAgent {
         self.protocol_watch = protocol_watch.clone();
 
         // The Intendant MCP server is wired exclusively via per-process
-        // `-c mcp_servers.intendant.{type,url}` overrides (see
-        // app_server_args): each spawned Codex carries its own
-        // session-scoped URL on its command line. A legacy code path also
+        // `-c mcp_servers.intendant.{type,url,bearer_token_env_var}`
+        // overrides (see app_server_args). The URL on argv carries only
+        // session/profile routing; the session-scoped bearer rides an
+        // explicitly injected child env var. A legacy code path also
         // wrote `<working_dir>/.codex/config.toml` — a location Codex does
         // not read config from — which stomped the user's real
         // `~/.codex/config.toml` whenever a session's working dir was
@@ -3473,6 +3499,68 @@ enabled = true
             format!(
                 "http://localhost:8765/mcp?session_id=session%20with%20spaces&managed_context=managed&tool_profile=core&mcp_token={expected_token}"
             )
+        );
+    }
+
+    #[test]
+    fn mcp_bearer_is_in_child_env_never_codex_argv() {
+        use std::ffi::{OsStr, OsString};
+
+        let mut agent = CodexAgent::with_options(
+            "codex".to_string(),
+            None,
+            "never".to_string(),
+            "workspace-write".to_string(),
+            Some(8765),
+            CodexAgentOptions {
+                managed_context: true,
+                ..CodexAgentOptions::default()
+            },
+        );
+        agent.mcp_session_id = Some("session-a".to_string());
+        agent.mcp_auth_token = Some("raw-process-secret".to_string());
+        let expected =
+            crate::web_gateway::session_scoped_mcp_token("raw-process-secret", "session-a");
+
+        let args = agent.app_server_args_with_mcp_inheritance(8765, true);
+        let argv = args.join("\0");
+        assert!(!argv.contains("raw-process-secret"));
+        assert!(!argv.contains(&expected));
+        assert!(args_have_config_override(
+            &args,
+            "mcp_servers.intendant.url=\"http://localhost:8765/mcp?session_id=session-a&managed_context=managed&tool_profile=core\""
+        ));
+        assert!(args_have_config_override(
+            &args,
+            "mcp_servers.intendant.bearer_token_env_var=\"INTENDANT_MCP_BEARER_TOKEN\""
+        ));
+
+        let mut command = crate::platform::spawn_command("codex");
+        super::super::apply_external_child_env_policy_from(
+            &mut command,
+            std::iter::empty::<(OsString, OsString)>(),
+            &std::collections::HashSet::new(),
+        );
+        agent.add_intendant_ctl_env(&mut command, 8765);
+        let envs: Vec<(OsString, Option<OsString>)> = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(OsString::from)))
+            .collect();
+        let value_for = |name: &str| {
+            envs.iter()
+                .find(|(key, _)| key == OsStr::new(name))
+                .and_then(|(_, value)| value.clone())
+        };
+        assert_eq!(
+            value_for(super::super::INTENDANT_MCP_BEARER_TOKEN_ENV),
+            Some(OsString::from(expected.clone()))
+        );
+        assert_eq!(
+            value_for("INTENDANT_MCP_URL"),
+            Some(OsString::from(format!(
+                "http://localhost:8765/mcp?session_id=session-a&managed_context=managed&tool_profile=core&mcp_token={expected}"
+            )))
         );
     }
 

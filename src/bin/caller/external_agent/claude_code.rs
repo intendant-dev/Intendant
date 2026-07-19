@@ -2836,7 +2836,9 @@ pub struct ClaudeCodeAgent {
     /// an idle goal update never burns a turn of its own (a mid-turn update
     /// is written immediately instead — the running turn absorbs it).
     pending_goal_notice: Option<String>,
-    /// Loopback MCP auth token from the daemon, baked into the injected URL.
+    /// Loopback MCP auth token from the daemon. The ctl URL carries it in
+    /// the child environment; Claude's argv contains only an environment
+    /// placeholder for the equivalent Authorization header.
     mcp_auth_token: Option<String>,
     /// Intendant session id scoping the injected MCP URL and ctl env.
     mcp_session_id: Option<String>,
@@ -2898,10 +2900,10 @@ impl ClaudeCodeAgent {
         self.max_budget_usd.filter(|b| !(b.is_finite() && *b > 0.0))
     }
 
-    /// The scoped loopback MCP URL injected into `--mcp-config` and the ctl
-    /// env. Claude Code has no managed-context mode, so the server treats the
-    /// session as vanilla; `tool_profile=core` keeps the advertised tool list
-    /// to the bootstrap set (full surface stays callable via `ctl tools`).
+    /// The scoped loopback MCP URL injected into the ctl env. Claude Code has
+    /// no managed-context mode, so the server treats the session as vanilla;
+    /// `tool_profile=core` keeps the advertised tool list to the bootstrap set
+    /// (full surface stays callable via `ctl tools`).
     fn intendant_mcp_url(&self, port: u16) -> String {
         super::intendant_bootstrap_mcp_url(
             port,
@@ -2909,6 +2911,39 @@ impl ClaudeCodeAgent {
             None,
             self.mcp_auth_token.as_deref(),
         )
+    }
+
+    /// Token-free endpoint placed in the inline MCP JSON on argv.
+    fn intendant_mcp_config_url(&self, port: u16) -> String {
+        super::intendant_bootstrap_mcp_url(port, self.mcp_session_id.as_deref(), None, None)
+    }
+
+    /// Inline Claude MCP config whose Authorization header expands from the
+    /// explicitly injected child environment. The serialized argv contains
+    /// `${INTENDANT_MCP_BEARER_TOKEN}`, never the credential value.
+    fn intendant_mcp_config(&self, port: u16) -> serde_json::Value {
+        let mut server = serde_json::json!({
+            "type": "http",
+            "url": self.intendant_mcp_config_url(port),
+        });
+        if super::intendant_mcp_bearer_token(
+            self.mcp_auth_token.as_deref(),
+            self.mcp_session_id.as_deref(),
+        )
+        .is_some()
+        {
+            server["headers"] = serde_json::json!({
+                "Authorization": format!(
+                    "Bearer ${{{}}}",
+                    super::INTENDANT_MCP_BEARER_TOKEN_ENV
+                )
+            });
+        }
+        serde_json::json!({
+            "mcpServers": {
+                "intendant": server
+            }
+        })
     }
 
     async fn write_line(&self, line: &str) -> Result<(), CallerError> {
@@ -3199,22 +3234,15 @@ impl ExternalAgent for ClaudeCodeAgent {
             args.push(self.allowed_tools.join(","));
         }
 
-        // MCP config for Intendant display/CU tools: the scoped bootstrap URL
-        // (session id + tool_profile=core + loopback auth token), same
-        // treatment as managed Codex.
+        // MCP config for Intendant display/CU tools: argv carries the scoped,
+        // token-free bootstrap URL and a header placeholder. The
+        // session-derived bearer itself is injected into the child env after
+        // the clear below, so local process listings cannot scrape it.
         let web_port = config.web_port.or(self.web_port);
         self.web_port = web_port;
         if let Some(port) = web_port {
-            let mcp_config = serde_json::json!({
-                "mcpServers": {
-                    "intendant": {
-                        "type": "http",
-                        "url": self.intendant_mcp_url(port)
-                    }
-                }
-            });
             args.push("--mcp-config".into());
-            args.push(mcp_config.to_string());
+            args.push(self.intendant_mcp_config(port).to_string());
         }
 
         // Spawn the process
@@ -3236,6 +3264,7 @@ impl ExternalAgent for ClaudeCodeAgent {
                 &mut command,
                 &self.intendant_mcp_url(port),
                 self.mcp_session_id.as_deref(),
+                self.mcp_auth_token.as_deref(),
             );
         }
         // An active oauth:claude-code lease materializes a synthesized
@@ -6510,6 +6539,35 @@ mod tests {
             format!(
                 "http://localhost:8765/mcp?session_id=session%20with%20spaces&tool_profile=core&mcp_token={expected_token}"
             )
+        );
+    }
+
+    #[test]
+    fn inline_mcp_config_uses_env_placeholder_not_bearer_value() {
+        let mut agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "default".into(),
+            None,
+            vec![],
+            Some(8765),
+        );
+        agent.mcp_session_id = Some("session-a".to_string());
+        agent.mcp_auth_token = Some("raw-process-secret".to_string());
+        let derived =
+            crate::web_gateway::session_scoped_mcp_token("raw-process-secret", "session-a");
+
+        let config = agent.intendant_mcp_config(8765);
+        let argv_value = config.to_string();
+        assert!(!argv_value.contains("raw-process-secret"));
+        assert!(!argv_value.contains(&derived));
+        assert_eq!(
+            config["mcpServers"]["intendant"]["url"],
+            "http://localhost:8765/mcp?session_id=session-a&tool_profile=core"
+        );
+        assert_eq!(
+            config["mcpServers"]["intendant"]["headers"]["Authorization"],
+            "Bearer ${INTENDANT_MCP_BEARER_TOKEN}"
         );
     }
 
