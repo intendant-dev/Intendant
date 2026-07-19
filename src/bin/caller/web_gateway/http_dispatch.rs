@@ -69,6 +69,17 @@ fn session_token_api_response(result: Result<String, String>) -> ApiResponse {
     }
 }
 
+fn retain_custom_domain_http_authority(
+    stream: &mut DemuxStream,
+    custom_domain: &Arc<crate::custom_domain::CustomDomainRuntime>,
+    selected: bool,
+) {
+    if selected {
+        let live_custom_domain = Arc::clone(custom_domain);
+        stream.retain_http_write_authority(Arc::new(move || live_custom_domain.enabled()));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_http_request(
     ctx: HttpRequestCtx,
@@ -320,6 +331,11 @@ pub(crate) async fn serve_http_request(
     let public_lease_ingress = public_lane.public_lease_ingress;
     let configured_public_control_lane = public_lane.configured;
     let tls_custom_domain = public_lane.live_custom_domain;
+    // A custom-domain TLS name is itself a live authority decision even
+    // before a passkey endpoint mints a lease. Retain that decision at the
+    // transport edge now, so body reads, authority-worker awaits, and
+    // backpressured responses all stop when owner-name eligibility closes.
+    retain_custom_domain_http_authority(&mut stream, &custom_domain, tls_custom_domain.is_some());
     if is_custom_domain_only_hosted_control_path(req_method, req_path)
         && tls_custom_domain.is_none()
     {
@@ -717,19 +733,14 @@ pub(crate) async fn serve_http_request(
                     BodyPolicy::Capped(cap) => cap,
                     _ => crate::gateway_routes::DEFAULT_BODY_CAP_BYTES,
                 };
-                let body = if let Some(authority) = hosted_http_authority
-                    .as_ref()
-                    .filter(|authority| authority.has_custom_domain_guard())
-                {
-                    read_request_body_capped_with_guard(&mut stream, header_text, cap, || {
-                        authority.ensure_custom_domain_live().map_err(|error| {
-                            (403, serde_json::json!({ "error": error }).to_string())
-                        })
-                    })
-                    .await
-                } else {
-                    read_request_body_capped(&mut stream, header_text, cap).await
-                };
+                let body_authority = stream.http_write_authority();
+                let body = read_request_body_capped_with_authority(
+                    &mut stream,
+                    header_text,
+                    cap,
+                    body_authority,
+                )
+                .await;
                 match body {
                     Ok(body) => {
                         // Keep-alive body leg: dispatch consumed exactly
@@ -767,6 +778,14 @@ pub(crate) async fn serve_http_request(
                 }
             }
         };
+        // Authority-free custom-domain routes do not have a hosted lease to
+        // refresh below. Recheck the owner-name gate after the body await and
+        // before any handler can persist a ceremony or other public-lane
+        // state. Protected custom-domain routes repeat this in revalidate().
+        if custom_domain_selected && !custom_domain.enabled() {
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
         // Proof verification precedes the body read, which can last many
         // minutes on the largest capped route. Refresh the lease, IAM
         // snapshot, certificate guard, and custom-name gate after that await
@@ -3125,7 +3144,7 @@ mod tests {
         let authority_live = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let writer_authority = Arc::clone(&authority_live);
         let mut stream = DemuxStream::new(Box::pin(transport));
-        stream.retain_http_write_authority_for_test(Arc::new(move || {
+        stream.retain_http_write_authority(Arc::new(move || {
             writer_authority.load(std::sync::atomic::Ordering::SeqCst)
         }));
         let writer = tokio::spawn(async move {
@@ -3147,6 +3166,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_custom_domain_installs_a_live_transport_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hosted = Arc::new(crate::access::hosted_control::HostedControlRuntime::new(
+            false,
+            dir.path().to_path_buf(),
+            None,
+            None,
+            String::new(),
+            false,
+        ));
+        let custom_domain = Arc::new(crate::custom_domain::CustomDomainRuntime::new(
+            &crate::project::CustomDomainConfig {
+                enabled: true,
+                name: Some("owner.example.test".to_string()),
+                ..Default::default()
+            },
+            dir.path().to_path_buf(),
+            hosted,
+            Some(Arc::clone(&observed)),
+        ));
+        assert!(custom_domain.enabled());
+
+        let write_polled = Arc::new(tokio::sync::Notify::new());
+        let transport = NeverWritable {
+            write_polled: Arc::clone(&write_polled),
+        };
+        let mut stream = DemuxStream::new(Box::pin(transport));
+        retain_custom_domain_http_authority(&mut stream, &custom_domain, true);
+        assert!(
+            stream.http_write_authority().is_some(),
+            "a selected custom SNI must bind its live gate before dispatch"
+        );
+        let writer = tokio::spawn(async move {
+            write_api_response(
+                stream,
+                ApiResponse::json(200, JsonBody::Value(serde_json::json!({"ok": true}))),
+                CorsPosture::OwnOrigin,
+                None,
+            )
+            .await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), write_polled.notified())
+            .await
+            .expect("response writer must reach the backpressured transport");
+        observed.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("custom-domain eligibility loss must interrupt backpressure")
+            .expect("response writer task");
+    }
+
+    #[tokio::test]
     async fn retained_authority_interrupts_direct_backpressured_http_write() {
         use tokio::io::AsyncWriteExt;
 
@@ -3161,7 +3234,7 @@ mod tests {
         let authority_live = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let writer_authority = Arc::clone(&authority_live);
         let mut stream = DemuxStream::new(Box::pin(transport));
-        stream.retain_http_write_authority_for_test(Arc::new(move || {
+        stream.retain_http_write_authority(Arc::new(move || {
             writer_authority.load(std::sync::atomic::Ordering::SeqCst)
         }));
         let writer = tokio::spawn(async move { stream.write_all(b"response").await });

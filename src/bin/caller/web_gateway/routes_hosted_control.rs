@@ -156,10 +156,6 @@ impl HostedHttpAuthority {
         }
     }
 
-    pub(crate) fn has_custom_domain_guard(&self) -> bool {
-        self.custom_domain.is_some()
-    }
-
     pub(crate) fn ensure_custom_domain_live(&self) -> Result<(), String> {
         if self
             .custom_domain

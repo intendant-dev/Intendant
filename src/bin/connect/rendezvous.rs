@@ -696,6 +696,8 @@ fn apply_daemon_registration(
             last_registration_proof_unix_ms: registration_proof_unix_ms,
             route_link_revision: 0,
             last_unclaim_proof_unix_ms: None,
+            last_dns_mutation_unix_ms: None,
+            last_dns_mutation_fingerprint: None,
             registered_unix_ms: now,
             last_seen_unix_ms: now,
             updated_unix_ms: now,
@@ -2158,13 +2160,17 @@ pub(crate) async fn dns_publish(
     commit_dns_record_update(
         Arc::clone(&state),
         Arc::clone(&zone),
-        daemon_id.clone(),
-        addresses.clone(),
-        false,
-        DnsRecordAudit {
-            event: "dns_publish",
-            user_id: daemon.owner_user_id,
-            detail: json!({ "name": name, "addresses": addresses.len() }),
+        DnsRecordMutation {
+            daemon_id: daemon_id.clone(),
+            addresses: addresses.clone(),
+            via_relay: false,
+            issued_at_unix_ms: body.issued_at_unix_ms,
+            request_fingerprint: dns_mutation_fingerprint(DNS_PUBLISH_PROTOCOL, &addresses_csv),
+            audit: DnsRecordAudit {
+                event: "dns_publish",
+                user_id: daemon.owner_user_id,
+                detail: json!({ "name": name, "addresses": addresses.len() }),
+            },
         },
     )
     .await?;
@@ -2365,6 +2371,8 @@ mod tests {
             last_registration_proof_unix_ms: None,
             route_link_revision: 0,
             last_unclaim_proof_unix_ms: None,
+            last_dns_mutation_unix_ms: None,
+            last_dns_mutation_fingerprint: None,
             registered_unix_ms: 1,
             last_seen_unix_ms: 1,
             updated_unix_ms: 1,

@@ -243,34 +243,39 @@ impl PasskeyRuntime {
     pub(crate) fn registration_invite(
         &self,
         input: RegistrationInviteInput,
+        current_fleet_zone_observed: Option<&AtomicBool>,
     ) -> Result<EnrollmentInvite, String> {
         let label = normalized_label(&input.label)?;
-        self.with_fresh_store(|store| {
-            if store.passkeys.len() >= MAX_PASSKEYS {
-                return Err("custom-domain passkey limit reached".to_string());
-            }
-            Ok(())
-        })?;
-        let token = Uuid::new_v4().simple().to_string();
-        let now = now_unix_ms();
-        let expires_unix_ms = now.saturating_add(INVITE_TTL_MS);
-        self.mutate_ceremonies(|ceremonies| {
-            if ceremonies.invitations.len() >= MAX_PENDING_FLOWS {
-                return Err("too many pending custom-domain enrollment invitations".to_string());
-            }
-            ceremonies.invitations.insert(
-                token.clone(),
-                PendingInvitation {
-                    label,
-                    expires_unix_ms,
-                },
-            );
-            Ok(())
-        })?;
-        Ok(EnrollmentInvite {
-            ok: true,
-            enrollment_url: format!("{}#passkey_enroll={token}", self.domain.origin),
-            expires_unix_ms,
+        self.with_passkey_lease_transaction(|| {
+            self.require_lane_eligible_locked(current_fleet_zone_observed)?;
+            self.with_fresh_store(|store| {
+                if store.passkeys.len() >= MAX_PASSKEYS {
+                    return Err("custom-domain passkey limit reached".to_string());
+                }
+                Ok(())
+            })?;
+            let token = Uuid::new_v4().simple().to_string();
+            let now = now_unix_ms();
+            let expires_unix_ms = now.saturating_add(INVITE_TTL_MS);
+            self.require_lane_eligible_locked(current_fleet_zone_observed)?;
+            self.mutate_ceremonies(|ceremonies| {
+                if ceremonies.invitations.len() >= MAX_PENDING_FLOWS {
+                    return Err("too many pending custom-domain enrollment invitations".to_string());
+                }
+                ceremonies.invitations.insert(
+                    token.clone(),
+                    PendingInvitation {
+                        label,
+                        expires_unix_ms,
+                    },
+                );
+                Ok(())
+            })?;
+            Ok(EnrollmentInvite {
+                ok: true,
+                enrollment_url: format!("{}#passkey_enroll={token}", self.domain.origin),
+                expires_unix_ms,
+            })
         })
     }
 
@@ -278,125 +283,139 @@ impl PasskeyRuntime {
         &self,
         input: RegistrationStartInput,
         origin: &str,
+        current_fleet_zone_observed: Option<&AtomicBool>,
     ) -> Result<CeremonyStart, String> {
         self.require_origin(origin)?;
         if input.token.len() > 64 {
             return Err("passkey enrollment invitation is invalid".to_string());
         }
         let token = input.token.trim().to_string();
-        let invitation = self.read_ceremonies(|ceremonies| {
-            ceremonies
-                .invitations
-                .get(&token)
-                .cloned()
-                .ok_or_else(|| "passkey enrollment invitation was not found".to_string())
-        })?;
-        if invitation.expires_unix_ms <= now_unix_ms() {
-            return Err("passkey enrollment invitation expired".to_string());
-        }
-        let label = invitation.label.clone();
-        let (user_id, exclude) = self.with_fresh_store(|store| {
-            if store.passkeys.len() >= MAX_PASSKEYS {
-                return Err("custom-domain passkey limit reached".to_string());
-            }
-            Ok((
-                store.user_id,
-                store
-                    .passkeys
-                    .iter()
-                    .map(|passkey| passkey.credential.id.clone())
-                    .collect::<Vec<_>>(),
-            ))
-        })?;
-        let (options, state) = self.webauthn.start_registration(
-            user_id.as_bytes(),
-            &self.domain.name,
-            &label,
-            &exclude,
-        );
-        let flow_id = Uuid::new_v4().to_string();
-        let now = now_unix_ms();
-        self.mutate_ceremonies(|ceremonies| {
-            if ceremonies.registrations.len() >= MAX_PENDING_FLOWS {
-                return Err("too many pending custom-domain registration ceremonies".to_string());
-            }
-            let current = ceremonies
-                .invitations
-                .get(&token)
-                .ok_or_else(|| "passkey enrollment invitation was not found".to_string())?;
-            if current.expires_unix_ms <= now {
+        self.with_passkey_lease_transaction(|| {
+            self.require_lane_eligible_locked(current_fleet_zone_observed)?;
+            let invitation = self.read_ceremonies(|ceremonies| {
+                ceremonies
+                    .invitations
+                    .get(&token)
+                    .cloned()
+                    .ok_or_else(|| "passkey enrollment invitation was not found".to_string())
+            })?;
+            if invitation.expires_unix_ms <= now_unix_ms() {
                 return Err("passkey enrollment invitation expired".to_string());
             }
-            if current.label != invitation.label
-                || current.expires_unix_ms != invitation.expires_unix_ms
-            {
-                return Err("passkey enrollment invitation changed".to_string());
-            }
-            ceremonies.invitations.remove(&token);
-            ceremonies.registrations.insert(
-                flow_id.clone(),
-                PendingRegistration {
-                    label,
-                    user_id,
-                    state,
-                    expires_unix_ms: now.saturating_add(FLOW_TTL_MS),
-                },
+            let label = invitation.label.clone();
+            let (user_id, exclude) = self.with_fresh_store(|store| {
+                if store.passkeys.len() >= MAX_PASSKEYS {
+                    return Err("custom-domain passkey limit reached".to_string());
+                }
+                Ok((
+                    store.user_id,
+                    store
+                        .passkeys
+                        .iter()
+                        .map(|passkey| passkey.credential.id.clone())
+                        .collect::<Vec<_>>(),
+                ))
+            })?;
+            let (options, state) = self.webauthn.start_registration(
+                user_id.as_bytes(),
+                &self.domain.name,
+                &label,
+                &exclude,
             );
-            Ok(())
-        })?;
-        Ok(CeremonyStart {
-            ok: true,
-            flow_id,
-            options: serde_json::to_value(options)
-                .map_err(|error| format!("serialize passkey registration options: {error}"))?,
+            let flow_id = Uuid::new_v4().to_string();
+            let now = now_unix_ms();
+            self.require_lane_eligible_locked(current_fleet_zone_observed)?;
+            self.mutate_ceremonies(|ceremonies| {
+                if ceremonies.registrations.len() >= MAX_PENDING_FLOWS {
+                    return Err(
+                        "too many pending custom-domain registration ceremonies".to_string()
+                    );
+                }
+                let current = ceremonies
+                    .invitations
+                    .get(&token)
+                    .ok_or_else(|| "passkey enrollment invitation was not found".to_string())?;
+                if current.expires_unix_ms <= now {
+                    return Err("passkey enrollment invitation expired".to_string());
+                }
+                if current.label != invitation.label
+                    || current.expires_unix_ms != invitation.expires_unix_ms
+                {
+                    return Err("passkey enrollment invitation changed".to_string());
+                }
+                ceremonies.invitations.remove(&token);
+                ceremonies.registrations.insert(
+                    flow_id.clone(),
+                    PendingRegistration {
+                        label,
+                        user_id,
+                        state,
+                        expires_unix_ms: now.saturating_add(FLOW_TTL_MS),
+                    },
+                );
+                Ok(())
+            })?;
+            Ok(CeremonyStart {
+                ok: true,
+                flow_id,
+                options: serde_json::to_value(options)
+                    .map_err(|error| format!("serialize passkey registration options: {error}"))?,
+            })
         })
     }
 
     pub(crate) fn registration_finish(
         &self,
         input: RegistrationFinishInput,
+        current_fleet_zone_observed: Option<&AtomicBool>,
     ) -> Result<PasskeyView, String> {
-        let pending = self.mutate_ceremonies(|ceremonies| {
-            ceremonies
-                .registrations
-                .remove(input.flow_id.trim())
-                .ok_or_else(|| "passkey registration flow was not found".to_string())
-        })?;
-        if pending.expires_unix_ms <= now_unix_ms() {
-            return Err("passkey registration flow expired".to_string());
-        }
-        let credential = self
-            .webauthn
-            .finish_registration(&pending.state, &input.credential)
-            .map_err(|error| format!("finish passkey registration: {error}"))?;
-        let now = now_unix_ms();
-        self.mutate_store(move |store| {
-            if store.user_id != pending.user_id {
-                return Err("passkey enrollment state changed; create a new invitation".to_string());
+        self.with_passkey_lease_transaction(|| {
+            self.require_lane_eligible_locked(current_fleet_zone_observed)?;
+            let pending = self.mutate_ceremonies(|ceremonies| {
+                ceremonies
+                    .registrations
+                    .remove(input.flow_id.trim())
+                    .ok_or_else(|| "passkey registration flow was not found".to_string())
+            })?;
+            if pending.expires_unix_ms <= now_unix_ms() {
+                return Err("passkey registration flow expired".to_string());
             }
-            if store
-                .passkeys
-                .iter()
-                .any(|stored| stored.credential.id == credential.id)
-            {
-                return Err("passkey is already registered".to_string());
-            }
-            if store.passkeys.len() >= MAX_PASSKEYS {
-                return Err("custom-domain passkey limit reached".to_string());
-            }
-            let view = PasskeyView {
-                credential_id: credential.id.to_b64url(),
-                label: pending.label.clone(),
-                created_unix_ms: now,
-                last_used_unix_ms: None,
-            };
-            store.passkeys.push(StoredPasskey {
-                credential,
-                label: pending.label,
-                created_unix_ms: now,
-                last_used_unix_ms: None,
-            });
-            Ok((view, true))
+            let credential = self
+                .webauthn
+                .finish_registration(&pending.state, &input.credential)
+                .map_err(|error| format!("finish passkey registration: {error}"))?;
+            let now = now_unix_ms();
+            self.require_lane_eligible_locked(current_fleet_zone_observed)?;
+            self.mutate_store(move |store| {
+                if store.user_id != pending.user_id {
+                    return Err(
+                        "passkey enrollment state changed; create a new invitation".to_string()
+                    );
+                }
+                if store
+                    .passkeys
+                    .iter()
+                    .any(|stored| stored.credential.id == credential.id)
+                {
+                    return Err("passkey is already registered".to_string());
+                }
+                if store.passkeys.len() >= MAX_PASSKEYS {
+                    return Err("custom-domain passkey limit reached".to_string());
+                }
+                let view = PasskeyView {
+                    credential_id: credential.id.to_b64url(),
+                    label: pending.label.clone(),
+                    created_unix_ms: now,
+                    last_used_unix_ms: None,
+                };
+                store.passkeys.push(StoredPasskey {
+                    credential,
+                    label: pending.label,
+                    created_unix_ms: now,
+                    last_used_unix_ms: None,
+                });
+                Ok((view, true))
+            })
         })
     }
 
@@ -405,86 +424,97 @@ impl PasskeyRuntime {
         input: AuthenticationStartInput,
         origin: &str,
         source_bucket: Option<&str>,
+        current_fleet_zone_observed: Option<&AtomicBool>,
     ) -> Result<CeremonyStart, String> {
         self.require_origin(origin)?;
         validate_pending_request_shape(&input.request)?;
-        let now = now_unix_ms();
-        let (user_id, credentials) = self.with_fresh_store(|store| {
-            if store.passkeys.is_empty() {
-                return Err("no passkey is registered for this custom domain".to_string());
-            }
-            Ok((
-                store.user_id,
-                store
-                    .passkeys
-                    .iter()
-                    .map(|passkey| passkey.credential.clone())
-                    .collect::<Vec<_>>(),
-            ))
-        })?;
-        let (options, state) = self
-            .webauthn
-            .start_authentication_with_creds_for_user(user_id.as_bytes(), &credentials);
-        let flow_id = Uuid::new_v4().to_string();
-        let source_rate_key = authentication_source_rate_key(source_bucket);
-        self.mutate_ceremonies(|ceremonies| {
-            if ceremonies.authentication_starts.len() >= AUTH_STARTS_PER_WINDOW {
-                return Err("custom-domain passkey ceremony rate limit reached".to_string());
-            }
-            if ceremonies.authentications.len() >= MAX_PENDING_FLOWS {
-                return Err("too many pending custom-domain authentication ceremonies".to_string());
-            }
-            if ceremonies
-                .authentication_starts_by_source
-                .get(&source_rate_key)
-                .is_some_and(|starts| starts.len() >= AUTH_STARTS_PER_SOURCE_WINDOW)
-            {
-                return Err("custom-domain passkey ceremony source rate limit reached".to_string());
-            }
-            let source_pending = ceremonies
-                .authentications
-                .values()
-                .filter(|flow| {
-                    authentication_source_rate_key(flow.source_bucket.as_deref()) == source_rate_key
-                })
-                .count();
-            if source_pending >= AUTH_PENDING_PER_SOURCE {
-                return Err(
-                    "too many pending custom-domain authentication ceremonies for this source"
-                        .to_string(),
+        self.with_passkey_lease_transaction(|| {
+            self.require_lane_eligible_locked(current_fleet_zone_observed)?;
+            let now = now_unix_ms();
+            let (user_id, credentials) = self.with_fresh_store(|store| {
+                if store.passkeys.is_empty() {
+                    return Err("no passkey is registered for this custom domain".to_string());
+                }
+                Ok((
+                    store.user_id,
+                    store
+                        .passkeys
+                        .iter()
+                        .map(|passkey| passkey.credential.clone())
+                        .collect::<Vec<_>>(),
+                ))
+            })?;
+            let (options, state) = self
+                .webauthn
+                .start_authentication_with_creds_for_user(user_id.as_bytes(), &credentials);
+            let flow_id = Uuid::new_v4().to_string();
+            let source_rate_key = authentication_source_rate_key(source_bucket);
+            self.require_lane_eligible_locked(current_fleet_zone_observed)?;
+            self.mutate_ceremonies(|ceremonies| {
+                if ceremonies.authentication_starts.len() >= AUTH_STARTS_PER_WINDOW {
+                    return Err("custom-domain passkey ceremony rate limit reached".to_string());
+                }
+                if ceremonies.authentications.len() >= MAX_PENDING_FLOWS {
+                    return Err(
+                        "too many pending custom-domain authentication ceremonies".to_string()
+                    );
+                }
+                if ceremonies
+                    .authentication_starts_by_source
+                    .get(&source_rate_key)
+                    .is_some_and(|starts| starts.len() >= AUTH_STARTS_PER_SOURCE_WINDOW)
+                {
+                    return Err(
+                        "custom-domain passkey ceremony source rate limit reached".to_string()
+                    );
+                }
+                let source_pending = ceremonies
+                    .authentications
+                    .values()
+                    .filter(|flow| {
+                        authentication_source_rate_key(flow.source_bucket.as_deref())
+                            == source_rate_key
+                    })
+                    .count();
+                if source_pending >= AUTH_PENDING_PER_SOURCE {
+                    return Err(
+                        "too many pending custom-domain authentication ceremonies for this source"
+                            .to_string(),
+                    );
+                }
+                if ceremonies.authentications.len()
+                    >= MAX_PENDING_FLOWS.saturating_sub(AUTH_NEW_SOURCE_RESERVED_SLOTS)
+                    && source_pending > 0
+                {
+                    return Err(
+                        "custom-domain passkey capacity is reserved for a new source".to_string(),
+                    );
+                }
+                ceremonies.authentication_starts.push_back(now);
+                ceremonies
+                    .authentication_starts_by_source
+                    .entry(source_rate_key)
+                    .or_default()
+                    .push_back(now);
+                ceremonies.authentications.insert(
+                    flow_id.clone(),
+                    PendingAuthentication {
+                        user_id,
+                        state,
+                        input: input.request,
+                        source_bucket: source_bucket.map(str::to_string),
+                        expires_unix_ms: now.saturating_add(FLOW_TTL_MS),
+                    },
                 );
-            }
-            if ceremonies.authentications.len()
-                >= MAX_PENDING_FLOWS.saturating_sub(AUTH_NEW_SOURCE_RESERVED_SLOTS)
-                && source_pending > 0
-            {
-                return Err(
-                    "custom-domain passkey capacity is reserved for a new source".to_string(),
-                );
-            }
-            ceremonies.authentication_starts.push_back(now);
-            ceremonies
-                .authentication_starts_by_source
-                .entry(source_rate_key)
-                .or_default()
-                .push_back(now);
-            ceremonies.authentications.insert(
-                flow_id.clone(),
-                PendingAuthentication {
-                    user_id,
-                    state,
-                    input: input.request,
-                    source_bucket: source_bucket.map(str::to_string),
-                    expires_unix_ms: now.saturating_add(FLOW_TTL_MS),
-                },
-            );
-            Ok(())
-        })?;
-        Ok(CeremonyStart {
-            ok: true,
-            flow_id,
-            options: serde_json::to_value(options)
-                .map_err(|error| format!("serialize passkey authentication options: {error}"))?,
+                Ok(())
+            })?;
+            Ok(CeremonyStart {
+                ok: true,
+                flow_id,
+                options: serde_json::to_value(options).map_err(|error| {
+                    format!("serialize passkey authentication options: {error}")
+                })?,
+            })
         })
     }
 
@@ -495,27 +525,27 @@ impl PasskeyRuntime {
         current_fleet_zone_observed: Option<&AtomicBool>,
     ) -> Result<PasskeyLeaseResult, String> {
         self.require_origin(origin)?;
-        let mut pending = self.mutate_ceremonies(|ceremonies| {
-            ceremonies
-                .authentications
-                .remove(input.flow_id.trim())
-                .ok_or_else(|| "passkey authentication flow was not found".to_string())
-        })?;
-        if pending.expires_unix_ms <= now_unix_ms() {
-            return Err("passkey authentication flow expired".to_string());
-        }
-        pending.input.nonce = input.nonce;
-        pending.input.timestamp_unix_ms = input.timestamp_unix_ms;
-        pending.input.signature = input.signature;
-        validate_pending_request_shape(&pending.input)?;
-        let credential_id = CredentialId::from_b64url(&input.credential.id)
-            .map_err(|error| format!("passkey credential id: {error}"))?;
         self.with_passkey_lease_transaction(|| {
             // Fleet provenance and passkey state share this authority lock.
             // Recheck after acquiring it so a zone observation committed
             // between the HTTP precheck and this transaction cannot mint a
             // lease from a lane that has just become ineligible.
             self.require_lane_eligible_locked(current_fleet_zone_observed)?;
+            let mut pending = self.mutate_ceremonies(|ceremonies| {
+                ceremonies
+                    .authentications
+                    .remove(input.flow_id.trim())
+                    .ok_or_else(|| "passkey authentication flow was not found".to_string())
+            })?;
+            if pending.expires_unix_ms <= now_unix_ms() {
+                return Err("passkey authentication flow expired".to_string());
+            }
+            pending.input.nonce = input.nonce;
+            pending.input.timestamp_unix_ms = input.timestamp_unix_ms;
+            pending.input.signature = input.signature;
+            validate_pending_request_shape(&pending.input)?;
+            let credential_id = CredentialId::from_b64url(&input.credential.id)
+                .map_err(|error| format!("passkey credential id: {error}"))?;
             self.mutate_store(|store| {
                 if store.user_id != pending.user_id {
                     return Err(
@@ -538,6 +568,7 @@ impl PasskeyRuntime {
                 Ok(((), true))
             })?;
 
+            self.require_lane_eligible_locked(current_fleet_zone_observed)?;
             let actor = passkey_actor(&credential_id);
             let lease = self
                 .hosted
@@ -1153,6 +1184,165 @@ mod tests {
     }
 
     #[test]
+    fn ineligible_lane_does_not_persist_passkey_ceremony_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = domain();
+        let runtime = PasskeyRuntime::new(
+            domain.clone(),
+            dir.path().to_path_buf(),
+            hosted_runtime(dir.path()),
+        )
+        .unwrap();
+        let observed = AtomicBool::new(false);
+        let waiting = "waiting for the current Connect fleet-zone observation";
+
+        assert!(runtime
+            .registration_invite(
+                RegistrationInviteInput {
+                    label: "Phone".to_string(),
+                },
+                Some(&observed),
+            )
+            .unwrap_err()
+            .contains(waiting));
+        let auth_input = AuthenticationStartInput {
+            request: HostedLeaseRequestInput {
+                browser_public_key: "browser-key".to_string(),
+                requested_preset: Default::default(),
+                requested_ttl_secs: 60,
+                requester_label: "Browser".to_string(),
+                nonce: String::new(),
+                timestamp_unix_ms: 0,
+                signature: String::new(),
+            },
+        };
+        assert!(runtime
+            .authentication_start(auth_input, &domain.origin, None, Some(&observed))
+            .unwrap_err()
+            .contains(waiting));
+        let credential = serde_json::from_value(serde_json::json!({
+            "id": "",
+            "transports": [],
+            "attestationObject": "",
+            "clientDataJSON": "",
+        }))
+        .unwrap();
+        assert!(runtime
+            .registration_finish(
+                RegistrationFinishInput {
+                    flow_id: "missing".to_string(),
+                    credential,
+                },
+                Some(&observed),
+            )
+            .unwrap_err()
+            .contains(waiting));
+
+        let empty = runtime
+            .read_ceremonies(|ceremonies| serde_json::to_vec(ceremonies).map_err(|e| e.to_string()))
+            .unwrap();
+        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let invite = runtime
+            .registration_invite(
+                RegistrationInviteInput {
+                    label: "Phone".to_string(),
+                },
+                Some(&observed),
+            )
+            .unwrap();
+        let token = invite
+            .enrollment_url
+            .split_once("#passkey_enroll=")
+            .unwrap()
+            .1
+            .to_string();
+        let before = runtime
+            .read_ceremonies(|ceremonies| serde_json::to_vec(ceremonies).map_err(|e| e.to_string()))
+            .unwrap();
+        assert_ne!(empty, before);
+
+        observed.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(runtime
+            .registration_start(
+                RegistrationStartInput { token },
+                &domain.origin,
+                Some(&observed),
+            )
+            .unwrap_err()
+            .contains(waiting));
+        let after = runtime
+            .read_ceremonies(|ceremonies| serde_json::to_vec(ceremonies).map_err(|e| e.to_string()))
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "an eligibility refusal must not consume an invitation or create a flow"
+        );
+
+        persist_store(
+            dir.path(),
+            &PasskeyStore {
+                schema_version: STORE_SCHEMA_VERSION,
+                name: domain.name.clone(),
+                rp_id: domain.rp_id.clone(),
+                user_id: Uuid::new_v4(),
+                passkeys: vec![stored_passkey(1, "phone")],
+            },
+        )
+        .unwrap();
+        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let auth = runtime
+            .authentication_start(
+                AuthenticationStartInput {
+                    request: HostedLeaseRequestInput {
+                        browser_public_key: "browser-key".to_string(),
+                        requested_preset: Default::default(),
+                        requested_ttl_secs: 60,
+                        requester_label: "Browser".to_string(),
+                        nonce: String::new(),
+                        timestamp_unix_ms: 0,
+                        signature: String::new(),
+                    },
+                },
+                &domain.origin,
+                Some("test-source"),
+                Some(&observed),
+            )
+            .unwrap();
+        let authentication = serde_json::from_value(serde_json::json!({
+            "id": "",
+            "clientDataJSON": "",
+            "authenticatorData": "",
+            "signature": "",
+            "userHandle": null,
+        }))
+        .unwrap();
+        observed.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(runtime
+            .authentication_finish(
+                AuthenticationFinishInput {
+                    flow_id: auth.flow_id.clone(),
+                    credential: authentication,
+                    nonce: String::new(),
+                    timestamp_unix_ms: 0,
+                    signature: String::new(),
+                },
+                &domain.origin,
+                Some(&observed),
+            )
+            .unwrap_err()
+            .contains(waiting));
+        runtime
+            .read_ceremonies(|ceremonies| {
+                if ceremonies.authentications.contains_key(&auth.flow_id) {
+                    Ok(())
+                } else {
+                    Err("eligibility refusal consumed the authentication flow".to_string())
+                }
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn empty_store_identity_is_persisted_before_ceremonies_are_exposed() {
         let dir = tempfile::tempdir().unwrap();
         let domain = domain();
@@ -1260,9 +1450,12 @@ mod tests {
         let second = PasskeyRuntime::new(domain.clone(), dir.path().to_path_buf(), hosted).unwrap();
 
         let invite = first
-            .registration_invite(RegistrationInviteInput {
-                label: "Phone".to_string(),
-            })
+            .registration_invite(
+                RegistrationInviteInput {
+                    label: "Phone".to_string(),
+                },
+                None,
+            )
             .unwrap();
         let token = invite
             .enrollment_url
@@ -1276,11 +1469,12 @@ mod tests {
                     token: token.clone(),
                 },
                 &domain.origin,
+                None,
             )
             .unwrap();
         assert!(
             first
-                .registration_start(RegistrationStartInput { token }, &domain.origin)
+                .registration_start(RegistrationStartInput { token }, &domain.origin, None)
                 .unwrap_err()
                 .contains("not found"),
             "the durable invitation is consumed exactly once across processes"
@@ -1309,9 +1503,12 @@ mod tests {
         )
         .unwrap();
         let invite = runtime
-            .registration_invite(RegistrationInviteInput {
-                label: "Phone".to_string(),
-            })
+            .registration_invite(
+                RegistrationInviteInput {
+                    label: "Phone".to_string(),
+                },
+                None,
+            )
             .unwrap();
         let token = invite
             .enrollment_url
@@ -1327,12 +1524,13 @@ mod tests {
                 token: token.clone(),
             },
             &domain.origin,
+            None,
         );
         std::fs::set_permissions(dir.path(), original).unwrap();
         assert!(failed.is_err(), "the durable commit was expected to fail");
 
         runtime
-            .registration_start(RegistrationStartInput { token }, &domain.origin)
+            .registration_start(RegistrationStartInput { token }, &domain.origin, None)
             .expect("the invitation survives a failed atomic flow commit");
     }
 
@@ -1349,9 +1547,12 @@ mod tests {
         )
         .unwrap();
         runtime
-            .registration_invite(RegistrationInviteInput {
-                label: "Phone".to_string(),
-            })
+            .registration_invite(
+                RegistrationInviteInput {
+                    label: "Phone".to_string(),
+                },
+                None,
+            )
             .unwrap();
 
         let original = std::fs::metadata(dir.path()).unwrap().permissions();
@@ -1403,28 +1604,28 @@ mod tests {
         };
         for _ in 0..AUTH_PENDING_PER_SOURCE {
             runtime
-                .authentication_start(input(), &domain.origin, None)
+                .authentication_start(input(), &domain.origin, None, None)
                 .unwrap();
         }
         assert!(runtime
-            .authentication_start(input(), &domain.origin, None)
+            .authentication_start(input(), &domain.origin, None, None)
             .unwrap_err()
             .contains("source"));
         runtime
-            .authentication_start(input(), &domain.origin, Some("198.51.100.7"))
+            .authentication_start(input(), &domain.origin, Some("198.51.100.7"), None)
             .expect("a distinct source retains admission below the global safety ceiling");
         for index in 0..47 {
             let source = format!("203.0.113.{index}:443");
             runtime
-                .authentication_start(input(), &domain.origin, Some(&source))
+                .authentication_start(input(), &domain.origin, Some(&source), None)
                 .unwrap();
         }
         assert!(runtime
-            .authentication_start(input(), &domain.origin, Some("198.51.100.7"))
+            .authentication_start(input(), &domain.origin, Some("198.51.100.7"), None)
             .unwrap_err()
             .contains("reserved"));
         runtime
-            .authentication_start(input(), &domain.origin, Some("198.51.100.8"))
+            .authentication_start(input(), &domain.origin, Some("198.51.100.8"), None)
             .expect("the global tail remains reserved for a previously unseen source");
     }
 
@@ -1466,6 +1667,7 @@ mod tests {
                 },
                 &domain.origin,
                 Some("test-source"),
+                None,
             )
             .unwrap();
         let consumed = second

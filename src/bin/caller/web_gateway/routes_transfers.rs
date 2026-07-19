@@ -991,34 +991,22 @@ pub(crate) async fn handle_transfer_upload_chunk(
     {
         let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
     }
-    let body = if let Some(authority) = hosted_authority
-        .as_ref()
-        .filter(|authority| authority.has_custom_domain_guard())
-    {
-        stream_body_to_tempfile_with_guard(
-            header_text,
-            &discard,
-            &mut stream,
-            TRANSFER_HTTP_CHUNK_MAX_BYTES,
-            || authority.ensure_custom_domain_live(),
-        )
-        .await
-    } else {
-        stream_body_to_tempfile(
-            header_text,
-            &discard,
-            &mut stream,
-            TRANSFER_HTTP_CHUNK_MAX_BYTES,
-        )
-        .await
-    };
+    let body_authority = stream.http_write_authority();
+    let body = stream_body_to_tempfile_with_authority(
+        header_text,
+        &discard,
+        &mut stream,
+        TRANSFER_HTTP_CHUNK_MAX_BYTES,
+        body_authority,
+    )
+    .await;
     let response = match body {
         Err(e) => {
             let status = if e.contains("too large") {
                 413
             } else if e.contains("timed out") {
                 408
-            } else if e.contains("custom-domain control became unavailable") {
+            } else if e == HOSTED_BODY_AUTHORITY_LOST_ERROR {
                 403
             } else {
                 400

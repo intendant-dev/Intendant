@@ -33,7 +33,7 @@ use super::*;
 
 use std::net::IpAddr;
 use std::sync::Mutex as StdMutex;
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
 /// Daemon-signed control-channel protocol tag. The daemon long-polls this
@@ -1439,13 +1439,20 @@ pub(crate) async fn dns_relay(
     commit_dns_record_update(
         Arc::clone(&state),
         Arc::clone(&zone),
-        daemon_id.clone(),
-        addresses.clone(),
-        body.enable,
-        DnsRecordAudit {
-            event: "dns_relay",
-            user_id: daemon.owner_user_id,
-            detail: json!({ "name": name, "enable": body.enable }),
+        DnsRecordMutation {
+            daemon_id: daemon_id.clone(),
+            addresses: addresses.clone(),
+            via_relay: body.enable,
+            issued_at_unix_ms: body.issued_at_unix_ms,
+            request_fingerprint: dns_mutation_fingerprint(
+                DNS_RELAY_PROTOCOL,
+                if body.enable { "1" } else { "0" },
+            ),
+            audit: DnsRecordAudit {
+                event: "dns_relay",
+                user_id: daemon.owner_user_id,
+                detail: json!({ "name": name, "enable": body.enable }),
+            },
         },
     )
     .await?;
@@ -1698,46 +1705,15 @@ async fn peek_sni(stream: &TcpStream) -> Option<String> {
 }
 
 /// Bidirectional byte splice with a per-direction byte cap and idle teardown.
-/// When either direction finishes (EOF, error, cap, or idle) both halves drop
-/// and the connection closes.
 async fn splice(browser: TcpStream, daemon: TcpStream, max_bytes: u64, idle: Duration) {
-    let (browser_r, browser_w) = browser.into_split();
-    let (daemon_r, daemon_w) = daemon.into_split();
-    let to_daemon = copy_half(browser_r, daemon_w, max_bytes, idle);
-    let to_browser = copy_half(daemon_r, browser_w, max_bytes, idle);
-    tokio::select! {
-        _ = to_daemon => {}
-        _ = to_browser => {}
-    }
-}
-
-async fn copy_half<R, W>(mut reader: R, mut writer: W, max_bytes: u64, idle: Duration)
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = vec![0u8; 16 * 1024];
-    let mut total: u64 = 0;
-    loop {
-        let n = match tokio::time::timeout(idle, reader.read(&mut buf)).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-            Ok(Ok(n)) => n,
-        };
-        total = total.saturating_add(n as u64);
-        if total > max_bytes {
-            break;
-        }
-        if writer.write_all(&buf[..n]).await.is_err() {
-            break;
-        }
-    }
-    let _ = writer.shutdown().await;
+    intendant_core::net::splice_bidirectional_bounded(browser, daemon, max_bytes, idle).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    use tokio::io::AsyncWriteExt as _;
     use tokio::net::{TcpListener, TcpStream};
 
     const TEST_POLLER_ID: &str = "11111111111111111111111111111111";
@@ -2639,6 +2615,8 @@ mod tests {
             last_registration_proof_unix_ms: None,
             route_link_revision: 0,
             last_unclaim_proof_unix_ms: None,
+            last_dns_mutation_unix_ms: None,
+            last_dns_mutation_fingerprint: None,
             registered_unix_ms: now,
             last_seen_unix_ms: now,
             updated_unix_ms: now,

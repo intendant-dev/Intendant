@@ -103,7 +103,7 @@ async fn read_relay_source_bucket(
 }
 
 fn bind_relay_gateway_ingress(config: &crate::project::ConnectConfig) -> Option<TcpListener> {
-    if !(config.enabled && config.relay_enabled) {
+    if !config.relay_enabled {
         return None;
     }
     let socket = match tokio::net::TcpSocket::new_v4() {
@@ -3512,15 +3512,27 @@ mod tests {
     #[tokio::test]
     async fn relay_config_binds_a_dedicated_loopback_only_ingress() {
         let config = crate::project::ConnectConfig {
-            enabled: true,
+            enabled: false,
             relay_enabled: true,
             ..Default::default()
         };
-        let listener =
-            bind_relay_gateway_ingress(&config).expect("relay config should bind its ingress");
+        let listener = bind_relay_gateway_ingress(&config)
+            .expect("boot-pinned relay config should bind even while Connect is disabled");
         let addr = listener.local_addr().unwrap();
         assert!(addr.ip().is_loopback());
         assert_ne!(addr.port(), 0);
+
+        for enabled in [false, true] {
+            let config = crate::project::ConnectConfig {
+                enabled,
+                relay_enabled: false,
+                ..Default::default()
+            };
+            assert!(
+                bind_relay_gateway_ingress(&config).is_none(),
+                "Connect enablement must not create an ingress without relay opt-in"
+            );
+        }
     }
 
     #[tokio::test]

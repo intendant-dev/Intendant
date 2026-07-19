@@ -13,7 +13,7 @@ use crate::dashboard_control::DashboardControlRegistry;
 use crate::project::ConnectConfig;
 use reqwest::{Client, RequestBuilder, Url};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -1724,6 +1724,9 @@ same resolution + signing discipline as request_unclaim. */
 
 const DNS_PUBLISH_PROTOCOL: &str = "intendant-connect-dns-publish-v1";
 const DNS_ACME_PROTOCOL: &str = "intendant-connect-dns-acme-v1";
+const DNS_MUTATION_CLOCK_FILE: &str = "connect-dns-mutation-clock.json";
+const DNS_MUTATION_CLOCK_SCHEMA_VERSION: u32 = 1;
+const DNS_MUTATION_CLOCK_MAX_BYTES: u64 = 4096;
 /// Relay-mode DNS publish: "answer my fleet label with the relay's address"
 /// (mirrors `bin/connect/relay.rs`; same signing discipline as the fleet-DNS
 /// publishes).
@@ -1733,6 +1736,73 @@ pub(crate) const DNS_RELAY_PROTOCOL: &str = "intendant-connect-dns-relay-v1";
 pub(crate) const RELAY_CONTROL_PROTOCOL_V1: &str = "intendant-connect-relay-control-v1";
 pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v2";
 pub(crate) const RELAY_DISCONNECT_PROTOCOL: &str = "intendant-connect-relay-disconnect-v1";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DnsMutationClock {
+    schema_version: u32,
+    last_issued_at_unix_ms: u64,
+}
+
+/// Allocate the timestamp shared by direct and relay DNS mutations under the
+/// daemon's cross-process authority lock. The signed timestamp doubles as the
+/// service's durable per-daemon mutation generation, so clock rollback,
+/// process restart, and sibling processes cannot issue an older local intent.
+fn next_dns_mutation_unix_ms_in(cert_dir: &Path, now_unix_ms: u64) -> Result<u64, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let path = cert_dir.join(DNS_MUTATION_CLOCK_FILE);
+        let previous = match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > DNS_MUTATION_CLOCK_MAX_BYTES => {
+                return Err(crate::access::AccessError(format!(
+                    "{} exceeds the {}-byte DNS mutation clock cap",
+                    path.display(),
+                    DNS_MUTATION_CLOCK_MAX_BYTES
+                )));
+            }
+            Ok(_) => {
+                let bytes = std::fs::read(&path).map_err(|error| {
+                    crate::access::AccessError(format!("read {}: {error}", path.display()))
+                })?;
+                let clock: DnsMutationClock = serde_json::from_slice(&bytes).map_err(|error| {
+                    crate::access::AccessError(format!("parse {}: {error}", path.display()))
+                })?;
+                if clock.schema_version != DNS_MUTATION_CLOCK_SCHEMA_VERSION {
+                    return Err(crate::access::AccessError(format!(
+                        "{} has unsupported schema version {}",
+                        path.display(),
+                        clock.schema_version
+                    )));
+                }
+                Some(clock.last_issued_at_unix_ms)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(crate::access::AccessError(format!(
+                    "inspect {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let issued_at_unix_ms = match previous {
+            Some(previous) => now_unix_ms.max(previous.checked_add(1).ok_or_else(|| {
+                crate::access::AccessError(
+                    "DNS mutation clock reached its numeric limit".to_string(),
+                )
+            })?),
+            None => now_unix_ms,
+        };
+        let body = serde_json::to_vec(&DnsMutationClock {
+            schema_version: DNS_MUTATION_CLOCK_SCHEMA_VERSION,
+            last_issued_at_unix_ms: issued_at_unix_ms,
+        })
+        .map_err(|error| {
+            crate::access::AccessError(format!("serialize DNS mutation clock: {error}"))
+        })?;
+        crate::access::authority_store::atomic_write_private_locked(&path, &body)?;
+        Ok(issued_at_unix_ms)
+    })
+    .map_err(|error| error.to_string())
+}
 
 #[cfg(test)] // golden-test twin of the payload `dns_signed_post` builds inline
 fn dns_publish_signing_payload(
@@ -1860,7 +1930,12 @@ async fn dns_signed_post_with_context(
     extra: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let daemon_public_key = identity.public_key_b64u();
-    let issued_at_unix_ms = crate::access::client_key::now_unix_ms().max(0) as u64;
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let now_unix_ms = crate::access::client_key::now_unix_ms().max(0) as u64;
+    let issued_at_unix_ms =
+        tokio::task::spawn_blocking(move || next_dns_mutation_unix_ms_in(&cert_dir, now_unix_ms))
+            .await
+            .map_err(|error| format!("DNS mutation clock worker failed: {error}"))??;
     let payload = format!(
         "{protocol}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{payload_tail}\n"
     );
@@ -2213,6 +2288,29 @@ mod tests {
         assert_eq!(
             join_url(&base, "api/daemon/next").unwrap().as_str(),
             "https://connect.example/root/api/daemon/next"
+        );
+    }
+
+    #[test]
+    fn dns_mutation_clock_is_durable_and_cross_process_serialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let cert_dir = dir.path().to_path_buf();
+            workers.push(std::thread::spawn(move || {
+                next_dns_mutation_unix_ms_in(&cert_dir, 1_000).unwrap()
+            }));
+        }
+        let mut issued = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        issued.sort_unstable();
+        assert_eq!(issued, (1_000..1_008).collect::<Vec<_>>());
+        assert_eq!(
+            next_dns_mutation_unix_ms_in(dir.path(), 900).unwrap(),
+            1_008,
+            "a reconstructed caller and a rolled-back wall clock must continue the durable generation"
         );
     }
 

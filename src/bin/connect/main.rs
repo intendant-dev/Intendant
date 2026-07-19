@@ -1189,6 +1189,15 @@ struct DaemonRecord {
     /// captured release single-use across service restarts and later claims.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_unclaim_proof_unix_ms: Option<u64>,
+    /// Latest accepted daemon-signed direct-or-relay DNS mutation. The
+    /// watermark lives on the daemon record because a withdrawal removes its
+    /// `DnsRecordEntry`; both endpoints share this one ordering domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_dns_mutation_unix_ms: Option<u64>,
+    /// Canonical signed-request digest for idempotent replay at the exact
+    /// watermark. Equal generations carrying a different intent are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_dns_mutation_fingerprint: Option<String>,
     registered_unix_ms: u64,
     last_seen_unix_ms: u64,
     updated_unix_ms: u64,
@@ -1732,28 +1741,72 @@ struct DnsRecordAudit {
     detail: serde_json::Value,
 }
 
+struct DnsRecordMutation {
+    daemon_id: String,
+    addresses: Vec<IpAddr>,
+    via_relay: bool,
+    issued_at_unix_ms: u64,
+    request_fingerprint: String,
+    audit: DnsRecordAudit,
+}
+
+fn dns_mutation_fingerprint(protocol: &str, payload_tail: &str) -> String {
+    sha256_b64u(format!("{protocol}\n{payload_tail}\n").as_bytes())
+}
+
 async fn update_dns_record_transaction(
     store: &Mutex<Store>,
     zone: &FleetZone,
-    daemon_id: &str,
-    addresses: &[IpAddr],
-    via_relay: bool,
-    record_audit: DnsRecordAudit,
+    mutation: DnsRecordMutation,
     persist: impl AsyncFnOnce(&Store) -> ApiResult<()>,
 ) -> ApiResult<()> {
+    let DnsRecordMutation {
+        daemon_id,
+        addresses,
+        via_relay,
+        issued_at_unix_ms,
+        request_fingerprint,
+        audit: record_audit,
+    } = mutation;
     // Validate before the durable commit. `set_daemon_addresses` has the same
     // sole validation rule, so its post-persist call cannot reject this id.
-    zone.daemon_fqdn(daemon_id)
+    zone.daemon_fqdn(&daemon_id)
         .ok_or_else(|| ApiError::bad_request("daemon id does not derive a DNS label"))?;
     let stored_addresses: Vec<String> = addresses.iter().map(ToString::to_string).collect();
     let now = now_unix_ms();
     let mut store = store.lock().await;
     let mut next = store.clone();
+    let daemon = next
+        .daemons
+        .iter_mut()
+        .find(|daemon| daemon.daemon_id == daemon_id)
+        .ok_or_else(|| {
+            ApiError::conflict("daemon registration changed during fleet DNS mutation")
+        })?;
+    match daemon.last_dns_mutation_unix_ms {
+        Some(previous) if issued_at_unix_ms < previous => {
+            return Err(ApiError::conflict(
+                "fleet DNS mutation is older than the accepted daemon generation",
+            ));
+        }
+        Some(previous) if issued_at_unix_ms == previous => {
+            if daemon.last_dns_mutation_fingerprint.as_deref() != Some(request_fingerprint.as_str())
+            {
+                return Err(ApiError::conflict(
+                    "fleet DNS mutation reuses a generation with different signed intent",
+                ));
+            }
+        }
+        _ => {
+            daemon.last_dns_mutation_unix_ms = Some(issued_at_unix_ms);
+            daemon.last_dns_mutation_fingerprint = Some(request_fingerprint.to_string());
+        }
+    }
     next.dns_records
         .retain(|record| record.daemon_id != daemon_id);
     if !addresses.is_empty() {
         next.dns_records.push(DnsRecordEntry {
-            daemon_id: daemon_id.to_string(),
+            daemon_id: daemon_id.clone(),
             addresses: stored_addresses,
             updated_unix_ms: now,
             via_relay,
@@ -1763,12 +1816,12 @@ async fn update_dns_record_transaction(
         &mut next,
         record_audit.event,
         record_audit.user_id,
-        Some(daemon_id.to_string()),
+        Some(daemon_id.clone()),
         record_audit.detail,
     );
     persist(&next).await?;
     *store = next;
-    zone.set_daemon_addresses(daemon_id, addresses)
+    zone.set_daemon_addresses(&daemon_id, &addresses)
         .map_err(|error| {
             ApiError::internal(format!(
                 "publish persisted fleet DNS record for validated daemon: {error}"
@@ -1791,21 +1844,12 @@ async fn cancellation_shielded_dns_update(
 async fn commit_dns_record_update(
     state: Arc<AppState>,
     zone: Arc<FleetZone>,
-    daemon_id: String,
-    addresses: Vec<IpAddr>,
-    via_relay: bool,
-    record_audit: DnsRecordAudit,
+    mutation: DnsRecordMutation,
 ) -> ApiResult<()> {
     cancellation_shielded_dns_update(async move {
-        update_dns_record_transaction(
-            &state.store,
-            &zone,
-            &daemon_id,
-            &addresses,
-            via_relay,
-            record_audit,
-            async |next| persist_locked(&state, next).await,
-        )
+        update_dns_record_transaction(&state.store, &zone, mutation, async |next| {
+            persist_locked(&state, next).await
+        })
         .await
     })
     .await
@@ -2008,6 +2052,51 @@ fn audit(
 mod tests {
     use super::*;
 
+    fn daemon_record(daemon_id: &str) -> DaemonRecord {
+        DaemonRecord {
+            daemon_id: daemon_id.to_string(),
+            label: None,
+            daemon_public_key: format!("{daemon_id}-key"),
+            hosted_control_enabled: false,
+            fleet_certificate_ledger: None,
+            owner_user_id: None,
+            claim_code_hash: None,
+            claim_code_created_unix_ms: None,
+            last_registration_proof_unix_ms: None,
+            route_link_revision: 0,
+            last_unclaim_proof_unix_ms: None,
+            last_dns_mutation_unix_ms: None,
+            last_dns_mutation_fingerprint: None,
+            registered_unix_ms: 1,
+            last_seen_unix_ms: 1,
+            updated_unix_ms: 1,
+            presence_hours: Vec::new(),
+        }
+    }
+
+    fn dns_mutation(
+        daemon_id: &str,
+        addresses: &[IpAddr],
+        via_relay: bool,
+        issued_at_unix_ms: u64,
+        request_fingerprint: &str,
+        event: &'static str,
+        detail: serde_json::Value,
+    ) -> DnsRecordMutation {
+        DnsRecordMutation {
+            daemon_id: daemon_id.to_string(),
+            addresses: addresses.to_vec(),
+            via_relay,
+            issued_at_unix_ms,
+            request_fingerprint: request_fingerprint.to_string(),
+            audit: DnsRecordAudit {
+                event,
+                user_id: None,
+                detail,
+            },
+        }
+    }
+
     #[test]
     fn account_handles_enforce_charset_length_and_reservations() {
         assert!(validate_account_name("lenny").is_ok());
@@ -2084,6 +2173,8 @@ mod tests {
             last_registration_proof_unix_ms: None,
             route_link_revision: 0,
             last_unclaim_proof_unix_ms: None,
+            last_dns_mutation_unix_ms: None,
+            last_dns_mutation_fingerprint: None,
             registered_unix_ms: 1,
             last_seen_unix_ms: 1,
             updated_unix_ms: 1,
@@ -2128,6 +2219,7 @@ mod tests {
         let old_address: IpAddr = "192.0.2.10".parse().unwrap();
         let new_address: IpAddr = "192.0.2.11".parse().unwrap();
         let store = Mutex::new(Store {
+            daemons: vec![daemon_record("daemon-1")],
             dns_records: vec![DnsRecordEntry {
                 daemon_id: "daemon-1".to_string(),
                 addresses: vec![old_address.to_string()],
@@ -2143,14 +2235,15 @@ mod tests {
         let result = update_dns_record_transaction(
             &store,
             &zone,
-            "daemon-1",
-            &[new_address],
-            true,
-            DnsRecordAudit {
-                event: "dns_relay",
-                user_id: None,
-                detail: json!({ "enable": true }),
-            },
+            dns_mutation(
+                "daemon-1",
+                &[new_address],
+                true,
+                2,
+                "relay-generation-2",
+                "dns_relay",
+                json!({ "enable": true }),
+            ),
             async |_| Err(ApiError::internal("forced persist failure")),
         )
         .await;
@@ -2173,6 +2266,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let data_file = root.path().join("state.json");
         let initial = Store {
+            daemons: vec![daemon_record("daemon-1")],
             dns_records: vec![DnsRecordEntry {
                 daemon_id: "daemon-1".to_string(),
                 addresses: vec![old_address.to_string()],
@@ -2195,14 +2289,15 @@ mod tests {
                 update_dns_record_transaction(
                     &caller_store,
                     &caller_zone,
-                    "daemon-1",
-                    &[new_address],
-                    true,
-                    DnsRecordAudit {
-                        event: "dns_relay",
-                        user_id: None,
-                        detail: json!({ "generation": 2 }),
-                    },
+                    dns_mutation(
+                        "daemon-1",
+                        &[new_address],
+                        true,
+                        2,
+                        "relay-generation-2",
+                        "dns_relay",
+                        json!({ "generation": 2 }),
+                    ),
                     async move |next| {
                         let _ = persist_started_tx.send(());
                         let _ = release_persist_rx.await;
@@ -2253,7 +2348,10 @@ mod tests {
     async fn concurrent_dns_updates_serialize_live_and_durable_generations() {
         let first_address: IpAddr = "192.0.2.20".parse().unwrap();
         let second_address: IpAddr = "192.0.2.21".parse().unwrap();
-        let store = Arc::new(Mutex::new(Store::default()));
+        let store = Arc::new(Mutex::new(Store {
+            daemons: vec![daemon_record("daemon-1")],
+            ..Store::default()
+        }));
         let zone = Arc::new(FleetZone::new("fleet.example.test", "ns.fleet.example.test").unwrap());
         let (first_persist_tx, first_persist_rx) = oneshot::channel();
         let (release_first_tx, release_first_rx) = oneshot::channel();
@@ -2263,14 +2361,15 @@ mod tests {
             update_dns_record_transaction(
                 &first_store,
                 &first_zone,
-                "daemon-1",
-                &[first_address],
-                false,
-                DnsRecordAudit {
-                    event: "dns_publish",
-                    user_id: None,
-                    detail: json!({ "generation": 1 }),
-                },
+                dns_mutation(
+                    "daemon-1",
+                    &[first_address],
+                    false,
+                    1,
+                    "direct-generation-1",
+                    "dns_publish",
+                    json!({ "generation": 1 }),
+                ),
                 async move |_| {
                     let _ = first_persist_tx.send(());
                     let _ = release_first_rx.await;
@@ -2288,14 +2387,15 @@ mod tests {
             update_dns_record_transaction(
                 &second_store,
                 &second_zone,
-                "daemon-1",
-                &[second_address],
-                true,
-                DnsRecordAudit {
-                    event: "dns_relay",
-                    user_id: None,
-                    detail: json!({ "generation": 2 }),
-                },
+                dns_mutation(
+                    "daemon-1",
+                    &[second_address],
+                    true,
+                    2,
+                    "relay-generation-2",
+                    "dns_relay",
+                    json!({ "generation": 2 }),
+                ),
                 async move |_| {
                     let _ = second_persist_tx.send(());
                     Ok(())
@@ -2325,6 +2425,150 @@ mod tests {
         assert_eq!(
             zone.daemon_addresses_for_test("daemon-1"),
             vec![second_address]
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_mutation_watermark_rejects_delayed_cross_endpoint_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let data_file = root.path().join("state.json");
+        let direct_address: IpAddr = "192.0.2.30".parse().unwrap();
+        let relay_address: IpAddr = "192.0.2.31".parse().unwrap();
+        let initial = Store {
+            daemons: vec![daemon_record("daemon-1")],
+            ..Store::default()
+        };
+        save_store(&data_file, &initial).unwrap();
+        let store = Mutex::new(initial);
+        let zone = FleetZone::new("fleet.example.test", "ns.fleet.example.test").unwrap();
+
+        update_dns_record_transaction(
+            &store,
+            &zone,
+            dns_mutation(
+                "daemon-1",
+                &[],
+                false,
+                11,
+                "relay-disable-11",
+                "dns_relay",
+                json!({"enable": false}),
+            ),
+            async |next| save_store(&data_file, next).map_err(ApiError::internal),
+        )
+        .await
+        .unwrap();
+        update_dns_record_transaction(
+            &store,
+            &zone,
+            dns_mutation(
+                "daemon-1",
+                &[direct_address],
+                false,
+                12,
+                "direct-address-12",
+                "dns_publish",
+                json!({"addresses": 1}),
+            ),
+            async |next| save_store(&data_file, next).map_err(ApiError::internal),
+        )
+        .await
+        .unwrap();
+
+        let stale = update_dns_record_transaction(
+            &store,
+            &zone,
+            dns_mutation(
+                "daemon-1",
+                &[relay_address],
+                true,
+                10,
+                "relay-enable-10",
+                "dns_relay",
+                json!({"enable": true}),
+            ),
+            async |next| save_store(&data_file, next).map_err(ApiError::internal),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.status, StatusCode::CONFLICT);
+        {
+            let current = store.lock().await;
+            assert_eq!(
+                current.dns_records[0].addresses,
+                [direct_address.to_string()]
+            );
+            assert!(!current.dns_records[0].via_relay);
+            assert_eq!(current.daemons[0].last_dns_mutation_unix_ms, Some(12));
+        }
+        assert_eq!(
+            zone.daemon_addresses_for_test("daemon-1"),
+            vec![direct_address]
+        );
+
+        // Reload the durable state: the watermark survives even though a
+        // withdrawal could have removed the DNS record itself.
+        let reloaded = Mutex::new(load_store(&data_file).unwrap());
+        let reloaded_zone = FleetZone::new("fleet.example.test", "ns.fleet.example.test").unwrap();
+        reloaded_zone
+            .set_daemon_addresses("daemon-1", &[direct_address])
+            .unwrap();
+        let stale_after_restart = update_dns_record_transaction(
+            &reloaded,
+            &reloaded_zone,
+            dns_mutation(
+                "daemon-1",
+                &[relay_address],
+                true,
+                10,
+                "relay-enable-10",
+                "dns_relay",
+                json!({"enable": true}),
+            ),
+            async |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale_after_restart.status, StatusCode::CONFLICT);
+
+        // The exact signed mutation is idempotent; the same generation with
+        // different signed intent is not.
+        update_dns_record_transaction(
+            &reloaded,
+            &reloaded_zone,
+            dns_mutation(
+                "daemon-1",
+                &[direct_address],
+                false,
+                12,
+                "direct-address-12",
+                "dns_publish",
+                json!({"addresses": 1}),
+            ),
+            async |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        let conflicting_reuse = update_dns_record_transaction(
+            &reloaded,
+            &reloaded_zone,
+            dns_mutation(
+                "daemon-1",
+                &[relay_address],
+                true,
+                12,
+                "relay-enable-12",
+                "dns_relay",
+                json!({"enable": true}),
+            ),
+            async |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflicting_reuse.status, StatusCode::CONFLICT);
+        assert_eq!(
+            reloaded_zone.daemon_addresses_for_test("daemon-1"),
+            vec![direct_address]
         );
     }
 
@@ -2440,6 +2684,8 @@ mod tests {
                 last_registration_proof_unix_ms: None,
                 route_link_revision: 0,
                 last_unclaim_proof_unix_ms: None,
+                last_dns_mutation_unix_ms: None,
+                last_dns_mutation_fingerprint: None,
                 registered_unix_ms: 1,
                 last_seen_unix_ms: 1,
                 updated_unix_ms: 1,
@@ -2521,6 +2767,8 @@ mod tests {
                 last_registration_proof_unix_ms: None,
                 route_link_revision: 0,
                 last_unclaim_proof_unix_ms: None,
+                last_dns_mutation_unix_ms: None,
+                last_dns_mutation_fingerprint: None,
                 registered_unix_ms: 1,
                 last_seen_unix_ms: 1,
                 updated_unix_ms: 1,

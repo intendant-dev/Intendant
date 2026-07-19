@@ -29,7 +29,7 @@ use std::{net::SocketAddr, time::Duration};
 use futures_util::StreamExt as _;
 use reqwest::{Client, Url};
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinSet;
@@ -951,42 +951,19 @@ fn shared_relay_source_bucket() -> String {
 
 /// Bidirectional byte splice with a per-direction byte cap and idle teardown.
 async fn splice(relay: TcpStream, gateway: TcpStream) {
-    let (relay_r, relay_w) = relay.into_split();
-    let (gateway_r, gateway_w) = gateway.into_split();
-    let to_gateway = copy_half(relay_r, gateway_w);
-    let to_relay = copy_half(gateway_r, relay_w);
-    tokio::select! {
-        _ = to_gateway => {}
-        _ = to_relay => {}
-    }
-}
-
-async fn copy_half<R, W>(mut reader: R, mut writer: W)
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = vec![0u8; 16 * 1024];
-    let mut total: u64 = 0;
-    loop {
-        let n = match tokio::time::timeout(SPLICE_IDLE, reader.read(&mut buf)).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-            Ok(Ok(n)) => n,
-        };
-        total = total.saturating_add(n as u64);
-        if total > SPLICE_MAX_BYTES {
-            break;
-        }
-        if writer.write_all(&buf[..n]).await.is_err() {
-            break;
-        }
-    }
-    let _ = writer.shutdown().await;
+    intendant_core::net::splice_bidirectional_bounded(
+        relay,
+        gateway,
+        SPLICE_MAX_BYTES,
+        SPLICE_IDLE,
+    )
+    .await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt as _;
     use tokio::net::TcpListener;
 
     #[test]

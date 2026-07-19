@@ -336,7 +336,8 @@ impl CustomDomainRuntime {
         &self,
         input: RegistrationInviteInput,
     ) -> Result<EnrollmentInvite, String> {
-        self.passkeys()?.registration_invite(input)
+        self.passkeys()?
+            .registration_invite(input, self.current_fleet_zone_observed.as_deref())
     }
 
     pub(crate) fn registration_start(
@@ -344,14 +345,19 @@ impl CustomDomainRuntime {
         input: RegistrationStartInput,
         origin: &str,
     ) -> Result<CeremonyStart, String> {
-        self.passkeys()?.registration_start(input, origin)
+        self.passkeys()?.registration_start(
+            input,
+            origin,
+            self.current_fleet_zone_observed.as_deref(),
+        )
     }
 
     pub(crate) fn registration_finish(
         &self,
         input: RegistrationFinishInput,
     ) -> Result<PasskeyView, String> {
-        self.passkeys()?.registration_finish(input)
+        self.passkeys()?
+            .registration_finish(input, self.current_fleet_zone_observed.as_deref())
     }
 
     pub(crate) fn authentication_start(
@@ -360,8 +366,12 @@ impl CustomDomainRuntime {
         origin: &str,
         source_bucket: Option<&str>,
     ) -> Result<CeremonyStart, String> {
-        self.passkeys()?
-            .authentication_start(input, origin, source_bucket)
+        self.passkeys()?.authentication_start(
+            input,
+            origin,
+            source_bucket,
+            self.current_fleet_zone_observed.as_deref(),
+        )
     }
 
     pub(crate) fn authentication_finish(

@@ -94,21 +94,23 @@ impl DemuxStream {
     /// response pump also clones this predicate to cover time spent waiting
     /// for a producer, when no socket future exists to drive `poll_write`.
     pub(crate) fn retain_hosted_http_authority(&mut self, authority: HostedHttpAuthority) {
-        self.http_write_authority =
-            Some(Arc::new(move || authority.opening_authority_is_current()));
+        self.retain_http_write_authority(Arc::new(move || {
+            authority.opening_authority_is_current()
+        }));
+    }
+
+    /// Retain an arbitrary live HTTP authority at the transport edge. Public
+    /// custom-domain entry points use this before they mint a lease, while a
+    /// verified hosted request replaces it with the stricter opening-grant
+    /// predicate above.
+    pub(crate) fn retain_http_write_authority(&mut self, authority: HttpWriteAuthority) {
+        self.http_write_authority = Some(authority);
         self.http_write_authority_tick = None;
         self.http_write_authority_invalid = false;
     }
 
     pub(crate) fn http_write_authority(&self) -> Option<HttpWriteAuthority> {
         self.http_write_authority.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retain_http_write_authority_for_test(&mut self, authority: HttpWriteAuthority) {
-        self.http_write_authority = Some(authority);
-        self.http_write_authority_tick = None;
-        self.http_write_authority_invalid = false;
     }
 
     /// Begin one request/response exchange: record the request leg's
@@ -583,6 +585,36 @@ pub(crate) async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
         || Ok(()),
     )
     .await
+}
+
+/// Spool a streaming request body under the transport's retained live
+/// authority, when present. The caller still performs its authoritative
+/// post-body refresh before committing the upload.
+pub(crate) async fn stream_body_to_tempfile_with_authority<S: AsyncRead + Unpin>(
+    header_text: &str,
+    initial_request_bytes: &[u8],
+    stream: &mut S,
+    max_bytes: usize,
+    authority: Option<HttpWriteAuthority>,
+) -> Result<SpooledBody, String> {
+    if let Some(authority) = authority {
+        stream_body_to_tempfile_with_guard(
+            header_text,
+            initial_request_bytes,
+            stream,
+            max_bytes,
+            move || {
+                if authority() {
+                    Ok(())
+                } else {
+                    Err(HOSTED_BODY_AUTHORITY_LOST_ERROR.to_string())
+                }
+            },
+        )
+        .await
+    } else {
+        stream_body_to_tempfile(header_text, initial_request_bytes, stream, max_bytes).await
+    }
 }
 
 pub(crate) async fn stream_body_to_tempfile_with_guard<
@@ -1135,6 +1167,8 @@ const REQUEST_BODY_READ_CHUNK_BYTES: usize = 16 * 1024;
 const REQUEST_BODY_TIMEOUT_FREE_BYTES: usize = 64 * 1024;
 const REQUEST_BODY_TIMEOUT_BYTES_PER_SEC: usize = 128 * 1024;
 const LIVE_BODY_GUARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+pub(crate) const HOSTED_BODY_AUTHORITY_LOST_ERROR: &str =
+    "hosted request authority became unavailable during body read";
 
 async fn poll_guarded_read<S, G, E>(
     stream: &mut S,
@@ -1180,6 +1214,33 @@ pub(crate) async fn read_request_body_capped<S: AsyncRead + Unpin>(
         || Ok(()),
     )
     .await
+}
+
+/// Read a capped request body under the exact live authority already retained
+/// by the HTTP transport. Fleet leases and public custom-domain entry points
+/// therefore share one selection rule instead of each call site deciding
+/// which part of authority deserves a recurring guard.
+pub(crate) async fn read_request_body_capped_with_authority<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    header_text: &str,
+    max_bytes: usize,
+    authority: Option<HttpWriteAuthority>,
+) -> Result<String, (u16, String)> {
+    if let Some(authority) = authority {
+        read_request_body_capped_with_guard(stream, header_text, max_bytes, move || {
+            if authority() {
+                Ok(())
+            } else {
+                Err((
+                    403,
+                    serde_json::json!({ "error": HOSTED_BODY_AUTHORITY_LOST_ERROR }).to_string(),
+                ))
+            }
+        })
+        .await
+    } else {
+        read_request_body_capped(stream, header_text, max_bytes).await
+    }
 }
 
 pub(crate) async fn read_request_body_capped_with_guard<
@@ -1512,7 +1573,7 @@ mod tests {
         let mut stream = DemuxStream::new(Box::pin(server));
         // Fail-closed defaults: no verdict, no armed slot.
         assert!(!stream.exchange_reusable());
-        stream.retain_http_write_authority_for_test(Arc::new(|| false));
+        stream.retain_http_write_authority(Arc::new(|| false));
         assert!(stream.http_write_authority().is_some());
         stream.begin_request(true);
         assert!(
@@ -1587,7 +1648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_request_body_capped_stops_when_live_guard_closes() {
+    async fn retained_authority_stops_a_stalled_capped_body_read() {
         let (_writer, mut reader) = tokio::io::duplex(64);
         let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let close = std::sync::Arc::clone(&live);
@@ -1596,28 +1657,26 @@ mod tests {
             close.store(false, std::sync::atomic::Ordering::Release);
         });
         let header_text = "POST /api/fs/write HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        let body_authority: HttpWriteAuthority =
+            Arc::new(move || live.load(std::sync::atomic::Ordering::Acquire));
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            read_request_body_capped_with_guard(&mut reader, header_text, 4, || {
-                if live.load(std::sync::atomic::Ordering::Acquire) {
-                    Ok(())
-                } else {
-                    Err((
-                        403,
-                        serde_json::json!({"error": "live authority closed"}).to_string(),
-                    ))
-                }
-            }),
+            read_request_body_capped_with_authority(
+                &mut reader,
+                header_text,
+                4,
+                Some(body_authority),
+            ),
         )
         .await
         .expect("the live guard must interrupt a stalled capped-body read")
         .unwrap_err();
         assert_eq!(error.0, 403);
-        assert!(error.1.contains("live authority closed"));
+        assert!(error.1.contains(HOSTED_BODY_AUTHORITY_LOST_ERROR));
     }
 
     #[tokio::test]
-    async fn tempfile_stream_stops_when_live_guard_closes() {
+    async fn retained_authority_stops_a_stalled_tempfile_body_read() {
         let (_writer, mut reader) = tokio::io::duplex(64);
         let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let close = std::sync::Arc::clone(&live);
@@ -1626,20 +1685,16 @@ mod tests {
             close.store(false, std::sync::atomic::Ordering::Release);
         });
         let header_text = "POST /api/transfers/job/chunk HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        let body_authority: HttpWriteAuthority =
+            Arc::new(move || live.load(std::sync::atomic::Ordering::Acquire));
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            stream_body_to_tempfile_with_guard(
+            stream_body_to_tempfile_with_authority(
                 header_text,
                 header_text.as_bytes(),
                 &mut reader,
                 4,
-                || {
-                    if live.load(std::sync::atomic::Ordering::Acquire) {
-                        Ok(())
-                    } else {
-                        Err("live authority closed".to_string())
-                    }
-                },
+                Some(body_authority),
             ),
         )
         .await
@@ -1648,7 +1703,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("the streaming body unexpectedly completed"),
         };
-        assert_eq!(error, "live authority closed");
+        assert_eq!(error, HOSTED_BODY_AUTHORITY_LOST_ERROR);
     }
 
     #[tokio::test]
