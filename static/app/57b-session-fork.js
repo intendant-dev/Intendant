@@ -439,8 +439,15 @@ function anchorForkPointForRecord(source, record) {
 function appendAnchorForkAffordance(entry, record, sessionId) {
   const sid = String(sessionId || (record && record.session_id) || '').trim();
   if (!sid || !entry) return;
+  // Source resolution: the fork index (loaded eagerly when the detail
+  // opened) is authoritative and present even when the sessions-list
+  // metadata has not hydrated (a directly opened detail); the metadata
+  // row is the live-lane fallback.
+  const idx = _sessionForkInlineIndexes.get(sid);
   const meta = typeof sessionConfigMetadata === 'function' ? sessionConfigMetadata(sid) : null;
-  const source = typeof sessionConfigSource === 'function' ? sessionConfigSource(meta) : '';
+  const source =
+    (idx && idx.source) ||
+    (typeof sessionConfigSource === 'function' ? sessionConfigSource(meta) : '');
   const point = anchorForkPointForRecord(source, record);
   if (!point) return;
   const btn = document.createElement('button');
