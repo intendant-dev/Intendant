@@ -44,18 +44,25 @@ pub struct Config {
     /// grown past the installer-minted files in a root-owned dir) — link
     /// gating may degrade, ordinary governance never rides with it.
     pub link_slots: u32,
+    /// Number of pre-created, writable `link-waiter-<i>` files available
+    /// to the crash-safe FIFO queue in front of the link slots. `0`
+    /// disables queue ordering while keeping the link gate itself. If no
+    /// waiter file is usable (for example, a new binary is installed
+    /// before its root-owned assets), link serialization remains active
+    /// but degrades to unordered polling.
+    pub link_queue_slots: u32,
     /// Usernames whose invocations are classed `ci`; everyone else is
     /// `local`.
     pub ci_users: Vec<String>,
-    /// Front of the compile chain for governed *and* fail-open
+    /// Front of the cacheable compile chain for governed and fail-open
     /// invocations: `wrap_with <real-compiler> <args…>` — in production
-    /// the sccache client, whose blocking round-trip is what carries the
-    /// permit's ceiling to server-side compiles (governed runs spawn it
-    /// and wait, permit parent-held; fail-open runs exec it). Unset (or
-    /// written as `""`, which the parser normalizes to unset) means "run
-    /// the compiler directly": the governor works without sccache. The
-    /// real compiler itself is never configured here — cargo passes it
-    /// as argv[1] (the RUSTC_WRAPPER contract).
+    /// the sccache client, whose blocking round-trip carries the permit's
+    /// ceiling to server-side compiles. Governed heavyweight bin/test
+    /// invocations are non-cacheable and run rustc directly so their
+    /// invocation-private linker shim is reliable. Unset (or `""`) means
+    /// "run the compiler directly": the governor works without sccache.
+    /// The real compiler itself is never configured here — cargo passes
+    /// it as argv[1] (the RUSTC_WRAPPER contract).
     pub wrap_with: Option<PathBuf>,
 }
 
@@ -71,6 +78,7 @@ impl Default for Config {
             // keys are ignored, so pre-gate configs stay parseable while
             // this default carries the policy).
             link_slots: 1,
+            link_queue_slots: 64,
             ci_users: vec!["_intendant-ci".to_string(), "ci".to_string()],
             wrap_with: None,
         }
@@ -116,6 +124,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             "local_reserved" => cfg.local_reserved = parse_u32(value).map_err(|e| err(&e))?,
             "ci_reserved" => cfg.ci_reserved = parse_u32(value).map_err(|e| err(&e))?,
             "link_slots" => cfg.link_slots = parse_u32(value).map_err(|e| err(&e))?,
+            "link_queue_slots" => cfg.link_queue_slots = parse_u32(value).map_err(|e| err(&e))?,
             "ci_users" => cfg.ci_users = parse_string_array(value).map_err(|e| err(&e))?,
             "wrap_with" => {
                 // Empty means unset: the installer's here-doc always writes
@@ -261,6 +270,7 @@ permit_dir = "/usr/local/var/intendant-governor"
 local_reserved = 1
 ci_reserved = 2   # per-box sizing
 link_slots = 1
+link_queue_slots = 64
 ci_users = ["_intendant-ci", "ci"]
 wrap_with = "/opt/homebrew/bin/sccache"
 "#;
@@ -287,6 +297,7 @@ wrap_with = "/opt/homebrew/bin/sccache"
             "local_reserved = 3\n",
             "ci_reserved = 0\n",
             "link_slots = 4\n",
+            "link_queue_slots = 12\n",
             "ci_users = [\"a\", \"b\",]\n",
             "wrap_with = \"/opt/sccache\"\n",
         );
@@ -296,6 +307,7 @@ wrap_with = "/opt/homebrew/bin/sccache"
         assert_eq!(cfg.local_reserved, 3);
         assert_eq!(cfg.ci_reserved, 0);
         assert_eq!(cfg.link_slots, 4);
+        assert_eq!(cfg.link_queue_slots, 12);
         assert_eq!(cfg.ci_users, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(cfg.wrap_with, Some(PathBuf::from("/opt/sccache")));
     }
@@ -310,6 +322,13 @@ wrap_with = "/opt/homebrew/bin/sccache"
         assert_eq!(parse("link_slots = 0\n").unwrap().link_slots, 0);
         assert!(parse("link_slots = -1\n").is_err());
         assert!(parse("link_slots = many\n").is_err());
+    }
+
+    #[test]
+    fn link_queue_defaults_to_a_bounded_fifo_and_zero_disables_ordering() {
+        assert_eq!(parse("enabled = true\n").unwrap().link_queue_slots, 64);
+        assert_eq!(parse("link_queue_slots = 0\n").unwrap().link_queue_slots, 0);
+        assert!(parse("link_queue_slots = -1\n").is_err());
     }
 
     #[test]

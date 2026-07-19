@@ -13,6 +13,8 @@
 //! - `link-<i>`,         i < link_slots      — the heavyweight-link slots
 //!   (machine-global, classless: host memory doesn't care whose link it
 //!   is, so there is no reservation split and no demand gate)
+//! - `link-waiter-<i>`,  i < link_queue_slots — writable ticket files for
+//!   the bounded, crash-safe FIFO in front of the link slots
 //!
 //! Protocol:
 //! - Holding a permit = holding LOCK_EX on its file. The governor holds
@@ -35,29 +37,35 @@
 //! - Nothing is ever killed or signalled; borrowed permits return naturally
 //!   when their holder exits.
 //!
-//! Link-slot ordering invariant (load-bearing — see `acquire_link_slot`):
-//! a heavyweight invocation takes its LINK SLOT FIRST, and only then its
-//! ordinary permit. **No ordinary-permit hoarding**: an invocation queued
-//! on the link gate holds zero ordinary permits, so however many
-//! heavyweights pile up, ordinary compiles keep the rest of the pool
-//! (three simultaneous final links — the observed cargo behavior — pin
-//! one slot and zero permits, not three permits). **Deadlock-free**: an
-//! ordinary-permit holder never waits on the link slot (only heavyweights
-//! do, and they acquired it first), so the wait graph has no cycle. The
-//! cost — a held slot idling while its owner queues for an ordinary
-//! permit — delays other *links* only, which is the acceptable direction.
-//! No FIFO/fairness guarantee exists in the flock+poll design; soak
-//! telemetry (govlog's wait fields) decides whether one is ever needed.
+//! The link slot is acquired by the linker shim, after rustc has completed
+//! compilation and codegen. The outer governor continues to hold that
+//! rustc's ordinary permit while the linker waits and runs. This cannot
+//! form a cycle: every heavyweight takes resources in the same
+//! permit-then-link order, and the process holding a link slot needs no
+//! further governor resource before it can finish. It also means a queued
+//! link may occupy a compile permit, but only for the duration of the
+//! actual links ahead of it — not for another crate's entire compile and
+//! codegen phase.
+//!
+//! FIFO is a fixed pool of root-minted, world-writable ticket files. A
+//! waiter exclusively flocks one file, writes its monotonic arrival tuple,
+//! and keeps the flock until it acquires a link slot. Scanners treat
+//! unlocked files as free/stale, so SIGKILL releases a ticket structurally
+//! with no cleanup daemon. The first `usable link slots` active tickets may
+//! compete for slots. If no ticket file is usable (old install, bad
+//! permissions), serialization remains active but ordering degrades to the
+//! old unordered poll; `link_queue_slots = 0` explicitly chooses that mode.
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{self, Config};
 use crate::flock;
 
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const LINK_WAIT_NOTICE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Class {
@@ -150,6 +158,24 @@ pub(crate) struct AcquiredLinkSlot {
     pub(crate) _file: File,
     pub(crate) name: String,
     pub(crate) wait_ms: u64,
+    pub(crate) queue: LinkQueueKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkQueueKind {
+    Fifo,
+    Disabled,
+    Degraded,
+}
+
+impl LinkQueueKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            LinkQueueKind::Fifo => "fifo",
+            LinkQueueKind::Disabled => "disabled",
+            LinkQueueKind::Degraded => "degraded",
+        }
+    }
 }
 
 /// Outcome of gating a heavyweight link.
@@ -181,6 +207,10 @@ fn link_slot_name(i: u32) -> String {
     format!("link-{i}")
 }
 
+fn link_waiter_name(i: u32) -> String {
+    format!("link-waiter-{i}")
+}
+
 /// Open (or, where the directory allows it, create) a lock file. flock(2)
 /// only needs an open fd — read-only is enough against the root-owned 0644
 /// files of a production install; the create fallback serves tempdir rigs
@@ -188,6 +218,24 @@ fn link_slot_name(i: u32) -> String {
 /// (O_CREAT without O_EXCL), so their locks contend correctly.
 fn open_lock_file(path: &Path) -> Option<File> {
     match OpenOptions::new().read(true).open(path) {
+        Ok(f) => Some(f),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .ok(),
+        Err(_) => None,
+    }
+}
+
+/// Queue tickets carry a small arrival record, so unlike ordinary lock
+/// files they must be writable by every governed account. Production
+/// assets are pre-created 0666 by the installer; creation is only a
+/// convenience for user-writable test/diagnostic rigs.
+fn open_queue_file(path: &Path) -> Option<File> {
+    match OpenOptions::new().read(true).write(true).open(path) {
         Ok(f) => Some(f),
         Err(e) if e.kind() == io::ErrorKind::NotFound => OpenOptions::new()
             .read(true)
@@ -231,14 +279,181 @@ fn foreign_has_no_waiters(demand: &File) -> bool {
     }
 }
 
-/// Acquire one machine-global link slot for a heavyweight link, waiting as
-/// long as it takes. Called BEFORE `acquire` — the ordering invariant in
-/// the module doc: a waiter here holds nothing, so it can hoard no
-/// ordinary capacity and can complete no deadlock cycle. No demand gate:
-/// the slots are classless, and the only takers are heavyweights in this
-/// same single queue. The live kill switch is honored mid-wait exactly
-/// like the permit poll.
-pub(crate) fn acquire_link_slot(cfg: &Config, config_path: &Path) -> LinkGate {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TicketOrder {
+    monotonic_ns: u128,
+    pid: u32,
+    index: u32,
+}
+
+struct QueueTicket {
+    file: File,
+    order: TicketOrder,
+}
+
+impl Drop for QueueTicket {
+    fn drop(&mut self) {
+        // Stale bytes are harmless (an unlocked file is inactive), but
+        // truncating keeps diagnostics human-readable on graceful exits.
+        let _ = self.file.set_len(0);
+        flock::unlock(&self.file);
+    }
+}
+
+enum QueueClaim {
+    Claimed(QueueTicket),
+    Full,
+    Unusable,
+}
+
+enum QueueState {
+    Fifo(QueueTicket),
+    Disabled,
+    Degraded,
+}
+
+impl QueueState {
+    fn kind(&self) -> LinkQueueKind {
+        match self {
+            QueueState::Fifo(_) => LinkQueueKind::Fifo,
+            QueueState::Disabled => LinkQueueKind::Disabled,
+            QueueState::Degraded => LinkQueueKind::Degraded,
+        }
+    }
+}
+
+fn monotonic_ns() -> u128 {
+    // CLOCK_MONOTONIC is machine-wide on both supported Unix families, so
+    // independently spawned waiters can order their arrivals without a
+    // mutable counter file. Fall back to wall time only if the OS call
+    // unexpectedly fails.
+    // SAFETY: `ts` is a live, writable timespec and clock_gettime writes
+    // exactly that value; CLOCK_MONOTONIC needs no other precondition.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if rc == 0 {
+        (ts.tv_sec.max(0) as u128) * 1_000_000_000 + ts.tv_nsec.max(0) as u128
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+}
+
+fn try_claim_queue_ticket(dir: &Path, count: u32) -> QueueClaim {
+    let mut occupied = false;
+    for index in 0..count {
+        let Some(mut file) = open_queue_file(&dir.join(link_waiter_name(index))) else {
+            continue;
+        };
+        if !flock::try_lock_exclusive(&file) {
+            occupied = true;
+            continue;
+        }
+        let order = TicketOrder {
+            monotonic_ns: monotonic_ns(),
+            pid: std::process::id(),
+            index,
+        };
+        let record = format!("{} {} {}\n", order.monotonic_ns, order.pid, order.index);
+        let wrote = file.set_len(0).is_ok()
+            && file.seek(SeekFrom::Start(0)).is_ok()
+            && file.write_all(record.as_bytes()).is_ok();
+        if wrote {
+            return QueueClaim::Claimed(QueueTicket { file, order });
+        }
+        flock::unlock(&file);
+    }
+    if occupied {
+        QueueClaim::Full
+    } else {
+        QueueClaim::Unusable
+    }
+}
+
+fn parse_ticket_record(text: &str, index: u32) -> TicketOrder {
+    let mut fields = text.split_whitespace();
+    let parsed = (|| {
+        Some(TicketOrder {
+            monotonic_ns: fields.next()?.parse().ok()?,
+            pid: fields.next()?.parse().ok()?,
+            index: fields.next()?.parse().ok()?,
+        })
+    })();
+    // An active owner may be observed in the few instructions between its
+    // flock and record write. Treat an empty/partial active record as the
+    // oldest waiter, conservatively preventing a newcomer from overtaking.
+    parsed.unwrap_or(TicketOrder {
+        monotonic_ns: 0,
+        pid: 0,
+        index,
+    })
+}
+
+fn active_ticket_rank(dir: &Path, count: u32, mine: TicketOrder) -> usize {
+    let mut active = Vec::new();
+    for index in 0..count {
+        let Some(mut file) = open_queue_file(&dir.join(link_waiter_name(index))) else {
+            continue;
+        };
+        if flock::try_lock_exclusive(&file) {
+            // Free or crash-stale: it is not an active queue member.
+            flock::unlock(&file);
+            continue;
+        }
+        let mut record = String::new();
+        let _ = file.seek(SeekFrom::Start(0));
+        let _ = file.read_to_string(&mut record);
+        active.push(parse_ticket_record(&record, index));
+    }
+    active.sort_unstable();
+    active
+        .iter()
+        .position(|ticket| *ticket == mine)
+        // Never let a missing/partially observed own record jump to the
+        // front. A normal claimant writes before this scan, so MAX is only
+        // a conservative one-tick response to a race (or external file
+        // removal/corruption).
+        .unwrap_or(usize::MAX)
+}
+
+fn live_config_enabled(config_path: &Path) -> bool {
+    matches!(config::load(config_path), Some(live) if live.enabled)
+}
+
+fn maybe_report_link_wait(
+    start: Instant,
+    reported: &mut bool,
+    crate_name: Option<&str>,
+    queue: &str,
+) {
+    if !*reported && start.elapsed() >= LINK_WAIT_NOTICE {
+        let name: String = crate_name
+            .unwrap_or("-")
+            .chars()
+            .filter(|c| c.is_ascii_graphic())
+            .take(64)
+            .collect();
+        eprintln!(
+            "rustc-governor: {} waiting for the machine-wide linker slot ({:.1}s, queue={queue})",
+            if name.is_empty() { "-" } else { &name },
+            start.elapsed().as_secs_f64(),
+        );
+        *reported = true;
+    }
+}
+
+/// Acquire one machine-global link slot for the actual linker process,
+/// waiting as long as it takes. The outer governor already holds this
+/// rustc invocation's ordinary permit; see the module-level ordering
+/// proof. No class demand gate applies: link slots are machine-global.
+/// The live kill switch is honored mid-wait exactly like the permit poll.
+pub(crate) fn acquire_link_slot(
+    cfg: &Config,
+    config_path: &Path,
+    crate_name: Option<&str>,
+) -> LinkGate {
     if cfg.link_slots == 0 {
         return LinkGate::Off;
     }
@@ -254,21 +469,47 @@ pub(crate) fn acquire_link_slot(cfg: &Config, config_path: &Path) -> LinkGate {
         return LinkGate::Degraded;
     }
     let start = Instant::now();
+    let mut reported = false;
+    let queue = if cfg.link_queue_slots == 0 {
+        QueueState::Disabled
+    } else {
+        loop {
+            match try_claim_queue_ticket(dir, cfg.link_queue_slots) {
+                QueueClaim::Claimed(ticket) => break QueueState::Fifo(ticket),
+                QueueClaim::Unusable => break QueueState::Degraded,
+                QueueClaim::Full => {
+                    if !live_config_enabled(config_path) {
+                        return LinkGate::FailOpen;
+                    }
+                    maybe_report_link_wait(start, &mut reported, crate_name, "full");
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            }
+        }
+    };
     loop {
-        if let Some((name, file)) = try_take(&mut slots) {
-            return LinkGate::Held(AcquiredLinkSlot {
-                _file: file,
-                name,
-                wait_ms: start.elapsed().as_millis() as u64,
-            });
+        let may_take = match &queue {
+            QueueState::Fifo(ticket) => {
+                active_ticket_rank(dir, cfg.link_queue_slots, ticket.order) < slots.len()
+            }
+            QueueState::Disabled | QueueState::Degraded => true,
+        };
+        if may_take {
+            if let Some((name, file)) = try_take(&mut slots) {
+                let queue_kind = queue.kind();
+                drop(queue);
+                return LinkGate::Held(AcquiredLinkSlot {
+                    _file: file,
+                    name,
+                    wait_ms: start.elapsed().as_millis() as u64,
+                    queue: queue_kind,
+                });
+            }
         }
-        // Same live kill switch as the permit poll below: a flipped
-        // `enabled = false` or a deleted config unwedges link waiters
-        // within one poll tick, fail-open.
-        match config::load(config_path) {
-            Some(live) if live.enabled => {}
-            _ => return LinkGate::FailOpen,
+        if !live_config_enabled(config_path) {
+            return LinkGate::FailOpen;
         }
+        maybe_report_link_wait(start, &mut reported, crate_name, queue.kind().as_str());
         std::thread::sleep(POLL_INTERVAL);
     }
 }
@@ -379,6 +620,7 @@ mod tests {
             local_reserved: local,
             ci_reserved: ci,
             link_slots: 1,
+            link_queue_slots: 8,
             ci_users: vec!["_intendant-ci".into(), "ci".into()],
             wrap_with: None,
         };
@@ -433,19 +675,25 @@ mod tests {
     fn link_gate_off_and_degraded_never_block() {
         let (_tmp, mut cfg, path) = rig(1, 0);
         cfg.link_slots = 0;
-        assert!(matches!(acquire_link_slot(&cfg, &path), LinkGate::Off));
+        assert!(matches!(
+            acquire_link_slot(&cfg, &path, None),
+            LinkGate::Off
+        ));
         // An unusable permit dir (here: a plain file where the dir should
         // be) means no slot file can be opened or created: Degraded, so
         // the caller keeps ordinary governance instead of failing open.
         cfg.link_slots = 1;
         cfg.permit_dir = path.clone();
-        assert!(matches!(acquire_link_slot(&cfg, &path), LinkGate::Degraded));
+        assert!(matches!(
+            acquire_link_slot(&cfg, &path, None),
+            LinkGate::Degraded
+        ));
     }
 
     #[test]
     fn link_slots_serialize_and_release() {
         let (_tmp, cfg, path) = rig(2, 0);
-        let a = match acquire_link_slot(&cfg, &path) {
+        let a = match acquire_link_slot(&cfg, &path, Some("first")) {
             LinkGate::Held(slot) => slot,
             _ => panic!("first heavyweight must take the slot"),
         };
@@ -453,7 +701,7 @@ mod tests {
         // The single slot is held: a second taker polls. Prove it waits
         // by watching a thread not finish, then release and join.
         let (cfg2, path2) = (cfg.clone(), path.clone());
-        let waiter = std::thread::spawn(move || acquire_link_slot(&cfg2, &path2));
+        let waiter = std::thread::spawn(move || acquire_link_slot(&cfg2, &path2, Some("second")));
         std::thread::sleep(Duration::from_millis(400));
         assert!(
             !waiter.is_finished(),
@@ -470,8 +718,8 @@ mod tests {
     fn multiple_link_slots_admit_that_many() {
         let (_tmp, mut cfg, path) = rig(2, 0);
         cfg.link_slots = 2;
-        let a = acquire_link_slot(&cfg, &path);
-        let b = acquire_link_slot(&cfg, &path);
+        let a = acquire_link_slot(&cfg, &path, Some("a"));
+        let b = acquire_link_slot(&cfg, &path, Some("b"));
         let (a, b) = match (a, b) {
             (LinkGate::Held(a), LinkGate::Held(b)) => (a, b),
             _ => panic!("two slots must admit two links"),
