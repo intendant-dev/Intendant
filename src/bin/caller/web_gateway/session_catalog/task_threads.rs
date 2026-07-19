@@ -33,21 +33,45 @@ pub(crate) fn is_claude_task_child_id(session_id: &str) -> bool {
     })
 }
 
+/// What a synthetic `task-*` id resolves to in the Claude Code store: the
+/// subagent transcript itself, the spawning `toolUseId` the id was minted
+/// from, and — when the same project alias carries it — the PARENT
+/// thread's transcript, the only file Claude Code persists the child's
+/// terminal status into (`<task-notification>` records; the subagent
+/// transcript just ends at its final assistant message).
+pub(crate) struct ClaudeTaskSubagentArtifacts {
+    pub(crate) transcript: PathBuf,
+    pub(crate) tool_use_id: String,
+    pub(crate) parent_transcript: Option<PathBuf>,
+}
+
 /// Resolve a synthetic `task-*` id to its `agent-<agentId>.jsonl`
-/// transcript: scan `projects/*/*/subagents/*.meta.json`, matching each
-/// sidecar's `toolUseId` through the SAME minting function the wrapper
-/// used, and return the first match whose sibling transcript exists. A
-/// relocated store can carry the parent dir under several project
-/// aliases (S0b Q1); the copies describe the same thread, so any match
-/// serves.
+/// transcript (see [`find_claude_task_subagent_artifacts`]).
 pub(crate) fn find_claude_task_subagent_transcript(
     home: &Path,
     session_id: &str,
 ) -> Option<PathBuf> {
+    find_claude_task_subagent_artifacts(home, session_id).map(|artifacts| artifacts.transcript)
+}
+
+/// Resolve a synthetic `task-*` id to its subagent-store artifacts: scan
+/// `projects/*/*/subagents/*.meta.json`, matching each sidecar's
+/// `toolUseId` through the SAME minting function the wrapper used, and
+/// return the first match whose sibling transcript exists. A relocated
+/// store can carry the parent dir under several project aliases (S0b Q1);
+/// the copies describe the same thread, so any match serves — but prefer
+/// an alias that also carries the parent transcript (the terminal-status
+/// source), falling back to the first transcript-only match so
+/// resolution never regresses to a miss.
+pub(crate) fn find_claude_task_subagent_artifacts(
+    home: &Path,
+    session_id: &str,
+) -> Option<ClaudeTaskSubagentArtifacts> {
     if !is_claude_task_child_id(session_id) {
         return None;
     }
     let projects = home.join(".claude").join("projects");
+    let mut transcript_only: Option<ClaudeTaskSubagentArtifacts> = None;
     for project in std::fs::read_dir(&projects).ok()?.flatten() {
         if !project.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
@@ -80,32 +104,262 @@ pub(crate) fn find_claude_task_subagent_transcript(
                 {
                     continue;
                 }
-                if !subagent_meta_matches_task_id(&meta_path, session_id) {
+                let Some(tool_use_id) = subagent_meta_task_tool_use_id(&meta_path, session_id)
+                else {
+                    continue;
+                };
+                let transcript = subagents.join(format!("{agent_stem}.jsonl"));
+                if !transcript.is_file() {
                     continue;
                 }
-                let transcript = subagents.join(format!("{agent_stem}.jsonl"));
-                if transcript.is_file() {
-                    return Some(transcript);
+                // The parent transcript is the child dir's sibling
+                // `<parent-uuid>.jsonl` in the same project alias.
+                let parent_transcript = child
+                    .path()
+                    .parent()
+                    .map(|dir| dir.join(format!("{}.jsonl", child.file_name().to_string_lossy())))
+                    .filter(|path| path.is_file());
+                let artifacts = ClaudeTaskSubagentArtifacts {
+                    transcript,
+                    tool_use_id,
+                    parent_transcript,
+                };
+                if artifacts.parent_transcript.is_some() {
+                    return Some(artifacts);
+                }
+                if transcript_only.is_none() {
+                    transcript_only = Some(artifacts);
                 }
             }
         }
     }
-    None
+    transcript_only
 }
 
-/// One sidecar read: does this meta's `toolUseId` mint the requested id?
-fn subagent_meta_matches_task_id(meta_path: &Path, session_id: &str) -> bool {
-    let Ok(contents) = std::fs::read_to_string(meta_path) else {
-        return false;
-    };
-    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&contents) else {
-        return false;
-    };
+/// One sidecar read: when this meta's `toolUseId` mints the requested id,
+/// return that `toolUseId` (the parent-transcript correlation key).
+fn subagent_meta_task_tool_use_id(meta_path: &Path, session_id: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(meta_path).ok()?;
+    let meta = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
     meta.get("toolUseId")
         .and_then(|value| value.as_str())
-        .is_some_and(|tool_use_id| {
+        .filter(|tool_use_id| {
             crate::external_agent::claude_code::task_tool_child_id(tool_use_id) == session_id
         })
+        .map(str::to_string)
+}
+
+// ---------------------------------------------------------------------
+// Completed-terminal synthesis
+//
+// The live "Task complete" LogEntry for a Task child is bus-only (never
+// persisted into any session log), and the subagent transcript carries
+// no terminal marker — so after a tab reload or daemon restart a
+// completed child rehydrated from this store read IDLE forever. Claude
+// Code itself DOES persist the completion: the parent transcript records
+// each `system:task_notification` as a `<task-notification>` XML block
+// (a `queue-operation` record plus the injected `user` delivery, both
+// carrying `<tool-use-id>` and `<status>`). Derive a synthetic terminal
+// row from that evidence so every hydration/replay lane serves the same
+// DONE the live window showed.
+// ---------------------------------------------------------------------
+
+/// `kind` marker of the synthesized completed-terminal row. The dashboard
+/// counts it as done-evidence during hydration and dedupes it against the
+/// live "Task complete" log line (which carries a different timestamp and
+/// event id, so signature dedupe never pairs them).
+pub(crate) const CLAUDE_TASK_TERMINAL_KIND: &str = "subagent_terminal";
+
+const TASK_NOTIFICATION_OPEN: &str = "<task-notification>";
+const TASK_NOTIFICATION_CLOSE: &str = "</task-notification>";
+
+/// One `<task-notification>` block's terminal facts as persisted in the
+/// parent transcript, stamped with the carrying record's timestamp.
+struct ClaudeTaskNotification {
+    status: String,
+    summary: Option<String>,
+    ts: Option<String>,
+    ts_ms: Option<i64>,
+}
+
+/// The LAST `<task-notification>` for this `tool_use_id` in the parent
+/// transcript ("the same task-id may notify more than once" — a resumed
+/// child re-notifies, so recency wins). One bounded pass: lines are only
+/// JSON-parsed when they contain the correlation needle, and only the
+/// two record shapes Claude Code writes the block into are accepted — an
+/// assistant message QUOTING the block must not count as evidence.
+fn last_claude_task_notification(
+    parent_transcript: &Path,
+    tool_use_id: &str,
+) -> Option<ClaudeTaskNotification> {
+    use std::io::BufRead as _;
+    let needle = format!("<tool-use-id>{tool_use_id}</tool-use-id>");
+    let file = std::fs::File::open(parent_transcript).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut last = None;
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        if !line.contains(&needle) {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let text = match record.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "queue-operation" => record
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            "user" => claude_user_record_text(&record),
+            _ => None,
+        };
+        let Some(text) = text else {
+            continue;
+        };
+        let Some((status, summary)) = task_notification_facts(&text, &needle) else {
+            continue;
+        };
+        let ts = record
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let ts_ms = ts
+            .as_deref()
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.timestamp_millis());
+        last = Some(ClaudeTaskNotification {
+            status,
+            summary,
+            ts,
+            ts_ms,
+        });
+    }
+    last
+}
+
+/// A `user` record's textual content: the injected notification delivery
+/// uses a plain string, but tolerate the block form too.
+fn claude_user_record_text(record: &serde_json::Value) -> Option<String> {
+    let content = record.get("message")?.get("content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    let blocks = content.as_array()?;
+    let mut text = String::new();
+    for block in blocks {
+        if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+            if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                text.push_str(t);
+                text.push('\n');
+            }
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+/// `<status>` / `<summary>` from the notification block that contains
+/// `needle`, tolerating unrelated blocks on the same record.
+fn task_notification_facts(text: &str, needle: &str) -> Option<(String, Option<String>)> {
+    let needle_at = text.find(needle)?;
+    let block_start = text[..needle_at].rfind(TASK_NOTIFICATION_OPEN)?;
+    let block_end = text[needle_at..]
+        .find(TASK_NOTIFICATION_CLOSE)
+        .map(|offset| needle_at + offset)
+        .unwrap_or(text.len());
+    let block = &text[block_start..block_end];
+    let status = xml_tag_text(block, "status")?;
+    let summary = xml_tag_text(block, "summary");
+    Some((status, summary))
+}
+
+fn xml_tag_text(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = block.find(&open)? + open.len();
+    let end = block[start..].find(&close)? + start;
+    let text = block[start..end].trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// One-line, bounded summary — the same shaping the live emit applies
+/// (`claude_code::task_summary_snippet`), so hydrated rows read like the
+/// live "Task complete" line byte-for-byte.
+fn task_terminal_summary_snippet(text: &str) -> Option<String> {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() > 240 {
+        Some(format!(
+            "{}…",
+            trimmed.chars().take(240).collect::<String>()
+        ))
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// The synthesized completed-terminal row for a Task child, or None when
+/// the durable evidence doesn't support one:
+///
+/// - no parent transcript at the resolved alias (conservative miss);
+/// - the last notification is not a completion — errored / stopped
+///   children keep today's behavior (their live path already emits a
+///   persisted `SessionEnded`); only completion is starved of durable
+///   evidence;
+/// - the subagent transcript has rows NEWER than the notification (a
+///   resumed child) — completion evidence older than the transcript tail
+///   is stale, and the resumed run's own terminal will re-derive.
+pub(crate) fn claude_task_terminal_entry(
+    artifacts: &ClaudeTaskSubagentArtifacts,
+    entries: &[serde_json::Value],
+) -> Option<serde_json::Value> {
+    let parent = artifacts.parent_transcript.as_deref()?;
+    let notification = last_claude_task_notification(parent, &artifacts.tool_use_id)?;
+    // The wire statuses the live path folds into "completed"
+    // (claude_code::handle_task_notification).
+    if !matches!(notification.status.as_str(), "completed" | "success") {
+        return None;
+    }
+    if let (Some(terminal_ms), Some(last_ms)) = (notification.ts_ms, last_entry_ts_ms(entries)) {
+        if terminal_ms < last_ms {
+            return None;
+        }
+    }
+    // Live grammar: `emit_external_subagent_state`'s completed arm with
+    // the backend source as the label.
+    let label = crate::external_agent::AgentBackend::ClaudeCode.to_string();
+    let content = match notification
+        .summary
+        .as_deref()
+        .and_then(task_terminal_summary_snippet)
+    {
+        Some(summary) => format!("Task complete: {label} subagent completed: {summary}"),
+        None => format!("Task complete: {label} subagent completed"),
+    };
+    let mut entry = serde_json::json!({
+        "level": "info",
+        "source": label,
+        "kind": CLAUDE_TASK_TERMINAL_KIND,
+        "content": content,
+    });
+    if let Some(ts) = notification.ts {
+        entry["ts"] = serde_json::Value::String(ts);
+    }
+    if let Some(ts_ms) = notification.ts_ms {
+        entry["ts_ms"] = serde_json::Value::from(ts_ms);
+    }
+    Some(entry)
+}
+
+fn last_entry_ts_ms(entries: &[serde_json::Value]) -> Option<i64> {
+    entries
+        .iter()
+        .rev()
+        .find_map(|entry| entry.get("ts_ms").and_then(|v| v.as_i64()))
 }
 
 #[cfg(test)]
@@ -345,5 +599,437 @@ mod tests {
             ),
             None
         );
+    }
+
+    // ---- Completed-terminal synthesis ----
+
+    /// The block Claude Code persists into the parent transcript for a
+    /// `system:task_notification` (fields in observed live order; the
+    /// multi-line `<result>` proves summary extraction doesn't bleed).
+    fn notification_block(tool_use_id: &str, status: &str, summary: &str) -> String {
+        format!(
+            "<task-notification>\n<task-id>a0343c7095a040965</task-id>\n\
+             <tool-use-id>{tool_use_id}</tool-use-id>\n\
+             <output-file>/tmp/tasks/a0343c7095a040965.output</output-file>\n\
+             <status>{status}</status>\n<summary>{summary}</summary>\n\
+             <note>A task-notification fires each time this agent stops.</note>\n\
+             <result>Full report:\n\n## Details\n\nline two</result>\n\
+             </task-notification>"
+        )
+    }
+
+    /// Append the two record shapes a real notification lands as — the
+    /// `queue-operation` copy and the injected `user` delivery — to the
+    /// parent transcript in the given project alias.
+    fn append_parent_notification(
+        home: &Path,
+        project: &str,
+        parent: &str,
+        tool_use_id: &str,
+        status: &str,
+        summary: &str,
+        ts: &str,
+    ) {
+        let block = notification_block(tool_use_id, status, summary);
+        let path = home
+            .join(".claude")
+            .join("projects")
+            .join(project)
+            .join(format!("{parent}.jsonl"));
+        let mut body = std::fs::read_to_string(&path).unwrap_or_default();
+        body.push_str(
+            &serde_json::json!({
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "timestamp": ts,
+                "sessionId": parent,
+                "content": block,
+            })
+            .to_string(),
+        );
+        body.push('\n');
+        body.push_str(
+            &serde_json::json!({
+                "parentUuid": "u-parent",
+                "isSidechain": false,
+                "type": "user",
+                "message": { "role": "user", "content": block },
+                "timestamp": ts,
+                "sessionId": parent,
+            })
+            .to_string(),
+        );
+        body.push('\n');
+        std::fs::write(&path, body).unwrap();
+    }
+
+    const COMPLETED_ROW: &str =
+        "Task complete: Claude Code subagent completed: Agent \"turn alignment\" finished";
+
+    #[test]
+    fn completed_notification_serves_synthetic_terminal_row() {
+        let home = tempfile::tempdir().unwrap();
+        write_subagent(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            "a0343c7095a040965",
+            TOOL_USE_ID,
+            &fixture_lines(),
+        );
+        append_parent_notification(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            TOOL_USE_ID,
+            "completed",
+            "Agent \"turn alignment\" finished",
+            "2026-07-17T10:00:30.000Z",
+        );
+        let entries = external_session_entries_from_home(home.path(), "claude-code", TASK_ID)
+            .expect("task child entries");
+        // Exactly ONE terminal row, even though the parent carries the
+        // block twice (queue-operation + user delivery).
+        let terminals: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                entry.get("kind").and_then(|v| v.as_str()) == Some(CLAUDE_TASK_TERMINAL_KIND)
+            })
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        let terminal = entries.last().expect("entries end with the terminal row");
+        assert_eq!(
+            terminal.get("kind").and_then(|v| v.as_str()),
+            Some(CLAUDE_TASK_TERMINAL_KIND)
+        );
+        assert_eq!(
+            terminal.get("content").and_then(|v| v.as_str()),
+            Some(COMPLETED_ROW)
+        );
+        assert_eq!(terminal.get("level").and_then(|v| v.as_str()), Some("info"));
+        assert_eq!(
+            terminal.get("source").and_then(|v| v.as_str()),
+            Some("Claude Code")
+        );
+        // Annotated like every served entry: stable id, delivery, ts.
+        assert!(terminal
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| !id.is_empty()));
+        assert_eq!(
+            terminal.get("ts").and_then(|v| v.as_str()),
+            Some("2026-07-17T10:00:30.000Z")
+        );
+        assert!(terminal.get("ts_ms").and_then(|v| v.as_i64()).is_some());
+
+        // The detail page (the hydration fetch) serves the same row.
+        let body = external_session_detail_from_home_with_page(
+            home.path(),
+            "claude-code",
+            TASK_ID,
+            None,
+            None,
+        )
+        .expect("detail body");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let detail_entries = value.get("entries").and_then(|v| v.as_array()).unwrap();
+        let last = detail_entries.last().expect("detail entries");
+        assert_eq!(
+            last.get("content").and_then(|v| v.as_str()),
+            Some(COMPLETED_ROW)
+        );
+        assert_eq!(
+            last.get("kind").and_then(|v| v.as_str()),
+            Some(CLAUDE_TASK_TERMINAL_KIND)
+        );
+    }
+
+    #[test]
+    fn non_completed_notifications_add_no_terminal_row() {
+        // Errored / stopped children keep today's behavior: no synthetic
+        // row (their live path already persists a SessionEnded).
+        for status in ["failed", "stopped", "killed"] {
+            let home = tempfile::tempdir().unwrap();
+            write_subagent(
+                home.path(),
+                "-repo-project",
+                PARENT,
+                "a0343c7095a040965",
+                TOOL_USE_ID,
+                &fixture_lines(),
+            );
+            append_parent_notification(
+                home.path(),
+                "-repo-project",
+                PARENT,
+                TOOL_USE_ID,
+                status,
+                "Agent \"turn alignment\" ended",
+                "2026-07-17T10:00:30.000Z",
+            );
+            let entries = external_session_entries_from_home(home.path(), "claude-code", TASK_ID)
+                .expect("task child entries");
+            assert_eq!(entries.len(), 2, "status {status} must not add a row");
+            assert_eq!(
+                entries[1].get("content").and_then(|v| v.as_str()),
+                Some("Starting on the alignment.")
+            );
+        }
+    }
+
+    #[test]
+    fn last_notification_wins_across_reruns() {
+        // failed then completed (a resumed child finishing cleanly):
+        // recency wins, the terminal row appears.
+        let home = tempfile::tempdir().unwrap();
+        write_subagent(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            "a0343c7095a040965",
+            TOOL_USE_ID,
+            &fixture_lines(),
+        );
+        append_parent_notification(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            TOOL_USE_ID,
+            "failed",
+            "boom",
+            "2026-07-17T10:00:30.000Z",
+        );
+        append_parent_notification(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            TOOL_USE_ID,
+            "completed",
+            "second run done",
+            "2026-07-17T10:05:00.000Z",
+        );
+        let entries = external_session_entries_from_home(home.path(), "claude-code", TASK_ID)
+            .expect("task child entries");
+        assert_eq!(
+            entries
+                .last()
+                .and_then(|e| e.get("content"))
+                .and_then(|v| v.as_str()),
+            Some("Task complete: Claude Code subagent completed: second run done")
+        );
+
+        // completed then failed: the stale completion must NOT resurface.
+        let home = tempfile::tempdir().unwrap();
+        write_subagent(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            "a0343c7095a040965",
+            TOOL_USE_ID,
+            &fixture_lines(),
+        );
+        append_parent_notification(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            TOOL_USE_ID,
+            "completed",
+            "first run done",
+            "2026-07-17T10:00:30.000Z",
+        );
+        append_parent_notification(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            TOOL_USE_ID,
+            "failed",
+            "rerun boom",
+            "2026-07-17T10:05:00.000Z",
+        );
+        let entries = external_session_entries_from_home(home.path(), "claude-code", TASK_ID)
+            .expect("task child entries");
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn transcript_rows_newer_than_notification_suppress_stale_terminal() {
+        // A resumed child streams rows after the old completion — the
+        // stale evidence must not paint the live-again child as done.
+        let home = tempfile::tempdir().unwrap();
+        let mut lines = fixture_lines();
+        lines.push(sidechain_line(
+            "assistant",
+            "a-2",
+            "2026-07-17T10:10:00.000Z",
+            serde_json::json!([{ "type": "text", "text": "Resumed and working again." }]),
+        ));
+        write_subagent(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            "a0343c7095a040965",
+            TOOL_USE_ID,
+            &lines,
+        );
+        append_parent_notification(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            TOOL_USE_ID,
+            "completed",
+            "Agent \"turn alignment\" finished",
+            "2026-07-17T10:00:30.000Z",
+        );
+        let entries = external_session_entries_from_home(home.path(), "claude-code", TASK_ID)
+            .expect("task child entries");
+        assert!(!entries.iter().any(|entry| {
+            entry.get("kind").and_then(|v| v.as_str()) == Some(CLAUDE_TASK_TERMINAL_KIND)
+        }));
+    }
+
+    #[test]
+    fn quoted_notification_in_assistant_row_is_not_evidence() {
+        // The parent model quoting the block in an assistant message must
+        // not count — only the queue-operation / user record shapes do.
+        let home = tempfile::tempdir().unwrap();
+        write_subagent(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            "a0343c7095a040965",
+            TOOL_USE_ID,
+            &fixture_lines(),
+        );
+        let block = notification_block(TOOL_USE_ID, "completed", "quoted");
+        let path = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-repo-project")
+            .join(format!("{PARENT}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": { "role": "assistant",
+                        "content": [{ "type": "text", "text": block }] },
+                    "timestamp": "2026-07-17T10:00:30.000Z",
+                    "sessionId": PARENT,
+                })
+            ),
+        )
+        .unwrap();
+        let entries = external_session_entries_from_home(home.path(), "claude-code", TASK_ID)
+            .expect("task child entries");
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn late_notification_upgrades_cached_no_terminal_entries() {
+        // The completion lands in the PARENT file after the subagent's
+        // last write: a parse cached in that gap must not pin IDLE
+        // forever. No-terminal cache hits re-derive; terminal entries
+        // are final and re-serve the same Arc.
+        let home = tempfile::tempdir().unwrap();
+        write_subagent(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            "a0343c7095a040965",
+            TOOL_USE_ID,
+            &fixture_lines(),
+        );
+        // Parent transcript exists (so the artifacts resolve with it) but
+        // carries no notification yet.
+        let parent_path = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-repo-project")
+            .join(format!("{PARENT}.jsonl"));
+        std::fs::write(&parent_path, "").unwrap();
+
+        let first = external_session_entries_from_home_arc(home.path(), "claude-code", TASK_ID)
+            .expect("pre-notification entries");
+        assert_eq!(first.len(), 2);
+
+        append_parent_notification(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            TOOL_USE_ID,
+            "completed",
+            "Agent \"turn alignment\" finished",
+            "2026-07-17T10:00:30.000Z",
+        );
+        // The subagent transcript is untouched — only the parent grew.
+        let second = external_session_entries_from_home_arc(home.path(), "claude-code", TASK_ID)
+            .expect("post-notification entries");
+        assert_eq!(second.len(), 3);
+        assert_eq!(
+            second
+                .last()
+                .and_then(|e| e.get("content"))
+                .and_then(|v| v.as_str()),
+            Some(COMPLETED_ROW)
+        );
+        // Terminal entries are final: later parent growth (the thread
+        // moving on) neither drops the row nor doubles it, whether the
+        // request is served from the cache or re-derived.
+        let mut body = std::fs::read_to_string(&parent_path).unwrap();
+        body.push_str("{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"parent moved on\"}]},\"timestamp\":\"2026-07-17T11:00:00.000Z\"}\n");
+        std::fs::write(&parent_path, body).unwrap();
+        let third = external_session_entries_from_home_arc(home.path(), "claude-code", TASK_ID)
+            .expect("entries after parent growth");
+        let terminals = third
+            .iter()
+            .filter(|entry| {
+                entry.get("kind").and_then(|v| v.as_str()) == Some(CLAUDE_TASK_TERMINAL_KIND)
+            })
+            .count();
+        assert_eq!(terminals, 1);
+    }
+
+    /// The dashboard fragment carries the one unavoidable mirror of the
+    /// terminal-row contract (the merge-dedupe guard's kind check and the
+    /// phase derivation's content prefix); pin both to the Rust source so
+    /// a rename here fails the suite instead of shipping as drift.
+    #[test]
+    fn terminal_row_contract_is_pinned_in_dashboard_fragment() {
+        let fragment = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("static/app/39-session-windows.js"),
+        )
+        .expect("dashboard fragment 39-session-windows.js");
+        assert!(
+            fragment.contains(&format!("'{CLAUDE_TASK_TERMINAL_KIND}'")),
+            "the merge guard must key on kind '{CLAUDE_TASK_TERMINAL_KIND}'"
+        );
+        assert!(
+            fragment.contains("startsWith('Task complete:')"),
+            "the restored-phase derivation must key on the 'Task complete:' prefix"
+        );
+    }
+
+    #[test]
+    fn missing_parent_transcript_serves_entries_without_terminal() {
+        let home = tempfile::tempdir().unwrap();
+        write_subagent(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            "a0343c7095a040965",
+            TOOL_USE_ID,
+            &fixture_lines(),
+        );
+        let artifacts = find_claude_task_subagent_artifacts(home.path(), TASK_ID)
+            .expect("artifacts resolve without a parent transcript");
+        assert_eq!(artifacts.tool_use_id, TOOL_USE_ID);
+        assert!(artifacts.parent_transcript.is_none());
+        let entries = external_session_entries_from_home(home.path(), "claude-code", TASK_ID)
+            .expect("task child entries");
+        assert_eq!(entries.len(), 2);
     }
 }
