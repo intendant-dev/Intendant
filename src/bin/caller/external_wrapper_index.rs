@@ -629,14 +629,14 @@ fn repair_active_selection(wrappers: &mut [ExternalWrapperRecord]) -> usize {
         if record.state != WrapperState::Active {
             continue;
         }
-        let key = (
-            record.source.as_str(),
-            record.intendant_session_id.as_str(),
-        );
+        let key = (record.source.as_str(), record.intendant_session_id.as_str());
         let replace = match best_by_wrapper.get(&key) {
             Some(&current) => {
                 (activity[i], record.backend_session_id.as_str())
-                    > (activity[current], wrappers[current].backend_session_id.as_str())
+                    > (
+                        activity[current],
+                        wrappers[current].backend_session_id.as_str(),
+                    )
             }
             None => true,
         };
@@ -1307,8 +1307,24 @@ mod tests {
         std::fs::create_dir_all(&new_dir).unwrap();
         let backend_id = "019ea8b9-0000-7000-8000-00000000ee01";
 
-        upsert(home.path(), "codex", backend_id, old_wrapper, &old_dir, None).unwrap();
-        upsert(home.path(), "codex", backend_id, new_wrapper, &new_dir, None).unwrap();
+        upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            old_wrapper,
+            &old_dir,
+            None,
+        )
+        .unwrap();
+        upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            new_wrapper,
+            &new_dir,
+            None,
+        )
+        .unwrap();
         let bytes_before = std::fs::read(index_path(home.path())).unwrap();
 
         // Worst-case order first (stale row visited last), then the other.
@@ -1433,8 +1449,24 @@ mod tests {
         std::fs::create_dir_all(&old_dir).unwrap();
         std::fs::create_dir_all(&new_dir).unwrap();
         let backend_id = "019ea8b9-0000-7000-8000-00000000ee21";
-        upsert(home.path(), "codex", backend_id, old_wrapper, &old_dir, None).unwrap();
-        upsert(home.path(), "codex", backend_id, new_wrapper, &new_dir, None).unwrap();
+        upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            old_wrapper,
+            &old_dir,
+            None,
+        )
+        .unwrap();
+        upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            new_wrapper,
+            &new_dir,
+            None,
+        )
+        .unwrap();
 
         let path = index_path(home.path());
         let bytes = std::fs::read(&path).unwrap();
@@ -1442,8 +1474,24 @@ mod tests {
         // Active row with an unchanged activity mtime, then a superseded
         // row whose sentinel deliberately differs from the dir's live
         // mtime: neither is dirty.
-        backfill(home.path(), "codex", backend_id, new_wrapper, &new_dir, None).unwrap();
-        backfill(home.path(), "codex", backend_id, old_wrapper, &old_dir, None).unwrap();
+        backfill(
+            home.path(),
+            "codex",
+            backend_id,
+            new_wrapper,
+            &new_dir,
+            None,
+        )
+        .unwrap();
+        backfill(
+            home.path(),
+            "codex",
+            backend_id,
+            old_wrapper,
+            &old_dir,
+            None,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),
