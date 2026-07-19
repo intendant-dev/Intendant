@@ -1595,13 +1595,18 @@ impl SessionLog {
     /// the conversation's concern, not the record's. `ref_seq` marks a
     /// projection: the text entered the conversation inside another entry
     /// (the native-tool askHuman answer rides a tool result) whose seq it
-    /// references for rewind-cut semantics.
+    /// references for rewind-cut semantics. `attachments` carries the
+    /// renderable upload-store refs delivered WITH this message (native
+    /// parity with the external lane's `[user]` rows — same array shape as
+    /// `user_message`); the field is omitted when empty, so rows without
+    /// attachments keep the exact pre-field line shape.
     pub fn conversation_message_user(
         &mut self,
         seq: u64,
         provenance: crate::conversation::MessageProvenance,
         text: &str,
         ref_seq: Option<u64>,
+        attachments: &[crate::types::SessionNoteAttachment],
     ) -> String {
         let message_id = Uuid::new_v4().to_string();
         let mut data = serde_json::json!({
@@ -1613,6 +1618,11 @@ impl SessionLog {
         });
         if let Some(ref_seq) = ref_seq {
             data["ref_seq"] = serde_json::Value::from(ref_seq);
+        }
+        if !attachments.is_empty() {
+            if let Ok(refs) = serde_json::to_value(attachments) {
+                data["attachments"] = refs;
+            }
         }
         let preview: String = text.chars().take(200).collect();
         self.emit(LogEvent {
