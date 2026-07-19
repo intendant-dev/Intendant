@@ -422,45 +422,49 @@ impl GitVitalsProber {
         let mut merge_parity = String::new();
         let mut primary_unpushed = None;
         if let Some((primary_branch, resolved_ref)) = self.primary_for(toplevel).await {
-            primary_ref = resolved_ref;
-            match self.ahead_behind(toplevel, &primary_ref).await {
+            match self.ahead_behind(toplevel, &resolved_ref).await {
                 Some((a, b)) => {
                     ahead = a;
                     behind = b;
+                    primary_ref = resolved_ref;
+
+                    merge_parity = if (ahead > 0) != (behind > 0) {
+                        // Fast-forward in one direction: trivially clean.
+                        "clean".to_string()
+                    } else if ahead > 0 && behind > 0 && merge_tree_supported() {
+                        match facts.head_oid.as_deref() {
+                            Some(head_oid) => self
+                                .merge_parity(toplevel, &primary_ref, head_oid)
+                                .await
+                                .unwrap_or_default(),
+                            None => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    if facts.branch != primary_branch {
+                        // No `rev-parse --verify` gate on `@{upstream}`
+                        // first: the `rev-list --count` fails to `None`
+                        // identically when the upstream doesn't resolve, so
+                        // the verify subprocess added no information.
+                        let primary_upstream = format!("{primary_branch}@{{upstream}}");
+                        primary_unpushed = self
+                            .git_count(toplevel, &format!("{primary_upstream}..{primary_branch}"))
+                            .await;
+                    }
                 }
                 // The cached primary stopped resolving (remote-tracking
-                // ref pruned, branch deleted): degrade to 0/0 for this
-                // tick — the old chain's per-call `unwrap_or(0)` — and
-                // drop the cache entry so the next tick rediscovers.
+                // ref pruned, branch deleted): drop the cache entry so the
+                // next tick rediscovers, and state NO primary-relative
+                // claims this tick — `primary_ref` stays empty, so the
+                // frontend shows its quiet "no primary to compare with"
+                // state. The old degrade-to-0/0 read as an affirmative
+                // "in sync with the primary", which a failed probe must
+                // never claim (fail open, not fail affirming).
                 None => {
                     self.primary_cache.remove(toplevel);
                 }
-            }
-
-            merge_parity = if (ahead > 0) != (behind > 0) {
-                // Fast-forward in one direction: trivially clean.
-                "clean".to_string()
-            } else if ahead > 0 && behind > 0 && merge_tree_supported() {
-                match facts.head_oid.as_deref() {
-                    Some(head_oid) => self
-                        .merge_parity(toplevel, &primary_ref, head_oid)
-                        .await
-                        .unwrap_or_default(),
-                    None => String::new(),
-                }
-            } else {
-                String::new()
-            };
-
-            if facts.branch != primary_branch {
-                // No `rev-parse --verify` gate on `@{upstream}` first: the
-                // `rev-list --count` fails to `None` identically when the
-                // upstream doesn't resolve, so the verify subprocess added
-                // no information.
-                let primary_upstream = format!("{primary_branch}@{{upstream}}");
-                primary_unpushed = self
-                    .git_count(toplevel, &format!("{primary_upstream}..{primary_branch}"))
-                    .await;
             }
         }
 
@@ -473,6 +477,10 @@ impl GitVitalsProber {
             merge_parity,
             unpushed,
             primary_unpushed,
+            checkout: toplevel
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         })
     }
 
@@ -969,6 +977,27 @@ impl GitTarget {
             }
         }
     }
+
+    /// Seed the locus from a FIRST-HAND statement of the session's working
+    /// directory — a resumed transcript's recorded cwd, the backend's own
+    /// init echo. Unlike [`Self::observe_write_activity`] this is not a
+    /// heuristic over tool traffic, so it applies immediately: no
+    /// sightings threshold, and a statement matching the registered root's
+    /// checkout clears any override the same way. A cwd outside any git
+    /// checkout says nothing about where to probe and changes nothing
+    /// (the registered root remains the fallback identity).
+    fn seed_locus(&mut self, cwd: &Path) {
+        let Some(checkout) = resolve_git_checkout_root(cwd) else {
+            return;
+        };
+        let home_checkout = resolve_git_checkout_root(&self.registered_root);
+        self.candidate = None;
+        self.active_locus = if Some(&checkout) == home_checkout.as_ref() {
+            None
+        } else {
+            Some(checkout)
+        };
+    }
 }
 
 /// Live registry of (session id → working dir) git-probe targets. The
@@ -1041,7 +1070,7 @@ impl GitVitalsTargets {
 
     /// Effective probe targets: the activity locus where one is active,
     /// the registered root otherwise.
-    fn snapshot(&self) -> Vec<(String, PathBuf)> {
+    pub(crate) fn snapshot(&self) -> Vec<(String, PathBuf)> {
         self.targets
             .lock()
             .expect("git vitals targets lock")
@@ -1056,6 +1085,19 @@ impl GitVitalsTargets {
         let mut targets = self.targets.lock().expect("git vitals targets lock");
         if let Some(target) = targets.get_mut(session_id.trim()) {
             target.observe_write_activity(paths);
+        }
+    }
+
+    /// Seed a session's activity locus from a first-hand working-directory
+    /// statement (see [`GitTarget::seed_locus`]) — the launch/resume path
+    /// calls this right after [`Self::register`] so the FIRST probe tick
+    /// already measures the checkout the backend actually works in, and
+    /// the backend's own cwd echo re-seeds it live. No-op for
+    /// unregistered ids.
+    pub(crate) fn seed_locus(&self, session_id: &str, cwd: &Path) {
+        let mut targets = self.targets.lock().expect("git vitals targets lock");
+        if let Some(target) = targets.get_mut(session_id.trim()) {
+            target.seed_locus(cwd);
         }
     }
 
@@ -1234,6 +1276,10 @@ pub(crate) fn spawn_session_vitals_producer(
 /// - `SessionFileActivity` folds a session's structured write paths into
 ///   its activity-locus state, retargeting the probe when the work moved
 ///   into a different checkout (see [`GitTarget::observe_write_activity`]).
+/// - `SessionCwdAnnounced` seeds the locus from the backend's own
+///   working-directory statement (Claude Code's `system:init` echo, Codex
+///   applied thread settings) — authoritative, so it retargets
+///   immediately (see [`GitTarget::seed_locus`]).
 ///
 /// Resolution runs through the hub's alias map both ways: resume lanes
 /// register the live (backend-native) id while events may carry the
@@ -1264,6 +1310,17 @@ fn spawn_git_target_maintainer(
                     for (id, _) in registry.snapshot() {
                         if hub.resolve(&id) == canonical {
                             registry.observe_write_activity(&id, &paths);
+                        }
+                    }
+                }
+                Ok(AppEvent::SessionCwdAnnounced {
+                    session_id: Some(session_id),
+                    cwd,
+                }) => {
+                    let canonical = hub.resolve(&session_id);
+                    for (id, _) in registry.snapshot() {
+                        if hub.resolve(&id) == canonical {
+                            registry.seed_locus(&id, Path::new(&cwd));
                         }
                     }
                 }
@@ -1445,6 +1502,10 @@ mod tests {
         assert_eq!((vitals.ahead, vitals.behind), (0, 0));
         assert_eq!(vitals.merge_parity, "");
         assert_eq!(vitals.primary_unpushed, None, "on the primary itself");
+        assert_eq!(
+            vitals.checkout, "work",
+            "vitals name the probed checkout's toplevel basename"
+        );
 
         // A local commit: ahead of the upstream (unpushed) and of the
         // remote primary (ahead) by the same one commit.
@@ -1474,6 +1535,47 @@ mod tests {
         let vitals = prober.probe(&work).await.expect("repo probes");
         assert_eq!(vitals.branch, "HEAD");
         assert_eq!(vitals.unpushed, None);
+    }
+
+    #[tokio::test]
+    async fn probe_fails_open_when_the_cached_primary_stops_resolving() {
+        // A cached primary whose comparison ref no longer resolves
+        // (remote-tracking ref pruned, branch deleted) must not degrade to
+        // an affirmative `+0/−0` against a dead ref: the tick states NO
+        // primary-relative claims (empty primary_ref → the frontend's
+        // quiet "no primary" state) and drops the cache entry so the next
+        // tick rediscovers honestly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work = repo_with_origin(dir.path());
+
+        let mut prober = GitVitalsProber::default();
+        let toplevel = prober.toplevel_for(&work).await.expect("toplevel");
+        prober.primary_cache.insert(
+            toplevel.clone(),
+            ("main".to_string(), "origin/pruned-away".to_string()),
+        );
+
+        let vitals = prober.probe(&work).await.expect("repo still probes");
+        assert_eq!(
+            vitals.primary_ref, "",
+            "no affirmative divergence against a dead comparison ref"
+        );
+        assert_eq!((vitals.ahead, vitals.behind), (0, 0));
+        assert_eq!(vitals.merge_parity, "");
+        assert_eq!(
+            vitals.primary_unpushed, None,
+            "primary-relative counts stay silent on the failed tick"
+        );
+        assert_eq!(vitals.branch, "main", "checkout-local facts still report");
+        assert!(
+            !prober.primary_cache.contains_key(&toplevel),
+            "the dead primary entry is dropped for rediscovery"
+        );
+
+        // The next tick rediscovers the real primary and the divergence
+        // claims return.
+        let vitals = prober.probe(&work).await.expect("repo probes");
+        assert_eq!(vitals.primary_ref, "origin/main");
     }
 
     #[tokio::test]
@@ -1572,11 +1674,13 @@ mod tests {
         assert_eq!(prober.primary_cache.len(), 1, "discovery cached");
 
         // The remote-tracking ref vanishes (remote pruned): the cached
-        // primary stops resolving. The failing tick degrades to 0/0 —
-        // the old chain's unwrap_or(0) — and invalidates the entry...
+        // primary stops resolving. The failing tick states NO
+        // primary-relative claims (fail open — an affirmative +0/−0
+        // against a dead ref would read as "in sync") and invalidates
+        // the entry...
         git_cmd(&work, &["update-ref", "-d", "refs/remotes/origin/main"]);
         let vitals = prober.probe(&work).await.expect("repo probes");
-        assert_eq!(vitals.primary_ref, "origin/main", "stale name for one tick");
+        assert_eq!(vitals.primary_ref, "", "no stale claim on the failed tick");
         assert_eq!((vitals.ahead, vitals.behind), (0, 0));
         assert!(
             prober.primary_cache.is_empty(),
@@ -2167,6 +2271,52 @@ mod tests {
         assert_eq!(targets.demote_locus("nope", &worktree), None);
     }
 
+    #[test]
+    fn seed_locus_is_immediate_and_authoritative() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let worktree = repo.join(".claude/worktrees/wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
+
+        let targets = GitVitalsTargets::default();
+        targets.register("s1", repo.clone());
+        let effective = |targets: &GitVitalsTargets| targets.snapshot()[0].1.clone();
+
+        // One first-hand statement retargets immediately — no sightings
+        // threshold (the launch/resume seed and the backend's own cwd
+        // echo are statements, not write-path heuristics).
+        targets.seed_locus("s1", &worktree.join("src"));
+        assert_eq!(effective(&targets), worktree, "one seed switches");
+
+        // A cwd outside any checkout says nothing — the locus stands.
+        let outside = temp.path().join("no-repo/deep");
+        std::fs::create_dir_all(&outside).unwrap();
+        targets.seed_locus("s1", &outside);
+        assert_eq!(effective(&targets), worktree, "checkout-less seed is inert");
+
+        // A seed pending write-activity candidate is superseded: the
+        // statement wins and clears it (repo sighting below starts over).
+        targets.observe_write_activity("s1", &[repo.join("x.rs").to_string_lossy().into_owned()]);
+        targets.seed_locus("s1", &worktree);
+        targets.observe_write_activity("s1", &[repo.join("x.rs").to_string_lossy().into_owned()]);
+        assert_eq!(
+            effective(&targets),
+            worktree,
+            "seed cleared the stale candidate — one sighting cannot switch"
+        );
+
+        // A statement matching the registered root's checkout clears the
+        // override the same way (immediately).
+        targets.seed_locus("s1", &repo.join("src"));
+        assert_eq!(effective(&targets), repo, "home statement clears the locus");
+
+        // Unregistered ids are a calm no-op.
+        targets.seed_locus("nope", &worktree);
+        assert_eq!(targets.snapshot().len(), 1);
+    }
+
     /// Seed one restored-session record (`session_meta.json`) under
     /// `<home>/.intendant/logs/<id>/`, the store layout the boot scan
     /// walks. Returns the meta path (tests stagger its mtime).
@@ -2446,6 +2596,88 @@ mod tests {
         tokio::time::timeout(deadline, wait_for_branch(&mut rx, "main"))
             .await
             .expect("dead locus falls back to the registered root");
+    }
+
+    #[tokio::test]
+    async fn announced_cwd_retargets_the_probe_immediately() {
+        // End-to-end through the producer: the backend STATES its working
+        // directory (`AppEvent::SessionCwdAnnounced` — a system:init echo
+        // or the registration-time transcript seed re-announced) and the
+        // git chip must measure that checkout from the next tick — ONE
+        // event, no write-activity sightings, and the emitted vitals name
+        // the checkout they were measured at.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        git_cmd(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git_cmd(root, &["add", "."]);
+        git_cmd(root, &["commit", "-qm", "base"]);
+        let worktree = root.join(".claude/worktrees/session-fork");
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        git_cmd(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worktree-announced",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        targets.register("s-announce", root.to_path_buf());
+
+        let deadline = std::time::Duration::from_secs(20);
+        async fn wait_for_branch(
+            rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+            want_branch: &str,
+            want_checkout: &str,
+        ) {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    assert_eq!(session_id, "s-announce");
+                    if let Some(git) = vitals.git.as_ref() {
+                        if git.branch == want_branch {
+                            assert_eq!(
+                                git.checkout, want_checkout,
+                                "vitals must name the measured checkout"
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        // The registered root probes first (its checkout basename is the
+        // tempdir's name).
+        let root_name = root.file_name().unwrap().to_string_lossy().into_owned();
+        tokio::time::timeout(deadline, wait_for_branch(&mut rx, "main", &root_name))
+            .await
+            .expect("registered root probes before any announcement");
+
+        // ONE first-hand statement — no hysteresis.
+        bus.send(AppEvent::SessionCwdAnnounced {
+            session_id: Some("s-announce".into()),
+            cwd: worktree.to_string_lossy().into_owned(),
+        });
+        tokio::time::timeout(
+            deadline,
+            wait_for_branch(&mut rx, "worktree-announced", "session-fork"),
+        )
+        .await
+        .expect("one announced cwd retargets the probe");
+
+        // Announcing the registered root clears the override immediately.
+        bus.send(AppEvent::SessionCwdAnnounced {
+            session_id: Some("s-announce".into()),
+            cwd: root.to_string_lossy().into_owned(),
+        });
+        tokio::time::timeout(deadline, wait_for_branch(&mut rx, "main", &root_name))
+            .await
+            .expect("announcing the home checkout switches back");
     }
 
     #[tokio::test]

@@ -1010,8 +1010,8 @@ pub fn spawn_event_listener(
                     | AppEvent::ConversationRolledBack { .. } => {
                         // Broadcast-only — handled by outbound event converter.
                     }
-                    AppEvent::SessionFileActivity { .. } => {
-                        // Internal git-vitals activity-locus signal — no
+                    AppEvent::SessionFileActivity { .. } | AppEvent::SessionCwdAnnounced { .. } => {
+                        // Internal git-vitals activity-locus signals — no
                         // MCP surface.
                     }
                     AppEvent::DisplayCaptureLost {
