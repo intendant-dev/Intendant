@@ -100,6 +100,46 @@ function summarizeRtcStats(stats, prev) {
   return { text, snapshot };
 }
 
+// ── Media teardown (shared release helpers) ─────────────────────────────
+// WebKit retains per-element media players and their IOSurface-backed
+// frame pools long after a stream stops rendering: a <video> that once
+// played a MediaStream keeps decoder/buffer state until the element is
+// reset through the media-load algorithm, and received MediaStream
+// tracks that are never stop()ed keep their receiver buffers alive even
+// after the RTCPeerConnection closes. Measured live (2026-07-19): a
+// dashboard tab alive ~2 days accumulated 1.27 GB of dirty IOSurface
+// memory in Safari's WebContent process after its display streams had
+// ended. Every viewer exit path funnels media release through these two
+// helpers so no path can strand the pools again.
+
+// Stop every track of `stream`. Null-safe and idempotent — stop() on an
+// already-ended track is a no-op per spec.
+function displayViewerStopStreamTracks(stream) {
+  if (!stream || typeof stream.getTracks !== 'function') return;
+  for (const track of stream.getTracks()) {
+    try { track.stop(); } catch (_) {}
+  }
+}
+
+// Detach and reset a media element so the engine can drop its media
+// player and frame pool: pause, drop srcObject/src, then re-run the
+// media-load algorithm with no resource selected (load() then parks the
+// element at NETWORK_EMPTY and releases the previous player — the
+// documented WebKit recipe for freeing video memory). Safe on elements
+// that never carried media, and safe to call repeatedly. Deliberately
+// does NOT stop tracks: pane-rebuild callers reset a *replaced* element
+// while its stream lives on in the replacement — track teardown is the
+// caller's decision via displayViewerStopStreamTracks.
+function displayViewerResetMediaElement(videoEl) {
+  if (!videoEl) return;
+  try { videoEl.pause(); } catch (_) {}
+  if (videoEl.srcObject !== null && videoEl.srcObject !== undefined) {
+    videoEl.srcObject = null;
+  }
+  videoEl.removeAttribute('src');
+  try { videoEl.load(); } catch (_) {}
+}
+
 // ── Signaling scaffold (offer/answer + pending-ICE buffering) ───────────
 // The invariant all three WebRTC lanes (local display, peer display, peer
 // file transfer) share: remote ICE candidates that arrive before the

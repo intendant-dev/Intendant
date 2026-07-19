@@ -813,9 +813,14 @@ class DisplaySlot {
         } else {
           // Dead end used to be terminal with no control; now it alarms
           // and offers a manual Reconnect that restarts the retry budget.
+          // disconnect() first (same ordering as the retry arm): it
+          // releases the failed pc AND its media — the dead end used to
+          // park the failed RTCPeerConnection, its ended stream, and the
+          // element's media player indefinitely — and it hides the
+          // overlay, so write the dead-end copy after.
+          this.disconnect();
           this.statusEl.textContent = DISPLAY_VIEWER_RETRY_DEAD_END_STATUS;
           this.statusEl.className = 'display-status error';
-          this._stopStatsSampler();
           this._setStageOverlay('error', DISPLAY_VIEWER_RETRY_DEAD_END_OVERLAY, {
             retryLabel: 'Reconnect',
             onRetry: () => this.manualReconnect(),
@@ -1813,8 +1818,47 @@ class DisplaySlot {
     if (this.pointerChannel) { this.pointerChannel.close(); this.pointerChannel = null; }
     if (this.clipboardChannel) { this.clipboardChannel.close(); this.clipboardChannel = null; }
     if (this.pc) { this.pc.close(); this.pc = null; }
-    if (this._focusResizeObserver) { this._focusResizeObserver.disconnect(); this._focusResizeObserver = null; }
+    // Release the received media LAST (pc closed, `connected` false): the
+    // pause event fired by the element reset then finds the pause guard's
+    // isLive() false and stays inert. connect() re-attaches a fresh
+    // stream via ontrack, so this is safe on every transient reconnect;
+    // on parked slots (display_capture_lost keeps the slot for a
+    // re-grant) it is the release that stops WebKit retaining the dead
+    // stream's decoder pools for days. Tracks are stopped explicitly:
+    // closing the pc alone leaves receiver buffers alive.
+    // (The shared-view focus ResizeObserver is viewer-lifetime state and
+    // deliberately NOT torn down here — disconnect() used to kill it on
+    // the first transient reconnect and nothing ever re-created it; it
+    // now lives until destroy().)
+    displayViewerStopStreamTracks(this.videoEl ? this.videoEl.srcObject : null);
+    displayViewerResetMediaElement(this.videoEl);
     this.statusEl.className = 'display-status error';
+  }
+
+  // Full viewer teardown for the remove-slot path (user close,
+  // user_display_revoked). disconnect() releases every per-connection
+  // resource and is safe to run repeatedly; this releases the
+  // viewer-lifetime remainder that must survive transient reconnects:
+  // the shared-view focus observer, the pause-guard binding, and the
+  // presence-capture canvases (retina-sized backing stores after a
+  // presence stream). Idempotent. removeDisplaySlot owns the module
+  // registries (slots map, thumbs, station source, stream generation)
+  // and the DOM removal of `el`.
+  destroy() {
+    this.disconnect({ userInitiated: true });
+    if (this._focusResizeObserver) {
+      this._focusResizeObserver.disconnect();
+      this._focusResizeObserver = null;
+    }
+    this._pauseGuard = null;
+    // Zeroing a canvas releases its backing store. Safe against the
+    // in-flight final-frame encode: removeDisplaySlot bumps the stream
+    // generation synchronously after destroy(), and pending promise
+    // callbacks cannot interleave with the synchronous removal, so the
+    // late completion drops on its generation check before ever touching
+    // the zeroed HQ canvas.
+    DisplaySlot._sizeCanvas(this._streamCanvas, 0, 0);
+    DisplaySlot._sizeCanvas(this._hqStreamCanvas, 0, 0);
   }
 }
 
@@ -1836,7 +1880,11 @@ function removeDisplaySlot(displayId) {
   // call `disconnect()` with the `userInitiated: false` default and
   // therefore preserve authority for a possible re-grant.
   slot.toggleFullscreen(false);
-  slot.disconnect({ userInitiated: true });
+  // destroy() = disconnect({ userInitiated: true }) + the viewer-lifetime
+  // remainder (focus observer, pause guard, capture-canvas backing
+  // stores) — the full-teardown boundary, vs the transient disconnect()
+  // the reconnect/capture-lost paths use.
+  slot.destroy();
   if (slot.el && slot.el.parentNode) slot.el.parentNode.removeChild(slot.el);
   displaySlots.delete(displayId);
   // Invalidate the removed slot's stream generation: an in-flight encode
@@ -3606,6 +3654,137 @@ function applyDisplayStripState() {
           };
         }),
       };
+    },
+
+    // Teardown-leak census (passive, side-effect-free): every <video> in
+    // the document plus per-viewer release state, so probes can assert
+    // "no video holds a stream / live tracks after close" without
+    // reaching into the module-scoped registries. `liveTracks` is the
+    // honest leak signal — a reset element has srcObject null, and a
+    // stopped stream has only 'ended' tracks.
+    displayMediaCensus() {
+      const liveTracks = (stream) => Boolean(
+        stream && typeof stream.getTracks === 'function' &&
+        stream.getTracks().some(track => track.readyState === 'live'));
+      const videos = Array.from(document.querySelectorAll('video'));
+      return {
+        domVideos: videos.length,
+        domVideosWithSrcObject: videos.filter(v => v.srcObject).length,
+        domVideosWithLiveTracks: videos.filter(v => liveTracks(v.srcObject)).length,
+        slots: Array.from(displaySlots.values()).map(slot => ({
+          displayId: Number(slot.displayId),
+          pcState: slot.pc ? slot.pc.connectionState : 'released',
+          srcObject: Boolean(slot.videoEl && slot.videoEl.srcObject),
+          liveTracks: liveTracks(slot.videoEl && slot.videoEl.srcObject),
+          inputListeners: Object.keys(slot._boundHandlers || {}).length,
+          pauseGuardArmed: Boolean(slot._pauseGuard),
+          statsSampler: Boolean(slot._statsTimer),
+          freezeWatch: Boolean(slot._freezeWatch),
+          captureCanvasBytes:
+            (slot._streamCanvas.width * slot._streamCanvas.height * 4) +
+            (slot._hqStreamCanvas.width * slot._hqStreamCanvas.height * 4),
+        })),
+        peerConnections: Array.from(peerDisplayConnections.values()).map(conn => ({
+          hostId: conn.hostId,
+          displayId: Number(conn.displayId),
+          pcState: conn.pc ? conn.pc.connectionState : 'released',
+          streamLiveTracks: liveTracks(conn.stream),
+          inputListeners: Object.keys(conn._boundHandlers || {}).length,
+          pauseGuardArmed: Boolean(conn._pauseGuard),
+          statsSampler: Boolean(conn._statsTimer),
+          tileCompositor: Boolean(conn.tileCompositor),
+        })),
+      };
+    },
+
+    // Active DOM-level exercise of the LOCAL viewer's full-teardown path:
+    // builds a real DisplaySlot in the live document, feeds its <video> a
+    // real canvas.captureStream() MediaStream and a real (unsignaled)
+    // RTCPeerConnection, arms the production samplers/watchdogs and input
+    // listeners, then removes it through removeDisplaySlot — the exact
+    // routine the close button and user_display_revoked run — and reports
+    // what was released. Effect-free on the daemon beyond two idempotent
+    // no-op control messages (authority release + release_display for a
+    // display id that was never granted).
+    displayViewerTeardownProbe() {
+      const id = 990001;
+      if (displaySlots.has(id)) return { error: 'probe slot already exists' };
+      const source = document.createElement('canvas');
+      source.width = 320;
+      source.height = 180;
+      const sctx = source.getContext('2d');
+      sctx.fillStyle = '#334455';
+      sctx.fillRect(0, 0, source.width, source.height);
+      if (typeof source.captureStream !== 'function') {
+        return { error: 'canvas.captureStream unavailable in this browser' };
+      }
+      const stream = source.captureStream(5);
+      const slot = new DisplaySlot(id, source.width, source.height);
+      displaySlots.set(id, slot);
+      (document.getElementById('displays-container') || document.body).appendChild(slot.el);
+      slot.pc = new RTCPeerConnection({ iceServers: [] });
+      slot.videoEl.srcObject = stream;
+      slot.connected = true;
+      slot._startStatsSampler();
+      slot._armFreezeWatchdog();
+      // Install the production input-capture stack the way interactive
+      // mode does, so the removal path's listener detach is exercised
+      // against real handlers (sends are stubbed; nothing is dispatched).
+      slot._heldKeys = new Set();
+      slot._flushHeldKeys = displayViewerMakeHeldKeyFlusher(slot, () => true);
+      slot._boundHandlers = displayViewerBuildInputHandlers({
+        owner: slot,
+        target: slot.videoEl,
+        sendControl: () => true,
+        sendPointer: () => {},
+      });
+      slot._boundHandlers.paste = displayViewerBuildPasteHandler(() => null);
+      document.addEventListener('paste', slot._boundHandlers.paste);
+      for (const [evt, handler] of Object.entries(slot._boundHandlers)) {
+        if (evt === 'paste') continue;
+        slot.videoEl.addEventListener(evt, handler, { passive: false });
+      }
+      slot.interactive = true;
+      const before = {
+        pcState: slot.pc.connectionState,
+        srcObject: Boolean(slot.videoEl.srcObject),
+        trackStates: stream.getTracks().map(track => track.readyState),
+        inDom: slot.el.isConnected,
+        registered: displaySlots.has(id),
+        inputListeners: Object.keys(slot._boundHandlers).length,
+      };
+      const videoEl = slot.videoEl;
+      const pc = slot.pc;
+      removeDisplaySlot(id);
+      const after = {
+        pcState: pc.connectionState,
+        srcObject: Boolean(videoEl.srcObject),
+        trackStates: stream.getTracks().map(track => track.readyState),
+        inDom: videoEl.isConnected,
+        registered: displaySlots.has(id),
+        inputListeners: Object.keys(slot._boundHandlers || {}).length,
+        pauseGuardArmed: Boolean(slot._pauseGuard),
+        statsSampler: Boolean(slot._statsTimer),
+        freezeWatch: Boolean(slot._freezeWatch),
+        noTrackWatch: slot._noTrackTimer !== null && slot._noTrackTimer !== undefined,
+        captureCanvasBytes:
+          (slot._streamCanvas.width * slot._streamCanvas.height * 4) +
+          (slot._hqStreamCanvas.width * slot._hqStreamCanvas.height * 4),
+      };
+      const pass =
+        after.pcState === 'closed' &&
+        !after.srcObject &&
+        after.trackStates.length > 0 &&
+        after.trackStates.every(state => state === 'ended') &&
+        !after.inDom &&
+        !after.registered &&
+        after.inputListeners === 0 &&
+        !after.pauseGuardArmed &&
+        !after.statsSampler &&
+        !after.freezeWatch &&
+        !after.noTrackWatch &&
+        after.captureCanvasBytes === 0;
+      return { pass, before, after };
     },
   });
 
