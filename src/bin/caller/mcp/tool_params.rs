@@ -134,6 +134,30 @@ pub struct AskUserOptionParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AskUserPreviewParams {
+    /// Short card caption shown above the preview (e.g. "A", "Before", "After",
+    /// or a matching option label).
+    pub label: String,
+    /// A complete self-contained HTML document rendered in a locked-down
+    /// sandboxed iframe (opaque origin: its scripts run, but external fetches
+    /// and daemon APIs do not resolve — inline all CSS/JS and use data: URLs
+    /// for images).
+    #[serde(default)]
+    pub html: Option<String>,
+    /// Base64-encoded image bytes (standard alphabet; a data-URL prefix is
+    /// tolerated). Requires media_type.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Image MIME type for `image`: image/png, image/jpeg, image/gif,
+    /// image/webp, or image/bmp.
+    #[serde(default)]
+    pub media_type: Option<String>,
+    /// Plain text or code snippet rendered preformatted.
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AskUserParams {
     /// The question to ask the user. Keep it self-contained — it renders on
     /// the dashboard question rail without surrounding context.
@@ -145,6 +169,13 @@ pub struct AskUserParams {
     /// free-text field only; free-text answers are always allowed on top.
     #[serde(default)]
     pub options: Vec<AskUserOptionParams>,
+    /// Optional preview cards rendered above the options — show, then ask
+    /// (prototype variants to pick between, before/after states to judge).
+    /// Each card carries exactly one of html / image / text. Caps: 4 cards,
+    /// 2 MB per html document, 4 MB per image (decoded), 4 KB per text
+    /// snippet, 8 MB total.
+    #[serde(default)]
+    pub previews: Vec<AskUserPreviewParams>,
     /// Allow selecting multiple options (answers join with ", ").
     #[serde(default)]
     pub multi_select: Option<bool>,

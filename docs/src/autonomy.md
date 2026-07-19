@@ -81,7 +81,13 @@ attention chain) without being approvals:
   through a verbs-only surface) never widens command autonomy. The asking
   agent blocks until an answer, a dismissal, or its wait expires; the
   timeout and the no-frontend shapes both hand the agent explicit
-  best-judgment guidance instead of a fabricated choice.
+  best-judgment guidance instead of a fabricated choice. A question may
+  carry **preview cards** (show, then ask — prototype variants,
+  before/after states): self-contained HTML rendered only inside a
+  sandboxed opaque-origin iframe, raster images, or inline text snippets;
+  blob kinds live in the session upload store and travel as references
+  (see the `ask_user` row in the MCP chapter and `intendant ctl ask
+  --help` for caps and flags).
 - **Notifications** (`notify_user`) request *nothing*: fire-and-forget,
   display-only, never blocking. `urgency` picks the delivery escalation —
   `info` renders a dashboard toast plus a transcript row; `attention` also

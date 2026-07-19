@@ -33,6 +33,17 @@ pub(crate) const ASK_USER_MAX_OPTION_LABEL_BYTES: usize = 120;
 pub(crate) const ASK_USER_DEFAULT_WAIT_SECS: u64 = 300;
 /// Hard cap on the blocking wait.
 pub(crate) const ASK_USER_MAX_WAIT_SECS: u64 = 900;
+/// Maximum preview cards per ask.
+pub(crate) const ASK_USER_MAX_PREVIEWS: usize = 4;
+/// Maximum size of one self-contained HTML preview document.
+pub(crate) const ASK_USER_MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum size of one inline text preview snippet.
+pub(crate) const ASK_USER_MAX_TEXT_PREVIEW_BYTES: usize = 4096;
+/// Maximum total preview payload (decoded) per ask.
+pub(crate) const ASK_USER_MAX_TOTAL_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum preview-card label size (truncated, not refused — the label is
+/// a caption, unlike an option label it is never an answer value).
+const ASK_USER_MAX_PREVIEW_LABEL_BYTES: usize = 80;
 /// Maximum notification text size. Notifications are alerts, not documents.
 pub(crate) const NOTIFY_USER_MAX_TEXT_BYTES: usize = 4096;
 
@@ -127,11 +138,152 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// One validated `ask_user` preview card, decoded but not yet committed —
+/// blob kinds still carry their bytes; `ask_user_inner` commits them into
+/// the calling session's upload store once the session is resolved.
+#[derive(Debug)]
+pub(crate) struct DecodedPreview {
+    pub(crate) label: String,
+    pub(crate) source: DecodedPreviewSource,
+}
+
+#[derive(Debug)]
+pub(crate) enum DecodedPreviewSource {
+    Html(String),
+    Image { mime: &'static str, bytes: Vec<u8> },
+    Text(String),
+}
+
+/// Decode and validate the preview cards of an `ask_user` call: exactly
+/// one source per card, the session-note MIME allowlist for images, and
+/// the per-kind plus total size caps.
+pub(crate) fn decode_ask_previews(
+    previews: &[AskUserPreviewParams],
+) -> Result<Vec<DecodedPreview>, String> {
+    if previews.len() > ASK_USER_MAX_PREVIEWS {
+        return Err(format!(
+            "too many previews: {} (max {ASK_USER_MAX_PREVIEWS})",
+            previews.len()
+        ));
+    }
+    let mut decoded = Vec::with_capacity(previews.len());
+    let mut total_bytes = 0usize;
+    for (index, preview) in previews.iter().enumerate() {
+        let label = preview.label.trim();
+        if label.is_empty() {
+            return Err(format!("previews[{index}]: label must not be empty"));
+        }
+        let label = crate::types::truncate_str(label, ASK_USER_MAX_PREVIEW_LABEL_BYTES).to_string();
+        let sources = usize::from(preview.html.is_some())
+            + usize::from(preview.image.is_some())
+            + usize::from(preview.text.is_some());
+        if sources != 1 {
+            return Err(format!(
+                "previews[{index}]: provide exactly one of html, image, or text"
+            ));
+        }
+        let source = if let Some(html) = preview.html.as_deref() {
+            if html.trim().is_empty() {
+                return Err(format!("previews[{index}]: html must not be empty"));
+            }
+            if html.len() > ASK_USER_MAX_HTML_BYTES {
+                return Err(format!(
+                    "previews[{index}]: html is {} bytes; max {} MB (send a self-contained \
+                     document with small inline assets)",
+                    html.len(),
+                    ASK_USER_MAX_HTML_BYTES / (1024 * 1024)
+                ));
+            }
+            total_bytes = total_bytes.saturating_add(html.len());
+            DecodedPreviewSource::Html(html.to_string())
+        } else if let Some(image) = preview.image.as_deref() {
+            let media_type = preview
+                .media_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .ok_or_else(|| format!("previews[{index}]: media_type is required with image"))?;
+            let mime = super::tools_notes::canonical_note_image_mime(media_type)
+                .map_err(|e| format!("previews[{index}]: {e}"))?;
+            let bytes = super::tools_notes::decode_flexible_base64(image)
+                .map_err(|e| format!("previews[{index}]: {e}"))?;
+            if bytes.len() > super::tools_notes::SESSION_NOTE_MAX_IMAGE_BYTES {
+                return Err(format!(
+                    "previews[{index}]: {} bytes exceeds the {} MB per-image cap",
+                    bytes.len(),
+                    super::tools_notes::SESSION_NOTE_MAX_IMAGE_BYTES / (1024 * 1024)
+                ));
+            }
+            total_bytes = total_bytes.saturating_add(bytes.len());
+            DecodedPreviewSource::Image { mime, bytes }
+        } else {
+            let text = preview.text.as_deref().unwrap_or_default().trim();
+            if text.is_empty() {
+                return Err(format!("previews[{index}]: text must not be empty"));
+            }
+            if text.len() > ASK_USER_MAX_TEXT_PREVIEW_BYTES {
+                return Err(format!(
+                    "previews[{index}]: text is {} bytes; max {} KB (use an html or image \
+                     preview for larger content)",
+                    text.len(),
+                    ASK_USER_MAX_TEXT_PREVIEW_BYTES / 1024
+                ));
+            }
+            total_bytes = total_bytes.saturating_add(text.len());
+            DecodedPreviewSource::Text(text.to_string())
+        };
+        if total_bytes > ASK_USER_MAX_TOTAL_PREVIEW_BYTES {
+            return Err(format!(
+                "total preview payload exceeds the {} MB per-ask cap",
+                ASK_USER_MAX_TOTAL_PREVIEW_BYTES / (1024 * 1024)
+            ));
+        }
+        decoded.push(DecodedPreview { label, source });
+    }
+    Ok(decoded)
+}
+
+/// Commit one preview blob into the calling session's upload store and
+/// return its descriptor. Mirrors the session-note attachment path: blobs
+/// travel onward as references, never inline bytes on the bus, in the
+/// state-line replay cache, or in the session log.
+fn commit_preview_blob(
+    bytes: &[u8],
+    label: &str,
+    extension: &str,
+    mime: &str,
+    log_dir: &std::path::Path,
+    session_id: &str,
+    scope: &crate::global_store::StoreScope,
+) -> Result<crate::upload_store::UploadDescriptor, String> {
+    let name = crate::upload_store::sanitize_name(&format!("{label}.{extension}"));
+    super::tools_notes::write_blob_tempfile(bytes).and_then(|tmp| {
+        crate::upload_store::commit_upload(
+            tmp,
+            &name,
+            mime,
+            bytes.len() as u64,
+            crate::upload_store::UploadDestination::Task,
+            log_dir,
+            session_id,
+            scope,
+        )
+        .map_err(|e| format!("failed to store preview '{label}': {e}"))
+    })
+}
+
+/// The upload-store `/raw` URL every browser (live and replay) resolves
+/// for a committed preview blob — same shape as session-note attachments.
+fn preview_raw_url(upload_id: &str) -> String {
+    format!("/api/session/current/uploads/{upload_id}/raw")
+}
+
 /// Validate `ask_user` parameters into the `UserQuestion` the rail renders.
-/// Returns the question plus the effective wait.
+/// Returns the question (previews still empty), the decoded-but-uncommitted
+/// preview cards, and the effective wait.
 pub(crate) fn build_ask_user_question(
     params: &AskUserParams,
-) -> Result<(crate::types::UserQuestion, u64), String> {
+) -> Result<(crate::types::UserQuestion, Vec<DecodedPreview>, u64), String> {
     let question = params.question.trim();
     if question.is_empty() {
         return Err("question must not be empty".to_string());
@@ -185,13 +337,16 @@ pub(crate) fn build_ask_user_question(
         .wait_seconds
         .unwrap_or(ASK_USER_DEFAULT_WAIT_SECS)
         .clamp(1, ASK_USER_MAX_WAIT_SECS);
+    let previews = decode_ask_previews(&params.previews)?;
     Ok((
         crate::types::UserQuestion {
             question: question.to_string(),
             header,
             options,
             multi_select: params.multi_select.unwrap_or(false),
+            previews: Vec::new(),
         },
+        previews,
         wait_seconds,
     ))
 }
@@ -231,7 +386,7 @@ fn guidance_answers(question: &str, guidance: &str) -> std::collections::HashMap
 
 impl IntendantServer {
     #[tool(
-        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Returns {status, answer, answers}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
+        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total. Returns {status, answer, answers}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
     )]
     pub(crate) async fn ask_user(&self, Parameters(params): Parameters<AskUserParams>) -> String {
         match self.ask_user_inner(params).await {
@@ -246,13 +401,13 @@ impl IntendantServer {
         &self,
         params: AskUserParams,
     ) -> Result<serde_json::Value, String> {
-        let (question, wait_seconds) = build_ask_user_question(&params)?;
+        let (mut question, decoded_previews, wait_seconds) = build_ask_user_question(&params)?;
         let question_text = question.question.clone();
 
         // Same session resolution as post_session_note: the HTTP dispatch
         // injects the URL-bound session id (`with_default_mcp_session_id`),
         // an explicit argument wins, then the single-session state fallback.
-        let (session_id, interactive_frontends) = {
+        let (session_id, interactive_frontends, project_root, log_dir) = {
             let state = self.state.read().await;
             let session_id = params
                 .session_id
@@ -268,7 +423,12 @@ impl IntendantServer {
                         Some(fallback.to_string())
                     }
                 });
-            (session_id, state.interactive_frontends)
+            (
+                session_id,
+                state.interactive_frontends,
+                state.project_root.clone(),
+                state.log_dir.clone(),
+            )
         };
         let Some(session_id) = session_id else {
             return Err(
@@ -300,6 +460,72 @@ impl IntendantServer {
                 guidance_answers(&question_text, NO_ANSWER_GUIDANCE),
                 Some(NO_ANSWER_GUIDANCE),
             ));
+        }
+
+        // Commit blob previews into the calling session's upload store —
+        // references only from here on (mirrors post_session_note): the
+        // broadcast, the reconnect state-line cache, and the session log
+        // stay small, and browsers fetch the bytes lazily via /raw.
+        if !decoded_previews.is_empty() {
+            let scope = crate::global_store::StoreScope::resolve(project_root.as_deref());
+            let mut committed: Vec<crate::types::QuestionPreview> = Vec::new();
+            for preview in decoded_previews {
+                let source =
+                    match preview.source {
+                        DecodedPreviewSource::Text(content) => {
+                            Ok(crate::types::QuestionPreviewSource::Text { content })
+                        }
+                        DecodedPreviewSource::Html(html) => commit_preview_blob(
+                            html.as_bytes(),
+                            &preview.label,
+                            "html",
+                            "text/html",
+                            &log_dir,
+                            &session_id,
+                            &scope,
+                        )
+                        .map(|descriptor| crate::types::QuestionPreviewSource::Html {
+                            url: preview_raw_url(&descriptor.id),
+                            upload_id: descriptor.id,
+                        }),
+                        DecodedPreviewSource::Image { mime, bytes } => commit_preview_blob(
+                            &bytes,
+                            &preview.label,
+                            super::tools_notes::note_image_extension(mime),
+                            mime,
+                            &log_dir,
+                            &session_id,
+                            &scope,
+                        )
+                        .map(|descriptor| crate::types::QuestionPreviewSource::Image {
+                            url: preview_raw_url(&descriptor.id),
+                            upload_id: descriptor.id,
+                            mime: mime.to_string(),
+                        }),
+                    };
+                match source {
+                    Ok(source) => committed.push(crate::types::QuestionPreview {
+                        label: preview.label,
+                        source,
+                    }),
+                    Err(message) => {
+                        // Roll back blobs committed earlier in this call so
+                        // a refused ask doesn't strand half its previews.
+                        for preview in &committed {
+                            let upload_id = match &preview.source {
+                                crate::types::QuestionPreviewSource::Html { upload_id, .. }
+                                | crate::types::QuestionPreviewSource::Image {
+                                    upload_id, ..
+                                } => upload_id,
+                                crate::types::QuestionPreviewSource::Text { .. } => continue,
+                            };
+                            let _ = crate::upload_store::delete_upload(upload_id, &log_dir, &scope);
+                        }
+                        return Err(message);
+                    }
+                }
+            }
+            question.previews = committed;
         }
 
         // Subscribe BEFORE announcing the question (same race as approvals:
@@ -522,9 +748,43 @@ mod tests {
             question: question.to_string(),
             header: None,
             options: vec![],
+            previews: vec![],
             multi_select: None,
             wait_seconds: None,
             session_id: None,
+        }
+    }
+
+    fn preview_params(label: &str) -> AskUserPreviewParams {
+        AskUserPreviewParams {
+            label: label.to_string(),
+            html: None,
+            image: None,
+            media_type: None,
+            text: None,
+        }
+    }
+
+    fn html_preview(label: &str, html: &str) -> AskUserPreviewParams {
+        AskUserPreviewParams {
+            html: Some(html.to_string()),
+            ..preview_params(label)
+        }
+    }
+
+    fn text_preview(label: &str, text: &str) -> AskUserPreviewParams {
+        AskUserPreviewParams {
+            text: Some(text.to_string()),
+            ..preview_params(label)
+        }
+    }
+
+    fn image_preview(label: &str, media_type: Option<&str>, bytes: &[u8]) -> AskUserPreviewParams {
+        use base64::Engine as _;
+        AskUserPreviewParams {
+            image: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            media_type: media_type.map(str::to_string),
+            ..preview_params(label)
         }
     }
 
@@ -585,19 +845,170 @@ mod tests {
         ];
         params.multi_select = Some(true);
         params.wait_seconds = Some(10_000);
-        let (question, wait) = build_ask_user_question(&params).unwrap();
+        let (question, previews, wait) = build_ask_user_question(&params).unwrap();
         assert_eq!(question.question, "Deploy now?");
         assert_eq!(question.header, "Release");
         assert_eq!(question.options.len(), 2);
         assert_eq!(question.options[0].label, "Yes");
         assert_eq!(question.options[0].description, "Ship it");
         assert!(question.multi_select);
+        assert!(previews.is_empty());
+        // Previews stay empty on the question until the inner path commits
+        // the decoded cards into the calling session's upload store.
+        assert!(question.previews.is_empty());
         assert_eq!(wait, ASK_USER_MAX_WAIT_SECS);
 
         let mut params = ask_params("Quick?");
         params.wait_seconds = Some(0);
-        let (_, wait) = build_ask_user_question(&params).unwrap();
+        let (_, _, wait) = build_ask_user_question(&params).unwrap();
         assert_eq!(wait, 1);
+    }
+
+    #[test]
+    fn decode_ask_previews_validates_kinds_and_caps() {
+        // Count cap.
+        let too_many: Vec<AskUserPreviewParams> = (0..ASK_USER_MAX_PREVIEWS + 1)
+            .map(|i| text_preview(&format!("p{i}"), "snippet"))
+            .collect();
+        let err = decode_ask_previews(&too_many).unwrap_err();
+        assert!(err.contains("too many previews"), "{err}");
+
+        // Label required; exactly one source required.
+        let err = decode_ask_previews(&[text_preview("  ", "snippet")]).unwrap_err();
+        assert!(err.contains("label must not be empty"), "{err}");
+        let err = decode_ask_previews(&[preview_params("A")]).unwrap_err();
+        assert!(err.contains("exactly one of html, image, or text"), "{err}");
+        let both = AskUserPreviewParams {
+            text: Some("t".into()),
+            ..html_preview("A", "<html></html>")
+        };
+        let err = decode_ask_previews(&[both]).unwrap_err();
+        assert!(err.contains("exactly one of html, image, or text"), "{err}");
+
+        // Per-kind caps and validation.
+        let err = decode_ask_previews(&[html_preview("A", "   ")]).unwrap_err();
+        assert!(err.contains("html must not be empty"), "{err}");
+        let err =
+            decode_ask_previews(&[html_preview("A", &"x".repeat(ASK_USER_MAX_HTML_BYTES + 1))])
+                .unwrap_err();
+        assert!(err.contains("max 2 MB"), "{err}");
+        let err = decode_ask_previews(&[image_preview("A", None, b"png")]).unwrap_err();
+        assert!(err.contains("media_type is required"), "{err}");
+        let err = decode_ask_previews(&[image_preview("A", Some("image/svg+xml"), b"<svg/>")])
+            .unwrap_err();
+        assert!(err.contains("unsupported media_type"), "{err}");
+        let err = decode_ask_previews(&[text_preview(
+            "A",
+            &"x".repeat(ASK_USER_MAX_TEXT_PREVIEW_BYTES + 1),
+        )])
+        .unwrap_err();
+        assert!(err.contains("max 4 KB"), "{err}");
+
+        // Total cap: individually legal cards that exceed the ask budget
+        // together (2 × 4 MB images + one html crosses 8 MB).
+        let big_image = vec![0u8; super::super::tools_notes::SESSION_NOTE_MAX_IMAGE_BYTES];
+        let err = decode_ask_previews(&[
+            image_preview("A", Some("image/png"), &big_image),
+            image_preview("B", Some("image/png"), &big_image),
+            html_preview("C", "<html><body>c</body></html>"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("total preview payload"), "{err}");
+
+        // Happy path: one of each kind; labels trim and truncate.
+        let decoded = decode_ask_previews(&[
+            html_preview("  A — dense layout  ", "<html><body>a</body></html>"),
+            image_preview("B", Some("image/jpg"), b"\xff\xd8jpeg"),
+            text_preview(&"L".repeat(200), "diff --git a b"),
+        ])
+        .unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].label, "A — dense layout");
+        assert!(
+            matches!(&decoded[0].source, DecodedPreviewSource::Html(h) if h.contains("<body>a</body>"))
+        );
+        // image/jpg canonicalizes to image/jpeg like note attachments.
+        assert!(
+            matches!(&decoded[1].source, DecodedPreviewSource::Image { mime, bytes } if *mime == "image/jpeg" && bytes.starts_with(b"\xff\xd8"))
+        );
+        assert_eq!(decoded[2].label.len(), 80);
+        assert!(
+            matches!(&decoded[2].source, DecodedPreviewSource::Text(t) if t == "diff --git a b")
+        );
+    }
+
+    /// The documented preview caps must always fit inside the `/mcp` body
+    /// cap. Images inflate 4/3 in base64; html and text ride as JSON
+    /// strings, whose escaping stays under ~3/2 for real documents (the
+    /// pathological all-control-character document would exceed it and is
+    /// simply refused by the gateway's body cap with a 413 — the contract
+    /// documents self-contained HTML, not binary blobs).
+    #[test]
+    fn documented_preview_caps_fit_inside_mcp_body_cap() {
+        let worst_wire = ASK_USER_MAX_TOTAL_PREVIEW_BYTES.div_ceil(2) * 3;
+        let envelope_headroom = 64 * 1024;
+        assert!(
+            worst_wire + ASK_USER_MAX_QUESTION_BYTES + envelope_headroom
+                < crate::gateway_routes::MCP_BODY_CAP_BYTES,
+            "ask preview caps ({worst_wire} wire bytes) exceed the /mcp body cap {}",
+            crate::gateway_routes::MCP_BODY_CAP_BYTES,
+        );
+    }
+
+    /// Pins the preview wire shape the dashboard reads (flattened
+    /// `kind`-tagged source alongside `label`).
+    #[test]
+    fn question_preview_wire_shape_is_pinned() {
+        let question = crate::types::UserQuestion {
+            question: "Which?".into(),
+            header: String::new(),
+            options: Vec::new(),
+            multi_select: false,
+            previews: vec![
+                crate::types::QuestionPreview {
+                    label: "A".into(),
+                    source: crate::types::QuestionPreviewSource::Html {
+                        upload_id: "u1".into(),
+                        url: "/api/session/current/uploads/u1/raw".into(),
+                    },
+                },
+                crate::types::QuestionPreview {
+                    label: "B".into(),
+                    source: crate::types::QuestionPreviewSource::Image {
+                        upload_id: "u2".into(),
+                        mime: "image/png".into(),
+                        url: "/api/session/current/uploads/u2/raw".into(),
+                    },
+                },
+                crate::types::QuestionPreview {
+                    label: "C".into(),
+                    source: crate::types::QuestionPreviewSource::Text {
+                        content: "snippet".into(),
+                    },
+                },
+            ],
+        };
+        let wire = serde_json::to_value(&question).unwrap();
+        assert_eq!(
+            wire["previews"],
+            serde_json::json!([
+                {"label": "A", "kind": "html", "upload_id": "u1", "url": "/api/session/current/uploads/u1/raw"},
+                {"label": "B", "kind": "image", "upload_id": "u2", "mime": "image/png", "url": "/api/session/current/uploads/u2/raw"},
+                {"label": "C", "kind": "text", "content": "snippet"},
+            ])
+        );
+        let back: crate::types::UserQuestion = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, question);
+
+        // A previewless question serializes without the key at all, so
+        // older dashboards and the state-line replay cache see the exact
+        // pre-preview wire shape.
+        let bare = crate::types::UserQuestion {
+            previews: Vec::new(),
+            ..question
+        };
+        let wire = serde_json::to_value(&bare).unwrap();
+        assert!(wire.get("previews").is_none());
     }
 
     #[tokio::test]
@@ -665,6 +1076,110 @@ mod tests {
                 _ => continue,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn ask_user_commits_previews_and_broadcasts_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        let log_dir = tmp.path().join("logs");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let bus = EventBus::new();
+        let mut state = McpAppState::new(
+            "test".into(),
+            "test".into(),
+            crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
+            log_dir.clone(),
+        );
+        state.session_id = "sess-preview".to_string();
+        state.project_root = Some(project_root.clone());
+        state.interactive_frontends = true;
+        let server = IntendantServer::new(Arc::new(RwLock::new(state)), bus.clone());
+        let mut rx = bus.subscribe();
+
+        let html = "<!doctype html><html><body>proto A</body></html>";
+        let png = [0x89u8, b'P', b'N', b'G'];
+        let mut params = ask_params("Which prototype?");
+        params.options = vec![
+            AskUserOptionParams {
+                label: "A".into(),
+                description: None,
+            },
+            AskUserOptionParams {
+                label: "B".into(),
+                description: None,
+            },
+        ];
+        params.previews = vec![
+            html_preview("A", html),
+            image_preview("B", Some("image/png"), &png),
+            text_preview("Diff", "- old\n+ new"),
+        ];
+        let ask_server = server.clone();
+        let ask = tokio::spawn(async move { ask_server.ask_user_inner(params).await });
+
+        let (id, questions) = match next_event(&mut rx, "UserQuestionRequired").await {
+            AppEvent::UserQuestionRequired { id, questions, .. } => (id, questions),
+            other => panic!("expected UserQuestionRequired, got {other:?}"),
+        };
+
+        // The broadcast carries references + inline text only — the blobs
+        // themselves live in the session's upload store, in the same scope
+        // the gateway's /raw route resolves for this project root.
+        let previews = &questions[0].previews;
+        assert_eq!(previews.len(), 3);
+        let scope = crate::global_store::StoreScope::resolve(Some(&project_root));
+        match &previews[0].source {
+            crate::types::QuestionPreviewSource::Html { upload_id, url } => {
+                assert_eq!(
+                    url,
+                    &format!("/api/session/current/uploads/{upload_id}/raw")
+                );
+                let descriptor = crate::upload_store::find_upload(upload_id, &log_dir, &scope)
+                    .expect("html blob committed");
+                assert_eq!(descriptor.session_id, "sess-preview");
+                assert_eq!(descriptor.mime, "text/html");
+                assert_eq!(std::fs::read(&descriptor.path).unwrap(), html.as_bytes());
+            }
+            other => panic!("expected html preview, got {other:?}"),
+        }
+        match &previews[1].source {
+            crate::types::QuestionPreviewSource::Image {
+                upload_id,
+                mime,
+                url,
+            } => {
+                assert_eq!(mime, "image/png");
+                assert_eq!(
+                    url,
+                    &format!("/api/session/current/uploads/{upload_id}/raw")
+                );
+                let descriptor = crate::upload_store::find_upload(upload_id, &log_dir, &scope)
+                    .expect("image blob committed");
+                assert_eq!(std::fs::read(&descriptor.path).unwrap(), png);
+            }
+            other => panic!("expected image preview, got {other:?}"),
+        }
+        assert!(matches!(
+            &previews[2].source,
+            crate::types::QuestionPreviewSource::Text { content } if content == "- old\n+ new"
+        ));
+        assert_eq!(previews[0].label, "A");
+        assert_eq!(previews[1].label, "B");
+        assert_eq!(previews[2].label, "Diff");
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::AnswerQuestion {
+            session_id: Some("sess-preview".into()),
+            id,
+            answers: std::collections::HashMap::from([(
+                "Which prototype?".to_string(),
+                "A".to_string(),
+            )]),
+        }));
+        let result = ask.await.expect("join").expect("ask_user result");
+        assert_eq!(result["status"], "answered", "{result}");
+        assert_eq!(result["answer"], "A");
     }
 
     #[tokio::test]

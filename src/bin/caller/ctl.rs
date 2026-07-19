@@ -1371,12 +1371,116 @@ async fn run_ask(client: &reqwest::Client, config: &Config, raw: &[String]) -> R
     }
 }
 
+/// Split one `--preview-*` value: `LABEL=VALUE` (VALUE is a path or
+/// inline text depending on the flag).
+fn split_preview_spec<'a>(flag: &str, spec: &'a str) -> Result<(&'a str, &'a str), String> {
+    let (label, value) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("{flag} expects LABEL=VALUE, got '{spec}'"))?;
+    let label = label.trim();
+    let value = value.trim();
+    if label.is_empty() || value.is_empty() {
+        return Err(format!("{flag} expects LABEL=VALUE, got '{spec}'"));
+    }
+    Ok((label, value))
+}
+
+fn preview_image_mime(path: &str) -> Result<&'static str, String> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" => Ok("image/png"),
+        "jpg" | "jpeg" => Ok("image/jpeg"),
+        "gif" => Ok("image/gif"),
+        "webp" => Ok("image/webp"),
+        "bmp" => Ok("image/bmp"),
+        _ => Err(format!(
+            "cannot infer an image type from '{path}' (expected .png/.jpg/.jpeg/.gif/.webp/.bmp)"
+        )),
+    }
+}
+
+/// Build `ask_user` preview cards from the repeatable `--preview-*`
+/// flags. Files are read HERE, in the ctl process — under the caller's
+/// own sandbox and privileges — because the daemon deliberately accepts
+/// inline content only: a sandboxed supervised agent must not be able to
+/// make the unsandboxed daemon read arbitrary file paths. Cards render
+/// in html → image → text flag order.
+fn collect_preview_args(args: &CommandArgs) -> Result<Vec<Value>, String> {
+    use base64::Engine as _;
+    let mut previews: Vec<Value> = Vec::new();
+    for spec in args.all("--preview-html") {
+        let (label, path) = split_preview_spec("--preview-html", spec)?;
+        let html = std::fs::read_to_string(path)
+            .map_err(|e| format!("--preview-html '{label}': failed to read {path}: {e}"))?;
+        if html.len() > crate::mcp::ASK_USER_MAX_HTML_BYTES {
+            return Err(format!(
+                "--preview-html '{label}': {path} is {} bytes; max {} MB",
+                html.len(),
+                crate::mcp::ASK_USER_MAX_HTML_BYTES / (1024 * 1024)
+            ));
+        }
+        let mut entry = Map::new();
+        entry.insert("label".to_string(), Value::String(label.to_string()));
+        entry.insert("html".to_string(), Value::String(html));
+        previews.push(Value::Object(entry));
+    }
+    for spec in args.all("--preview-image") {
+        let (label, path) = split_preview_spec("--preview-image", spec)?;
+        let mime = preview_image_mime(path)?;
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("--preview-image '{label}': failed to read {path}: {e}"))?;
+        if bytes.len() > crate::mcp::SESSION_NOTE_MAX_IMAGE_BYTES {
+            return Err(format!(
+                "--preview-image '{label}': {path} is {} bytes; max {} MB",
+                bytes.len(),
+                crate::mcp::SESSION_NOTE_MAX_IMAGE_BYTES / (1024 * 1024)
+            ));
+        }
+        let mut entry = Map::new();
+        entry.insert("label".to_string(), Value::String(label.to_string()));
+        entry.insert(
+            "image".to_string(),
+            Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+        );
+        entry.insert("media_type".to_string(), Value::String(mime.to_string()));
+        previews.push(Value::Object(entry));
+    }
+    for spec in args.all("--preview-text") {
+        let (label, text) = split_preview_spec("--preview-text", spec)?;
+        let mut entry = Map::new();
+        entry.insert("label".to_string(), Value::String(label.to_string()));
+        entry.insert("text".to_string(), Value::String(text.to_string()));
+        previews.push(Value::Object(entry));
+    }
+    if previews.len() > crate::mcp::ASK_USER_MAX_PREVIEWS {
+        return Err(format!(
+            "too many previews: {} (max {})",
+            previews.len(),
+            crate::mcp::ASK_USER_MAX_PREVIEWS
+        ));
+    }
+    Ok(previews)
+}
+
 /// Build `ask_user` arguments from `ask` flags. Options arrive as
-/// repeatable `--option "Label"` / `--option "Label:what it means"`.
+/// repeatable `--option "Label"` / `--option "Label:what it means"`;
+/// preview cards as repeatable `--preview-html/-image/-text LABEL=VALUE`.
 fn ask_args(raw: &[String]) -> Result<Value, String> {
     let args = parse_command_args(
         raw,
-        &["--option", "--header", "--wait", "--session"],
+        &[
+            "--option",
+            "--header",
+            "--wait",
+            "--session",
+            "--preview-html",
+            "--preview-image",
+            "--preview-text",
+        ],
         &["--multi", "--free-text"],
     )?;
     if args.positional.is_empty() {
@@ -1434,6 +1538,10 @@ fn ask_args(raw: &[String]) -> Result<Value, String> {
             })
             .collect();
         map.insert("options".to_string(), Value::Array(options));
+    }
+    let previews = collect_preview_args(&args)?;
+    if !previews.is_empty() {
+        map.insert("previews".to_string(), Value::Array(previews));
     }
     Ok(Value::Object(map))
 }
@@ -3234,7 +3342,9 @@ Examples:\n\
 fn help_ask() {
     println!(
         "Usage: intendant ctl ask \"QUESTION\" [--option \"Label[:desc]\"]... [--multi] \\\n\
-\x20                          [--header TEXT] [--free-text] [--wait SECONDS] [--json]\n\
+\x20                          [--header TEXT] [--free-text] [--wait SECONDS] [--json] \\\n\
+\x20                          [--preview-html LABEL=FILE]... [--preview-image LABEL=FILE]... \\\n\
+\x20                          [--preview-text LABEL=TEXT]...\n\
 \n\
 Raises the question on the dashboard question rail and BLOCKS until the user\n\
 answers, then prints the answer to stdout. A question requests input, never\n\
@@ -3244,9 +3354,19 @@ of options. --multi allows selecting several options (joined with \", \").\n\
 Default --wait 300 seconds, max 900; on timeout prints best-judgment guidance\n\
 and exits nonzero. --json prints {{status, answer, answers}} instead.\n\
 \n\
+Preview cards render above the options — show, then ask (prototype variants,\n\
+before/after states). --preview-html embeds a self-contained HTML file in a\n\
+locked-down sandboxed frame (its scripts run; external fetches do not\n\
+resolve), --preview-image a raster image, --preview-text an inline snippet.\n\
+ctl reads the files itself. Caps: 4 cards, 2 MB per html, 4 MB per image.\n\
+\n\
 Examples:\n\
   intendant ctl ask \"Which database?\" --option \"postgres:Existing infra\" --option sqlite\n\
-  intendant ctl ask \"Name the release branch\" --free-text --wait 600"
+  intendant ctl ask \"Name the release branch\" --free-text --wait 600\n\
+  intendant ctl ask \"Which landing page?\" --option A --option B \\\n\
+      --preview-html A=proto-a.html --preview-html B=proto-b.html\n\
+  intendant ctl ask \"Ship this change?\" --option \"Ship it\" --option \"Needs work\" \\\n\
+      --preview-image Before=before.png --preview-image After=after.png"
     );
 }
 
@@ -3461,6 +3581,88 @@ mod tests {
         }
         let err = ask_args(&over).unwrap_err();
         assert!(err.contains("too many options"), "{err}");
+    }
+
+    #[test]
+    fn ask_args_reads_preview_files_client_side() {
+        use base64::Engine as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let html_path = tmp.path().join("proto-a.html");
+        let png_path = tmp.path().join("after.png");
+        std::fs::write(&html_path, "<!doctype html><body>A</body>").unwrap();
+        std::fs::write(&png_path, [0x89u8, b'P', b'N', b'G']).unwrap();
+
+        let value = ask_args(&args(&[
+            "Which landing page?",
+            "--option",
+            "A",
+            "--preview-html",
+            &format!("A={}", html_path.display()),
+            "--preview-image",
+            &format!("After={}", png_path.display()),
+            "--preview-text",
+            "Diff=- old\n+ new",
+        ]))
+        .expect("ask args");
+        let previews = value["previews"].as_array().unwrap();
+        assert_eq!(previews.len(), 3);
+        assert_eq!(previews[0]["label"], "A");
+        assert_eq!(previews[0]["html"], "<!doctype html><body>A</body>");
+        assert_eq!(previews[1]["label"], "After");
+        assert_eq!(previews[1]["media_type"], "image/png");
+        assert_eq!(
+            previews[1]["image"],
+            base64::engine::general_purpose::STANDARD.encode([0x89u8, b'P', b'N', b'G'])
+        );
+        assert_eq!(previews[2]["label"], "Diff");
+        assert_eq!(previews[2]["text"], "- old\n+ new");
+
+        // No preview flags → no previews key at all.
+        let value = ask_args(&args(&["Q"])).expect("ask args");
+        assert!(value.get("previews").is_none());
+    }
+
+    #[test]
+    fn ask_args_preview_validation_fails_fast_client_side() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let err = ask_args(&args(&["Q", "--preview-html", "no-separator"])).unwrap_err();
+        assert!(err.contains("expects LABEL=VALUE"), "{err}");
+
+        let err =
+            ask_args(&args(&["Q", "--preview-html", "A=/nonexistent/proto.html"])).unwrap_err();
+        assert!(err.contains("failed to read"), "{err}");
+
+        // Image type must be inferable from the extension.
+        let odd = tmp.path().join("shot.tiff");
+        std::fs::write(&odd, [1u8, 2, 3]).unwrap();
+        let err = ask_args(&args(&[
+            "Q",
+            "--preview-image",
+            &format!("A={}", odd.display()),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("cannot infer an image type"), "{err}");
+
+        // Card cap derives from the tool's own constant, across kinds.
+        let mut over = vec!["Q".to_string()];
+        for i in 0..crate::mcp::ASK_USER_MAX_PREVIEWS + 1 {
+            over.push("--preview-text".to_string());
+            over.push(format!("t{i}=snippet"));
+        }
+        let err = ask_args(&over).unwrap_err();
+        assert!(err.contains("too many previews"), "{err}");
+
+        // Oversized html refuses before any network call.
+        let big = tmp.path().join("big.html");
+        std::fs::write(&big, "x".repeat(crate::mcp::ASK_USER_MAX_HTML_BYTES + 1)).unwrap();
+        let err = ask_args(&args(&[
+            "Q",
+            "--preview-html",
+            &format!("A={}", big.display()),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("max 2 MB"), "{err}");
     }
 
     #[test]
