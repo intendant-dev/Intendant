@@ -1056,6 +1056,53 @@ mod tests {
         drop(lifecycle_tx);
     }
 
+    /// A transient withdrawal failure (5xx, transport) schedules a retry;
+    /// once a withdrawal reports success — including a not-found rejection
+    /// `dns_publish_via_relay` maps to converged success because the record
+    /// is already absent — the reconciler stops scheduling attempts.
+    #[tokio::test]
+    async fn withdrawal_retries_transient_errors_and_stops_after_convergence() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (lifecycle_tx, lifecycle_rx) = watch::channel(false);
+        let (readiness_tx, readiness_rx) = watch::channel(false);
+        let calls_for_loop = Arc::clone(&calls);
+        let reconciler = tokio::spawn(relay_dns_reassert_loop_with(
+            false,
+            lifecycle_rx,
+            readiness_rx,
+            readiness_tx.clone(),
+            move |enable| {
+                let calls = Arc::clone(&calls_for_loop);
+                async move {
+                    let mut calls = calls.lock().unwrap();
+                    calls.push(enable);
+                    if calls.len() == 1 {
+                        Err("dns publish rejected: HTTP 500 Internal Server Error".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while calls.lock().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("no retry was scheduled after a transient withdrawal failure");
+        assert_eq!(calls.lock().unwrap().as_slice(), [false, false]);
+        // Converged: nothing may schedule another withdrawal attempt.
+        tokio::time::sleep(BACKOFF_MIN + Duration::from_millis(200)).await;
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [false, false],
+            "a successful withdrawal must stop the retry loop"
+        );
+        reconciler.abort();
+        drop(lifecycle_tx);
+    }
+
     #[tokio::test]
     async fn relay_dns_withdrawal_restores_direct_addresses_before_success() {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));

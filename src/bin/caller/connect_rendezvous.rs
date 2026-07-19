@@ -1906,6 +1906,24 @@ pub(crate) fn active_custom_domain_dns_fallback() -> Option<(&'static str, Strin
         .flatten()
 }
 
+/// A failed signed DNS mutation. `status` is present only when the rendezvous
+/// itself answered the request with a non-success HTTP status (a rejection);
+/// transport, signing, and serialization failures carry no status.
+#[derive(Debug)]
+struct DnsPostError {
+    status: Option<reqwest::StatusCode>,
+    message: String,
+}
+
+impl From<String> for DnsPostError {
+    fn from(message: String) -> Self {
+        Self {
+            status: None,
+            message,
+        }
+    }
+}
+
 async fn dns_signed_post(
     path: &str,
     protocol: &str,
@@ -1920,6 +1938,7 @@ async fn dns_signed_post(
         extra,
     )
     .await
+    .map_err(|failure| failure.message)
 }
 
 async fn dns_signed_post_with_context(
@@ -1928,7 +1947,7 @@ async fn dns_signed_post_with_context(
     protocol: &str,
     payload_tail: &str,
     extra: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, DnsPostError> {
     let daemon_public_key = identity.public_key_b64u();
     let cert_dir = crate::access::backend::select_backend().cert_dir();
     let now_unix_ms = crate::access::client_key::now_unix_ms().max(0) as u64;
@@ -1960,12 +1979,26 @@ async fn dns_signed_post_with_context(
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    decode_dns_post_response(response).await
+}
+
+/// Decode one rendezvous DNS-mutation response, preserving the HTTP status of
+/// a rejection so callers can distinguish not-found from transient failures.
+async fn decode_dns_post_response(
+    response: reqwest::Response,
+) -> Result<serde_json::Value, DnsPostError> {
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(format!("dns publish rejected: HTTP {status} {text}"));
+        return Err(DnsPostError {
+            status: Some(status),
+            message: format!("dns publish rejected: HTTP {status} {text}"),
+        });
     }
-    response.json().await.map_err(|e| e.to_string())
+    response
+        .json()
+        .await
+        .map_err(|error| DnsPostError::from(error.to_string()))
 }
 
 /// Publish this daemon's A/AAAA addresses for its fleet name. Returns
@@ -1998,7 +2031,8 @@ async fn dns_publish_addresses_with_context(
         &addresses_csv,
         serde_json::json!({ "addresses": addresses }),
     )
-    .await?;
+    .await
+    .map_err(|failure| failure.message)?;
     Ok(body
         .get("addresses")
         .and_then(|value| value.as_array())
@@ -2038,20 +2072,43 @@ pub(crate) async fn dns_acme_clear() -> Result<(), String> {
 /// label with the reachability relay's address (`enable = true`) so the name
 /// resolves to the relay, or revert to direct address publishing
 /// (`enable = false`). Best-effort: only meaningful when the rendezvous runs
-/// both fleet DNS and the relay.
+/// both fleet DNS and the relay. A withdrawal the rendezvous answers with
+/// not-found reports `Ok`: there is no relay record to withdraw there, which
+/// is exactly the state a withdrawal converges toward.
 pub(crate) async fn dns_publish_via_relay(
     config: &ConnectConfig,
     enable: bool,
 ) -> Result<(), String> {
-    dns_signed_post_with_context(
+    let result = dns_signed_post_with_context(
         signed_daemon_context_for_config(config.clone())?,
         "api/dns/relay",
         DNS_RELAY_PROTOCOL,
         if enable { "1" } else { "0" },
         serde_json::json!({ "enable": enable }),
     )
-    .await
-    .map(|_| ())
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(failure) if relay_withdrawal_already_converged(enable, &failure) => {
+            eprintln!(
+                "[relay] relay-mode dns withdrawal: nothing to withdraw ({}); converged",
+                failure.message
+            );
+            Ok(())
+        }
+        Err(failure) => Err(failure.message),
+    }
+}
+
+/// True when a relay-mode DNS mutation was a withdrawal (`enable == false`)
+/// and the rendezvous rejected it as not-found. HTTP 404 covers a rendezvous
+/// without relay or fleet-DNS support (feature or route absent) as well as
+/// one holding no record for this daemon — either way relay-mode DNS is not
+/// published there, the withdrawal's desired end state, so the caller reports
+/// success instead of retrying forever. Relay-mode *publish* (`enable ==
+/// true`) rejections and transient failures (5xx, transport) never converge.
+fn relay_withdrawal_already_converged(enable: bool, failure: &DnsPostError) -> bool {
+    !enable && failure.status == Some(reqwest::StatusCode::NOT_FOUND)
 }
 
 /* ── Pending-request attention nudge (attention_nudge.rs) ──
@@ -2289,6 +2346,79 @@ mod tests {
             join_url(&base, "api/daemon/next").unwrap().as_str(),
             "https://connect.example/root/api/daemon/next"
         );
+    }
+
+    #[test]
+    fn relay_withdrawal_not_found_converges_while_other_failures_retry() {
+        let not_found = DnsPostError {
+            status: Some(reqwest::StatusCode::NOT_FOUND),
+            message: "dns publish rejected: HTTP 404 Not Found ".to_string(),
+        };
+        // Withdrawal: the record is already absent — the desired end state.
+        assert!(relay_withdrawal_already_converged(false, &not_found));
+        // Publish path: a 404 stays an error (semantics unchanged).
+        assert!(!relay_withdrawal_already_converged(true, &not_found));
+        // Genuine transient failures keep retrying on both paths.
+        let server_error = DnsPostError {
+            status: Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            message: "dns publish rejected: HTTP 500 Internal Server Error ".to_string(),
+        };
+        assert!(!relay_withdrawal_already_converged(false, &server_error));
+        assert!(!relay_withdrawal_already_converged(true, &server_error));
+        // Transport-level failures carry no status and keep retrying.
+        let transport = DnsPostError::from("error sending request".to_string());
+        assert!(!relay_withdrawal_already_converged(false, &transport));
+    }
+
+    #[tokio::test]
+    async fn dns_post_rejections_preserve_the_http_status() {
+        let router = axum::Router::new()
+            .route(
+                "/ok",
+                axum::routing::post(|| async { axum::Json(serde_json::json!({ "ok": true })) }),
+            )
+            .route(
+                "/missing",
+                axum::routing::post(|| async { axum::http::StatusCode::NOT_FOUND }),
+            )
+            .route(
+                "/broken",
+                axum::routing::post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        let client = Client::builder().build().unwrap();
+
+        let ok = decode_dns_post_response(client.post(format!("{base}/ok")).send().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ok.get("ok").and_then(|value| value.as_bool()), Some(true));
+
+        let missing =
+            decode_dns_post_response(client.post(format!("{base}/missing")).send().await.unwrap())
+                .await
+                .unwrap_err();
+        assert_eq!(missing.status, Some(reqwest::StatusCode::NOT_FOUND));
+        assert!(
+            missing
+                .message
+                .starts_with("dns publish rejected: HTTP 404"),
+            "{}",
+            missing.message
+        );
+
+        let broken =
+            decode_dns_post_response(client.post(format!("{base}/broken")).send().await.unwrap())
+                .await
+                .unwrap_err();
+        assert_eq!(
+            broken.status,
+            Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        server.abort();
     }
 
     #[test]
