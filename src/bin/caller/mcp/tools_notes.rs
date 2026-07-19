@@ -45,7 +45,7 @@ pub(crate) struct DecodedSessionNoteImage {
     pub(crate) bytes: Vec<u8>,
 }
 
-fn canonical_note_image_mime(media_type: &str) -> Result<&'static str, String> {
+pub(crate) fn canonical_note_image_mime(media_type: &str) -> Result<&'static str, String> {
     let normalized = media_type.trim().to_ascii_lowercase();
     let normalized = match normalized.as_str() {
         "image/jpg" => "image/jpeg",
@@ -63,7 +63,7 @@ fn canonical_note_image_mime(media_type: &str) -> Result<&'static str, String> {
         })
 }
 
-fn note_image_extension(mime: &str) -> &'static str {
+pub(crate) fn note_image_extension(mime: &str) -> &'static str {
     match mime {
         "image/png" => "png",
         "image/jpeg" => "jpg",
@@ -74,14 +74,36 @@ fn note_image_extension(mime: &str) -> &'static str {
     }
 }
 
+/// Decode agent-supplied base64 tolerantly: an optional data-URL prefix
+/// and embedded whitespace are stripped (both are common in
+/// agent-produced base64), then the remainder must be valid standard
+/// base64 decoding to non-empty bytes.
+pub(crate) fn decode_flexible_base64(data: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let raw = data.trim();
+    let raw = match raw.split_once("base64,") {
+        Some((prefix, rest)) if prefix.starts_with("data:") => rest,
+        _ => raw,
+    };
+    let compact: String = raw.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    if compact.is_empty() {
+        return Err("empty base64 data".to_string());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(compact.as_bytes())
+        .map_err(|e| format!("invalid base64: {e}"))?;
+    if bytes.is_empty() {
+        return Err("decoded data is empty".to_string());
+    }
+    Ok(bytes)
+}
+
 /// Decode and validate the base64 images of a `post_session_note` call.
 /// Enforces the count / per-image / total caps and the raster-MIME
 /// allowlist with actionable error messages.
 pub(crate) fn decode_session_note_images(
     images: &[SessionNoteImageParams],
 ) -> Result<Vec<DecodedSessionNoteImage>, String> {
-    use base64::Engine as _;
-
     if images.len() > SESSION_NOTE_MAX_IMAGES {
         return Err(format!(
             "too many images: {} (max {SESSION_NOTE_MAX_IMAGES} per note)",
@@ -93,24 +115,8 @@ pub(crate) fn decode_session_note_images(
     for (index, image) in images.iter().enumerate() {
         let mime = canonical_note_image_mime(&image.media_type)
             .map_err(|e| format!("images[{index}]: {e}"))?;
-        // Tolerate a data-URL prefix and embedded whitespace — both are
-        // common in agent-produced base64 — then require valid standard
-        // base64 for the remainder.
-        let raw = image.data.trim();
-        let raw = match raw.split_once("base64,") {
-            Some((prefix, rest)) if prefix.starts_with("data:") => rest,
-            _ => raw,
-        };
-        let compact: String = raw.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-        if compact.is_empty() {
-            return Err(format!("images[{index}]: empty base64 data"));
-        }
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(compact.as_bytes())
-            .map_err(|e| format!("images[{index}]: invalid base64: {e}"))?;
-        if bytes.is_empty() {
-            return Err(format!("images[{index}]: decoded image is empty"));
-        }
+        let bytes =
+            decode_flexible_base64(&image.data).map_err(|e| format!("images[{index}]: {e}"))?;
         if bytes.len() > SESSION_NOTE_MAX_IMAGE_BYTES {
             return Err(format!(
                 "images[{index}]: {} bytes exceeds the {} MB per-image cap",
@@ -230,7 +236,7 @@ impl IntendantServer {
         let scope = crate::global_store::StoreScope::resolve(project_root.as_deref());
         let mut attachments: Vec<crate::types::SessionNoteAttachment> = Vec::new();
         for image in &decoded {
-            let committed = write_note_image_tempfile(&image.bytes).and_then(|tmp| {
+            let committed = write_blob_tempfile(&image.bytes).and_then(|tmp| {
                 crate::upload_store::commit_upload(
                     tmp,
                     &image.name,
@@ -285,13 +291,13 @@ impl IntendantServer {
     }
 }
 
-fn write_note_image_tempfile(bytes: &[u8]) -> Result<tempfile::NamedTempFile, String> {
+pub(crate) fn write_blob_tempfile(bytes: &[u8]) -> Result<tempfile::NamedTempFile, String> {
     use std::io::Write as _;
     let mut tmp =
         tempfile::NamedTempFile::new().map_err(|e| format!("failed to create tempfile: {e}"))?;
     tmp.write_all(bytes)
         .and_then(|_| tmp.flush())
-        .map_err(|e| format!("failed to write image tempfile: {e}"))?;
+        .map_err(|e| format!("failed to write blob tempfile: {e}"))?;
     Ok(tmp)
 }
 
