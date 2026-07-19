@@ -1674,11 +1674,13 @@ mod tests {
         assert_eq!(prober.primary_cache.len(), 1, "discovery cached");
 
         // The remote-tracking ref vanishes (remote pruned): the cached
-        // primary stops resolving. The failing tick degrades to 0/0 —
-        // the old chain's unwrap_or(0) — and invalidates the entry...
+        // primary stops resolving. The failing tick states NO
+        // primary-relative claims (fail open — an affirmative +0/−0
+        // against a dead ref would read as "in sync") and invalidates
+        // the entry...
         git_cmd(&work, &["update-ref", "-d", "refs/remotes/origin/main"]);
         let vitals = prober.probe(&work).await.expect("repo probes");
-        assert_eq!(vitals.primary_ref, "origin/main", "stale name for one tick");
+        assert_eq!(vitals.primary_ref, "", "no stale claim on the failed tick");
         assert_eq!((vitals.ahead, vitals.behind), (0, 0));
         assert!(
             prober.primary_cache.is_empty(),
