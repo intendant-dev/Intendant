@@ -510,6 +510,15 @@ function renderManagedContextAnchors() {
     btn.textContent = 'Use';
     btn.addEventListener('click', () => fillManagedContextAnchor(itemId, rowInfo.sessionId || sid));
     row.appendChild(btn);
+    const forkBtn = document.createElement('button');
+    forkBtn.type = 'button';
+    forkBtn.className = 'managed-context-btn';
+    forkBtn.textContent = 'Fork';
+    forkBtn.title = 'Fork the session at this anchor into a new session (the parent is untouched)';
+    forkBtn.addEventListener('click', () =>
+      managedContextForkFromAnchor(row, itemId, rowInfo.sessionId || sid)
+    );
+    row.appendChild(forkBtn);
     host.appendChild(row);
   }
   if (!host.childElementCount) {
