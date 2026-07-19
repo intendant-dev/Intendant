@@ -81,6 +81,10 @@ function ui2ApplyLayout(mode) {
   const grid = mode === 'grid';
   document.documentElement.dataset.ui2Layout = grid ? 'grid' : 'focus';
   try { localStorage.setItem('intendant.ui2.layout', grid ? 'grid' : 'focus'); } catch (e) { /* private mode */ }
+  // A layout flip moves the Arrange trigger (and leaving Grid hides the
+  // whole Arrange surface) — fully close the menu so its stamped anchor
+  // and aria-expanded never go stale (no-op while closed).
+  ui2CloseArrangeMenu();
   const fBtn = document.getElementById('ui2-layout-focus-btn');
   const gBtn = document.getElementById('ui2-layout-grid-btn');
   if (fBtn) fBtn.setAttribute('aria-pressed', String(!grid));
@@ -106,161 +110,146 @@ function ui2WireLayoutToggle() {
   }
 }
 
-// ── "Minimize done" bulk pill ──────────────────────────────────────────
-// Sits beside the layout toggle; visible only while at least one done
-// sub-agent window is still expanded, with the count of what one click
-// will collapse. The predicate is 41's sessionWindowIsDoneSubagent — the
-// same active boundary the parent "N sub" badge counts with — and the
-// click delegates to minimizeDoneSubagentWindows. Freshness: 40's badge
-// refreshes and the relationship render pass both call the rAF-deduped
-// refresher below.
-function ui2CollectExpandedDoneSubagents() {
-  const out = [];
-  if (typeof sessionWindows === 'undefined'
-      || typeof sessionWindowIsDoneSubagent !== 'function') return out;
+// ── The "Arrange ▾" menu: every bulk session-window sweep ──────────────
+// One compact toolbar button replacing the five standalone pills that had
+// accumulated beside the layout toggle (Minimize done, Hide done,
+// Collapse all/Expand all, Expand/Collapse details), plus the new
+// "Collapse sub-agents" sweep. Chrome consolidation only: every row
+// delegates to 41-session-window-actions.js's existing sweeps —
+//   expand-all / collapse-all → setAllSessionWindowsMinimized
+//   collapse-subs             → minimizeSubagentWindows (every sub-agent
+//                               window, working or finished; top-level
+//                               windows untouched)
+//   minimize-done             → minimizeDoneSubagentWindows
+//   hide-done                 → hideDoneSessionWindows
+//   details                   → setAllSessionWindowHeadersCollapsed
+// Grid-only like the pills it replaces (Focus hides the windows the
+// sweeps act on) via the stylesheet layout gate, and hidden while no
+// session window exists. Freshness: 40's badge refreshes and the
+// relationship render pass call the same (rAF-deduped) refresher the
+// pills rode, which now derives every row in one pass.
+
+// One walk over sessionWindows for every count the menu renders (each
+// retired pill used to run its own walk on the same freshness ticks).
+// Predicates are 41/40's shared boundaries: sessionWindowIsSubagent (the
+// relationship kind the badges use), sessionWindowIsDoneSubagent (the
+// "N sub" active boundary), sessionWindowHasHardDoneEvidence (ended /
+// done / interrupted — never bare idle).
+function ui2ArrangeMenuModel() {
+  const model = {
+    windows: 0, expanded: 0, minimized: 0,
+    subs: 0, subsExpanded: 0, doneSubsExpanded: 0,
+    hardDone: 0, detailsExpanded: 0,
+  };
+  if (typeof sessionWindows === 'undefined') return model;
+  const isSub = typeof sessionWindowIsSubagent === 'function' ? sessionWindowIsSubagent : null;
+  const isDoneSub = typeof sessionWindowIsDoneSubagent === 'function' ? sessionWindowIsDoneSubagent : null;
+  const isHardDone = typeof sessionWindowHasHardDoneEvidence === 'function' ? sessionWindowHasHardDoneEvidence : null;
   for (const [sid, win] of sessionWindows) {
-    if (!win || win.minimized) continue;
-    if (sessionWindowIsDoneSubagent(sid)) out.push(sid);
+    if (!win) continue;
+    model.windows += 1;
+    if (win.minimized) model.minimized += 1;
+    else {
+      model.expanded += 1;
+      if (!win.headerCollapsed) model.detailsExpanded += 1;
+    }
+    if (isSub && isSub(sid)) {
+      model.subs += 1;
+      if (!win.minimized) {
+        model.subsExpanded += 1;
+        if (isDoneSub && isDoneSub(sid)) model.doneSubsExpanded += 1;
+      }
+    }
+    if (isHardDone && isHardDone(sid)) model.hardDone += 1;
   }
-  return out;
+  return model;
 }
 
+function ui2ArrangeSetRow(id, spec) {
+  const row = document.getElementById(id);
+  if (!row) return;
+  row.hidden = !!spec.hidden;
+  row.disabled = !!spec.disabled;
+  if (spec.title) row.title = spec.title;
+  if (spec.label) {
+    const labelEl = row.querySelector('.ui2-arrange-item-label');
+    if (labelEl) labelEl.textContent = spec.label;
+  }
+  if (spec.direction) row.dataset.direction = spec.direction;
+  const countEl = row.querySelector('.ui2-arrange-count');
+  if (countEl) {
+    const show = typeof spec.count === 'number' && spec.count > 0;
+    countEl.hidden = !show;
+    countEl.textContent = String(show ? spec.count : 0);
+  }
+}
+
+// The single-pass refresh behind every freshness tick. Row policy: the
+// universal axes (windows, details) stay visible and disable when their
+// direction has nothing to act on, so the menu never jumps around; the
+// situational sweeps (sub-agents, finished-window hygiene) hide outright
+// while their concept is absent — a no-sub-agent, nothing-finished
+// session shows a three-row menu, not three dead rows.
+function ui2RefreshArrangeMenu() {
+  const btn = document.getElementById('ui2-arrange-btn');
+  if (!btn) return;
+  const m = ui2ArrangeMenuModel();
+  btn.hidden = m.windows === 0;
+  // A sweep can empty the grid under an open menu (Hide finished closes
+  // every card) — retire the popover with its trigger.
+  if (btn.hidden) ui2CloseArrangeMenu();
+  ui2ArrangeSetRow('ui2-arrange-expand-all', {
+    count: m.minimized,
+    disabled: m.minimized === 0,
+    title: 'Restore every minimized session window',
+  });
+  ui2ArrangeSetRow('ui2-arrange-collapse-all', {
+    count: m.expanded,
+    disabled: m.expanded === 0,
+    title: m.expanded === 1
+      ? 'Minimize the session window to its header bar'
+      : `Minimize all ${m.expanded} session windows to their header bars`,
+  });
+  ui2ArrangeSetRow('ui2-arrange-collapse-subs', {
+    count: m.subsExpanded,
+    hidden: m.subs === 0,
+    disabled: m.subsExpanded === 0,
+    title: m.subsExpanded === 1
+      ? 'Minimize the sub-agent window — top-level sessions stay in place'
+      : `Minimize all ${m.subsExpanded} sub-agent windows — working or finished — leaving top-level sessions in place`,
+  });
+  ui2ArrangeSetRow('ui2-arrange-minimize-done', {
+    count: m.doneSubsExpanded,
+    hidden: m.doneSubsExpanded === 0,
+    title: m.doneSubsExpanded === 1
+      ? 'Minimize the finished sub-agent window'
+      : `Minimize all ${m.doneSubsExpanded} finished sub-agent windows`,
+  });
+  ui2ArrangeSetRow('ui2-arrange-hide-done', {
+    count: m.hardDone,
+    hidden: m.hardDone === 0,
+    title: m.hardDone === 1
+      ? 'Hide the finished session card (its session stays in Sessions)'
+      : `Hide all ${m.hardDone} finished session cards (their sessions stay in Sessions)`,
+  });
+  const collapseDetails = m.detailsExpanded > 0;
+  ui2ArrangeSetRow('ui2-arrange-details', {
+    label: collapseDetails ? 'Collapse all details' : 'Expand all details',
+    direction: collapseDetails ? 'collapse' : 'expand',
+    title: collapseDetails
+      ? (m.detailsExpanded === 1
+          ? 'Collapse header details on the expanded session window'
+          : `Collapse header details on all ${m.detailsExpanded} expanded session windows`)
+      : 'Expand header details on every session window',
+  });
+}
+
+// Legacy seam: 40-session-launch.js's relationship-render pass still
+// calls the refresher by its pill-era name (directly at the render pass,
+// rAF-deduped from the badge refreshes) — keep both names routing into
+// the single-pass menu refresh.
 function ui2RefreshMinimizeDoneControl() {
-  const btn = document.getElementById('ui2-minimize-done-btn');
-  if (!btn) return;
-  const count = ui2CollectExpandedDoneSubagents().length;
-  const countEl = document.getElementById('ui2-minimize-done-count');
-  if (countEl) countEl.textContent = String(count);
-  btn.hidden = count === 0;
-  btn.title = count === 1
-    ? 'Minimize the finished sub-agent window'
-    : `Minimize all ${count} finished sub-agent windows`;
-  // The hide-done, collapse-all, and header-details pills ride the same
-  // freshness passes (badge refresh, relationship render, every minimize
-  // state change routes here).
-  ui2RefreshHideDoneControl();
-  ui2RefreshCollapseAllControl();
-  ui2RefreshHeaderDetailsControl();
-}
-
-// ── "Hide done" close sweep pill ───────────────────────────────────────
-// Beside "Minimize done" but the stronger hygiene action: CLOSE every
-// hard-done window's card (41's hideDoneSessionWindows — the same path
-// as the × button's "Hide card" choice), sub-agent or top-level alike.
-// Hard done evidence only (ended / phase done|interrupted — never bare
-// idle), so idle-parked and live windows always survive, and the closed
-// cards' sessions stay in the Sessions list, reopenable and replayable.
-// Hidden while nothing qualifies; grid-only via the stylesheet layout
-// gate like the sweep pills.
-function ui2CountHardDoneWindows() {
-  if (typeof sessionWindows === 'undefined'
-      || typeof sessionWindowHasHardDoneEvidence !== 'function') return 0;
-  let count = 0;
-  for (const sid of sessionWindows.keys()) {
-    if (sessionWindowHasHardDoneEvidence(sid)) count += 1;
-  }
-  return count;
-}
-
-function ui2RefreshHideDoneControl() {
-  const btn = document.getElementById('ui2-hide-done-btn');
-  if (!btn) return;
-  const count = ui2CountHardDoneWindows();
-  const countEl = document.getElementById('ui2-hide-done-count');
-  if (countEl) countEl.textContent = String(count);
-  btn.hidden = count === 0;
-  btn.title = count === 1
-    ? 'Hide the finished session card (its session stays in Sessions)'
-    : `Hide all ${count} finished session cards (their sessions stay in Sessions)`;
-}
-
-// ── "Collapse all / Expand all" grid sweep pill ────────────────────────
-// Beside "Minimize done", acting on EVERY session window (41's
-// setAllSessionWindowsMinimized): one click drops the grid to a stack of
-// header bars for an all-sessions glance, the next restores it. The
-// label always names the direction one click will act — any expanded
-// window means Collapse all, an all-minimized grid means Expand all.
-// Grid-only surface: Focus hides the session windows the sweep acts on,
-// so the stylesheet layout-gates the pill (html[data-ui2-layout]).
-function ui2RefreshCollapseAllControl() {
-  const btn = document.getElementById('ui2-collapse-all-btn');
-  if (!btn) return;
-  const windows = typeof sessionWindows !== 'undefined' ? sessionWindows : null;
-  if (!windows || windows.size === 0) {
-    btn.hidden = true;
-    return;
-  }
-  let expanded = 0;
-  for (const win of windows.values()) {
-    if (win && !win.minimized) expanded += 1;
-  }
-  const collapse = expanded > 0;
-  btn.hidden = false;
-  btn.dataset.direction = collapse ? 'collapse' : 'expand';
-  btn.textContent = collapse ? 'Collapse all' : 'Expand all';
-  btn.title = collapse
-    ? (expanded === 1
-        ? 'Minimize the session window to its header bar'
-        : `Minimize all ${expanded} session windows to their header bars`)
-    : 'Restore every minimized session window';
-  btn.setAttribute('aria-label', btn.title);
-}
-
-function ui2WireCollapseAllControl() {
-  const btn = document.getElementById('ui2-collapse-all-btn');
-  if (!btn) return;
-  btn.addEventListener('click', () => {
-    const collapse = btn.dataset.direction !== 'expand';
-    if (typeof setAllSessionWindowsMinimized === 'function') {
-      setAllSessionWindowsMinimized(collapse);
-    }
-    ui2RefreshMinimizeDoneControl();
-  });
-}
-
-// ── "Expand details / Collapse details" header sweep pill ──────────────
-// Beside "Collapse all", driving the OTHER axis: every window's
-// click-to-expand header-details strip (41's
-// setAllSessionWindowHeadersCollapsed) — vitals chips, git indicators,
-// paths, goal, tier, relationships — while the windows themselves stay
-// put. Direction counts NON-minimized windows only (the same visibility
-// boundary the sibling counts with); the sweep still flips minimized
-// windows so a later restore honors the choice. Grid-only via the same
-// stylesheet layout gate as its neighbor.
-function ui2RefreshHeaderDetailsControl() {
-  const btn = document.getElementById('ui2-header-details-btn');
-  if (!btn) return;
-  const windows = typeof sessionWindows !== 'undefined' ? sessionWindows : null;
-  if (!windows || windows.size === 0) {
-    btn.hidden = true;
-    return;
-  }
-  let expanded = 0;
-  for (const win of windows.values()) {
-    if (win && !win.minimized && !win.headerCollapsed) expanded += 1;
-  }
-  const collapse = expanded > 0;
-  btn.hidden = false;
-  btn.dataset.direction = collapse ? 'collapse' : 'expand';
-  btn.textContent = collapse ? 'Collapse details' : 'Expand details';
-  btn.title = collapse
-    ? (expanded === 1
-        ? 'Collapse header details on the expanded session window'
-        : `Collapse header details on all ${expanded} expanded session windows`)
-    : 'Expand header details on every session window';
-  btn.setAttribute('aria-label', btn.title);
-}
-
-function ui2WireHeaderDetailsControl() {
-  const btn = document.getElementById('ui2-header-details-btn');
-  if (!btn) return;
-  btn.addEventListener('click', () => {
-    const collapse = btn.dataset.direction !== 'expand';
-    if (typeof setAllSessionWindowHeadersCollapsed === 'function') {
-      setAllSessionWindowHeadersCollapsed(collapse);
-    }
-    ui2RefreshMinimizeDoneControl();
-  });
+  ui2RefreshArrangeMenu();
 }
 
 let ui2MinimizeDoneRefreshQueued = false;
@@ -269,27 +258,107 @@ function ui2QueueMinimizeDoneRefresh() {
   ui2MinimizeDoneRefreshQueued = true;
   requestAnimationFrame(() => {
     ui2MinimizeDoneRefreshQueued = false;
-    ui2RefreshMinimizeDoneControl();
+    ui2RefreshArrangeMenu();
   });
 }
 
-function ui2WireMinimizeDoneControl() {
-  const btn = document.getElementById('ui2-minimize-done-btn');
-  if (!btn) return;
-  btn.addEventListener('click', () => {
-    if (typeof minimizeDoneSubagentWindows === 'function') minimizeDoneSubagentWindows();
-    ui2RefreshMinimizeDoneControl();
-  });
-  ui2RefreshMinimizeDoneControl();
+// Menu close is callable from anywhere (ui2ApplyLayout runs it on every
+// layout flip), so it re-queries the DOM instead of riding the wire
+// closure. No-op while closed.
+function ui2CloseArrangeMenu() {
+  const menu = document.getElementById('ui2-arrange-menu');
+  const btn = document.getElementById('ui2-arrange-btn');
+  if (menu) menu.classList.remove('open');
+  if (btn) btn.setAttribute('aria-expanded', 'false');
 }
 
-function ui2WireHideDoneControl() {
-  const btn = document.getElementById('ui2-hide-done-btn');
-  if (!btn) return;
-  btn.addEventListener('click', () => {
-    if (typeof hideDoneSessionWindows === 'function') hideDoneSessionWindows();
-    ui2RefreshMinimizeDoneControl();
+function ui2RunArrangeAction(action, row) {
+  switch (action) {
+    case 'expand-all':
+    case 'collapse-all':
+      if (typeof setAllSessionWindowsMinimized === 'function') {
+        setAllSessionWindowsMinimized(action === 'collapse-all');
+      }
+      break;
+    case 'collapse-subs':
+      if (typeof minimizeSubagentWindows === 'function') minimizeSubagentWindows();
+      break;
+    case 'minimize-done':
+      if (typeof minimizeDoneSubagentWindows === 'function') minimizeDoneSubagentWindows();
+      break;
+    case 'hide-done':
+      if (typeof hideDoneSessionWindows === 'function') hideDoneSessionWindows();
+      break;
+    case 'details':
+      // Direction rides the row's data-direction so the label the user
+      // clicked and the sweep it runs can never disagree.
+      if (typeof setAllSessionWindowHeadersCollapsed === 'function') {
+        setAllSessionWindowHeadersCollapsed(row?.dataset.direction !== 'expand');
+      }
+      break;
+    default:
+      break;
+  }
+  ui2RefreshArrangeMenu();
+}
+
+// Popover mechanics copied from the Options wiring below: fixed-position
+// anchor stamped at open, outside-pointerdown + Escape close, resize
+// re-anchor. The off-log guard differs — the router only stamps .hidden
+// on the Options panel — so leaving the Timeline is observed on the log
+// sub-tab button's class instead (the stylesheet display gate already
+// keeps a stale .open invisible; this keeps aria in step).
+function ui2WireArrangeMenu() {
+  const btn = document.getElementById('ui2-arrange-btn');
+  const menu = document.getElementById('ui2-arrange-menu');
+  if (!btn || !menu) return;
+  const setOpen = (open) => {
+    if (!open) {
+      ui2CloseArrangeMenu();
+      return;
+    }
+    const r = btn.getBoundingClientRect();
+    menu.style.top = `${Math.round(r.bottom + 6)}px`;
+    menu.style.left = '';
+    menu.style.right = `${Math.max(8, Math.round(window.innerWidth - r.right))}px`;
+    // Counts are fresh at the moment the menu opens, whatever tick last
+    // painted them.
+    ui2RefreshArrangeMenu();
+    menu.classList.add('open');
+    btn.setAttribute('aria-expanded', 'true');
+  };
+  btn.addEventListener('click', () => setOpen(!menu.classList.contains('open')));
+  for (const row of menu.querySelectorAll('.ui2-arrange-item')) {
+    row.addEventListener('click', () => {
+      if (row.disabled) return;
+      ui2RunArrangeAction(row.dataset.arrangeAction, row);
+      // Menu semantics: an action dismisses the menu (counts re-derive on
+      // the next open; the sweep's own render pass keeps the grid live).
+      setOpen(false);
+      btn.focus();
+    });
+  }
+  document.addEventListener('pointerdown', (e) => {
+    if (!menu.classList.contains('open')) return;
+    if (menu.contains(e.target) || btn.contains(e.target)) return;
+    setOpen(false);
   });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || !menu.classList.contains('open')) return;
+    setOpen(false);
+    btn.focus();
+  });
+  const logBtn = document.querySelector('#activity-subtabs .subtab-btn[data-activity-tab="log"]');
+  if (logBtn) {
+    new MutationObserver(() => {
+      if (!logBtn.classList.contains('active') && menu.classList.contains('open')) setOpen(false);
+    }).observe(logBtn, { attributes: true, attributeFilter: ['class'] });
+  }
+  // position:fixed captures the anchor at open time — track resizes.
+  window.addEventListener('resize', () => {
+    if (menu.classList.contains('open')) setOpen(true);
+  });
+  ui2RefreshArrangeMenu();
 }
 
 // Composer dressing: placeholder copy + the attach glyph. The send
@@ -441,13 +510,25 @@ window.qa = Object.assign(window.qa || {}, {
       return log ? log.querySelectorAll('.log-entry').length : 0;
     })(),
   }),
-  // Sub-agent auto-minimize + the "Minimize done" pill: the count the
-  // pill shows, its visibility, and the per-subagent-window flag state
-  // the derivation runs on (the failure modes — a live window collapsed,
-  // a user-restored window re-collapsed — are silent without this).
-  minimizeDone: () => ({
-    count: ui2CollectExpandedDoneSubagents().length,
-    visible: !(document.getElementById('ui2-minimize-done-btn')?.hidden ?? true),
+  // The Arrange menu (successor of the pill-era qa.minimizeDone): the
+  // one-pass model every row derives from, the trigger/menu open state,
+  // each row's rendered label/count/state, and the per-subagent-window
+  // flag state the sweeps mutate (the failure modes — a live window
+  // collapsed, a user-restored window re-collapsed — are silent without
+  // this).
+  arrangeMenu: () => ({
+    model: ui2ArrangeMenuModel(),
+    buttonHidden: document.getElementById('ui2-arrange-btn')?.hidden ?? true,
+    expanded: document.getElementById('ui2-arrange-btn')?.getAttribute('aria-expanded') === 'true',
+    open: document.getElementById('ui2-arrange-menu')?.classList.contains('open') ?? false,
+    rows: [...document.querySelectorAll('#ui2-arrange-menu .ui2-arrange-item')].map((row) => ({
+      action: row.dataset.arrangeAction || '',
+      label: row.querySelector('.ui2-arrange-item-label')?.textContent || '',
+      count: row.querySelector('.ui2-arrange-count:not([hidden])')?.textContent || '',
+      hidden: !!row.hidden,
+      disabled: !!row.disabled,
+      direction: row.dataset.direction || '',
+    })),
     subagents: (typeof sessionWindows !== 'undefined'
       && typeof sessionWindowIsSubagent === 'function')
       ? [...sessionWindows.entries()]
@@ -772,10 +853,7 @@ function ui2RailTick(force) {
   const wire = () => {
     ui2AugmentApprovalPanel();
     ui2WireLayoutToggle();
-    ui2WireMinimizeDoneControl();
-    ui2WireHideDoneControl();
-    ui2WireCollapseAllControl();
-    ui2WireHeaderDetailsControl();
+    ui2WireArrangeMenu();
     ui2WireViewOptions();
     ui2DressComposer();
     ui2BuildVitalsRail();
