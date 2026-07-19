@@ -3356,12 +3356,13 @@ impl ClaudeCodeAgent {
     }
 
     /// Deliver an operator-goal notice to the model: queued as a prelude on
-    /// the next user message, always. Mid-turn stdin writes were the old
-    /// delivery for running turns, but 2.1.2xx discards user lines while a
-    /// turn runs (see `steer_turn`) — the notice would silently vanish. A
-    /// standalone user message is no better: it would start — and pay for —
-    /// a whole turn. The prelude path costs nothing and cannot be dropped;
-    /// a notice raced by an in-flight turn reaches the model one turn later.
+    /// the next user message, always. Mid-turn stdin absorption exists again
+    /// on current CLIs (see `steer_turn`), but its delivery is unconfirmable
+    /// (no stdout echo) and one CLI era (2.1.207) was observed discarding
+    /// such lines — a goal notice must never silently vanish, and a
+    /// standalone user message would start (and pay for) a whole turn. The
+    /// prelude path costs nothing and cannot be dropped; a notice raced by
+    /// an in-flight turn reaches the model one turn later.
     async fn deliver_goal_notice(&mut self, notice: String) -> Result<(), CallerError> {
         self.pending_goal_notice = match self.pending_goal_notice.take() {
             // Coalesce an undelivered notice instead of overwriting it —
@@ -3878,26 +3879,26 @@ impl ExternalAgent for ClaudeCodeAgent {
     }
 
     async fn steer_turn(&mut self, text: &str) -> Result<(), CallerError> {
-        // 2.1.200 absorbed a user message written mid-turn into the running
-        // turn; that was a bug, and 2.1.2xx removed it — the CLI silently
-        // DISCARDS stdin user lines while a turn is running (probed live on
-        // 2.1.207: the text never enters the conversation, no ack, no next
-        // turn; init capabilities advertise no replacement protocol yet).
-        // Writing the bytes anyway produced phantom "delivered" steers. So:
-        // report the truth and let the drain queue the steer for the turn
-        // boundary (the load-bearing "mid-turn steering not supported"
-        // wording — see external_steer_queue_reason), or, when no turn is
-        // running, hand it back as an immediate follow-up ("no active
-        // turn" marker).
-        let _ = text;
+        // A stdin user message written mid-turn is absorbed into the RUNNING
+        // turn at the CLI's next checkpoint (probed live on 2.1.215: a
+        // message injected during a tool call shaped that same turn's final
+        // reply; 2.1.207 was observed discarding such lines, 2.1.200
+        // absorbed them). The CLI never echoes the injected message on
+        // stream-json stdout, so delivery is inferred at the next model
+        // checkpoint via the drain's pending-runtime-steer tracking, and a
+        // line a discarding CLI eats would still be marked delivered at turn
+        // completion — accepted imprecision; the alternative is refusing
+        // native steering entirely and parking every steer until turn end.
         if !self.shared.turn_active.load(Ordering::SeqCst) {
             return Err(CallerError::ExternalAgent(
                 "claude-code has no active turn to steer".into(),
             ));
         }
-        Err(CallerError::ExternalAgent(
-            "mid-turn steering not supported by Claude Code 2.1.x — stream-json input applies user messages only at turn boundaries".into(),
-        ))
+        // Benign race: if the turn ends between the check above and this
+        // write, the CLI treats the line as the next turn's prompt — a
+        // spontaneous round the drain already supervises (same shape as a
+        // task-notification turn).
+        self.write_user_message(text).await
     }
 
     async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
@@ -4877,12 +4878,13 @@ mod tests {
     }
 
     /// The steer contract the drain keys on: idle → "no active turn"
-    /// (immediate follow-up path); running → "mid-turn steering not
-    /// supported" (queue-for-turn-boundary path). CC 2.1.2xx discards
-    /// stdin user lines mid-turn, so steer_turn never writes — writing
-    /// produced phantom "delivered" steers the model never saw.
+    /// (immediate follow-up path); running → write the user message onto
+    /// stdin (the CLI absorbs it into the running turn at its next
+    /// checkpoint — verified live on 2.1.215). Uninitialized here, so the
+    /// running case must fail on the WRITE (no writer yet), never with the
+    /// old "steering not supported" refusal.
     #[tokio::test]
-    async fn steer_reports_queue_semantics_instead_of_writing() {
+    async fn steer_writes_mid_turn_and_requires_active_turn() {
         let mut agent =
             ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
         let idle_err = agent.steer_turn("more context").await.unwrap_err();
@@ -4893,16 +4895,19 @@ mod tests {
         agent.shared.turn_active.store(true, Ordering::SeqCst);
         let running_err = agent.steer_turn("more context").await.unwrap_err();
         assert!(
-            running_err
-                .to_string()
-                .contains("mid-turn steering not supported"),
-            "got: {running_err}"
+            running_err.to_string().contains("Not initialized"),
+            "running steer should reach the stdin write path, got: {running_err}"
+        );
+        assert!(
+            !running_err.to_string().contains("not supported"),
+            "steering must no longer be refused as unsupported: {running_err}"
         );
     }
 
     /// Goal notices always queue as the next prompt's prelude — a mid-turn
-    /// stdin write would be discarded by the CLI, and consecutive notices
-    /// coalesce in order instead of overwriting each other.
+    /// stdin write is unconfirmable (and one CLI era discarded them), and
+    /// consecutive notices coalesce in order instead of overwriting each
+    /// other.
     #[tokio::test]
     async fn goal_notices_queue_and_coalesce() {
         let mut agent =
