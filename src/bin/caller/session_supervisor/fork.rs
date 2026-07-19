@@ -300,6 +300,123 @@ impl SessionSupervisor {
     /// Chain-slice the parent transcript into a fresh child uuid in the
     /// same project dir. Returns `(parent_backend_id, child_uuid,
     /// kept_lines, parent_project_root)`.
+    /// Service an EDIT of a claude-code user message as an anchor-fork
+    /// branch: Claude Code has no in-place rewind on the supervision wire
+    /// (its /rewind is an interactive TUI feature of the CLI itself), so
+    /// "edit turn N and redo" becomes "fork from before that message and
+    /// run the edited prompt in the child". The live lane's turn numbers
+    /// count this supervision run — not the transcript chain — so the
+    /// edited row is located by its exact original prose
+    /// (`claude_edit_branch_anchor`), refusing ambiguity rather than
+    /// guessing; the transcript's inline fork affordance covers refusals.
+    pub(crate) async fn fork_claude_edit_branch(
+        &self,
+        request: super::EditUserMessageRequest,
+        target: super::EditRouteTarget,
+    ) {
+        let sid = Some(target.managed_id.clone());
+        let turn = request.user_turn_index;
+        let Some(original_text) = request
+            .original_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+        else {
+            self.emit_edit_user_message_status(
+                sid,
+                turn,
+                "failed",
+                "the edited row carried no original text to locate in the transcript",
+            );
+            return;
+        };
+        self.emit_edit_user_message_status(
+            sid.clone(),
+            turn,
+            "running",
+            "Claude Code cannot rewind in place — branching into a new session from before this message",
+        );
+        let token = target.managed_id.clone();
+        let home = self.logs_home();
+        let backend_id = match persisted_external_identity_for_session_in_home(&home, &token) {
+            Some((source, id)) if source == "claude-code" => id,
+            Some((source, _)) => {
+                self.emit_edit_user_message_status(
+                    sid,
+                    turn,
+                    "failed",
+                    format!("session is a {source} session, not claude-code"),
+                );
+                return;
+            }
+            None => token.clone(),
+        };
+        let Some(transcript) = crate::web_gateway::find_claude_session_file(&home, &backend_id)
+        else {
+            self.emit_edit_user_message_status(
+                sid,
+                turn,
+                "failed",
+                format!("transcript for claude-code session {backend_id} not found"),
+            );
+            return;
+        };
+        let anchor = match tokio::task::spawn_blocking(move || {
+            crate::session_fork::claude_edit_branch_anchor(&transcript, &original_text)
+        })
+        .await
+        .unwrap_or_else(|err| Err(format!("anchor resolution task failed: {err}")))
+        {
+            Ok(anchor) => anchor,
+            Err(reason) => {
+                self.emit_edit_user_message_status(sid, turn, "failed", reason);
+                return;
+            }
+        };
+        if !request.attachments.is_empty() {
+            self.emit_edit_user_message_status(
+                sid.clone(),
+                turn,
+                "running",
+                "attachments are not carried into an edit branch yet — the edited text runs without them",
+            );
+        }
+        match self.fork_claude_session(&token, &anchor).await {
+            Ok((resolved_backend_id, child_uuid, kept_lines, parent_project_root)) => {
+                let child_short: String = child_uuid.chars().take(8).collect();
+                self.announce_claude_fork(
+                    "claude-code",
+                    resolved_backend_id,
+                    &anchor,
+                    None,
+                    Some(request.text.clone()),
+                    parent_project_root,
+                    Some(format!("edit-{}", request.requested_id)),
+                    child_uuid,
+                    kept_lines,
+                )
+                .await;
+                self.emit_edit_user_message_status(
+                    sid,
+                    turn,
+                    "ok",
+                    format!(
+                        "branched to {child_short} — the edited prompt runs there ({kept_lines} lines kept)"
+                    ),
+                );
+            }
+            Err(error) => {
+                self.emit_edit_user_message_status(
+                    sid,
+                    turn,
+                    "failed",
+                    format!("edit branch fork failed: {error}"),
+                );
+            }
+        }
+    }
+
     async fn fork_claude_session(
         &self,
         token: &str,
