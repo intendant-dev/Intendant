@@ -6791,10 +6791,12 @@ mod tests {
     }
 
     /// The canonical JSON framing (`Cache-Control` + `Connection` tail):
-    /// detail and context-snapshot responses, spelled out literally.
+    /// detail and context-snapshot responses, spelled out literally (the
+    /// serialization seam prepends the embedded bundle's build stamp).
     fn golden_session_json_transcript(status_line: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            crate::web_gateway::static_assets::app_build(),
             body.len()
         )
     }
@@ -6807,7 +6809,8 @@ mod tests {
     /// pinned separately below).
     fn golden_session_fleet_json_transcript(status_line: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\nVary: Origin\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nx-intendant-app-build: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\nVary: Origin\r\n\r\n{body}",
+            crate::web_gateway::static_assets::app_build(),
             body.len()
         )
     }
@@ -7396,7 +7399,8 @@ mod tests {
     /// The text/plain framing (report/asset error bodies), spelled out.
     fn golden_text_plain_transcript(status_line: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nx-intendant-app-build: {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            crate::web_gateway::static_assets::app_build(),
             body.len()
         )
     }
@@ -7404,7 +7408,8 @@ mod tests {
     /// The immutable-asset framing (recording segments, frame images).
     fn golden_public_asset_transcript(content_type: &str, bytes: &[u8]) -> Vec<u8> {
         let mut expected = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: public, max-age=3600\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: public, max-age=3600\r\nConnection: close\r\n\r\n",
+            crate::web_gateway::static_assets::app_build(),
             bytes.len()
         )
         .into_bytes();
@@ -7565,7 +7570,8 @@ mod tests {
         // builds byte-identical); the framing around them is the pin.
         let bytes = build_session_report_zip(&log_dir).unwrap();
         let mut expected = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"intendant-session-{session_id}.zip\"\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"intendant-session-{session_id}.zip\"\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+            crate::web_gateway::static_assets::app_build(),
             bytes.len()
         )
         .into_bytes();
@@ -7696,7 +7702,8 @@ mod tests {
         .await;
         let m3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.000,\nseg_00001.mp4\n#EXT-X-ENDLIST\n";
         let expected = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{m3u8}",
+            "HTTP/1.1 200 OK\r\nx-intendant-app-build: {}\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{m3u8}",
+            crate::web_gateway::static_assets::app_build(),
             m3u8.len()
         );
         assert_eq!(golden_transcript(&response), expected);
