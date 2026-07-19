@@ -926,6 +926,7 @@ window.qa = Object.assign(window.qa || {}, {
   sessionWindowSweeps: {
     build: (sessionId, meta) => !!ensureSessionWindow(sessionId, meta || {}),
     setMinimized: (sessionId, minimized) => setSessionWindowMinimized(sessionId, !!minimized),
+    relate: (evt) => applySessionRelationship(evt || {}),
     windowIds: () => [...sessionWindows.keys()],
     windowState: (sessionId) => {
       const sid = String(sessionId || '').trim();
