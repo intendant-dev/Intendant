@@ -165,8 +165,8 @@ JSON-serializable snapshot. Current probes: `qa.sessionsHydration()`
 `qa.sessionsFuel()` (new-session credential preflight,
 `55b-session-launch.js`), `qa.newSessionAgentPrefs()` (last-used
 launch-option prefill state, same fragment), `qa.focusSurface()` (Activity
-Focus target/promotion state), `qa.minimizeDone()` (sub-agent auto-minimize
-and bulk-control state), and `qa.station()` — a pointer to
+Focus target/promotion state), `qa.arrangeMenu()` (the Arrange menu's
+bulk-sweep rows, counts, and sub-agent auto-minimize state), and `qa.station()` — a pointer to
 `window.stationProbe`, which predates the namespace and keeps its legacy name
 (the validator's `--station-*` probes and smoke skills depend on it).
 `window.__intendantPaneDiag` above is the other legacy surface.

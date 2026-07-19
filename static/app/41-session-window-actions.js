@@ -871,6 +871,31 @@ function setAllSessionWindowsMinimized(minimized) {
   return changed;
 }
 
+// Bulk sweep behind the Arrange menu's "Collapse sub-agents" row
+// (ui2-activity.js owns the menu): minimize EVERY sub-agent window —
+// working or finished alike (predicate: sessionWindowIsSubagent, the
+// same relationship boundary the badges and the done-sub sweeps share) —
+// leaving top-level windows untouched. The middle ground between
+// "Collapse all" (everything) and "Minimize done" (finished subs only):
+// a parent fanning out work keeps its own transcript on screen while the
+// whole fan-out drops to header bars. Manual-sweep semantics exactly
+// like setAllSessionWindowsMinimized's collapse direction: autoMinimized
+// stays false so the done→active crossing never pops open a window the
+// user swept closed, and userRestoredWhileDone re-arms false. Returns
+// how many windows changed state.
+function minimizeSubagentWindows() {
+  let changed = 0;
+  for (const [sid, win] of sessionWindows) {
+    if (!win || win.minimized) continue;
+    if (!sessionWindowIsSubagent(sid)) continue;
+    win.autoMinimized = false;
+    win.userRestoredWhileDone = false;
+    setSessionWindowMinimized(sid, true);
+    changed += 1;
+  }
+  return changed;
+}
+
 // Bulk header-details sweep behind the "Expand details / Collapse
 // details" pill (ui2-activity.js owns the button): flips every window's
 // click-to-expand header strip — vitals chips, git indicators, PROJ/CWD
@@ -2785,9 +2810,15 @@ function appendEditUserMessageButton(entry, c) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = 'log-edit-message';
+  const meta = typeof sessionConfigMetadata === 'function'
+    ? sessionConfigMetadata(String(c?.session_id || ''))
+    : null;
+  const editSource = typeof sessionConfigSource === 'function' ? sessionConfigSource(meta) : '';
   btn.title = c.superseded
     ? 'Create a managed branch from this historical message'
-    : 'Edit this user message and rerun from here';
+    : editSource === 'claude-code'
+      ? 'Edit this message and branch: the edited prompt reruns in a new session (Claude Code cannot rewind in place)'
+      : 'Edit this user message and rerun from here';
   btn.innerHTML = '&#9998;';
   btn.dataset.sessionId = c.session_id || '';
   btn.dataset.userTurnIndex = String(c.user_turn_index);

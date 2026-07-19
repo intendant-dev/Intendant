@@ -729,6 +729,7 @@ impl OutputHub {
 pub struct PtySession {
     master: StdMutex<Box<dyn MasterPty + Send>>,
     writer: StdMutex<Box<dyn Write + Send>>,
+    child_killer: StdMutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     output: StdMutex<OutputHub>,
     alive: StdMutex<bool>,
     /// Windows: the refcounted RESTRICTED ACE grants for this session's
@@ -830,6 +831,7 @@ impl PtySession {
             }
         };
 
+        let child_killer = child.clone_killer();
         let reader = pair
             .master
             .try_clone_reader()
@@ -842,6 +844,7 @@ impl PtySession {
         let session = Arc::new(Self {
             master: StdMutex::new(pair.master),
             writer: StdMutex::new(writer),
+            child_killer: StdMutex::new(child_killer),
             output: StdMutex::new(OutputHub::new(SCROLLBACK_LIMIT)),
             alive: StdMutex::new(true),
             #[cfg(windows)]
@@ -1054,6 +1057,14 @@ impl PtySession {
         self.alive.lock().map(|g| *g).unwrap_or(false)
     }
 
+    fn terminate(&self) {
+        let mut killer = self
+            .child_killer
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _ = killer.kill();
+    }
+
     pub fn shared(&self) -> bool {
         self.shared.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -1128,6 +1139,33 @@ struct OpeningSlot {
     /// is abandoned — a failed replacement must leave the registry as
     /// the spawn-under-lock code did (dead session still present).
     prev: Option<Arc<PtySession>>,
+}
+
+/// Owns a newly spawned shell until the registry publishes it. Dropping an
+/// opener task while it waits to re-acquire the registry lock must terminate
+/// the shell rather than leave the reader thread as its only owner.
+struct UnpublishedPtyGuard {
+    session: Option<Arc<PtySession>>,
+}
+
+impl UnpublishedPtyGuard {
+    fn new(session: Arc<PtySession>) -> Self {
+        Self {
+            session: Some(session),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.session = None;
+    }
+}
+
+impl Drop for UnpublishedPtyGuard {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.terminate();
+        }
+    }
 }
 
 /// Whether `entry` is this exact reservation (and not a later slot that
@@ -1299,15 +1337,26 @@ impl TerminalRegistry {
 
             return match spawned {
                 Ok(session) => {
-                    {
+                    let mut unpublished = UnpublishedPtyGuard::new(session.clone());
+                    let published = {
                         let mut guard = self.sessions.write().await;
                         if slot_is_current(guard.get(&key), &slot) {
                             guard.insert(key.clone(), SessionSlot::Live(session.clone()));
+                            unpublished.disarm();
+                            true
+                        } else {
+                            false
                         }
-                    }
+                    };
                     // Wake waiters only after the map shows the result.
                     let _ = done.send(true);
-                    Ok((session, true))
+                    if published {
+                        Ok((session, true))
+                    } else {
+                        Err(TerminalOpenError::Spawn(
+                            "terminal spawn reservation was replaced".to_string(),
+                        ))
+                    }
                 }
                 Err(err) => {
                     {
@@ -1722,6 +1771,87 @@ mod tests {
         assert!(session.is_alive());
         assert_eq!(registry.len().await, 1);
         registry.close_visible(&key, &TerminalActor::Root).await;
+    }
+
+    /// Cancellation after the child exists but before publication must not
+    /// leave the shell running under the reader thread's `Arc`. Hold the
+    /// registry write lock while the spawner returns so the opener parks at
+    /// exactly that handoff, then abort it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_open_terminates_unpublished_shell() {
+        let registry = Arc::new(TerminalRegistry::new(std::env::temp_dir()));
+        let key = TerminalKey::local("cancel-after-spawn");
+        let (spawned_tx, spawned_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let (returning_tx, returning_rx) = std::sync::mpsc::sync_channel(1);
+
+        let opener = {
+            let registry = registry.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                registry
+                    .open_or_attach_with(key, &TerminalActor::Root, true, move || {
+                        let session = PtySession::spawn(
+                            80,
+                            24,
+                            Some(std::env::temp_dir()),
+                            None,
+                            false,
+                            None,
+                        )?;
+                        spawned_tx
+                            .send(session.clone())
+                            .map_err(|_| "test receiver dropped".to_string())?;
+                        release_rx
+                            .recv_timeout(Duration::from_secs(30))
+                            .map_err(|_| "test release timed out".to_string())?;
+                        let _ = returning_tx.send(());
+                        Ok(session)
+                    })
+                    .await
+            })
+        };
+
+        let session = spawned_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("shell must spawn");
+        assert!(session.is_alive());
+
+        // The reservation already exists, so this lock acquisition does
+        // not block on the spawner. Releasing the spawner while holding it
+        // forces the opener's next await to park before publication.
+        let registry_guard = registry.sessions.write().await;
+        release_tx.send(()).unwrap();
+        returning_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("spawner must return");
+        opener.abort();
+        let cancelled = match opener.await {
+            Err(err) => err,
+            Ok(_) => panic!("opener completed despite cancellation"),
+        };
+        assert!(cancelled.is_cancelled());
+        drop(registry_guard);
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while session.is_alive() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("unpublished shell must terminate after opener cancellation");
+
+        // A waiter still performs the existing reservation repair after
+        // the cancelled opener drops its completion sender.
+        let slot = {
+            let guard = registry.sessions.read().await;
+            match guard.get(&key) {
+                Some(SessionSlot::Opening(slot)) => slot.clone(),
+                _ => panic!("cancelled opener must leave its reservation for waiter repair"),
+            }
+        };
+        registry.await_opening(&key, slot).await;
+        assert_eq!(registry.len().await, 0);
     }
 
     /// The ownership model end to end: private sessions are invisible to

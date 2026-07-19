@@ -689,6 +689,35 @@ fn context_window_from_model_usage(model_usage: &serde_json::Value, model: &str)
     entry.get("contextWindow").and_then(|v| v.as_u64())
 }
 
+/// Known context windows by model-id family, per Anthropic's model catalog:
+/// the Claude 5 family (Fable/Mythos/Sonnet 5), Opus 4.6+, and Sonnet 4.6
+/// are 1M-window models; Haiku 4.5 is 200k. Matched on the id prefix so
+/// dated snapshot ids (`claude-haiku-4-5-20251001`) resolve too. Only a
+/// fallback: an explicit `modelUsage.contextWindow` report always wins.
+/// Without this, a 1M-window session whose results never state a window is
+/// divided by the 200k default — the footprint/window clamp then pins the
+/// context meter at exactly 100% for the whole session (observed live on a
+/// claude-fable-5 session at 442k real footprint).
+fn claude_model_context_window(model: &str) -> Option<u64> {
+    const ONE_M: u64 = 1_000_000;
+    let model = model.trim();
+    for (prefix, window) in [
+        ("claude-fable-5", ONE_M),
+        ("claude-mythos-5", ONE_M),
+        ("claude-opus-4-8", ONE_M),
+        ("claude-opus-4-7", ONE_M),
+        ("claude-opus-4-6", ONE_M),
+        ("claude-sonnet-5", ONE_M),
+        ("claude-sonnet-4-6", ONE_M),
+        ("claude-haiku-4-5", 200_000),
+    ] {
+        if model.starts_with(prefix) {
+            return Some(window);
+        }
+    }
+    None
+}
+
 /// Map Intendant's configured permission mode onto Claude Code's CLI
 /// values. Always yields a flag value — `default` included: when
 /// `--permission-mode` is omitted the CLI resolves its default from the
@@ -970,6 +999,58 @@ struct CcTaskSpawn {
     model: Option<String>,
 }
 
+/// Per-block cap on buffered streamed thinking text. Thinking blocks can
+/// be long (extended-thinking budgets) but not unbounded; past the cap the
+/// tail is dropped and the drain appends a truncation marker.
+const THINKING_BUFFER_MAX_BYTES: usize = 512 * 1024;
+/// Cap on a buffered streamed signature (real ones are a few hundred
+/// bytes; a truncated signature simply won't match its envelope copy and
+/// the drain falls back to FIFO order).
+const THINKING_SIGNATURE_MAX_BYTES: usize = 4 * 1024;
+/// Cap on concurrently buffered thinking blocks across all scopes —
+/// defensive only: buffers drain on their envelope and clear at
+/// message/turn/child boundaries, so this is reachable only if the wire
+/// misbehaves. Oldest entries are evicted first.
+const THINKING_BUFFER_MAX_BLOCKS: usize = 32;
+
+/// One thinking block's streamed text, accumulated from `thinking_delta`
+/// stream events until the completed assistant envelope drains it
+/// (`CcReader::thinking_buffers`). Print-mode Claude Code ≥ 2.1.211 no
+/// longer materializes thinking text into the assistant envelope — the
+/// block arrives as `{"thinking":"","signature":…}` and the deltas hold
+/// the only copy — while older CLIs still materialize it; buffering plus
+/// a consume-always drain serves both without ever emitting twice.
+#[derive(Default)]
+struct CcThinkingBuffer {
+    /// RAW wrapper `parent_tool_use_id` (None = the main thread).
+    scope: Option<String>,
+    /// The block's `content_block_*` stream index within its API message.
+    index: u64,
+    /// Accumulated `thinking_delta` text (capped).
+    text: String,
+    /// Accumulated `signature_delta` — equals the completed block's
+    /// `signature` when the CLI provides one.
+    signature: String,
+    /// The text cap was hit; the drain appends a truncation marker.
+    truncated: bool,
+}
+
+/// Append `src` to `dst` under a byte cap, cutting at a char boundary;
+/// returns true when anything was dropped.
+fn append_capped(dst: &mut String, src: &str, cap: usize) -> bool {
+    let remaining = cap.saturating_sub(dst.len());
+    if src.len() <= remaining {
+        dst.push_str(src);
+        return false;
+    }
+    let mut cut = remaining;
+    while cut > 0 && !src.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    dst.push_str(&src[..cut]);
+    true
+}
+
 /// Line-by-line interpreter for Claude Code's stream-json stdout. Pure with
 /// respect to I/O — `process_line` returns the events to emit and any
 /// auto-responses to write — so the protocol mapping is unit-testable
@@ -1044,6 +1125,9 @@ struct CcReader {
     /// Most recent model name seen (init message / message_start).
     model: String,
     context_window: u64,
+    /// The window came from an explicit `modelUsage.contextWindow` report;
+    /// once true, model-echo fallbacks never overwrite it.
+    context_window_reported: bool,
     /// Raw usage of the turn's most recent API call (`message_delta`).
     /// The turn `result`'s own usage SUMS every call in the turn — spend,
     /// not footprint — so the end-of-turn context meter re-emits this
@@ -1057,6 +1141,10 @@ struct CcReader {
     /// the 5-minute default — wrong for every 1-hour-cache session
     /// (subscription Claude Code).
     cache_ttl_flavor: Option<u32>,
+    /// Streamed thinking text accumulated per open block, in arrival order
+    /// (the drain is FIFO within a scope). See `CcThinkingBuffer` for why
+    /// the deltas must be kept at all.
+    thinking_buffers: Vec<CcThinkingBuffer>,
     last_intendant_mcp_status: Option<String>,
     init_logged: bool,
     /// The echoed effective permission mode a divergence warning was
@@ -1092,8 +1180,10 @@ impl CcReader {
             limit_windows: std::collections::BTreeMap::new(),
             model: "claude".to_string(),
             context_window: DEFAULT_CONTEXT_WINDOW,
+            context_window_reported: false,
             last_call_usage: None,
             cache_ttl_flavor: None,
+            thinking_buffers: Vec::new(),
             last_intendant_mcp_status: None,
             init_logged: false,
             permission_mode_warned: None,
@@ -1110,6 +1200,14 @@ impl CcReader {
             return;
         }
         self.model = model.to_string();
+        // No result has stated a window yet: size the meter from the model
+        // family instead of the 200k default (a 1M-window model against the
+        // default reads as a meter pinned at 100%).
+        if !self.context_window_reported {
+            if let Some(window) = claude_model_context_window(model) {
+                self.context_window = window;
+            }
+        }
         out.events.push(AgentEvent::ConfigFacts {
             facts: crate::types::SessionConfigVitals {
                 model: Some(model.to_string()),
@@ -1187,8 +1285,11 @@ impl CcReader {
 
         // In-band sub-agent activity: assistant/user envelopes carry the
         // spawning tool_use id as top-level `parent_tool_use_id`. Route the
-        // whole envelope to the child's synthetic session. (Only complete
-        // envelopes are tagged — stream_events are always main-thread.)
+        // whole envelope to the child's synthetic session. (Complete
+        // envelopes only — stream_events are never routed here: their one
+        // per-scope concern, the thinking buffers, reads the raw tag itself
+        // in `handle_stream_event`, and their activity claims stay
+        // main-thread.)
         if matches!(msg_type, "assistant" | "user") {
             if let Some(child_id) = self.task_scope_for(&msg, &mut out) {
                 let mut child_out = CcLineOutcome::default();
@@ -1348,6 +1449,10 @@ impl CcReader {
             }
             _ => return,
         };
+        // Thread-scope boundary: the child's undrained streamed thinking
+        // (interrupted mid-block) must not leak into a resumed run's
+        // blocks.
+        self.clear_thinking_buffers_for_scope(Some(tool_use_id));
         let owned: Vec<String> = self
             .open_tools
             .iter()
@@ -1859,6 +1964,10 @@ impl CcReader {
         else {
             return;
         };
+        // The thinking buffers' scope key — the RAW wrapper tag, matching
+        // how the streamed deltas were buffered (deliberately not the
+        // resolved child id `child_scope` carries).
+        let thinking_scope = Self::thinking_scope(msg);
         for block in content {
             match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                 "text" => {
@@ -1869,12 +1978,26 @@ impl CcReader {
                     }
                 }
                 "thinking" => {
-                    if let Some(text) = block.get("thinking").and_then(|t| t.as_str()) {
-                        if !text.trim().is_empty() {
-                            out.events.push(AgentEvent::Reasoning {
-                                text: text.to_string(),
-                            });
-                        }
+                    // Print-mode Claude Code ≥ 2.1.211 ships this block with
+                    // empty text (`{"thinking":"","signature":…}`) — the
+                    // real text exists only in the streamed thinking_deltas
+                    // buffered by `handle_stream_event`. Older CLIs still
+                    // materialize it here. Always consume the buffered copy
+                    // so the two sources can never double-emit, then prefer
+                    // the envelope's own text when it has one.
+                    let signature = block
+                        .get("signature")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let buffered = self.take_thinking_buffer(thinking_scope.as_deref(), signature);
+                    let envelope = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                    let text = if envelope.trim().is_empty() {
+                        buffered.unwrap_or_default()
+                    } else {
+                        envelope.to_string()
+                    };
+                    if !text.trim().is_empty() {
+                        out.events.push(AgentEvent::Reasoning { text });
                     }
                 }
                 "tool_use" => {
@@ -2235,6 +2358,95 @@ impl CcReader {
         }
     }
 
+    /// The RAW top-level `parent_tool_use_id` of a wrapper line — the
+    /// thinking buffers' scope key (None = the main thread). Deliberately
+    /// not `task_scope_for`'s resolved child id: the same raw value tags a
+    /// scope's stream_events and its completed envelopes, which is exactly
+    /// the pairing the buffers need, and reading it has no
+    /// child-materializing side effects.
+    fn thinking_scope(msg: &serde_json::Value) -> Option<String> {
+        msg.get("parent_tool_use_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Accumulate one streamed `thinking_delta` into its block's buffer
+    /// (created on first sight).
+    fn buffer_thinking_delta(&mut self, scope: Option<String>, index: u64, text: &str) {
+        let entry = self.thinking_buffer_entry(scope, index);
+        if append_capped(&mut entry.text, text, THINKING_BUFFER_MAX_BYTES) {
+            entry.truncated = true;
+        }
+    }
+
+    /// Record a thinking block's streamed signature — the drain key that
+    /// pairs the buffer with its completed envelope copy.
+    fn buffer_thinking_signature(&mut self, scope: Option<String>, index: u64, sig: &str) {
+        let entry = self.thinking_buffer_entry(scope, index);
+        append_capped(&mut entry.signature, sig, THINKING_SIGNATURE_MAX_BYTES);
+    }
+
+    fn thinking_buffer_entry(
+        &mut self,
+        scope: Option<String>,
+        index: u64,
+    ) -> &mut CcThinkingBuffer {
+        if let Some(pos) = self
+            .thinking_buffers
+            .iter()
+            .position(|b| b.scope == scope && b.index == index)
+        {
+            return &mut self.thinking_buffers[pos];
+        }
+        if self.thinking_buffers.len() >= THINKING_BUFFER_MAX_BLOCKS {
+            // Oldest first — the newest block is the one whose envelope
+            // drain is nearest.
+            self.thinking_buffers.remove(0);
+        }
+        self.thinking_buffers.push(CcThinkingBuffer {
+            scope,
+            index,
+            ..Default::default()
+        });
+        self.thinking_buffers.last_mut().expect("just pushed")
+    }
+
+    /// Remove and return the buffered streamed thinking for a completed
+    /// block — the signature match when both sides have one, else the
+    /// oldest buffered block in the same scope (blocks complete in stream
+    /// order, and message/turn/child boundaries clear leftovers, so FIFO
+    /// within a scope pairs correctly). None when nothing was buffered.
+    fn take_thinking_buffer(&mut self, scope: Option<&str>, signature: &str) -> Option<String> {
+        let pos = (!signature.is_empty())
+            .then(|| {
+                self.thinking_buffers
+                    .iter()
+                    .position(|b| b.scope.as_deref() == scope && b.signature == signature)
+            })
+            .flatten()
+            .or_else(|| {
+                self.thinking_buffers
+                    .iter()
+                    .position(|b| b.scope.as_deref() == scope)
+            })?;
+        let entry = self.thinking_buffers.remove(pos);
+        let mut text = entry.text;
+        if entry.truncated {
+            text.push_str("\n… [thinking truncated]");
+        }
+        Some(text)
+    }
+
+    /// Drop buffered thinking for one scope (see the `message_start`,
+    /// `handle_result`, and `emit_task_terminal` call sites for the
+    /// boundary semantics).
+    fn clear_thinking_buffers_for_scope(&mut self, scope: Option<&str>) {
+        self.thinking_buffers
+            .retain(|b| b.scope.as_deref() != scope);
+    }
+
     fn handle_stream_event(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         let Some(event) = msg.get("event") else {
             return;
@@ -2270,13 +2482,37 @@ impl CcReader {
                             }
                             self.observe_activity(ActivityObs::ResponseDelta, out);
                         }
-                        // thinking_delta CONTENT stays skipped (reasoning is
-                        // emitted once per completed block from the assistant
-                        // message) — but each delta is the live heartbeat that
-                        // keeps the "Thinking" activity claim honest.
+                        // thinking_delta content still renders nothing here —
+                        // reasoning emits once per completed block from the
+                        // assistant envelope — but print-mode CLIs ≥ 2.1.211
+                        // ship that envelope block with EMPTY text
+                        // (`{"thinking":"","signature":…}`), so the deltas
+                        // are the only copy of the thinking text: accumulate
+                        // them for `handle_assistant`'s thinking arm to
+                        // drain. Each delta also stays the live heartbeat
+                        // that keeps the "Thinking" activity claim honest.
+                        "thinking_delta" => {
+                            if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
+                                let index =
+                                    event.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                                self.buffer_thinking_delta(Self::thinking_scope(msg), index, text);
+                            }
+                            self.observe_activity(ActivityObs::ReasoningDelta, out);
+                        }
                         // signature_delta closes a thinking block and counts
-                        // as the same reasoning-stream evidence.
-                        "thinking_delta" | "signature_delta" => {
+                        // as the same reasoning-stream evidence; the
+                        // signature doubles as the drain key that pairs a
+                        // buffered block with its completed envelope copy.
+                        "signature_delta" => {
+                            if let Some(sig) = delta.get("signature").and_then(|s| s.as_str()) {
+                                let index =
+                                    event.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                                self.buffer_thinking_signature(
+                                    Self::thinking_scope(msg),
+                                    index,
+                                    sig,
+                                );
+                            }
                             self.observe_activity(ActivityObs::ReasoningDelta, out);
                         }
                         // Streamed tool-call arguments: response bytes.
@@ -2288,6 +2524,12 @@ impl CcReader {
                 }
             }
             "message_start" => {
+                // A new API message in this scope: every prior block's
+                // envelope already had its drain chance, so leftover
+                // thinking buffers (killed turn, envelope never emitted)
+                // are stale — drop them before this message's blocks
+                // stream, or they would FIFO-pair with the wrong block.
+                self.clear_thinking_buffers_for_scope(Self::thinking_scope(msg).as_deref());
                 let message = event.get("message");
                 if let Some(model) = message
                     .and_then(|m| m.get("model"))
@@ -2328,6 +2570,11 @@ impl CcReader {
     fn handle_result(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         let was_interrupt = self.shared.interrupt_pending.swap(false, Ordering::SeqCst);
         self.shared.turn_active.store(false, Ordering::SeqCst);
+        // Turn boundary: main-thread thinking buffers are stale (their
+        // envelopes already drained or died with the turn). Child-scoped
+        // buffers survive — async sub-agents legitimately stream past the
+        // turn's result and drain on their own envelopes / terminals.
+        self.clear_thinking_buffers_for_scope(None);
         // Every result path — success, error, interrupt — ends the turn's
         // activity claim. (The absorbed out-of-band /compact result is a
         // no-op here: no turn was dispatched, the machine is already idle.)
@@ -2336,6 +2583,7 @@ impl CcReader {
         if let Some(model_usage) = msg.get("modelUsage") {
             if let Some(window) = context_window_from_model_usage(model_usage, &self.model) {
                 self.context_window = window;
+                self.context_window_reported = true;
             }
         }
         if self.shared.compact_pending.swap(false, Ordering::SeqCst)
@@ -3720,6 +3968,16 @@ mod tests {
         })
     }
 
+    fn reasoning_texts(out: &CcLineOutcome) -> Vec<String> {
+        out.events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Reasoning { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The wire → activity mapping: thinking blocks (and their live
     /// deltas) are the ONLY ground for a reasoning claim; text/args
     /// deltas respond; tool_use runs tools; tool results settle back to
@@ -4834,6 +5092,189 @@ mod tests {
         assert!(reader.open_tools.contains_key("t1"));
     }
 
+    /// Print-mode CLIs ≥ 2.1.211 ship the completed envelope's thinking
+    /// block with EMPTY text — the streamed deltas are the only copy, and
+    /// the envelope drain must recover it (exactly once, from the buffer).
+    #[test]
+    fn reader_recovers_thinking_from_deltas_when_envelope_is_empty() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The user wants "}},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"a fix."}},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-1"}},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"","signature":"sig-1"},{"type":"text","text":"On it."}]},"session_id":"s1"}"#,
+        );
+        assert_eq!(reasoning_texts(&out), vec!["The user wants a fix."]);
+        assert!(
+            reader.thinking_buffers.is_empty(),
+            "the envelope drain must consume the buffered block"
+        );
+    }
+
+    /// Older CLIs (≤ 2.1.210) still materialize the thinking text into the
+    /// envelope: it wins, the buffered stream copy is discarded, and
+    /// exactly one Reasoning emits — never both.
+    #[test]
+    fn reader_never_double_emits_thinking_when_envelope_is_materialized() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"pondering"}},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-2"}},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"pondering deeply","signature":"sig-2"}]},"session_id":"s1"}"#,
+        );
+        assert_eq!(reasoning_texts(&out), vec!["pondering deeply"]);
+        assert!(
+            reader.thinking_buffers.is_empty(),
+            "the buffered copy must be discarded, not left to leak"
+        );
+    }
+
+    /// Concurrent scopes: a sub-agent's tagged deltas buffer under their
+    /// own raw `parent_tool_use_id`; each envelope drains only its own
+    /// scope's blocks, in stream order.
+    #[test]
+    fn reader_scopes_buffered_thinking_to_subagent_streams() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"main first"}},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"stream_event","parent_tool_use_id":"spawn-1","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"child thought"}},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"main second"}},"session_id":"s1"}"#,
+        );
+        // The child's envelope (lazy-materialized scope) drains only the
+        // child's block, and the recovered text rides the scoped event.
+        let out = reader.process_line(
+            r#"{"type":"assistant","parent_tool_use_id":"spawn-1","message":{"content":[{"type":"thinking","thinking":""}]},"session_id":"s1"}"#,
+        );
+        let cid = task_tool_child_id("spawn-1");
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Scoped { thread_id: Some(tid), event, .. }
+                    if tid == &cid
+                        && matches!(event.as_ref(), AgentEvent::Reasoning { text } if text == "child thought")
+            )),
+            "child thinking must emit into the child's scope"
+        );
+        // The main envelope drains the two main blocks in stream order.
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":""},{"type":"thinking","thinking":""}]},"session_id":"s1"}"#,
+        );
+        assert_eq!(reasoning_texts(&out), vec!["main first", "main second"]);
+        assert!(reader.thinking_buffers.is_empty());
+    }
+
+    /// Boundaries: `message_start` clears its own scope's leftovers, the
+    /// turn result clears the main thread but spares still-streaming child
+    /// scopes, and a child's terminal notification clears that child.
+    #[test]
+    fn reader_clears_thinking_buffers_at_boundaries() {
+        let mut reader = test_reader();
+        // (a) A new API message in the same scope drops stale leftovers.
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"stale"}},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-fable-5","usage":{"input_tokens":1,"output_tokens":1}}},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":""}]},"session_id":"s1"}"#,
+        );
+        assert!(
+            reasoning_texts(&out).is_empty(),
+            "a cleared block must not re-emit stale text"
+        );
+        // (b) The turn result clears the main scope but spares a child's
+        // in-flight stream (async sub-agents outlive the turn).
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"gone at result"}},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"stream_event","parent_tool_use_id":"spawn-9","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"child survives"}},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1,"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.thinking_buffers.len(), 1);
+        assert_eq!(reader.thinking_buffers[0].scope.as_deref(), Some("spawn-9"));
+        let out = reader.process_line(
+            r#"{"type":"assistant","parent_tool_use_id":"spawn-9","message":{"content":[{"type":"thinking","thinking":""}]},"session_id":"s1"}"#,
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Scoped { event, .. }
+                    if matches!(event.as_ref(), AgentEvent::Reasoning { text } if text == "child survives")
+            )),
+            "a child's buffered thinking must survive the parent turn's result"
+        );
+        // (c) The child's terminal notification clears its scope.
+        reader.process_line(
+            r#"{"type":"stream_event","parent_tool_use_id":"spawn-9","event":{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"undrained"}},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"tn9","tool_use_id":"spawn-9","status":"completed","summary":"done","session_id":"s1"}"#,
+        );
+        assert!(
+            reader.thinking_buffers.is_empty(),
+            "a terminal child's undrained thinking must not linger"
+        );
+    }
+
+    /// The per-block cap truncates (with a marker) instead of growing
+    /// without bound.
+    #[test]
+    fn reader_caps_buffered_thinking() {
+        let mut reader = test_reader();
+        let big = "a".repeat(THINKING_BUFFER_MAX_BYTES + 10_000);
+        let line = format!(
+            r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"{big}"}}}},"session_id":"s1"}}"#
+        );
+        reader.process_line(&line);
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":""}]},"session_id":"s1"}"#,
+        );
+        let texts = reasoning_texts(&out);
+        assert_eq!(texts.len(), 1);
+        assert!(texts[0].starts_with("aaaa"));
+        assert!(texts[0].ends_with("[thinking truncated]"));
+        assert_eq!(
+            texts[0].len(),
+            THINKING_BUFFER_MAX_BYTES + "\n… [thinking truncated]".len()
+        );
+    }
+
+    /// The entry cap evicts oldest-first (defensive; normal wires never
+    /// hold this many undrained blocks).
+    #[test]
+    fn reader_evicts_oldest_thinking_buffers_past_entry_cap() {
+        let mut reader = test_reader();
+        for i in 0..(THINKING_BUFFER_MAX_BLOCKS + 8) {
+            let line = format!(
+                r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":{i},"delta":{{"type":"thinking_delta","thinking":"t{i}"}}}},"session_id":"s1"}}"#
+            );
+            reader.process_line(&line);
+        }
+        assert_eq!(reader.thinking_buffers.len(), THINKING_BUFFER_MAX_BLOCKS);
+        assert_eq!(reader.thinking_buffers[0].index, 8);
+    }
+
     #[test]
     fn reader_completes_tools_from_user_message_results() {
         // Tool results ride user-type messages; missing this left every
@@ -4880,6 +5321,73 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, AgentEvent::MessageDelta { text } if text == "hel")));
+    }
+
+    #[test]
+    fn model_family_windows_resolve_and_unknown_models_fall_through() {
+        assert_eq!(
+            claude_model_context_window("claude-fable-5"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            claude_model_context_window("claude-sonnet-5"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            claude_model_context_window("claude-opus-4-8"),
+            Some(1_000_000)
+        );
+        // Dated snapshot ids resolve via the prefix.
+        assert_eq!(
+            claude_model_context_window("claude-haiku-4-5-20251001"),
+            Some(200_000)
+        );
+        assert_eq!(claude_model_context_window("claude"), None);
+        assert_eq!(claude_model_context_window("gpt-x"), None);
+    }
+
+    /// A 1M-window model whose results never state a contextWindow must not
+    /// be metered against the 200k default — the footprint/window clamp
+    /// would pin the meter at exactly 100% (observed live on a fable
+    /// session at a 442k real footprint). The model echo sizes the window
+    /// from the family table; an explicit report still always wins and is
+    /// never overwritten by later echoes.
+    #[test]
+    fn model_echo_sizes_window_until_a_result_reports_one() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-fable-5","usage":{"input_tokens":1,"output_tokens":1}}},"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.context_window, 1_000_000);
+
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":2,"cache_read_input_tokens":441603,"cache_creation_input_tokens":810,"output_tokens":1479}},"session_id":"s1"}"#,
+        );
+        let usage = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Usage { usage } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.context_window, 1_000_000);
+        assert!(
+            usage.usage_pct > 40.0 && usage.usage_pct < 50.0,
+            "442k of 1M must read as ~44%, not a clamped 100%: {}",
+            usage.usage_pct
+        );
+
+        // An explicit report wins over the family table…
+        reader.process_line(
+            r#"{"type":"result","modelUsage":{"claude-fable-5":{"contextWindow":850000}},"usage":{"input_tokens":1,"output_tokens":1},"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.context_window, 850_000);
+        // …and later model echoes never overwrite the reported figure.
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-sonnet-5","usage":{"input_tokens":1,"output_tokens":1}}},"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.context_window, 850_000);
     }
 
     #[test]

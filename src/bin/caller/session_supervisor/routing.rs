@@ -467,6 +467,14 @@ impl SessionSupervisor {
             );
             return;
         };
+        if backend == external_agent::AgentBackend::ClaudeCode {
+            // No in-place rewind exists on the claude-code supervision
+            // wire — service the edit as an anchor-fork branch instead
+            // (the child keeps everything before the edited message and
+            // the edited prompt becomes its first task).
+            self.fork_claude_edit_branch(request, target).await;
+            return;
+        }
         if !backend.supports_user_message_rewind() {
             self.warn(&format!(
                 "Edit dropped: {} session {} does not support user-message rewind yet",
