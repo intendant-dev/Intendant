@@ -860,6 +860,7 @@ mod tests {
                         merge_parity: String::new(),
                         unpushed: None,
                         primary_unpushed: None,
+                        checkout: String::new(),
                     }),
                     cache: None,
                     limits: Vec::new(),

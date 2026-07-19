@@ -594,6 +594,7 @@ impl AppEventUpcaster {
             | AppEvent::SessionAgentConfigResult { .. }
             | AppEvent::FileChanged { .. }
             | AppEvent::SessionFileActivity { .. }
+            | AppEvent::SessionCwdAnnounced { .. }
             | AppEvent::UploadReady { .. }
             | AppEvent::UploadDeleted { .. }
             | AppEvent::SnapshotCreated { .. }
@@ -4618,6 +4619,7 @@ mod tests {
                 merge_parity: "clean".into(),
                 unpushed: Some(0),
                 primary_unpushed: None,
+                checkout: String::new(),
             }),
             cache: None,
             limits: Vec::new(),

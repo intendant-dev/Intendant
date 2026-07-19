@@ -1020,6 +1020,18 @@ pub enum AppEvent {
         paths: Vec<String>,
     },
 
+    /// The session's backend stated its effective working directory
+    /// first-hand (Claude Code's `system:init` `cwd` echo, Codex's
+    /// applied thread settings). Seeds the git-vitals activity locus
+    /// authoritatively — unlike `SessionFileActivity`'s write-path
+    /// heuristic, the probe target switches immediately, so the git chip
+    /// measures the checkout the backend says it works in from the next
+    /// tick. Internal event: not broadcast to frontends, not persisted.
+    SessionCwdAnnounced {
+        session_id: Option<String>,
+        cwd: String,
+    },
+
     /// A user-uploaded file was committed to the upload store. Emitted by
     /// the `POST /api/upload` handler after the bytes land on disk. The
     /// dashboard keeps a list of these to let the user attach one or more
@@ -3212,6 +3224,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::Tick
         | AppEvent::JsonExtracted { .. }
         | AppEvent::SessionFileActivity { .. }
+        | AppEvent::SessionCwdAnnounced { .. }
         | AppEvent::SessionDirChanged { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::PresenceReady

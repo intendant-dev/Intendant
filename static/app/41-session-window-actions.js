@@ -322,7 +322,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   el.appendChild(jumpBottom);
   el.addEventListener('mousedown', () => focusSessionWindow(sid));
   el.addEventListener('focus', () => focusSessionWindow(sid));
-  log.addEventListener('scroll', () => updateSessionWindowFollowFromScroll(sessionWindows.get(sid)));
+  log.addEventListener('scroll', () => updateSessionWindowFollowFromScroll(sessionWindows.get(sid)), { passive: true });
   jumpBottom.addEventListener('click', (e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -421,7 +421,6 @@ function ensureSessionWindow(sessionId, meta = {}) {
     autoMinimized: false,
     userRestoredWhileDone: false,
     followOutput: true,
-    pendingOutput: false,
     logHistory: [],
     renderStart: 0,
     renderEnd: 0,
@@ -719,7 +718,6 @@ function restoreSessionWindowTranscript(win) {
   const history = ensureSessionWindowHistory(win);
   renderSessionWindowRange(win, sessionWindowTailStart(history.length));
   win.followOutput = true;
-  win.pendingOutput = false;
   updateSessionWindowJumpButton(win);
   scheduleSessionWindowScrollToBottom(win);
 }
@@ -942,17 +940,33 @@ function hideDoneSessionWindows() {
 }
 
 // QA facade (window.qa convention): the dashboard validator's grid-pill
-// probe builds throwaway windows and reads per-window sweep state — the
-// bulk sweeps above are otherwise unreachable from the page's global
-// scope (every fragment shares one module scope). build/setMinimized
-// route through the same ensureSessionWindow / setSessionWindowMinimized
-// paths live sessions use; the readbacks are serializable snapshots.
+// probe builds throwaway windows and reads per-window sweep state, and the
+// boot smoke's jump-button probe drives the transcript state machine — the
+// bulk sweeps above and the append/remove paths are otherwise unreachable
+// from the page's global scope (every fragment shares one module scope).
+// build/setMinimized/append/remove route through the same
+// ensureSessionWindow / setSessionWindowMinimized /
+// appendSessionWindowHistory / removeSessionWindow paths live sessions
+// use; the readbacks are serializable snapshots (windowState's
+// followOutput/logAtBottom expose the jump-button state machine — QA-only
+// layout read, never on a hot path).
 window.qa = Object.assign(window.qa || {}, {
   sessionWindowSweeps: {
     build: (sessionId, meta) => !!ensureSessionWindow(sessionId, meta || {}),
     setMinimized: (sessionId, minimized) => setSessionWindowMinimized(sessionId, !!minimized),
     relate: (evt) => applySessionRelationship(evt || {}),
     windowIds: () => [...sessionWindows.keys()],
+    append: (sessionId, text) => {
+      const sid = String(sessionId || '').trim();
+      const win = sid ? sessionWindows.get(sid) : null;
+      if (!win) return -1;
+      const div = document.createElement('div');
+      div.className = 'log-entry';
+      div.textContent = String(text || '');
+      appendSessionWindowHistory(win, div, sessionWindowShouldFollowNextOutput(win));
+      return ensureSessionWindowHistory(win).length;
+    },
+    remove: (sessionId) => removeSessionWindow(sessionId),
     windowState: (sessionId) => {
       const sid = String(sessionId || '').trim();
       const win = sid ? sessionWindows.get(sid) : null;
@@ -963,6 +977,9 @@ window.qa = Object.assign(window.qa || {}, {
         minimizedClass: win.el.classList.contains('minimized'),
         headerCollapsedClass: win.el.classList.contains('header-collapsed'),
         hardDone: sessionWindowHasHardDoneEvidence(sid),
+        followOutput: !!win.followOutput,
+        logAtBottom: sessionWindowIsRenderingTail(win) && sessionWindowLogIsAtBottom(win.log),
+        jumpHidden: !win.jumpBottom || win.jumpBottom.classList.contains('hidden'),
       };
     },
   },
@@ -1868,6 +1885,8 @@ function createLogScaffold(c, extraClass) {
       fillManagedContextAnchor(c.item_id, sid);
     });
     entry.appendChild(anchor);
+    // Everything labeled anchor forks: the ⑂ rides the label itself.
+    appendAnchorForkAffordance(entry, c, sid);
   }
   return { entry, hostId };
 }

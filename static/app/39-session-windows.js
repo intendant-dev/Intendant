@@ -1149,9 +1149,16 @@ const VITALS_SYMBOLS = {
     priority: 40,
     quiet: 'No primary branch to compare with.',
     chip: (v) => `+${v.ahead}/−${v.behind}`,
-    explain: (v) => [
-      `Compared with ${v.primaryRef}: this branch has ${v.ahead} commit${v.ahead === 1 ? '' : 's'} of its own and is missing ${v.behind} from there.`,
-    ],
+    explain: (v) => {
+      const lines = [
+        `Compared with ${v.primaryRef}: this branch has ${v.ahead} commit${v.ahead === 1 ? '' : 's'} of its own and is missing ${v.behind} from there.`,
+      ];
+      // Honesty line: WHERE the numbers were measured. The probe follows
+      // the checkout the agent actually works in (which can be a worktree,
+      // not the registered project root), and the popover says so.
+      if (v.checkout) lines.push(`vs ${v.primaryRef} · at ${v.checkout}`);
+      return lines;
+    },
   },
   parity: {
     label: 'Merge readiness',
@@ -1407,6 +1414,7 @@ function vitalsChipModels(vitals, meta, sessionId) {
         ahead: Number(git.ahead) || 0,
         behind: Number(git.behind) || 0,
         primaryRef,
+        checkout: String(git.checkout || '').trim(),
       });
     }
     const parity = String(git.mergeParity || '').trim();
