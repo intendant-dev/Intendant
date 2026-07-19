@@ -1307,13 +1307,29 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
                 category: category.to_string(),
             });
         }
-        AppEvent::ApprovalResolved { action, .. } => {
-            s.pending_approval = None;
-            s.pending_question = None;
-            if action == "deny" {
-                s.phase = "done".to_string();
-            } else {
-                s.phase = "running_agent".to_string();
+        AppEvent::ApprovalResolved { id, action, .. } => {
+            let approval_matched = s
+                .pending_approval
+                .as_ref()
+                .is_some_and(|pending| pending.id == *id);
+            let question_matched = s
+                .pending_question
+                .as_ref()
+                .is_some_and(|pending| pending.id == *id);
+            if approval_matched {
+                s.pending_approval = None;
+            }
+            if question_matched {
+                s.pending_question = None;
+            }
+            // A daemon-wide event stream may carry another session's
+            // resolution. Never let it clear or advance this session's rail.
+            if approval_matched || question_matched {
+                if action == "deny" {
+                    s.phase = "done".to_string();
+                } else {
+                    s.phase = "running_agent".to_string();
+                }
             }
         }
         AppEvent::HumanQuestionDetected { .. } => {
@@ -1502,6 +1518,7 @@ mod tests {
             round: 1,
             turns_in_round: 5,
             native_message_count: None,
+            project_root: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_some());
 
@@ -1543,6 +1560,7 @@ mod tests {
             round: 1,
             turns_in_round: 5,
             native_message_count: None,
+            project_root: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_some());
     }
@@ -1665,6 +1683,42 @@ mod tests {
                 s.last_output_summary,
                 "Orchestrator completed: analyzed project structure"
             );
+        }
+
+        update_agent_state(
+            &AppEvent::ApprovalRequired {
+                session_id: Some("session-a".to_string()),
+                id: 100,
+                command_preview: "sensitive action".to_string(),
+                category: crate::autonomy::ActionCategory::CommandExec,
+            },
+            &state,
+        );
+        update_agent_state(
+            &AppEvent::ApprovalResolved {
+                session_id: Some("session-b".to_string()),
+                id: 101,
+                action: "approve".to_string(),
+            },
+            &state,
+        );
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.pending_approval.as_ref().map(|p| p.id), Some(100));
+            assert_eq!(s.phase, "waiting_approval");
+        }
+        update_agent_state(
+            &AppEvent::ApprovalResolved {
+                session_id: Some("session-a".to_string()),
+                id: 100,
+                action: "approve".to_string(),
+            },
+            &state,
+        );
+        {
+            let s = state.lock().unwrap();
+            assert!(s.pending_approval.is_none());
+            assert_eq!(s.phase, "running_agent");
         }
 
         update_agent_state(

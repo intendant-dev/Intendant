@@ -2193,7 +2193,7 @@ function addDisplaySlot(displayId, width, height) {
   height = Number(height);
   // **#59**: idempotent re-entry. The server emits `display_ready`
   // both on the bootstrap snapshot for currently-active displays
-  // (`web_gateway.rs` bootstrap path) and via `log_replay` of the
+  // (`web_gateway/listener.rs` bootstrap path) and via `log_replay` of the
   // historical `display_ready` from session.jsonl. Both arrive on the
   // same WS connection, so this function gets called twice for one
   // live grant. The slot's lifecycle is owned exclusively by:

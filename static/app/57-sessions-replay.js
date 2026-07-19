@@ -1735,7 +1735,14 @@ function renderSessionFrames(sessionId, frames) {
     group.className = 'sd-frame-group' + (collapsed ? ' collapsed' : '');
     const header = document.createElement('div');
     header.className = 'sd-frame-group-header';
-    header.innerHTML = `<span class="sd-frame-group-chevron">&#x25BE;</span>${title} <span class="sd-frame-group-badge">${badge}</span>`;
+    const chevron = document.createElement('span');
+    chevron.className = 'sd-frame-group-chevron';
+    chevron.textContent = '\u25BE';
+    const titleText = document.createTextNode(title + ' ');
+    const badgeText = document.createElement('span');
+    badgeText.className = 'sd-frame-group-badge';
+    badgeText.textContent = badge;
+    header.append(chevron, titleText, badgeText);
     header.addEventListener('click', () => group.classList.toggle('collapsed'));
     group.appendChild(header);
     const gallery = document.createElement('div');
@@ -1881,6 +1888,7 @@ function rebuildSessionDetailViewRows(view) {
   view.expandableRowCount = countSessionDetailExpandableRows(view.rows);
   view.expandedRows = new Set();
   if (detailExpandAll) setSessionDetailRowsExpanded(view, true);
+  else seedSessionDetailProseExpanded(view);
 }
 
 function updateSessionDetailLogsBadge(view, fallbackCount = 0) {
@@ -1980,6 +1988,10 @@ function renderSessionDetailLogs(entries, el, pageInfo = {}) {
       : pageInfo;
     renderSessionDetailEntries(currentEntries, logsContainer, status, pagerControls, currentPageInfo);
     updateSessionDetailLogsBadge(sessionDetailLogView, currentEntries.length);
+    // Chapter-nav cluster rides the pager toolbar; re-mounting after every
+    // (re)render keeps its mode/count in step with the freshly built rows
+    // (57c-chapter-nav.js; idempotent).
+    if (typeof chapterNavMountDetailCluster === 'function') chapterNavMountDetailCluster(controls);
   };
   filterSelect.addEventListener('change', () => {
     detailLogFilter = filterSelect.value;
@@ -2059,6 +2071,35 @@ function setSessionDetailRowsExpanded(view, expanded) {
   }
 }
 
+// Conversational prose in the detail lane — the chapter-nav detail
+// vocabulary (57c: the renderer's own displaySource decision for user
+// rows — so the external Tool relabel is already applied — plus
+// model-level non-reasoning records) plus steer rows. Diffs are never
+// prose: they render through the diff branch whatever their level.
+function sessionDetailRowIsProse(row) {
+  if (!row || row.kind !== 'entry') return false;
+  const record = row.record || {};
+  if (isDiffLog(record)) return false;
+  if (row.displaySource === sessionDetailSourceLabels.user) return true;
+  if (String(record.source || '').toLowerCase() === 'steer') return true;
+  return record.level === 'model' && record.kind !== 'reasoning';
+}
+
+// Default expansion for a freshly built row set: prose reads open,
+// payloads read compact. expandedRows keeps its polarity (member =
+// expanded), so the per-row toggle and the Expand/Collapse-all sweep
+// stay untouched; an explicit sweep overrides this default until the
+// next rebuild (rebuilds already reset every per-row toggle — the index
+// Set cannot survive one).
+function seedSessionDetailProseExpanded(view) {
+  for (let i = 0; i < view.rows.length; i++) {
+    const row = view.rows[i];
+    if (sessionDetailRowIsProse(row) && sessionDetailRowIsExpandable(row)) {
+      view.expandedRows.add(i);
+    }
+  }
+}
+
 function toggleSessionDetailExpandAll(view) {
   if (!view) return;
   detailExpandAll = !detailExpandAll;
@@ -2096,6 +2137,14 @@ function buildSessionDetailRows(entries) {
       const reasoning = String(e.reasoning_summary || e.reasoningSummary || '').trim();
       if (!reasoning) continue;
       e = { ...e, level: 'model', kind: 'reasoning', content: reasoning, source: e.source || 'model' };
+    } else if (e && e.event === 'model_response') {
+      // Native model_response events carry no level/source of their own —
+      // normalize into the same "model prose" grammar the live WASM lane
+      // and the session-window replay lane use (level model, source model)
+      // so the detail view labels/colors them as model text instead of ℹ
+      // info rows, and level-derived consumers (verbosity, chapter
+      // navigation) classify them consistently across all three lanes.
+      e = { ...e, level: e.level || 'model', source: e.source || 'model' };
     }
     const level = e.level || 'info';
     if (!visibleLevels.includes(level)) continue;
@@ -2558,6 +2607,9 @@ function loadOlderRemoteSessionDetailRows(view) {
         renderSessionDetailRange(view, 0);
       }
       updateSessionDetailLogsBadge(view);
+      // Chapter-nav seam: finish a parked prev-chapter jump now that the
+      // older page is merged (57c-chapter-nav.js; no-op without intent).
+      if (typeof chapterNavDetailHistoryLoaded === 'function') chapterNavDetailHistoryLoaded(view);
     })
     .catch(err => {
       console.warn('Failed to load older session detail page', sessionId, err);
@@ -2590,4 +2642,3 @@ function loadNewerSessionDetailRows(view) {
   }
   return true;
 }
-

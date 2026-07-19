@@ -43,7 +43,7 @@ example.
 | X11     | live session frame, else in-process root-window capture via `x11rb` | `x11rb`/XTest | Linux (X11) |
 | Wayland | live session frame (PipeWire portal)        | portal `InputEvent`s       | Linux (Wayland) |
 | MacOS   | live session frame, else `screencapture`    | in-process CGEvents        | macOS           |
-| Windows | live session frame (DXGI)                   | `SendInput` via session    | Windows         |
+| Windows | live Windows display-session frame          | `SendInput` via session    | Windows         |
 
 Wayland and Windows are **session-only** backends: both capture and input run
 through the live `DisplaySession` (WebRTC pipeline); without an active session
@@ -503,7 +503,7 @@ invoking control.
 
 > **Status note (vaulted 2026-07-04):** the all-tasks CU-first interception —
 > where every non-direct task in the agent loop is first offered to a fast CU
-> model (`try_cu_first` in `main.rs`) — is **off by default**, behind
+> model (`try_cu_first` in `display_glue.rs`) — is **off by default**, behind
 > `[experimental] cu_first_routing = true`. In practice it added a model hop
 > (latency) to every task and, under subscription-based external agents
 > (Codex, Claude Code), reintroduced an API-key model the deployment
@@ -549,7 +549,7 @@ the CU run with `CuTaskResult::Escalate` and hands the task to the main agent.
 [computer_use]
 provider = "gemini"          # optional; default = CU_PROVIDER / PROVIDER env, else auto
 model = "gemini-3-flash-preview"  # optional; gemini default shown
-backend = "auto"             # "x11" | "wayland" | "macos" | "auto" (default)
+backend = "auto"             # "x11" | "wayland" | "macos" | "windows" | "auto" (default)
 ```
 
 Provider/model resolution (`provider::select_cu_provider`): config → `CU_PROVIDER`
@@ -568,7 +568,7 @@ audio bridge.
 ```
 voice model ──WebSocket──▶ Intendant ──audio bridge──▶ application
    │  PCM16 mono 24 kHz        │   virtual mic/speaker      │
-   │  structured tool calls    │   (Vortex shm / PulseAudio)│
+   │  structured tool calls    │   (platform audio bridge) │
    │◀─────────────────────────│◀──────────────────────────│
 ```
 
@@ -581,7 +581,18 @@ voice model ──WebSocket──▶ Intendant ──audio bridge──▶ appli
    app, and inbound audio is also teed to Whisper for a transcript.
 4. When the model calls `submit_response`, the data is validated against the
    schema; the tool returns a `LiveAudioResult` with a `status` of `Completed`,
-   `TimedOut`, or `SchemaError`.
+   `TimedOut`, `Disconnected`, `SchemaError`, or `Failed` (the last two carry
+   an error string).
+
+The live path is bounded for real-time behavior. Vortex capture still polls its
+shared-memory ring every 5 ms, but aggregates samples into 20–40 ms WebSocket
+frames and flushes a short tail when the input goes quiet. Playback, capture,
+and the optional Whisper tee each hold at most 30 s of PCM16 and evict the
+oldest audio on overflow, so a stalled consumer skips ahead instead of growing
+memory or replaying a call far behind real time. Whisper intake forms 3 s
+windows, keeps at most four pending while one sequential request is in flight,
+drops the oldest completed window on overflow, and flushes each ordered
+transcript entry to disk.
 
 ### Security Model — Untrusted, Schema-Validated, Quarantined
 
@@ -611,17 +622,19 @@ turns" — the real mechanism is the 15-second silence timer.)
 
 ### Audio Bridge — Per Platform
 
-The bridge is selected at spawn time by probing for the Vortex shared-memory
-segment (`shm_open("/vortex-audio")`). The preferred path on **both** macOS and
-Linux is the **Vortex Audio HAL plugin via a direct POSIX shared-memory bridge**
-(`start_vortex_shm_bridge`, `shm_open` + `mmap`, no daemon/socket). If the Vortex
-segment isn't present, it falls back to the per-OS device bridge:
+On macOS and Linux the bridge first probes for the Vortex shared-memory segment
+(`shm_open("/vortex-audio")`). The preferred Unix path is the **Vortex Audio
+HAL plugin via a direct POSIX shared-memory bridge**
+(`start_vortex_shm_bridge`, `shm_open` + `mmap`, no daemon/socket); if its
+segment is absent, the platform fallback is used. Windows goes directly to its
+ffmpeg/VB-CABLE fallback:
 
 | Path                  | Implementation |
 |-----------------------|----------------|
 | Vortex (preferred)    | Direct POSIX shm ring buffers shared with the Vortex HAL plugin (`start_vortex_shm_bridge`). Converts Vortex Float32 stereo 48 kHz ↔ model PCM16 mono 24 kHz. POSIX-only. |
 | Linux fallback        | PulseAudio null sinks via `pactl` (virtual mic/speaker, set as default for the session, restored on drop). |
 | macOS fallback        | BlackHole virtual device + `SwitchAudioSource` (legacy). |
+| Windows fallback      | `ffmpeg` captures `CABLE Output` with DirectShow and `ffplay` consumes model PCM from stdin through the system default output. Requires VB-CABLE and manual default-device routing; per-app routing and automatic default save/restore are unavailable. |
 
 Audio routing is only needed for the app-to-model bridge. Browser voice
 interaction through the [dashboard](./web-dashboard.md) (Gemini Live / OpenAI

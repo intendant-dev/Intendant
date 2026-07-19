@@ -945,7 +945,7 @@ const PERMISSION_KIND_COPY = {
 
 // Resolve a permission kind + raw mode into display copy. `autonomy` is
 // the native backend: the label reuses the sidebar's autonomy vocabulary
-// ("Medium · gate writes"), and the ungated Full level gets the same
+// ("Medium · review commands"), and the ungated Full level gets the same
 // quiet warning tint as bypass. Unknown kinds show the raw mode verbatim
 // — honest passthrough, never a guessed plain-language claim.
 function permissionDisplay(kind, mode) {
@@ -1142,7 +1142,7 @@ const VITALS_SYMBOLS = {
       `${v.count} file${v.count === 1 ? ' has' : 's have'} changes that aren't committed to git yet.`,
       'Normal while the agent works — they become permanent history once committed.',
     ],
-    action: () => ({ label: 'View the changes', run: () => vitalsOpenChangesTab() }),
+    action: (v, sessionId) => ({ label: 'View the changes', run: () => vitalsOpenChangesTab(sessionId) }),
   },
   divergence: {
     label: 'Ahead / behind',
@@ -1237,6 +1237,7 @@ const VITALS_SYMBOLS = {
       }
       if (v.reset) lines.push(`The window resets in ~${v.reset}.`);
       if (v.severity === 'crit') lines.push('When an allowance runs out, the provider pauses this agent until the window resets.');
+      else if (v.severity === 'warn') lines.push('If the window fills up, the provider will pause this agent until it resets.');
       return lines;
     },
     brief: (v) => {
@@ -2514,7 +2515,14 @@ function vitalsCopyText(text) {
   scratch.remove();
 }
 
-function vitalsOpenChangesTab() {
+function vitalsOpenChangesTab(sessionId) {
+  // The Changes tab targets the CURRENT session — focus the chip's
+  // session first so the tab shows the checkout the chip counted, not
+  // whichever session happened to be current.
+  const sid = String(sessionId || '').trim();
+  if (sid && sid !== currentSessionFullId && typeof focusSessionWindow === 'function') {
+    focusSessionWindow(sid);
+  }
   const btn = document.querySelector('#activity-subtabs [data-activity-tab="changes"]');
   if (btn) btn.click();
 }
@@ -2693,6 +2701,151 @@ function showCacheExpiryToast(sid, text) {
   setTimeout(() => { if (toast.parentNode) toast.remove(); }, 12000);
 }
 
+// ── Rate-limit status escalation alerts ─────────────────────────────
+// The chip row is the continuous surface for limit state; this layer adds
+// ONE attention-grabbing toast per live escalation (ok → warning,
+// → limited), so the first warning is never missable. Anti-spam is
+// layered: the daemon logs transitions only, per-session/per-window
+// severity tracking alerts once per escalation until recovery re-arms it,
+// first observation of a session seeds silently (no toast parade on page
+// load), and near-simultaneous escalations coalesce into one toast with a
+// cooldown between flushes (one account limit warns many sessions at
+// once).
+const LIMIT_ALERT_DEBOUNCE_MS = 2000;
+const LIMIT_ALERT_COOLDOWN_MS = 30000;
+
+function maybeAlertLimitTransitions(sid, limits, { replay = false } = {}) {
+  if (!Array.isArray(limits) || !limits.length) return;
+  let seen = sessionLimitStatusSeen.get(sid);
+  const firstObservation = !seen;
+  if (!seen) {
+    seen = new Map();
+    sessionLimitStatusSeen.set(sid, seen);
+    if (sessionLimitStatusSeen.size > 200) {
+      sessionLimitStatusSeen.delete(sessionLimitStatusSeen.keys().next().value);
+    }
+  }
+  for (const w of limits) {
+    const label = String(w?.label || '').trim() || 'window';
+    const severity = limitStatusSeverity(w?.status);
+    const prev = seen.get(label) || '';
+    seen.set(label, severity);
+    if (replay || firstObservation) continue;
+    if (VITALS_SEVERITY_RANK[severity] <= VITALS_SEVERITY_RANK[prev]) continue;
+    queueLimitAlert(sid, {
+      severity,
+      label,
+      status: String(w?.status || ''),
+      resetsAtEpoch: Number(w?.resetsAtEpoch) || 0,
+    });
+  }
+}
+
+function queueLimitAlert(sid, entry) {
+  const existing = pendingLimitAlerts.get(sid);
+  if (!existing || VITALS_SEVERITY_RANK[entry.severity] >= VITALS_SEVERITY_RANK[existing.severity]) {
+    pendingLimitAlerts.set(sid, entry);
+  }
+  if (limitAlertFlushTimer) return;
+  const now = Date.now();
+  const delay = Math.max(LIMIT_ALERT_DEBOUNCE_MS, lastLimitAlertFlushMs + LIMIT_ALERT_COOLDOWN_MS - now);
+  limitAlertFlushTimer = setTimeout(flushLimitAlerts, delay);
+}
+
+function flushLimitAlerts() {
+  limitAlertFlushTimer = null;
+  const entries = [];
+  for (const [sid, entry] of pendingLimitAlerts) {
+    // A session that recovered while the flush waited is stale news.
+    const current = sessionLimitStatusSeen.get(sid)?.get(entry.label) || '';
+    if (VITALS_SEVERITY_RANK[current] >= VITALS_SEVERITY_RANK[entry.severity]) {
+      entries.push({ sid, ...entry });
+    }
+  }
+  pendingLimitAlerts.clear();
+  if (!entries.length) return;
+  lastLimitAlertFlushMs = Date.now();
+  const anyCrit = entries.some((e) => e.severity === 'crit');
+  const lineFor = (e) => {
+    const identity = sessionIdentityParts(e.sid);
+    const name = identity.name || identity.shortId || 'session';
+    const backend = String((sessionMetadataById.get(e.sid) || {}).source_label || '').trim();
+    const windowName = `${backend ? `${backend} ` : ''}${vitalsLimitLabelLong(e.label)}`;
+    const reset = e.resetsAtEpoch ? formatLimitReset(e.resetsAtEpoch) : '';
+    return e.severity === 'crit'
+      ? `${name} hit its ${windowName} usage limit${reset ? ` — resumes in ~${reset}` : ''}`
+      : `${name} is approaching its ${windowName} usage limit${reset ? ` — resets in ~${reset}` : ''}`;
+  };
+  const glyph = anyCrit ? '⛔' : '⚠';
+  const text = entries.length === 1
+    ? `${glyph} ${lineFor(entries[0])}`
+    : `${glyph} ${entries.length} sessions ${anyCrit ? 'hit or are near' : 'are approaching'} provider usage limits`;
+  showLimitStatusToast(entries, text, anyCrit);
+  if (typeof Notification !== 'undefined' && Notification.permission === 'granted' && document.hidden) {
+    try { new Notification('Intendant', { body: text }); } catch (_) { /* notification blocked */ }
+  }
+}
+
+// Limit toast: mirrors showCacheExpiryToast's DOM contract (single
+// .control-toast, same host selection). Dismissible, and it routes to the
+// affected session — coalesced alerts route to the Sessions tab and name
+// every session in the tooltip.
+function showLimitStatusToast(entries, text, crit) {
+  const controlBody = document.querySelector('#activity-control-pane .control-pane-body');
+  const host = controlBody && controlBody.offsetParent !== null ? controlBody : document.body;
+  if (!host) return;
+  host.querySelector('.control-toast')?.remove();
+  const toast = document.createElement('div');
+  toast.className = `control-toast ${crit ? 'error' : 'warn'}`;
+  if (host === document.body) toast.classList.add('global-command-toast');
+  const label = document.createElement('span');
+  label.textContent = text;
+  toast.appendChild(label);
+  const single = entries.length === 1 ? entries[0] : null;
+  const open = document.createElement('button');
+  open.type = 'button';
+  open.className = 'ui-btn';
+  open.textContent = single ? 'Open session' : 'Show sessions';
+  open.style.marginLeft = '0.6em';
+  open.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    toast.remove();
+    if (typeof routeTo === 'function') routeTo('sessions');
+    if (single && typeof focusSessionWindow === 'function') {
+      focusSessionWindow(single.sid);
+      sessionWindows.get(single.sid)?.el?.scrollIntoView?.({ block: 'nearest' });
+    }
+  });
+  toast.appendChild(open);
+  const dismiss = document.createElement('button');
+  dismiss.type = 'button';
+  dismiss.className = 'ui-btn';
+  dismiss.textContent = '×';
+  dismiss.setAttribute('aria-label', 'Dismiss');
+  dismiss.style.marginLeft = '0.4em';
+  dismiss.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    toast.remove();
+  });
+  toast.appendChild(dismiss);
+  if (entries.length > 1) {
+    toast.title = entries.map(lineForLimitEntryTitle).join('\n');
+  }
+  host.appendChild(toast);
+  setTimeout(() => { if (toast.parentNode) toast.remove(); }, 14000);
+}
+
+// Tooltip line for one coalesced limit alert (the toast body only counts).
+function lineForLimitEntryTitle(e) {
+  const identity = sessionIdentityParts(e.sid);
+  const name = identity.name || identity.shortId || 'session';
+  const reset = e.resetsAtEpoch ? formatLimitReset(e.resetsAtEpoch) : '';
+  const verb = e.severity === 'crit' ? 'hit' : 'is approaching';
+  return `${name} ${verb} its ${vitalsLimitLabelLong(e.label)} limit${reset ? ` (~${reset})` : ''}`;
+}
+
 // Cheap per-tick predicate: does this session's vitals row need a 1 Hz
 // repaint at all? True for the warm-cache countdown (the only `ticking`
 // model vitalsChipModels emits) and for status-only rate-limit chips whose
@@ -2777,7 +2930,7 @@ function mergeSessionVitals(incoming, existing) {
   };
 }
 
-function applySessionVitals(raw = {}) {
+function applySessionVitals(raw = {}, options = {}) {
   const data = raw?.data && typeof raw.data === 'object' ? raw.data : raw;
   const sid = String(data?.session_id || data?.sessionId || '').trim();
   if (!sid) return;
@@ -2793,6 +2946,9 @@ function applySessionVitals(raw = {}) {
       maybeRefreshSessionWindowActivityPill(id, win, merged);
     }
   }
+  // Once per arrival (not per identity alias), from the incoming limits —
+  // transitions are about what the wire just said, not the merged cache.
+  maybeAlertLimitTransitions(sid, vitals.limits, options);
   refreshSessionVitalsTicker();
 }
 
@@ -2813,7 +2969,9 @@ function applySessionVitalsFromReplayEntries(entries) {
   if (!Array.isArray(entries)) return;
   for (const entry of entries) {
     if (entry?.event !== 'session_vitals') continue;
-    applySessionVitals(entry);
+    // Replayed history seeds the limit-transition tracker without
+    // alerting — old status flips are not live news.
+    applySessionVitals(entry, { replay: true });
   }
 }
 
@@ -3399,7 +3557,18 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
   if (event === 'replay_start' || event === 'context_snapshot') return null;
   if (event === 'log_entry' || !event) {
     if (!content) return null;
-    return { ...base, level: level || 'info', source: source || 'system', content, kind, output_id: entry.output_id || entry.outputId || '' };
+    return {
+      ...base,
+      level: level || 'info',
+      source: source || 'system',
+      content,
+      kind,
+      output_id: entry.output_id || entry.outputId || '',
+      // User rows served by the daemon can carry renderable upload refs
+      // (the UserMessageLog lane) — map them onto the same preview shape
+      // the record builders render as a thumbnail strip.
+      attachment_previews: userLogAttachmentPreviews(entry),
+    };
   }
   if (event === 'session_note') {
     const noteText = String(entry.text || content || '').trim();
@@ -3683,7 +3852,7 @@ function sessionWindowTranscriptContentForNode(node) {
   return sessionWindowTranscriptContentForElement(contentEl);
 }
 
-function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') {
+function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '', options = {}) {
   if (!node) return [];
   const isCommandOutput = !!node.dataset?.outputId || node.dataset?.kind === 'agent_output';
   // Reasoning rows render a label + elided summary and defer their body,
@@ -3711,7 +3880,7 @@ function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') 
     replacement_for_user_turn_index: node.dataset?.replacementForUserTurnIndex,
     content,
   }, fallbackSessionId);
-  return sessionWindowTranscriptSignaturesFromParts(parts);
+  return sessionWindowTranscriptSignaturesFromParts(parts, options);
 }
 
 // Per-item signature cache (log-append hot path). Computing a node item's
@@ -3720,12 +3889,15 @@ function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') 
 // the full-history signature scans. Signatures are stable for an item's
 // lifetime except for its session id, which retargets rewrite in place —
 // so entries are keyed by the effective session id and recomputed when it
-// changes. Node signatures ignore options (as before); record signatures
-// cache per options variant ('near' = includeUserNearTime dedup passes).
-// Item content mutations (live command-output summaries) intentionally do
-// not invalidate: their identity signatures (event/output/item ids) are
-// immutable and their summary-text signatures never matched replayed
-// records in the first place.
+// changes. Both lanes cache per options variant ('near' =
+// includeUserNearTime dedup passes): node-backed items honor options too,
+// so a LIVE user node emits the near-time/turn signatures during
+// hydration dedupe and pairs with its replayed copy (node signatures used
+// to ignore options, which left live user rows invisible to the
+// near-time bridge). Item content mutations (live command-output
+// summaries) intentionally do not invalidate: their identity signatures
+// (event/output/item ids) are immutable and their summary-text signatures
+// never matched replayed records in the first place.
 const _sessionWindowItemSignatureCache = new WeakMap();
 
 function sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId = '', options = {}) {
@@ -3737,9 +3909,10 @@ function sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId
     ? String(node.dataset?.sessionId || '').trim()
     : String(record.session_id || record.sessionId || '').trim();
   const sid = ownSid || String(fallbackSessionId || '').trim();
-  const variant = node
-    ? 'node'
-    : (options.includeUserNearTime ? 'near' : (options.includeText === false ? 'noText' : 'def'));
+  const optionsVariant = options.includeUserNearTime
+    ? 'near'
+    : (options.includeText === false ? 'noText' : 'def');
+  const variant = (node ? 'node-' : 'record-') + optionsVariant;
   let cached = _sessionWindowItemSignatureCache.get(item);
   if (cached && cached.sid === sid && cached[variant]) return cached[variant];
   if (!cached || cached.sid !== sid) {
@@ -3747,7 +3920,7 @@ function sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId
     _sessionWindowItemSignatureCache.set(item, cached);
   }
   const signatures = node
-    ? sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId)
+    ? sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId, options)
     : sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId, options);
   cached[variant] = signatures;
   return signatures;
@@ -3878,6 +4051,7 @@ function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
     renderSessionWindowRange(win, win.renderStart);
   }
   applySessionWindowOutputScroll(win, shouldFollow);
+  notifyMinimizedSessionWindowHistoryAppend(win);
 }
 
 function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSessionId) {
@@ -5009,4 +5183,3 @@ function sessionConfigApprovalPolicy(meta = {}) {
     'on-request'
   );
 }
-

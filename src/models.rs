@@ -28,6 +28,22 @@ pub struct Command {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentInput {
     pub commands: Vec<Command>,
+    /// Controller-minted per-spawn secret authenticating runtime JSONL
+    /// results. The controller overwrites any model-supplied value before
+    /// spawn, and strips it again after verification. It is delivered only
+    /// over the runtime's one-shot stdin, never through the child-shell
+    /// environment or a file the shell can read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_protocol_token: Option<String>,
+    /// Controller-minted per-batch secret for the askHuman answer file:
+    /// the runtime accepts a `human_response` whose first line matches,
+    /// and discards anything else. The controller overwrites any
+    /// model-supplied value before spawn, and the token never touches
+    /// shell-readable disk — so a model-driven shell (which can write the
+    /// answer path) cannot forge an answer. Absent = legacy caller,
+    /// answers accepted unauthenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_response_token: Option<String>,
 }
 
 #[allow(dead_code)]

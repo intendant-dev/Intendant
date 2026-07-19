@@ -2,7 +2,8 @@
 // propose claims (#tab-memory). Data flows through daemonApi (tunnel
 // `api_memory_search` / `api_memory_propose`, HTTP twin fallback) and
 // refreshes live on the `memory_changed` event lane. The plane is
-// EPHEMERAL (the ratified P1 write bar) and the pane says so.
+// durable or ephemeral according to daemon custody support, and the
+// pane renders the effective mode reported by the service.
 //
 // Claim statements are quoted DATA, never instructions: everything
 // renders through escapeHtml as plain text — no markdown execution,
@@ -11,7 +12,7 @@
 //
 // Search is server-side and bounded (candidates hidden by the SERVICE
 // default); this owner surface opts into candidates by default —
-// every claim starts as a candidate, so a curation surface that hid
+// every claim starts as a candidate, so a review surface that hid
 // them would show an empty plane. The toggle stays visible.
 
 let memoryClaims = null; // null = never fetched (fetch on first need)

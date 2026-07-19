@@ -734,9 +734,11 @@ struct CcTaskChild {
     /// see it as an ephemeral child session wired to the parent via a
     /// `session_relationship` — it is not resumable or addressable.
     child_id: String,
-    /// A terminal state was already emitted; late envelopes (e.g. the main
-    /// agent continuing the child via SendMessage) still scope to the
-    /// child window, but no second terminal event fires.
+    /// A terminal state was already emitted. The latch guards against a
+    /// duplicate terminal for the same run segment only: envelopes routed
+    /// back into a terminal child (the main agent resuming the task — the
+    /// stream re-enters tagged with the same spawn tool_use id) clear it
+    /// again in `task_scope_for`, so the resumed run's own end can emit.
     terminal: bool,
 }
 
@@ -744,7 +746,13 @@ struct CcTaskChild {
 /// spawning tool_use id (the correlation key Claude Code stamps on child
 /// envelopes as `parent_tool_use_id`), with the constant `toolu_01` prefix
 /// stripped so 8-char short forms stay distinctive.
-fn task_tool_child_id(tool_use_id: &str) -> String {
+///
+/// `pub(crate)`: the session catalog's task-thread resolver
+/// (`web_gateway::session_catalog::task_threads`) maps these ids back to
+/// the subagent transcript Claude Code persisted by minting each sidecar's
+/// `toolUseId` through this SAME function — the sanitization must never
+/// fork into a second copy.
+pub(crate) fn task_tool_child_id(tool_use_id: &str) -> String {
     let suffix = tool_use_id
         .strip_prefix("toolu_")
         .unwrap_or(tool_use_id)
@@ -983,8 +991,16 @@ struct CcReader {
     /// In-band sub-agents by spawning tool_use id (the value child
     /// envelopes carry as `parent_tool_use_id`).
     task_children: HashMap<String, CcTaskChild>,
-    /// `task_id` (the key `system:task_*` events use) → spawning
-    /// tool_use id.
+    /// `task_id` (the key `system:task_*` events use) → the SPAWN
+    /// tool_use id, first-write-wins. Claude Code keys each
+    /// `system:task_notification` by whichever tool_use initiated THAT
+    /// run segment — the spawn for run #1, the resume message for a
+    /// resumed run — while the task_id stays stable across runs and
+    /// children stay keyed by the spawn id (the value child envelopes
+    /// carry as `parent_tool_use_id`). The first binding for a task_id is
+    /// therefore the spawn binding, and later `task_started`s for the
+    /// same task must never overwrite it: this map is how a resumed
+    /// run's notification finds its child again.
     task_ids: HashMap<String, String>,
     /// tool_use ids of plan-shaped calls (`TodoWrite`, `TaskUpdate`) already
     /// rendered as `PlanUpdate`, mapped to the tool name for failure logs, so
@@ -1242,9 +1258,26 @@ impl CcReader {
             };
             self.register_task_child(&ptid, None, spawn, out);
         }
-        self.task_children
-            .get(&ptid)
-            .map(|child| child.child_id.clone())
+        let child = self.task_children.get_mut(&ptid)?;
+        if child.terminal {
+            // The stream flowing into a terminal child proves the agent
+            // lives again: a resumed Task run re-enters the same child
+            // window (same spawn tool_use id), and its own end must be
+            // able to emit — re-arm the once-guard. Deliberately no fresh
+            // `SubAgentToolCall { inProgress }` rides the re-arm: the
+            // frontend derives the window's active look from the scoped
+            // stream itself and its end from the terminal's log line, not
+            // from the inProgress state, while a re-registration event
+            // would add parent-turn bookkeeping (AgentStarted/turn
+            // counters) — and, arriving while the parent sits idle, would
+            // open a spurious observe-drain round on it. The drain re-arms
+            // its SessionEnded dedupe from the same scoped stream
+            // (`thread_actions::note_external_subagent_liveness`). Side
+            // effect, intended: a re-armed child is non-terminal again,
+            // so shutdown (`close_open_task_children`) properly closes it.
+            child.terminal = false;
+        }
+        Some(child.child_id.clone())
     }
 
     /// Register an in-band sub-agent and announce it as a synthetic child
@@ -1518,10 +1551,17 @@ impl CcReader {
         }
     }
 
-    /// Surface the injected Intendant MCP server's health from the init
-    /// message. A failed loopback connection was previously invisible: the
-    /// backend simply ran without display/CU tools and nobody could tell
-    /// why from a frontend.
+    /// Surface the injected Intendant MCP server's health as Claude Code
+    /// reports it in the init message — the client-side echo, phrased as
+    /// such. The daemon's gate reports its own serves firsthand and
+    /// immediately (`web_gateway::note_supervised_mcp_serve`); this
+    /// turn-boundary echo is the only authority on client-side
+    /// *registration* — the CLI can accept the transport yet reject the
+    /// served tool list (schema validation), so "connected" is reported
+    /// with the number of Intendant tools it actually registered. A failed
+    /// loopback connection was previously invisible: the backend simply
+    /// ran without display/CU tools and nobody could tell why from a
+    /// frontend.
     fn report_intendant_mcp_status(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         let status = msg
             .get("mcp_servers")
@@ -1539,14 +1579,38 @@ impl CcReader {
         }
         self.last_intendant_mcp_status = Some(status.clone());
         match status.as_str() {
-            "connected" => out.log("info", "Intendant MCP server connected"),
+            "connected" => {
+                // Registration truth: count the Intendant tools the CLI
+                // accepted into its tool set (`mcp__intendant__*` names).
+                // Transport-connected with zero registered tools is the
+                // client-side-rejection signature — the count keeps that
+                // visible.
+                let registered = msg.get("tools").and_then(|t| t.as_array()).map(|tools| {
+                    tools
+                        .iter()
+                        .filter(|tool| {
+                            tool.as_str()
+                                .is_some_and(|name| name.starts_with("mcp__intendant__"))
+                        })
+                        .count()
+                });
+                out.log(
+                    "info",
+                    match registered {
+                        Some(count) => format!(
+                            "Claude Code reports MCP: connected — {count} tools registered"
+                        ),
+                        None => "Claude Code reports MCP: connected".to_string(),
+                    },
+                );
+            }
             "missing" => out.log(
                 "warn",
-                "Intendant MCP server missing from Claude Code's MCP config — display/CU tools unavailable",
+                "Claude Code reports MCP: Intendant server missing from its MCP config — display/CU tools unavailable",
             ),
             other => out.log(
                 "warn",
-                format!("Intendant MCP server status: {other} — display/CU tools may be unavailable"),
+                format!("Claude Code reports MCP: {other} — display/CU tools may be unavailable"),
             ),
         }
     }
@@ -1576,14 +1640,27 @@ impl CcReader {
         // The correlation key is recorded for every task kind: it only
         // feeds task_notification's id resolution, and a stray entry for a
         // Bash task resolves to an id with no registered child (no-op).
+        // First-write-wins: the first tool_use seen for a task_id is the
+        // spawn segment's (see the `task_ids` field docs).
         let task_id = msg
             .get("task_id")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
         if let Some(task_id) = task_id {
-            self.task_ids
-                .insert(task_id.to_string(), tool_use_id.to_string());
+            let spawn_tool_use_id = self
+                .task_ids
+                .entry(task_id.to_string())
+                .or_insert_with(|| tool_use_id.to_string());
+            // A task_started re-announcing a known task under a NEW
+            // tool_use id describes a later run segment of the same task
+            // (a resume), never a second spawn. Registering or arming
+            // under the segment id would ghost a second child that then
+            // captures the run's task_notification away from the real
+            // child window.
+            if spawn_tool_use_id.as_str() != tool_use_id {
+                return;
+            }
         }
         // Background command announced (`run_in_background` Bash and
         // auto-backgrounded commands alike, live-probed on 2.1.211): arm
@@ -1672,17 +1749,18 @@ impl CcReader {
     /// `system:task_notification`: the async sub-agent's authoritative end
     /// (status + final summary).
     fn handle_task_notification(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
+        let task_id = msg
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let tool_use_id = msg
             .get("tool_use_id")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .or_else(|| {
-                msg.get("task_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|task_id| self.task_ids.get(task_id.trim()).cloned())
-            });
+            .or_else(|| task_id.and_then(|task_id| self.task_ids.get(task_id).cloned()));
         let Some(tool_use_id) = tool_use_id else {
             return;
         };
@@ -1734,6 +1812,21 @@ impl CcReader {
             self.observe_bg_tasks(out);
             return;
         }
+        // Segment re-keying: Claude Code keys a resumed run's notification
+        // by the tool_use that initiated THAT run segment (the resume
+        // message's id), while the child stays keyed by the spawn tool_use
+        // and the task_id stays stable across runs. When the notification's
+        // id misses the children, resolve through the first-write spawn
+        // binding so the resumed run terminates the original child window.
+        // Unknown tool_use AND unknown task_id stays a silent no-op
+        // (`emit_task_terminal` drops ids it never registered).
+        let tool_use_id = if self.task_children.contains_key(&tool_use_id) {
+            tool_use_id
+        } else {
+            task_id
+                .and_then(|task_id| self.task_ids.get(task_id).cloned())
+                .unwrap_or(tool_use_id)
+        };
         let (outer_status, state_status) = match status {
             "completed" | "success" => ("completed", "completed"),
             "failed" | "error" | "errored" => ("failed", "errored"),
@@ -2568,6 +2661,12 @@ impl CcReader {
                 label: cc_rate_limit_label(kind),
                 ..Default::default()
             });
+        // The CLI re-announces the window's CURRENT status on roughly
+        // every model call while it persists (live: one allowed_warning
+        // per call through the whole warned span). The gauge takes every
+        // event; the log arm at the bottom fires on genuine status
+        // transitions only, so capture what this event overwrites.
+        let prev_status = window.status.clone();
         if used_pct.is_some() {
             window.used_pct = used_pct;
         }
@@ -2607,13 +2706,53 @@ impl CcReader {
                 self.observe_activity(ActivityObs::RateLimited { resets_at_epoch }, out);
             }
         }
-        if status.is_empty() || status == "allowed" {
+        // Log rows fire on status TRANSITIONS only. Same-status
+        // re-announcements are vitals traffic, not news — logging each one
+        // put a warn row in the Activity log (and the persisted session
+        // JSONL) once per model call for as long as a warning persisted;
+        // the limits vitals chip is the continuous surface for the state.
+        if status.is_empty() || prev_status.as_deref() == Some(status) {
             return;
         }
-        out.log(
-            "warn",
-            format!("Claude Code rate limit: status {status} ({kind} window)"),
-        );
+        match status {
+            "allowed" => {
+                // Recovery is only news after a non-allowed status; the
+                // session's first plain allowed stays silent.
+                if prev_status.is_some() {
+                    out.log(
+                        "info",
+                        format!("Claude Code rate limit cleared ({kind} window)"),
+                    );
+                }
+            }
+            "allowed_warning" => {
+                let reset = resets_at_epoch
+                    .map(|at| {
+                        let phrase = super::limit_reset_phrase_verb(
+                            "resets",
+                            Some(at),
+                            crate::session_activity::epoch_seconds(),
+                        );
+                        format!(" — {phrase}")
+                    })
+                    .unwrap_or_default();
+                out.log(
+                    "warn",
+                    format!(
+                        "Claude Code rate limit warning: the {kind} window is approaching its limit{reset}"
+                    ),
+                );
+            }
+            _ => {
+                // Hard statuses (rejected, …): the turn-level report with
+                // the resume time rides handle_result's structured
+                // TurnLimitRejected; this row records the wire status flip.
+                out.log(
+                    "warn",
+                    format!("Claude Code rate limit: status {status} ({kind} window)"),
+                );
+            }
+        }
     }
 
     /// Current rate-limit windows for attaching to usage snapshots.
@@ -2753,7 +2892,9 @@ pub struct ClaudeCodeAgent {
     /// an idle goal update never burns a turn of its own (a mid-turn update
     /// is written immediately instead — the running turn absorbs it).
     pending_goal_notice: Option<String>,
-    /// Loopback MCP auth token from the daemon, baked into the injected URL.
+    /// Loopback MCP auth token from the daemon. The ctl URL carries it in
+    /// the child environment; Claude's argv contains only an environment
+    /// placeholder for the equivalent Authorization header.
     mcp_auth_token: Option<String>,
     /// Intendant session id scoping the injected MCP URL and ctl env.
     mcp_session_id: Option<String>,
@@ -2815,10 +2956,10 @@ impl ClaudeCodeAgent {
         self.max_budget_usd.filter(|b| !(b.is_finite() && *b > 0.0))
     }
 
-    /// The scoped loopback MCP URL injected into `--mcp-config` and the ctl
-    /// env. Claude Code has no managed-context mode, so the server treats the
-    /// session as vanilla; `tool_profile=core` keeps the advertised tool list
-    /// to the bootstrap set (full surface stays callable via `ctl tools`).
+    /// The scoped loopback MCP URL injected into the ctl env. Claude Code has
+    /// no managed-context mode, so the server treats the session as vanilla;
+    /// `tool_profile=core` keeps the advertised tool list to the bootstrap set
+    /// (full surface stays callable via `ctl tools`).
     fn intendant_mcp_url(&self, port: u16) -> String {
         super::intendant_bootstrap_mcp_url(
             port,
@@ -2826,6 +2967,39 @@ impl ClaudeCodeAgent {
             None,
             self.mcp_auth_token.as_deref(),
         )
+    }
+
+    /// Token-free endpoint placed in the inline MCP JSON on argv.
+    fn intendant_mcp_config_url(&self, port: u16) -> String {
+        super::intendant_bootstrap_mcp_url(port, self.mcp_session_id.as_deref(), None, None)
+    }
+
+    /// Inline Claude MCP config whose Authorization header expands from the
+    /// explicitly injected child environment. The serialized argv contains
+    /// `${INTENDANT_MCP_BEARER_TOKEN}`, never the credential value.
+    fn intendant_mcp_config(&self, port: u16) -> serde_json::Value {
+        let mut server = serde_json::json!({
+            "type": "http",
+            "url": self.intendant_mcp_config_url(port),
+        });
+        if super::intendant_mcp_bearer_token(
+            self.mcp_auth_token.as_deref(),
+            self.mcp_session_id.as_deref(),
+        )
+        .is_some()
+        {
+            server["headers"] = serde_json::json!({
+                "Authorization": format!(
+                    "Bearer ${{{}}}",
+                    super::INTENDANT_MCP_BEARER_TOKEN_ENV
+                )
+            });
+        }
+        serde_json::json!({
+            "mcpServers": {
+                "intendant": server
+            }
+        })
     }
 
     async fn write_line(&self, line: &str) -> Result<(), CallerError> {
@@ -3036,6 +3210,8 @@ impl ExternalAgent for ClaudeCodeAgent {
         &mut self,
         config: AgentConfig,
     ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, CallerError> {
+        let dns_credential_env = config.dns_credential_env.clone();
+        let dns_credential_store = config.dns_credential_store.clone();
         if let Some(budget) = self.invalid_max_budget() {
             return Err(CallerError::ExternalAgent(format!(
                 "claude-code max_budget_usd must be a positive dollar amount, got {budget}; \
@@ -3114,22 +3290,15 @@ impl ExternalAgent for ClaudeCodeAgent {
             args.push(self.allowed_tools.join(","));
         }
 
-        // MCP config for Intendant display/CU tools: the scoped bootstrap URL
-        // (session id + tool_profile=core + loopback auth token), same
-        // treatment as managed Codex.
+        // MCP config for Intendant display/CU tools: argv carries the scoped,
+        // token-free bootstrap URL and a header placeholder. The
+        // session-derived bearer itself is injected into the child env after
+        // the clear below, so local process listings cannot scrape it.
         let web_port = config.web_port.or(self.web_port);
         self.web_port = web_port;
         if let Some(port) = web_port {
-            let mcp_config = serde_json::json!({
-                "mcpServers": {
-                    "intendant": {
-                        "type": "http",
-                        "url": self.intendant_mcp_url(port)
-                    }
-                }
-            });
             args.push("--mcp-config".into());
-            args.push(mcp_config.to_string());
+            args.push(self.intendant_mcp_config(port).to_string());
         }
 
         // Spawn the process
@@ -3140,6 +3309,10 @@ impl ExternalAgent for ClaudeCodeAgent {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // Reset to the external-child env allowlist FIRST: the deliberate
+        // `.env()` injections below survive the clear; inherited provider
+        // keys and ambient credentials do not.
+        super::apply_external_child_env_policy(&mut command);
         // `"$INTENDANT" ctl ...` bootstrap env, so the lazy CLI surface works
         // from Claude Code's shell without any PATH or port assumptions.
         if let Some(port) = web_port {
@@ -3147,6 +3320,7 @@ impl ExternalAgent for ClaudeCodeAgent {
                 &mut command,
                 &self.intendant_mcp_url(port),
                 self.mcp_session_id.as_deref(),
+                self.mcp_auth_token.as_deref(),
             );
         }
         // An active oauth:claude-code lease materializes a synthesized
@@ -3159,7 +3333,12 @@ impl ExternalAgent for ClaudeCodeAgent {
         crate::platform::die_with_parent(&mut command);
         #[cfg(target_os = "linux")]
         crate::linux_display_env::apply_to_tokio_command(&mut command);
-        let mut child = command.spawn().map_err(|e| {
+        let mut child = crate::credential_leases::spawn_with_dns_credential_scrub(
+            &mut command,
+            dns_credential_env.as_deref(),
+            dns_credential_store.as_deref(),
+        )
+        .map_err(|e| {
             CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
         })?;
         let child_pid = child.id();
@@ -4869,7 +5048,7 @@ mod tests {
         let out = reader.process_line(init_failed);
         assert!(out.events.iter().any(|e| matches!(
             e,
-            AgentEvent::Log { level, message } if level == "warn" && message.contains("status: failed")
+            AgentEvent::Log { level, message } if level == "warn" && message.contains("Claude Code reports MCP: failed")
         )));
         // Same status again: quiet.
         let out = reader.process_line(init_failed);
@@ -4877,13 +5056,32 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, AgentEvent::Log { message, .. } if message.contains("failed"))));
-        // Recovery is reported.
+        // Recovery is reported, with the registered-tool count (zero here:
+        // the init lists no `mcp__intendant__*` tools — the client-side
+        // rejection signature stays visible even though the transport
+        // connected).
         let out = reader.process_line(
             r#"{"type":"system","subtype":"init","model":"m","tools":[],"mcp_servers":[{"name":"intendant","status":"connected"}],"session_id":"s1"}"#,
         );
         assert!(out.events.iter().any(|e| matches!(
             e,
-            AgentEvent::Log { level, message } if level == "info" && message.contains("connected")
+            AgentEvent::Log { level, message } if level == "info"
+                && message.contains("Claude Code reports MCP: connected — 0 tools registered")
+        )));
+    }
+
+    #[test]
+    fn reader_reports_intendant_registered_tool_count() {
+        let mut reader = test_reader();
+        // Only `mcp__intendant__*` names count as registered Intendant
+        // tools; built-ins and other MCP servers' tools do not.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"init","model":"m","tools":["Bash","mcp__intendant__take_screenshot","mcp__intendant__get_status","mcp__other__x"],"mcp_servers":[{"name":"intendant","status":"connected"}],"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message } if level == "info"
+                && message.contains("Claude Code reports MCP: connected — 2 tools registered")
         )));
     }
 
@@ -5158,6 +5356,212 @@ mod tests {
                     AgentEvent::SubAgentToolCall { status, agents, .. }
                         if status == "failed" && agents[0].status == "errored"
                 )
+        )));
+    }
+
+    #[test]
+    fn resumed_task_stream_rearms_and_notification_rekeys_via_task_id() {
+        // Claude Code keys each task_notification by the tool_use that
+        // initiated THAT run segment — the Agent spawn for run #1, the
+        // resume message for a resumed run — while the task_id stays
+        // stable and child envelopes keep carrying the spawn id as
+        // parent_tool_use_id. Observed live: without re-keying, a resumed
+        // run re-activates the child window but can never re-terminate
+        // it.
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"aa440","tool_use_id":"toolu_01AAABBBCCCDDDEEE","description":"probe echo","subagent_type":"general-purpose","task_type":"local_agent","session_id":"s1"}"#,
+        );
+        // Run #1 ends under the spawn tool_use id.
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"aa440","tool_use_id":"toolu_01AAABBBCCCDDDEEE","status":"completed","summary":"first run done","session_id":"s1"}"#,
+        );
+        assert!(reader.task_children["toolu_01AAABBBCCCDDDEEE"].terminal);
+
+        // Resume: the stream re-enters the child, tagged with the SPAWN id.
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"back to work"}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        assert!(
+            !reader.task_children["toolu_01AAABBBCCCDDDEEE"].terminal,
+            "stream re-entry must re-arm the terminal once-guard"
+        );
+        // Deliberately no re-registration event rides the re-arm: the
+        // window's active look derives from the scoped stream itself.
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })),
+            "re-arm must not re-register: {:?}",
+            out.events
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(event.as_ref(), AgentEvent::Message { text } if text == "back to work")
+        )));
+
+        // Run #2 ends under the RESUME segment's tool_use id + the stable
+        // task_id: the notification must resolve back to the spawn child.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"aa440","tool_use_id":"toolu_01RESUMESEGMENT000","status":"completed","summary":"second run done","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::SubAgentToolCall { item_id, status, agents, .. }
+                            if item_id == "toolu_01AAABBBCCCDDDEEE"
+                                && status == "completed"
+                                && agents[0].status == "completed"
+                                && agents[0].message.as_deref() == Some("second run done")
+                    )
+        )));
+        assert!(reader.task_children["toolu_01AAABBBCCCDDDEEE"].terminal);
+        // A duplicate of run #2's notification stays silent — the
+        // once-guard is latched again.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"aa440","tool_use_id":"toolu_01RESUMESEGMENT000","status":"completed","summary":"second run done","session_id":"s1"}"#,
+        );
+        assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn task_id_spawn_binding_survives_later_task_started() {
+        // A resumed run may re-announce the same task_id under the new
+        // segment's tool_use id: the spawn binding is first-write-wins,
+        // and the segment id must not register a second (ghost) child
+        // that would capture the run's notification away from the real
+        // child window.
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"aa440","tool_use_id":"toolu_01AAABBBCCCDDDEEE","description":"probe echo","subagent_type":"general-purpose","task_type":"local_agent","session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"aa440","tool_use_id":"toolu_01RESUMESEGMENT000","description":"probe echo","subagent_type":"general-purpose","task_type":"local_agent","session_id":"s1"}"#,
+        );
+        assert_eq!(
+            reader.task_ids.get("aa440").map(String::as_str),
+            Some("toolu_01AAABBBCCCDDDEEE"),
+            "spawn binding must survive later task_starteds"
+        );
+        assert!(
+            !reader
+                .task_children
+                .contains_key("toolu_01RESUMESEGMENT000"),
+            "segment id must not ghost a second child"
+        );
+        assert!(
+            out.events.is_empty(),
+            "segment re-announce is silent: {:?}",
+            out.events
+        );
+        // A notification correlating only by task_id still resolves to
+        // the spawn child.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"aa440","status":"completed","summary":"done","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::SubAgentToolCall { item_id, status, .. }
+                            if item_id == "toolu_01AAABBBCCCDDDEEE" && status == "completed"
+                    )
+        )));
+    }
+
+    #[test]
+    fn unknown_notification_ids_stay_silent() {
+        // Neither the tool_use id nor the task_id is known: silent no-op —
+        // no spurious terminal, no panic, the real child untouched.
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"zz404","tool_use_id":"toolu_01NEVERSEEN0000000","status":"failed","summary":"whose task is this","session_id":"s1"}"#,
+        );
+        assert!(
+            out.events.is_empty(),
+            "unknown ids must no-op: {:?}",
+            out.events
+        );
+        assert!(!reader.task_children["toolu_01AAABBBCCCDDDEEE"].terminal);
+    }
+
+    #[test]
+    fn midrun_continuation_keeps_spawn_keying() {
+        // Steering a RUNNING task does not open a new run segment: child
+        // activity keeps flowing and the notification stays keyed by the
+        // spawn tool_use id. Pinned so the segment re-keying never
+        // disturbs the normal single-run flow.
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"aa440","tool_use_id":"toolu_01AAABBBCCCDDDEEE","description":"probe echo","subagent_type":"general-purpose","task_type":"local_agent","session_id":"s1"}"#,
+        );
+        // Mid-run child activity (never terminal): no re-arm, no
+        // re-register.
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"still working"}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })));
+        assert!(!reader.task_children["toolu_01AAABBBCCCDDDEEE"].terminal);
+        // The run's end still arrives under the spawn id and terminates
+        // exactly once.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"aa440","tool_use_id":"toolu_01AAABBBCCCDDDEEE","status":"completed","summary":"done","session_id":"s1"}"#,
+        );
+        let terminals = out
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::Scoped { event, .. }
+                        if matches!(
+                            event.as_ref(),
+                            AgentEvent::SubAgentToolCall { status, .. } if status == "completed"
+                        )
+                )
+            })
+            .count();
+        assert_eq!(terminals, 1);
+    }
+
+    #[test]
+    fn rearmed_child_is_closeable_at_shutdown_again() {
+        // Intended side effect of the re-arm: a resumed child that never
+        // re-terminates is open again, so shutdown closes it instead of
+        // skipping it as already-terminal.
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","tool_use_id":"toolu_01AAABBBCCCDDDEEE","status":"completed","session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"resumed"}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        let mut out = CcLineOutcome::default();
+        reader.close_open_task_children(&mut out);
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Scoped { thread_id, event, .. }
+                if thread_id.as_deref() == Some(TASK_CHILD)
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::SubAgentToolCall { status, agents, .. }
+                            if status == "interrupted" && agents[0].status == "shutdown"
+                    )
         )));
     }
 
@@ -5948,6 +6352,102 @@ mod tests {
         )));
     }
 
+    /// The live spam incident: the CLI re-announces `allowed_warning` on
+    /// every model call for as long as the warning persists, and each
+    /// re-announcement logged a warn row (Activity log + persisted JSONL).
+    /// Log rows must fire on status TRANSITIONS only, while the vitals
+    /// gauge keeps taking every event.
+    #[test]
+    fn rate_limit_status_logs_only_on_transitions() {
+        fn log_events(out: &CcLineOutcome) -> Vec<(String, String)> {
+            out.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Log { level, message } => Some((level.clone(), message.clone())),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let mut reader = test_reader();
+        // Entering the warning logs once, with the reset time.
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","resetsAt":9999999999},"session_id":"s1"}"#,
+        );
+        let logs = log_events(&out);
+        assert_eq!(logs.len(), 1, "one warn row on the transition: {logs:?}");
+        assert_eq!(logs[0].0, "warn");
+        assert!(
+            logs[0].1.contains("warning") && logs[0].1.contains("five_hour"),
+            "row names the state and window: {}",
+            logs[0].1
+        );
+        assert!(
+            logs[0].1.contains("resets"),
+            "row carries the reset time when the wire has one: {}",
+            logs[0].1
+        );
+
+        // Re-announcements of the SAME status stay silent — even when the
+        // reset time moves — but the vitals gauge still takes the update.
+        for resets_at in [9999999999u64, 9999999998] {
+            let line = format!(
+                r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","rateLimitType":"five_hour","resetsAt":{resets_at}}},"session_id":"s1"}}"#
+            );
+            let out = reader.process_line(&line);
+            assert!(
+                log_events(&out).is_empty(),
+                "re-announced status must not log: {:?}",
+                log_events(&out)
+            );
+        }
+        let windows = reader.current_limit_windows();
+        let five_hour = windows.iter().find(|w| w.label == "5h").expect("5h window");
+        assert_eq!(
+            five_hour.resets_at_epoch,
+            Some(9_999_999_998),
+            "silent re-announcements still update the gauge"
+        );
+        assert_eq!(five_hour.status.as_deref(), Some("allowed_warning"));
+
+        // Escalation to a hard status logs again; repeating it is silent.
+        let rejected = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"},"session_id":"s1"}"#;
+        let out = reader.process_line(rejected);
+        let logs = log_events(&out);
+        assert_eq!(logs.len(), 1, "escalation logs once: {logs:?}");
+        assert!(logs[0].1.contains("rejected"));
+        let out = reader.process_line(rejected);
+        assert!(log_events(&out).is_empty(), "repeated rejected is silent");
+
+        // Recovery back to allowed logs an info row once; a fresh warning
+        // afterwards is a new transition and logs again.
+        let allowed = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"s1"}"#;
+        let out = reader.process_line(allowed);
+        let logs = log_events(&out);
+        assert_eq!(logs.len(), 1, "recovery logs once: {logs:?}");
+        assert_eq!(logs[0].0, "info");
+        assert!(logs[0].1.contains("cleared"));
+        let out = reader.process_line(allowed);
+        assert!(log_events(&out).is_empty(), "repeated allowed is silent");
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        assert_eq!(
+            log_events(&out).len(),
+            1,
+            "a fresh warning after recovery re-arms the row"
+        );
+
+        // Independent windows transition independently: a seven_day
+        // warning logs even while five_hour sits in the same state.
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day"},"session_id":"s1"}"#,
+        );
+        let logs = log_events(&out);
+        assert_eq!(logs.len(), 1, "per-window transition: {logs:?}");
+        assert!(logs[0].1.contains("seven_day"));
+    }
+
     /// The captured incident shape: a `rate_limit_event` with status
     /// `rejected` followed by the turn's result — subtype still `success`,
     /// `is_error: true`, the limit notice as the text. The reader must
@@ -6301,6 +6801,35 @@ mod tests {
             format!(
                 "http://localhost:8765/mcp?session_id=session%20with%20spaces&tool_profile=core&mcp_token={expected_token}"
             )
+        );
+    }
+
+    #[test]
+    fn inline_mcp_config_uses_env_placeholder_not_bearer_value() {
+        let mut agent = ClaudeCodeAgent::new(
+            "claude".into(),
+            None,
+            "default".into(),
+            None,
+            vec![],
+            Some(8765),
+        );
+        agent.mcp_session_id = Some("session-a".to_string());
+        agent.mcp_auth_token = Some("raw-process-secret".to_string());
+        let derived =
+            crate::web_gateway::session_scoped_mcp_token("raw-process-secret", "session-a");
+
+        let config = agent.intendant_mcp_config(8765);
+        let argv_value = config.to_string();
+        assert!(!argv_value.contains("raw-process-secret"));
+        assert!(!argv_value.contains(&derived));
+        assert_eq!(
+            config["mcpServers"]["intendant"]["url"],
+            "http://localhost:8765/mcp?session_id=session-a&tool_profile=core"
+        );
+        assert_eq!(
+            config["mcpServers"]["intendant"]["headers"]["Authorization"],
+            "Bearer ${INTENDANT_MCP_BEARER_TOKEN}"
         );
     }
 

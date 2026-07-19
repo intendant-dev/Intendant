@@ -81,7 +81,7 @@ use rtc::statistics::stats::RTCStatsType;
 use rtc::statistics::StatsSelector;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -321,6 +321,26 @@ pub struct WebRtcPeer {
     /// `active_rids` snapshot is always in lockstep with the
     /// negotiated answer SDP.
     active_rids: Vec<SimulcastRid>,
+    /// The codec this peer's forwarders actually consume, frozen at
+    /// construction alongside `active_rids` (both derive from the same
+    /// initial pool subscription). Lets the layer-policy coordinator
+    /// attribute an **on-demand** encoder slot (keyed `(codec, rid)`)
+    /// to the peers holding it when reconciling tile-mode video
+    /// standby.
+    active_codec: CodecKind,
+    /// Tile-mode video standby: `true` while this peer's client paints
+    /// dirty-region tiles (video element hidden), meaning the peer
+    /// currently demands **no** video encoder output. Read by the
+    /// layer-policy coordinator each evaluation — a standby peer
+    /// contributes nothing to the demanded/pinned layer sets and does
+    /// not hold its on-demand slot active — so a tile-only session's
+    /// encoders pause while any non-standby viewer on the same display
+    /// keeps its layers running untouched. Written by the display
+    /// session's tile bridge at the subscribe / fallback transitions;
+    /// flipped back **before** `FallbackToVideo` is sent so the resume
+    /// (with its forced keyframe) races ahead of the browser's surface
+    /// switch.
+    video_standby: AtomicBool,
     shutdown: CancellationToken,
 }
 
@@ -430,6 +450,26 @@ impl WebRtcPeer {
         &self.active_rids
     }
 
+    /// The codec this peer's forwarders consume, frozen at construction.
+    /// See the `active_codec` field docs.
+    pub fn active_codec(&self) -> CodecKind {
+        self.active_codec
+    }
+
+    /// Enter or leave tile-mode video standby (see the `video_standby`
+    /// field docs). Written by the owning display session's tile
+    /// bridge; the layer-policy coordinator reads it on every
+    /// evaluation, so callers pair a transition with a coordinator
+    /// kick when they need the pause/resume to land immediately.
+    pub fn set_video_standby(&self, standby: bool) {
+        self.video_standby.store(standby, Ordering::Relaxed);
+    }
+
+    /// Whether this peer is in tile-mode video standby.
+    pub fn video_standby(&self) -> bool {
+        self.video_standby.load(Ordering::Relaxed)
+    }
+
     /// Test-only: construct a `WebRtcPeer` with just `active_rids`
     /// populated and dummy values for everything else. The dummy
     /// channels are constructed but their senders are dropped so
@@ -448,6 +488,18 @@ impl WebRtcPeer {
     /// pipeline directly.
     #[cfg(any(test, feature = "test-util"))]
     pub fn new_for_test(peer_id: PeerId, active_rids: Vec<SimulcastRid>) -> Self {
+        Self::new_for_test_with_codec(peer_id, crate::encode::pool::BASELINE_CODEC, active_rids)
+    }
+
+    /// [`Self::new_for_test`] with an explicit `active_codec` — for
+    /// tests exercising the on-demand standby reconcile, which
+    /// attributes `(codec, rid)` slots to peers by this field.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn new_for_test_with_codec(
+        peer_id: PeerId,
+        active_codec: CodecKind,
+        active_rids: Vec<SimulcastRid>,
+    ) -> Self {
         use std::collections::HashMap;
         let (command_tx, _command_rx) = mpsc::channel(1);
         let (_obs_tx, observed_send_bitrate_rx) = watch::channel(None);
@@ -465,6 +517,8 @@ impl WebRtcPeer {
             remote_inbound_health_rx,
             twcc_health_rx,
             active_rids,
+            active_codec,
+            video_standby: AtomicBool::new(false),
             shutdown: CancellationToken::new(),
         }
     }
@@ -506,7 +560,7 @@ impl WebRtcPeer {
 /// Personalized display-input authority state for one viewer.
 ///
 /// Wire vocabulary matches the local 5c data-channel protocol exactly
-/// (see `web_gateway.rs::compute_bootstrap_authority_snapshots`). Used
+/// (see `web_gateway/input_authority.rs`). Used
 /// by [`WebRtcPeer::send_authority_state`] for the federated path's
 /// `display_input_authority` data channel — peer broadcasts a
 /// personalized value to each subscribed federated browser.
@@ -545,14 +599,13 @@ impl DisplayInputAuthorityState {
 /// { "t": "display_input_authority_release", "display_id": 0 }
 /// ```
 ///
-/// `display/webrtc.rs` parses these frames off the wire and hands
+/// This module parses these frames off the wire and hands
 /// them to an opaque [`AuthorityChannelHandler`] without applying any
 /// policy. The handler — built outside the transport in
-/// `web_gateway.rs` by the slice that wires the registry — consults
-/// the federated authority registry and decides whether to grant /
-/// release / no-op. Same separation as the existing
-/// `input_handler`: webrtc.rs parses the wire shape, the gate lives
-/// outside.
+/// `web_gateway/input_authority.rs` by the slice that wires the registry —
+/// consults the federated authority registry and decides whether to grant /
+/// release / no-op. Same separation as the existing `input_handler`: this
+/// module parses the wire shape, while the gate lives outside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthorityChannelMessage {
     Request { display_id: u32 },

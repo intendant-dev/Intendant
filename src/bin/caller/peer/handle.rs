@@ -282,6 +282,7 @@ struct PeerHandleInner {
     /// [`PeerSnapshot::browser_tcp_via_url`] so the dashboard can
     /// pick it over `ws_url` when sending federated WebRTC offers.
     browser_tcp_via_url: Option<String>,
+    certificate_witness_vantage: crate::peer::PeerWitnessVantage,
     /// The auth material the registry assembled for this peer's
     /// transport (operator config + card auth + installed access
     /// identity), retained verbatim so side-channel HTTP calls to the
@@ -379,6 +380,10 @@ impl PeerHandle {
     #[allow(dead_code)]
     pub fn browser_tcp_via_url(&self) -> Option<&str> {
         self.inner.browser_tcp_via_url.as_deref()
+    }
+
+    pub fn certificate_witness_vantage(&self) -> crate::peer::PeerWitnessVantage {
+        self.inner.certificate_witness_vantage
     }
 
     /// The transport-grade auth material for this peer (bearer,
@@ -729,6 +734,29 @@ impl PeerHandle {
         }
     }
 
+    /// Submit this daemon's signed observation of the peer's hosted fleet
+    /// certificate over the already-authenticated peer transport.
+    pub async fn submit_certificate_witness(
+        &self,
+        report: crate::access::hosted_control::HostedCertificateWitnessReport,
+    ) -> Result<(), PeerError> {
+        if !self.features().certificate_witness {
+            return Err(PeerError::UnsupportedCapability(
+                "hosted_certificate_witness".into(),
+            ));
+        }
+        match self
+            .exec(PeerOp::HostedCertificateWitness { report })
+            .await?
+        {
+            PeerOpAck::Ok => Ok(()),
+            other => Err(PeerError::Transport(format!(
+                "expected Ok ack, got {}",
+                other.name()
+            ))),
+        }
+    }
+
     /// Request explicit disconnect. Awaits until the actor has
     /// transitioned to [`ConnectionState::Disconnected`] so callers
     /// know the transport is actually torn down when this returns.
@@ -858,7 +886,7 @@ pub struct PeerSnapshot {
 /// ```ignore
 /// let handle = spawn_peer(
 ///     peer_id, initial_card, via_urls, browser_tcp_via_url,
-///     label_override, credentials, log_sink,
+///     label_override, certificate_witness_vantage, credentials, log_sink,
 ///     |events_tx| Box::new(IntendantWsTransport::new(url, events_tx)),
 /// );
 /// ```
@@ -902,6 +930,7 @@ pub fn spawn_peer<F>(
     via_urls: Vec<String>,
     browser_tcp_via_url: Option<String>,
     label_override: Option<String>,
+    certificate_witness_vantage: crate::peer::PeerWitnessVantage,
     credentials: TransportCredentials,
     log_sink: mpsc::Sender<EnqueuedPeerEvent>,
     build_transport: F,
@@ -961,6 +990,7 @@ where
             commands: commands_tx,
             events: events_out_tx,
             browser_tcp_via_url,
+            certificate_witness_vantage,
             credentials,
         }),
     }
@@ -1037,6 +1067,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            crate::peer::PeerWitnessVantage::Unknown,
             TransportCredentials::default(),
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
@@ -1147,6 +1178,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            crate::peer::PeerWitnessVantage::Unknown,
             TransportCredentials::default(),
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
@@ -1286,6 +1318,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            crate::peer::PeerWitnessVantage::Unknown,
             TransportCredentials::default(),
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
@@ -1398,6 +1431,7 @@ mod tests {
             Vec::new(),
             Some(browser_url.clone()),
             None,
+            crate::peer::PeerWitnessVantage::Remote,
             TransportCredentials::default(),
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
@@ -1413,6 +1447,10 @@ mod tests {
             handle.browser_tcp_via_url(),
             Some(browser_url.as_str()),
             "getter mirrors snapshot"
+        );
+        assert_eq!(
+            handle.certificate_witness_vantage(),
+            crate::peer::PeerWitnessVantage::Remote
         );
         // Belt-and-suspenders: the None case doesn't crash.
         // (Constructed separately to avoid re-using the same card id,
@@ -1457,6 +1495,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            crate::peer::PeerWitnessVantage::Unknown,
             TransportCredentials::default(),
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
@@ -1531,6 +1570,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            crate::peer::PeerWitnessVantage::Unknown,
             TransportCredentials::default(),
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url, events_tx)),

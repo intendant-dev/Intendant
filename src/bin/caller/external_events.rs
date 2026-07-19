@@ -147,9 +147,6 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
     managed_context_density_handoff: bool,
     managed_context_density_handoff_completed: bool,
 ) -> DrainOutcome {
-    use std::sync::atomic::Ordering;
-
-    let approval_counter = std::sync::atomic::AtomicU64::new(1);
     let mut turns_in_round = 0usize;
     let local_session_id = config.session_id.clone();
     let alias_session_id = config.alias_session_id.clone();
@@ -618,6 +615,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                     None,
                                     None,
                                     None,
+                                    &[],
                                     &text,
                                 );
                                 pending_runtime_steers.push_back(PendingRuntimeSteer {
@@ -736,7 +734,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                             &mut active_side_turns,
                             session_id,
                             text,
-                            UserAttachments::from_items(attachments),
+                            attachments,
                             follow_up_id,
                             None,
                         )
@@ -1015,6 +1013,14 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
         let event_is_side = side_thread_id.is_some() && !event_is_primary;
         let event_is_codex_subagent =
             codex_subagent_thread_id.is_some() && !event_is_primary && !event_is_side;
+        if event_is_codex_subagent {
+            if let Some(child_thread_id) = codex_subagent_thread_id.as_deref() {
+                // A terminal-marked child that streams again is alive again
+                // (Claude Code Task resume): re-arm the SessionEnded dedupe
+                // so the resumed run's own terminal can emit.
+                note_external_subagent_liveness(stats, child_thread_id, &event);
+            }
+        }
         let child_thread_id = side_thread_id
             .as_ref()
             .or(codex_subagent_thread_id.as_ref());
@@ -1816,7 +1822,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         });
                     }
                 } else {
-                    let id = approval_counter.fetch_add(1, Ordering::Relaxed);
+                    let id = event::next_approval_id();
                     // Arm the responder BEFORE announcing the approval: a
                     // frontend that reacts to the event instantly (scripted
                     // control-socket clients) must find the registry entry,
@@ -1963,7 +1969,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         });
                     }
                 } else {
-                    let id = approval_counter.fetch_add(1, Ordering::Relaxed);
+                    let id = event::next_approval_id();
                     // Arm the responder BEFORE announcing the question (same
                     // race as approvals: an instant answer must find the
                     // registry entry).
@@ -2163,7 +2169,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         });
                     }
                 } else {
-                    let id = approval_counter.fetch_add(1, Ordering::Relaxed);
+                    let id = event::next_approval_id();
                     // Arm the responder BEFORE announcing (same race as the
                     // command-approval arm above).
                     let rx = if let Some(slot) = config.json_approval {

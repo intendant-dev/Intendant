@@ -349,6 +349,10 @@ fn spawn_ceremony_process(id: u64, command: &str) -> Result<(), String> {
     args.extend(["login".to_string(), "--device-auth".to_string()]);
     let mut cmd = portable_pty::CommandBuilder::new(&program);
     cmd.args(&args);
+    // Same env policy as the supervised-backend spawns: the login ceremony
+    // runs the same external CLI and must not inherit provider keys or
+    // ambient credentials. Applied before the deliberate sets below.
+    crate::external_agent::apply_external_child_env_policy_pty(&mut cmd);
     cmd.env("TERM", "xterm-256color");
     if let Some((shim_dir, _)) = shim.as_ref() {
         cmd.env(

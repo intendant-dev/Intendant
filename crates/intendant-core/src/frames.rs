@@ -4,12 +4,56 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Maximum accepted length for browser/client-provided media identifiers.
+pub const MEDIA_ID_MAX_LEN: usize = 64;
+
+/// Why a frame or clip identifier was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaIdError {
+    Empty,
+    TooLong,
+    InvalidCharacter,
+}
+
+impl std::fmt::Display for MediaIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "must not be empty"),
+            Self::TooLong => write!(f, "must be at most {MEDIA_ID_MAX_LEN} characters"),
+            Self::InvalidCharacter => {
+                write!(f, "must contain only ASCII letters, digits, '_' or '-'")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MediaIdError {}
+
+/// Validate an identifier that may cross a media transport or become part of
+/// a frame filename. Keeping the alphabet deliberately narrow makes the same
+/// value safe in URLs, logs, DOM labels, and on every supported filesystem.
+pub fn validate_media_id(id: &str) -> Result<(), MediaIdError> {
+    if id.is_empty() {
+        return Err(MediaIdError::Empty);
+    }
+    if id.len() > MEDIA_ID_MAX_LEN {
+        return Err(MediaIdError::TooLong);
+    }
+    if !id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(MediaIdError::InvalidCharacter);
+    }
+    Ok(())
+}
+
 /// Server-side frame registry.
 ///
 /// Stores frame metadata in memory and HQ frame data on disk under the session
 /// directory (`<session_dir>/frames/`). The browser assigns frame IDs client-side
-/// using a deterministic `{stream}-f{counter}` scheme; the server validates
-/// uniqueness and persists HQ data.
+/// using a deterministic `{stream}-f{counter}` scheme; the server validates the
+/// identifier before persisting HQ data.
 pub struct FrameRegistry {
     /// Frame metadata indexed by frame_id.
     frames: HashMap<String, FrameMeta>,
@@ -40,7 +84,7 @@ impl FrameRegistry {
     /// `hq_data` is the raw image bytes (e.g. JPEG).
     /// Returns the path where the HQ image was stored, or an error.
     pub fn register(&mut self, meta: FrameMeta, hq_data: &[u8]) -> Result<PathBuf, std::io::Error> {
-        let hq_path = self.frames_dir.join(format!("{}.jpg", &meta.frame_id));
+        let hq_path = self.path_for(&meta.frame_id)?;
         fs::write(&hq_path, hq_data)?;
 
         // Append metadata to frames.jsonl manifest
@@ -78,15 +122,21 @@ impl FrameRegistry {
 
     /// Read the HQ image data for a frame from disk.
     pub fn read_hq(&self, frame_id: &str) -> Result<Vec<u8>, std::io::Error> {
-        let path = self.frames_dir.join(format!("{}.jpg", frame_id));
+        let path = self.path_for(frame_id)?;
         fs::read(&path)
     }
 
     /// Compute the on-disk HQ path for a frame ID. Does not check for existence.
     /// Used by external-agent attachment resolvers that need to pass a file path
     /// (e.g. Codex `LocalImage`) instead of base64 over JSON-RPC.
-    pub fn path_for(&self, frame_id: &str) -> PathBuf {
-        self.frames_dir.join(format!("{}.jpg", frame_id))
+    pub fn path_for(&self, frame_id: &str) -> Result<PathBuf, std::io::Error> {
+        validate_media_id(frame_id).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid frame_id: {err}"),
+            )
+        })?;
+        Ok(self.frames_dir.join(format!("{frame_id}.jpg")))
     }
 
     /// Query frames by stream and/or recent count.
@@ -179,6 +229,50 @@ mod tests {
 
         let data = reg.read_hq("cam0-f00001").unwrap();
         assert_eq!(data, hq_data);
+    }
+
+    #[test]
+    fn media_identifier_validation_is_strict_and_bounded() {
+        assert_eq!(validate_media_id("cam0-f00001"), Ok(()));
+        assert_eq!(validate_media_id("A_b-9"), Ok(()));
+        assert_eq!(validate_media_id(""), Err(MediaIdError::Empty));
+        assert_eq!(
+            validate_media_id(&"a".repeat(MEDIA_ID_MAX_LEN + 1)),
+            Err(MediaIdError::TooLong)
+        );
+        for invalid in [
+            "../escape",
+            "/absolute",
+            r"dir\frame",
+            "frame.jpg",
+            "frame id",
+            "<img>",
+            "café",
+        ] {
+            assert_eq!(
+                validate_media_id(invalid),
+                Err(MediaIdError::InvalidCharacter),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_paths_reject_traversal_before_filesystem_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reg = FrameRegistry::new(tmp.path());
+        let escaped = tmp.path().join("escaped.jpg");
+
+        let register_err = reg
+            .register(test_meta("../escaped", "cam0"), b"attacker bytes")
+            .unwrap_err();
+        assert_eq!(register_err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!escaped.exists());
+
+        let read_err = reg.read_hq("../escaped").unwrap_err();
+        assert_eq!(read_err.kind(), std::io::ErrorKind::InvalidInput);
+        let path_err = reg.path_for("../escaped").unwrap_err();
+        assert_eq!(path_err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

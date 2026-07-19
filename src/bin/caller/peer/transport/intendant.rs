@@ -561,6 +561,7 @@ impl PeerTransport for IntendantWsTransport {
             webrtc_signal: true,
             file_transfer_signal: true,
             dashboard_control_signal: true,
+            certificate_witness: true,
         }
     }
 
@@ -706,6 +707,11 @@ impl PeerTransport for IntendantWsTransport {
                     signal,
                 })
                 .await?;
+                Ok(PeerOpAck::Ok)
+            }
+            PeerOp::HostedCertificateWitness { report } => {
+                self.write_control_msg(&ControlMsg::HostedCertificateWitness { report })
+                    .await?;
                 Ok(PeerOpAck::Ok)
             }
             // check_feature rejects the other variants before they
@@ -980,12 +986,54 @@ mod tests {
         assert!(features.send_message);
         assert!(features.task_delegation);
         assert!(features.resolve_approval);
+        assert!(features.certificate_witness);
         assert!(!features.task_cancel, "no wire primitive for cancel");
         assert!(!features.task_query, "no wire primitive for task query");
         assert!(
             !features.invoke_capability,
             "no wire primitive for capability invoke"
         );
+    }
+
+    #[tokio::test]
+    async fn certificate_witness_wire_frame_requires_an_authenticated_peer() {
+        let (port, gateway, mut bus_rx) = spawn_test_peer_with_bus().await;
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let mut transport = IntendantWsTransport::new(url, tx);
+        let _ = transport.connect().await.unwrap();
+        let report = crate::access::hosted_control::HostedCertificateWitnessReport {
+            protocol: crate::access::hosted_control::CERTIFICATE_WITNESS_PROTOCOL.to_string(),
+            report_id: "report-1".to_string(),
+            observer_kind: crate::access::hosted_control::HostedWitnessKind::Peer,
+            observer_id: "observer-1".to_string(),
+            observer_public_key: "key".to_string(),
+            target_daemon_id: "target".to_string(),
+            fleet_origin: "https://target.example.test".to_string(),
+            ledger_sha256: "digest".to_string(),
+            observed_serial_hex: "abc".to_string(),
+            vantage: crate::access::hosted_control::HostedWitnessVantage::Remote,
+            observed_unix_ms: 1,
+            signature: "signature".to_string(),
+        };
+
+        let ack = transport
+            .send(PeerOp::HostedCertificateWitness { report })
+            .await
+            .unwrap();
+        assert!(matches!(ack, PeerOpAck::Ok));
+        assert!(wait_for_event(&mut bus_rx, |event| {
+            matches!(
+                event,
+                AppEvent::PresenceLog { message, .. }
+                    if message.contains("denied hosted certificate witness")
+            )
+        })
+        .await
+        .is_some());
+
+        transport.disconnect().await.unwrap();
+        gateway.abort();
     }
 
     /// `send_message` writes a `ControlMsg::FollowUp` to the peer's

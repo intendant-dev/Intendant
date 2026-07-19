@@ -6,7 +6,8 @@ external tool does the actual coding; Intendant wraps it in its own oversight,
 display, and computer-use surface by pointing the tool's MCP client at Intendant's
 own [MCP server](./mcp-server.md).
 
-This is the fourth execution mode (alongside Direct, User, and Sub-Agent — see
+This is one of the four current execution shapes — Direct, Orchestrate,
+Sub-Agent, and External-Agent (see
 [Agent Execution & Multi-Agent Orchestration](./multi-agent.md)). It is selected
 by `--agent <backend>` or the `[agent] default_backend` config key.
 
@@ -73,9 +74,10 @@ pub trait ExternalAgent: Send + Sync {
 ```
 
 `initialize()` spawns the backend process and returns a channel of normalized
-**`AgentEvent`**s; everything the backend emits (deltas, messages, reasoning, plan
-updates, tool start/output/complete, approval requests, diffs, usage, termination)
-is translated into that enum so the controller's display and oversight code is
+**`AgentEvent`**s; everything the backend emits (deltas, messages, reasoning,
+plan updates, tool start/output/complete, approval and structured-question
+requests, diffs, usage/vitals facts, limit-rejected turns, and termination) is
+translated into that enum so the controller's display and oversight code is
 backend-agnostic. `AgentEvent::Scoped { thread_id, turn_id, .. }` wraps inner
 events when a backend (Codex) multiplexes several threads through one process.
 
@@ -96,16 +98,16 @@ persisted sessions from it remain readable but cannot be resumed.
 
 ## Per-Backend Reference
 
-`create_external_agent()` (`main.rs`) constructs the right adapter from
-`[agent.<backend>]` config, then `run_external_agent_mode()` drives the supervise
-loop.
+`create_external_agent()` (`external_supervision.rs`) constructs the right
+adapter from `[agent.<backend>]` config, then `run_external_agent_mode()`
+(`external_mode.rs`) drives the supervise loop.
 
 | | **Codex** (reference impl) | **Claude Code** |
 |---|---|---|
 | Module | `external_agent/codex/` (mod, threads, wire, context_trace, reader) | `external_agent/claude_code.rs` |
 | Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --permission-mode <mode>` |
 | Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio |
-| MCP injection | Per-process `-c mcp_servers.intendant.{type,url}` overrides plus scoped env; no workspace config file | Inline `--mcp-config '{…}'` JSON string |
+| MCP injection | Per-process `-c mcp_servers.intendant.{type,url,bearer_token_env_var}` overrides plus scoped env; no workspace config file | Inline `--mcp-config '{…}'` JSON with an environment-expanded Authorization header |
 | Multi-thread | Yes — many threads per process | No |
 | Native thread id | Yes | Yes — announced via `AgentEvent::NativeSessionId` on the first turn (placeholder `claude-code-session` until then; `--resume` keeps the id stable so resumed threads are canonical immediately) |
 | Mid-turn steer | Yes (`turn/steer`) | No — 2.1.2xx discards stdin user messages mid-turn (2.1.200's absorb was a CLI bug, since removed); `steer_turn` reports queue semantics and the steer delivers at the turn boundary (or immediately as its own turn when idle) |
@@ -180,7 +182,7 @@ What each supervised backend actually receives:
 | | **Codex** | **Claude Code** |
 |---|---|---|
 | MCP tool exposure | `tool_profile=core` (bootstrap set) | `tool_profile=core` (bootstrap set) |
-| Loopback `mcp_token` in URL | yes | yes |
+| Session-scoped MCP bearer | child env → Authorization header | child env → environment-expanded Authorization header |
 | `session_id` scope in URL | yes | yes |
 | `$INTENDANT` + `INTENDANT_MCP_URL` env (`ctl` bootstrap) | yes (+ `INTENDANT_MANAGED_CONTEXT`) | yes |
 | Guidance channel | managed-context developer message | first-prompt bootstrap addendum |
@@ -191,6 +193,39 @@ The bootstrap set for both Codex and Claude Code includes the CU path
 regardless of managed context; managed-context/fission tools remain
 managed-only.
 
+### Environment at spawn
+
+A supervised CLI does **not** inherit the controller's environment. Every
+backend spawn starts from `env_clear()` plus an explicit allowlist
+(`external_agent::apply_external_child_env_policy`): system basics (`PATH`,
+`HOME`, `USER`, `SHELL`, `TERM`, `TMPDIR`, `TZ`, `LANG`/`LC_*`, …), the
+platform's process-bootstrap set (macOS `__CF_USER_TEXT_ENCODING`; Linux
+`DISPLAY`/`WAYLAND_DISPLAY`/`XDG_*`; Windows `SYSTEMROOT`, `COMSPEC`,
+`PATHEXT`, `APPDATA`, `USERPROFILE`, …), proxy vars
+(`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`, either case), the CLIs'
+own config-home pointers (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`), and the
+`INTENDANT`/`INTENDANT_*` control channel. Everything else is dropped —
+in particular the controller's provider API keys
+(`OPENAI`/`ANTHROPIC`/`GEMINI_API_KEY` and every `*_API_KEY`/`*_API_TOKEN`
+shape), ambient host credentials (`SSH_AUTH_SOCK`, `AWS_*` secrets,
+`GH_TOKEN`/`GITHUB_TOKEN`, `KUBECONFIG`, `DOCKER_CONFIG`, registry tokens),
+the Linux D-Bus session bus (`DBUS_SESSION_BUS_ADDRESS` — desktop-keyring
+reach), and `NODE_OPTIONS`. Backends authenticate with their own
+subscription auth under `HOME` (`~/.codex`, `~/.claude`) or a vault-leased
+home injected explicitly at spawn; they never see the controller's model
+keys.
+
+`INTENDANT_ENV_PASSTHROUGH` (comma-separated exact names,
+case-insensitive, set on the controller) deliberately extends the
+allowlist — e.g. `INTENDANT_ENV_PASSTHROUGH=SSH_AUTH_SOCK` for supervised
+sessions that must push over SSH. Provider API keys never pass, even if
+named there. The same variable exempts names from the ambient-credential
+scrub at the native runtime's spawn boundary. The runtime's own exec/PTY
+shells apply a second defense-in-depth scrub that currently does not consult
+this variable, so classified ambient credentials such as `SSH_AUTH_SOCK` do
+not survive into native shell commands even when the runtime process inherited
+them.
+
 ### Codex (the reference backend)
 
 Codex is the most fully wired backend; Claude Code falls back to defaults for
@@ -200,8 +235,13 @@ features it lacks.
   server exclusively through command-line `-c` overrides on the app-server
   process; Intendant does not write, back up, or restore
   `<workspace>/.codex/config.toml`. The command line includes
-  `-c mcp_servers.intendant.type="http" -c mcp_servers.intendant.url="…"`, plus the
-  user's toggles as further `-c` overrides:
+  `-c mcp_servers.intendant.type="http"`,
+  `-c mcp_servers.intendant.url="…"`, and
+  `-c mcp_servers.intendant.bearer_token_env_var="INTENDANT_MCP_BEARER_TOKEN"`.
+  The URL on argv carries session/profile routing but no credential; the
+  session-derived bearer exists only in the explicitly injected child
+  environment and Codex sends it as `Authorization: Bearer`. The user's
+  toggles ride as further `-c` overrides:
   `tools.web_search=true`, `model_reasoning_effort="…"`,
   `sandbox_workspace_write.network_access=true` (only in `workspace-write`), and
   `sandbox_workspace_write.writable_roots=[…]`.
@@ -227,10 +267,13 @@ features it lacks.
   `INTENDANT=/absolute/path/to/intendant`, `INTENDANT_MCP_URL`,
   `INTENDANT_SESSION_ID`, and `INTENDANT_MANAGED_CONTEXT`, so agent shells can
   run `"$INTENDANT" ctl ...` without relying on user PATH setup. Claude Code
-  gets the same treatment (scoped URL with `tool_profile=core` + `mcp_token` +
-  `session_id`, the `$INTENDANT`/`INTENDANT_MCP_URL`/`INTENDANT_SESSION_ID`
-  env, and a first-prompt bootstrap addendum naming the bootstrap tools and
-  the `ctl` discovery flow).
+  gets the same treatment: its inline MCP JSON contains a token-free scoped URL
+  and an `Authorization` header that expands
+  `${INTENDANT_MCP_BEARER_TOKEN}` inside the child. Both backends also receive
+  the token-bearing `$INTENDANT_MCP_URL` for `ctl` through their private
+  environment, plus `$INTENDANT`/`INTENDANT_SESSION_ID`; no bearer value rides
+  either process's argv. Claude's first-prompt bootstrap addendum names the
+  bootstrap tools and the `ctl` discovery flow.
 
   For dashboard/browser validation against an already-running Intendant web port,
   managed agents should use the repository helper instead of generating ad-hoc
@@ -406,9 +449,9 @@ Managed Codex sessions can fork themselves. Alongside the rewind tools, the
 managed-context gate exposes a fission surface (`fission_tool()` in `mcp/tool_gate.rs`)
 that lets the model split separable work into parallel **full-context sibling
 branches** and join the results back deliberately. The spawn/import mechanics
-live in `main.rs` (`apply_fission_spawn_action` / `apply_fission_import_action`),
-the runtime contract in `fission_lifecycle.rs`, and the durable state in
-`fission_ledger.rs`.
+live in `thread_actions.rs` (`apply_fission_spawn_action` /
+`apply_fission_import_action`), the runtime contract in
+`fission_lifecycle.rs`, and the durable state in `fission_ledger.rs`.
 
 The tools:
 
@@ -433,7 +476,7 @@ completed turn** and do not see the spawning turn — the in-flight tool call
 (including the `fission_spawn` arguments) is invisible to the children — so
 every `objective` must be self-contained: each fact, path, and constraint the
 branch needs. The supervisor injects a `<fission_charter>` developer message
-into each fork (`fission_charter_message`, `main.rs`) carrying identity
+into each fork (`fission_charter_message`, `thread_actions.rs`) carrying identity
 (group id + branch session id), the objective, the **owned write scope** (or
 "read-only"), the worktree if any, and the report-back contract: work only
 within your write scope; end the final turn with a concise outcome summary
@@ -532,7 +575,8 @@ Spawned in non-interactive stream-json mode (`-p --input-format stream-json
 `--permission-prompt-tool stdio`, so permission prompts arrive as
 `control_request`/`can_use_tool` messages on the JSON stream and become
 `AgentEvent::ApprovalRequest` (file tools carry the `FileChange` category).
-Protocol details that are load-bearing (verified against Claude Code 2.1.200):
+Protocol details that are load-bearing (compatibility vocabulary verified
+through Claude Code 2.1.210):
 
 - **Approvals**: the allow response **must echo the original tool input as
   `updatedInput`** — a bare `{"behavior":"allow"}` fails the CLI's schema
@@ -636,10 +680,12 @@ Protocol details that are load-bearing (verified against Claude Code 2.1.200):
   visible from frontends instead of silently running without CU tools.
 
 The Intendant MCP server is passed **inline** as a JSON string to
-`--mcp-config` (not a file path); the URL is the scoped bootstrap endpoint
-(`session_id` + `tool_profile=core` + `mcp_token`), and the child gets
-`$INTENDANT`, `INTENDANT_MCP_URL`, and `INTENDANT_SESSION_ID` so
-`"$INTENDANT" ctl ...` works from its shell. The first user message carries a
+`--mcp-config` (not a file path). Its argv-visible URL carries `session_id` +
+`tool_profile=core` but no token; the Authorization header expands
+`${INTENDANT_MCP_BEARER_TOKEN}` from the child environment. The child also gets
+the token-bearing `INTENDANT_MCP_URL` plus `$INTENDANT` and
+`INTENDANT_SESSION_ID` so `"$INTENDANT" ctl ...` works from its shell. The
+first user message carries a
 bootstrap addendum naming the MCP bootstrap tools
 (`read_screen`/`take_screenshot`/`execute_cu_actions`, shared-view), the lazy
 `ctl --help` discovery flow, and the dashboard-validation helper.
@@ -652,9 +698,37 @@ recorded in the session's launch config. The reader reconciles the
 warning on divergence (once per distinct echoed value).
 `--allowedTools` is added from config when set.
 
+## Rate-limit Parking
+
+Claude Code's `rate_limit_event` with status `rejected`, correlated with the
+turn's terminal result, becomes `AgentEvent::TurnLimitRejected` rather than an
+ordinary completed round. The backend process remains usable, but the rejected
+round did no work and consumes no round budget. Both the foreground
+external-mode lane and persistent-daemon lane apply the same
+`external_supervision.rs` policy:
+
+- The rejected message remains pending. If the wire supplied `resetsAt`, it is
+  resent after that instant plus 30–90 seconds of jitter; any one sleep is
+  capped at six hours so long windows are rechecked. Without a reset time,
+  consecutive rejections back off from 5 to 30 minutes.
+- Follow-ups arriving while parked queue FIFO behind the pending resend instead
+  of being burned against the exhausted backend. A cancelled follow-up is
+  skipped when the queue drains.
+- An interrupt cancels the park and drops its pending resend (other queued
+  follow-ups remain queued). Backend termination also cancels the resend; in
+  the persistent lane, queued user messages can run against the next agent
+  build. `/new` is an explicit reset and drops both the park and that lane's
+  queued messages.
+- An out-of-band `compact` action is refused with the reset-time explanation
+  while a park is armed; request it again after the reset.
+
+The park is an in-memory session-lane state, not a durable scheduler. Activity
+and session-log rows make the pause, queued messages, cancellation, and resend
+visible.
+
 ## Dashboard and Station parity: Codex vs Claude Code
 
-The per-session dashboard features (Activity → Logs agent windows and the
+The per-session dashboard features (Activity → Timeline agent windows and the
 [Station](./station.md) canvas) were built against Codex first. An audit
 (2026-07-04 @ `d590ad94`) found that the *rails* are almost all
 backend-neutral already — what is Codex-only is the *producers*. The
@@ -720,7 +794,7 @@ supervisor-spawned native sessions, plus the Station work tracked in
 
 When a supervised agent asks to run a command or change a file, the backend emits
 `AgentEvent::ApprovalRequest` / `FileApprovalRequest`. `drain_external_agent_events()`
-(`main.rs`) routes the decision through **the same autonomy policy and approval
+(`external_events.rs`) routes the decision through **the same autonomy policy and approval
 registry as the native agent**:
 
 ```
@@ -841,8 +915,9 @@ shared state (when driven over MCP) → config default → native.
 ## Gotchas and Caveats
 
 - **No workspace config mutation.** Codex MCP injection is per-process:
-  Intendant passes `-c` overrides and scoped env to the app-server process. It
-  does not write `<workspace>/.codex/config.toml`, create
+  Intendant passes token-free `-c` overrides and a session-scoped bearer in the
+  child environment to the app-server process. It does not write
+  `<workspace>/.codex/config.toml`, create
   `config.toml.intendant-backup`, or restore files on shutdown.
 - **Settings latch at thread/process start.** Codex latches sandbox, approval
   policy, model, reasoning effort, tool set, and writable roots at `thread/start`.

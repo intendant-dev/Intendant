@@ -47,12 +47,14 @@ cargo build --release --bin intendant-connect
 | `--static-root` | `INTENDANT_CONNECT_STATIC_ROOT` | Deprecated compatibility input; accepted but ignored. Connect serves only embedded discovery pages/assets. `/app` and `/app.html` redirect to `/connect`; every other unknown path is `404` |
 | `--data-file` | `INTENDANT_CONNECT_DATA_FILE` | JSON state (accounts, claims, fleet records) |
 | `--daemon-token` | `INTENDANT_CONNECT_TOKEN` | Shared deployment bearer required at registration unless open registration is enabled; also the admin-API credential. It is not the per-daemon polling credential |
+| `--release-token` | `INTENDANT_CONNECT_RELEASE_TOKEN` | Dedicated bearer for release-manifest submissions; deliberately separate from the operator/admin daemon token. Without it, the submission endpoint returns 503 while reads remain public |
+| `--invite-required` | `INTENDANT_CONNECT_INVITE_REQUIRED` | Require a valid invite code for new-account registration; existing accounts are unaffected |
 | `--open-registration` | `INTENDANT_CONNECT_OPEN_REGISTRATION` | Skip only the shared deployment bearer on registration (rate-limited; stale unlinked records expire). Registration still requires a fresh daemon-key signature; each success rotates a short-lived daemon-session credential required for poll/answer/error/dry/claim-proof. The token keeps guarding the admin API |
 | `--dns-zone` | `INTENDANT_CONNECT_DNS_ZONE` | Fleet DNS: the delegated subzone this service answers for authoritatively (see below). All three `--dns-*` values or none |
 | `--dns-ns-name` | `INTENDANT_CONNECT_DNS_NS_NAME` | The NS host the parent zone delegates to (served in the apex SOA/NS) |
 | `--dns-listen` | `INTENDANT_CONNECT_DNS_LISTEN` | UDP+TCP bind for the DNS server, e.g. `0.0.0.0:53` |
 | `--relay-listen` | `INTENDANT_CONNECT_RELAY_LISTEN` | Raw TLS/SNI passthrough listener. Requires at least one relay address |
-| `--relay-address` | `INTENDANT_CONNECT_RELAY_ADDRESS` | Repeatable public IP published for relay-mode fleet DNS |
+| `--relay-address` | `INTENDANT_CONNECT_RELAY_ADDRESS` | Comma-separated public IP list published for relay-mode fleet DNS |
 
 The service speaks plain HTTP; terminate TLS in front of it (nginx,
 Caddy, a cloud load balancer). WebAuthn requires the public origin to be
@@ -112,9 +114,17 @@ Setup, one time:
 
 The register response then carries each daemon's `fleet_dns` name; the
 daemon's Connect card shows it with an **Enable HTTPS discovery** button.
+The daemon accepts a present hint only when its zone and name agree in the
+canonical `d-<20hex>.<zone>` form; incomplete or inconsistent metadata does
+not become durable fleet provenance.
 Address records persist in the state file and follow the daemon-record
 lifecycle (they survive link/release; the stale-unlinked sweep drops
-them). ACME TXT challenges are in-memory and self-expire. Posture:
+them). Each address generation is serialized per daemon, persisted before it
+replaces the live zone answer, and leaves both memory and the live answer on
+the prior generation if persistence fails. The commit runs as an owned
+transaction, so an HTTP deadline or disconnected caller cannot stop it between
+durable persistence and in-memory/live-zone publication. ACME TXT challenges
+are in-memory and self-expire. Posture:
 authoritative-only, `Refused` outside the zone, no AXFR, RFC 8482
 minimal `ANY`, 60 s TTLs. Daemons validating against Let's Encrypt
 *staging* set `INTENDANT_ACME_DIRECTORY` to the staging directory URL.
@@ -308,9 +318,24 @@ Connect ever terminating TLS or seeing plaintext:
   `/api/dns/publish`). When a browser connects, the relay mints a
   single-use nonce, hands it to the daemon over the control channel, and
   the daemon **dials back** a data connection carrying that nonce. The
-  relay correlates the two and splices them 1:1. On the daemon side the
+  relay correlates the two and splices them 1:1 (the dial-back hello is
+  read under one overall deadline and a small byte cap, so a slow writer
+  cannot hold the slot). On the daemon side the
   tunnel opens a second connection to a dedicated, ephemeral,
-  loopback-only gateway ingress instead of the public gateway listener.
+  loopback-only gateway ingress instead of the public gateway listener. Each
+  fallback or exact-name queue has its own wake signal, so activity for one
+  route does not wake parked polls for unrelated routes.
+- Control protocol v2 also binds a normalized, sorted list of exact custom
+  names and a process-stable poller id into that daemon signature. Exact-name
+  liveness and dialbacks remain attached to the v2 poller that supplied the
+  certificate proof; a rolling v1 sibling can refresh and consume only the
+  derived fleet-label fallback. An exact SNI claim routes only when one daemon
+  identity owns it; competing live claims fail closed. A separate
+  daemon-signed disconnect protocol removes that poller's exact and fallback
+  registration immediately instead of waiting for the liveness timeout. Each
+  accepted exact poll has a keyed generation: disconnect or a superseding poll
+  wakes and invalidates the prior generation, which can neither recreate the
+  withdrawn route nor consume dialbacks queued for its replacement.
 - The browser's TLS handshake therefore completes end-to-end against the
   **daemon's own fleet certificate**. Connect moves only ciphertext.
 
@@ -351,15 +376,40 @@ Deployment notes:
   fleet label with `--relay-address` instead of the daemon's own (NAT'd)
   addresses. The store/serve split is unchanged — `dns.rs` serves the
   substituted address verbatim.
-- Abuse is bounded by per-source-IP and per-tunnel connection caps, a
-  per-connection byte cap, idle teardown, and a bounded dial-back wait.
+- Abuse is bounded by pre-demux global and per-source-IP connection caps,
+  a per-tunnel cap, a per-connection byte cap, idle teardown, and a bounded
+  dial-back wait. The daemon caps active dialback tasks, applies one deadline
+  across relay connect, nonce hello, private-ingress connect, and provenance
+  preamble, and incrementally caps every control response before JSON or error
+  decoding. For daemon-local public-ceremony admission, the relay maps
+  each route and browser source address to a process-salted opaque bucket and
+  carries that bucket beside the dialback nonce. The gateway uses it only for
+  availability fairness; it never participates in identity or authority.
 
 A daemon opts in through `[connect] relay_enabled` + `relay_endpoint`
 (see the configuration reference). It then holds the control channel,
 dials back browser connections into the gateway's private relay ingress,
-and publishes relay-mode fleet DNS while the tunnel is up. That ingress
+and publishes relay-mode fleet DNS only after a successful control poll has
+established this process's readiness. Every boot with a configured rendezvous
+starts the DNS reconciler: disabled, invalid, disconnected, or not-yet-ready
+tunnel state explicitly converges toward `enable = false`, including stale
+relay publication left by a prior process. A successful withdrawal is not
+complete until the daemon has republished its direct addresses against the
+same pinned rendezvous generation; failure of either step keeps the whole
+transition retryable. Certificate issuance and renewal publish address
+refreshes through the same coordinator: while relay mode is established they
+retain the daemon's direct fallback locally without overwriting the live relay
+answer. That ingress
 binds only to an ephemeral `127.0.0.1` port, is never advertised, and
 does not share the public listener's trusted-local classification. Connect
+runtime settings may move the ordinary registration client to another
+destination, but an already running tunnel keeps its signed control URL,
+relay-mode DNS calls, credentials, daemon identity, and raw dialback endpoint
+on one boot configuration generation until restart. Disabling Connect cancels
+that generation's in-flight control poll and dialbacks, sends its signed
+disconnect, and publishes `enable = false` to `/api/dns/relay`; re-enabling
+resumes the same boot generation only after the registration gate is closed
+for fresh fleet-zone observation. Connect
 shows its **Request control** navigation only when registration carries the
 daemon-signed hosted-capability hint and that daemon has a relay-mode DNS
 record; older daemons and direct-mode DNS remain discovery-only in the
@@ -421,6 +471,14 @@ already applied sequence `N` accept an older sequence. It can withhold the
 latest list—or serve a still-valid older list to a fresh daemon with no local
 sequence history—so availability and first-sync freshness still depend on the
 courier. The list contains only org-public revocation data.
+
+Publication is bounded: a list is capped at 64 KiB, the handle must be
+shaped like an org handle, per-source rate limits apply (with a separate,
+much tighter hourly budget for never-before-seen `(handle, root_key)`
+pairs), and the board holds at most 1024 distinct records — new pairs are
+refused once it is full, while an org already on the board can always
+publish an updated list. Republishing the currently stored sequence is
+acknowledged without a store write.
 
 ## Notifications
 
@@ -515,10 +573,26 @@ The verifier fetches the logged manifest, checks the tree-head
 signature, the entry's inclusion proof, and consistency against the
 tree head pinned under the daemon state root
 (`~/.intendant/hosted-verify/<host>.json`, honoring `$INTENDANT_HOME`),
-then downloads every listed artifact exactly as a browser would and
-compares hashes — nonzero exit and a per-artifact diff on divergence.
-Every daemon with Connect enabled also runs this check twice daily as an
-advisory tripwire (the CT tripwire's sibling): a divergence flips
+and the highest verified artifact-manifest index pinned beside it
+(`~/.intendant/hosted-verify/<host>.artifact-manifest.json`). A lower
+manifest index, or different manifest hash at the pinned index, is a loud
+verification failure even though that older leaf remains included in the
+append-only tree. The verifier then downloads every listed artifact exactly
+as a browser would and compares hashes — nonzero exit and a per-artifact diff
+on divergence.
+Metadata bodies, proof arrays, artifact lists, and their strings are all
+bounded before verification work. Manifests must have unique, strictly sorted
+paths and cover the stable Connect pages, installers, service worker, and brand
+routes; those minimum routes cannot be removed and an empty declaration cannot
+pass. Each artifact is capped at 64 MiB; one manifest run is additionally
+capped at 256 MiB and five minutes, with bytes consumed by an over-limit stream
+charged to that aggregate budget and with bounded response-header and
+between-chunk idle waits.
+Verification fetches do not follow HTTP redirects, so a served log response
+cannot turn the monitor into a request to another origin, loopback, link-local,
+or LAN service.
+Every daemon with Connect enabled also runs this check on boot and then
+daily as an advisory tripwire (the CT tripwire's sibling): a divergence flips
 `hosted_bundle_state` to `alert` on the Connect status payload and
 raises **HOSTED CODE ALERT** on the dashboard's Connect card; network
 failures only stamp `hosted_bundle_last_error` and never block anything.
@@ -532,12 +606,12 @@ independent monitors from multiple vantage points buy is that
 *sustained* or *later-denied* equivocation becomes evidenced: the
 operator is publicly committed to a manifest history, every daemon is a
 monitor from its own vantage point, and "we never served that" stops
-being deniable. Coverage is what the service declares — but the HTML
-entrypoints are declared, so undeclared payloads require serving
-modified (hash-diverging) entrypoints. A transforming proxy between
-verifier and service (one that rewrites bodies) will surface as a
-divergence; the verifier sends no `Accept-Encoding`, so ordinary
-compression layers do not.
+being deniable. The verifier fixes a minimum route set independently of the
+service's declaration. Additional embedded assets remain service-declared, but
+an undeclared executable payload still requires a modified (hash-diverging)
+entrypoint or service worker. A transforming proxy between verifier and service
+(one that rewrites bodies) will surface as a divergence; the verifier sends no
+`Accept-Encoding`, so ordinary compression layers do not.
 
 **Reproducibility.** A manifest entry maps back to source: take the entry's
 `git_sha`, check out that commit, and rebuild. The embedded Connect pages are
@@ -581,8 +655,12 @@ per-host pin), then compares the logged artifact list against the
 GitHub release's asset *metadata* — names, sizes, and the sha256
 digests the API reports — without downloading multi-hundred-MB
 artifacts; assets on the release that the log never blessed are flagged
-too. `--download` upgrades to fetching every artifact and hashing it
-against the log — the strongest check. With an explicit tag, a release
+too. Release tags are encoded as one GitHub API path segment (including tags
+that contain `/`). `--download` upgrades to fetching every artifact and hashing it
+against the log — the strongest check. Release downloads permit progressing
+large transfers up to the per-artifact cap instead of imposing the metadata
+client's short total timeout; connection, response-header, and between-chunk
+idle waits remain bounded. With an explicit tag, a release
 absent from the log is a failure (exit 1): an unlogged release is
 exactly what the check exists to catch. (`--repo <owner/name>` points
 self-hosted forks at their own repository, and the optional
@@ -612,5 +690,17 @@ separately sign a hosted-control capability on registration. Connect displays
 relay-mode fleet-DNS route, then performs a plain navigation to
 `https://d-<hash>.<zone>/`. The public doorbell at that origin grants nothing;
 the target daemon—not the rendezvous—serves the page, verifies the tab's proof,
-and mints any approved lease. An independently recorded direct daemon URL still
-opens the daemon's own HTTPS/mTLS root-capable origin.
+and mints any approved lease. An enabled daemon may also attach its separately
+signed fleet-certificate ledger to registration. Connect stores and projects
+that document verbatim for signed-application observation; its daemon
+signature, exact fleet origin, and canonical serial set remain independently
+verifiable. An independently recorded direct daemon URL still opens the
+daemon's own HTTPS/mTLS root-capable origin.
+
+A daemon can additionally register an opt-in
+[user-owned custom name](./custom-domain.md). The registration is signed by
+the same daemon identity key and carries a possession proof made with the
+matching publicly trusted certificate key. Connect verifies the certificate
+chain, singleton exact-name SAN, and proof signature before using it as an
+exact SNI routing hint. Certificate issuance, WebAuthn, and bounded lease
+minting remain on the daemon.

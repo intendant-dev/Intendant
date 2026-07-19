@@ -1,4 +1,4 @@
-//! The P1 Memory service — controller-owned, D0-A-format, ephemeral.
+//! The P1 Memory service — controller-owned and D0-A-format.
 //!
 //! Consumes the vendored owner-plane kernel: operations are minted
 //! device-signed through `owner_plane_core` (the writer side) and
@@ -10,27 +10,23 @@
 //! verbatim (the D-203 §C.2 fail-closed contract: never a silent
 //! proceed, never a downgrade).
 //!
-//! **Write bar (ratified — the P1 kickoff brief):** this build is
-//! EPHEMERAL-ONLY. The op log lives in memory and dies with the
-//! daemon; every view is labeled `durability: "ephemeral"`. Durable
-//! local writes unlock only after the Gate-B-lite custody subset, the
-//! P0.5 checkpoint replacement, and the tombed-memory cutover — in
-//! that program order. Do not add persistence here ahead of it.
+//! Storage is selected at daemon bootstrap. macOS uses the durable
+//! Gate-B-lite store by default; other platforms, the
+//! `INTENDANT_MEMORY_EPHEMERAL=1` kill switch, and a failed durable
+//! bootstrap use an in-memory plane. Every view carries the effective
+//! `durability` label, so a fallback is visible rather than silently
+//! weakening the contract.
 //!
 //! This module is deliberately unrelated to the legacy
 //! per-project `.intendant/memory.json` key-value system (deleted at
 //! the P1.7 cutover) and reuses none of its
 //! identifiers, so the cutover's exact-denylist CI absence test stays
-//! exact while the two coexist.
+//! exact.
 
 pub(crate) mod handle;
 pub(crate) mod plane;
 pub(crate) mod service;
-/// The P1.5 Gate-B-lite custody adapter — a de-risking ARTIFACT, not
-/// a live path: nothing here is reachable from the service until the
-/// ratified sequence completes (P0.5 + tombed cutover → P1.8), so
-/// outside its own battery the module is deliberately dead code.
-#[allow(dead_code)]
+/// The Gate-B-lite custody adapter used by the durable Memory mode.
 pub(crate) mod store;
 pub(crate) mod types;
 

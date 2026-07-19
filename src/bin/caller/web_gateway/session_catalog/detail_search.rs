@@ -432,14 +432,15 @@ pub(crate) async fn sessions_search_response_body_with_cancel(
     project_filter: Vec<String>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> String {
-    if SESSION_SEARCH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+    let Some(in_flight) = SessionSearchInFlightGuard::try_acquire() else {
         return serde_json::json!({
             "error": "Another deep session search is already running. Wait for it to finish before starting a new one.",
             "busy": true,
         })
         .to_string();
-    }
+    };
     let body = match tokio::task::spawn_blocking(move || {
+        let _in_flight = in_flight;
         let home_path = crate::platform::home_dir();
         session_log_search_from_home_with_projects_cancel(
             &home_path,
@@ -458,7 +459,6 @@ pub(crate) async fn sessions_search_response_body_with_cancel(
         })
         .to_string(),
     };
-    SESSION_SEARCH_IN_FLIGHT.store(false, Ordering::SeqCst);
     body
 }
 
@@ -1057,6 +1057,26 @@ pub(crate) fn session_log_match_snippet(text: &str, terms: &[String], max_chars:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_frame_group_titles_are_rendered_as_text() {
+        let source = include_str!("../../../../../static/app/57-sessions-replay.js");
+        let make_group = source
+            .split_once("function makeGroup(title, badge, fileList, collapsed)")
+            .map(|(_, tail)| tail)
+            .expect("session frame group renderer");
+        let make_group = make_group
+            .split_once("// Annotations")
+            .map(|(body, _)| body)
+            .expect("bounded session frame group renderer");
+
+        assert!(make_group.contains("document.createTextNode(title + ' ')"));
+        assert!(make_group.contains("badgeText.textContent = badge"));
+        assert!(
+            !make_group.contains("innerHTML"),
+            "stored frame filenames must never enter an HTML parser"
+        );
+    }
 
     #[test]
     fn session_log_search_finds_intendant_log_content_not_summary() {

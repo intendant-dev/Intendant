@@ -1,11 +1,12 @@
 name: app.html assembly
 
 # static/app.html is a generated artifact: build.rs assembles it from the
-# static/app/ fragments via crates/app-html-assembler. windows.yml's paths
-# filter deliberately skips static-asset pushes (they can't break a compile),
-# so this small job is the regen gate for exactly those pushes: rerun the
-# real assembler and fail if the committed artifact doesn't match the
-# committed fragments — a hand-edit to the generated file, a forgotten
+# static/app/ fragments via crates/app-html-assembler. The heavy windows.yml
+# gate has no push trigger, so this small paths-filtered push job is the
+# post-landing regen signal for static-asset changes; on pull_request and
+# merge_group it is deliberately unfiltered because it is a required check.
+# Rerun the real assembler and fail if the committed artifact doesn't match
+# the committed fragments — a hand-edit to the generated file, a forgotten
 # regeneration, or manifest ↔ directory drift (the assembler itself fails
 # closed on that). The assembler is std-only, so this compiles and runs in
 # seconds; no cache needed.

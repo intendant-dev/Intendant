@@ -108,6 +108,9 @@ pub(crate) async fn run_with_presence(
     resume_session: Option<String>,
     resume_session_config: Option<session_config::SessionAgentConfig>,
 ) -> Result<LoopStats, CallerError> {
+    // Effective root stamped on every RoundComplete this mode emits, so
+    // the file watcher's round listener can route rounds by root.
+    let round_session_root: Option<std::path::PathBuf> = Some(project.root.clone());
     // 1. Try to create presence provider. Degrade to silent mode on failure so
     //    an external-agent-only run (e.g. codex with no API keys configured)
     //    still starts. The main task loop below doesn't depend on the presence
@@ -880,6 +883,7 @@ pub(crate) async fn run_with_presence(
                                             round: cumulative_stats.rounds,
                                             turns_in_round,
                                             native_message_count: None,
+                                            project_root: round_session_root.clone(),
                                         });
                                     }
                                     Ok(DrainOutcome::ContextRewindRequested {
@@ -908,6 +912,7 @@ pub(crate) async fn run_with_presence(
                                                     round: cumulative_stats.rounds,
                                                     turns_in_round,
                                                     native_message_count: None,
+                                                    project_root: round_session_root.clone(),
                                                 });
                                             }
                                             Ok(Some(DrainOutcome::LimitRejected {
@@ -939,6 +944,7 @@ pub(crate) async fn run_with_presence(
                                                     round: cumulative_stats.rounds,
                                                     turns_in_round,
                                                     native_message_count: None,
+                                                    project_root: round_session_root.clone(),
                                                 });
                                                 bus.send(AppEvent::PresenceLog {
                                                     message: recovery_required_message(
@@ -1047,6 +1053,7 @@ pub(crate) async fn run_with_presence(
                                             round: cumulative_stats.rounds,
                                             turns_in_round,
                                             native_message_count: None,
+                                            project_root: round_session_root.clone(),
                                         });
                                         bus.send(AppEvent::PresenceLog {
                                             message: recovery_required_message(
@@ -1776,6 +1783,7 @@ pub(crate) async fn run_with_presence(
                                         round,
                                         turns_in_round,
                                         native_message_count: None,
+                                        project_root: round_session_root.clone(),
                                     });
                                 }
                                 DrainOutcome::Interrupted { .. } => {
@@ -1820,6 +1828,7 @@ pub(crate) async fn run_with_presence(
                                         round,
                                         turns_in_round,
                                         native_message_count: None,
+                                        project_root: round_session_root.clone(),
                                     });
                                 }
                                 DrainOutcome::ContextRewindRequested {
@@ -1846,6 +1855,7 @@ pub(crate) async fn run_with_presence(
                                         round,
                                         turns_in_round,
                                         native_message_count: None,
+                                        project_root: round_session_root.clone(),
                                     });
                                 }
                                 DrainOutcome::Terminated { reason, .. } => {
@@ -2311,15 +2321,13 @@ pub(crate) async fn run_with_presence(
             let initial_attachments = if envelope.attachment_frame_ids.is_empty() {
                 UserAttachments::default()
             } else {
-                UserAttachments::from_items(
-                    resolve_attachments(
-                        &envelope.attachment_frame_ids,
-                        &frame_registry,
-                        &session_dir,
-                        &project.root,
-                    )
-                    .await,
+                resolve_attachments(
+                    &envelope.attachment_frame_ids,
+                    &frame_registry,
+                    &session_dir,
+                    &project.root,
                 )
+                .await
             };
             let mut initial_followup =
                 FollowUpMessage::with_attachments(task_text.clone(), initial_attachments);
@@ -2655,6 +2663,7 @@ pub(crate) async fn run_with_presence(
                                                 round: cumulative_stats.rounds,
                                                 turns_in_round,
                                                 native_message_count: None,
+                                                project_root: round_session_root.clone(),
                                             });
                                             next_persistent_turn = Some(
                                                 FollowUpMessage::text(recovery_text)
@@ -2707,6 +2716,7 @@ pub(crate) async fn run_with_presence(
                                                         round: cumulative_stats.rounds,
                                                         turns_in_round,
                                                         native_message_count: None,
+                                                        project_root: round_session_root.clone(),
                                                     });
                                                     next_persistent_turn = Some(continuation);
                                                     continue;
@@ -2734,6 +2744,7 @@ pub(crate) async fn run_with_presence(
                                             round: cumulative_stats.rounds,
                                             turns_in_round,
                                             native_message_count: None,
+                                            project_root: round_session_root.clone(),
                                         });
                                         bus.send(AppEvent::LoopError(message));
                                         break;
@@ -2752,6 +2763,7 @@ pub(crate) async fn run_with_presence(
                                             round: cumulative_stats.rounds,
                                             turns_in_round,
                                             native_message_count: None,
+                                            project_root: round_session_root.clone(),
                                         });
                                         bus.send(AppEvent::LoopError(message));
                                         break;
@@ -2778,6 +2790,7 @@ pub(crate) async fn run_with_presence(
                                             round: cumulative_stats.rounds,
                                             turns_in_round,
                                             native_message_count: None,
+                                            project_root: round_session_root.clone(),
                                         });
                                         next_persistent_turn = Some(replay);
                                         continue;
@@ -2804,6 +2817,7 @@ pub(crate) async fn run_with_presence(
                                                 round: cumulative_stats.rounds,
                                                 turns_in_round,
                                                 native_message_count: None,
+                                                project_root: round_session_root.clone(),
                                             });
                                             next_persistent_turn = Some(
                                                 FollowUpMessage::text(handoff_text)
@@ -2824,6 +2838,7 @@ pub(crate) async fn run_with_presence(
                                             round: cumulative_stats.rounds,
                                             turns_in_round,
                                             native_message_count: None,
+                                            project_root: round_session_root.clone(),
                                         });
                                         bus.send(AppEvent::LoopError(message));
                                         break;
@@ -2843,6 +2858,7 @@ pub(crate) async fn run_with_presence(
                                             round: cumulative_stats.rounds,
                                             turns_in_round,
                                             native_message_count: None,
+                                            project_root: round_session_root.clone(),
                                         });
                                         bus.send(AppEvent::LoopError(message));
                                         break;
@@ -2866,6 +2882,7 @@ pub(crate) async fn run_with_presence(
                             round: cumulative_stats.rounds,
                             turns_in_round,
                             native_message_count: None,
+                            project_root: round_session_root.clone(),
                         });
                     }
                     DrainOutcome::ContextRewindRequested {
@@ -2882,6 +2899,7 @@ pub(crate) async fn run_with_presence(
                             round: cumulative_stats.rounds,
                             turns_in_round,
                             native_message_count: None,
+                            project_root: round_session_root.clone(),
                         });
                         match apply_external_context_rewind(
                             agent,
@@ -3031,6 +3049,7 @@ pub(crate) async fn run_with_presence(
                                     round: cumulative_stats.rounds,
                                     turns_in_round,
                                     native_message_count: None,
+                                    project_root: round_session_root.clone(),
                                 });
                                 next_persistent_turn = Some(
                                     FollowUpMessage::text(recovery_text)
@@ -3079,6 +3098,7 @@ pub(crate) async fn run_with_presence(
                                             round: cumulative_stats.rounds,
                                             turns_in_round,
                                             native_message_count: None,
+                                            project_root: round_session_root.clone(),
                                         });
                                         next_persistent_turn = Some(continuation);
                                         continue;
@@ -3098,6 +3118,7 @@ pub(crate) async fn run_with_presence(
                             round: cumulative_stats.rounds,
                             turns_in_round,
                             native_message_count: None,
+                            project_root: round_session_root.clone(),
                         });
                         bus.send(AppEvent::PresenceLog {
                             message: recovery_required_message(&message, recovery_hint.as_deref()),
@@ -3366,7 +3387,6 @@ pub(crate) struct NativeSessionConfig {
     /// Replaces the role-resolved system prompt wholesale (the
     /// INTENDANT_SYSTEM_PROMPT semantic, session-scoped).
     pub(crate) system_prompt_override: Option<String>,
-    /// Inject the project knowledge store into fresh conversations.
     /// Present on supervised (daemon) sessions: grants the loop the
     /// spawn_sub_agent / wait_sub_agents / submit_result capability.
     pub(crate) orchestration: Option<session_supervisor::SessionOrchestration>,

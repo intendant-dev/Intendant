@@ -20,10 +20,11 @@
 //! ## Transport selection
 //!
 //! `add_peer` fetches a peer's Agent Card from its
-//! `/.well-known/agent-card.json` URL, picks the first
-//! [`TransportSpec`] in the card's `transports` list that this
-//! build supports, constructs the corresponding transport, and
-//! hands it to `spawn_peer`. Phase 1 only supports
+//! `/.well-known/agent-card.json` URL, keeps every supported
+//! [`TransportSpec`] in preference order, wraps the concrete
+//! transports in `MultiTransport`, and hands that wrapper to
+//! `spawn_peer`. `MultiTransport` probes the candidates top-down on
+//! every connect until one succeeds. This build supports
 //! [`IntendantWsTransport`]; non-Intendant transports in a card
 //! are filtered out via `TransportSpec::Unknown` fallback (the
 //! forward-compat discipline from the earlier pass) or skipped
@@ -312,6 +313,31 @@ impl PeerRegistry {
         explicit_client_identity: Option<ClientIdentityPaths>,
         label_override: Option<String>,
     ) -> Result<PeerId, PeerError> {
+        self.add_peer_with_credentials_and_client_identity_label_and_witness_vantage(
+            card_url,
+            via_urls,
+            bearer_token,
+            override_pinned_fingerprints,
+            browser_tcp_via_url,
+            explicit_client_identity,
+            label_override,
+            crate::peer::PeerWitnessVantage::Unknown,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_peer_with_credentials_and_client_identity_label_and_witness_vantage(
+        &self,
+        card_url: &str,
+        via_urls: Vec<String>,
+        bearer_token: Option<String>,
+        override_pinned_fingerprints: Vec<String>,
+        browser_tcp_via_url: Option<String>,
+        explicit_client_identity: Option<ClientIdentityPaths>,
+        label_override: Option<String>,
+        certificate_witness_vantage: crate::peer::PeerWitnessVantage,
+    ) -> Result<PeerId, PeerError> {
         let label_override = label_override
             .map(|label| label.trim().to_string())
             .filter(|label| !label.is_empty());
@@ -359,6 +385,7 @@ impl PeerRegistry {
             browser_tcp_via_url,
             explicit_client_identity,
             label_override,
+            certificate_witness_vantage,
         )
         .await
     }
@@ -402,10 +429,12 @@ impl PeerRegistry {
             browser_tcp_via_url,
             None,
             None,
+            crate::peer::PeerWitnessVantage::Unknown,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn add_peer_with_card_and_auth_and_client_identity(
         &self,
         card: AgentCard,
@@ -414,6 +443,7 @@ impl PeerRegistry {
         browser_tcp_via_url: Option<String>,
         explicit_client_identity: Option<ClientIdentityPaths>,
         label_override: Option<String>,
+        certificate_witness_vantage: crate::peer::PeerWitnessVantage,
     ) -> Result<PeerId, PeerError> {
         if self.inner.peers.read().unwrap().contains_key(&card.id) {
             return Err(PeerError::Rejected {
@@ -476,6 +506,7 @@ impl PeerRegistry {
             via_urls,
             browser_tcp_via_url,
             label_override,
+            certificate_witness_vantage,
             transport_credentials,
             log_sink,
             move |events_tx| {

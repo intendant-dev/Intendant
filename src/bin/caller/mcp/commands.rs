@@ -105,7 +105,7 @@ pub(crate) async fn start_task_with_state(
     s.session_cached_tokens = 0;
     s.session_cache_creation_tokens = 0;
     s.set_phase(Phase::Thinking);
-    s.pending_approval = None;
+    s.pending_approvals.clear();
     s.human_question = None;
     s.should_quit = false;
     s.next_task_orchestrate = orchestrate;
@@ -153,7 +153,12 @@ pub(crate) async fn handle_control_command_mcp(
         }
         ControlMsg::Approve { id, .. } => {
             let mut s = state.write().await;
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Approve);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                id,
+                ApprovalResponse::Approve,
+                McpToolScope::Unrestricted,
+            );
             if matches!(outcome, ActionOutcome::Ok) {
                 bus.send(AppEvent::ApprovalResolved {
                     session_id: None,
@@ -172,7 +177,12 @@ pub(crate) async fn handle_control_command_mcp(
         }
         ControlMsg::Deny { id, .. } => {
             let mut s = state.write().await;
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Deny);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                id,
+                ApprovalResponse::Deny,
+                McpToolScope::Unrestricted,
+            );
             if matches!(outcome, ActionOutcome::Ok) {
                 bus.send(AppEvent::ApprovalResolved {
                     session_id: None,
@@ -194,23 +204,29 @@ pub(crate) async fn handle_control_command_mcp(
             // structured answers straight to whichever waiter registered
             // this id (question prompts share the approval registry).
             let mut s = state.write().await;
-            resolve_approval(
+            let resolved = resolve_approval(
                 &s.approval_registry,
                 id,
                 ApprovalResponse::Answer { answers },
             );
-            s.set_phase(Phase::RunningAgent);
-            s.push_log(LogLevel::Info, "Question answered by MCP agent".to_string());
-            bus.send(AppEvent::ApprovalResolved {
-                session_id: None,
-                id,
-                action: "answer".to_string(),
-            });
+            if resolved {
+                s.set_phase(Phase::RunningAgent);
+                s.push_log(LogLevel::Info, "Question answered by MCP agent".to_string());
+                bus.send(AppEvent::ApprovalResolved {
+                    session_id: None,
+                    id,
+                    action: "answer".to_string(),
+                });
+            }
             emit_control_result(
                 control_tx,
                 "answer_question",
-                true,
-                "answers delivered".to_string(),
+                resolved,
+                if resolved {
+                    "answers delivered".to_string()
+                } else {
+                    format!("question {id} is not pending")
+                },
                 None,
             );
             Some(RESOURCE_APPROVAL_URI)
@@ -229,7 +245,12 @@ pub(crate) async fn handle_control_command_mcp(
         }
         ControlMsg::Skip { id, .. } => {
             let mut s = state.write().await;
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Skip);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                id,
+                ApprovalResponse::Skip,
+                McpToolScope::Unrestricted,
+            );
             if matches!(outcome, ActionOutcome::Ok) {
                 bus.send(AppEvent::ApprovalResolved {
                     session_id: None,
@@ -248,7 +269,12 @@ pub(crate) async fn handle_control_command_mcp(
         }
         ControlMsg::ApproveAll { id, .. } => {
             let mut s = state.write().await;
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::ApproveAll);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                id,
+                ApprovalResponse::ApproveAll,
+                McpToolScope::Unrestricted,
+            );
             if matches!(outcome, ActionOutcome::Ok) {
                 bus.send(AppEvent::ApprovalResolved {
                     session_id: None,
@@ -1560,6 +1586,11 @@ pub(crate) async fn handle_control_command_mcp(
             // `session_registry` to flip the matching DisplaySession's
             // diagnostic flag. MCP doesn't drive display sessions and
             // has no path to the registry from this dispatcher; no-op.
+            None
+        }
+        ControlMsg::HostedCertificateWitness { .. } => {
+            // Accepted only on an authenticated peer WebSocket and consumed
+            // at that transport edge. MCP cannot supply the peer binding.
             None
         }
     }

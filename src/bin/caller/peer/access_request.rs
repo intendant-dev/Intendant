@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::access;
 use crate::error::CallerError;
+use crate::peer::transport::pinning;
 use crate::project::{PeerAccessRequestConfig, PeerConfig, Project};
 
 use super::access_policy::unix_timestamp;
@@ -642,53 +643,37 @@ pub(crate) async fn initiate_access_request(
             Err(e) => eprintln!("[peer-request] caller-id skipped (no daemon identity): {e}"),
         }
     }
-    let client = bootstrap_http_client()?;
-    let mut sent_caller_id = request.requester_daemon_id.is_some();
-    let mut resp = client
+    let (client, captured_fingerprint) = bootstrap_capturing_http_client()?;
+    let resp = client
         .post(&endpoint)
         .json(&request)
         .send()
         .await
         .map_err(|e| CallerError::Config(format!("send access request: {e}")))?;
-    let mut status = resp.status();
-    let mut text = resp
+    let status = resp.status();
+    let text = resp
         .text()
         .await
         .map_err(|e| CallerError::Config(format!("read access request response: {e}")))?;
-    // A target that predates caller-ID (or the tier claim) rejects the
-    // unknown fields (`deny_unknown_fields` → 400 before any handler
-    // logic). Retry once bare — ALL optional caller fields stripped,
-    // tier included — and say so: the ceremony still works, the
-    // approval card just shows an unverified caller.
-    if status.as_u16() == 400 && sent_caller_id {
-        eprintln!(
-            "[peer-request] target rejected caller-id fields (likely an older daemon) — retrying without: {text}"
-        );
-        request.requester_daemon_id = None;
-        request.requester_daemon_sig = None;
-        request.requester_daemon_sig_ts = None;
-        request.dialed_origin = None;
-        request.requester_tier = None;
-        sent_caller_id = false;
-        resp = client
-            .post(&endpoint)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| CallerError::Config(format!("send access request: {e}")))?;
-        status = resp.status();
-        text = resp
-            .text()
-            .await
-            .map_err(|e| CallerError::Config(format!("read access request response: {e}")))?;
-    }
-    let _ = sent_caller_id;
+    // The caller-ID fields are the only supported shape. A target that
+    // predates them rejects the unknown fields (`deny_unknown_fields` →
+    // 400); we surface that as a hard error rather than silently
+    // downgrading to an unauthenticated bare request, which an on-path
+    // attacker could force by injecting a 400.
     if !status.is_success() {
         return Err(CallerError::Config(format!(
             "target rejected access request ({status}): {text}"
         )));
     }
     let created: AccessRequestCreated = serde_json::from_str(&text)?;
+    // Over TLS, bind the fingerprint the target reports to the cert it
+    // actually presented (pinned on first contact). This is what makes
+    // the permanent peer pin the requester stores below the transport
+    // identity it authenticated — not a value an on-path party chose.
+    // A cleartext loopback target has no transport cert to compare.
+    if endpoint.starts_with("https://") {
+        verify_reported_matches_pinned(&captured_fingerprint, &created.server_cert_fingerprint)?;
+    }
     let outgoing_dir = outgoing_request_dir(cert_dir, &created.request_id);
     std::fs::create_dir_all(&outgoing_dir)?;
     let client_key_path = outgoing_dir.join("client.key");
@@ -721,7 +706,10 @@ pub(crate) async fn poll_access_request(
     validate_request_id(request_id)?;
     let mut outgoing = read_outgoing_request(cert_dir, request_id)?
         .ok_or_else(|| CallerError::Config("outgoing access request not found".into()))?;
-    let client = bootstrap_http_client()?;
+    // Pin the status poll to the exact server cert learned (and verified
+    // against the transport) during the initial request — the whole
+    // ceremony rides one authenticated identity.
+    let client = bootstrap_pinned_http_client(&outgoing.server_cert_fingerprint)?;
     let resp = client
         .get(&outgoing.status_url)
         .send()
@@ -751,6 +739,23 @@ pub(crate) async fn poll_access_request(
     let result = remote
         .result
         .ok_or_else(|| CallerError::Config("approved access request is missing result".into()))?;
+    // The approved result's server fingerprint must equal the identity
+    // pinned for the whole flow, so a swapped fingerprint in the
+    // approval can't redirect the permanent peer pin installed below.
+    let pinned_fp = pinning::parse_fingerprint(&outgoing.server_cert_fingerprint)
+        .map_err(|e| CallerError::Config(format!("stored target fingerprint is invalid: {e}")))?;
+    let approved_fp = pinning::parse_fingerprint(&result.server_cert_fingerprint).map_err(|e| {
+        CallerError::Config(format!(
+            "approved result has invalid server fingerprint: {e}"
+        ))
+    })?;
+    if pinned_fp != approved_fp {
+        return Err(CallerError::Config(format!(
+            "approved result server fingerprint {} does not match the pinned target identity {} — refusing to install",
+            pinning::format_fingerprint(&approved_fp),
+            pinning::format_fingerprint(&pinned_fp),
+        )));
+    }
     let key_pem = std::fs::read_to_string(&outgoing.client_key_path)?;
     let install = install_approved_identity(
         project,
@@ -825,6 +830,7 @@ pub(crate) fn install_approved_identity(
                 client_key: Some(key_path.to_string_lossy().into_owned()),
                 pinned_fingerprints: pins,
                 browser_tcp_via_url: None,
+                certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
             });
         }
     }
@@ -1186,6 +1192,15 @@ fn target_request_endpoint(raw: &str) -> Result<String, CallerError> {
             "target URL must start with https:// or http://".into(),
         ));
     }
+    // Cleartext is permitted only to a loopback target (local testing).
+    // A non-loopback `http://` doorbell would ring — and pin the
+    // resulting peer identity — over an unauthenticated, tamperable
+    // transport, exactly the MITM the pinning above closes.
+    if trimmed.starts_with("http://") && !endpoint_is_loopback(trimmed) {
+        return Err(CallerError::Config(
+            "refusing a non-loopback http:// peer access request target; use https://".into(),
+        ));
+    }
     if trimmed.ends_with(PUBLIC_REQUEST_PATH) {
         return Ok(trimmed.to_string());
     }
@@ -1208,12 +1223,180 @@ fn request_origin(endpoint: &str) -> Option<String> {
     }
 }
 
-fn bootstrap_http_client() -> Result<reqwest::Client, CallerError> {
+/// Slot holding the SHA-256 fingerprint of the first server cert the
+/// capturing bootstrap client saw. Read back after the request to bind
+/// the reported fingerprint to the transport identity.
+type CapturedFingerprint = StdMutex<Option<pinning::Fingerprint>>;
+
+/// Bootstrap TLS verifier for the outbound doorbell: pin-on-first-
+/// contact. Peer daemons serve their own self-signed certs, so there is
+/// no CA to anchor to on first contact — instead the first cert
+/// presented is recorded and accepted, and every later handshake in the
+/// same flow must present the identical cert (a mid-flow swap fails).
+/// The recorded fingerprint is checked after the exchange against the
+/// fingerprint the target reports, so the permanent peer pin can only
+/// ever be the transport identity the requester actually spoke to. This
+/// replaces the previous blanket `danger_accept_invalid_certs(true)`,
+/// which accepted any cert and pinned a target-reported fingerprint it
+/// never compared to the transport.
+#[derive(Debug)]
+struct CaptureOnFirstContactVerifier {
+    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+    seen: std::sync::Arc<CapturedFingerprint>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for CaptureOnFirstContactVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let fp = pinning::fingerprint_of_der(end_entity.as_ref());
+        let mut seen = self
+            .seen
+            .lock()
+            .map_err(|_| rustls::Error::General("bootstrap pin slot poisoned".into()))?;
+        match *seen {
+            None => {
+                *seen = Some(fp);
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            Some(prev) if prev == fp => Ok(rustls::client::danger::ServerCertVerified::assertion()),
+            Some(_) => Err(rustls::Error::General(
+                "server presented a different certificate mid-flow".into(),
+            )),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn bootstrap_crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+}
+
+/// Bootstrap client for the initial doorbell POST: pins the first
+/// server cert it sees and hands back the slot so the caller can bind
+/// the reported fingerprint to that transport identity.
+fn bootstrap_capturing_http_client(
+) -> Result<(reqwest::Client, std::sync::Arc<CapturedFingerprint>), CallerError> {
+    let seen: std::sync::Arc<CapturedFingerprint> = std::sync::Arc::new(StdMutex::new(None));
+    let provider = bootstrap_crypto_provider();
+    let verifier = CaptureOnFirstContactVerifier {
+        provider: provider.clone(),
+        seen: seen.clone(),
+    };
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .map_err(|e| CallerError::Config(format!("bootstrap TLS versions: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+        .with_no_client_auth();
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_HTTP_TIMEOUT)
+        .use_preconfigured_tls(config)
+        .build()
+        .map_err(|e| CallerError::Config(format!("build bootstrap HTTP client: {e}")))?;
+    Ok((client, seen))
+}
+
+/// Bootstrap client for the status poll: pins the exact server cert
+/// fingerprint learned (and verified against the transport) during the
+/// initial request, so the whole ceremony is bound to one identity.
+fn bootstrap_pinned_http_client(
+    server_cert_fingerprint: &str,
+) -> Result<reqwest::Client, CallerError> {
+    let verifier = pinning::PinnedFingerprintVerifier::from_strings([server_cert_fingerprint])
+        .map_err(|e| CallerError::Config(format!("pin target server cert: {e}")))?;
+    let config = pinning::pinned_client_config(verifier);
     reqwest::Client::builder()
         .timeout(REQUEST_HTTP_TIMEOUT)
-        .danger_accept_invalid_certs(true)
+        .use_preconfigured_tls(config)
         .build()
         .map_err(|e| CallerError::Config(format!("build bootstrap HTTP client: {e}")))
+}
+
+/// Confirm the fingerprint the target reported equals the transport
+/// identity we pinned on first contact. Fails closed: a `None` slot
+/// (no TLS cert captured) or a mismatch refuses the pairing.
+fn verify_reported_matches_pinned(
+    captured: &CapturedFingerprint,
+    reported: &str,
+) -> Result<(), CallerError> {
+    let reported_fp = pinning::parse_fingerprint(reported).map_err(|e| {
+        CallerError::Config(format!(
+            "target reported an invalid server fingerprint: {e}"
+        ))
+    })?;
+    let seen = captured
+        .lock()
+        .map_err(|_| CallerError::Config("bootstrap pin slot poisoned".into()))?;
+    match *seen {
+        Some(transport_fp) if transport_fp == reported_fp => Ok(()),
+        Some(transport_fp) => Err(CallerError::Config(format!(
+            "target reported server fingerprint {} but presented {} on the wire — refusing to pair",
+            pinning::format_fingerprint(&reported_fp),
+            pinning::format_fingerprint(&transport_fp),
+        ))),
+        None => Err(CallerError::Config(
+            "no server certificate was captured during the request — refusing to pair".into(),
+        )),
+    }
+}
+
+/// True when `endpoint`'s host is a loopback address or `localhost` —
+/// the only case where a cleartext `http://` doorbell is permitted.
+fn endpoint_is_loopback(endpoint: &str) -> bool {
+    let Some(host) = url::Url::parse(endpoint)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+    else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1781,5 +1964,45 @@ mod tests {
                 .contains("peer access request rate limit exceeded"),
             "err: {err}"
         );
+    }
+
+    #[test]
+    fn endpoint_is_loopback_matches_localhost_and_loopback_ips() {
+        assert!(endpoint_is_loopback("http://127.0.0.1:8765"));
+        assert!(endpoint_is_loopback("http://localhost:8765/x"));
+        assert!(endpoint_is_loopback("http://[::1]:8765"));
+        assert!(!endpoint_is_loopback("http://10.0.0.4:8765"));
+        assert!(!endpoint_is_loopback("http://peer.example:8765"));
+    }
+
+    #[test]
+    fn target_request_endpoint_rejects_non_loopback_http() {
+        let err = target_request_endpoint("http://peer.example:8765").unwrap_err();
+        assert!(err.to_string().contains("non-loopback http"), "err: {err}");
+        // Loopback http is allowed (local testing); https always is.
+        assert!(target_request_endpoint("http://127.0.0.1:8765").is_ok());
+        assert!(target_request_endpoint("https://peer.example:8765").is_ok());
+    }
+
+    #[test]
+    fn reported_fingerprint_must_match_pinned_transport() {
+        let transport_fp = pinning::fingerprint_of_der(b"the-cert-bytes");
+        let captured: CapturedFingerprint = StdMutex::new(Some(transport_fp));
+        // Matching reported fingerprint passes.
+        assert!(verify_reported_matches_pinned(
+            &captured,
+            &pinning::format_fingerprint(&transport_fp)
+        )
+        .is_ok());
+        // A different reported fingerprint fails closed.
+        let other = pinning::format_fingerprint(&pinning::fingerprint_of_der(b"other-bytes"));
+        assert!(verify_reported_matches_pinned(&captured, &other).is_err());
+        // No captured cert (handshake never ran) fails closed.
+        let empty: CapturedFingerprint = StdMutex::new(None);
+        assert!(verify_reported_matches_pinned(
+            &empty,
+            &pinning::format_fingerprint(&transport_fp)
+        )
+        .is_err());
     }
 }

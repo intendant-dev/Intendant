@@ -1,8 +1,8 @@
 # Autonomy & Approvals
 
-Autonomy controls which actions require human approval (`autonomy.rs`). It
-layers three mechanisms, enforced in the agent loop and surfaced identically
-by every frontend.
+Autonomy controls which actions require human approval
+(`crates/intendant-core/src/autonomy.rs`). It layers three mechanisms, enforced
+in the agent loop and surfaced identically by every frontend.
 
 > **Frontends are display-only clients of the control plane.** They render
 > state and emit [`ControlMsg`](./integrations.md) values onto the `EventBus`;
@@ -21,23 +21,42 @@ Set with `--autonomy`, from the dashboard, or with
 | Level | Behavior |
 |-------|----------|
 | Low | Ask before every category except `FileRead` |
-| Medium (default) | Ask for writes, deletes, destructive, and network |
-| High | Don't ask for the above (only the always-ask categories below) |
-| Full | Ask only for the always-ask categories: `HumanInput` and `LiveAudioSpawn` |
+| Medium (default) | Apply category rules; defaults ask for arbitrary shell execution, writes, deletes, and destructive actions (`network` defaults to auto for the structured `browse` tool) |
+| High | Auto-approve ordinary `ask` rules; native policy denials and hard gates remain |
+| Full | Native runtime and controller actions auto-approve except policy denials and the `HumanInput` / `LiveAudioSpawn` hard gates; see the external-agent caveat below |
 
 ## Layer 2 — per-category rules
 
-The `[approval]` section of `intendant.toml` sets a per-category rule that
-overrides the global level: `auto` (always approve), `ask` (require approval),
-`deny` (always deny — surfaced as an approval that will be denied).
+The `[approval]` section of `intendant.toml` sets a per-category baseline:
+`auto`, `ask`, or `deny`. For native runtime batches and
+controller-dispatched tools, `deny` is consulted before the autonomy level and
+refuses the action without presenting an approval card. A runtime-batch denial
+ends the task (`Denied by policy`); a controller-tool denial returns an error
+for that one call and lets the session continue. `auto` and `ask` remain
+level-sensitive: Low intentionally prompts for ordinary categories even when
+their rule is `auto`, while High and Full auto-approve ordinary `ask` rules.
+None of these rules bypasses the human-input/live-audio hard gates or the
+separate user-display grant. External-agent requests take a separate path,
+described below.
+
+`CommandExec` is capability-composed rather than parser-composed. Its effective
+rule is the strictest of `command_exec`, `file_read`, `file_write`,
+`file_delete`, `network`, `destructive`, and `display_control` (`deny` >
+`ask` > `auto`). A shell can reach all of those effects through interpreters,
+subshells, variable expansion, or binaries the classifier has never seen, so
+setting only `command_exec = "auto"` cannot weaken a stricter effect rule. To
+auto-allow arbitrary shell execution, every reachable category must permit it.
 
 ## Layer 3 — per-action approval
 
-When approval is required, the agent loop pauses and the frontends surface the
-command preview and category — the dashboard shows an approval card, and
-MCP / `intendant ctl` expose the same choices ([MCP Server](./mcp-server.md)):
-approve, skip (continue with the next command), approve-all (which also flips
-autonomy to Full), or deny (and stop).
+When a native approval is required, the agent loop pauses and the frontends
+surface the command preview and category — the dashboard shows an approval
+card, and MCP / `intendant ctl` expose the same choices
+([MCP Server](./mcp-server.md)): approve, skip (continue with the next command),
+approve-all (which also flips native autonomy to Full), or deny (and stop).
+External-agent approval cards use the same verbs, but their approve-all is
+session-scoped and does not change native autonomy; the scope table below
+spells out that asymmetry.
 
 A pending request does not depend on someone happening to look at a
 dashboard: an open-but-hidden tab badges its title/favicon with the pending
@@ -78,19 +97,107 @@ escalation ("ring the owner"): the `UserNotification` event carries the
 urgency on the bus, so a future voice leg (see [Presence](./presence.md))
 can subscribe to it without a new wire shape. No such leg exists yet.
 
+## Scheduled Sessions Do Not Bypass Autonomy
+
+Agenda schedule approval is a separate owner decision over an exact one-shot
+manifest (goal and fire time). It authorizes the daemon to create the session at
+that instant; it does **not** pre-approve the actions the session later proposes.
+The scheduled task is dispatched as a normal supervised session with its own
+agent-session principal, sandbox, and the same autonomy/approval machinery
+described here. Missed or uncertain occurrences are terminal and never
+auto-retried.
+
 ## How `needs_approval` actually resolves
 
-The precise logic (`Autonomy::needs_approval`) has nuances worth knowing:
+The precise logic (`AutonomyState::needs_approval`) has nuances worth knowing:
 
 - **Always ask, regardless of level:** `HumanInput` and `LiveAudioSpawn` — these
   always require a human even at Full.
-- **`DisplayControl`** — asks on *first* use, then the session grant takes over
-  (`return !user_display_granted`).
-- **Full** — auto-approves everything else.
+- **Explicit deny is checked before the level on native paths:** the runtime
+  loop and controller-tool gate reject the action without presenting an
+  approval.
+- **`DisplayControl` below Full** — asks until the separate user-display grant
+  is present (`return !user_display_granted`). Full bypasses this category
+  prompt, but does not mint the executor's user-display grant.
+- **Full** — auto-approves every other native action that survived the
+  explicit-deny check.
 - **Low** — asks for everything except `FileRead` (a `deny` rule still blocks).
 - **Medium / High** — start from the per-category rule. For an `ask` rule,
-  Medium asks only for `FileWrite` / `FileDelete` / `Destructive` /
-  `NetworkRequest`; High asks for none of them.
+  Medium asks only for `CommandExec` / `FileWrite` / `FileDelete` /
+  `Destructive` / `NetworkRequest` / `ToolCall`; High asks for none of them.
+  `ToolCall` defaults to `ask`, so the shipped Medium posture prompts before
+  outbound MCP, skill invocation, orchestration spawns/checkpoints, and
+  external-agent MCP permission requests.
+
+## Approval dedup (what "remembered" means)
+
+Approving an action records its **dedup source** so an identical retry does
+not re-prompt. Two properties bound that memory:
+
+- **Per session.** One autonomy state backs every native session of a daemon,
+  but remembered approvals are bucketed by session id — an approval in one
+  session never silences a prompt in another. (The approve-all **level**
+  escalation stays daemon-wide by design; see the table below.)
+- **Content-aware.** The dedup source is not the display preview. For
+  `writeFile`/`editFile` it includes a digest of the full command (minus the
+  per-call `nonce`), so approving one edit of a path never covers different
+  content aimed at the same path; controller-dispatched tool calls digest
+  their full arguments the same way. Exec commands keep byte-exact string
+  matching. In particular, display selectors and `$NONCE[...]` process
+  references remain part of the identity because they change the target and
+  may contain executable shell syntax. Only the structured runtime call's
+  top-level JSON `nonce` is removed before hashing.
+
+## Controller-dispatched tools
+
+Tools the controller executes itself never reach the runtime, so
+`classify_command` never sees them. They consult the same approval flow
+through a dedicated chokepoint (`gate_controller_tool_call` in the agent
+loop), **before any side effect**, honoring the `[approval] tool_call` rule
+and the autonomy level. Prompted calls use the same `ApprovalRequired` /
+`ApprovalResolved` bus flow as runtime batches; prompt, dedup, and policy
+outcomes write the corresponding session-log rows (`waiting`, `approved`,
+`approve-all`, `skipped`, `denied`, `denied-no-approver`, `denied-policy`, or
+`dedup-auto-approved`), while an automatic policy permit emits
+`AutoApproved`.
+
+| Tool | Gate |
+|------|------|
+| Outbound MCP calls (`mcp__*`) | `tool_call` gate, per call, before dispatch |
+| `invoke_skill` | `tool_call` gate before the skill body loads |
+| `spawn_sub_agent` | `tool_call` gate before the child session exists |
+| `workflow_checkpoint` | `tool_call` gate before the coordination write |
+| `wait_sub_agents` | ungated — a pure join on children whose spawn already passed the gate |
+| `peer` | dedicated gate peer-side: the profile the peer issued this daemon plus the peer's own approval flow |
+| `shared_view` | dedicated `user_display_granted` opt-in for user-display show/capture |
+| `spawn_live_audio` | dedicated always-ask consent gate (never auto-approved) |
+
+Semantics at the gate: the default `tool_call = "ask"` prompts at Medium and
+Low; High/Full auto-approve it. A user who deliberately trusts the configured
+tool boundary can set `tool_call = "auto"` to dispatch without a prompt at
+Medium (with an `AutoApproved` audit event). `deny` refuses the call at every
+level — absolute, like a runtime-batch deny rule — returning an error tool
+result with no dispatch. At the prompt, skip refuses just that call and the
+session continues; deny stops the task, exactly like a runtime-command deny.
+Headless with no approver surface fails closed. Calls are gated and dispatched
+strictly in order, so a later call never runs while an earlier prompt in the
+batch is unresolved.
+
+External-agent approval requests use the deliberately separate
+`external_approval_decision` path. Below Full, an explicit `deny` rejects,
+`ToolCall` plus an explicit `auto` auto-approves, and every other request is
+shown to the human even when the native category default is `auto`. Because
+`ToolCall` defaults to `ask`, external-agent MCP/tool permission requests are
+shown at Medium unless the owner opts into auto.
+At Full, the current implementation returns `AutoApprove` **before** reading
+the category rule, so an external approval request bypasses an explicit
+`deny`; the `external_approval_full_overrides_deny` test codifies that
+precedence. Separately, the external event drain consults its per-session
+approve-all flag before the current policy decision, so a category changed to
+`deny` after that grant is also auto-approved for the remainder of the
+session. External-agent denials are therefore not absolute under those two
+conditions. This differs from the native runtime/controller path and is a
+current implementation caveat, not an authority guarantee.
 
 ## Action classification
 
@@ -101,23 +208,73 @@ Commands are classified into categories by inspecting the command JSON
 |----------|----------|
 | FileRead | `inspectPath` |
 | FileWrite | `editFile`, `writeFile` |
-| FileDelete | shell commands with `rm`, `rmdir` |
+| FileDelete | Reserved/configurable category; the current runtime classifier does not emit it |
 | CommandExec | `execAsAgent`, `execPty` |
 | NetworkRequest | shell commands with `curl`, `wget`, `ssh`, `git` |
 | Destructive | shell commands with `rm -rf`, `kill`, `dd`, `mkfs`, `sudo` |
 | HumanInput | `askHuman` |
-| LiveAudioSpawn | `spawn_live_audio` (voice sessions, phone calls) |
+| LiveAudioSpawn | Dedicated `spawn_live_audio` consent gate (voice sessions, phone calls) |
 | DisplayControl | user-session display access (session grant) |
-| ToolCall | external-agent MCP/tool approval category |
+| ToolCall | controller-dispatched tools and external-agent MCP/tool approvals |
 
 For shell commands (`execAsAgent`/`execPty`), the command string is further
-inspected for destructive patterns, network tools, and file writes (redirects,
-`tee`, `mv`, `cp`). A `sudo` prefix is flagged Destructive *and* the command
-after `sudo` is classified too. When multiple categories apply, the highest-
-severity one drives the prompt label.
+inspected for destructive patterns (including long-form flags, absolute
+binary paths like `/bin/rm`, and `find … -delete`/`-exec rm`), network
+tools, and file writes (redirects, `tee`, `mv`, `cp`). A `sudo` prefix is
+flagged Destructive *and* the command after `sudo` is classified too. When
+multiple categories apply, the highest-severity one drives the prompt label.
+Every shell command also carries `CommandExec`, whose effective policy is the
+strictest reachable rule described above.
 
-`ToolCall` is not produced by ordinary runtime `classify_command`; it is used by
+The shell substring classifier is **display enrichment, not an authorization
+parser**: it cannot see through variable indirection, subshells, interpreters,
+or novel spellings. Missing one of those spellings no longer downgrades the
+decision because `CommandExec` governs the whole shell capability. The
+runtime's filesystem/exec sandbox remains an independent hard boundary on
+where an approved command can act.
+
+`ToolCall` is not produced by ordinary runtime `classify_command`; it governs
+[controller-dispatched tools](#controller-dispatched-tools) and
 external-agent approval routing through `external_approval_decision`.
+
+## Sandbox denial consent
+
+The runtime write sandbox (on by default on macOS/Linux and opt-in on Windows;
+see the [sandbox configuration](./configuration.md#sandbox)) is a hard OS wall,
+but a denial is not a dead end: when a runtime batch result carries a write
+denied by the sandbox, the daemon classifies it
+(`sandbox_denial_grant_offer`) and raises a **"Sandbox" card on the
+question rail** offering three resolutions:
+
+- **Allow for this session** — the path joins that session's write set at
+  the next runtime spawn; gone on daemon restart.
+- **Always allow** — the grant is live-applied to the daemon's write set
+  immediately (no restart) and persisted to `[sandbox]
+  extra_write_paths` in the session project's `intendant.toml`.
+- **Keep denied** — nothing changes.
+
+The model simultaneously sees an `[intendant]` note on the denied tool
+result explaining that the sandbox (not the task) blocked the write and
+that a grant prompt was raised — so it retries after a grant instead of
+giving up. Approval and consent stay distinct layers: an approved command
+can still be denied by the wall, and the card is how the wall becomes
+negotiable without dropping it.
+
+Guardrails: the card shows the exact path a grant would cover (for a
+not-yet-existing target, the nearest existing ancestor — honestly wide
+when it is wide); a filesystem root is never offered; credential
+locations (`~/.ssh`, `~/.gnupg`, the intendant config home, any `.env`)
+are never offered — on Linux, Landlock has no deny layer under a grant,
+so offering those would genuinely open them. Denials inside the grant
+set (plain filesystem permissions) get no card. Each (session, path)
+offers once per daemon run; headless runs get the note only.
+
+One current gap narrows that guarantee: the forbidden-offer classifier does not
+include the daemon state root's credential-bearing subtrees or Windows'
+separate access-certificate directory. macOS' later Seatbelt deny still blocks
+its known state-root credential paths, but on Linux/Windows a denied write there
+can produce a consent offer when an overlapping project or explicit path makes
+the target reachable. That is a security defect, not an intended grant surface.
 
 ## DisplayControl session grant
 

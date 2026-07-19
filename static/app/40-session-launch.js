@@ -739,11 +739,14 @@ function ensureSessionWindowHistory(win) {
 // indices and the rendered nodes' data-history-index. Skipped while the
 // reader is paging inside the region that would be dropped (they can only
 // be there after deep back-paging; the trim resumes when they move on).
+// A minimized window has NO reader (transcript unmounted, renderStart
+// pinned to 0) — trim regardless, or a long-running minimized session
+// would grow logHistory unboundedly.
 function trimSessionWindowHistoryIfNeeded(win) {
   const history = ensureSessionWindowHistory(win);
   if (history.length <= SESSION_WINDOW_HISTORY_LIMIT) return;
   const drop = history.length - SESSION_WINDOW_HISTORY_RETAIN;
-  if (win.renderStart < drop) return;
+  if (win.renderStart < drop && !win.minimized) return;
   // Dropped entries stay in the replay-dedup set as bare signatures, so a
   // reconnect replay can't re-append them as fresh content.
   if (!(win.trimmedHistorySignatures instanceof Set)) win.trimmedHistorySignatures = new Set();
@@ -762,8 +765,10 @@ function trimSessionWindowHistoryIfNeeded(win) {
   // explicitly so the stale Set (with the trimmed items' signatures)
   // frees instead of lingering behind the ref check.
   invalidateSessionWindowHistorySignatureCache(win);
-  win.renderStart -= drop;
-  win.renderEnd -= drop;
+  // Minimized windows sit at renderStart 0 with nothing mounted; clamp
+  // instead of going negative (the children loop below no-ops there).
+  win.renderStart = Math.max(0, win.renderStart - drop);
+  win.renderEnd = Math.max(win.renderStart, win.renderEnd - drop);
   if (win.log) {
     for (const child of win.log.children) {
       const idx = Number(child.dataset?.historyIndex);
@@ -1046,7 +1051,10 @@ function buildSessionWindowLogEntry(c) {
   appendCopyLogEntryButton(entry, c.content ?? '');
   appendEditUserMessageButton(entry, c);
   if (c.collapsible || content.split('\n').length > 3 || content.length > 300) {
-    makeSessionWindowLogEntryCollapsible(entry, cnt);
+    // Conversational prose (user/steer/model text) starts expanded — only
+    // tool/system payloads keep the compact collapsed default (41's
+    // isConversationalProseLog, the chapter-nav vocabulary).
+    makeSessionWindowLogEntryCollapsible(entry, cnt, isConversationalProseLog(c));
   }
   return entry;
 }
@@ -1084,6 +1092,10 @@ function sessionWindowIsRenderingTail(win, historyLength = null) {
 
 function renderSessionWindowRange(win, start) {
   if (!win || !win.log) return;
+  // Minimized: the transcript is unmounted and appends are DATA-ONLY —
+  // every render request no-ops until restore re-renders the tail
+  // (setSessionWindowMinimized → restoreSessionWindowTranscript).
+  if (win.minimized) return;
   const history = ensureSessionWindowHistory(win);
   if (history.length === 0) {
     win.renderStart = 0;
@@ -1110,7 +1122,7 @@ function renderSessionWindowRange(win, start) {
 }
 
 function renderSessionWindowTail(win) {
-  if (!win) return;
+  if (!win || win.minimized) return;
   const history = ensureSessionWindowHistory(win);
   const start = sessionWindowTailStart(history.length);
   if (
@@ -1146,7 +1158,7 @@ function renderSessionWindowTail(win) {
 }
 
 function appendSessionWindowRenderedTailItem(win, item, index, historyLength) {
-  if (!win || !win.log || win.renderEnd !== index) return false;
+  if (!win || !win.log || win.minimized || win.renderEnd !== index) return false;
   const node = materializeSessionWindowHistoryItem(win, item, index);
   if (!node) return false;
   if (win.log.firstElementChild?.classList?.contains('session-window-empty')) {
@@ -1166,7 +1178,7 @@ function appendSessionWindowRenderedTailItem(win, item, index, historyLength) {
 }
 
 function appendSessionWindowRenderedTailItems(win, items, startIndex, historyLength) {
-  if (!win || !win.log || !Array.isArray(items) || items.length === 0) return false;
+  if (!win || !win.log || win.minimized || !Array.isArray(items) || items.length === 0) return false;
   if (win.renderEnd !== startIndex) return false;
   if (win.log.firstElementChild?.classList?.contains('session-window-empty')) {
     win.log.replaceChildren();
@@ -1345,6 +1357,20 @@ function deduplicateSessionWindowHistory(win, shouldFollow = null) {
   return removed;
 }
 
+// While a window is minimized its transcript appends are DATA-ONLY — no
+// DOM mutations — so DOM observers (the composer peek clone-mirrors the
+// log element) never fire. This event is the substitute signal: the peek
+// re-materializes its tail from win.logHistory when the bound window's
+// history grows under it.
+function notifyMinimizedSessionWindowHistoryAppend(win) {
+  if (!win || !win.minimized || !win.sessionId) return;
+  try {
+    window.dispatchEvent(new CustomEvent('ui2:session-window-history-append', {
+      detail: { sessionId: win.sessionId },
+    }));
+  } catch (_) { /* CustomEvent unavailable — the peek stays static until restore */ }
+}
+
 function appendSessionWindowHistory(win, entry, shouldFollow) {
   if (!win || !entry) return;
   const history = ensureSessionWindowHistory(win);
@@ -1369,6 +1395,7 @@ function appendSessionWindowHistory(win, entry, shouldFollow) {
   }
   applySessionWindowOutputScroll(win, shouldFollow);
   trimSessionWindowHistoryIfNeeded(win);
+  notifyMinimizedSessionWindowHistoryAppend(win);
 }
 
 function appendSessionWindowHistoryBatch(win, entries, shouldFollow) {
@@ -1403,6 +1430,7 @@ function appendSessionWindowHistoryBatch(win, entries, shouldFollow) {
   }
   applySessionWindowOutputScroll(win, shouldFollow);
   trimSessionWindowHistoryIfNeeded(win);
+  notifyMinimizedSessionWindowHistoryAppend(win);
 }
 
 function loadOlderSessionWindowEntries(win) {
@@ -1476,6 +1504,9 @@ function loadOlderRemoteSessionWindowEntries(win) {
       } else {
         renderSessionWindowRange(win, 0);
       }
+      // Chapter-nav seam: finish a parked prev-chapter jump now that the
+      // older page is merged (57c-chapter-nav.js; no-op without intent).
+      if (typeof chapterNavPaneHistoryLoaded === 'function') chapterNavPaneHistoryLoaded(win);
       stationScheduleUpdate();
     })
     .catch(err => {

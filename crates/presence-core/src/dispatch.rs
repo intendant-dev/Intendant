@@ -166,6 +166,20 @@ fn handle_respond(args: &Value) -> PresenceAction {
 
 fn handle_set_autonomy(args: &Value) -> PresenceAction {
     let level = args["level"].as_str().unwrap_or("medium").to_string();
+    // Full autonomy silences every future approval prompt for the
+    // daemon's lifetime — too much authority to hand to the voice/ambient
+    // lane, whose input is injectable (anyone audible in the room, any
+    // page read aloud). The presence layer may move autonomy anywhere
+    // below Full; the last step happens on the dashboard, an
+    // owner-attributable surface. Both presence transports (server text
+    // and browser voice WASM) dispatch through this one gate.
+    if level.trim().eq_ignore_ascii_case("full") {
+        return PresenceAction::TextResult(
+            "I can't switch to full autonomy from voice — raise it on the dashboard under \
+             Settings, or ask me for a lower level."
+                .to_string(),
+        );
+    }
     PresenceAction::SetAutonomy { level }
 }
 
@@ -285,11 +299,24 @@ mod tests {
     #[test]
     fn dispatch_set_autonomy() {
         let state = AgentStateSnapshot::default();
-        let action = dispatch_tool_call("set_autonomy", &json!({"level": "full"}), &state);
+        // Below Full: passes through as an action.
+        let action = dispatch_tool_call("set_autonomy", &json!({"level": "medium"}), &state);
         match action {
-            PresenceAction::SetAutonomy { level } => assert_eq!(level, "full"),
+            PresenceAction::SetAutonomy { level } => assert_eq!(level, "medium"),
             _ => panic!("expected SetAutonomy"),
         }
+        // Full is refused at the dispatch gate on every presence
+        // transport: the voice lane must not be able to silence all
+        // future approvals (injectable input).
+        let action = dispatch_tool_call("set_autonomy", &json!({"level": "full"}), &state);
+        match action {
+            PresenceAction::TextResult(text) => {
+                assert!(text.contains("dashboard"), "{text}")
+            }
+            _ => panic!("expected TextResult refusal for full"),
+        }
+        let action = dispatch_tool_call("set_autonomy", &json!({"level": " FULL "}), &state);
+        assert!(matches!(action, PresenceAction::TextResult(_)));
     }
 
     #[test]

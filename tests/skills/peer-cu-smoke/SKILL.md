@@ -19,7 +19,7 @@ session and persistent grants.
 ## Prerequisites
 
 - A release controller built from **your own worktree** (never the
-  repo root): `cargo build --release`.
+  repo root): `cargo build --release --bin intendant --bin intendant-runtime`.
 - A `[[peer]]` entry for the target box, produced by the pairing
   ceremony (`intendant peer request/approve/complete` — see
   `docs/src/peer-federation.md`): `card_url`, `client_cert` /

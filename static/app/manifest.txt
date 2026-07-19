@@ -25,6 +25,7 @@ ui2-station.css
 ui2-vault.css
 ui2-sessions.css
 ui2-activity.css
+ui2-activity-panes.css
 ui2-agenda.css
 ui2-memory.css
 ui2-grid.css
@@ -114,6 +115,7 @@ ui2-settings.js
 57b-session-fork.js
 57-sessions-replay.js
 57-sessions-message-search.js
+57c-chapter-nav.js
 57-attention-notifications.js
 58-shortcuts-boot.js
 58-display-request.js

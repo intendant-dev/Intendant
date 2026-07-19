@@ -11,6 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_AGENT_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
+/// Process-wide allocator for every approval and structured-question rail.
+///
+/// Approval registries are session-scoped, but events and frontend state are
+/// daemon-wide. A single allocator keeps their numeric wire ids unambiguous
+/// even when several sessions block concurrently. The base leaves all legacy
+/// turn/range ids below it and remains exactly representable by JavaScript.
+static NEXT_APPROVAL_ID: AtomicU64 = AtomicU64::new(1 << 44);
+const MAX_SAFE_WIRE_ID: u64 = (1 << 53) - 1;
 const OUTBOUND_CONTEXT_SNAPSHOT_RAW_INLINE_LIMIT: usize = 128 * 1024;
 
 pub fn next_agent_output_id() -> String {
@@ -20,6 +28,15 @@ pub fn next_agent_output_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or_default();
     format!("ao-{millis:x}-{seq:x}")
+}
+
+pub(crate) fn next_approval_id() -> u64 {
+    let id = NEXT_APPROVAL_ID.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        id <= MAX_SAFE_WIRE_ID,
+        "process exhausted the JavaScript-safe approval id space"
+    );
+    id
 }
 
 /// Source of a context injection item.
@@ -324,7 +341,7 @@ pub enum AppEvent {
     ExternalFollowUpRequested {
         session_id: String,
         text: String,
-        attachments: Vec<crate::external_agent::AgentAttachment>,
+        attachments: crate::agent_loop::UserAttachments,
         follow_up_id: Option<String>,
     },
     SessionStarted {
@@ -719,6 +736,15 @@ pub enum AppEvent {
         /// so a conversation-rollback request can truncate back to that
         /// length when rolling back to this round.
         native_message_count: Option<u32>,
+        /// Effective project root of the session that completed the round
+        /// (the emitter's `Project.root` / working root). The file
+        /// watcher's round listener routes on it: a round for a DIFFERENT
+        /// root (a worktree sub-agent, an external session elsewhere)
+        /// skips that watcher's stat walk + round persist entirely, while
+        /// `None` — an emitter that cannot resolve a root, or a replayed
+        /// log — fails open and records as before. In-process routing
+        /// metadata only: deliberately not mirrored to `OutboundEvent`.
+        project_root: Option<std::path::PathBuf>,
     },
 
     /// Presence layer responded — switch to follow-up mode without logging
@@ -959,6 +985,10 @@ pub enum AppEvent {
         user_turn_index: Option<u32>,
         user_turn_revision: Option<u32>,
         replacement_for_user_turn_index: Option<u32>,
+        /// Renderable upload refs for attachments delivered with this
+        /// message (upload-backed only; frame grabs mint no ref). Display
+        /// metadata: the dashboard shows a thumbnail strip on the row.
+        attachments: Vec<crate::types::SessionNoteAttachment>,
     },
 
     /// Display transport pipeline metrics snapshot.
@@ -2009,6 +2039,12 @@ pub enum ControlMsg {
         session_id: String,
         signal: crate::peer::WebRtcSignal,
     },
+    /// An authenticated peer's certificate observation for this daemon's
+    /// hosted fleet name. The gateway consumes this at the peer transport
+    /// edge; it is never forwarded into the general control plane.
+    HostedCertificateWitness {
+        report: crate::access::hosted_control::HostedCertificateWitnessReport,
+    },
     CreateBrowserWorkspace {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,
@@ -2985,6 +3021,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             user_turn_index: None,
             user_turn_revision: None,
             replacement_for_user_turn_index: None,
+            attachments: Vec::new(),
         }),
         AppEvent::SessionNote {
             session_id,
@@ -3016,6 +3053,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             user_turn_index,
             user_turn_revision,
             replacement_for_user_turn_index,
+            attachments,
         } => Some(OutboundEvent::LogEntry {
             level: "info".to_string(),
             source: "User".to_string(),
@@ -3025,6 +3063,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             user_turn_index: *user_turn_index,
             user_turn_revision: *user_turn_revision,
             replacement_for_user_turn_index: *replacement_for_user_turn_index,
+            attachments: attachments.clone(),
         }),
         AppEvent::RecordingStarted { stream_name } => Some(OutboundEvent::RecordingStarted {
             stream_name: stream_name.clone(),
@@ -4002,6 +4041,14 @@ pub fn spawn_human_question_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_ids_are_process_wide_monotonic_and_wire_safe() {
+        let first = next_approval_id();
+        let second = next_approval_id();
+        assert!(second > first);
+        assert!(second <= MAX_SAFE_WIRE_ID);
+    }
 
     #[test]
     fn event_bus_send_receive() {
@@ -6061,6 +6108,7 @@ mod tests {
             user_turn_index: Some(4),
             user_turn_revision: Some(2),
             replacement_for_user_turn_index: Some(4),
+            attachments: Vec::new(),
         };
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
@@ -6068,6 +6116,30 @@ mod tests {
         assert!(json.contains("\"user_turn_index\":4"));
         assert!(json.contains("\"user_turn_revision\":2"));
         assert!(json.contains("\"replacement_for_user_turn_index\":4"));
+        // Empty attachments stay OFF the wire — the pre-field wire format.
+        assert!(!json.contains("\"attachments\""));
+    }
+
+    #[test]
+    fn outbound_user_message_log_carries_attachment_refs() {
+        let event = AppEvent::UserMessageLog {
+            session_id: Some("sess-1".to_string()),
+            content: "See the screenshot".to_string(),
+            user_turn_index: Some(2),
+            user_turn_revision: Some(1),
+            replacement_for_user_turn_index: None,
+            attachments: vec![crate::types::SessionNoteAttachment {
+                upload_id: "u-77".to_string(),
+                name: "screen.png".to_string(),
+                mime: "image/png".to_string(),
+                url: "/api/session/current/uploads/u-77/raw".to_string(),
+            }],
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"log_entry\""));
+        assert!(json.contains("\"upload_id\":\"u-77\""));
+        assert!(json.contains("\"url\":\"/api/session/current/uploads/u-77/raw\""));
     }
 
     #[test]

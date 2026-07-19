@@ -1352,7 +1352,7 @@ impl SessionLog {
         } else {
             format!("turns/context_{}.json", snapshot_id)
         };
-        let file = if fs::write(self.dir.join(&relative), &rendered).is_ok() {
+        let file = if write_private_file(&self.dir.join(&relative), &rendered).is_ok() {
             Some(relative)
         } else {
             None
@@ -1977,7 +1977,7 @@ impl SessionLog {
         }
         let path = self.dir.join("summary.json");
         if let Ok(pretty) = serde_json::to_string_pretty(&summary) {
-            if let Err(e) = fs::write(&path, &pretty) {
+            if let Err(e) = write_private_file(&path, &pretty) {
                 eprintln!("session_log: failed to write summary.json: {}", e);
             }
         }
@@ -1990,7 +1990,7 @@ impl SessionLog {
                 meta.last_turn = Some(total_turns);
                 meta.rounds = rounds;
                 if let Ok(json) = serde_json::to_string_pretty(&meta) {
-                    if let Err(e) = fs::write(&meta_path, &json) {
+                    if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
                         eprintln!("session_log: failed to update session_meta.json: {}", e);
                     }
                 }

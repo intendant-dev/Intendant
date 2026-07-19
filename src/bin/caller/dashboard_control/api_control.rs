@@ -1331,12 +1331,20 @@ pub(crate) async fn api_settings_save_response(
         session.runtime_settings.settings_root.clone()
     }
     .or_else(|| runtime.project_root.clone());
+    // Same per-field escalation as the HTTP twin: executable repointing
+    // requires credentials.manage; everything else rides the row's
+    // Settings authorization.
+    let caller_may_manage_credentials = runtime
+        .grant
+        .access_decision(crate::peer::access_policy::PeerOperation::CredentialsManage)
+        .allowed;
     frame_api_response(
         id,
         crate::web_gateway::settings_post_api_response(
             &body_text,
             settings_root.as_deref(),
             &runtime.bus,
+            caller_may_manage_credentials,
         ),
         "settings save",
     )
@@ -1830,6 +1838,7 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::WebRtcSignal { .. } => "webrtc_signal",
         ControlMsg::PeerFileTransferSignal { .. } => "peer_file_transfer_signal",
         ControlMsg::PeerDashboardControlSignal { .. } => "peer_dashboard_control_signal",
+        ControlMsg::HostedCertificateWitness { .. } => "hosted_certificate_witness",
         ControlMsg::RequestDisplayInputAuthority { .. } => "request_display_input_authority",
         ControlMsg::ReleaseDisplayInputAuthority { .. } => "release_display_input_authority",
         ControlMsg::SetDiagnosticsVisualMarker { .. } => "set_diagnostics_visual_marker",
@@ -1839,6 +1848,8 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
 pub(crate) async fn api_api_keys_save_response(
     id: String,
     params: Option<&serde_json::Value>,
+    audit_actor: String,
+    audit_origin: &'static str,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
     // The transport edge resolves the ambient env path; the persist
@@ -1848,6 +1859,8 @@ pub(crate) async fn api_api_keys_save_response(
         crate::web_gateway::api_keys_save_api_response(
             crate::web_gateway::api_keys_env_path().as_deref(),
             &body_text,
+            &audit_actor,
+            audit_origin,
         ),
         "api keys save",
     )
@@ -2658,7 +2671,7 @@ mod tests {
         let payload = parity_settings_payload();
         let body_text = params_body_text(Some(&payload));
         let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::settings_post_api_response(&body_text, None, &rt.bus),
+            crate::web_gateway::settings_post_api_response(&body_text, None, &rt.bus, true),
         );
         assert_eq!(status, 400);
         let frame =
@@ -2678,9 +2691,10 @@ mod tests {
                 &body_text,
                 Some(http_dir.path()),
                 &rt.bus,
+                true,
             ));
         assert_eq!(status, 200);
-        assert_eq!(http_body, serde_json::json!({"ok": true}));
+        assert_eq!(http_body, serde_json::json!({"ok": true, "applied": true}));
         assert!(http_dir.path().join("intendant.toml").exists());
 
         let tunnel_dir = tempfile::tempdir().expect("temp tunnel root");
@@ -2703,15 +2717,25 @@ mod tests {
         // and still 200 (difference #3), so the tunnel's failure body
         // carries _httpOk true.
         let payload = serde_json::json!({"keys": {"NOT_A_KNOWN_KEY": "x"}});
-        let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::api_keys_save_api_response(None, &params_body_text(Some(&payload))),
-        );
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::api_keys_save_api_response(
+                None,
+                &params_body_text(Some(&payload)),
+                "parity-actor",
+                "local",
+            ));
         assert_eq!(status, 200);
         assert_eq!(
             http_body,
             serde_json::json!({"error": "Unknown key: NOT_A_KNOWN_KEY"})
         );
-        let frame = api_api_keys_save_response("parity-api-keys".to_string(), Some(&payload)).await;
+        let frame = api_api_keys_save_response(
+            "parity-api-keys".to_string(),
+            Some(&payload),
+            "parity-actor".to_string(),
+            "local",
+        )
+        .await;
         let mut result = frame["result"].clone();
         let map = result.as_object_mut().expect("result object");
         assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(200)));
@@ -3790,6 +3814,36 @@ mod tests {
             crate::access::access_policy::control_msg_operation(&msg),
             crate::peer::access_policy::PeerOperation::SessionManage,
         );
+    }
+
+    /// Executable repointing rides the settings carry allowlist but
+    /// classifies as credentials.manage: the command path decides which
+    /// binary runs with the owner's credentials, so a Settings-only caller
+    /// (peer profiles; scoped humans without the grant) cannot repoint it
+    /// through the ControlMsg lane any more than through POST /api/settings.
+    #[test]
+    fn executable_repoint_control_msgs_classify_as_credentials_manage() {
+        for (probe, action) in [
+            (
+                serde_json::json!({ "action": "set_codex_command", "command": "x" }),
+                "set_codex_command",
+            ),
+            (
+                serde_json::json!({ "action": "set_codex_managed_command", "command": "x" }),
+                "set_codex_managed_command",
+            ),
+        ] {
+            let msg: ControlMsg = serde_json::from_value(probe).expect("parses");
+            assert_eq!(dashboard_control_msg_action(&msg), action);
+            assert!(
+                dashboard_control_msg_allowed(&msg),
+                "stays on the carry allowlist (root dashboard still saves)"
+            );
+            assert_eq!(
+                crate::access::access_policy::control_msg_operation(&msg),
+                crate::peer::access_policy::PeerOperation::CredentialsManage,
+            );
+        }
     }
 
     /// Every allowlisted action name must be a real `ControlMsg` wire name —

@@ -5,6 +5,7 @@ use crate::quarantine;
 use crate::schema_validator;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::{SinkExt, StreamExt};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -686,60 +687,396 @@ async fn vortex_write_msg(
 // Format conversion: Vortex (Float32 stereo 48kHz) ↔ Model (PCM16 mono 24kHz)
 // ---------------------------------------------------------------------------
 
-/// Convert Vortex daemon PCM_OUTPUT (Float32 stereo 48kHz) to model input
-/// (PCM16 mono 24kHz). 8:1 size reduction.
-fn vortex_capture_convert(f32_stereo_48k: &[u8]) -> Vec<u8> {
-    // Each stereo frame = 2 floats = 8 bytes
-    // After mono downmix + 2:1 decimation + i16 conversion: 1 frame → 2 bytes
-    let num_floats = f32_stereo_48k.len() / 4;
-    let num_stereo_frames = num_floats / 2;
-    let num_output_samples = num_stereo_frames / 2; // 2:1 decimation
-    let mut out = Vec::with_capacity(num_output_samples * 2);
+/// Core of [`vortex_capture_convert`]: downmix + decimate f32 stereo 48kHz
+/// samples directly to PCM16 mono 24kHz bytes, appended to `out`. Operating
+/// on f32 samples (not a little-endian byte image of them) lets the shm
+/// capture path convert straight from ring reads with no intermediate byte
+/// buffer, into a reusable output buffer.
+fn downmix_decimate_f32_to_pcm16(f32_stereo_48k: &[f32], out: &mut Vec<u8>) {
+    // Each stereo frame = 2 floats. After mono downmix + 2:1 decimation +
+    // i16 conversion: 2 frames → one 2-byte sample.
+    let num_stereo_frames = f32_stereo_48k.len() / 2;
+    out.reserve(num_stereo_frames.div_ceil(2) * 2);
 
     for i in (0..num_stereo_frames).step_by(2) {
-        // Read stereo pair (left + right)
-        let base = i * 8; // 2 floats * 4 bytes each
-        if base + 8 > f32_stereo_48k.len() {
-            break;
-        }
-        let left = f32::from_le_bytes([
-            f32_stereo_48k[base],
-            f32_stereo_48k[base + 1],
-            f32_stereo_48k[base + 2],
-            f32_stereo_48k[base + 3],
-        ]);
-        let right = f32::from_le_bytes([
-            f32_stereo_48k[base + 4],
-            f32_stereo_48k[base + 5],
-            f32_stereo_48k[base + 6],
-            f32_stereo_48k[base + 7],
-        ]);
+        let left = f32_stereo_48k[i * 2];
+        let right = f32_stereo_48k[i * 2 + 1];
         let mono = (left + right) * 0.5;
         let clamped = mono.clamp(-1.0, 1.0);
         let sample = (clamped * 32767.0) as i16;
         out.extend_from_slice(&sample.to_le_bytes());
     }
+}
+
+/// Convert Vortex daemon PCM_OUTPUT (Float32 stereo 48kHz, little-endian
+/// bytes) to model input (PCM16 mono 24kHz). 8:1 size reduction. Byte-image
+/// front-end over [`downmix_decimate_f32_to_pcm16`] for the daemon-socket
+/// path, which receives the ring contents as wire bytes.
+fn vortex_capture_convert(f32_stereo_48k: &[u8]) -> Vec<u8> {
+    let mut floats = Vec::with_capacity(f32_stereo_48k.len() / 4);
+    for chunk in f32_stereo_48k.chunks_exact(4) {
+        floats.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    let mut out = Vec::new();
+    downmix_decimate_f32_to_pcm16(&floats, &mut out);
     out
 }
 
-/// Convert model output (PCM16 mono 24kHz) to Vortex daemon PCM_INPUT
-/// (Float32 stereo 48kHz). 8:1 size expansion.
-fn vortex_playback_convert(pcm16_mono_24k: &[u8]) -> Vec<u8> {
+/// Core of [`vortex_playback_convert`]: expand model output (PCM16 mono
+/// 24kHz) to Vortex f32 stereo 48kHz samples appended to `out` (duplicate
+/// 2:1 upsample, L=R). The shm playback path writes these f32 samples
+/// straight into the input ring without round-tripping a byte image.
+fn pcm16_to_f32_stereo_upsampled(pcm16_mono_24k: &[u8], out: &mut Vec<f32>) {
     let num_samples = pcm16_mono_24k.len() / 2;
-    // Each mono sample → 2 stereo frames (upsample) × 2 channels × 4 bytes
-    let mut out = Vec::with_capacity(num_samples * 16);
+    // Each mono sample → 2 stereo frames (upsample) × 2 channels
+    out.reserve(num_samples * 4);
 
     for i in 0..num_samples {
         let sample = i16::from_le_bytes([pcm16_mono_24k[i * 2], pcm16_mono_24k[i * 2 + 1]]);
         let f = sample as f32 / 32768.0;
-        let bytes = f.to_le_bytes();
         // Duplicate sample for 2:1 upsample, stereo (L=R)
         for _ in 0..2 {
-            out.extend_from_slice(&bytes); // left
-            out.extend_from_slice(&bytes); // right
+            out.push(f); // left
+            out.push(f); // right
         }
     }
+}
+
+/// Convert model output (PCM16 mono 24kHz) to Vortex daemon PCM_INPUT
+/// (Float32 stereo 48kHz, little-endian bytes). 8:1 size expansion.
+/// Byte-image front-end over [`pcm16_to_f32_stereo_upsampled`] for the
+/// daemon-socket wire path.
+fn vortex_playback_convert(pcm16_mono_24k: &[u8]) -> Vec<u8> {
+    let mut samples = Vec::new();
+    pcm16_to_f32_stereo_upsampled(pcm16_mono_24k, &mut samples);
+    let mut out = Vec::with_capacity(samples.len() * 4);
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Capture frame aggregation (vortex shm path)
+// ---------------------------------------------------------------------------
+
+/// f32 ring samples per millisecond in the Vortex capture ring (48kHz × 2
+/// channels — fixed by the HAL plugin's shared-memory format).
+const VORTEX_RING_F32_PER_MS: usize = 96;
+
+/// One 2:1 decimation group: two stereo frames (4 f32 samples) collapse into
+/// one output sample, so frames are cut on this boundary to keep the
+/// decimation phase continuous across WS messages.
+const CAPTURE_DECIMATION_GROUP_F32: usize = 4;
+
+/// Minimum audio per capture WS message (~20ms): the aggregation floor that
+/// turns the 5ms ring poll into 4-8× fewer, larger messages while adding at
+/// most one frame of latency — well inside a 40ms budget.
+const CAPTURE_FRAME_MIN_MS: usize = 20;
+
+/// Maximum audio per capture WS message (~40ms): caps message size when a
+/// scheduling hiccup piles up ring backlog, so recovery sends a few normal
+/// frames instead of one giant one.
+const CAPTURE_FRAME_MAX_MS: usize = 40;
+
+const CAPTURE_FRAME_MIN_F32: usize = CAPTURE_FRAME_MIN_MS * VORTEX_RING_F32_PER_MS;
+const CAPTURE_FRAME_MAX_F32: usize = CAPTURE_FRAME_MAX_MS * VORTEX_RING_F32_PER_MS;
+
+// Frame cuts must land on decimation-group boundaries.
+const _: () = assert!(
+    CAPTURE_FRAME_MIN_F32.is_multiple_of(CAPTURE_DECIMATION_GROUP_F32)
+        && CAPTURE_FRAME_MAX_F32.is_multiple_of(CAPTURE_DECIMATION_GROUP_F32)
+        && CAPTURE_FRAME_MIN_F32 <= CAPTURE_FRAME_MAX_F32
+);
+
+/// Accumulates raw f32 ring samples across 5ms poll ticks and cuts them into
+/// 20-40ms frames for conversion + WS send. Both buffers live for the whole
+/// capture task and are reused (clear-don't-realloc), so steady-state capture
+/// allocates nothing per tick.
+struct CaptureFrameAggregator {
+    /// Samples read from the ring but not yet emitted in a frame.
+    pending: Vec<f32>,
+    /// Scratch for the frame currently being emitted.
+    frame: Vec<f32>,
+}
+
+impl CaptureFrameAggregator {
+    fn new() -> Self {
+        Self {
+            pending: Vec::with_capacity(CAPTURE_FRAME_MAX_F32),
+            frame: Vec::with_capacity(CAPTURE_FRAME_MAX_F32),
+        }
+    }
+
+    /// Append one ring sample (called straight from the masked ring read).
+    fn push_sample(&mut self, sample: f32) {
+        self.pending.push(sample);
+    }
+
+    /// Cut the next full frame if at least [`CAPTURE_FRAME_MIN_F32`] samples
+    /// are pending: up to [`CAPTURE_FRAME_MAX_F32`] samples, always aligned
+    /// to a decimation-group boundary; the remainder stays pending.
+    fn next_full_frame(&mut self) -> Option<&[f32]> {
+        if self.pending.len() < CAPTURE_FRAME_MIN_F32 {
+            return None;
+        }
+        let cut = self.pending.len().min(CAPTURE_FRAME_MAX_F32);
+        let cut = cut - (cut % CAPTURE_DECIMATION_GROUP_F32);
+        self.frame.clear();
+        self.frame.extend(self.pending.drain(..cut));
+        Some(&self.frame)
+    }
+
+    /// Emit whatever is pending regardless of size — used when the ring goes
+    /// quiet so utterance tails are not held back waiting for a full frame.
+    fn flush(&mut self) -> Option<&[f32]> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        self.frame.clear();
+        self.frame.append(&mut self.pending);
+        Some(&self.frame)
+    }
+}
+
+/// Convert one aggregated capture frame and forward it to the model
+/// WebSocket (and the optional transcription tee). Reuses the caller's
+/// conversion/encoding buffers; the WS message layout is byte-identical to
+/// the historical per-tick sends apart from carrying a larger PCM chunk.
+#[cfg(unix)]
+#[allow(clippy::result_unit_err)]
+async fn send_capture_frame(
+    frame: &[f32],
+    pcm16_buf: &mut Vec<u8>,
+    b64_buf: &mut String,
+    provider: LiveAudioProvider,
+    sample_rate: u32,
+    tee: Option<&AudioQueueSender>,
+    sink: &Mutex<WsSink>,
+) -> Result<(), ()> {
+    pcm16_buf.clear();
+    downmix_decimate_f32_to_pcm16(frame, pcm16_buf);
+    if pcm16_buf.is_empty() {
+        return Ok(());
+    }
+    b64_buf.clear();
+    BASE64.encode_string(&*pcm16_buf, b64_buf);
+    let ws_msg = match provider {
+        LiveAudioProvider::Gemini => serde_json::json!({
+            "realtime_input": {
+                "media_chunks": [{
+                    "mime_type": format!("audio/pcm;rate={}", sample_rate),
+                    "data": &*b64_buf
+                }]
+            }
+        }),
+        LiveAudioProvider::OpenAI => serde_json::json!({
+            "type": "input_audio_buffer.append",
+            "audio": &*b64_buf
+        }),
+    };
+    if let Some(tee) = tee {
+        let _ = tee.send(pcm16_buf.clone());
+    }
+    let mut sink = sink.lock().await;
+    sink.send(WsMessage::Text(ws_msg.to_string().into()))
+        .await
+        .map_err(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// Duration-bounded drop-oldest audio queues
+// ---------------------------------------------------------------------------
+//
+// Live audio lanes must never buffer unboundedly: a stalled consumer (slow
+// WS peer, wedged playback sink, slow Whisper spell) would otherwise grow
+// the queue for the lifetime of the call. Every lane instead carries a
+// duration budget; overflow evicts the OLDEST audio first — for a live
+// stream a skip is strictly better than unbounded lag, because dropping the
+// oldest keeps the survivors near real time.
+
+/// Playback lane budget: model audio waiting to enter the output device.
+/// TTS bursts arrive faster than real time, so a healthy lane briefly holds
+/// several seconds; 30s absorbs a full long utterance while capping a wedged
+/// playback sink at ~1.4 MiB instead of the whole call.
+const PLAYBACK_QUEUE_SECONDS: usize = 30;
+
+/// Capture-side lane budget (the daemon-socket capture stage and the Whisper
+/// tee): capture is produced in real time, so any backlog beyond a few
+/// seconds means the consumer stalled; 30s (matching the playback lane) is
+/// far more than a healthy lane ever holds while still bounding a stalled
+/// one.
+const CAPTURE_QUEUE_SECONDS: usize = 30;
+
+/// Rate limit for the per-lane overflow log: one line per interval
+/// summarising everything dropped since the last, so a sustained stall logs
+/// a heartbeat instead of a flood.
+const QUEUE_DROP_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Rate-limited accounting for a lane's drop-oldest evictions.
+struct DropLog {
+    lane: &'static str,
+    dropped_chunks: u64,
+    dropped_secs: f64,
+    last_log: Option<Instant>,
+}
+
+impl DropLog {
+    fn new(lane: &'static str) -> Self {
+        Self {
+            lane,
+            dropped_chunks: 0,
+            dropped_secs: 0.0,
+            last_log: None,
+        }
+    }
+
+    /// Record `chunks` evicted chunks worth `secs` of audio, emitting at most
+    /// one summary line per [`QUEUE_DROP_LOG_INTERVAL`].
+    fn note(&mut self, chunks: u64, secs: f64) {
+        self.dropped_chunks += chunks;
+        self.dropped_secs += secs;
+        let now = Instant::now();
+        let due = self
+            .last_log
+            .is_none_or(|at| now.duration_since(at) >= QUEUE_DROP_LOG_INTERVAL);
+        if due {
+            eprintln!(
+                "live_audio: {} lane over budget — dropped {} oldest chunk(s) (~{:.1}s of audio)",
+                self.lane, self.dropped_chunks, self.dropped_secs
+            );
+            self.dropped_chunks = 0;
+            self.dropped_secs = 0.0;
+            self.last_log = Some(now);
+        }
+    }
+}
+
+struct AudioQueueState {
+    chunks: VecDeque<Vec<u8>>,
+    queued_bytes: usize,
+    sender_dropped: bool,
+    receiver_dropped: bool,
+    drop_log: DropLog,
+}
+
+struct AudioQueueShared {
+    state: std::sync::Mutex<AudioQueueState>,
+    notify: tokio::sync::Notify,
+    max_bytes: usize,
+    bytes_per_sec: usize,
+}
+
+/// Producer half of a [`bounded_audio_queue`]. Not `Clone`: every lane has a
+/// single producer, and dropping it closes the lane for the receiver.
+pub(crate) struct AudioQueueSender {
+    shared: Arc<AudioQueueShared>,
+}
+
+/// Consumer half of a [`bounded_audio_queue`].
+pub(crate) struct AudioQueueReceiver {
+    shared: Arc<AudioQueueShared>,
+}
+
+/// Build a duration-bounded drop-oldest audio lane: `seconds` ×
+/// `bytes_per_sec` is the byte budget, and queueing beyond it evicts the
+/// oldest chunks (never the chunk being queued) with a rate-limited log
+/// naming the lane.
+fn bounded_audio_queue(
+    lane: &'static str,
+    seconds: usize,
+    bytes_per_sec: usize,
+) -> (AudioQueueSender, AudioQueueReceiver) {
+    let shared = Arc::new(AudioQueueShared {
+        state: std::sync::Mutex::new(AudioQueueState {
+            chunks: VecDeque::new(),
+            queued_bytes: 0,
+            sender_dropped: false,
+            receiver_dropped: false,
+            drop_log: DropLog::new(lane),
+        }),
+        notify: tokio::sync::Notify::new(),
+        max_bytes: seconds * bytes_per_sec,
+        bytes_per_sec,
+    });
+    (
+        AudioQueueSender {
+            shared: shared.clone(),
+        },
+        AudioQueueReceiver { shared },
+    )
+}
+
+impl AudioQueueSender {
+    /// Queue one chunk. An over-budget lane evicts its oldest chunks first;
+    /// returns `Err(())` once the receiver is gone so producers can wind
+    /// down (mirrors `mpsc::UnboundedSender::send`'s error contract).
+    #[allow(clippy::result_unit_err)]
+    fn send(&self, chunk: Vec<u8>) -> Result<(), ()> {
+        let mut st = self.shared.state.lock().unwrap();
+        if st.receiver_dropped {
+            return Err(());
+        }
+        st.queued_bytes += chunk.len();
+        st.chunks.push_back(chunk);
+        let mut dropped_chunks = 0u64;
+        let mut dropped_bytes = 0usize;
+        while st.queued_bytes > self.shared.max_bytes && st.chunks.len() > 1 {
+            let oldest = st.chunks.pop_front().expect("len > 1");
+            st.queued_bytes -= oldest.len();
+            dropped_chunks += 1;
+            dropped_bytes += oldest.len();
+        }
+        if dropped_chunks > 0 {
+            let secs = dropped_bytes as f64 / self.shared.bytes_per_sec.max(1) as f64;
+            st.drop_log.note(dropped_chunks, secs);
+        }
+        drop(st);
+        self.shared.notify.notify_one();
+        Ok(())
+    }
+}
+
+impl Drop for AudioQueueSender {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.shared.state.lock() {
+            st.sender_dropped = true;
+        }
+        self.shared.notify.notify_one();
+    }
+}
+
+impl AudioQueueReceiver {
+    /// Await the next chunk; `None` once the sender is gone and the queue is
+    /// drained (mirrors `mpsc::UnboundedReceiver::recv`). Cancel-safe: state
+    /// lives in the shared queue, and every call re-checks it before
+    /// sleeping, so a chunk enqueued between checks is never missed.
+    async fn recv(&mut self) -> Option<Vec<u8>> {
+        loop {
+            let notified = self.shared.notify.notified();
+            {
+                let mut st = self.shared.state.lock().unwrap();
+                if let Some(chunk) = st.chunks.pop_front() {
+                    st.queued_bytes -= chunk.len();
+                    return Some(chunk);
+                }
+                if st.sender_dropped {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for AudioQueueReceiver {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.shared.state.lock() {
+            st.receiver_dropped = true;
+            st.chunks.clear();
+            st.queued_bytes = 0;
+        }
+    }
 }
 
 pub async fn start_audio_bridge(
@@ -747,8 +1084,8 @@ pub async fn start_audio_bridge(
     provider: LiveAudioProvider,
     sample_rate: u32,
     bridge: &AudioBridge,
-    audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    audio_out_rx: AudioQueueReceiver,
+    capture_tee_tx: Option<AudioQueueSender>,
 ) -> Result<AudioStreamBridge, CallerError> {
     if bridge.uses_vortex_shm() {
         // The Vortex shared-memory bridge is POSIX-only (shm_open/mmap).
@@ -823,6 +1160,49 @@ const OFF_IN_READ_POS: usize = 48;
 const OFF_OUT_BUFFER: usize = 56;
 const OFF_IN_BUFFER: usize = OFF_OUT_BUFFER + VORTEX_RING_SAMPLES * 4;
 
+/// Owners below this uid are system daemons, not peer users. The Vortex
+/// HAL plugin runs inside `coreaudiod`, so the legitimate object is owned
+/// by `_coreaudiod` (uid 202 — observed live) or root, never by the
+/// console user; macOS system service uids sit below 500 (Linux below
+/// 1000, but 500 covers the daemon accounts that matter and keeps every
+/// ordinary-user squatter out on both).
+#[cfg(unix)]
+const VORTEX_SHM_SYSTEM_UID_CEILING: libc::uid_t = 500;
+
+/// Pre-`mmap` validation of the Vortex shm object's `fstat` results,
+/// factored out of [`start_vortex_shm_bridge`] so the checks are unit
+/// testable without a live shm object.
+///
+/// An object owned by another ordinary user means the well-known name was
+/// squatted — refuse it. The current user and system-daemon owners
+/// (`coreaudiod` hosts the HAL plugin that creates the object) are the
+/// legitimate cases. An undersized object would SIGBUS on the first ring
+/// access past EOF — refuse it before mapping. Same-uid writers remain
+/// inside the trust boundary: POSIX shm offers no OS boundary between
+/// same-user processes, so shm audio is necessarily trusted once these
+/// checks pass.
+#[cfg(unix)]
+fn validate_vortex_shm_object(
+    st_size: i64,
+    st_uid: libc::uid_t,
+    required_size: usize,
+    euid: libc::uid_t,
+) -> Result<(), String> {
+    if st_uid != euid && st_uid >= VORTEX_SHM_SYSTEM_UID_CEILING {
+        return Err(format!(
+            "vortex shm object is owned by uid {st_uid}, not the current user (uid {euid}) \
+             or a system audio daemon; refusing to attach"
+        ));
+    }
+    if st_size < 0 || (st_size as u64) < required_size as u64 {
+        return Err(format!(
+            "vortex shm object is {st_size} bytes, smaller than the required {required_size}; \
+             refusing to map a truncated object"
+        ));
+    }
+    Ok(())
+}
+
 /// Direct shared memory bridge: reads/writes the Vortex HAL plugin's ring
 /// buffers without the daemon. No sockets, no IPC, no deadlocks.
 ///
@@ -834,8 +1214,8 @@ async fn start_vortex_shm_bridge(
     session_write: Arc<Mutex<WsSink>>,
     provider: LiveAudioProvider,
     sample_rate: u32,
-    audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    audio_out_rx: AudioQueueReceiver,
+    capture_tee_tx: Option<AudioQueueSender>,
 ) -> Result<AudioStreamBridge, CallerError> {
     // Open and mmap the shared memory
     // SAFETY: VORTEX_SHM_NAME is a static NUL-terminated POSIX shm name.
@@ -855,8 +1235,33 @@ async fn start_vortex_shm_bridge(
     }
 
     let shm_size = OFF_IN_BUFFER + VORTEX_RING_SAMPLES * 4;
-    // SAFETY: fd is a live descriptor from shm_open; shm_size covers the
-    // VortexSharedAudioState header and both f32 ring buffers.
+
+    // Validate the object before mapping (see validate_vortex_shm_object).
+    // SAFETY: `st` is a zeroed stat buffer owned by this frame; fstat only
+    // writes into it and reports failure via the return value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is a live descriptor from shm_open; `st` is a valid,
+    // writable stat buffer.
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: fd was returned by shm_open above and is closed exactly once.
+        unsafe { libc::close(fd) };
+        return Err(CallerError::Agent(format!(
+            "vortex shm fstat failed: {err}"
+        )));
+    }
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if let Err(reason) = validate_vortex_shm_object(st.st_size, st.st_uid, shm_size, euid) {
+        // SAFETY: fd was returned by shm_open above and is closed exactly once.
+        unsafe { libc::close(fd) };
+        return Err(CallerError::Agent(reason));
+    }
+
+    // SAFETY: fd is a live descriptor from shm_open, fstat-verified above to
+    // be at least shm_size bytes; shm_size covers the VortexSharedAudioState
+    // header and both f32 ring buffers.
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -919,7 +1324,11 @@ async fn start_vortex_shm_bridge(
         unsafe { *((base + buf_offset) as *mut f32).add(idx) = val };
     }
 
-    // Capture task: poll output ring → convert → model WebSocket
+    // Capture task: poll output ring → aggregate → convert → model WebSocket.
+    // The ring is still polled every 5ms (reads stay per-sample with masked
+    // indices), but samples accumulate in the aggregator and only go out as
+    // 20-40ms frames — 4-8× fewer WS messages than the old per-tick sends —
+    // through buffers reused across the task's lifetime.
     let capture_write = session_write;
     let capture_rate = sample_rate;
     let capture_provider = provider;
@@ -930,55 +1339,60 @@ async fn start_vortex_shm_bridge(
         let mut ticker = tokio::time::interval(Duration::from_millis(5));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        loop {
+        let mut agg = CaptureFrameAggregator::new();
+        let mut pcm16_buf: Vec<u8> = Vec::new();
+        let mut b64_buf = String::new();
+
+        'capture: loop {
             ticker.tick().await;
 
             let w = atomic_load_u64(b, OFF_OUT_WRITE_POS, Ordering::Acquire);
             let r = atomic_load_u64(b, OFF_OUT_READ_POS, Ordering::Relaxed);
             let avail = w.wrapping_sub(r) as usize;
             if avail == 0 {
+                // Stream went quiet with a partial frame pending: flush it so
+                // utterance tails are not held back waiting for a full frame.
+                if let Some(frame) = agg.flush() {
+                    if send_capture_frame(
+                        frame,
+                        &mut pcm16_buf,
+                        &mut b64_buf,
+                        capture_provider,
+                        capture_rate,
+                        capture_tee_tx.as_ref(),
+                        &capture_write,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break 'capture;
+                    }
+                }
                 continue;
             }
 
             let to_read = avail.min(VORTEX_RING_SAMPLES);
-            let mut f32_buf = Vec::with_capacity(to_read);
             for i in 0..to_read {
                 let idx = ((r + i as u64) & VORTEX_RING_MASK) as usize;
-                f32_buf.push(read_f32(b, OFF_OUT_BUFFER, idx));
+                agg.push_sample(read_f32(b, OFF_OUT_BUFFER, idx));
             }
             atomic_store_u64(b, OFF_OUT_READ_POS, r + to_read as u64, Ordering::Release);
 
-            let f32_bytes: Vec<u8> = f32_buf.iter().flat_map(|f| f.to_le_bytes()).collect();
-            let pcm16 = vortex_capture_convert(&f32_bytes);
-            if pcm16.is_empty() {
-                continue;
-            }
-
-            let b64 = BASE64.encode(&pcm16);
-            let ws_msg = match capture_provider {
-                LiveAudioProvider::Gemini => serde_json::json!({
-                    "realtime_input": {
-                        "media_chunks": [{
-                            "mime_type": format!("audio/pcm;rate={}", capture_rate),
-                            "data": b64
-                        }]
-                    }
-                }),
-                LiveAudioProvider::OpenAI => serde_json::json!({
-                    "type": "input_audio_buffer.append",
-                    "audio": b64
-                }),
-            };
-            if let Some(ref tee) = capture_tee_tx {
-                let _ = tee.send(pcm16);
-            }
-            let mut sink = capture_write.lock().await;
-            if sink
-                .send(WsMessage::Text(ws_msg.to_string().into()))
+            while let Some(frame) = agg.next_full_frame() {
+                if send_capture_frame(
+                    frame,
+                    &mut pcm16_buf,
+                    &mut b64_buf,
+                    capture_provider,
+                    capture_rate,
+                    capture_tee_tx.as_ref(),
+                    &capture_write,
+                )
                 .await
                 .is_err()
-            {
-                break;
+                {
+                    break 'capture;
+                }
             }
         }
     });
@@ -989,13 +1403,13 @@ async fn start_vortex_shm_bridge(
         use std::sync::atomic::Ordering;
         let b = playback_base;
         let mut rx = audio_out_rx;
+        // Reused across chunks (clear-don't-realloc); converted directly from
+        // PCM16 to f32 samples with no intermediate byte image.
+        let mut samples: Vec<f32> = Vec::new();
 
         while let Some(pcm_data) = rx.recv().await {
-            let f32_bytes = vortex_playback_convert(&pcm_data);
-            let samples: Vec<f32> = f32_bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
+            samples.clear();
+            pcm16_to_f32_stereo_upsampled(&pcm_data, &mut samples);
 
             let mut written = 0;
             while written < samples.len() {
@@ -1036,8 +1450,8 @@ async fn start_vortex_audio_bridge(
     provider: LiveAudioProvider,
     sample_rate: u32,
     socket_path: &str,
-    audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    audio_out_rx: AudioQueueReceiver,
+    capture_tee_tx: Option<AudioQueueSender>,
 ) -> Result<AudioStreamBridge, CallerError> {
     // Clean up stale socket and bind
     let _ = std::fs::remove_file(socket_path);
@@ -1088,8 +1502,13 @@ async fn start_vortex_audio_bridge(
     // Capture: two tasks to decouple socket reads from WebSocket writes.
     // Task A drains the daemon socket as fast as possible (prevents buffer
     // backup that deadlocks the daemon's send/recv). Task B forwards the
-    // converted PCM to the model WebSocket at its own pace.
-    let (cap_tx, mut cap_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // converted PCM to the model WebSocket at its own pace — a slow WS peer
+    // costs the oldest queued audio, never unbounded memory.
+    let (cap_tx, mut cap_rx) = bounded_audio_queue(
+        "vortex-capture",
+        CAPTURE_QUEUE_SECONDS,
+        sample_rate as usize * 2,
+    );
 
     // Task A: drain daemon socket → channel
     let capture_drain = tokio::spawn(async move {
@@ -1174,8 +1593,8 @@ async fn start_network_audio_bridge(
     provider: LiveAudioProvider,
     sample_rate: u32,
     host_addr: &str,
-    audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    audio_out_rx: AudioQueueReceiver,
+    capture_tee_tx: Option<AudioQueueSender>,
 ) -> Result<AudioStreamBridge, CallerError> {
     let stream = tokio::net::TcpStream::connect(host_addr)
         .await
@@ -1259,8 +1678,8 @@ async fn start_local_audio_bridge(
     provider: LiveAudioProvider,
     sample_rate: u32,
     bridge: &AudioBridge,
-    audio_out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    capture_tee_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    audio_out_rx: AudioQueueReceiver,
+    capture_tee_tx: Option<AudioQueueSender>,
 ) -> Result<AudioStreamBridge, CallerError> {
     // Capture task: platform command -> model
     let (capture_cmd, capture_args) = bridge.capture_command(sample_rate);
@@ -1418,6 +1837,19 @@ fn extract_json_object(text: &str) -> Option<String> {
 // Transcript logger
 // ---------------------------------------------------------------------------
 
+/// Open options for live-audio artifacts (transcripts, call results):
+/// they hold conversation content, so files are owner-only (0600) from
+/// creation on Unix; Windows relies on the profile ACL.
+fn private_audio_file_options() -> tokio::fs::OpenOptions {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    options
+}
+
 pub struct TranscriptLogger {
     file: tokio::fs::File,
     path: PathBuf,
@@ -1426,10 +1858,15 @@ pub struct TranscriptLogger {
 impl TranscriptLogger {
     pub async fn new(dir: &Path, live_audio_id: &str) -> Result<Self, CallerError> {
         let transcript_dir = dir.join(format!("live_audio_{}", live_audio_id));
-        tokio::fs::create_dir_all(&transcript_dir).await?;
+        let mut dir_builder = tokio::fs::DirBuilder::new();
+        dir_builder.recursive(true);
+        #[cfg(unix)]
+        {
+            dir_builder.mode(0o700);
+        }
+        dir_builder.create(&transcript_dir).await?;
         let path = transcript_dir.join("transcript.jsonl");
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
+        let file = private_audio_file_options()
             .append(true)
             .open(&path)
             .await?;
@@ -1457,29 +1894,58 @@ impl TranscriptLogger {
 // Full session orchestrator
 // ---------------------------------------------------------------------------
 
-/// Buffer inbound audio chunks from the capture tee, accumulate ~3 seconds,
-/// run silence detection, and send to Whisper for transcription.
-/// Results are appended to the transcript JSONL as "app" speaker entries.
+/// Inbound transcription window length: seconds of buffered call audio per
+/// Whisper request. ~3s balances transcript latency against per-request
+/// overhead (unchanged from the original inline pipeline).
+const WHISPER_WINDOW_SECONDS: usize = 3;
+
+/// Bound on transcription windows queued behind the in-flight Whisper call.
+/// Each window is [`WHISPER_WINDOW_SECONDS`] of voiced audio, so 4 windows
+/// keeps at most ~12s of speech waiting through a slow API spell; beyond
+/// that the oldest window is dropped — a transcript gap beats an
+/// ever-growing backlog a slow API may never catch up on.
+const WHISPER_MAX_PENDING_WINDOWS: usize = 4;
+
+/// Buffer inbound audio chunks from the capture tee, accumulate
+/// [`WHISPER_WINDOW_SECONDS`] windows, run silence detection, and send
+/// voiced windows to the transcriber. Results are appended to the transcript
+/// JSONL as "app" speaker entries.
+///
+/// Requests are sequential (at most one in flight) so transcript entries
+/// land in capture order, but the intake never stalls behind them: while a
+/// request is in flight, chunks keep draining and completed windows queue in
+/// a bounded drop-oldest FIFO ([`WHISPER_MAX_PENDING_WINDOWS`]). The
+/// in-flight future is held inside this task rather than spawned, so
+/// aborting the task cancels the request with it.
 ///
 /// The transcriber is constructed by `run_session` from the project's
 /// `[transcription]` config — this loop only ever runs when the project has
 /// explicitly opted in.
-async fn whisper_inbound_loop(
-    transcriber: crate::transcription::WhisperTranscriber,
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+async fn whisper_inbound_loop<T>(
+    transcriber: T,
+    mut rx: AudioQueueReceiver,
     sample_rate: u32,
     transcript_path: &Path,
-) {
-    use crate::transcription::{self, Transcriber};
+) where
+    T: crate::transcription::Transcriber + 'static,
+{
+    use crate::transcription;
+    use std::future::Future;
+    use std::pin::Pin;
 
-    // Buffer ~3 seconds of audio before sending to Whisper
-    let threshold = (sample_rate as usize) * 2 * 3; // 3 seconds of 16-bit mono
+    let transcriber = Arc::new(transcriber);
+
+    let threshold = (sample_rate as usize) * 2 * WHISPER_WINDOW_SECONDS; // 16-bit mono
     let mut audio_buf: Vec<u8> = Vec::with_capacity(threshold);
     let rms_threshold = 1000.0f64;
 
+    let mut pending_windows: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut window_drop_log = DropLog::new("whisper-window");
+    let mut in_flight: Option<Pin<Box<dyn Future<Output = Option<String>> + Send>>> = None;
+    let mut intake_open = true;
+
     // Open transcript file for appending
-    let mut transcript_file = match tokio::fs::OpenOptions::new()
-        .create(true)
+    let mut transcript_file = match private_audio_file_options()
         .append(true)
         .open(transcript_path)
         .await
@@ -1488,39 +1954,72 @@ async fn whisper_inbound_loop(
         Err(_) => return,
     };
 
-    while let Some(chunk) = rx.recv().await {
-        audio_buf.extend_from_slice(&chunk);
-
-        if audio_buf.len() < threshold {
-            continue;
-        }
-
-        // RMS silence detection
-        let rms = {
-            let samples = audio_buf
-                .chunks_exact(2)
-                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f64);
-            let n = audio_buf.len() / 2;
-            let sum_sq: f64 = samples.map(|s| s * s).sum();
-            if n > 0 {
-                (sum_sq / n as f64).sqrt()
-            } else {
-                0.0
+    loop {
+        // Launch the next queued window whenever the lane is idle; requests
+        // stay sequential so results publish in capture order.
+        if in_flight.is_none() {
+            if let Some(window) = pending_windows.pop_front() {
+                let transcriber = Arc::clone(&transcriber);
+                in_flight = Some(Box::pin(async move {
+                    let wav = transcription::encode_wav(&window, sample_rate, 1);
+                    match transcriber.transcribe(&wav).await {
+                        Ok(segment) => Some(segment.text),
+                        Err(_) => None,
+                    }
+                }));
+            } else if !intake_open {
+                break; // intake closed and every window drained
             }
-        };
-
-        if rms < rms_threshold {
-            audio_buf.clear();
-            continue;
         }
 
-        // Encode as WAV and transcribe
-        let wav = transcription::encode_wav(&audio_buf, sample_rate, 1);
-        audio_buf.clear();
+        tokio::select! {
+            chunk = rx.recv(), if intake_open => {
+                let Some(chunk) = chunk else {
+                    intake_open = false;
+                    continue;
+                };
+                audio_buf.extend_from_slice(&chunk);
+                if audio_buf.len() < threshold {
+                    continue;
+                }
 
-        if let Ok(segment) = transcriber.transcribe(&wav).await {
-            let text = segment.text.trim();
-            if !text.is_empty() {
+                // RMS silence detection
+                let rms = {
+                    let samples = audio_buf
+                        .chunks_exact(2)
+                        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f64);
+                    let n = audio_buf.len() / 2;
+                    let sum_sq: f64 = samples.map(|s| s * s).sum();
+                    if n > 0 {
+                        (sum_sq / n as f64).sqrt()
+                    } else {
+                        0.0
+                    }
+                };
+
+                if rms < rms_threshold {
+                    audio_buf.clear();
+                    continue;
+                }
+
+                if pending_windows.len() >= WHISPER_MAX_PENDING_WINDOWS {
+                    pending_windows.pop_front();
+                    window_drop_log.note(1, WHISPER_WINDOW_SECONDS as f64);
+                }
+                pending_windows.push_back(std::mem::take(&mut audio_buf));
+            }
+            text = async {
+                match in_flight.as_mut() {
+                    Some(request) => request.await,
+                    None => std::future::pending().await,
+                }
+            }, if in_flight.is_some() => {
+                in_flight = None;
+                let Some(text) = text else { continue };
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
                 let entry = serde_json::json!({
                     "ts": chrono::Utc::now().to_rfc3339(),
                     "speaker": "app",
@@ -1529,6 +2028,10 @@ async fn whisper_inbound_loop(
                 let mut line = serde_json::to_string(&entry).unwrap_or_default();
                 line.push('\n');
                 let _ = transcript_file.write_all(line.as_bytes()).await;
+                // tokio's File hands writes to the blocking pool and returns
+                // before they land; flush per entry so the transcript is
+                // durable even if the session aborts this task right after.
+                let _ = transcript_file.flush().await;
             }
         }
     }
@@ -1552,23 +2055,10 @@ async fn whisper_inbound_loop(
 // dispatch path's approval registry (popped directly by the MCP
 // approve/deny tools) against the event bus's `ControlCommand` approval
 // verbs (how the web dashboard, tunnel, and control socket resolve), so it
-// works uniformly across daemon shapes. Ids come from a dedicated high
-// range so they can never collide with per-session turn-keyed approvals or
-// the ask range, and the session supervisor's approval routing consults
+// works uniformly across daemon shapes. Ids come from the process-wide
+// approval allocator, and the session supervisor's approval routing consults
 // [`spawn_consent_pending`] so a gate id is not misreported as an unknown
 // approval.
-
-/// Base of the live-audio consent id range. Per-session loops key approvals
-/// by small turn counters and `ask_user` draws from `1 << 40`; this range is
-/// disjoint from both while staying below JS's `Number.MAX_SAFE_INTEGER`.
-const SPAWN_CONSENT_ID_BASE: u64 = 1 << 41;
-
-static SPAWN_CONSENT_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(SPAWN_CONSENT_ID_BASE);
-
-fn next_spawn_consent_id() -> u64 {
-    SPAWN_CONSENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
 
 /// Default blocking wait for the consent prompt (same as `ask_user`).
 pub(crate) const SPAWN_CONSENT_WAIT: Duration = Duration::from_secs(300);
@@ -1717,7 +2207,7 @@ pub(crate) async fn request_spawn_consent(
 ) -> Result<SpawnConsent, String> {
     use crate::event::{AppEvent, ApprovalResponse, ControlMsg};
 
-    let id = next_spawn_consent_id();
+    let id = crate::event::next_approval_id();
 
     // Native JSON mode: the stdin loop owns the response channel. Arm the
     // slot before announcing so an instant response cannot miss it.
@@ -1826,8 +2316,8 @@ pub(crate) async fn request_spawn_consent(
                         );
                     }
                     Ok(Ok(AppEvent::ControlCommand(msg))) => match msg {
-                        // Ids from the dedicated consent range are globally
-                        // unique — match on id alone (same as `ask_user`).
+                        // Approval ids are process-wide — match on id alone
+                        // (same as `ask_user`).
                         ControlMsg::Approve { id: verb_id, .. }
                         | ControlMsg::ApproveAll { id: verb_id, .. }
                             if verb_id == id =>
@@ -1916,8 +2406,15 @@ pub async fn run_session(
     // Set up transcript logger
     let mut transcript = TranscriptLogger::new(session_log_dir, &spec.id).await?;
 
-    // Channel for routing model audio output to the playback task
-    let (audio_out_tx, audio_out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // PCM16 mono byte rate at the session's negotiated sample rate — the
+    // duration accounting for both bounded audio lanes below.
+    let pcm_bytes_per_sec = session.sample_rate as usize * 2;
+
+    // Lane for routing model audio output to the playback task: duration-
+    // bounded drop-oldest, so a wedged playback sink skips ahead instead of
+    // buffering the whole call.
+    let (audio_out_tx, audio_out_rx) =
+        bounded_audio_queue("playback", PLAYBACK_QUEUE_SECONDS, pcm_bytes_per_sec);
 
     // Set up the Whisper transcription tee for inbound audio — only when the
     // project has explicitly opted in ([transcription] enabled = true).
@@ -1925,7 +2422,8 @@ pub async fn run_session(
     let (capture_tee_tx, whisper_handle) = if transcription.enabled {
         match crate::transcription::WhisperTranscriber::new(transcription) {
             Ok(transcriber) => {
-                let (tee_tx, tee_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let (tee_tx, tee_rx) =
+                    bounded_audio_queue("whisper-tee", CAPTURE_QUEUE_SECONDS, pcm_bytes_per_sec);
                 let whisper_transcript_path = transcript.path().to_path_buf();
                 let handle = tokio::spawn(async move {
                     whisper_inbound_loop(transcriber, tee_rx, 24000, &whisper_transcript_path)
@@ -2248,7 +2746,16 @@ pub async fn run_session(
     // to the transcript ensures it survives crashes.
     let result_path = transcript.path().with_file_name("result.json");
     if let Ok(json) = serde_json::to_string_pretty(&result) {
-        if let Err(err) = tokio::fs::write(&result_path, json).await {
+        let write_result = async {
+            let mut file = private_audio_file_options()
+                .truncate(true)
+                .open(&result_path)
+                .await?;
+            file.write_all(json.as_bytes()).await?;
+            file.flush().await
+        }
+        .await;
+        if let Err(err) = write_result {
             let message = format!(
                 "live_audio: CRITICAL: failed to persist call result {}: {}",
                 result_path.display(),
@@ -2270,6 +2777,44 @@ pub async fn run_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Vortex shm object validation (pure logic; never touches a live object)
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn vortex_shm_validation_refuses_foreign_and_short_objects() {
+        let required = OFF_IN_BUFFER + VORTEX_RING_SAMPLES * 4;
+
+        // Exact-size and oversized same-uid objects are fine.
+        assert!(validate_vortex_shm_object(required as i64, 501, required, 501).is_ok());
+        assert!(validate_vortex_shm_object((required + 4096) as i64, 501, required, 501).is_ok());
+
+        // System-daemon owners are legitimate: the HAL plugin creates the
+        // object inside coreaudiod (`_coreaudiod` = 202; root when older
+        // configurations apply), not as the console user.
+        assert!(validate_vortex_shm_object(required as i64, 202, required, 501).is_ok());
+        assert!(validate_vortex_shm_object(required as i64, 0, required, 501).is_ok());
+
+        // Foreign ordinary user: the well-known name was squatted.
+        let err = validate_vortex_shm_object(required as i64, 502, required, 501).unwrap_err();
+        assert!(err.contains("owned by uid 502"), "{err}");
+
+        // Undersized (or nonsense-sized) object: mapping it would SIGBUS.
+        let err = validate_vortex_shm_object(required as i64 - 1, 501, required, 501).unwrap_err();
+        assert!(err.contains("smaller than the required"), "{err}");
+        assert!(validate_vortex_shm_object(0, 501, required, 501).is_err());
+        assert!(validate_vortex_shm_object(-1, 501, required, 501).is_err());
+
+        // A system-owned but undersized object still refuses on size.
+        assert!(validate_vortex_shm_object(0, 202, required, 501).is_err());
+
+        // Ownership is checked before size: a foreign object is reported as
+        // foreign even when also undersized.
+        let err = validate_vortex_shm_object(0, 502, required, 501).unwrap_err();
+        assert!(err.contains("owned by uid 502"), "{err}");
+    }
 
     // -----------------------------------------------------------------------
     // Vortex format conversion tests
@@ -2362,6 +2907,407 @@ mod tests {
     #[test]
     fn vortex_playback_empty_input() {
         assert!(vortex_playback_convert(&[]).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct-conversion parity tests
+    // -----------------------------------------------------------------------
+
+    /// The pre-refactor capture pipeline, kept verbatim as the reference the
+    /// direct conversion is pinned against: f32 samples → little-endian byte
+    /// image → per-frame byte parsing → PCM16.
+    fn reference_capture_two_step(samples: &[f32]) -> Vec<u8> {
+        let f32_bytes: Vec<u8> = samples.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let num_floats = f32_bytes.len() / 4;
+        let num_stereo_frames = num_floats / 2;
+        let mut out = Vec::with_capacity((num_stereo_frames / 2) * 2);
+        for i in (0..num_stereo_frames).step_by(2) {
+            let base = i * 8;
+            if base + 8 > f32_bytes.len() {
+                break;
+            }
+            let left = f32::from_le_bytes([
+                f32_bytes[base],
+                f32_bytes[base + 1],
+                f32_bytes[base + 2],
+                f32_bytes[base + 3],
+            ]);
+            let right = f32::from_le_bytes([
+                f32_bytes[base + 4],
+                f32_bytes[base + 5],
+                f32_bytes[base + 6],
+                f32_bytes[base + 7],
+            ]);
+            let mono = (left + right) * 0.5;
+            let clamped = mono.clamp(-1.0, 1.0);
+            let sample = (clamped * 32767.0) as i16;
+            out.extend_from_slice(&sample.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn direct_capture_convert_matches_two_step_reference() {
+        let mut cases: Vec<Vec<f32>> = vec![
+            vec![],
+            vec![0.5, -0.5],                                 // one stereo frame
+            vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],              // odd frame count
+            vec![2.0, 2.0, -3.0, 1.0, 1.0, 1.0, -1.0, -1.0], // clamping
+        ];
+        // Deterministic sweep across the clamped range, unaligned length.
+        let sweep: Vec<f32> = (0..1001)
+            .map(|i| ((i as f32 * 0.7311) % 3.0) - 1.5)
+            .collect();
+        cases.push(sweep);
+
+        for samples in &cases {
+            let mut direct = Vec::new();
+            downmix_decimate_f32_to_pcm16(samples, &mut direct);
+            assert_eq!(
+                direct,
+                reference_capture_two_step(samples),
+                "n={}",
+                samples.len()
+            );
+        }
+    }
+
+    #[test]
+    fn capture_convert_ignores_trailing_partial_frames() {
+        // One complete stereo frame + half a frame + 2 stray bytes.
+        let mut bytes = Vec::new();
+        for v in [0.5f32, 0.5, 0.25] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0xAA, 0xBB]);
+        let out = vortex_capture_convert(&bytes);
+        assert_eq!(out.len(), 2, "one mono sample from the one complete frame");
+        let s = i16::from_le_bytes([out[0], out[1]]);
+        assert!((s - 16383).abs() <= 1, "s={s}");
+    }
+
+    #[test]
+    fn direct_playback_convert_matches_byte_image() {
+        let pcm: Vec<u8> = [0i16, 16383, -32768, 32767, -1]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let mut direct = Vec::new();
+        pcm16_to_f32_stereo_upsampled(&pcm, &mut direct);
+        let parsed: Vec<f32> = vortex_playback_convert(&pcm)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(direct, parsed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Capture frame aggregation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capture_aggregator_aggregates_5ms_ticks_into_min_frames() {
+        let mut agg = CaptureFrameAggregator::new();
+        let tick = 5 * VORTEX_RING_F32_PER_MS; // one 5ms poll's worth
+                                               // Below the 20ms floor nothing is emitted...
+        for _ in 0..3 {
+            for _ in 0..tick {
+                agg.push_sample(0.25);
+            }
+            assert!(agg.next_full_frame().is_none(), "no frame below the floor");
+        }
+        // ...the fourth tick crosses it and yields exactly one 20ms frame.
+        for _ in 0..tick {
+            agg.push_sample(0.25);
+        }
+        let frame = agg.next_full_frame().expect("full frame at 20ms");
+        assert_eq!(frame.len(), CAPTURE_FRAME_MIN_F32);
+        assert!(
+            agg.next_full_frame().is_none(),
+            "nothing pending after an exact frame"
+        );
+    }
+
+    #[test]
+    fn capture_aggregator_splits_bursts_into_max_frames() {
+        let mut agg = CaptureFrameAggregator::new();
+        // A 100ms burst (ring backlog after a stall) cuts into 40+40+20ms.
+        let burst = 100 * VORTEX_RING_F32_PER_MS;
+        for i in 0..burst {
+            agg.push_sample(i as f32);
+        }
+        let mut sizes = Vec::new();
+        let mut samples = Vec::new();
+        while let Some(frame) = agg.next_full_frame() {
+            sizes.push(frame.len());
+            samples.extend_from_slice(frame);
+        }
+        assert_eq!(
+            sizes,
+            vec![
+                CAPTURE_FRAME_MAX_F32,
+                CAPTURE_FRAME_MAX_F32,
+                CAPTURE_FRAME_MIN_F32
+            ]
+        );
+        // Order preserved sample-for-sample across the cuts.
+        for (i, s) in samples.iter().enumerate() {
+            assert_eq!(*s, i as f32);
+        }
+        assert!(
+            agg.flush().is_none(),
+            "burst divided evenly, nothing pending"
+        );
+    }
+
+    #[test]
+    fn capture_aggregator_quiet_flush_releases_partial_tail() {
+        let mut agg = CaptureFrameAggregator::new();
+        let tail = 7 * VORTEX_RING_F32_PER_MS; // 7ms tail, under the 20ms floor
+        for i in 0..tail {
+            agg.push_sample(i as f32);
+        }
+        assert!(agg.next_full_frame().is_none());
+        let frame = agg.flush().expect("quiet flush emits the partial tail");
+        assert_eq!(frame.len(), tail);
+        for (i, s) in frame.iter().enumerate() {
+            assert_eq!(*s, i as f32);
+        }
+        assert!(agg.flush().is_none(), "flush drains the aggregator");
+    }
+
+    #[test]
+    fn capture_aggregator_cuts_on_decimation_boundaries() {
+        let mut agg = CaptureFrameAggregator::new();
+        // An unaligned backlog (not a multiple of the 4-sample decimation
+        // group) must leave the stragglers pending, not smear the phase.
+        let n = CAPTURE_FRAME_MIN_F32 + 3;
+        for i in 0..n {
+            agg.push_sample(i as f32);
+        }
+        let frame = agg.next_full_frame().expect("frame at the floor");
+        assert_eq!(frame.len(), CAPTURE_FRAME_MIN_F32);
+        assert_eq!(frame.len() % CAPTURE_DECIMATION_GROUP_F32, 0);
+        let tail = agg.flush().expect("stragglers stay pending");
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0], CAPTURE_FRAME_MIN_F32 as f32);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded drop-oldest queue tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn bounded_queue_drops_oldest_on_overflow() {
+        // 1s × 1000 B/s = 1000-byte budget.
+        let (tx, mut rx) = bounded_audio_queue("test", 1, 1000);
+        for tag in 1u8..=5 {
+            tx.send(vec![tag; 300]).expect("receiver alive");
+        }
+        // 5×300 = 1500 > 1000: the two oldest chunks were evicted.
+        drop(tx);
+        let mut tags = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            assert_eq!(chunk.len(), 300);
+            tags.push(chunk[0]);
+        }
+        assert_eq!(tags, vec![3, 4, 5], "oldest dropped, survivor order intact");
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_never_evicts_the_only_chunk() {
+        let (tx, mut rx) = bounded_audio_queue("test", 1, 100); // 100-byte budget
+        tx.send(vec![7u8; 500]).expect("receiver alive");
+        let got = rx.recv().await.expect("oversized chunk still delivered");
+        assert_eq!(got.len(), 500);
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_send_fails_once_receiver_gone() {
+        let (tx, rx) = bounded_audio_queue("test", 1, 1000);
+        drop(rx);
+        assert!(tx.send(vec![1, 2, 3]).is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_recv_drains_then_ends_after_sender_drop() {
+        let (tx, mut rx) = bounded_audio_queue("test", 1, 1000);
+        tx.send(vec![1]).unwrap();
+        tx.send(vec![2]).unwrap();
+        drop(tx);
+        assert_eq!(rx.recv().await, Some(vec![1]));
+        assert_eq!(rx.recv().await, Some(vec![2]));
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_wakes_blocked_receiver() {
+        let (tx, mut rx) = bounded_audio_queue("test", 1, 1000);
+        let recv_task = tokio::spawn(async move { rx.recv().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.send(vec![9]).unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), recv_task)
+            .await
+            .expect("receiver woke")
+            .expect("task");
+        assert_eq!(got, Some(vec![9]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Whisper intake tests (hermetic — stub transcriber, no network)
+    // -----------------------------------------------------------------------
+
+    /// Stub transcriber gated on a watch flag: calls stall until the test
+    /// opens the gate, then identify their window by its first PCM sample
+    /// (offset 44 = end of the standard WAV header).
+    struct GatedStubTranscriber {
+        release: tokio::sync::watch::Receiver<bool>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::transcription::Transcriber for GatedStubTranscriber {
+        async fn transcribe(
+            &self,
+            audio_wav: &[u8],
+        ) -> Result<crate::transcription::TranscriptSegment, CallerError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut release = self.release.clone();
+            release
+                .wait_for(|open| *open)
+                .await
+                .map_err(|_| CallerError::Agent("gate dropped".into()))?;
+            let tag = i16::from_le_bytes([audio_wav[44], audio_wav[45]]);
+            Ok(crate::transcription::TranscriptSegment {
+                text: format!("w{tag}"),
+                language: None,
+                duration_secs: 0.0,
+            })
+        }
+    }
+
+    /// One voiced [`WHISPER_WINDOW_SECONDS`] window of constant amplitude
+    /// `tag` (must clear the RMS gate at 1000).
+    fn voiced_window(tag: i16, rate: u32) -> Vec<u8> {
+        let bytes = rate as usize * 2 * WHISPER_WINDOW_SECONDS;
+        let mut window = Vec::with_capacity(bytes);
+        for _ in 0..bytes / 2 {
+            window.extend_from_slice(&tag.to_le_bytes());
+        }
+        window
+    }
+
+    fn transcript_texts(path: &Path) -> Vec<String> {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        content
+            .lines()
+            .map(|line| {
+                let entry: serde_json::Value = serde_json::from_str(line).expect("jsonl entry");
+                assert_eq!(entry["speaker"], "app");
+                entry["text"].as_str().expect("text").to_string()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn whisper_intake_keeps_draining_while_transcription_stalls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript_path = dir.path().join("transcript.jsonl");
+
+        // Tiny synthetic rate keeps windows small (600 bytes each).
+        let rate: u32 = 100;
+
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stub = GatedStubTranscriber {
+            release: release_rx,
+            calls: calls.clone(),
+        };
+
+        let (tee_tx, tee_rx) =
+            bounded_audio_queue("whisper-tee", CAPTURE_QUEUE_SECONDS, rate as usize * 2);
+        let loop_path = transcript_path.clone();
+        let handle = tokio::spawn(async move {
+            whisper_inbound_loop(stub, tee_rx, rate, &loop_path).await;
+        });
+
+        // Feed 7 voiced windows while the first transcription is stalled.
+        // Intake must keep accepting: window 2000 goes in flight, and of the
+        // rest the bounded FIFO keeps the newest 4 (2003..=2006), dropping
+        // the two oldest queued windows (2001, 2002).
+        for tag in 2000i16..=2006 {
+            tee_tx
+                .send(voiced_window(tag, rate))
+                .expect("intake accepts while a transcription is stalled");
+        }
+        drop(tee_tx);
+
+        // The consumer keeps draining while stalled: exactly one request in
+        // flight, everything else queued/bounded, nothing blocked.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while calls.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < deadline, "first request never launched");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "requests stay sequential while the first is in flight"
+        );
+        assert!(
+            transcript_texts(&transcript_path).is_empty(),
+            "nothing published before the stall resolves"
+        );
+
+        // Release the gate: the stalled request and the surviving windows
+        // resolve in capture order.
+        release_tx.send(true).expect("loop alive");
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("whisper loop drains and exits")
+            .expect("whisper task");
+
+        assert_eq!(
+            transcript_texts(&transcript_path),
+            vec!["w2000", "w2003", "w2004", "w2005", "w2006"],
+            "results in capture order; only the oldest queued windows dropped"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn whisper_silent_windows_are_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript_path = dir.path().join("transcript.jsonl");
+        let rate: u32 = 100;
+
+        let (release_tx, release_rx) = tokio::sync::watch::channel(true); // gate open
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stub = GatedStubTranscriber {
+            release: release_rx,
+            calls: calls.clone(),
+        };
+
+        let (tee_tx, tee_rx) =
+            bounded_audio_queue("whisper-tee", CAPTURE_QUEUE_SECONDS, rate as usize * 2);
+        let loop_path = transcript_path.clone();
+        let handle = tokio::spawn(async move {
+            whisper_inbound_loop(stub, tee_rx, rate, &loop_path).await;
+        });
+
+        // A silent window is discarded by the RMS gate; a voiced one lands.
+        tee_tx.send(voiced_window(0, rate)).expect("loop alive");
+        tee_tx.send(voiced_window(3000, rate)).expect("loop alive");
+        drop(tee_tx);
+
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("whisper loop exits")
+            .expect("whisper task");
+        drop(release_tx);
+
+        assert_eq!(transcript_texts(&transcript_path), vec!["w3000"]);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -2775,7 +3721,11 @@ mod tests {
         }
 
         // Start audio bridge (capture silence → model, model audio → playback)
-        let (audio_out_tx, audio_out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (audio_out_tx, audio_out_rx) = bounded_audio_queue(
+            "playback",
+            PLAYBACK_QUEUE_SECONDS,
+            session.sample_rate as usize * 2,
+        );
         let audio_bridge = start_audio_bridge(
             session.ws_write.clone(),
             session.provider,
@@ -3249,8 +4199,8 @@ mod tests {
     }
 
     /// Wait for the gate's ApprovalRequired and return its id, asserting the
-    /// prompt rides the approval rail with the live-audio category and an id
-    /// from the dedicated consent range.
+    /// prompt rides the approval rail with the live-audio category and a
+    /// JavaScript-safe id from the process-wide allocator.
     async fn wait_for_consent_prompt(rx: &mut tokio::sync::broadcast::Receiver<AppEvent>) -> u64 {
         loop {
             match tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -3265,10 +4215,7 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(category, crate::autonomy::ActionCategory::LiveAudioSpawn);
-                    assert!(
-                        id >= SPAWN_CONSENT_ID_BASE,
-                        "consent ids come from the dedicated range: {id}"
-                    );
+                    assert!(id <= (1_u64 << 53) - 1, "consent id is not wire-safe: {id}");
                     assert!(
                         command_preview.contains("spawn_live_audio"),
                         "{command_preview}"

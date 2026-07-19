@@ -13,7 +13,7 @@ use crate::dashboard_control::DashboardControlRegistry;
 use crate::project::ConnectConfig;
 use reqwest::{Client, RequestBuilder, Url};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -64,6 +64,8 @@ struct RegisterRequest {
     signature: String,
     hosted_control_enabled: bool,
     hosted_control_signature: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fleet_certificate_ledger: Option<crate::access::hosted_control::HostedCertificateLedger>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -386,10 +388,37 @@ fn register_nudge() -> &'static Notify {
 /// started with, so the gateway toggle can stop/restart at runtime.
 struct ClientState {
     handle: Option<JoinHandle<()>>,
+    /// Monotonic runtime-client generation. Every stop and start advances it;
+    /// task-side mutations are serialized against this value so a response
+    /// from a replaced rendezvous cannot update current authority state.
+    epoch: u64,
     dashboard_control: Option<Arc<DashboardControlRegistry>>,
+    hosted_control: Option<Arc<crate::access::hosted_control::HostedControlRuntime>>,
+    /// Last effective config supplied by boot or the live settings surface.
+    /// Kept private: daemon-signed side channels need the configured bearer
+    /// token and custom-domain registration, but neither belongs in the
+    /// dashboard status snapshot.
+    effective_config: Option<ConnectConfig>,
     /// The web gateway's TCP port — combined with the rendezvous-observed
     /// IP to advertise an ICE-TCP candidate on Connect offers.
     gateway_tcp_port: Option<u16>,
+    /// Set only after the currently enabled rendezvous has returned a
+    /// complete registration response whose fleet-zone provenance was
+    /// accepted.
+    fleet_zone_observed: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Shared lifecycle for boot-pinned relay/DNS side channels. Runtime
+    /// Connect disablement cancels their in-flight work immediately; enabling
+    /// resumes the same immutable boot generation.
+    relay_lifecycle: Option<tokio::sync::watch::Sender<bool>>,
+    /// Exact normalized rendezvous generation captured with the boot-pinned
+    /// relay. A live client may observe another service, but that observation
+    /// cannot authorize custom-name material on the boot relay.
+    relay_rendezvous_key: Option<String>,
+}
+
+struct RendezvousClientGeneration {
+    epoch: u64,
+    relay_rendezvous_key: Option<String>,
 }
 
 fn client_state() -> &'static Mutex<ClientState> {
@@ -397,38 +426,155 @@ fn client_state() -> &'static Mutex<ClientState> {
     STATE.get_or_init(|| {
         Mutex::new(ClientState {
             handle: None,
+            epoch: 0,
             dashboard_control: None,
+            hosted_control: None,
+            effective_config: None,
             gateway_tcp_port: None,
+            fleet_zone_observed: None,
+            relay_lifecycle: None,
+            relay_rendezvous_key: None,
         })
     })
+}
+
+fn client_reconfiguration_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn with_client_reconfiguration<T>(operation: impl FnOnce() -> T) -> T {
+    let _guard = client_reconfiguration_lock()
+        .lock()
+        .expect("connect client reconfiguration poisoned");
+    operation()
+}
+
+fn client_epoch_is_current(epoch: u64) -> bool {
+    client_state()
+        .lock()
+        .expect("connect client state poisoned")
+        .epoch
+        == epoch
+}
+
+fn with_current_client_epoch(epoch: u64, update: impl FnOnce()) -> bool {
+    let state = client_state()
+        .lock()
+        .expect("connect client state poisoned");
+    if state.epoch != epoch {
+        return false;
+    }
+    update();
+    true
+}
+
+fn configured_rendezvous_value(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn rendezvous_origin_key(value: Option<&str>) -> Option<String> {
+    let url = Url::parse(configured_rendezvous_value(value)?).ok()?;
+    Some(base_origin(&url))
+}
+
+fn rendezvous_endpoint_key(value: Option<&str>) -> Option<String> {
+    let mut url = Url::parse(configured_rendezvous_value(value)?).ok()?;
+    url.set_fragment(None);
+    Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn rendezvous_origin_changed(current: Option<&str>, requested: Option<&str>) -> bool {
+    match (
+        rendezvous_origin_key(current),
+        rendezvous_origin_key(requested),
+    ) {
+        (Some(current), Some(requested)) => current != requested,
+        (None, None) => {
+            configured_rendezvous_value(current) != configured_rendezvous_value(requested)
+        }
+        (Some(_), None) | (None, Some(_)) => true,
+    }
+}
+
+/// Only enablement, destination, and explicit daemon identity are live
+/// settings. The relay/custom-domain/auth fields belong to the boot-wired
+/// runtime and take effect together on restart. A boot bearer remains usable
+/// only while the live destination stays on the same normalized origin.
+fn live_reconfigured_connect_config(
+    current: Option<&ConnectConfig>,
+    requested: ConnectConfig,
+) -> ConnectConfig {
+    let Some(current) = current else {
+        return requested;
+    };
+    let mut effective = current.clone();
+    effective.enabled = requested.enabled;
+    if rendezvous_origin_changed(
+        current.rendezvous_url.as_deref(),
+        requested.rendezvous_url.as_deref(),
+    ) {
+        effective.auth_token = None;
+    }
+    effective.rendezvous_url = requested.rendezvous_url;
+    effective.daemon_id = requested.daemon_id;
+    effective
 }
 
 pub fn spawn_connect_rendezvous_client(
     config: ConnectConfig,
     dashboard_control: Arc<DashboardControlRegistry>,
     gateway_tcp_port: Option<u16>,
+    hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
+    fleet_zone_observed: Arc<std::sync::atomic::AtomicBool>,
+    relay_lifecycle: tokio::sync::watch::Sender<bool>,
 ) {
-    {
-        let mut state = client_state()
-            .lock()
-            .expect("connect client state poisoned");
-        state.dashboard_control = Some(dashboard_control.clone());
-        state.gateway_tcp_port = gateway_tcp_port;
-    }
-    start_client(config, dashboard_control, gateway_tcp_port);
+    with_client_reconfiguration(|| {
+        let relay_rendezvous_key = rendezvous_endpoint_key(config.rendezvous_url.as_deref());
+        {
+            let mut state = client_state()
+                .lock()
+                .expect("connect client state poisoned");
+            state.dashboard_control = Some(dashboard_control.clone());
+            state.hosted_control = Some(Arc::clone(&hosted_control));
+            state.gateway_tcp_port = gateway_tcp_port;
+            state.fleet_zone_observed = Some(Arc::clone(&fleet_zone_observed));
+            state.relay_lifecycle = Some(relay_lifecycle);
+            state.relay_rendezvous_key = relay_rendezvous_key;
+        }
+        start_client(
+            config,
+            dashboard_control,
+            gateway_tcp_port,
+            hosted_control,
+            fleet_zone_observed,
+        );
+    });
 }
 
 /// Stop the running client task, if any. All of the task's awaits are
 /// cancellation-safe HTTP calls, so an abort leaves no local state
 /// half-written.
 pub(crate) fn stop_client() {
-    let handle = client_state()
-        .lock()
-        .expect("connect client state poisoned")
-        .handle
-        .take();
+    let (handle, fleet_zone_observed, relay_lifecycle) = {
+        let mut state = client_state()
+            .lock()
+            .expect("connect client state poisoned");
+        state.epoch = state.epoch.wrapping_add(1);
+        (
+            state.handle.take(),
+            state.fleet_zone_observed.clone(),
+            state.relay_lifecycle.clone(),
+        )
+    };
     if let Some(handle) = handle {
         handle.abort();
+    }
+    if let Some(observed) = fleet_zone_observed {
+        observed.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    if let Some(lifecycle) = relay_lifecycle {
+        lifecycle.send_replace(false);
     }
     with_status(|status| {
         status.running = false;
@@ -443,8 +589,29 @@ pub(crate) fn stop_client() {
 /// provided the dashboard-control registry (the gateway calling this
 /// implies it already exists).
 pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
+    with_client_reconfiguration(|| apply_config_locked(config))
+}
+
+fn apply_config_locked(config: ConnectConfig) -> Result<bool, String> {
+    let config = {
+        let state = client_state()
+            .lock()
+            .expect("connect client state poisoned");
+        live_reconfigured_connect_config(state.effective_config.as_ref(), config)
+    };
+    crate::credential_leases::configure_dns_credential_child_scrub(&config.custom_domain);
     stop_client();
     if !config.enabled {
+        let fleet_zone_observed = {
+            let mut state = client_state()
+                .lock()
+                .expect("connect client state poisoned");
+            state.effective_config = Some(config.clone());
+            state.fleet_zone_observed.clone()
+        };
+        if let Some(observed) = fleet_zone_observed {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         with_status(|status| {
             status.configured = false;
             status.env_forced = ConnectConfig::env_forced();
@@ -453,17 +620,36 @@ pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
             status.claim_code_expires_unix_ms = None;
             status.last_error = None;
         });
+        crate::hosted_verify::note_connect_config(false, None);
         return Ok(false);
     }
-    let (dashboard_control, gateway_tcp_port) = {
+    let (dashboard_control, gateway_tcp_port, hosted_control, fleet_zone_observed) = {
         let state = client_state()
             .lock()
             .expect("connect client state poisoned");
-        (state.dashboard_control.clone(), state.gateway_tcp_port)
+        (
+            state.dashboard_control.clone(),
+            state.gateway_tcp_port,
+            state.hosted_control.clone(),
+            state.fleet_zone_observed.clone(),
+        )
     };
     let dashboard_control = dashboard_control
         .ok_or_else(|| "connect client cannot start before the web gateway".to_string())?;
-    start_client(config, dashboard_control, gateway_tcp_port);
+    let hosted_control = hosted_control.ok_or_else(|| {
+        "connect client cannot start before hosted control is initialized".to_string()
+    })?;
+    let fleet_zone_observed = fleet_zone_observed.ok_or_else(|| {
+        "connect client cannot start before fleet-zone observation is initialized".to_string()
+    })?;
+    start_client(
+        config,
+        dashboard_control,
+        gateway_tcp_port,
+        hosted_control,
+        fleet_zone_observed,
+    );
+    crate::hosted_verify::spawn_check_now();
     Ok(client_state()
         .lock()
         .expect("connect client state poisoned")
@@ -477,7 +663,22 @@ fn start_client(
     config: ConnectConfig,
     dashboard_control: Arc<DashboardControlRegistry>,
     gateway_tcp_port: Option<u16>,
+    hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
+    fleet_zone_observed: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    crate::credential_leases::configure_dns_credential_child_scrub(&config.custom_domain);
+    let generation = {
+        let mut state = client_state()
+            .lock()
+            .expect("connect client state poisoned");
+        state.epoch = state.epoch.wrapping_add(1);
+        state.effective_config = Some(config.clone());
+        RendezvousClientGeneration {
+            epoch: state.epoch,
+            relay_rendezvous_key: state.relay_rendezvous_key.clone(),
+        }
+    };
+    let epoch = generation.epoch;
     with_status(|status| {
         status.configured = config.enabled;
         status.env_forced = ConnectConfig::env_forced();
@@ -485,6 +686,16 @@ fn start_client(
         status.daemon_id = config.daemon_id.clone();
         status.signed_claim = load_signed_claim_record();
     });
+    crate::hosted_verify::note_connect_config(config.enabled, config.rendezvous_url.as_deref());
+    fleet_zone_observed.store(!config.enabled, std::sync::atomic::Ordering::SeqCst);
+    if let Some(lifecycle) = client_state()
+        .lock()
+        .expect("connect client state poisoned")
+        .relay_lifecycle
+        .clone()
+    {
+        lifecycle.send_replace(config.enabled);
+    }
     if !config.enabled {
         // One line per gateway spawn: a daemon that silently never
         // registers is indistinguishable from a broken rendezvous — say
@@ -526,18 +737,44 @@ fn start_client(
         }
     };
     let handle = tokio::spawn(async move {
-        run_connect_rendezvous_client(config, base_url, dashboard_control, gateway_tcp_port).await;
+        run_connect_rendezvous_client(
+            config,
+            base_url,
+            dashboard_control,
+            gateway_tcp_port,
+            hosted_control,
+            fleet_zone_observed,
+            generation,
+        )
+        .await;
         // Natural exit (identity or HTTP-client construction failure) —
         // an abort via `stop_client` never reaches this line, but that
         // path flips the flag itself.
-        with_status(|status| {
-            status.running = false;
+        with_current_client_epoch(epoch, || {
+            with_status(|status| {
+                status.running = false;
+            });
         });
     });
-    client_state()
-        .lock()
-        .expect("connect client state poisoned")
-        .handle = Some(handle);
+    let mut handle = Some(handle);
+    let replaced = {
+        let mut state = client_state()
+            .lock()
+            .expect("connect client state poisoned");
+        if state.epoch == epoch {
+            state
+                .handle
+                .replace(handle.take().expect("fresh connect client handle"))
+        } else {
+            None
+        }
+    };
+    if let Some(stale) = replaced {
+        stale.abort();
+    }
+    if let Some(stale) = handle {
+        stale.abort();
+    }
 }
 
 async fn run_connect_rendezvous_client(
@@ -545,13 +782,20 @@ async fn run_connect_rendezvous_client(
     base_url: Url,
     dashboard_control: Arc<DashboardControlRegistry>,
     gateway_tcp_port: Option<u16>,
+    hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
+    fleet_zone_observed: Arc<std::sync::atomic::AtomicBool>,
+    generation: RendezvousClientGeneration,
 ) {
+    let epoch = generation.epoch;
+    let relay_rendezvous_key = generation.relay_rendezvous_key;
     let identity = match DaemonIdentity::load_or_create_default() {
         Ok(identity) => identity,
         Err(e) => {
             eprintln!("[connect] daemon identity unavailable: {e}");
-            with_status(|status| {
-                status.last_error = Some(format!("daemon identity unavailable: {e}"));
+            with_current_client_epoch(epoch, || {
+                with_status(|status| {
+                    status.last_error = Some(format!("daemon identity unavailable: {e}"));
+                });
             });
             return;
         }
@@ -573,22 +817,41 @@ async fn run_connect_rendezvous_client(
         Ok(client) => client,
         Err(e) => {
             eprintln!("[connect] failed to build HTTP client: {e}");
-            with_status(|status| {
-                status.last_error = Some(format!("failed to build HTTP client: {e}"));
+            with_current_client_epoch(epoch, || {
+                with_status(|status| {
+                    status.last_error = Some(format!("failed to build HTTP client: {e}"));
+                });
             });
             return;
         }
     };
     let retry_delay = Duration::from_millis(config.retry_delay_ms.max(100));
     eprintln!("[connect] rendezvous client enabled for daemon {daemon_id}");
-    with_status(|status| {
-        status.running = true;
-        status.daemon_id = Some(daemon_id.clone());
+    with_current_client_epoch(epoch, || {
+        with_status(|status| {
+            status.running = true;
+            status.daemon_id = Some(daemon_id.clone());
+        });
     });
 
     loop {
-        match register(&client, &base_url, &config, &daemon_id, &identity).await {
-            Ok(response) => note_register_response(&response, &base_url),
+        match register(
+            &client,
+            &base_url,
+            &config,
+            &daemon_id,
+            &identity,
+            &hosted_control,
+        )
+        .await
+        {
+            Ok(response) => note_register_response(
+                &response,
+                &base_url,
+                &fleet_zone_observed,
+                relay_rendezvous_key.as_deref(),
+                epoch,
+            ),
             Err(RegisterError::Rejected(e)) => {
                 eprintln!(
                     "[connect] register rejected: {e} — the rendezvous refused this daemon \
@@ -596,13 +859,13 @@ async fn run_connect_rendezvous_client(
                      registration); retrying every {}s",
                     REGISTER_REJECTED_RETRY.as_secs()
                 );
-                note_register_error(&e);
+                note_register_error(&e, &fleet_zone_observed, epoch);
                 tokio::time::sleep(REGISTER_REJECTED_RETRY).await;
                 continue;
             }
             Err(RegisterError::Transient(e)) => {
                 eprintln!("[connect] register failed: {e}");
-                note_register_error(&e);
+                note_register_error(&e, &fleet_zone_observed, epoch);
                 tokio::time::sleep(retry_delay).await;
                 continue;
             }
@@ -618,6 +881,9 @@ async fn run_connect_rendezvous_client(
                 result = poll_next(&client, &base_url, &config, &daemon_id) => {
                     match result {
                         Ok(Some(event)) => {
+                            if !client_epoch_is_current(epoch) {
+                                return;
+                            }
                             handle_event(
                                 &client,
                                 &base_url,
@@ -627,6 +893,7 @@ async fn run_connect_rendezvous_client(
                                 &dashboard_control,
                                 gateway_tcp_port,
                                 event,
+                                epoch,
                             )
                             .await;
                             // Fall through to the refresh check below: a
@@ -642,8 +909,10 @@ async fn run_connect_rendezvous_client(
                         }
                         Err(e) => {
                             eprintln!("[connect] poll failed: {e}");
-                            with_status(|status| {
-                                status.last_error = Some(format!("poll failed: {e}"));
+                            with_current_client_epoch(epoch, || {
+                                with_status(|status| {
+                                    status.last_error = Some(format!("poll failed: {e}"));
+                                });
                             });
                             tokio::time::sleep(retry_delay).await;
                             break;
@@ -653,9 +922,24 @@ async fn run_connect_rendezvous_client(
                 _ = register_nudge().notified() => true,
             };
             if force_register || last_register.elapsed() >= REGISTER_REFRESH_INTERVAL {
-                match register(&client, &base_url, &config, &daemon_id, &identity).await {
+                match register(
+                    &client,
+                    &base_url,
+                    &config,
+                    &daemon_id,
+                    &identity,
+                    &hosted_control,
+                )
+                .await
+                {
                     Ok(response) => {
-                        note_register_response(&response, &base_url);
+                        note_register_response(
+                            &response,
+                            &base_url,
+                            &fleet_zone_observed,
+                            relay_rendezvous_key.as_deref(),
+                            epoch,
+                        );
                         last_register = Instant::now();
                     }
                     Err(RegisterError::Rejected(e)) => {
@@ -664,13 +948,13 @@ async fn run_connect_rendezvous_client(
                              every {}s",
                             REGISTER_REJECTED_RETRY.as_secs()
                         );
-                        note_register_error(&e);
+                        note_register_error(&e, &fleet_zone_observed, epoch);
                         tokio::time::sleep(REGISTER_REJECTED_RETRY).await;
                         break;
                     }
                     Err(RegisterError::Transient(e)) => {
                         eprintln!("[connect] refresh register failed: {e}");
-                        note_register_error(&e);
+                        note_register_error(&e, &fleet_zone_observed, epoch);
                         tokio::time::sleep(retry_delay).await;
                         break;
                     }
@@ -680,11 +964,28 @@ async fn run_connect_rendezvous_client(
     }
 }
 
-fn note_register_error(error: &str) {
-    with_status(|status| {
-        status.registered = false;
-        status.last_error = Some(error.to_string());
+fn note_register_error(
+    error: &str,
+    fleet_zone_observed: &std::sync::atomic::AtomicBool,
+    epoch: u64,
+) {
+    with_current_client_epoch(epoch, || {
+        note_current_register_error(error, fleet_zone_observed);
     });
+}
+
+fn note_current_register_error(error: &str, fleet_zone_observed: &std::sync::atomic::AtomicBool) {
+    close_fleet_zone_observation(fleet_zone_observed);
+    with_status(|status| fold_register_error_status(status, error));
+}
+
+fn close_fleet_zone_observation(fleet_zone_observed: &std::sync::atomic::AtomicBool) {
+    fleet_zone_observed.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn fold_register_error_status(status: &mut ConnectStatus, error: &str) {
+    status.registered = false;
+    status.last_error = Some(error.to_string());
 }
 
 /// Fold a register response into the status snapshot, cross-checking the
@@ -692,109 +993,167 @@ fn note_register_error(error: &str) {
 /// and print the claim line when the code actually changed (the old
 /// every-60s repeat was log noise; the current code is always visible in
 /// the Access card).
-fn note_register_response(response: &RegisterResponse, base_url: &Url) {
+fn note_register_response(
+    response: &RegisterResponse,
+    base_url: &Url,
+    fleet_zone_observed: &std::sync::atomic::AtomicBool,
+    relay_rendezvous_key: Option<&str>,
+    epoch: u64,
+) {
+    with_current_client_epoch(epoch, || {
+        note_current_register_response_for_relay(
+            response,
+            base_url,
+            fleet_zone_observed,
+            relay_rendezvous_key,
+        );
+    });
+}
+
+fn registration_matches_relay_endpoint(base_url: &Url, relay_rendezvous_key: Option<&str>) -> bool {
+    relay_rendezvous_key.is_some_and(|expected| {
+        rendezvous_endpoint_key(Some(base_url.as_str())).as_deref() == Some(expected)
+    })
+}
+
+fn note_fleet_zone_observation(
+    response: &RegisterResponse,
+    base_url: &Url,
+    fleet_zone_observed: &std::sync::atomic::AtomicBool,
+    relay_rendezvous_key: Option<&str>,
+) {
+    // Fleet DNS: hand the name to the certificate machinery (it installs
+    // any stored certificate the first time the name is learned).
+    let provenance_accepted = match response.fleet_dns.as_ref() {
+        Some(hint) => {
+            crate::fleet_cert::note_fleet_dns(Some(hint.zone.clone()), Some(hint.name.clone()))
+        }
+        None => crate::fleet_cert::note_fleet_dns(None, None),
+    };
+    fleet_zone_observed.store(
+        provenance_accepted && registration_matches_relay_endpoint(base_url, relay_rendezvous_key),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+fn fold_register_response_status(
+    status: &mut ConnectStatus,
+    response: &RegisterResponse,
+    base_url: &Url,
+    now: i64,
+    local_code: Option<String>,
+) -> (Option<String>, Option<(String, String)>) {
+    let mut print_claim = None;
+    let mut claim_mismatch = None;
+    status.registered = true;
+    status.last_register_unix_ms = Some(now);
+    status.last_error = None;
+    status.observed_ip = response.observed_ip.clone();
+    status.claimed = Some(response.claimed);
+    if response.claimed {
+        status.claimed_by_user_id = response.claimed_by_user_id.clone();
+        status.claimed_by_handle = response.claimed_by_handle.clone();
+        status.claim_code = None;
+        status.claim_url = None;
+        status.claim_code_expires_unix_ms = None;
+        status.claim_binding = Some(match (&status.signed_claim, &response.claimed_by_user_id) {
+            (Some(record), Some(asserted)) if record.account_user_id == *asserted => {
+                ClaimBinding::DaemonSigned
+            }
+            (Some(_), Some(_)) => ClaimBinding::Mismatch,
+            // An older service asserts no linked account id — nothing to
+            // cross-check against, even with a local record.
+            (Some(_), None) | (None, _) => ClaimBinding::ServiceAsserted,
+        });
+        if status.claim_binding == Some(ClaimBinding::Mismatch) {
+            claim_mismatch = Some((
+                response
+                    .claimed_by_user_id
+                    .clone()
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+                status
+                    .signed_claim
+                    .as_ref()
+                    .map(|record| record.account_user_id.clone())
+                    .unwrap_or_else(|| "<none>".to_string()),
+            ));
+        }
+    } else {
+        status.claimed_by_user_id = None;
+        status.claimed_by_handle = None;
+        status.claim_binding = None;
+        // New services retain only the daemon-minted hash and return
+        // null plaintext fields. Older services ignore that hash, mint
+        // their own plaintext code, and return the code/URL pair that
+        // they can actually redeem. Treat any legacy fields as a
+        // coherent pair; mixing their URL or code with the local phrase
+        // would display an unclaimable credential during a rolling
+        // service upgrade.
+        let (effective_code, effective_url) =
+            if response.claim_code.is_some() || response.claim_url.is_some() {
+                (response.claim_code.clone(), response.claim_url.clone())
+            } else {
+                let local_url = local_code
+                    .as_deref()
+                    .map(|code| route_claim_url(base_url, code));
+                (local_code, local_url)
+            };
+        if status.claim_code != effective_code {
+            print_claim = match (&effective_url, &effective_code) {
+                (Some(url), _) if !url.is_empty() => Some(format!(
+                    "one-time claim code: link this daemon at {url}. Linking changes no \
+                         IAM and grants no access"
+                )),
+                (_, Some(code)) if !code.is_empty() => Some(format!(
+                    "one-time claim code {code}. Linking changes no IAM and grants no access"
+                )),
+                _ => None,
+            };
+        }
+        status.claim_code = effective_code;
+        status.claim_url = effective_url;
+        status.claim_code_expires_unix_ms = response.claim_code_expires_unix_ms;
+    }
+    (print_claim, claim_mismatch)
+}
+
+fn note_current_register_response_for_relay(
+    response: &RegisterResponse,
+    base_url: &Url,
+    fleet_zone_observed: &std::sync::atomic::AtomicBool,
+    relay_rendezvous_key: Option<&str>,
+) {
     let now = crate::access::client_key::now_unix_ms();
-    let mut print_claim: Option<String> = None;
     let daemon_session_token = response.daemon_session_token.clone().filter(|_| {
         response
             .daemon_session_expires_unix_ms
             .is_none_or(|expires| expires > now.max(0) as u64)
     });
     set_daemon_session(daemon_session_token);
-    if response.claimed {
+    let local_code = if response.claimed {
         clear_route_claim_code();
-    }
-    // Fleet DNS: hand the name to the certificate machinery (it installs
-    // any stored certificate the first time the name is learned).
-    crate::fleet_cert::note_fleet_dns(
-        response
-            .fleet_dns
-            .as_ref()
-            .map(|hint| hint.zone.clone())
-            .filter(|zone| !zone.is_empty()),
-        response
-            .fleet_dns
-            .as_ref()
-            .map(|hint| hint.name.clone())
-            .filter(|name| !name.is_empty()),
+        None
+    } else {
+        peek_route_claim_code()
+    };
+    note_fleet_zone_observation(
+        response,
+        base_url,
+        fleet_zone_observed,
+        relay_rendezvous_key,
     );
+    let mut fold = (None, None);
     with_status(|status| {
-        status.registered = true;
-        status.last_register_unix_ms = Some(now);
-        status.last_error = None;
-        status.observed_ip = response.observed_ip.clone();
-        status.claimed = Some(response.claimed);
-        if response.claimed {
-            status.claimed_by_user_id = response.claimed_by_user_id.clone();
-            status.claimed_by_handle = response.claimed_by_handle.clone();
-            status.claim_code = None;
-            status.claim_url = None;
-            status.claim_code_expires_unix_ms = None;
-            status.claim_binding =
-                Some(match (&status.signed_claim, &response.claimed_by_user_id) {
-                    (Some(record), Some(asserted)) if record.account_user_id == *asserted => {
-                        ClaimBinding::DaemonSigned
-                    }
-                    (Some(_), Some(_)) => ClaimBinding::Mismatch,
-                    // An older service asserts no linked account id — nothing to
-                    // cross-check against, even with a local record.
-                    (Some(_), None) | (None, _) => ClaimBinding::ServiceAsserted,
-                });
-            if status.claim_binding == Some(ClaimBinding::Mismatch) {
-                eprintln!(
-                    "[connect] WARNING: the rendezvous asserts this daemon is claimed by \
-                     account {} but this daemon co-signed a claim by account {} — a re-bind \
-                     this daemon never acknowledged",
-                    response
-                        .claimed_by_user_id
-                        .as_deref()
-                        .unwrap_or("<unknown>"),
-                    status
-                        .signed_claim
-                        .as_ref()
-                        .map(|record| record.account_user_id.as_str())
-                        .unwrap_or("<none>"),
-                );
-            }
-        } else {
-            status.claimed_by_user_id = None;
-            status.claimed_by_handle = None;
-            status.claim_binding = None;
-            // New services retain only the daemon-minted hash and return
-            // null plaintext fields. Older services ignore that hash, mint
-            // their own plaintext code, and return the code/URL pair that
-            // they can actually redeem. Treat any legacy fields as a
-            // coherent pair; mixing their URL or code with the local phrase
-            // would display an unclaimable credential during a rolling
-            // service upgrade.
-            let local_code = peek_route_claim_code();
-            let (effective_code, effective_url) =
-                if response.claim_code.is_some() || response.claim_url.is_some() {
-                    (response.claim_code.clone(), response.claim_url.clone())
-                } else {
-                    let local_url = local_code
-                        .as_deref()
-                        .map(|code| route_claim_url(base_url, code));
-                    (local_code, local_url)
-                };
-            if status.claim_code != effective_code {
-                print_claim = match (&effective_url, &effective_code) {
-                    (Some(url), _) if !url.is_empty() => Some(format!(
-                        "one-time claim code: link this daemon at {url}. Linking changes no \
-                             IAM and grants no access"
-                    )),
-                    (_, Some(code)) if !code.is_empty() => Some(format!(
-                        "one-time claim code {code}. Linking changes no IAM and grants no access"
-                    )),
-                    _ => None,
-                };
-            }
-            status.claim_code = effective_code;
-            status.claim_url = effective_url;
-            status.claim_code_expires_unix_ms = response.claim_code_expires_unix_ms;
-        }
+        fold = fold_register_response_status(status, response, base_url, now, local_code);
     });
-    if let Some(line) = print_claim {
+    if let Some((asserted, signed)) = fold.1 {
+        eprintln!(
+            "[connect] WARNING: the rendezvous asserts this daemon is claimed by \
+             account {asserted} but this daemon co-signed a claim by account {signed} — a \
+             re-bind this daemon never acknowledged"
+        );
+    }
+    if let Some(line) = fold.0 {
         eprintln!("[connect] {line}");
     }
 }
@@ -847,6 +1206,7 @@ async fn register(
     config: &ConnectConfig,
     daemon_id: &str,
     identity: &DaemonIdentity,
+    hosted_control: &crate::access::hosted_control::HostedControlRuntime,
 ) -> Result<RegisterResponse, RegisterError> {
     let daemon_public_key = identity.public_key_b64u();
     let claim_code = current_route_claim_code().map_err(RegisterError::Transient)?;
@@ -865,6 +1225,13 @@ async fn register(
         issued_at_unix_ms,
         config.hosted_control_enabled,
     );
+    let fleet_certificate_ledger = if config.hosted_control_enabled {
+        hosted_control.certificate_ledger().ok().filter(|ledger| {
+            ledger.daemon_id == daemon_id && ledger.daemon_public_key == daemon_public_key
+        })
+    } else {
+        None
+    };
     let request = RegisterRequest {
         protocol: "intendant-connect-rendezvous-v1",
         daemon_id: daemon_id.to_string(),
@@ -874,6 +1241,7 @@ async fn register(
         signature: identity.sign_b64u(payload.as_bytes()),
         hosted_control_enabled: config.hosted_control_enabled,
         hosted_control_signature: identity.sign_b64u(hosted_control_payload.as_bytes()),
+        fleet_certificate_ledger,
     };
     authenticated(
         config,
@@ -937,6 +1305,7 @@ async fn handle_event(
     _dashboard_control: &Arc<DashboardControlRegistry>,
     _gateway_tcp_port: Option<u16>,
     event: RendezvousEvent,
+    epoch: u64,
 ) {
     // Defense in depth for mixed-version and self-hosted deployments: the
     // current service never enqueues these events, but an older service can.
@@ -1040,51 +1409,53 @@ async fn handle_event(
                     .map_err(|e| e.to_string())
             }) {
                 Ok(()) => {
-                    // 2xx means the service verified the proof and bound
-                    // the claim — this is the moment the daemon's own
-                    // acknowledgment becomes durable truth.
-                    if let Some(user_id) = account_user_id {
-                        let record = SignedClaimRecord {
-                            claim_id: claim_id.to_string(),
-                            daemon_id: daemon_id.to_string(),
-                            rendezvous: base_origin(base_url),
-                            account_user_id: user_id,
-                            account_name: account_name.clone(),
-                            protocol: protocol.to_string(),
-                            signed_at_unix_ms: crate::access::client_key::now_unix_ms(),
-                        };
-                        store_signed_claim_record(&record);
-                        eprintln!(
-                            "[connect] route link acknowledged for {} — no IAM authority changed",
-                            if record.account_name.is_empty() {
-                                record.account_user_id.clone()
-                            } else {
-                                format!("@{}", record.account_name)
-                            }
-                        );
-                        with_status(|status| {
-                            status.claimed = Some(true);
-                            status.claimed_by_user_id = Some(record.account_user_id.clone());
-                            status.claimed_by_handle = if record.account_name.is_empty() {
-                                None
-                            } else {
-                                Some(record.account_name.clone())
+                    with_current_client_epoch(epoch, || {
+                        // 2xx means the current service verified the proof
+                        // and bound the claim — this is the moment the
+                        // daemon's own acknowledgment becomes durable truth.
+                        if let Some(user_id) = account_user_id {
+                            let record = SignedClaimRecord {
+                                claim_id: claim_id.to_string(),
+                                daemon_id: daemon_id.to_string(),
+                                rendezvous: base_origin(base_url),
+                                account_user_id: user_id,
+                                account_name: account_name.clone(),
+                                protocol: protocol.to_string(),
+                                signed_at_unix_ms: crate::access::client_key::now_unix_ms(),
                             };
-                            status.claim_binding = Some(ClaimBinding::DaemonSigned);
-                            status.claim_code = None;
-                            status.claim_url = None;
-                            status.claim_code_expires_unix_ms = None;
-                            status.signed_claim = Some(record);
-                        });
-                    } else {
-                        with_status(|status| {
-                            status.claimed = Some(true);
-                            status.claim_binding = Some(ClaimBinding::ServiceAsserted);
-                            status.claim_code = None;
-                            status.claim_url = None;
-                            status.claim_code_expires_unix_ms = None;
-                        });
-                    }
+                            store_signed_claim_record(&record);
+                            eprintln!(
+                                "[connect] route link acknowledged for {} — no IAM authority changed",
+                                if record.account_name.is_empty() {
+                                    record.account_user_id.clone()
+                                } else {
+                                    format!("@{}", record.account_name)
+                                }
+                            );
+                            with_status(|status| {
+                                status.claimed = Some(true);
+                                status.claimed_by_user_id = Some(record.account_user_id.clone());
+                                status.claimed_by_handle = if record.account_name.is_empty() {
+                                    None
+                                } else {
+                                    Some(record.account_name.clone())
+                                };
+                                status.claim_binding = Some(ClaimBinding::DaemonSigned);
+                                status.claim_code = None;
+                                status.claim_url = None;
+                                status.claim_code_expires_unix_ms = None;
+                                status.signed_claim = Some(record);
+                            });
+                        } else {
+                            with_status(|status| {
+                                status.claimed = Some(true);
+                                status.claim_binding = Some(ClaimBinding::ServiceAsserted);
+                                status.claim_code = None;
+                                status.claim_url = None;
+                                status.claim_code_expires_unix_ms = None;
+                            });
+                        }
+                    });
                 }
                 Err(e) => eprintln!("[connect] post claim proof failed: {e}"),
             }
@@ -1353,13 +1724,85 @@ same resolution + signing discipline as request_unclaim. */
 
 const DNS_PUBLISH_PROTOCOL: &str = "intendant-connect-dns-publish-v1";
 const DNS_ACME_PROTOCOL: &str = "intendant-connect-dns-acme-v1";
+const DNS_MUTATION_CLOCK_FILE: &str = "connect-dns-mutation-clock.json";
+const DNS_MUTATION_CLOCK_SCHEMA_VERSION: u32 = 1;
+const DNS_MUTATION_CLOCK_MAX_BYTES: u64 = 4096;
 /// Relay-mode DNS publish: "answer my fleet label with the relay's address"
 /// (mirrors `bin/connect/relay.rs`; same signing discipline as the fleet-DNS
 /// publishes).
 pub(crate) const DNS_RELAY_PROTOCOL: &str = "intendant-connect-dns-relay-v1";
 /// Persistent relay control-channel long-poll protocol (mirrors
 /// `bin/connect/relay.rs`).
-pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v1";
+pub(crate) const RELAY_CONTROL_PROTOCOL_V1: &str = "intendant-connect-relay-control-v1";
+pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v2";
+pub(crate) const RELAY_DISCONNECT_PROTOCOL: &str = "intendant-connect-relay-disconnect-v1";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DnsMutationClock {
+    schema_version: u32,
+    last_issued_at_unix_ms: u64,
+}
+
+/// Allocate the timestamp shared by direct and relay DNS mutations under the
+/// daemon's cross-process authority lock. The signed timestamp doubles as the
+/// service's durable per-daemon mutation generation, so clock rollback,
+/// process restart, and sibling processes cannot issue an older local intent.
+fn next_dns_mutation_unix_ms_in(cert_dir: &Path, now_unix_ms: u64) -> Result<u64, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let path = cert_dir.join(DNS_MUTATION_CLOCK_FILE);
+        let previous = match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > DNS_MUTATION_CLOCK_MAX_BYTES => {
+                return Err(crate::access::AccessError(format!(
+                    "{} exceeds the {}-byte DNS mutation clock cap",
+                    path.display(),
+                    DNS_MUTATION_CLOCK_MAX_BYTES
+                )));
+            }
+            Ok(_) => {
+                let bytes = std::fs::read(&path).map_err(|error| {
+                    crate::access::AccessError(format!("read {}: {error}", path.display()))
+                })?;
+                let clock: DnsMutationClock = serde_json::from_slice(&bytes).map_err(|error| {
+                    crate::access::AccessError(format!("parse {}: {error}", path.display()))
+                })?;
+                if clock.schema_version != DNS_MUTATION_CLOCK_SCHEMA_VERSION {
+                    return Err(crate::access::AccessError(format!(
+                        "{} has unsupported schema version {}",
+                        path.display(),
+                        clock.schema_version
+                    )));
+                }
+                Some(clock.last_issued_at_unix_ms)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(crate::access::AccessError(format!(
+                    "inspect {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let issued_at_unix_ms = match previous {
+            Some(previous) => now_unix_ms.max(previous.checked_add(1).ok_or_else(|| {
+                crate::access::AccessError(
+                    "DNS mutation clock reached its numeric limit".to_string(),
+                )
+            })?),
+            None => now_unix_ms,
+        };
+        let body = serde_json::to_vec(&DnsMutationClock {
+            schema_version: DNS_MUTATION_CLOCK_SCHEMA_VERSION,
+            last_issued_at_unix_ms: issued_at_unix_ms,
+        })
+        .map_err(|error| {
+            crate::access::AccessError(format!("serialize DNS mutation clock: {error}"))
+        })?;
+        crate::access::authority_store::atomic_write_private_locked(&path, &body)?;
+        Ok(issued_at_unix_ms)
+    })
+    .map_err(|error| error.to_string())
+}
 
 #[cfg(test)] // golden-test twin of the payload `dns_signed_post` builds inline
 fn dns_publish_signing_payload(
@@ -1390,13 +1833,23 @@ fn dns_acme_signing_payload(
 /// URL, identity, and the effective daemon id.
 pub(crate) fn signed_daemon_context() -> Result<(ConnectConfig, Url, DaemonIdentity, String), String>
 {
-    let mut config = crate::project::ConnectConfig::default().effective_with_env();
-    if config.rendezvous_url.is_none() {
-        config.rendezvous_url = status_snapshot().rendezvous_url;
-    }
-    if config.daemon_id.is_none() {
-        config.daemon_id = status_snapshot().daemon_id;
-    }
+    let stored = client_state()
+        .lock()
+        .expect("connect client state poisoned")
+        .effective_config
+        .clone();
+    let status = status_snapshot();
+    let config = signed_daemon_config(stored, &status);
+    signed_daemon_context_for_config(config)
+}
+
+/// Resolve a daemon-signed request context from one immutable configuration
+/// generation. Long-lived side channels use this instead of the live client
+/// snapshot so their control URL, identity, credentials, and data endpoint
+/// cannot straddle two runtime configurations.
+pub(crate) fn signed_daemon_context_for_config(
+    config: ConnectConfig,
+) -> Result<(ConnectConfig, Url, DaemonIdentity, String), String> {
     let base_url = config
         .rendezvous_url
         .as_deref()
@@ -1415,15 +1868,74 @@ pub(crate) fn signed_daemon_context() -> Result<(ConnectConfig, Url, DaemonIdent
     Ok((config, base_url, identity, daemon_id))
 }
 
+fn signed_daemon_config(stored: Option<ConnectConfig>, status: &ConnectStatus) -> ConnectConfig {
+    let mut config =
+        stored.unwrap_or_else(|| crate::project::ConnectConfig::default().effective_with_env());
+    // URL and daemon id are the two settings that can change live. Preserve
+    // every other startup field while following the running client's current
+    // destination and identity. A bearer is scoped to its configured origin;
+    // custom-domain wiring remains boot-pinned.
+    if status.rendezvous_url.is_some() {
+        if rendezvous_origin_changed(
+            config.rendezvous_url.as_deref(),
+            status.rendezvous_url.as_deref(),
+        ) {
+            config.auth_token = None;
+        }
+        config.rendezvous_url.clone_from(&status.rendezvous_url);
+    }
+    if status.daemon_id.is_some() {
+        config.daemon_id.clone_from(&status.daemon_id);
+    }
+    config
+}
+
+/// Exact environment fallback belonging to the currently active, validated
+/// custom-domain configuration. The name is authority metadata, never the
+/// credential value.
+pub(crate) fn active_custom_domain_dns_fallback() -> Option<(&'static str, String)> {
+    let config = client_state()
+        .lock()
+        .expect("connect client state poisoned")
+        .effective_config
+        .clone()?;
+    config
+        .custom_domain
+        .validated_dns_credential_fallback()
+        .ok()
+        .flatten()
+}
+
 async fn dns_signed_post(
     path: &str,
     protocol: &str,
     payload_tail: &str,
     extra: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let (config, base_url, identity, daemon_id) = signed_daemon_context()?;
+    dns_signed_post_with_context(
+        signed_daemon_context()?,
+        path,
+        protocol,
+        payload_tail,
+        extra,
+    )
+    .await
+}
+
+async fn dns_signed_post_with_context(
+    (config, base_url, identity, daemon_id): (ConnectConfig, Url, DaemonIdentity, String),
+    path: &str,
+    protocol: &str,
+    payload_tail: &str,
+    extra: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let daemon_public_key = identity.public_key_b64u();
-    let issued_at_unix_ms = crate::access::client_key::now_unix_ms().max(0) as u64;
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let now_unix_ms = crate::access::client_key::now_unix_ms().max(0) as u64;
+    let issued_at_unix_ms =
+        tokio::task::spawn_blocking(move || next_dns_mutation_unix_ms_in(&cert_dir, now_unix_ms))
+            .await
+            .map_err(|error| format!("DNS mutation clock worker failed: {error}"))??;
     let payload = format!(
         "{protocol}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{payload_tail}\n"
     );
@@ -1459,8 +1971,28 @@ async fn dns_signed_post(
 /// Publish this daemon's A/AAAA addresses for its fleet name. Returns
 /// the address list the service accepted.
 pub(crate) async fn dns_publish_addresses(addresses: &[String]) -> Result<Vec<String>, String> {
+    dns_publish_addresses_with_context(signed_daemon_context()?, addresses).await
+}
+
+/// Publish direct fleet-DNS addresses against one immutable rendezvous
+/// generation. Long-lived side channels use this when leaving relay mode so
+/// the withdrawal and direct replacement cannot straddle a live config
+/// change.
+pub(crate) async fn dns_publish_addresses_for_config(
+    config: &ConnectConfig,
+    addresses: &[String],
+) -> Result<Vec<String>, String> {
+    dns_publish_addresses_with_context(signed_daemon_context_for_config(config.clone())?, addresses)
+        .await
+}
+
+async fn dns_publish_addresses_with_context(
+    context: (ConnectConfig, Url, DaemonIdentity, String),
+    addresses: &[String],
+) -> Result<Vec<String>, String> {
     let addresses_csv = addresses.join(",");
-    let body = dns_signed_post(
+    let body = dns_signed_post_with_context(
+        context,
         "api/dns/publish",
         DNS_PUBLISH_PROTOCOL,
         &addresses_csv,
@@ -1507,8 +2039,12 @@ pub(crate) async fn dns_acme_clear() -> Result<(), String> {
 /// resolves to the relay, or revert to direct address publishing
 /// (`enable = false`). Best-effort: only meaningful when the rendezvous runs
 /// both fleet DNS and the relay.
-pub(crate) async fn dns_publish_via_relay(enable: bool) -> Result<(), String> {
-    dns_signed_post(
+pub(crate) async fn dns_publish_via_relay(
+    config: &ConnectConfig,
+    enable: bool,
+) -> Result<(), String> {
+    dns_signed_post_with_context(
+        signed_daemon_context_for_config(config.clone())?,
         "api/dns/relay",
         DNS_RELAY_PROTOCOL,
         if enable { "1" } else { "0" },
@@ -1699,6 +2235,20 @@ pub(crate) fn join_url(base_url: &Url, path: &str) -> Result<Url, String> {
 mod tests {
     use super::*;
 
+    fn note_test_fleet_zone_observation(
+        response: &RegisterResponse,
+        base_url: &Url,
+        observed: &std::sync::atomic::AtomicBool,
+    ) {
+        let relay_rendezvous_key = rendezvous_endpoint_key(Some(base_url.as_str()));
+        note_fleet_zone_observation(
+            response,
+            base_url,
+            observed,
+            relay_rendezvous_key.as_deref(),
+        );
+    }
+
     fn hosted_event_test_registry(
         root: &std::path::Path,
     ) -> (
@@ -1738,6 +2288,29 @@ mod tests {
         assert_eq!(
             join_url(&base, "api/daemon/next").unwrap().as_str(),
             "https://connect.example/root/api/daemon/next"
+        );
+    }
+
+    #[test]
+    fn dns_mutation_clock_is_durable_and_cross_process_serialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let cert_dir = dir.path().to_path_buf();
+            workers.push(std::thread::spawn(move || {
+                next_dns_mutation_unix_ms_in(&cert_dir, 1_000).unwrap()
+            }));
+        }
+        let mut issued = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        issued.sort_unstable();
+        assert_eq!(issued, (1_000..1_008).collect::<Vec<_>>());
+        assert_eq!(
+            next_dns_mutation_unix_ms_in(dir.path(), 900).unwrap(),
+            1_008,
+            "a reconstructed caller and a rolled-back wall clock must continue the durable generation"
         );
     }
 
@@ -1847,8 +2420,12 @@ mod tests {
 
         for event in events {
             assert!(hosted_control_event_refusal(&event).is_some());
+            let epoch = client_state()
+                .lock()
+                .expect("connect client state poisoned")
+                .epoch;
             handle_event(
-                &client, &base_url, &config, "daemon-1", &identity, &registry, None, event,
+                &client, &base_url, &config, "daemon-1", &identity, &registry, None, event, epoch,
             )
             .await;
             assert_eq!(tabs.snapshot(), tabs_before);
@@ -2030,6 +2607,36 @@ mod tests {
     }
 
     #[test]
+    fn daemon_signed_side_channels_drop_bearer_across_origins() {
+        let mut stored = ConnectConfig {
+            enabled: true,
+            rendezvous_url: Some("https://old.example".to_string()),
+            daemon_id: Some("old-daemon".to_string()),
+            auth_token: Some("configured-token".to_string()),
+            ..ConnectConfig::default()
+        };
+        stored.custom_domain.enabled = true;
+        stored.custom_domain.name = Some("box.example.test".to_string());
+        let status = ConnectStatus {
+            rendezvous_url: Some("https://current.example".to_string()),
+            daemon_id: Some("current-daemon".to_string()),
+            ..ConnectStatus::default()
+        };
+
+        let effective = signed_daemon_config(Some(stored), &status);
+        assert_eq!(
+            effective.rendezvous_url.as_deref(),
+            Some("https://current.example")
+        );
+        assert_eq!(effective.daemon_id.as_deref(), Some("current-daemon"));
+        assert_eq!(effective.auth_token, None);
+        assert_eq!(
+            effective.custom_domain.name.as_deref(),
+            Some("box.example.test")
+        );
+    }
+
+    #[test]
     fn route_claim_url_keeps_the_phrase_out_of_the_request_target() {
         let base = Url::parse("https://connect.example/base?ignored=1").unwrap();
         let url = route_claim_url(&base, "word-word-word");
@@ -2071,6 +2678,81 @@ mod tests {
         assert_eq!(legacy.claim_code_expires_unix_ms, None);
     }
 
+    #[test]
+    fn present_incoherent_fleet_dns_hint_does_not_open_the_observation_gate() {
+        let base_url = Url::parse("https://connect.example").unwrap();
+        let observed = std::sync::atomic::AtomicBool::new(true);
+        let mut response = RegisterResponse {
+            claimed: false,
+            claimed_by_user_id: None,
+            claimed_by_handle: None,
+            claim_code: None,
+            claim_code_expires_unix_ms: None,
+            claim_url: None,
+            daemon_session_token: None,
+            daemon_session_expires_unix_ms: None,
+            observed_ip: None,
+            fleet_dns: Some(FleetDnsHint {
+                zone: String::new(),
+                name: String::new(),
+            }),
+        };
+        note_test_fleet_zone_observation(&response, &base_url, &observed);
+        assert!(!observed.load(std::sync::atomic::Ordering::SeqCst));
+
+        response.fleet_dns = Some(FleetDnsHint {
+            zone: "other.example.test".to_string(),
+            name: "d-1234567890abcdef1234.fleet.example.test".to_string(),
+        });
+        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        note_test_fleet_zone_observation(&response, &base_url, &observed);
+        assert!(!observed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn omitted_fleet_dns_hint_does_not_open_the_observation_gate() {
+        let base_url = Url::parse("https://connect.example").unwrap();
+        let observed = std::sync::atomic::AtomicBool::new(true);
+        note_test_fleet_zone_observation(
+            &RegisterResponse {
+                claimed: false,
+                claimed_by_user_id: None,
+                claimed_by_handle: None,
+                claim_code: None,
+                claim_code_expires_unix_ms: None,
+                claim_url: None,
+                daemon_session_token: None,
+                daemon_session_expires_unix_ms: None,
+                observed_ip: None,
+                fleet_dns: None,
+            },
+            &base_url,
+            &observed,
+        );
+        assert!(!observed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn relay_observation_is_bound_to_the_boot_rendezvous_generation() {
+        let boot = rendezvous_endpoint_key(Some("https://boot.example/base")).unwrap();
+        assert!(registration_matches_relay_endpoint(
+            &Url::parse("https://boot.example/base").unwrap(),
+            Some(&boot),
+        ));
+        assert!(!registration_matches_relay_endpoint(
+            &Url::parse("https://other.example/base").unwrap(),
+            Some(&boot),
+        ));
+        assert!(!registration_matches_relay_endpoint(
+            &Url::parse("https://boot.example/other").unwrap(),
+            Some(&boot),
+        ));
+        assert!(!registration_matches_relay_endpoint(
+            &Url::parse("https://boot.example/base").unwrap(),
+            None,
+        ));
+    }
+
     /// A register response asserting a different account link than the daemon's
     /// own signed acknowledgment must surface as a mismatch, not be
     /// silently displayed as truth.
@@ -2085,13 +2767,13 @@ mod tests {
             protocol: CLAIM_PROTOCOL_V2.to_string(),
             signed_at_unix_ms: 1_700_000_000_000,
         };
-        with_status(|status| {
-            *status = ConnectStatus::default();
-            status.signed_claim = Some(record);
-        });
-
+        let mut status = ConnectStatus {
+            signed_claim: Some(record),
+            ..ConnectStatus::default()
+        };
         let base_url = Url::parse("https://connect.example").unwrap();
-        note_register_response(
+        let (claim_line, mismatch) = fold_register_response_status(
+            &mut status,
             &RegisterResponse {
                 claimed: true,
                 claimed_by_user_id: Some("alice-user-id".to_string()),
@@ -2105,13 +2787,25 @@ mod tests {
                 fleet_dns: None,
             },
             &base_url,
+            1_700_000_000_000,
+            None,
         );
-        assert_eq!(
-            status_snapshot().claim_binding,
-            Some(ClaimBinding::DaemonSigned)
-        );
+        assert_eq!(status.claim_binding, Some(ClaimBinding::DaemonSigned));
+        assert_eq!(claim_line, None);
+        assert_eq!(mismatch, None);
 
-        note_register_response(
+        let fleet_zone_observed = std::sync::atomic::AtomicBool::new(true);
+        close_fleet_zone_observation(&fleet_zone_observed);
+        fold_register_error_status(&mut status, "registration refresh unavailable");
+        assert!(!status.registered);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("registration refresh unavailable")
+        );
+        assert!(!fleet_zone_observed.load(std::sync::atomic::Ordering::SeqCst));
+
+        let (_, mismatch) = fold_register_response_status(
+            &mut status,
             &RegisterResponse {
                 claimed: true,
                 claimed_by_user_id: Some("mallory-user-id".to_string()),
@@ -2125,19 +2819,23 @@ mod tests {
                 fleet_dns: None,
             },
             &base_url,
+            1_700_000_000_001,
+            None,
         );
+        assert_eq!(status.claim_binding, Some(ClaimBinding::Mismatch));
         assert_eq!(
-            status_snapshot().claim_binding,
-            Some(ClaimBinding::Mismatch)
+            mismatch,
+            Some(("mallory-user-id".to_string(), "alice-user-id".to_string()))
         );
 
         // During a mixed-version rollout an older service ignores the
         // daemon-minted hash and returns the different plaintext phrase it
         // can redeem. Its coherent response pair must outrank the local
         // phrase; otherwise the dashboard displays an unclaimable code.
-        let local_code = current_route_claim_code().unwrap();
+        let local_code = "local-claim-code".to_string();
         assert_ne!(local_code, "word-word-word");
-        note_register_response(
+        let (claim_line, mismatch) = fold_register_response_status(
+            &mut status,
             &RegisterResponse {
                 claimed: false,
                 claimed_by_user_id: None,
@@ -2153,8 +2851,11 @@ mod tests {
                 fleet_dns: None,
             },
             &base_url,
+            1_700_000_600_000,
+            Some(local_code.clone()),
         );
-        let status = status_snapshot();
+        assert_eq!(mismatch, None);
+        assert!(claim_line.is_some());
         assert_eq!(status.claimed, Some(false));
         assert_eq!(status.claim_binding, None);
         assert_eq!(status.claim_code.as_deref(), Some("word-word-word"));
@@ -2167,7 +2868,8 @@ mod tests {
         // A new service returns null plaintext fields because it retained the
         // signed local hash. In that case the same local phrase and its
         // fragment URL are the claim surface.
-        note_register_response(
+        let (claim_line, mismatch) = fold_register_response_status(
+            &mut status,
             &RegisterResponse {
                 claimed: false,
                 claimed_by_user_id: None,
@@ -2181,16 +2883,127 @@ mod tests {
                 fleet_dns: None,
             },
             &base_url,
+            1_700_001_200_000,
+            Some(local_code.clone()),
         );
-        let status = status_snapshot();
+        assert_eq!(mismatch, None);
+        assert!(claim_line.is_some());
         assert_eq!(status.claim_code.as_deref(), Some(local_code.as_str()));
         let local_url = route_claim_url(&base_url, &local_code);
         assert_eq!(status.claim_url.as_deref(), Some(local_url.as_str()));
         assert_eq!(status.claim_code_expires_unix_ms, Some(1_700_001_200_000));
+    }
 
-        // Leave no residue for other tests sharing the process-global
-        // registry.
-        clear_route_claim_code();
-        with_status(|status| *status = ConnectStatus::default());
+    #[test]
+    fn live_reconfigure_clears_boot_bearer_on_origin_change() {
+        let mut current = ConnectConfig {
+            enabled: true,
+            rendezvous_url: Some("https://old.example".to_string()),
+            auth_token: Some("boot-token".to_string()),
+            ..ConnectConfig::default()
+        };
+        current.custom_domain.enabled = true;
+        current.custom_domain.name = Some("box.example.test".to_string());
+        current.custom_domain.dns = Some(crate::project::CustomDomainDnsConfig::Cloudflare {
+            zone_id: "zone-id".to_string(),
+            token_env: Some("BOOT_DNS_API_TOKEN".to_string()),
+            propagation_delay_secs: 10,
+        });
+        let mut requested = current.clone();
+        requested.enabled = false;
+        requested.rendezvous_url = Some("https://new.example".to_string());
+        requested.auth_token = Some("changed-token".to_string());
+        requested.custom_domain.name = Some("changed.example.test".to_string());
+        requested.custom_domain.dns = Some(crate::project::CustomDomainDnsConfig::Cloudflare {
+            zone_id: "changed-zone".to_string(),
+            token_env: Some("CHANGED_DNS_API_TOKEN".to_string()),
+            propagation_delay_secs: 20,
+        });
+
+        let effective = live_reconfigured_connect_config(Some(&current), requested);
+        assert!(!effective.enabled);
+        assert_eq!(
+            effective.rendezvous_url.as_deref(),
+            Some("https://new.example")
+        );
+        assert_eq!(effective.auth_token, None);
+        assert_eq!(
+            effective.custom_domain.name.as_deref(),
+            Some("box.example.test")
+        );
+        assert_eq!(
+            effective
+                .custom_domain
+                .dns_credential_env_for_child_scrub()
+                .as_deref(),
+            Some("BOOT_DNS_API_TOKEN")
+        );
+    }
+
+    #[test]
+    fn live_reconfigure_preserves_boot_bearer_on_the_same_origin() {
+        let current = ConnectConfig {
+            enabled: true,
+            rendezvous_url: Some("https://connect.example/base".to_string()),
+            auth_token: Some("boot-token".to_string()),
+            ..ConnectConfig::default()
+        };
+        let mut requested = current.clone();
+        requested.rendezvous_url = Some("https://CONNECT.example:443/other".to_string());
+        requested.auth_token = Some("ignored-live-token".to_string());
+
+        let effective = live_reconfigured_connect_config(Some(&current), requested);
+        assert_eq!(
+            effective.rendezvous_url.as_deref(),
+            Some("https://CONNECT.example:443/other")
+        );
+        assert_eq!(effective.auth_token.as_deref(), Some("boot-token"));
+    }
+
+    #[test]
+    fn connect_reconfiguration_transitions_are_serialized() {
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            with_client_reconfiguration(|| {
+                first_entered_tx.send(()).unwrap();
+                release_first_rx.recv().unwrap();
+            });
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            with_client_reconfiguration(|| second_entered_tx.send(()).unwrap());
+        });
+        assert!(matches!(
+            second_entered_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_first_tx.send(()).unwrap();
+        second_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+    }
+
+    #[test]
+    fn stale_client_epoch_cannot_fold_a_register_response() {
+        let current_epoch = {
+            let state = client_state()
+                .lock()
+                .expect("connect client state poisoned");
+            state.epoch
+        };
+        let stale_epoch = current_epoch.wrapping_sub(1);
+        let folded = std::sync::atomic::AtomicBool::new(false);
+        with_current_client_epoch(stale_epoch, || {
+            folded.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(!folded.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

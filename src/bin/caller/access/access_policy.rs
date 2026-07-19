@@ -277,7 +277,7 @@ pub enum PeerOperation {
     AgendaWrite,
     /// Search and read Memory claims (bounded, provenance-labeled).
     MemoryRead,
-    /// Propose Memory claims (the candidate lane; ephemeral in P1.1).
+    /// Propose Memory claims (the candidate lane).
     MemoryWrite,
 }
 
@@ -487,13 +487,23 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
         // user-lane-only. No peer profile — AdminPeer included — may
         // exercise them, because both must be attributable to an
         // identified person the target itself admitted, and a peer
-        // connection's principal is a daemon.
+        // connection's principal is a daemon. The exclusion holds
+        // end-to-end only while every credential-writing surface gates
+        // on CredentialsManage (POST /api/api-keys included): a
+        // key-writing route gated at Settings would hand AdminPeer
+        // custody through the side door.
         AdminPeer => !matches!(op, AccessManage | CredentialsManage),
     }
 }
 
 #[allow(dead_code)]
 pub fn profile_allows_control_msg(profile: &str, ctrl: &ControlMsg) -> bool {
+    if matches!(ctrl, ControlMsg::HostedCertificateWitness { .. }) {
+        // This transport-only verb is admitted from an authenticated peer
+        // certificate at the gateway edge, independent of general peer
+        // control profiles.
+        return false;
+    }
     if matches!(ctrl, ControlMsg::PeerDashboardControlSignal { .. }) {
         return profile_allows_dashboard_control_tunnel(profile);
     }
@@ -800,11 +810,12 @@ pub const FRAME_LANES: &[FrameLaneSpec] = &[
     // ---- tunnel only ----
     FrameLaneSpec {
         frame: "presence_frame",
-        op: Some(PeerOperation::Message),
+        op: Some(PeerOperation::RuntimeControl),
         ws: false,
         tunnel: true,
         note: "the tunnel's envelope for the presence family /ws speaks raw (rows above); \
-               gated as messaging into the presence layer",
+               it injects into the live presence/voice session (connect, transcript/log \
+               entries), so it carries the family's runtime-control floor on this lane too",
     },
     FrameLaneSpec {
         frame: "upload_start",
@@ -860,6 +871,14 @@ pub const FRAME_LANES: &[FrameLaneSpec] = &[
         tunnel: true,
         note: "error terminator — same gate",
     },
+    FrameLaneSpec {
+        frame: "egress_request_ack",
+        op: Some(PeerOperation::CredentialsManage),
+        ws: false,
+        tunnel: true,
+        note: "request-side credit refill from a relay page that declared request_credits — \
+               same gate and same per-request session binding as egress_response",
+    },
     // ---- both lanes: liveness ----
     FrameLaneSpec {
         frame: "ping",
@@ -896,6 +915,9 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         // through `profile_allows_dashboard_control_tunnel` (the tunnel is
         // multi-capability, so its door is any-of, not this single op).
         ControlMsg::PeerDashboardControlSignal { .. } => PeerOperation::SessionInspect,
+        // Fallback classification only: the gateway admits this exact
+        // transport verb solely from a verified peer identity.
+        ControlMsg::HostedCertificateWitness { .. } => PeerOperation::PresenceRead,
         ControlMsg::PeerFileTransferSignal { .. } => PeerOperation::FilesystemRead,
         ControlMsg::RequestDisplayInputAuthority { .. }
         | ControlMsg::ReleaseDisplayInputAuthority { .. }
@@ -920,11 +942,19 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::Skip { .. }
         | ControlMsg::ApproveAll { .. }
         | ControlMsg::AnswerQuestion { .. } => PeerOperation::Approval,
+        // Executable repointing is credential-adjacent, not Settings: the
+        // command path decides WHICH binary external-agent sessions run
+        // with the owner's credentials and workspace, so it takes the same
+        // credentials.manage authority as /api/api-keys (an operation no
+        // peer profile grants). POST /api/settings enforces the same rule
+        // per-field (`executable_repoint_denials`); `claude_command` has no
+        // ControlMsg twin and is covered there alone.
+        ControlMsg::SetCodexCommand { .. } | ControlMsg::SetCodexManagedCommand { .. } => {
+            PeerOperation::CredentialsManage
+        }
         ControlMsg::SetAutonomy { .. }
         | ControlMsg::SetApprovalRule { .. }
         | ControlMsg::SetExternalAgent { .. }
-        | ControlMsg::SetCodexCommand { .. }
-        | ControlMsg::SetCodexManagedCommand { .. }
         | ControlMsg::SetCodexSandbox { .. }
         | ControlMsg::SetCodexApprovalPolicy { .. }
         | ControlMsg::SetCodexModel { .. }
@@ -1568,8 +1598,10 @@ mod tests {
             ("dashboard_control_offer",        None,                 None),
             ("dashboard_control_ice",          None,                 None),
             ("dashboard_control_close",        None,                 None),
-            // -- tunnel only: the presence wrapper envelope --
-            ("presence_frame",                 None,                 Some(Message)),
+            // -- tunnel only: the presence wrapper envelope (injects into
+            //    the live presence/voice session, so it carries the raw
+            //    family's runtime-control floor) --
+            ("presence_frame",                 None,                 Some(RuntimeControl)),
             // -- tunnel only: upload frames are authorized by the method
             //    they deliver, never by a blanket grant --
             ("upload_start",                   None,                 None),
@@ -1580,6 +1612,7 @@ mod tests {
             ("egress_chunk",                   None,                 Some(CredentialsManage)),
             ("egress_end",                     None,                 Some(CredentialsManage)),
             ("egress_error",                   None,                 Some(CredentialsManage)),
+            ("egress_request_ack",             None,                 Some(CredentialsManage)),
             // -- no-authority dispatch machinery + unknown kinds --
             ("ping",                           None,                 None),
             ("hello",                          None,                 None),

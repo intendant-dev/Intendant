@@ -98,11 +98,10 @@ pub(crate) fn spawn_control_stream(
     tokio::spawn(async move {
         // Same RAII contract as the request lane, with one refinement: a
         // mid-stream framer exit must NOT free the slot while the line
-        // producer's detached hydration keeps running (its final send
-        // results are ignored, so a dropped receiver does not stop it) —
-        // the framer hands the slot + receiver to a drain task that frees
-        // the slot only when the producer's sender drops (see
-        // `hold_slot_until_producer_exits`).
+        // producer's cancellation is still unwinding. The framer cancels and
+        // aborts the producer, drops its receiver, then hands the slot to a
+        // waiter that frees it only when the source task actually exits (see
+        // `cancel_producer_and_hold_slot_until_exit`).
         match method.as_str() {
             "api_sessions_stream" => {
                 stream_sessions_response(
@@ -333,7 +332,15 @@ pub(crate) async fn control_request_frame(
             ),
             "external agents",
         ),
-        "api_api_keys_save" => api_api_keys_save_response(id, params.as_ref()).await,
+        "api_api_keys_save" => {
+            api_api_keys_save_response(
+                id,
+                params.as_ref(),
+                runtime.grant.access_principal().id,
+                runtime.grant.custody_origin_class(),
+            )
+            .await
+        }
         "api_voice_session" => api_voice_session_response(id, &runtime).await,
         "api_project_root" => frame_api_json_body_response(
             id,
@@ -483,18 +490,35 @@ pub(crate) async fn stream_sessions_response(
     .await;
 }
 
-/// Free `slot` only when the line PRODUCER actually exits: discard
-/// remaining lines until `recv()` returns `None` — the producer dropping
-/// its sender is the producer function returning. Mid-stream framer exits
-/// (cancellation, send failure, invalid JSON) hand their receiver here so
-/// admission capacity is never released while hydration keeps running;
-/// slot lifetime equals producer lifetime by construction, with zero
-/// producer-side changes.
-fn hold_slot_until_producer_exits(slot: Option<LiveWorkSlot>, mut line_rx: mpsc::Receiver<String>) {
+/// Stop useful producer work immediately, but retain `slot` until the source
+/// task really exits. Aborting a running `spawn_blocking` task is cooperative
+/// only, so the detached waiter owns the admission slot through its actual
+/// completion.
+fn cancel_producer_and_hold_slot_until_exit(
+    slot: Option<LiveWorkSlot>,
+    line_rx: mpsc::Receiver<String>,
+    source: tokio::task::JoinHandle<()>,
+    producer_cancellation: CancellationToken,
+) {
+    producer_cancellation.cancel();
+    drop(line_rx);
+    source.abort();
     tokio::spawn(async move {
         let _slot = slot;
-        while line_rx.recv().await.is_some() {}
+        let _ = source.await;
     });
+}
+
+async fn send_stream_task_or_cancel(
+    task_tx: &mpsc::Sender<SequencedTaskResponse>,
+    task: SequencedTaskResponse,
+    cancel: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => false,
+        result = task_tx.send(task) => result.is_ok(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
@@ -509,14 +533,21 @@ pub(crate) async fn stream_json_lines_response(
 ) {
     let crate::web_gateway::LineStream {
         lines: mut line_rx,
-        source: stream_task,
+        source: mut stream_task,
+        cancellation: producer_cancellation,
     } = stream;
     if cancel.is_cancelled() {
-        return hold_slot_until_producer_exits(slot, line_rx);
+        return cancel_producer_and_hold_slot_until_exit(
+            slot,
+            line_rx,
+            stream_task,
+            producer_cancellation,
+        );
     }
 
-    if task_tx
-        .send((
+    if !send_stream_task_or_cancel(
+        &task_tx,
+        (
             generation,
             ControlTaskResponse {
                 id: id.clone(),
@@ -528,23 +559,38 @@ pub(crate) async fn stream_json_lines_response(
                 byte_stream: None,
                 done: false,
             },
-        ))
-        .await
-        .is_err()
+        ),
+        &cancel,
+    )
+    .await
     {
-        return hold_slot_until_producer_exits(slot, line_rx);
+        return cancel_producer_and_hold_slot_until_exit(
+            slot,
+            line_rx,
+            stream_task,
+            producer_cancellation,
+        );
     }
 
     let mut seq: u64 = 0;
     loop {
-        let Some(line) = line_rx.recv().await else {
+        let next_line = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return cancel_producer_and_hold_slot_until_exit(
+                    slot,
+                    line_rx,
+                    stream_task,
+                    producer_cancellation,
+                );
+            }
+            line = line_rx.recv() => line,
+        };
+        let Some(line) = next_line else {
             // recv() == None: the producer exited — the loop ends and the
             // slot may now die with this framer.
             break;
         };
-        if cancel.is_cancelled() {
-            return hold_slot_until_producer_exits(slot, line_rx);
-        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -558,8 +604,15 @@ pub(crate) async fn stream_json_lines_response(
                     "ok": false,
                     "error": format!("session stream returned invalid JSON: {e}"),
                 });
-                let _ = task_tx
-                    .send((
+                cancel_producer_and_hold_slot_until_exit(
+                    slot,
+                    line_rx,
+                    stream_task,
+                    producer_cancellation,
+                );
+                let _ = send_stream_task_or_cancel(
+                    &task_tx,
+                    (
                         generation,
                         ControlTaskResponse {
                             id,
@@ -567,9 +620,11 @@ pub(crate) async fn stream_json_lines_response(
                             byte_stream: None,
                             done: true,
                         },
-                    ))
-                    .await;
-                return hold_slot_until_producer_exits(slot, line_rx);
+                    ),
+                    &cancel,
+                )
+                .await;
+                return;
             }
         };
         let chunk_id = format!("{id}:{seq}");
@@ -581,8 +636,9 @@ pub(crate) async fn stream_json_lines_response(
             "event": event,
         });
         seq = seq.saturating_add(1);
-        if task_tx
-            .send((
+        if !send_stream_task_or_cancel(
+            &task_tx,
+            (
                 generation,
                 ControlTaskResponse {
                     id: id.clone(),
@@ -590,15 +646,33 @@ pub(crate) async fn stream_json_lines_response(
                     byte_stream: None,
                     done: false,
                 },
-            ))
-            .await
-            .is_err()
+            ),
+            &cancel,
+        )
+        .await
         {
-            return hold_slot_until_producer_exits(slot, line_rx);
+            return cancel_producer_and_hold_slot_until_exit(
+                slot,
+                line_rx,
+                stream_task,
+                producer_cancellation,
+            );
         }
     }
 
-    let frame = match stream_task.await {
+    let source_result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            return cancel_producer_and_hold_slot_until_exit(
+                slot,
+                line_rx,
+                stream_task,
+                producer_cancellation,
+            );
+        }
+        result = &mut stream_task => result,
+    };
+    let frame = match source_result {
         Ok(()) => serde_json::json!({
             "t": "stream_end",
             "id": id,
@@ -614,19 +688,20 @@ pub(crate) async fn stream_json_lines_response(
             "error": format!("session stream task failed: {e}"),
         }),
     };
-    if !cancel.is_cancelled() {
-        let _ = task_tx
-            .send((
-                generation,
-                ControlTaskResponse {
-                    id,
-                    frame,
-                    byte_stream: None,
-                    done: true,
-                },
-            ))
-            .await;
-    }
+    let _ = send_stream_task_or_cancel(
+        &task_tx,
+        (
+            generation,
+            ControlTaskResponse {
+                id,
+                frame,
+                byte_stream: None,
+                done: true,
+            },
+        ),
+        &cancel,
+    )
+    .await;
 }
 
 /// The tunnel's sessions-stream limit vocabulary, parsed at this
@@ -1575,10 +1650,9 @@ mod tests {
     use super::*;
     use crate::dashboard_control::tests::runtime;
 
-    /// A cancelled stream must NOT free its live-work slot while the line
-    /// producer keeps running: the framer hands the slot + receiver to
-    /// the drain task, which frees the slot only when the producer's
-    /// sender drops (the producer function returning).
+    /// A cancelled stream must signal its producer immediately, yet must NOT
+    /// free its live-work slot while a running `spawn_blocking` producer is
+    /// still unwinding (JoinHandle::abort cannot stop it).
     #[tokio::test]
     async fn cancelled_stream_slot_frees_only_when_producer_exits() {
         let mut pending = PendingControlRequests::new();
@@ -1586,13 +1660,21 @@ mod tests {
         assert_eq!(pending.live_work(), 1);
 
         let (line_tx, line_rx) = mpsc::channel::<String>(4);
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        // A producer that keeps running well past the framer's exit.
-        let source = tokio::spawn(async move {
-            let _ = line_tx.send("{\"type\":\"ping\"}\n".to_string()).await;
-            let _ = release_rx.await;
-            // line_tx drops here — the producer's actual exit.
+        let producer_cancellation = CancellationToken::new();
+        let producer_wait = producer_cancellation.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let source = tokio::task::spawn_blocking(move || {
+            let _ = line_tx.blocking_send("{\"type\":\"ping\"}\n".to_string());
+            started_tx.send(()).unwrap();
+            while !producer_wait.is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            release_rx.recv().unwrap();
         });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("blocking producer started");
         let (task_tx, _task_rx) = mpsc::channel::<SequencedTaskResponse>(8);
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -1603,6 +1685,7 @@ mod tests {
             crate::web_gateway::LineStream {
                 lines: line_rx,
                 source,
+                cancellation: producer_cancellation.clone(),
             },
             task_tx,
             generation,
@@ -1610,6 +1693,10 @@ mod tests {
             Some(slot),
         )
         .await;
+        assert!(
+            producer_cancellation.is_cancelled(),
+            "request cancellation must reach the line producer"
+        );
 
         // The framer returned (cancelled), the producer still runs: the
         // slot must still be held.
@@ -1620,7 +1707,7 @@ mod tests {
             "cancellation must not free the slot while the producer runs"
         );
 
-        // Let the producer exit; the drain task frees the slot at None.
+        // Let the non-abortable producer exit; its waiter then frees the slot.
         release_tx.send(()).expect("producer waiting");
         let mut freed = false;
         for _ in 0..400 {
@@ -1630,7 +1717,91 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        assert!(freed, "slot must free when the producer's sender drops");
+        assert!(freed, "slot must free when the producer task exits");
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_silent_line_receive() {
+        let (line_tx, line_rx) = mpsc::channel::<String>(1);
+        let producer_cancellation = CancellationToken::new();
+        let producer_wait = producer_cancellation.clone();
+        let source = tokio::spawn(async move {
+            producer_wait.cancelled().await;
+            drop(line_tx);
+        });
+        let (task_tx, mut task_rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let cancel = CancellationToken::new();
+        let framer_cancel = cancel.clone();
+        let producer_observer = producer_cancellation.clone();
+        let framer = tokio::spawn(stream_json_lines_response(
+            "silent".to_string(),
+            "api_sessions_stream".to_string(),
+            crate::web_gateway::LineStream {
+                lines: line_rx,
+                source,
+                cancellation: producer_cancellation,
+            },
+            task_tx,
+            1,
+            framer_cancel,
+            None,
+        ));
+        let (_, start) = task_rx.recv().await.expect("stream start");
+        assert_eq!(start.frame["t"], "stream_start");
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), framer)
+            .await
+            .expect("request cancellation must interrupt line receive")
+            .expect("framer task");
+        assert!(producer_observer.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_backpressured_stream_start() {
+        let (line_tx, line_rx) = mpsc::channel::<String>(1);
+        let producer_cancellation = CancellationToken::new();
+        let producer_wait = producer_cancellation.clone();
+        let source = tokio::spawn(async move {
+            producer_wait.cancelled().await;
+            drop(line_tx);
+        });
+        let (task_tx, _task_rx) = mpsc::channel::<SequencedTaskResponse>(1);
+        task_tx
+            .send((
+                0,
+                ControlTaskResponse {
+                    id: "occupied".to_string(),
+                    frame: serde_json::json!({"t": "occupied"}),
+                    byte_stream: None,
+                    done: false,
+                },
+            ))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let framer_cancel = cancel.clone();
+        let producer_observer = producer_cancellation.clone();
+        let framer = tokio::spawn(stream_json_lines_response(
+            "blocked".to_string(),
+            "api_sessions_stream".to_string(),
+            crate::web_gateway::LineStream {
+                lines: line_rx,
+                source,
+                cancellation: producer_cancellation,
+            },
+            task_tx,
+            1,
+            framer_cancel,
+            None,
+        ));
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), framer)
+            .await
+            .expect("request cancellation must interrupt a blocked start send")
+            .expect("framer task");
+        assert!(producer_observer.is_cancelled());
     }
 
     /// The spawned request lane's RAII contract: a spawned task holds its
@@ -2011,6 +2182,7 @@ mod tests {
             crate::web_gateway::LineStream {
                 lines: line_rx,
                 source: stream_task,
+                cancellation: CancellationToken::new(),
             },
             task_tx,
             7,
@@ -2990,7 +3162,11 @@ mod tests {
                 }
             }
         });
-        crate::web_gateway::LineStream { lines: rx, source }
+        crate::web_gateway::LineStream {
+            lines: rx,
+            source,
+            cancellation: CancellationToken::new(),
+        }
     }
 
     /// Same params ⇒ same event-line sequence on both lanes (design §8,
@@ -3028,6 +3204,7 @@ mod tests {
                         .into()
                     },
                     tx,
+                    CancellationToken::new(),
                 );
             });
             let mut lines = Vec::new();

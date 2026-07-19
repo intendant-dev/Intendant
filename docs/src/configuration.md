@@ -53,7 +53,14 @@ for the headless `tests/e2e/` suite and demos) and requires
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, access certs, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), and the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves). |
+| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. On macOS/Linux it also holds `access-certs/`; Windows keeps that store under the OS data directory instead. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), the Windows access-cert store, the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves), and the current macOS durable Memory plane at `~/.intendant/memory-plane` (which does not yet honor `INTENDANT_HOME`). |
+| `INTENDANT_MEMORY_EPHEMERAL` | unset | Set to `1` to force the owner-plane Memory service to use an in-memory plane. With the variable unset, macOS attempts durable storage at `~/.intendant/memory-plane` and falls back softly to an honestly labeled ephemeral plane if bootstrap fails; Linux and Windows currently use the ephemeral plane. |
+
+### Child-process environment
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INTENDANT_ENV_PASSTHROUGH` | unset | Comma-separated exact env-var names (case-insensitive) added to the native runtime and supervised external CLI cleared-environment allowlists. Unknown variables do not otherwise inherit. Provider API keys never pass. Native runtime exec/PTY shells apply a second credential scrub that currently does **not** honor this override, so classified ambient credentials such as `SSH_AUTH_SOCK` remain unavailable there; named ordinary build variables do reach those shells. Treat every entry as an explicit grant of that variable's value to model-driven code. |
 
 ### Model and behavior tuning
 
@@ -89,6 +96,10 @@ precedence is **explicit config > env var > auto-detect**.
 | `INTENDANT_BROWSER_WORKSPACE_EXECUTABLE` | managed browser cache | Explicit Chromium/Chrome-for-Testing executable for CDP browser workspaces |
 | `INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER` | `false` on macOS, `true` elsewhere | On macOS, explicitly permit CDP workspaces to launch system Chrome/Chromium apps such as `/Applications/Google Chrome.app` |
 
+The older `INTENDANT_BROWSER_EXECUTABLE` and
+`INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_CHROME` names remain accepted as
+compatibility aliases; new configuration should use the names in the table.
+
 The default CDP resolver prefers managed Playwright/Puppeteer/Chrome-for-Testing
 browser caches and Intendant's own browser cache locations. This avoids
 attributing Google Chrome updater/app-bundle activity to Intendant on macOS. Set
@@ -98,6 +109,12 @@ Run `intendant setup browsers` to download Chrome for Testing into Intendant's
 managed cache. The helper accepts `--check`, `--force`,
 `--channel stable|beta|dev|canary`, `--json`, and `--print-path`; use
 `--check` to verify the cache without network access.
+
+### Display diagnostics
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INTENDANT_DISPLAY_INPUT_TELEMETRY` | unset (off) | Set to `1`, `true`, `yes`, or `on` to emit once-per-second aggregate data-channel, authority-drop, input-queue, and injection timing counters while display input is active |
 
 ### Dashboard dev override
 
@@ -110,9 +127,14 @@ with `cargo run -p app-html-assembler` after each fragment edit — the next
 browser refresh picks up the change with no daemon rebuild or restart. The
 disk copy gets the same `?v=` asset-URL rewriting as the embedded one;
 everything else (WASM, vendored JS/CSS, icons) stays embedded and still
-needs a normal build. A read failure serves a loud 500 naming the override
-rather than silently falling back to the embedded copy, and the gateway
-logs the active override at startup.
+needs a normal build, except `/vault-kernel.js`: when a sibling
+`vault-kernel.js` exists beside the overridden `app.html`, the gateway also
+re-reads that file on every request so its bytes match the assembler-injected
+hash pin. A missing or unreadable sibling falls back to the embedded kernel,
+whose mismatch the page's integrity check will reject. An `app.html` read
+failure serves a loud 500 naming the override rather than silently falling
+back to the embedded copy, and the gateway logs the active override at
+startup.
 
 ### Session-log retention variables
 
@@ -133,6 +155,7 @@ sessions spawned in-process via the `spawn_sub_agent` tool (see
 |----------|-------------|
 | `INTENDANT_TASK` | Task description fallback when no CLI task argument is given |
 | `INTENDANT_SYSTEM_PROMPT` | Replaces the resolved system prompt wholesale for a direct CLI invocation (escape hatch; per-session overrides use `spawn_sub_agent`'s `system_prompt`) |
+| `INTENDANT_PROJECT_ROOT` | Explicit project root for MCP helper surfaces that otherwise use the current directory; selects the controller-loop state directory and the project-local live-audio prompt override |
 | `INTENDANT_SANDBOX_WRITE_PATHS` | Sandbox write paths (set by the caller when sandboxing; enforced by Landlock on Linux, Seatbelt on macOS, restricted tokens on Windows) |
 | `INTENDANT_LOG_DIR` | Session log directory (set by the caller for the runtime) |
 
@@ -145,11 +168,10 @@ daemon-wide file while `/api/project-root` remains null. Every section is
 optional; an absent section uses its defaults. The structure and defaults below
 are taken directly from `src/bin/caller/project.rs`.
 
-### `[memory]`
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `enabled` | bool | `true` | Enable the persistent project memory store (`.intendant/memory.json`) |
+Memory is no longer project configuration: the legacy `[memory]` table and
+`.intendant/memory.json` store were removed. Owner-plane Memory durability is
+selected at daemon startup by platform and `INTENDANT_MEMORY_EPHEMERAL`, as
+described above.
 
 ### `[model]`
 
@@ -179,6 +201,15 @@ Per-category approval rules. Each value is `auto` (run without asking), `ask`
 | `network` | rule | `auto` | NetworkRequest |
 | `destructive` | rule | `ask` | Destructive |
 | `display_control` | rule | `ask` | DisplayControl |
+| `tool_call` | rule | `ask` | ToolCall (outbound MCP, skills/orchestration, and external-agent tool/MCP permission requests) |
+
+Arbitrary `CommandExec` is governed by the strictest configured rule among
+`command_exec` and every effect a shell can reach: `file_read`, `file_write`,
+`file_delete`, `network`, `destructive`, and `display_control` (`deny` >
+`ask` > `auto`). Consequently the default effective shell rule is `ask` even
+though the `command_exec` field itself defaults to `auto`. This composition is
+deliberate: shell syntax cannot be classified completely, so effect rules must
+not be bypassable with indirection or a different executable spelling.
 
 The `HumanInput` and `LiveAudioSpawn` categories always require a human and are
 not configurable here.
@@ -245,7 +276,7 @@ rows while that routing is off.
 |-----|------|---------|-------------|
 | `provider` | string | auto-detect | CU model provider |
 | `model` | string | auto-detect | CU model |
-| `backend` | string | `auto` | Input/screenshot backend: `x11`, `wayland`, `macos`, or `auto` |
+| `backend` | string | `auto` | Input/screenshot backend: `x11`, `wayland`, `macos`, `windows`, or `auto` |
 
 ### `[experimental]`
 
@@ -272,6 +303,7 @@ Routes coding tasks to an external CLI agent instead of the native loop (see
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `command` | string | `codex` | Path or command name for the Codex binary |
+| `managed_command` | string | unset (fall back to `command`) | Path or command name for an Intendant-aware Codex fork. Managed-context sessions prefer this binary; vanilla sessions always use `command`. Leaving it unset preserves legacy setups but makes managed-fork capability ambiguous in the dashboard |
 | `model` | string | unset | Model override |
 | `approval_policy` | string | `on-request` | `untrusted`, `on-request`, or `never` (UI set; `on-failure` is deprecated upstream) |
 | `sandbox` | string | `workspace-write` | `read-only`, `workspace-write`, or `danger-full-access` |
@@ -323,17 +355,42 @@ and live voice (see [Computer Use & Live Audio](./computer-use-and-audio.md)).
 
 ### `[sandbox]`
 
-Filesystem sandboxing for the runtime — Landlock on Linux, Seatbelt on
-macOS, restricted tokens on Windows. Also enabled by `--sandbox`.
+Filesystem write sandboxing for the runtime — Landlock on Linux, Seatbelt
+on macOS, restricted tokens on Windows. **On by default on macOS and
+Linux; opt-in on Windows**, where a write grant is an inheritable ACE and
+granting a large tree rewrites every descendant's DACL synchronously at
+startup — enabling it there accepts that first-stamp cost. Resolution
+order: `--sandbox` forces on, `--no-sandbox` forces off, otherwise an
+explicit `enabled` here decides, otherwise the platform default.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable filesystem sandboxing |
-| `extra_write_paths` | array | `[]` | Extra writable paths beyond project root, the OS scratch dir (`/tmp` / `%TEMP%`), the log dir, and `~/.intendant` |
+| `enabled` | bool | unset (= platform default) | Explicitly enable/disable filesystem sandboxing; the CLI flags override it |
+| `extra_write_paths` | array | `[]` | Extra writable paths beyond the default grant set: project root (plus the session's own project root for dashboard-picked projects), the OS scratch dir (`TMPDIR` / `/tmp` / `%TEMP%`), the session log dir and the state root's `logs/` subtree, and — Unix only — the toolchain caches (`~/.cargo`, `~/.rustup`, the user cache dir). The state root itself is deliberately **not** granted: it also holds access credentials, leased auth, and custody state. On Windows toolchain-cache writes are instead granted on demand through the denial-consent card |
 
-On Linux kernels without Landlock support, sandboxing is silently skipped;
-on macOS and Windows a sandbox that fails to apply fails the run rather
-than continuing unconfined.
+The dashboard's Settings → Security card edits both values live (new
+commands pick the change up without a restart; a `--sandbox`/`--no-sandbox`
+flag pins the live state for that daemon run, so saves then only persist
+intent), and approving a sandbox write-denial consent prompt can append
+grants — for the session, or persisted here via "always allow".
+On Windows, an extra-path-only Settings save currently resolves an omitted
+`enabled` value as `true`, not the Windows platform default, and does not perform
+startup's full ACE-stamping lifecycle. Treat that as a Settings defect: include
+the intended enabled state explicitly and restart after changing Windows
+sandbox grants.
+
+Once the sandbox reaches a runtime, an enforcement failure aborts that run
+rather than continuing unconfined: for example, a Linux kernel without
+Landlock support refuses the runtime until `--no-sandbox` (or `enabled =
+false`) makes the opt-out explicit, and Windows restricted-token re-exec fails
+closed. One controller-edge caveat remains: if startup cannot encode the
+write-grant environment, it currently logs the error, removes the sandbox
+variable, and continues; a Windows ACE-stamping failure instead leaves the
+restricted runtime unable to write. Reads stay open except the credential
+carve-outs (macOS denies `~/.ssh`, `~/.gnupg`, the intendant config home, and
+the `.env` search path at the OS layer; on Linux, Landlock cannot express read
+carve-outs under a broad read grant, so project/config `.env` files remain
+readable — credential custody is the tracked fix).
 
 ### `[webrtc]`
 
@@ -371,9 +428,28 @@ without changing that refusal or the Connect account's `role:none` posture.
 | `auth_token` | string | unset | Optional bearer token for daemon-to-service authentication; not dashboard authorization |
 | `poll_timeout_ms` | integer | `15000` | Long-poll timeout per daemon `/next` request |
 | `retry_delay_ms` | integer | `1000` | Delay after transient rendezvous errors |
-| `relay_enabled` | bool | `false` | Hold a reachability-relay control channel to Connect so this daemon's NAT'd fleet name is reachable through the relay's SNI passthrough (docs/src/self-hosted-rendezvous.md). Dial-backs terminate on a dedicated loopback-only gateway ingress and cannot enter the trusted-local lane. Requires `relay_endpoint` |
+| `relay_enabled` | bool | `false` | Hold a reachability-relay control channel to Connect so this daemon's NAT'd fleet name is reachable through the relay's SNI passthrough (docs/src/self-hosted-rendezvous.md). Custom exact-name routes additionally prove possession of their publicly trusted certificate key. Dial-backs terminate on a dedicated loopback-only gateway ingress and cannot enter the trusted-local lane. Requires `relay_endpoint` |
 | `relay_endpoint` | string | unset | `host:port` of the relay's raw passthrough port, where this daemon dials back browser connections (e.g. `relay.example.com:443`) |
 | `hosted_control_enabled` | bool | `false` | Enable the daemon-local hosted lease doorbell and exact lease-proof/ticket carve on fleet/relay ingress. Restart-only; deliberately has no environment-variable override |
+| `custom_domain.enabled` | bool | `false` | Enable the separate user-owned-name lane. Restart-only; no environment-variable override |
+| `custom_domain.name` | string | unset | Exact ASCII/punycode DNS name served by the daemon |
+| `custom_domain.rp_id` | string | `custom_domain.name` | WebAuthn relying-party id; when present it must equal the exact name |
+| `custom_domain.acme_issuance_enabled` | bool | `false` | Allow certificate orders after the displayed ACME account URI has been pinned in CAA |
+
+`[connect.custom_domain.dns]` selects the DNS-01 provider. `provider =
+"cloudflare"` requires `zone_id`, with optional `token_env` (default
+`CLOUDFLARE_API_TOKEN`) and `propagation_delay_secs` (default 10, maximum
+3600).
+`provider = "rfc2136"` requires `server`, `zone`, and `key_name`, with optional
+`secret_env` (default `INTENDANT_RFC2136_TSIG_SECRET`), `ttl_secs` (default
+60), and `propagation_delay_secs` (default 2, maximum 3600). Provider secrets
+come from the `dns:cloudflare` / `dns:rfc2136` daemon credential lease or the
+named environment fallback, never this table. Alternate names must end in
+`_API_TOKEN` or `_TSIG_SECRET` respectively so they remain excluded from
+runtime children; custom names cannot occupy the reserved `INTENDANT_`
+namespace. See
+[Your Fleet, Your Name](./custom-domain.md) for CNAME, CAA account pinning,
+and passkey enrollment.
 
 `INTENDANT_CONNECT_RELAY_ENDPOINT` force-enables the relay tunnel and sets
 `relay_endpoint`. The relay is availability-only: it never terminates TLS,
@@ -409,6 +485,16 @@ rendezvous_url = "https://connect.intendant.dev"
 daemon_id = "vortex-deb-x11-intendant"
 auth_token = "same daemon token configured on intendant-connect"
 hosted_control_enabled = false
+
+[connect.custom_domain]
+enabled = false
+name = "box.example.com"
+acme_issuance_enabled = false
+
+[connect.custom_domain.dns]
+provider = "cloudflare"
+zone_id = "your-zone-id"
+token_env = "CLOUDFLARE_API_TOKEN"
 ```
 
 The service is a separate binary:
@@ -552,8 +638,14 @@ The service accepts these deployment flags and equivalent environment variables:
 | `INTENDANT_CONNECT_STATIC_ROOT` | `--static-root` | ignored | Deprecated compatibility input. Accepted but never read or mounted; Connect serves only its explicit embedded allowlist |
 | `INTENDANT_CONNECT_DATA_FILE` | `--data-file` | platform data dir `intendant/connect/state.json` | JSON state file |
 | `INTENDANT_CONNECT_TOKEN` | `--daemon-token` | unset | Shared deployment bearer for registration unless open registration is enabled; still guards admin surfaces. It does not replace the daemon's signed registration proof or rotating daemon-session credential |
+| `INTENDANT_CONNECT_RELEASE_TOKEN` | `--release-token` | unset | Dedicated bearer for `POST /api/log/release-manifest`. Deliberately separate from the operator/admin daemon token; without it, release-manifest submission returns 503 |
 | `INTENDANT_CONNECT_INVITE_REQUIRED` | `--invite-required` | `false` | Require a valid invite code for new account registration |
 | `INTENDANT_CONNECT_OPEN_REGISTRATION` | `--open-registration` | `false` | Skip only the shared deployment bearer on registration. Daemons still sign a fresh key-possession proof, and successful registration rotates a short-lived daemon-session credential required by poll/answer/error/dry/claim-proof endpoints |
+| `INTENDANT_CONNECT_DNS_ZONE` | `--dns-zone` | unset | Delegated fleet DNS zone. Must be configured together with `INTENDANT_CONNECT_DNS_NS_NAME` and `INTENDANT_CONNECT_DNS_LISTEN` |
+| `INTENDANT_CONNECT_DNS_NS_NAME` | `--dns-ns-name` | unset | Authoritative nameserver host served in the fleet-zone apex SOA/NS records |
+| `INTENDANT_CONNECT_DNS_LISTEN` | `--dns-listen` | unset | UDP+TCP bind address for the embedded authoritative DNS server |
+| `INTENDANT_CONNECT_RELAY_LISTEN` | `--relay-listen` | unset | Raw TCP bind address for the TLS/SNI passthrough relay. Must be configured together with at least one relay address |
+| `INTENDANT_CONNECT_RELAY_ADDRESS` | `--relay-address` | unset | Comma-separated public IP list published for relay-mode fleet DNS |
 
 The service also accepts environment-only operational overrides for
 self-hosting and tests:
@@ -617,7 +709,9 @@ node scripts/connect-transport-e2e.cjs
 
 ### `[server]` (daemon and federation)
 
-What this daemon advertises to peers and requires of inbound connections. Most
+What this daemon advertises to peers and requires of inbound connections.
+Those are related but independently configured; in particular the Agent
+Card's advertised transport is not inferred from the gateway's TLS mode. Most
 deployments only ever touch `[server.tls]`.
 
 `[server]`:
@@ -631,12 +725,14 @@ deployments only ever touch `[server.tls]`.
 `rustls` + `rcgen`, all platforms; ORed with the `--tls` flag). The dashboard
 defaults to mTLS. This section supplies HTTPS/WSS and a browser secure context,
 but it does not give a certless remote browser daemon authority: only loopback
-certless requests receive the local-root posture, and protected remote
-HTTP/WebSocket/control requests still require mTLS:
+certless requests receive the local-root posture. TLS-only mode does not load a
+client CA, so protected remote HTTP/WebSocket/control requests are denied unless
+they carry a separately authenticated peer or hosted-lease identity; use the
+default mTLS mode when client-certificate authentication is required:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable HTTPS/WSS; certless access is local-root only on loopback, while remote protected routes still require mTLS |
+| `enabled` | bool | `false` | Enable TLS-only HTTPS/WSS. Certless access is local-root only on loopback; remote protected routes require an authenticated peer/hosted-lease identity and ordinary client certificates cannot authenticate because this mode loads no client CA |
 | `cert` | string | installed access certs, then auto self-signed | PEM cert (chain) overriding the default cert selection; pair with `key` |
 | `key` | string | — | PEM private key (PKCS#8, PKCS#1, or SEC1) matching `cert` |
 | `hostname` | string | — | Extra SAN hostname for the self-signed cert (in addition to bind IP + `localhost`) |
@@ -652,7 +748,7 @@ certificate.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Explicitly require browser/client certificates during the TLS handshake; default behavior already does this unless `--tls` / `[server.tls]` or `--no-tls` is used |
+| `enabled` | bool | `false` | Enable client-certificate authentication (also the default dashboard transport unless `--tls` / `[server.tls]` or `--no-tls` is used). TLS accepts a certless handshake so public shell/discovery bytes remain reachable; protected HTTP routes and every ordinary WebSocket then require a CA-verified client certificate or another authenticated peer/hosted-lease identity |
 | `ca` | string | installed access CA | PEM CA bundle used to verify client certificates |
 
 Use `[server.tls]` for a secure context on loopback or for public/bootstrap
@@ -703,6 +799,12 @@ locally before any client certificate is issued. Set
 | `advertised_transport` | string | `none` | What the Agent Card advertises: `none`, `mutual-tls`, or `pin-self-cert` |
 | `bearer_token` | string | none | Legacy/advanced: require `Authorization: Bearer <token>` on inbound HTTP/WS; prefer mTLS/client certificates for normal access |
 
+`advertised_transport` is declarative rather than derived. Its compatibility
+default remains `none` even though the dashboard gateway now defaults to mTLS.
+Federation deployments using that default gateway must set
+`advertised_transport = "mutual-tls"` (or `pin-self-cert`) so the Agent Card
+does not understate what a connecting peer must present.
+
 ### `[[peer]]` — federated peers
 
 Each `[[peer]]` block auto-registers a remote daemon at startup. Only `card_url`
@@ -718,6 +820,7 @@ is required.
 | `client_key` | string | installed access client key when present | Private key PEM for `client_cert`; must be paired with `client_cert` |
 | `pinned_fingerprints` | array | `[]` | Operator-pinned SHA-256 cert fingerprints; when set, replaces the card's `auth.transport` claim |
 | `browser_tcp_via_url` | string | from primary | Explicit URL the browser uses to reach this peer's HTTP port for WebRTC ICE-TCP |
+| `certificate_witness_vantage` | `unknown`, `same_lan`, or `remote` | `unknown` | Local operator statement about this daemon's network relationship to the peer for certificate-witness weighting. Set `remote` only for an independently operated outside-network observer; public destination addresses are not sufficient. |
 
 Manual dashboard additions live only in the in-memory registry unless the
 operator checks **Save to intendant.toml**. Pairing flows are durable by default:
@@ -755,11 +858,12 @@ Schema version 3 contains:
 | `schema_version` | State schema version; currently `3` |
 | `principals` | Local managed human/device principal records |
 | `roles` | Built-in or local role templates |
-| `grants` | Local IAM grant records targeting daemon IDs (optional `expires_at_unix_ms` stops enforcement after that instant; shown as `expired`) |
+| `grants` | Local IAM grant records targeting daemon IDs. Optional `expires_at_unix_ms` stops enforcement after that instant (shown as `expired`); `issued_via` records a delegated org issuer, and `fs_scope` confines mediated file reads/writes to normalized roots |
 | `audit_events` | Local IAM audit metadata |
 | `role_ceilings` | Per-binding-kind effective-role caps for low-provenance sessions (see below) |
 | `hosted_origins` | Origins treated as hosted app sources when recorded on client-key bindings |
 | `trusted_orgs` | Organizations whose signed grant documents this daemon accepts, each with a local `max_role` cap (implemented; see [Trust Architecture](./trust-architecture.md)) |
+| `tier` | Optional owner-selected daemon trust tier (`integrated` or `disposable`). It informs doctrine and UI warnings but grants or denies nothing by itself |
 | `hosted_control` | Daemon-local hosted policy, pending doorbells, active/recent lease records, and qualifying signed-app anchors. Defaults to a Tasks ceiling and empty request/lease/anchor sets |
 
 The daemon loads this file into `/api/access/overview` under the `iam` object
@@ -855,10 +959,13 @@ grants. New mixed-version attempts are blocked at both service and daemon.
 
 The enforced built-in user/client roles are `role:scoped-human`,
 `role:observer`, `role:session-reader`, `role:terminal`, `role:files-read`,
-`role:files-write`, `role:operator`, and `role:root`. `role:peer-profile` is
-visible in the same Access overview so daemon peer grants and human grants can
-be compared, but it is daemon-to-daemon only and cannot be assigned to a
-browser certificate or Connect account.
+`role:files-write`, `role:peer-user`, `role:operator`, and `role:root`.
+`role:peer-user` admits this principal to the local daemon's peer-routed
+terminal/file/display surfaces; the target peer still authorizes each tunnel
+under this daemon's grant there. `role:peer-profile` is visible in the same
+Access overview so daemon peer grants and human grants can be compared, but it
+is daemon-to-daemon only and cannot be assigned to a browser certificate or
+Connect account.
 
 Hosted leases use three reserved compiled role ids:
 `role:hosted-view`, `role:hosted-tasks`, and `role:hosted-operate`. Their
@@ -904,9 +1011,6 @@ an array-of-tables entry.
 A reasonably full `intendant.toml`:
 
 ```toml
-[memory]
-enabled = true
-
 [model]
 context_window = 200000
 max_output_tokens = 8192
@@ -922,6 +1026,7 @@ command_exec = "auto"
 network = "auto"
 destructive = "ask"
 display_control = "ask"
+tool_call = "ask"
 
 [presence]
 enabled = true
@@ -980,8 +1085,9 @@ openai_model = "gpt-4o-realtime-preview"
 sample_rate = 24000
 
 [sandbox]
-enabled = false
-extra_write_paths = ["/var/log"]
+# Omit `enabled` for the platform default (on macOS/Linux, off Windows).
+# enabled = true
+extra_write_paths = []
 
 [webrtc]
 federation_allow_h264 = false
@@ -1013,6 +1119,7 @@ advertised_transport = "none"
 # client_cert = "/etc/intendant/peers/peer-client.crt"
 # client_key = "/etc/intendant/peers/peer-client.key"
 # bearer_token = "legacy-token-if-the-peer-requires-one"
+# certificate_witness_vantage = "remote" # only for a known outside-network peer
 
 [[mcp_servers]]
 name = "filesystem"
@@ -1035,26 +1142,34 @@ Approval is decided by a three-layer model (full UI details in
 
 1. **Global autonomy** — `--autonomy <low|medium|high|full>` (defaults to
    `medium`). `low` asks for everything except file reads; `full` keeps the
-   human entirely out of the loop (auto-approve) except for `HumanInput`.
+   human entirely out of the loop (auto-approve) except for `HumanInput` and
+   `LiveAudioSpawn`.
 2. **Category rules** — the `[approval]` section above (`auto`/`ask`/`deny`) per
-   category.
+   category. Arbitrary shell execution inherits the strictest rule of every
+   effect it can reach.
 3. **Per-action approval** — `y` / `s` / `a` / `n` (approve / skip / approve-all
    / deny) prompts in any frontend.
 
-The nine action categories are: `FileRead`, `FileWrite`, `FileDelete`,
+The ten action categories are: `FileRead`, `FileWrite`, `FileDelete`,
 `CommandExec`, `NetworkRequest`, `Destructive`, `HumanInput`, `LiveAudioSpawn`,
-`DisplayControl`. `DisplayControl` uses a session-grant model — approve once and
-subsequent display actions skip the prompt (revocable in-frontend).
+`DisplayControl`, `ToolCall`. `DisplayControl` uses a session-grant model —
+approve once and subsequent display actions skip the prompt (revocable
+in-frontend).
 `HumanInput` and `LiveAudioSpawn` always require a human regardless of autonomy
 level or category rule.
 
 ## Skills
 
 Skills are named instruction sets stored as `SKILL.md` files with YAML
-frontmatter, discovered from two directories (project-scoped first):
+frontmatter. Discovery checks these locations in order; the first skill with a
+given name wins:
 
-1. `<project-root>/.intendant/skills/<name>/SKILL.md`
-2. `~/.intendant/skills/<name>/SKILL.md`
+1. `<project-root>/.agents/skills/<name>/SKILL.md` (Agent Skills standard)
+2. `<project-root>/.intendant/skills/<name>/SKILL.md` (legacy project path)
+3. `<project-root>/skills/<name>/SKILL.md` (visible repository path)
+4. `~/.agents/skills/<name>/SKILL.md` (personal standard path)
+5. `<state-root>/skills/<name>/SKILL.md` (legacy personal path; default
+   `~/.intendant/skills`)
 
 ```yaml
 ---
@@ -1083,7 +1198,8 @@ take precedence over personal skills of the same name.
 Place `INTENDANT.md` in your project root or at
 `~/.config/intendant/INTENDANT.md` for global instructions. Both are loaded if
 present (global first, project-local second) and injected into the conversation
-at session start, before knowledge/memory.
+at session start, after the working-directory context and before the skill
+catalog. Memory is pull-only and is not injected into fresh conversations.
 
 ## System prompts
 

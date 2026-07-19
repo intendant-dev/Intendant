@@ -2396,6 +2396,7 @@ version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bab31817bfb44672a252e97fe81cd0c18d1b2cf892108922f6818820df8c643"
 dependencies = [
+ "bitflags 2.11.0",
  "data-encoding",
  "idna",
  "ipnet",
@@ -2403,8 +2404,10 @@ dependencies = [
  "once_cell",
  "rand 0.10.1",
  "ring",
+ "rustls-pki-types",
  "serde",
  "thiserror 2.0.18",
+ "time",
  "tinyvec",
  "tracing",
  "url",
@@ -2912,6 +2915,7 @@ dependencies = [
  "env_logger",
  "flate2",
  "futures-util",
+ "hickory-proto",
  "hickory-server",
  "html2text",
  "image",
@@ -2960,6 +2964,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "uuid",
+ "webpki-roots",
  "which 8.0.2",
  "windows 0.59.0",
  "x509-parser 0.18.1",
@@ -5866,9 +5871,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.9.8"
+version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "spirv"

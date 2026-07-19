@@ -24,6 +24,9 @@ Every real deployment decision sits on two independent axes:
   cannot authenticate to that daemon. An owner may separately enable the
   [hosted-control lane](./hosted-control.md), where a disposable fleet-origin
   tab borrows only a short-lived, confirmed lease under a compiled preset.
+  The opt-in [user-owned-name lane](./custom-domain.md) binds WebAuthn and the
+  daemon's ACME account to an exact owner-controlled name, while retaining the
+  same bounded presets and immutable floor.
   Root-capable control starts with code whose provenance you accept: a
   dashboard served by a daemon you own over loopback or an independently
   fingerprint-verified direct-mTLS route (the
@@ -141,7 +144,7 @@ Getting a direct control origin today: use a typed/pinned address, an
 owner-controlled hostname, mDNS or a tailnet route, then complete the direct
 mTLS enrollment ceremony. The fleet strip may remember that independently
 verified URL, and the daemon-store vault
-([Credential Custody](./credential-custody.md#the-vault)) makes the trusted
+([Credential Custody](./credential-custody.md#custody-the-vault)) makes the trusted
 tab self-sufficient.
 
 **Fleet certificates are different.** A rendezvous serving a delegated DNS subzone
@@ -149,15 +152,30 @@ tab self-sufficient.
 gives each daemon a real name, and the Connect card's *Enable HTTPS
 discovery* button publishes the daemon's addresses (LAN included — no
 port forwarding needed) and mints a Let's Encrypt certificate via DNS-01,
-renewed automatically, private keys never leaving the machine. With hosted
-control off, that gives a warning-free public shell/discovery endpoint. With it
-on, unproved fleet traffic remains anonymous `role:none`; protected traffic
-must prove an approved short-lived lease and pass the exact
+renewed automatically, private keys never leaving the machine. Issuance intent
+is recorded durably before ACME begins, so a crash before the first
+certificate pair is committed remains retryable. The active order URL, CSR,
+and certificate private key are journaled before finalization; an ambiguous
+finalize or certificate-poll result resumes the same order. A live issuance
+owner renews its lease through network waits and defers CT classification only
+inside the pre-ledger commit window; dormant resumable orders remain
+recoverable while CT evidence is reconciled normally. Before opening a new
+order, a process adopts any sibling-committed exact-name pair that is already
+outside the renewal window and refreshes its process-local TLS resolver. Pair
+and own-certificate
+ledger reads and replacements share the daemon
+authority-store lock; restored and newly issued certificates must name the
+current exact fleet origin. With
+hosted control off, that gives a warning-free public shell/discovery endpoint.
+With it on, unproved fleet traffic remains anonymous `role:none`; protected
+traffic must prove an approved short-lived lease and pass the exact
 route/method/frame/action projection. The rendezvous controls the name and can
 serve code at the same origin, so the lease ceiling and immutable floor—not the
-name—bound that code. CT monitoring is the current slower detection fallback;
-the peer and signed-app outside-vantage witnesses remain planned work. None
-of those signals grants authority. Certless root exists only on verified
+name—bound that code. Peer certificate witnesses are shipped. The
+signed-application witness protocol may also report when a qualifying signed
+distribution exists, but the current unsigned development artifact is never
+eligible. CT remains the slower fallback when no outside vantage is available.
+None of those signals grants authority. Certless root exists only on verified
 loopback; `--allow-public-plaintext` and fleet WebPKI grant no authority by
 themselves.
 
@@ -203,10 +221,11 @@ Three rungs, ordered by what betrayal costs the attacker:
    fleet SNI like the hosted tab for authority: public shell and discovery
    bytes only. The optional hosted lane does not promote the origin; it admits
    only a confirmed, short-lived lease under a compiled preset, while all
-   unproved protected HTTP/MCP/signaling/WebSocket traffic remains refused. CT
-   is the current fallback detection signal; peer and enrolled signed-app
-   witnesses remain planned. Detection is not authority. Assigned fleet
-   names are remembered
+   unproved protected HTTP/MCP/signaling/WebSocket traffic remains refused.
+   Peer witnessing is shipped, an eligible signed application can report only
+   when a qualifying distribution anchor exists, and CT remains the fallback
+   when neither outside vantage is available. Detection is not authority.
+   Assigned fleet names are remembered
    durably even when Connect is later disabled or reports no current zone; a
    previously service-controlled name never decays into a direct anchor.
    Pre-provenance installs recover exact names from `fleet-cert.pem` on
@@ -341,7 +360,7 @@ the owner's memory. All four are **shipped**:
    (`hosted`/`direct`/`local`/`peer`). Any future hosted vault client would need
    to honor the trusted-only policy, but that would remain client-side mistake
    prevention, not protection from a malicious served bundle. See the **local
-   vault** in [Credential Custody](./credential-custody.md#the-vault).
+   vault** in [Credential Custody](./credential-custody.md#custody-the-vault).
 4. **First-contact route, surfaced and watched.** Historical/staged enrollment approvals
    carry a route chip computed daemon-side (`iam::origin_route_class`:
    hosted / fleet / direct / unknown — route provenance for approval
@@ -350,12 +369,22 @@ the owner's memory. All four are **shipped**:
    integrated-tier warning on any network route. Fleet and hosted classes do
    not admit ordinary browser-key control; an exact hosted lease is evaluated
    separately. The **CT tripwire** is a route diagnostic: `fleet_cert`
-   records the serial of
-   every certificate it obtains (before install, so a crash cannot make
-   an own certificate look foreign), polls crt.sh for the daemon's fleet
-   name on each renewal tick, and flips the Connect card to **CT ALERT**
-   on any serial the daemon never requested. Advisory and fail-open by
-   design: a crt.sh outage stamps `ct_last_error` rather than blocking
+   records the serial of every certificate it obtains (before install, so a
+   crash cannot make an own certificate look foreign), polls crt.sh for both
+   the daemon's exact fleet identity and its one-label covering wildcard on
+   each renewal tick, then filters search results to certificate identities
+   that cover that name exactly or by that valid wildcard. Both bounded
+   searches must complete before the daemon commits a new verdict. The
+   Connect card flips to **CT ALERT** on any
+   matching serial the daemon never requested. The exact-name
+   verdict and resumable active-order journal are durable under the
+   cross-process authority lock; processes merge foreign serials instead of
+   overwriting newer evidence, and only a locally recorded own serial removes
+   one.
+   A foreign serial or unreadable durable verdict suspends hosted-lease
+   admission while leaving direct/local management and certificate renewal
+   available. A crt.sh fetch failure creates no new evidence, preserves the
+   last durable verdict, and stamps `ct_last_error` rather than blocking
    renewal.
 
 ## Two lanes: whose authority a pane spends

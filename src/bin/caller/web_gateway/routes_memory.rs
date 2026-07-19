@@ -3,10 +3,10 @@
 //! transport-neutral cores their dashboard-control tunnel twins reuse.
 //! The IAM gate (`memory.read` / `memory.write`) runs pre-dispatch off
 //! the route rows; writes funnel through the daemon's single-writer
-//! [`crate::memory::MemoryHandle`]. The plane is EPHEMERAL (the
-//! ratified P1 write bar): every view and response says so, and kernel
-//! rejections surface the reducer's named outcome/disposition verbatim
-//! in the error body (D-203 §C.2).
+//! [`crate::memory::MemoryHandle`]. Every view and response reports
+//! the effective durability mode, and kernel rejections surface the
+//! reducer's named outcome/disposition verbatim in the error body
+//! (D-203 §C.2).
 
 use super::*;
 

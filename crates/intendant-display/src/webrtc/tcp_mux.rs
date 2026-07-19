@@ -4,6 +4,7 @@
 //! minimal STUN USERNAME parser the registries route on.
 
 use super::*;
+use tokio::io::AsyncReadExt;
 
 // ---------------------------------------------------------------------------
 // TCP peer registry (ufrag → per-peer connection channel)
@@ -177,10 +178,64 @@ impl TcpPeerRegistry {
 // match), `TcpRelayRegistry::contains_ufrag` returns true, the accept
 // loop dispatches to the relay path.
 
+/// Lifetime bounds for federation relay registrations and splices.
+///
+/// A relay entry only needs to be live from the moment a peer's Answer
+/// is forwarded until the browser's ICE finishes forming the TCP
+/// candidate pair (seconds, occasionally re-formed on an ICE restart).
+/// Once the byte splice is running it no longer consults the registry,
+/// so entries past their useful window are stale weight. Expiring them
+/// closes the exposure where a registration that never expires lets any
+/// host that can reach the gateway port drive the relay indefinitely.
+const RELAY_ENTRY_TTL: Duration = Duration::from_secs(30 * 60);
+/// Ceiling on concurrently live relay registrations. Bounds how many
+/// entries a misbehaving or compromised peer can accumulate; expired
+/// entries are pruned first, and a table full of live entries refuses
+/// new *distinct* ufrags (a re-registration of an existing ufrag always
+/// succeeds — it just refreshes the session's own entry).
+const MAX_RELAY_ENTRIES: usize = 256;
+/// Max concurrent relayed TCP connections per registered ufrag. One
+/// healthy session forms a single TCP candidate pair; a small allowance
+/// covers ICE restarts and retries. Caps the open-relay blast radius of
+/// a single registration.
+const MAX_RELAY_CONNS_PER_UFRAG: usize = 8;
+/// Idle cutoff for a relayed splice: no bytes in EITHER direction for
+/// this long tears it down. Media relay is asymmetric (mostly
+/// peer→browser), so idleness is measured across both directions
+/// together, never per-direction.
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Absolute lifetime cap for a single relayed splice, regardless of
+/// activity — a backstop against a splice pinned open forever.
+const RELAY_MAX_LIFETIME: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// A live relay registration: where to dial, which signaling session it
+/// belongs to, and when it was (re-)registered (for TTL expiry).
+struct RelayEntry {
+    outbound: SocketAddr,
+    /// The signaling session this registration belongs to. A relay
+    /// entry only exists for a genuine, session-scoped Answer — the
+    /// registrar refuses to key an entry that carries no session id,
+    /// and [`TcpRelayRegistry::unregister_session`] tears the session's
+    /// entries down on Close.
+    session_id: String,
+    registered_at: Instant,
+}
+
 /// Registry of `ufrag → outbound peer address` entries for federation-
 /// level TCP relay. See the module-level comment above for flow.
 pub struct TcpRelayRegistry {
-    registry: std::sync::Mutex<HashMap<String, SocketAddr>>,
+    registry: std::sync::Mutex<HashMap<String, RelayEntry>>,
+    /// Per-ufrag count of in-flight relayed connections, so the splice
+    /// path can enforce [`MAX_RELAY_CONNS_PER_UFRAG`]. Decremented via
+    /// [`RelayConnGuard`] when a splice ends.
+    active: std::sync::Mutex<HashMap<String, usize>>,
+}
+
+/// Drop expired entries in place. Cheap `retain` — the map is bounded
+/// by [`MAX_RELAY_ENTRIES`], so this stays O(entries) on the register /
+/// lookup paths that call it.
+fn prune_expired_entries(registry: &mut HashMap<String, RelayEntry>, now: Instant) {
+    registry.retain(|_, entry| now.duration_since(entry.registered_at) < RELAY_ENTRY_TTL);
 }
 
 impl TcpRelayRegistry {
@@ -190,46 +245,78 @@ impl TcpRelayRegistry {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             registry: std::sync::Mutex::new(HashMap::new()),
+            active: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
     /// Associate a remote peer's ICE ufrag with the outbound
-    /// [`SocketAddr`] the primary will dial when it sees an incoming
-    /// TCP connection carrying that ufrag. Idempotent — re-registering
-    /// the same ufrag updates the outbound address (useful for peer
-    /// reconnects that issue a fresh Answer with a new address).
-    pub fn register(&self, ufrag: String, outbound: SocketAddr) {
-        self.registry.lock().unwrap().insert(ufrag, outbound);
+    /// [`SocketAddr`] the primary will dial for that peer's signaled
+    /// session. Re-registering the same ufrag refreshes the entry
+    /// (address, session, and TTL) — the peer-reconnect / ICE-restart
+    /// case. A new ufrag is refused once the table is full of unexpired
+    /// entries, so a peer cannot grow the registry without bound.
+    pub fn register(&self, ufrag: String, outbound: SocketAddr, session_id: String) {
+        let now = Instant::now();
+        let mut registry = self.registry.lock().unwrap();
+        prune_expired_entries(&mut registry, now);
+        if !registry.contains_key(&ufrag) && registry.len() >= MAX_RELAY_ENTRIES {
+            return;
+        }
+        registry.insert(
+            ufrag,
+            RelayEntry {
+                outbound,
+                session_id,
+                registered_at: now,
+            },
+        );
     }
 
     /// Remove a ufrag entry. Called when the corresponding federated
     /// WebRTC session closes (browser-initiated close, peer teardown,
     /// transport disconnect). Missing entries are silently ignored
     /// — idempotent cleanup.
-    #[allow(dead_code)]
     pub fn unregister(&self, ufrag: &str) {
         self.registry.lock().unwrap().remove(ufrag);
     }
 
-    /// Look up the outbound address for a ufrag. Returns `None` when
-    /// no relay entry exists (typical case for ufrags belonging to
-    /// locally-hosted WebRTC peers handled by `TcpPeerRegistry`).
-    pub fn lookup(&self, ufrag: &str) -> Option<SocketAddr> {
-        self.registry.lock().unwrap().get(ufrag).copied()
+    /// Remove every entry registered under `session_id` — the prompt
+    /// cleanup path for a signaled session's teardown (Close). The TTL
+    /// remains the guaranteed lifecycle bound when no Close arrives.
+    pub fn unregister_session(&self, session_id: &str) {
+        self.registry
+            .lock()
+            .unwrap()
+            .retain(|_, entry| entry.session_id != session_id);
     }
 
-    /// Return `true` if an entry exists for this ufrag. Non-consuming
-    /// — used by the gateway's accept loop to dispatch between local
-    /// and relay paths.
+    /// Look up the outbound address for a ufrag, skipping (and pruning)
+    /// entries past their TTL. Returns `None` when no live relay entry
+    /// exists (typical case for ufrags belonging to locally-hosted
+    /// WebRTC peers handled by `TcpPeerRegistry`).
+    pub fn lookup(&self, ufrag: &str) -> Option<SocketAddr> {
+        let now = Instant::now();
+        let mut registry = self.registry.lock().unwrap();
+        prune_expired_entries(&mut registry, now);
+        registry.get(ufrag).map(|entry| entry.outbound)
+    }
+
+    /// Return `true` if a live (unexpired) entry exists for this ufrag.
+    /// Non-consuming — used by the gateway's accept loop to dispatch
+    /// between local and relay paths.
     pub fn contains_ufrag(&self, ufrag: &str) -> bool {
-        self.registry.lock().unwrap().contains_key(ufrag)
+        let now = Instant::now();
+        let mut registry = self.registry.lock().unwrap();
+        prune_expired_entries(&mut registry, now);
+        registry.contains_key(ufrag)
     }
 
     /// Route an already-accepted STUN-framed TCP connection through
     /// the relay: dial the peer, re-frame and write the peeked first
-    /// frame, then spawn a bidirectional byte-forwarding task for the
-    /// remainder. Returns an error if the lookup misses or the
-    /// outbound connect fails — caller closes the stream in that case.
+    /// frame, then spawn a bounded bidirectional byte-forwarding task
+    /// for the remainder. Returns an error if the lookup misses, the
+    /// per-ufrag connection cap is reached, or the outbound connect
+    /// fails — caller closes the stream in that case.
     ///
     /// `first_frame` is the RFC 4571 payload (without the 2-byte length
     /// prefix) that the gateway already consumed from the stream; we
@@ -254,6 +341,13 @@ impl TcpRelayRegistry {
             .lookup(&local_ufrag)
             .ok_or_else(|| format!("no relay registered for ufrag {local_ufrag:?}"))?;
 
+        // Cap concurrent splices per ufrag before dialing anything: a
+        // single healthy session forms one candidate pair, so a peer's
+        // registration can only ever fan out to a bounded number of
+        // open relay connections. The guard decrements on splice end.
+        let guard = RelayConnGuard::acquire(self, &local_ufrag)
+            .ok_or_else(|| format!("relay connection cap reached for ufrag {local_ufrag:?}"))?;
+
         // Dial the peer. If this fails, the browser's ICE will see
         // the TCP pair as unformable and (usually) fall back to UDP
         // or time out — no retry at this layer.
@@ -268,16 +362,126 @@ impl TcpRelayRegistry {
             .await
             .map_err(|e| format!("write first frame to {outbound_addr}: {e}"))?;
 
-        // Spawn a bidirectional byte-forwarder. `copy_bidirectional`
-        // handles both directions concurrently and exits when either
-        // side closes — matches the ICE-TCP lifecycle where a single
-        // candidate pair's TCP connection lives for the WebRTC
-        // session's duration.
-        let mut stream = stream;
+        // Shuttle bytes both ways under an idle timeout and an absolute
+        // lifetime cap — an unauthenticated splice never lives longer
+        // than a real ICE-TCP session needs it to.
         tokio::spawn(async move {
-            let _ = tokio::io::copy_bidirectional(&mut stream, &mut outbound).await;
+            let _guard = guard;
+            relay_splice(stream, outbound).await;
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl TcpRelayRegistry {
+    /// Plant an entry with an explicit age, bypassing capacity/prune, so
+    /// TTL expiry can be exercised without a real clock.
+    fn register_with_age(&self, ufrag: String, outbound: SocketAddr, age: Duration) {
+        let registered_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        self.registry.lock().unwrap().insert(
+            ufrag,
+            RelayEntry {
+                outbound,
+                session_id: "test".into(),
+                registered_at,
+            },
+        );
+    }
+}
+
+/// RAII counter guard for [`TcpRelayRegistry::active`]: increments a
+/// ufrag's in-flight relay count on acquire, decrements on drop.
+struct RelayConnGuard {
+    registry: Arc<TcpRelayRegistry>,
+    ufrag: String,
+}
+
+impl RelayConnGuard {
+    /// Acquire a slot for `ufrag`, or `None` if it is already at
+    /// [`MAX_RELAY_CONNS_PER_UFRAG`] in-flight connections.
+    fn acquire(registry: &Arc<TcpRelayRegistry>, ufrag: &str) -> Option<Self> {
+        let mut active = registry.active.lock().unwrap();
+        let count = active.entry(ufrag.to_string()).or_insert(0);
+        if *count >= MAX_RELAY_CONNS_PER_UFRAG {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            registry: Arc::clone(registry),
+            ufrag: ufrag.to_string(),
+        })
+    }
+}
+
+impl Drop for RelayConnGuard {
+    fn drop(&mut self) {
+        let mut active = self.registry.active.lock().unwrap();
+        if let Some(count) = active.get_mut(&self.ufrag) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&self.ufrag);
+            }
+        }
+    }
+}
+
+/// Copy one direction of a relay splice, recording activity so the
+/// bidirectional idle watchdog can see it. `last_activity_ms` holds the
+/// elapsed-milliseconds (relative to `start`) of the most recent byte
+/// moved in EITHER direction.
+async fn relay_copy_direction<R, W>(
+    mut reader: R,
+    mut writer: W,
+    last_activity_ms: &AtomicU64,
+    start: Instant,
+) where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        last_activity_ms.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+        if writer.write_all(&buf[..n]).await.is_err() {
+            break;
+        }
+    }
+    let _ = writer.shutdown().await;
+}
+
+/// Bidirectionally shuttle bytes between the browser stream and the
+/// dialed peer stream until either side closes, the connection goes idle
+/// for [`RELAY_IDLE_TIMEOUT`], or it reaches [`RELAY_MAX_LIFETIME`].
+/// Dropping the streams on return closes both sockets, unblocking the
+/// other direction.
+async fn relay_splice(mut browser: TcpStream, mut peer: TcpStream) {
+    let start = Instant::now();
+    let last_activity_ms = AtomicU64::new(0);
+    let (browser_read, browser_write) = browser.split();
+    let (peer_read, peer_write) = peer.split();
+    let browser_to_peer = relay_copy_direction(browser_read, peer_write, &last_activity_ms, start);
+    let peer_to_browser = relay_copy_direction(peer_read, browser_write, &last_activity_ms, start);
+    let lifetime = tokio::time::sleep(RELAY_MAX_LIFETIME);
+    tokio::pin!(browser_to_peer, peer_to_browser, lifetime);
+    let idle_ms = RELAY_IDLE_TIMEOUT.as_millis() as u64;
+    loop {
+        let idle_tick = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
+        tokio::pin!(idle_tick);
+        tokio::select! {
+            _ = &mut browser_to_peer => break,
+            _ = &mut peer_to_browser => break,
+            _ = &mut lifetime => break,
+            _ = &mut idle_tick => {
+                let elapsed = start.elapsed().as_millis() as u64;
+                if elapsed.saturating_sub(last_activity_ms.load(Ordering::Relaxed)) >= idle_ms {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -291,10 +495,10 @@ impl TcpRelayRegistry {
 /// which is a malformed SDP per RFC 5245 — callers treat it as
 /// "this Answer isn't relay-able, skip the rewrite."
 ///
-/// Exposed publicly so the `OutboundEvent` translator in
-/// `web_gateway.rs` can extract the ufrag from an incoming federated
-/// `WebRtcSignal::Answer` and register it in [`TcpRelayRegistry`]
-/// keyed to the outbound peer address.
+/// Exposed publicly so the gateway's federated-answer translator in
+/// `web_gateway/peer_requests.rs` can extract the ufrag from an incoming
+/// `WebRtcSignal::Answer` and register it in [`TcpRelayRegistry`] keyed to
+/// the outbound peer address.
 pub fn parse_sdp_ice_ufrag(sdp: &str) -> Option<String> {
     for line in sdp.lines() {
         let line = line.trim_end_matches('\r');
@@ -711,7 +915,7 @@ mod tests {
         let addr = SocketAddr::new(Ipv4Addr::new(192, 168, 64, 3).into(), 8765);
         assert!(!reg.contains_ufrag("abc"));
         assert_eq!(reg.lookup("abc"), None);
-        reg.register("abc".into(), addr);
+        reg.register("abc".into(), addr, "session-1".into());
         assert!(reg.contains_ufrag("abc"));
         assert_eq!(reg.lookup("abc"), Some(addr));
         reg.unregister("abc");
@@ -729,8 +933,68 @@ mod tests {
         let reg = TcpRelayRegistry::new();
         let a1 = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 8765);
         let a2 = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), 9090);
-        reg.register("same-ufrag".into(), a1);
-        reg.register("same-ufrag".into(), a2);
+        reg.register("same-ufrag".into(), a1, "session-1".into());
+        reg.register("same-ufrag".into(), a2, "session-1".into());
         assert_eq!(reg.lookup("same-ufrag"), Some(a2));
+    }
+
+    /// Entries past their TTL are treated as absent (and pruned on the
+    /// next touch): a registration cannot outlive its signaling session
+    /// and become a standing open-relay hook.
+    #[test]
+    fn tcp_relay_registry_expires_stale_entries() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let reg = TcpRelayRegistry::new();
+        let addr = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 9).into(), 8765);
+        reg.register_with_age("fresh".into(), addr, Duration::from_secs(1));
+        reg.register_with_age(
+            "stale".into(),
+            addr,
+            RELAY_ENTRY_TTL + Duration::from_secs(1),
+        );
+        assert!(reg.contains_ufrag("fresh"));
+        assert_eq!(reg.lookup("fresh"), Some(addr));
+        assert!(!reg.contains_ufrag("stale"));
+        assert_eq!(reg.lookup("stale"), None);
+    }
+
+    /// A full table of live entries refuses a new distinct ufrag, but
+    /// re-registering an existing ufrag (session refresh) still works.
+    #[test]
+    fn tcp_relay_registry_caps_distinct_entries() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let reg = TcpRelayRegistry::new();
+        let addr = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 8765);
+        for i in 0..MAX_RELAY_ENTRIES {
+            reg.register(format!("ufrag-{i}"), addr, "session".into());
+        }
+        assert!(reg.contains_ufrag("ufrag-0"));
+        // A new distinct ufrag is refused while the table is full.
+        reg.register("overflow".into(), addr, "session".into());
+        assert!(!reg.contains_ufrag("overflow"));
+        // Refreshing an already-present ufrag is always accepted.
+        let addr2 = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), 9090);
+        reg.register("ufrag-0".into(), addr2, "session".into());
+        assert_eq!(reg.lookup("ufrag-0"), Some(addr2));
+    }
+
+    /// The per-ufrag connection guard caps in-flight splices and frees
+    /// the slot on drop.
+    #[test]
+    fn relay_conn_guard_caps_per_ufrag() {
+        let reg = TcpRelayRegistry::new();
+        let mut guards = Vec::new();
+        for _ in 0..MAX_RELAY_CONNS_PER_UFRAG {
+            guards.push(RelayConnGuard::acquire(&reg, "u").expect("under cap"));
+        }
+        assert!(
+            RelayConnGuard::acquire(&reg, "u").is_none(),
+            "cap must refuse the extra connection"
+        );
+        // A different ufrag has its own independent budget.
+        assert!(RelayConnGuard::acquire(&reg, "other").is_some());
+        // Freeing one slot lets a new connection through.
+        guards.pop();
+        assert!(RelayConnGuard::acquire(&reg, "u").is_some());
     }
 }

@@ -114,6 +114,9 @@ function appendSessionWindowActionMenuItem(parent, action, codex = false) {
 // fields; a no-op once real entries exist.
 function renderSessionWindowLogPlaceholder(win) {
   if (!win || !win.log) return;
+  // Minimized windows keep their transcript unmounted (data-only appends;
+  // see setSessionWindowMinimized) — the placeholder is transcript DOM too.
+  if (win.minimized) return;
   const existing = win.log.querySelector('.session-window-empty');
   // Real entries present: never stomp them (placeholder is gone already).
   if (win.log.childElementCount > (existing ? 1 : 0)) return;
@@ -150,6 +153,14 @@ function renderSessionWindowLogPlaceholder(win) {
       }
     });
     box.appendChild(retry);
+    // The reason itself, visible — "session not found (404)" beats a
+    // generic line whose cause hides in a tooltip nobody hovers. Quiet
+    // full-width secondary line; the tooltip keeps the untruncated text.
+    const reason = document.createElement('span');
+    reason.className = 'session-window-empty-reason';
+    reason.textContent = errorText;
+    reason.title = errorText;
+    box.appendChild(reason);
   } else if (hydrating) {
     box.classList.add('session-window-empty-loading');
     box.textContent = 'Loading transcript…';
@@ -683,16 +694,51 @@ function toggleSessionWindowHeaderCollapsed(sessionId) {
   setSessionWindowHeaderCollapsed(sid, !win.headerCollapsed);
 }
 
+// Minimize UNMOUNTS the transcript children — a minimized card used to
+// keep its whole rendered window (up to SESSION_WINDOW_RENDER_LIMIT
+// entries) mounted under display:none, so auto-minimized done sub-agents
+// and the Collapse-all sweep saved nothing. The data plane is untouched:
+// win.logHistory keeps accumulating through the ordinary append paths
+// (which go data-only via the win.minimized guards in
+// renderSessionWindowRange / renderSessionWindowTail /
+// appendSessionWindowRenderedTailItem(s)), so restore loses nothing —
+// it re-materializes the visible tail from the history records and lands
+// at the bottom (the existing jump-bottom behavior).
+function unmountSessionWindowTranscript(win) {
+  if (!win || !win.log) return;
+  win.log.replaceChildren();
+  // Nothing is mounted: an empty range at the head is the honest render
+  // state (restore re-renders via renderSessionWindowRange, which has no
+  // early-out, so there is no stale-match hazard).
+  win.renderStart = 0;
+  win.renderEnd = 0;
+}
+
+function restoreSessionWindowTranscript(win) {
+  if (!win || !win.log) return;
+  const history = ensureSessionWindowHistory(win);
+  renderSessionWindowRange(win, sessionWindowTailStart(history.length));
+  win.followOutput = true;
+  win.pendingOutput = false;
+  updateSessionWindowJumpButton(win);
+  scheduleSessionWindowScrollToBottom(win);
+}
+
 function setSessionWindowMinimized(sessionId, minimized) {
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win) return;
+  const wasMinimized = !!win.minimized;
   win.minimized = !!minimized;
   if (win.minimized && maximizedSessionWindowId === sid) {
     maximizedSessionWindowId = '';
     updateSessionWindowMaximizeState();
   }
   updateSessionWindowMinimizeState(sid);
+  if (win.minimized !== wasMinimized) {
+    if (win.minimized) unmountSessionWindowTranscript(win);
+    else restoreSessionWindowTranscript(win);
+  }
   refreshSessionWindowPathLabels(win);
   applySessionWindowGridHeight();
   scheduleSessionRelationshipRender();
@@ -734,14 +780,26 @@ function sessionWindowIsDoneSubagent(sessionId) {
   return sessionWindowIsSubagent(sid) && !sessionRelationshipSubagentIsActive(sid);
 }
 
-// The AUTO rule demands HARD done-evidence — ended, or phase
-// done/interrupted. Bare 'idle' is deliberately NOT enough here: replayed
-// windows are built at 'idle' before their real phase arrives
-// (onSessionStarted during log replay, when update_status_bar is not
-// applied), and waiting_followup normalizes to 'idle' — auto-collapsing
-// either would hide a live window. The bulk pill uses the broader badge
-// predicate above: an explicit click may collapse idle-parked sub-agents
-// too.
+// HARD done-evidence — ended, or phase done/interrupted. Bare 'idle' is
+// deliberately NOT enough: replayed windows are built at 'idle' before
+// their real phase arrives (onSessionStarted during log replay, when
+// update_status_bar is not applied), and waiting_followup normalizes to
+// 'idle' — treating either as done would target a live window. Shared by
+// the sub-agent auto-minimize derivation below and the "Hide done" bulk
+// sweep, which applies it to ANY window (top-level sessions included).
+function sessionWindowHasHardDoneEvidence(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win) return false;
+  const meta = sessionMetadataById.get(sid) || {};
+  const phase = normalizeSessionPhase(win.phase || meta.phase || '');
+  return !!(win.ended || meta.ended) || phase === 'done' || phase === 'interrupted';
+}
+
+// The AUTO rule demands HARD done-evidence
+// (sessionWindowHasHardDoneEvidence above — never bare 'idle'). The
+// "Minimize done" bulk pill uses the broader badge predicate instead:
+// an explicit click may collapse idle-parked sub-agents too.
 //
 // User intent always wins: a maximized window is never touched, and a
 // window the user explicitly restored while done (userRestoredWhileDone —
@@ -765,11 +823,7 @@ function maybeAutoMinimizeSubagentWindow(sessionId) {
   }
   if (win.minimized || win.userRestoredWhileDone) return;
   if (maximizedSessionWindowId === sid) return;
-  const meta = sessionMetadataById.get(sid) || {};
-  const phase = normalizeSessionPhase(win.phase || meta.phase || '');
-  const hardDone = !!(win.ended || meta.ended)
-    || phase === 'done' || phase === 'interrupted';
-  if (!hardDone) return;
+  if (!sessionWindowHasHardDoneEvidence(sid)) return;
   win.autoMinimized = true;
   setSessionWindowMinimized(sid, true);
 }
@@ -792,6 +846,102 @@ function minimizeDoneSubagentWindows() {
   }
   return changed;
 }
+
+// Bulk grid sweep behind the "Collapse all / Expand all" pill
+// (ui2-activity.js owns the button): EVERY session window, not just done
+// sub-agents, so the user can drop the grid to a stack of header bars
+// and glance across all of them at once. Explicit intent, per-window
+// MANUAL semantics — exactly toggleSessionWindowMinimized's contract:
+// a collapse leaves autoMinimized false, so the done→active crossing
+// never pops open a window the user swept closed; a restore of a done
+// sub-agent is recorded (userRestoredWhileDone) so the auto-minimize
+// derivation does not immediately re-collapse it. A maximized window is
+// released by setSessionWindowMinimized itself when minimized. Returns
+// how many windows changed state.
+function setAllSessionWindowsMinimized(minimized) {
+  const target = !!minimized;
+  let changed = 0;
+  for (const [sid, win] of sessionWindows) {
+    if (!win || !!win.minimized === target) continue;
+    win.autoMinimized = false;
+    win.userRestoredWhileDone = !target && sessionWindowIsDoneSubagent(sid);
+    setSessionWindowMinimized(sid, target);
+    changed += 1;
+  }
+  return changed;
+}
+
+// Bulk header-details sweep behind the "Expand details / Collapse
+// details" pill (ui2-activity.js owns the button): flips every window's
+// click-to-expand header strip — vitals chips, git indicators, PROJ/CWD
+// paths, goal, tier, relationship strip — in one click. The OTHER axis
+// from its "Collapse all" neighbor: windows stay put, only their header
+// details open or close. Minimized windows are swept too — the class
+// flip is visually inert under .minimized and simply applies when the
+// window is restored (restore re-runs the path labels, and the vitals
+// ticker re-renders chips). Like minimized, headerCollapsed is
+// per-page-load and never persisted. Each per-window set schedules the
+// rAF-deduped relationship render, so a sweep costs one render pass.
+// Returns how many windows changed state.
+function setAllSessionWindowHeadersCollapsed(collapsed) {
+  const target = !!collapsed;
+  let changed = 0;
+  for (const [sid, win] of sessionWindows) {
+    if (!win || !!win.headerCollapsed === target) continue;
+    setSessionWindowHeaderCollapsed(sid, target);
+    changed += 1;
+  }
+  return changed;
+}
+
+// Bulk close behind the "Hide done" pill (ui2-activity.js owns the
+// button + live count): remove every hard-done window's card from this
+// dashboard through the SAME path as the × button's "Hide card" choice
+// (hideSessionWindowAction → removeSessionWindow), so side-relationship
+// cleanup, the sessionWindows map, persistence, and DOM teardown all
+// ride the existing code. Closing a card neither ends nor deletes the
+// session — it stays in the Sessions list, reopenable and replayable.
+// Scope is ANY window with hard done evidence — sub-agent or top-level —
+// and deliberately NOT bare 'idle' (an idle-parked session may still
+// continue; the "Minimize done" pill's broader idle-parked boundary
+// does not apply here). Key snapshot up front: each hide deletes from
+// sessionWindows mid-walk. Returns how many cards it closed.
+function hideDoneSessionWindows() {
+  let changed = 0;
+  for (const sid of [...sessionWindows.keys()]) {
+    if (!sessionWindowHasHardDoneEvidence(sid)) continue;
+    hideSessionWindowAction(sid);
+    changed += 1;
+  }
+  return changed;
+}
+
+// QA facade (window.qa convention): the dashboard validator's grid-pill
+// probe builds throwaway windows and reads per-window sweep state — the
+// bulk sweeps above are otherwise unreachable from the page's global
+// scope (every fragment shares one module scope). build/setMinimized
+// route through the same ensureSessionWindow / setSessionWindowMinimized
+// paths live sessions use; the readbacks are serializable snapshots.
+window.qa = Object.assign(window.qa || {}, {
+  sessionWindowSweeps: {
+    build: (sessionId, meta) => !!ensureSessionWindow(sessionId, meta || {}),
+    setMinimized: (sessionId, minimized) => setSessionWindowMinimized(sessionId, !!minimized),
+    relate: (evt) => applySessionRelationship(evt || {}),
+    windowIds: () => [...sessionWindows.keys()],
+    windowState: (sessionId) => {
+      const sid = String(sessionId || '').trim();
+      const win = sid ? sessionWindows.get(sid) : null;
+      if (!win) return null;
+      return {
+        minimized: !!win.minimized,
+        headerCollapsed: !!win.headerCollapsed,
+        minimizedClass: win.el.classList.contains('minimized'),
+        headerCollapsedClass: win.el.classList.contains('header-collapsed'),
+        hardDone: sessionWindowHasHardDoneEvidence(sid),
+      };
+    },
+  },
+});
 
 function updateSessionWindowMaximizeState() {
   const grid = document.getElementById('session-window-grid');
@@ -1695,6 +1845,24 @@ function createLogScaffold(c, extraClass) {
     entry.appendChild(anchor);
   }
   return { entry, hostId };
+}
+
+// Conversational prose vs tool/system payload, for collapse DEFAULTS:
+// prose rows (what someone SAID) start expanded wherever the length/flag
+// collapse rules fire; payload rows keep the compact collapsed default.
+// The classification derives from the same stamped vocabulary the
+// renderers and the chapter-nav classifier key on (57c-chapter-nav.js) —
+// user and steer sources, plus model-level non-reasoning rows — never a
+// parallel kind list. User rows drop tool-shaped payloads riding the
+// user role (external backends' tool results; sessionDetailToolResultShape
+// is the shared predicate — native user rows virtually never match it,
+// and a false positive merely keeps today's collapsed default).
+function isConversationalProseLog(c) {
+  if (!c) return false;
+  const source = String(c.source || '').toLowerCase();
+  if (source === 'steer') return true;
+  if (source === 'user') return !sessionDetailToolResultShape(c);
+  return c.level === 'model' && c.kind !== 'reasoning';
 }
 
 // rAF-coalesced follow for the MAIN stream (finding: interleaved layout
@@ -2697,6 +2865,25 @@ function sessionNoteAttachmentPreviews(d) {
   }));
 }
 
+// User log_entry rows can carry the same upload-ref shape
+// ({upload_id, name, mime, url}) on `attachments` — the daemon's
+// UserMessageLog lane persists what the user attached. Same strip
+// renderer as session notes, but only image refs get a thumbnail src;
+// non-image files degrade straight to the named chip instead of an
+// <img> that errors into one.
+function userLogAttachmentPreviews(d) {
+  const attachments = Array.isArray(d?.attachments) ? d.attachments : [];
+  return attachments.map(att => {
+    const image = String(att?.mime || '').toLowerCase().startsWith('image/');
+    return {
+      dataUrl: image ? (att?.url || '') : '',
+      url: att?.url || '',
+      name: att?.name || 'attachment',
+      mime: att?.mime || '',
+    };
+  });
+}
+
 // Normalize a session_note wire event (live WS or a raw replay/session-
 // detail entry) into the log-command shape renderLogEntry consumes.
 function sessionNoteLogCommand(d) {
@@ -2857,7 +3044,6 @@ function renderLogEntry(c) {
     return;
   }
   finalizeSessionCommandOutputGroups(c);
-  if (shouldSuppressAttachmentReceiptDuplicate(c)) return;
   inferSessionPhaseFromLog(c);
 
   const { entry } = createLogScaffold(c, '');
@@ -2883,6 +3069,10 @@ function renderLogEntry(c) {
   if (c.collapsible || hasImages) {
     entry.classList.add('collapsible');
     if (hasImages) _logImageStore.set(entry, c.images);
+    // Flagged long prose stays readable: collapsible (the "less" toggle
+    // remains) but expanded from the start. Image rows keep the collapsed
+    // default — expanding is what materializes the deferred gallery.
+    if (!hasImages && isConversationalProseLog(c)) entry.classList.add('expanded');
     const toggle = document.createElement('span');
     toggle.className = 'collapse-toggle';
     toggle.innerHTML = '<span class="arrow">\u25B8 more</span><span class="arrow-up">\u25BE less</span>';

@@ -1045,7 +1045,7 @@ pub(crate) async fn release_manifest_submit(
         ReleaseRecordOutcome::Duplicate { index } => (false, index),
     };
     if logged {
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
         eprintln!(
             "[connect] release manifest logged: {} ({} artifacts, {})",
             manifest.tag,
@@ -1191,6 +1191,32 @@ pub(crate) async fn orl_preflight() -> Response {
 
 pub(crate) const MAX_ORL_BULLETIN_BYTES: usize = 64 * 1024;
 
+/// Upper bound on distinct (handle, root key) records on the bulletin
+/// board. Publishes are self-certified (any fresh key can mint a new
+/// pair), so without a count bound the board — rewritten in full with the
+/// rest of the store on every persist — could grow without limit. A
+/// legitimate org occupies one record, updated in place: new pairs are
+/// refused once the board is full, updates always pass.
+pub(crate) const MAX_ORL_BULLETINS: usize = 1024;
+
+/// New (handle, root key) pairs accepted per observed source per hour.
+/// Creating an org root is a rare ceremony, so this is generous headroom;
+/// the budget slows board-fill and bounds the signature-verification CPU
+/// spent on never-seen pairs, while updates from known pairs never touch it.
+const MAX_NEW_ORL_PAIRS_PER_HOUR: u32 = 10;
+
+/// Mirrors `access::org::valid_org_handle` in the daemon (replicated like
+/// `orl_signing_payload`, and for the same reason): only a handle an org
+/// root could actually be minted under is worth a bulletin slot.
+pub(crate) fn valid_orl_handle(handle: &str) -> bool {
+    (2..=40).contains(&handle.len())
+        && handle
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !handle.starts_with('-')
+        && !handle.ends_with('-')
+}
+
 pub(crate) async fn orl_publish(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1224,6 +1250,34 @@ pub(crate) async fn orl_publish(
     let seq = list.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
     if handle.is_empty() || root_key.is_empty() {
         return Err(ApiError::bad_request("missing org handle or root key"));
+    }
+    if !valid_orl_handle(&handle) {
+        return Err(ApiError::bad_request(
+            "org handle must be 2..=40 ASCII lowercase letters, digits, or '-', \
+             with no leading or trailing '-'",
+        ));
+    }
+    let known_pair = state
+        .store
+        .lock()
+        .await
+        .orl_bulletins
+        .iter()
+        .any(|b| b.handle == handle && b.root_key == root_key);
+    if !known_pair {
+        // Updates from an org already on the board must not spend the
+        // creation budget. Never-seen pairs are separately bounded per
+        // observed source, deliberately BEFORE signature verification: the
+        // budget bounds verification CPU as well as record creation
+        // (mirrors the daemon_register new-identity budget).
+        check_rate_limit(
+            &state,
+            &headers,
+            "orl_publish_new_org",
+            MAX_NEW_ORL_PAIRS_PER_HOUR,
+            60 * 60_000,
+        )
+        .await?;
     }
     let payload = orl_signing_payload(&list)
         .ok_or_else(|| ApiError::bad_request("malformed revocation list"))?;
@@ -1263,6 +1317,14 @@ pub(crate) async fn orl_publish(
         }
         changed
     } else {
+        // Never-seen pair: bound the board. Checked under the same lock as
+        // the push (the pre-verification probe above only routes the
+        // creation budget), so concurrent first publishes cannot overshoot.
+        if store.orl_bulletins.len() >= MAX_ORL_BULLETINS {
+            return Err(ApiError::too_many_requests(
+                "org revocation bulletin capacity is full",
+            ));
+        }
         store.orl_bulletins.push(OrlBulletinRecord {
             handle: handle.clone(),
             root_key: root_key.clone(),
@@ -1278,7 +1340,7 @@ pub(crate) async fn orl_publish(
             "org_orl_published",
             json!({ "handle": handle, "root_key": root_key, "seq": seq }),
         );
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
     }
     Ok(orl_cors(
         Json(json!({ "ok": true, "stored": stored, "seq": seq })).into_response(),
@@ -1966,6 +2028,157 @@ mod tests {
         assert_eq!(
             keypair.public_key().as_ref(),
             reloaded.public_key().as_ref()
+        );
+    }
+
+    // ── ORL bulletin board bounds ───────────────────────────────────────
+
+    fn orl_test_key() -> ring::signature::Ed25519KeyPair {
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
+    }
+
+    fn orl_root_key_b64u(key: &ring::signature::Ed25519KeyPair) -> String {
+        use ring::signature::KeyPair as _;
+        b64u(key.public_key().as_ref())
+    }
+
+    fn signed_orl_list(
+        key: &ring::signature::Ed25519KeyPair,
+        handle: &str,
+        seq: u64,
+    ) -> serde_json::Value {
+        let mut list = json!({
+            "v": 1,
+            "kind": "org-revocations",
+            "org": { "handle": handle, "root_key": orl_root_key_b64u(key) },
+            "seq": seq,
+            "revoked_grant_ids": ["grant-1"],
+            "revoked_subjects": [],
+            "revoked_issuer_keys": [],
+            "issued_at_unix_ms": 1,
+        });
+        let payload = orl_signing_payload(&list).expect("signable list");
+        list["sig"] = json!(b64u(key.sign(&payload).as_ref()));
+        list
+    }
+
+    async fn publish_orl(state: &Arc<AppState>, list: serde_json::Value) -> ApiResult<Response> {
+        orl_publish(State(state.clone()), HeaderMap::new(), Json(list)).await
+    }
+
+    #[tokio::test]
+    async fn orl_publish_rejects_handles_an_org_root_could_not_mint() {
+        let root = tempfile::tempdir().unwrap();
+        let state = production_router_test_state(root.path(), Store::default());
+        let key = orl_test_key();
+        let too_long = "h".repeat(41);
+        for bad in [
+            "Upper",
+            "under_score",
+            "-lead",
+            "trail-",
+            "x",
+            too_long.as_str(),
+        ] {
+            let err = publish_orl(&state, signed_orl_list(&key, bad, 1))
+                .await
+                .unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "handle {bad:?}");
+        }
+        assert!(state.store.lock().await.orl_bulletins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn orl_publish_bounds_the_board_and_always_accepts_updates_within_caps() {
+        let root = tempfile::tempdir().unwrap();
+        let key = orl_test_key();
+        let mut store = Store::default();
+        // Fill the board to capacity: fillers plus one real pair that keeps
+        // publishing while the board is full.
+        for index in 0..MAX_ORL_BULLETINS - 1 {
+            store.orl_bulletins.push(OrlBulletinRecord {
+                handle: format!("org-{index}"),
+                root_key: format!("filler-key-{index}"),
+                seq: 1,
+                list: json!({}),
+                updated_unix_ms: 0,
+            });
+        }
+        store.orl_bulletins.push(OrlBulletinRecord {
+            handle: "real-org".to_string(),
+            root_key: orl_root_key_b64u(&key),
+            seq: 2,
+            list: json!({}),
+            updated_unix_ms: 0,
+        });
+        let state = production_router_test_state(root.path(), store);
+
+        // An update from an org already on the board passes at capacity.
+        publish_orl(&state, signed_orl_list(&key, "real-org", 3))
+            .await
+            .expect("update at capacity must pass");
+        // Rollback stays refused.
+        let err = publish_orl(&state, signed_orl_list(&key, "real-org", 2))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        // An identical republish is deduplicated: no growth, no log append.
+        let log_len = state.store.lock().await.log_entries.len();
+        publish_orl(&state, signed_orl_list(&key, "real-org", 3))
+            .await
+            .expect("same-seq republish is acknowledged");
+        {
+            let store = state.store.lock().await;
+            assert_eq!(store.log_entries.len(), log_len);
+            assert_eq!(store.orl_bulletins.len(), MAX_ORL_BULLETINS);
+        }
+        // A never-seen pair is refused while the board is full.
+        let fresh = orl_test_key();
+        let err = publish_orl(&state, signed_orl_list(&fresh, "new-org", 1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+        let store = state.store.lock().await;
+        assert_eq!(store.orl_bulletins.len(), MAX_ORL_BULLETINS);
+        let real = store
+            .orl_bulletins
+            .iter()
+            .find(|b| b.handle == "real-org")
+            .unwrap();
+        assert_eq!(real.seq, 3);
+    }
+
+    #[tokio::test]
+    async fn orl_new_pair_budget_is_separate_from_update_traffic() {
+        let root = tempfile::tempdir().unwrap();
+        let state = production_router_test_state(root.path(), Store::default());
+        let first = orl_test_key();
+        publish_orl(&state, signed_orl_list(&first, "org-zero", 1))
+            .await
+            .expect("first pair within budget");
+        for index in 1..MAX_NEW_ORL_PAIRS_PER_HOUR as usize {
+            let key = orl_test_key();
+            publish_orl(&state, signed_orl_list(&key, &format!("org-{index}"), 1))
+                .await
+                .unwrap_or_else(|e| panic!("pair {index} within budget: {}", e.message));
+        }
+        // Budget spent: the next never-seen pair is refused…
+        let over = orl_test_key();
+        let err = publish_orl(&state, signed_orl_list(&over, "org-over", 1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+        // …while an update from a known pair still passes.
+        publish_orl(&state, signed_orl_list(&first, "org-zero", 2))
+            .await
+            .expect("updates bypass the creation budget");
+        let store = state.store.lock().await;
+        assert_eq!(
+            store.orl_bulletins.len(),
+            MAX_NEW_ORL_PAIRS_PER_HOUR as usize
         );
     }
 }

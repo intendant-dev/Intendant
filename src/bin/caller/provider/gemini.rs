@@ -104,11 +104,13 @@ impl GeminiProvider {
     /// POST a generateContent-family request through whichever auth path
     /// this instance carries. Auth never rides an egress request — the
     /// relay attaches `x-goog-api-key` from the vault. Takes the request
-    /// pre-serialized so the body is produced exactly once per call.
+    /// pre-serialized as shared `Bytes` so the body is produced exactly
+    /// once per turn and every attempt (first send and retries) reuses
+    /// the same allocation via a refcount bump.
     pub(crate) async fn post_generate(
         &self,
         url: &str,
-        request_body: &[u8],
+        request_body: &bytes::Bytes,
         streaming: bool,
     ) -> Result<ProviderHttpResponse, CallerError> {
         match &self.auth {
@@ -119,7 +121,7 @@ impl GeminiProvider {
                         .post(url)
                         .header("content-type", "application/json")
                         .header("x-goog-api-key", api_key)
-                        .body(request_body.to_vec());
+                        .body(request_body.clone());
                     if streaming {
                         request.timeout(STREAM_TIMEOUT)
                     } else {
@@ -135,6 +137,8 @@ impl GeminiProvider {
             }
             ProviderAuth::ClientEgress { kind } => {
                 let headers = vec![("content-type".to_string(), "application/json".to_string())];
+                // The relay ships the request as owned frames — one copy
+                // at this boundary, accepted (egress `fetch` takes Vec).
                 crate::credential_egress::fetch(kind, "POST", url, headers, request_body.to_vec())
                     .await
                     .map(ProviderHttpResponse::Egress)
@@ -155,11 +159,16 @@ pub(crate) fn gemini_role(role: &str) -> &str {
 
 #[async_trait]
 impl ChatProvider for GeminiProvider {
-    fn request_snapshot(
+    /// The one request build: contents assembly, systemInstruction, and a
+    /// single serialization straight to shared bytes. The snapshot, the
+    /// first send, and every retry all derive from this build. The
+    /// `stream` flag does not change the body — Gemini selects streaming
+    /// by endpoint (`:streamGenerateContent?alt=sse`), not by a field.
+    fn prepare_request(
         &self,
         messages: &[Message],
         stream: bool,
-    ) -> Result<(String, serde_json::Value), CallerError> {
+    ) -> Result<PreparedRequest, CallerError> {
         let _ = stream;
         let (system_text, mut request_body) = build_gemini_request_parts(messages, self);
 
@@ -169,30 +178,22 @@ impl ChatProvider for GeminiProvider {
             });
         }
 
-        Ok((
-            "gemini.generate-content.request.v1".to_string(),
-            request_body,
+        Ok(PreparedRequest::new(
+            "gemini.generate-content.request.v1",
+            serde_json::to_vec(&request_body).map_err(CallerError::Json)?,
         ))
     }
 
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
-        let (system_text, mut request_body) = build_gemini_request_parts(messages, self);
-
-        if let Some(ref sys) = system_text {
-            request_body["systemInstruction"] = serde_json::json!({
-                "parts": [{"text": sys}]
-            });
-        }
-
         // Note: Gemini API uses implicit context caching. Requests with the same
         // prefix are automatically cached server-side. No explicit API changes needed.
+        let prepared = self.prepare_request(messages, false)?;
         let url = format!(
             "{}/v1beta/models/{}:generateContent",
             self.endpoint, self.model
         );
 
-        let body_bytes = serde_json::to_vec(&request_body).map_err(CallerError::Json)?;
-        let response = self.post_generate(&url, &body_bytes, false).await?;
+        let response = self.post_generate(&url, &prepared.body, false).await?;
 
         if !response.status_success() {
             let status = response.status_line();
@@ -347,22 +348,22 @@ impl ChatProvider for GeminiProvider {
         messages: &[Message],
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ChatResponse, CallerError> {
-        let (system_text, mut request_body) = build_gemini_request_parts(messages, self);
+        let prepared = self.prepare_request(messages, true)?;
+        self.chat_stream_prepared(&prepared, on_event).await
+    }
 
-        if let Some(ref sys) = system_text {
-            request_body["systemInstruction"] = serde_json::json!({
-                "parts": [{"text": sys}]
-            });
-        }
-
+    async fn chat_stream_prepared(
+        &self,
+        prepared: &PreparedRequest,
+        on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<ChatResponse, CallerError> {
         // Use streamGenerateContent endpoint
         let url = format!(
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
             self.endpoint, self.model
         );
 
-        let body_bytes = serde_json::to_vec(&request_body).map_err(CallerError::Json)?;
-        let response = self.post_generate(&url, &body_bytes, true).await?;
+        let response = self.post_generate(&url, &prepared.body, true).await?;
 
         if !response.status_success() {
             let status = response.status_line();
@@ -374,134 +375,153 @@ impl ChatProvider for GeminiProvider {
             )));
         }
 
-        let mut text_parts = Vec::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut cu_calls: Vec<crate::computer_use::CuToolCall> = Vec::new();
-        let mut raw_model_parts: Vec<serde_json::Value> = Vec::new();
-        let mut usage = TokenUsage::default();
-        let mut line_buf = SseLineBuffer::new();
+        let mut fold = GeminiStreamFold::new(self.cu_enabled, self.cu_display);
+        streaming::run_sse_stream(response, &mut fold, on_event)
+            .await
+            .map_err(streaming::StreamFailure::into_caller_error)?;
+        let response = fold.finish();
+        on_event(StreamEvent::Complete(response.clone()));
+        Ok(response)
+    }
+}
 
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| CallerError::Provider(format!("Stream error: {}", e)))?;
-            line_buf.push_chunk(&chunk);
+/// The Gemini streamGenerateContent arm of the shared SSE driver: exactly
+/// the per-chunk mutable state the old hand-rolled loop carried
+/// (candidate parts, raw echo-back parts, last-chunk `usageMetadata`),
+/// with the mechanics living in `provider::streaming`.
+pub(crate) struct GeminiStreamFold {
+    cu_enabled: bool,
+    cu_display: Option<(u32, u32)>,
+    json: streaming::EventJson,
+    text_parts: Vec<String>,
+    tool_calls: Vec<ToolCall>,
+    cu_calls: Vec<crate::computer_use::CuToolCall>,
+    raw_model_parts: Vec<serde_json::Value>,
+    usage: TokenUsage,
+}
 
-            while let Some(line) = line_buf.next_line() {
-                if line.is_empty() {
-                    continue;
-                }
-
-                // Gemini streaming with alt=sse returns SSE format
-                let data = if let Some(("data", d)) = parse_sse_line(&line) {
-                    d
-                } else {
-                    continue;
-                };
-
-                if let Ok(resp) = serde_json::from_str::<serde_json::Value>(data) {
-                    // Extract text and function calls from candidates
-                    if let Some(parts) = resp
-                        .pointer("/candidates/0/content/parts")
-                        .and_then(|p| p.as_array())
-                    {
-                        for part in parts {
-                            // Capture raw parts for verbatim echo-back (preserves thoughtSignature)
-                            raw_model_parts.push(part.clone());
-
-                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                text_parts.push(text.to_string());
-                                on_event(StreamEvent::Delta(text.to_string()));
-                            }
-                            if let Some(fc) = part.get("functionCall") {
-                                let name = fc
-                                    .get("name")
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let args_val =
-                                    fc.get("args").cloned().unwrap_or(serde_json::json!({}));
-
-                                if self.cu_enabled && GEMINI_CU_FUNCTIONS.contains(&name.as_str()) {
-                                    let (dw, dh) = self.cu_display.unwrap_or((1440, 900));
-                                    if let Some(action) =
-                                        parse_gemini_cu_action(&name, &args_val, dw, dh)
-                                    {
-                                        let id = format!("gemini_cu_{}", cu_calls.len());
-                                        cu_calls.push(crate::computer_use::CuToolCall {
-                                            call_id: id,
-                                            actions: vec![action],
-                                            metadata: crate::computer_use::CuCallMetadata::default(
-                                            ),
-                                        });
-                                    }
-                                } else {
-                                    let args = serde_json::to_string(&args_val)
-                                        .unwrap_or_else(|_| "{}".to_string());
-                                    let id = format!("gemini_call_{}", tool_calls.len());
-                                    tool_calls.push(ToolCall {
-                                        id: id.clone(),
-                                        call_id: id,
-                                        name,
-                                        arguments: args,
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    // Extract usage from the last chunk
-                    if let Some(u) = resp.get("usageMetadata") {
-                        let prompt = u
-                            .get("promptTokenCount")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let completion = u
-                            .get("candidatesTokenCount")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let total = u
-                            .get("totalTokenCount")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(prompt + completion);
-                        let cached = u
-                            .get("cachedContentTokenCount")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        usage = TokenUsage {
-                            prompt_tokens: prompt,
-                            completion_tokens: completion,
-                            total_tokens: total,
-                            cached_tokens: cached,
-                            ..Default::default()
-                        };
-                    }
-                }
-            }
+impl GeminiStreamFold {
+    pub(crate) fn new(cu_enabled: bool, cu_display: Option<(u32, u32)>) -> Self {
+        Self {
+            cu_enabled,
+            cu_display,
+            json: streaming::EventJson::new(),
+            text_parts: Vec::new(),
+            tool_calls: Vec::new(),
+            cu_calls: Vec::new(),
+            raw_model_parts: Vec::new(),
+            usage: TokenUsage::default(),
         }
+    }
 
-        let content = text_parts.join("");
+    /// Assemble the final response after the stream ends.
+    pub(crate) fn finish(self) -> ChatResponse {
+        let content = self.text_parts.join("");
         // Store raw parts for echo-back (preserves thoughtSignature for
         // Gemini CU). Adjacent pure-text delta parts are coalesced first:
         // streaming produced one `{"text": …}` fragment per delta, and
         // echoing hundreds of them back in every subsequent request body
         // was pure wire/parse bloat.
-        let raw_model_parts = coalesce_adjacent_text_parts(raw_model_parts);
+        let raw_model_parts = coalesce_adjacent_text_parts(self.raw_model_parts);
         let raw_output = if !raw_model_parts.is_empty() {
             Some(raw_model_parts)
         } else {
             None
         };
-        let response = ChatResponse {
+        ChatResponse {
             content,
-            usage,
+            usage: self.usage,
             reasoning_summary: None,
             reasoning_content: None,
-            tool_calls,
-            cu_calls,
+            tool_calls: self.tool_calls,
+            cu_calls: self.cu_calls,
             raw_output,
+        }
+    }
+}
+
+impl streaming::SseFold for GeminiStreamFold {
+    fn on_data(
+        &mut self,
+        data: &str,
+        on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<(), CallerError> {
+        let Some(resp) = self.json.parse(data) else {
+            return Ok(());
         };
-        on_event(StreamEvent::Complete(response.clone()));
-        Ok(response)
+        // Extract text and function calls from candidates
+        if let Some(parts) = resp
+            .pointer("/candidates/0/content/parts")
+            .and_then(|p| p.as_array())
+        {
+            for part in parts {
+                // Capture raw parts for verbatim echo-back (preserves thoughtSignature)
+                self.raw_model_parts.push(part.clone());
+
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    self.text_parts.push(text.to_string());
+                    on_event(StreamEvent::Delta(text.to_string()));
+                }
+                if let Some(fc) = part.get("functionCall") {
+                    let name = fc
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let args_val = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
+
+                    if self.cu_enabled && GEMINI_CU_FUNCTIONS.contains(&name.as_str()) {
+                        let (dw, dh) = self.cu_display.unwrap_or((1440, 900));
+                        if let Some(action) = parse_gemini_cu_action(&name, &args_val, dw, dh) {
+                            let id = format!("gemini_cu_{}", self.cu_calls.len());
+                            self.cu_calls.push(crate::computer_use::CuToolCall {
+                                call_id: id,
+                                actions: vec![action],
+                                metadata: crate::computer_use::CuCallMetadata::default(),
+                            });
+                        }
+                    } else {
+                        let args =
+                            serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_string());
+                        let id = format!("gemini_call_{}", self.tool_calls.len());
+                        self.tool_calls.push(ToolCall {
+                            id: id.clone(),
+                            call_id: id,
+                            name,
+                            arguments: args,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Extract usage from the last chunk
+        if let Some(u) = resp.get("usageMetadata") {
+            let prompt = u
+                .get("promptTokenCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let completion = u
+                .get("candidatesTokenCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let total = u
+                .get("totalTokenCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(prompt + completion);
+            let cached = u
+                .get("cachedContentTokenCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            self.usage = TokenUsage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: total,
+                cached_tokens: cached,
+                ..Default::default()
+            };
+        }
+        Ok(())
     }
 }
 
@@ -1027,5 +1047,139 @@ mod tests {
         assert_eq!(out[0]["thoughtSignature"].as_str(), Some("sig1"));
         assert_eq!(out[0]["text"].as_str(), Some("a"));
         assert_eq!(out[1], serde_json::json!({"text": "bc"}));
+    }
+
+    // --- PreparedRequest: one build feeds wire and snapshot ---
+
+    #[test]
+    fn prepare_request_builds_wire_and_snapshot_once() {
+        // new_plain: deterministic (no env-dependent tool set, no CU).
+        let provider = GeminiProvider::new_plain(
+            "key".to_string(),
+            "gemini-2.5-pro".to_string(),
+            1_048_576,
+            65_536,
+        );
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                ..Default::default()
+            },
+        ];
+        let prepared = provider.prepare_request(&messages, true).unwrap();
+        assert_eq!(prepared.format, "gemini.generate-content.request.v1");
+
+        // Wire pin: the bytes equal a manual build of the exact request
+        // the old snapshot and stream paths each built separately.
+        let (system_text, mut manual) = build_gemini_request_parts(&messages, &provider);
+        manual["systemInstruction"] = serde_json::json!({
+            "parts": [{"text": system_text.unwrap()}]
+        });
+        assert_eq!(
+            prepared.body.as_ref(),
+            serde_json::to_vec(&manual).unwrap().as_slice()
+        );
+
+        // Snapshot parity: parsed from the wire bytes (by construction)
+        // and equal to the legacy request body Value.
+        let snapshot = prepared.snapshot_value().unwrap();
+        assert_eq!(
+            snapshot,
+            serde_json::from_slice::<serde_json::Value>(&prepared.body).unwrap()
+        );
+        assert_eq!(snapshot, manual);
+
+        // The trait snapshot derives from the same build path.
+        let (format, value) = provider.request_snapshot(&messages, true).unwrap();
+        assert_eq!(format, prepared.format);
+        assert_eq!(value, snapshot);
+
+        // Retries reuse the allocation: a Bytes clone shares the pointer
+        // (each HTTP attempt's `.body(bytes.clone())` is a refcount bump).
+        let retry_view = prepared.body.clone();
+        assert_eq!(retry_view.as_ptr(), prepared.body.as_ptr());
+
+        // The stream flag never changes the body: Gemini selects
+        // streaming by endpoint, so both builds serialize identically.
+        let non_stream = provider.prepare_request(&messages, false).unwrap();
+        assert_eq!(non_stream.body, prepared.body);
+    }
+
+    // --- Stream fold (the Gemini arm of the shared SSE driver) ---
+
+    /// A realistic streamGenerateContent alt=sse transcript: split text
+    /// deltas (multibyte content), a functionCall part, a
+    /// thoughtSignature part that must survive coalescing verbatim, and
+    /// usageMetadata where the last chunk wins.
+    const GEMINI_SSE_TRANSCRIPT: &str = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hel\"}]}}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2}}\r\n",
+        "\r\n",
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo 🦀\"},{\"text\":\"sig\",\"thoughtSignature\":\"tsig_1\"},{\"functionCall\":{\"name\":\"exec_command\",\"args\":{\"command\":\"ls\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":50,\"candidatesTokenCount\":10,\"totalTokenCount\":60,\"cachedContentTokenCount\":30}}\r\n",
+        "\r\n",
+    );
+
+    #[tokio::test]
+    async fn gemini_fold_assembles_text_tools_raw_parts_and_usage() {
+        let mut fold = GeminiStreamFold::new(false, None);
+        let deltas =
+            streaming::test_support::drive_transcript(&mut fold, GEMINI_SSE_TRANSCRIPT, 7).await;
+        // The thoughtSignature part's text is a delta too (the old loop
+        // emitted any part with a text field).
+        assert_eq!(deltas, vec!["Hel", "lo 🦀", "sig"]);
+
+        let response = fold.finish();
+        assert_eq!(response.content, "Hello 🦀sig");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "gemini_call_0");
+        assert_eq!(response.tool_calls[0].call_id, "gemini_call_0");
+        assert_eq!(response.tool_calls[0].name, "exec_command");
+        assert_eq!(response.tool_calls[0].arguments, "{\"command\":\"ls\"}");
+
+        // Raw parts coalesce pure-text runs but keep the signed part and
+        // the functionCall verbatim as boundaries.
+        let raw = response.raw_output.as_ref().unwrap();
+        assert_eq!(raw.len(), 3);
+        assert_eq!(raw[0], serde_json::json!({"text": "Hello 🦀"}));
+        assert_eq!(raw[1]["thoughtSignature"].as_str(), Some("tsig_1"));
+        assert!(raw[2].get("functionCall").is_some());
+
+        // usageMetadata: the last chunk's counters win.
+        assert_eq!(response.usage.prompt_tokens, 50);
+        assert_eq!(response.usage.completion_tokens, 10);
+        assert_eq!(response.usage.total_tokens, 60);
+        assert_eq!(response.usage.cached_tokens, 30);
+    }
+
+    #[tokio::test]
+    async fn gemini_fold_routes_cu_functions_when_cu_enabled() {
+        let transcript = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"click_at\",\"args\":{\"x\":500,\"y\":500}}}]}}]}\n\n",
+        );
+        // CU-enabled: click_at maps through the normalized-coordinate CU
+        // parser instead of the tool-call lane.
+        let mut fold = GeminiStreamFold::new(true, Some((1000, 1000)));
+        streaming::test_support::drive_transcript(&mut fold, transcript, 64).await;
+        let response = fold.finish();
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.cu_calls.len(), 1);
+        assert_eq!(response.cu_calls[0].call_id, "gemini_cu_0");
+        assert!(matches!(
+            response.cu_calls[0].actions[..],
+            [crate::computer_use::CuAction::Click { .. }]
+        ));
+
+        // CU-disabled: the same functionCall is an ordinary tool call.
+        let mut fold = GeminiStreamFold::new(false, None);
+        streaming::test_support::drive_transcript(&mut fold, transcript, 64).await;
+        let response = fold.finish();
+        assert!(response.cu_calls.is_empty());
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "click_at");
     }
 }

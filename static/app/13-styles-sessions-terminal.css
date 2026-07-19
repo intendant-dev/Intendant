@@ -2797,6 +2797,9 @@ button.wt-session-chip:focus-visible {
 .control-toast.error { border-left-color: var(--red); }
 .control-toast.success { border-left-color: var(--green); }
 .control-toast.info { border-left-color: var(--blue); }
+/* Rate-limit escalation alerts: amber, matching the vitals chips'
+   data-severity="warn" role. */
+.control-toast.warn { border-left-color: var(--yellow); }
 /* The base gradient is a literal dark glass; under the ui-v2 light theme
    --text flips to dark ink, which rendered toasts dark-on-dark ("Load
    failed" unreadable). Light mode gets a light raised surface instead. */

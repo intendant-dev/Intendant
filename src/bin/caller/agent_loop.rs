@@ -63,14 +63,36 @@ pub(crate) struct LoopStats {
     pub(crate) announced_native_session_id: Option<String>,
 }
 
+// `pub` (not `pub(crate)`): this rides the `pub` `AppEvent` enum
+// (`ExternalFollowUpRequested`), and in a bin crate the wider visibility
+// only exists to keep the field/type visibilities consistent — exactly
+// like `external_agent::AgentAttachment`, which the field carried before.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct UserAttachments {
-    pub(crate) items: Vec<external_agent::AgentAttachment>,
+pub struct UserAttachments {
+    pub items: Vec<external_agent::AgentAttachment>,
+    /// Renderable upload-store refs for the SAME user message, minted at
+    /// attachment-resolution time (`resolve_attachments_with_scopes`) for
+    /// the upload-backed entries. These ride the canonical
+    /// `UserMessageLog` row (live wire + session-log persistence) so
+    /// replayed transcripts can show the user's attachments; frame grabs
+    /// have no upload blob and mint no ref. Never consumed by backends —
+    /// display metadata only.
+    pub refs: Vec<crate::types::SessionNoteAttachment>,
 }
 
 impl UserAttachments {
-    pub(crate) fn from_items(items: Vec<external_agent::AgentAttachment>) -> Self {
-        Self { items }
+    pub fn from_items(items: Vec<external_agent::AgentAttachment>) -> Self {
+        Self {
+            items,
+            refs: Vec::new(),
+        }
+    }
+
+    pub fn from_resolved(
+        items: Vec<external_agent::AgentAttachment>,
+        refs: Vec<crate::types::SessionNoteAttachment>,
+    ) -> Self {
+        Self { items, refs }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -834,6 +856,223 @@ pub(crate) async fn handle_peer_tool_call(
     }
 }
 
+/// Outcome of the controller-tool approval gate.
+enum ControllerToolGate {
+    /// Dispatch the call.
+    Dispatch,
+    /// Do not dispatch; hand this text to the model as the tool result.
+    Refuse(String),
+    /// User denied: the loop exits `Denied`, like a runtime-command deny.
+    StopDenied,
+    /// Interrupt arrived while the prompt was pending.
+    StopInterrupted,
+    /// Headless with no approver surface: fail closed like the runtime path.
+    StopNoApprover,
+}
+
+/// Consult autonomy for a controller-dispatched tool call and, when needed,
+/// hold the SAME approval prompt runtime commands get (`ApprovalRequired`
+/// on the bus, resolved through the JSON stdin slot or the approval
+/// registry) BEFORE any side effect. Controller tools never pass through
+/// the runtime batch classifier, so without this gate
+/// `[approval] tool_call = "deny"` and Low autonomy would not apply to
+/// them at all, and their dispatch would leave no approval audit trail.
+#[allow(clippy::too_many_arguments)] // mirrors the loop's approval plumbing, not a bundle
+async fn gate_controller_tool_call(
+    tool_label: &str,
+    preview: &str,
+    dedup_source: &str,
+    autonomy: &SharedAutonomy,
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    json_approval: Option<&JsonApprovalSlot>,
+    approval_registry: &event::ApprovalRegistry,
+    headless: bool,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    local_session_id: &Option<String>,
+) -> ControllerToolGate {
+    let category = autonomy::ActionCategory::ToolCall;
+    let decision = autonomy.read().await.controller_tool_decision();
+    match decision {
+        autonomy::ControllerToolDecision::AutoApprove => {
+            // Same visibility signal the runtime path emits for
+            // auto-approved batches.
+            bus.send(AppEvent::AutoApproved {
+                preview: preview.to_string(),
+            });
+            return ControllerToolGate::Dispatch;
+        }
+        autonomy::ControllerToolDecision::Deny => {
+            slog(session_log, |l| {
+                l.approval(&category.to_string(), preview, "denied-policy")
+            });
+            return ControllerToolGate::Refuse(format!(
+                "Denied by approval policy: [approval] tool_call = \"deny\" refuses \
+                 controller-dispatched tool calls ({tool_label}). Not dispatched."
+            ));
+        }
+        autonomy::ControllerToolDecision::Ask => {}
+    }
+
+    // Dedup: an identical call already approved in this session skips the
+    // prompt (content-aware — the dedup source digests the arguments).
+    if autonomy
+        .read()
+        .await
+        .was_command_approved(local_session_id.as_deref(), dedup_source)
+    {
+        slog(session_log, |l| {
+            l.approval(&category.to_string(), preview, "dedup-auto-approved")
+        });
+        return ControllerToolGate::Dispatch;
+    }
+
+    slog(session_log, |l| {
+        l.approval(&category.to_string(), preview, "waiting")
+    });
+    let id = event::next_approval_id();
+
+    // (response, via_json): on the JSON stdin lane this waiter emits
+    // ApprovalResolved itself; on the registry lane the resolver
+    // (session supervisor / MCP state) emits it when popping the
+    // responder — matching the runtime approval path on both lanes.
+    let (response, via_json) = if let Some(slot) = json_approval {
+        // JSON mode: arm the stdin slot before announcing so an instant
+        // response cannot miss it.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut guard = slot.lock().unwrap();
+            *guard = Some((id, tx));
+        }
+        bus.send(AppEvent::ApprovalRequired {
+            session_id: local_session_id.clone(),
+            id,
+            command_preview: preview.to_string(),
+            category,
+        });
+        (rx.await, true)
+    } else if headless {
+        slog(session_log, |l| {
+            l.approval(&category.to_string(), preview, "denied-no-approver")
+        });
+        return ControllerToolGate::StopNoApprover;
+    } else {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        approval_registry.lock().unwrap().insert(id, tx);
+        bus.send(AppEvent::ApprovalRequired {
+            session_id: local_session_id.clone(),
+            id,
+            command_preview: preview.to_string(),
+            category,
+        });
+        (rx.await, false)
+    };
+
+    let resolve = |action: &str| {
+        if via_json {
+            bus.send(AppEvent::ApprovalResolved {
+                session_id: local_session_id.clone(),
+                id,
+                action: action.to_string(),
+            });
+        }
+    };
+    match response {
+        Ok(event::ApprovalResponse::Approve) => {
+            slog(session_log, |l| {
+                l.approval(&category.to_string(), preview, "approved")
+            });
+            resolve("approve");
+            apply_user_approval(
+                event::ApprovalResponse::Approve,
+                category,
+                local_session_id.as_deref(),
+                dedup_source,
+                autonomy,
+                bus,
+            )
+            .await;
+            ControllerToolGate::Dispatch
+        }
+        Ok(event::ApprovalResponse::ApproveAll) => {
+            slog(session_log, |l| {
+                l.approval(&category.to_string(), preview, "approve-all")
+            });
+            resolve("approve_all");
+            apply_user_approval(
+                event::ApprovalResponse::ApproveAll,
+                category,
+                local_session_id.as_deref(),
+                dedup_source,
+                autonomy,
+                bus,
+            )
+            .await;
+            ControllerToolGate::Dispatch
+        }
+        Ok(event::ApprovalResponse::Skip) => {
+            slog(session_log, |l| {
+                l.approval(&category.to_string(), preview, "skipped")
+            });
+            resolve("skip");
+            ControllerToolGate::Refuse(format!("Skipped by user: {tool_label} was not dispatched."))
+        }
+        // Answer targets question prompts; a tool-call approval receiving
+        // one fails closed, matching the runtime path.
+        Ok(event::ApprovalResponse::Deny | event::ApprovalResponse::Answer { .. }) | Err(_) => {
+            // Distinguish a real user deny from an interrupt draining the
+            // registry with synthetic Deny responses.
+            if cancel_token.is_cancelled() {
+                return ControllerToolGate::StopInterrupted;
+            }
+            slog(session_log, |l| {
+                l.approval(&category.to_string(), preview, "denied")
+            });
+            resolve("deny");
+            ControllerToolGate::StopDenied
+        }
+    }
+}
+
+/// Emit the terminal events for a `Stop*` gate outcome and name the loop
+/// exit reason; callers return it alongside their loop stats.
+fn controller_gate_stop_exit(
+    outcome: &ControllerToolGate,
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    local_session_id: &Option<String>,
+) -> LoopExitReason {
+    match outcome {
+        ControllerToolGate::StopInterrupted => {
+            bus.send(AppEvent::Interrupted {
+                session_id: local_session_id.clone(),
+                reason: "user requested".into(),
+            });
+            slog(session_log, |l| {
+                l.info("Agent loop interrupted during approval wait")
+            });
+            LoopExitReason::Interrupted
+        }
+        ControllerToolGate::StopNoApprover => {
+            bus.send(AppEvent::TaskComplete {
+                session_id: local_session_id.clone(),
+                reason: "Approval required in headless mode (tool_call)".to_string(),
+                summary: None,
+            });
+            LoopExitReason::Denied
+        }
+        // StopDenied (and, defensively, any non-stop variant routed here).
+        _ => {
+            bus.send(AppEvent::TaskComplete {
+                session_id: local_session_id.clone(),
+                reason: "Denied by user".to_string(),
+                summary: None,
+            });
+            LoopExitReason::Denied
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn run_agent_loop(
     provider: &dyn provider::ChatProvider,
@@ -1167,31 +1406,50 @@ pub(crate) async fn run_agent_loop(
         // (the trait default errors — mock and custom providers), the
         // messages dump is the turn's ONLY exact input record, so it is
         // written regardless of the gate.
-        let request_snapshot = provider.request_snapshot(conversation.messages(), true);
-        if messages_json_dump_enabled() || request_snapshot.is_err() {
+        //
+        // ONE build per turn: the prepared request's bytes feed both the
+        // Context-tab snapshot below (parsed back from the same bytes, so
+        // "exact request payload" holds by construction) and every stream
+        // attempt in the retry loop — the old shape built the full request
+        // once for the snapshot and again per chat_stream call.
+        let prepared = provider.prepare_request(conversation.messages(), true);
+        if messages_json_dump_enabled() || prepared.is_err() {
             slog(&session_log, |l| {
                 if let Ok(json) = serde_json::to_string_pretty(conversation.messages()) {
                     l.messages_input(&json);
                 }
             });
         }
-        match request_snapshot {
-            Ok((context_format, raw_context)) => {
-                bus.send(AppEvent::ContextSnapshot {
-                    session_id: local_session_id.clone(),
-                    source: "native".to_string(),
-                    label: "Internal agent request payload".to_string(),
-                    request_id: Some(format!("native-turn-{turn}")),
-                    request_index: Some(turn as u64),
-                    turn: Some(turn),
-                    format: context_format,
-                    token_count: conversation.last_usage().map(|u| u.total_tokens),
-                    token_count_kind: None,
-                    context_window: Some(conversation.context_window()),
-                    hard_context_window: Some(conversation.context_window()),
-                    item_count: provider_request_item_count(&raw_context),
-                    raw: std::sync::Arc::new(raw_context),
-                });
+        let prepared = match prepared {
+            Ok(prepared) => {
+                match prepared.snapshot_value() {
+                    Ok(raw_context) => {
+                        bus.send(AppEvent::ContextSnapshot {
+                            session_id: local_session_id.clone(),
+                            source: "native".to_string(),
+                            label: "Internal agent request payload".to_string(),
+                            request_id: Some(format!("native-turn-{turn}")),
+                            request_index: Some(turn as u64),
+                            turn: Some(turn),
+                            format: prepared.format.clone(),
+                            token_count: conversation.last_usage().map(|u| u.total_tokens),
+                            token_count_kind: None,
+                            context_window: Some(conversation.context_window()),
+                            hard_context_window: Some(conversation.context_window()),
+                            item_count: provider_request_item_count(&raw_context),
+                            raw: std::sync::Arc::new(raw_context),
+                        });
+                    }
+                    Err(e) => {
+                        slog(&session_log, |l| {
+                            l.warn(&format!(
+                                "Failed to build provider request context snapshot: {}",
+                                e
+                            ))
+                        });
+                    }
+                }
+                Some(prepared)
             }
             Err(e) => {
                 slog(&session_log, |l| {
@@ -1200,8 +1458,9 @@ pub(crate) async fn run_agent_loop(
                         e
                     ))
                 });
+                None
             }
-        }
+        };
 
         // Streaming API call — wrapped in select! so an interrupt cancels
         // mid-stream without waiting for the provider to finish. The
@@ -1234,7 +1493,13 @@ pub(crate) async fn run_agent_loop(
                         }
                     }
                 };
-                let stream_fut = provider.chat_stream(conversation.messages(), &on_stream_event);
+                // The prepared bytes ride every attempt (Bytes refcount
+                // bumps); only providers without a prepare path (mock,
+                // custom) fall back to the rebuild-per-call shape.
+                let stream_fut = match prepared.as_ref() {
+                    Some(prepared) => provider.chat_stream_prepared(prepared, &on_stream_event),
+                    None => provider.chat_stream(conversation.messages(), &on_stream_event),
+                };
                 let outcome = tokio::select! {
                     biased;
                     _ = cancel_token.cancelled() => {
@@ -1249,7 +1514,13 @@ pub(crate) async fn run_agent_loop(
                         break;
                     }
                     Err(e) => {
-                        let is_stream_error = e.to_string().contains("Stream error");
+                        // Typed classification first (the driver reports
+                        // mid-stream chunk failures as StreamChunk); the
+                        // string match stays as a compatibility fallback
+                        // for error paths that still stringify, not as
+                        // the contract.
+                        let is_stream_error = matches!(e, CallerError::StreamChunk(_))
+                            || e.to_string().contains("Stream error");
                         if is_stream_error && attempt < STREAM_RETRIES {
                             slog(&session_log, |l| {
                                 l.warn(&format!(
@@ -1549,18 +1820,58 @@ pub(crate) async fn run_agent_loop(
                 break;
             }
 
-            // Process MCP tool calls (if any)
+            // Process MCP tool calls (if any). Controller-dispatched — the
+            // runtime batch classifier never sees them — so each call
+            // consults the approval gate here, BEFORE dispatch: the
+            // `tool_call` rule (including deny) and Low autonomy hold for
+            // outbound MCP exactly as for runtime commands, with the same
+            // prompt, log rows, and events. Calls are gated and dispatched
+            // strictly in order, so a later call never runs while an
+            // earlier prompt is unresolved.
             if !batch.mcp_calls.is_empty() {
                 if let Some(mgr) = mcp_mgr {
                     for (call_id, tool_name, args_json) in &batch.mcp_calls {
                         let args: serde_json::Value =
                             serde_json::from_str(args_json).unwrap_or_default();
-                        let result = mgr.call_tool(tool_name, args).await;
-                        let output = match result {
-                            Ok(text) => text,
-                            Err(e) => format!("MCP tool error: {}", e),
-                        };
-                        conversation.add_tool_result(call_id, tool_name, &output);
+                        let preview =
+                            format!("mcp: {} {}", tool_name, types::truncate_str(args_json, 160));
+                        let dedup_source = autonomy::controller_tool_dedup_source(tool_name, &args);
+                        match gate_controller_tool_call(
+                            tool_name,
+                            &preview,
+                            &dedup_source,
+                            &autonomy,
+                            bus,
+                            &session_log,
+                            json_approval,
+                            approval_registry,
+                            headless,
+                            &cancel_token,
+                            &local_session_id,
+                        )
+                        .await
+                        {
+                            ControllerToolGate::Dispatch => {
+                                let result = mgr.call_tool(tool_name, args).await;
+                                let output = match result {
+                                    Ok(text) => text,
+                                    Err(e) => format!("MCP tool error: {}", e),
+                                };
+                                conversation.add_tool_result(call_id, tool_name, &output);
+                            }
+                            ControllerToolGate::Refuse(text) => {
+                                conversation.add_tool_result(call_id, tool_name, &text);
+                            }
+                            stop => {
+                                let reason = controller_gate_stop_exit(
+                                    &stop,
+                                    bus,
+                                    &session_log,
+                                    &local_session_id,
+                                );
+                                return Ok((loop_stats, reason));
+                            }
+                        }
                         handled_call_ids.insert(call_id.clone());
                     }
                 } else {
@@ -1575,9 +1886,40 @@ pub(crate) async fn run_agent_loop(
                 }
             }
 
-            // Process invoke_skill tool calls (if any)
+            // Process invoke_skill tool calls (if any). Controller-side:
+            // same approval gate as MCP calls, before the skill body loads.
             for (call_id, skill_name, arguments) in &batch.skill_invocations {
                 handled_call_ids.insert(call_id.clone());
+                let gate_args = serde_json::json!({
+                    "skill_name": skill_name,
+                    "arguments": arguments,
+                });
+                match gate_controller_tool_call(
+                    "invoke_skill",
+                    &format!("invoke_skill: {}", skill_name),
+                    &autonomy::controller_tool_dedup_source("invoke_skill", &gate_args),
+                    &autonomy,
+                    bus,
+                    &session_log,
+                    json_approval,
+                    approval_registry,
+                    headless,
+                    &cancel_token,
+                    &local_session_id,
+                )
+                .await
+                {
+                    ControllerToolGate::Dispatch => {}
+                    ControllerToolGate::Refuse(text) => {
+                        conversation.add_tool_result(call_id, "invoke_skill", &text);
+                        continue;
+                    }
+                    stop => {
+                        let reason =
+                            controller_gate_stop_exit(&stop, bus, &session_log, &local_session_id);
+                        return Ok((loop_stats, reason));
+                    }
+                }
                 let discovered = skills::discover_skills(Some(&project.root));
                 match discovered.iter().find(|s| s.config.name == *skill_name) {
                     Some(skill) => {
@@ -1627,6 +1969,10 @@ pub(crate) async fn run_agent_loop(
             // `crate::peer::ops` bodies — the same implementations
             // behind the MCP tools and `intendant ctl peer`. Peer
             // screenshots attach as images so the model sees them.
+            // Deliberately NOT behind the controller-tool gate: every
+            // effectful peer op is gated peer-side by the profile the peer
+            // issued this daemon plus the peer's own autonomy/approval
+            // flow (see `peer::ops`) — a dedicated gate, not a bypass.
             for (call_id, args) in &batch.peer_calls {
                 handled_call_ids.insert(call_id.clone());
                 let response = handle_peer_tool_call(args, peer_registry).await;
@@ -1639,15 +1985,78 @@ pub(crate) async fn run_agent_loop(
             }
 
             // Workflow checkpoints (coordination files §9 v0).
+            // Controller-side file writes: same approval gate as MCP calls.
             for (call_id, args) in &batch.workflow_checkpoints {
                 handled_call_ids.insert(call_id.clone());
+                match gate_controller_tool_call(
+                    "workflow_checkpoint",
+                    &format!(
+                        "workflow_checkpoint: {}",
+                        args.get("action")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("write")
+                    ),
+                    &autonomy::controller_tool_dedup_source("workflow_checkpoint", args),
+                    &autonomy,
+                    bus,
+                    &session_log,
+                    json_approval,
+                    approval_registry,
+                    headless,
+                    &cancel_token,
+                    &local_session_id,
+                )
+                .await
+                {
+                    ControllerToolGate::Dispatch => {}
+                    ControllerToolGate::Refuse(text) => {
+                        conversation.add_tool_result(call_id, "workflow_checkpoint", &text);
+                        continue;
+                    }
+                    stop => {
+                        let reason =
+                            controller_gate_stop_exit(&stop, bus, &session_log, &local_session_id);
+                        return Ok((loop_stats, reason));
+                    }
+                }
                 let response = handle_workflow_checkpoint_call(args, project, &local_session_id);
                 conversation.add_tool_result(call_id, "workflow_checkpoint", &response);
             }
 
             // Spawn supervised sub-agent sessions (spawn_sub_agent).
+            // Controller-side: same approval gate as MCP calls, before the
+            // child session exists. The default `tool_call = ask` rule
+            // prompts at Medium/Low; an explicit auto allows it and an
+            // explicit deny refuses.
             for (call_id, args) in &batch.sub_agent_spawns {
                 handled_call_ids.insert(call_id.clone());
+                let task_line = args.get("task").and_then(|t| t.as_str()).unwrap_or("");
+                match gate_controller_tool_call(
+                    "spawn_sub_agent",
+                    &format!("spawn_sub_agent: {}", types::truncate_str(task_line, 120)),
+                    &autonomy::controller_tool_dedup_source("spawn_sub_agent", args),
+                    &autonomy,
+                    bus,
+                    &session_log,
+                    json_approval,
+                    approval_registry,
+                    headless,
+                    &cancel_token,
+                    &local_session_id,
+                )
+                .await
+                {
+                    ControllerToolGate::Dispatch => {}
+                    ControllerToolGate::Refuse(text) => {
+                        conversation.add_tool_result(call_id, "spawn_sub_agent", &text);
+                        continue;
+                    }
+                    stop => {
+                        let reason =
+                            controller_gate_stop_exit(&stop, bus, &session_log, &local_session_id);
+                        return Ok((loop_stats, reason));
+                    }
+                }
                 let response =
                     handle_spawn_sub_agent_call(args, orchestration, project, &session_log).await;
                 conversation.add_tool_result(call_id, "spawn_sub_agent", &response);
@@ -1655,6 +2064,9 @@ pub(crate) async fn run_agent_loop(
 
             // Await sub-agent completions (wait_sub_agents). Blocking:
             // resolves inside this tool call, honoring interrupt/stop.
+            // Not behind the controller-tool gate: waiting is a pure join
+            // on children whose spawn already passed it — prompting again
+            // here would gate no side effect.
             for (call_id, args) in &batch.sub_agent_waits {
                 handled_call_ids.insert(call_id.clone());
                 let response = handle_wait_sub_agents_call(
@@ -1668,7 +2080,10 @@ pub(crate) async fn run_agent_loop(
                 conversation.add_tool_result(call_id, "wait_sub_agents", &response);
             }
 
-            // Handle shared_view tool calls (dashboard coordination layer)
+            // Handle shared_view tool calls (dashboard coordination layer).
+            // Not behind the controller-tool gate: user-display show/capture
+            // is gated inside `handle_shared_view_calls` by the dedicated
+            // `user_display_granted` opt-in (agent-owned views need none).
             if !batch.shared_view_calls.is_empty() {
                 for (call_id, _) in &batch.shared_view_calls {
                     handled_call_ids.insert(call_id.clone());
@@ -1847,7 +2262,7 @@ pub(crate) async fn run_agent_loop(
             };
             empty_command_streak = 0;
 
-            // Inject project context and normalize
+            // Normalize legacy command aliases before classification.
             let json_str = finalize_command_batch(json_str);
             // One parse of the final batch answers every per-batch question
             // below (ask-human rail, Xvfb triggers, Activity preview, runtime
@@ -1883,79 +2298,79 @@ pub(crate) async fn run_agent_loop(
             // AnswerQuestion into this session's approval registry) instead
             // of dispatching to the runtime, which would park on the
             // human_question file no frontend watches under the daemon.
-            // Scope: batches that are entirely askHuman (the shape models
-            // emit — a blocking question stands alone); a mixed batch keeps
-            // the legacy path and logs why.
+            // ANY batch containing askHuman is consumed by the question (the
+            // text loop's ratified semantics): the askHuman call gets the
+            // answer, and the other calls of a mixed batch get a not-executed
+            // note asking the model to re-issue them. (A mixed batch
+            // previously fell to the runtime file prompt nothing watched.)
             if !headless && json_approval.is_none() && batch_facts.has_ask_human {
-                if batch_facts.all_ask_human {
-                    let question = batch_facts
-                        .ask_human_question
-                        .clone()
-                        .unwrap_or_else(|| "The agent asked for your input.".to_string());
-                    slog(&session_log, |l| l.human_question(&question));
-                    let question_id = turn as u64;
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    approval_registry.lock().unwrap().insert(question_id, tx);
-                    bus.send(AppEvent::UserQuestionRequired {
-                        session_id: local_session_id.clone(),
-                        id: question_id,
-                        questions: vec![crate::types::UserQuestion {
-                            question: question.clone(),
-                            header: String::new(),
-                            options: Vec::new(),
-                            multi_select: false,
-                        }],
-                    });
-                    let answer = match rx.await {
-                        Ok(event::ApprovalResponse::Answer { answers }) => answers
-                            .get(&question)
-                            .cloned()
-                            .or_else(|| answers.values().next().cloned())
-                            .unwrap_or_default(),
-                        Ok(_) | Err(_) => String::new(),
-                    };
-                    let answered = !answer.trim().is_empty();
-                    let reply = if answered {
-                        slog(&session_log, |l| l.human_response_sent());
-                        answer
-                    } else {
-                        "The user dismissed the question without answering. Proceed with \
-                         your best judgment; you can re-ask later if it is still relevant."
-                            .to_string()
-                    };
-                    let mut first_result_seq: Option<u64> = None;
-                    for (call_id, tool_name) in &batch.call_id_names {
-                        if handled_call_ids.contains(call_id) {
-                            continue;
-                        }
-                        let seq = conversation.add_tool_result(call_id, tool_name, &reply);
+                let question = batch_facts
+                    .ask_human_question
+                    .clone()
+                    .unwrap_or_else(|| "The agent asked for your input.".to_string());
+                slog(&session_log, |l| l.human_question(&question));
+                let question_id = event::next_approval_id();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                approval_registry.lock().unwrap().insert(question_id, tx);
+                bus.send(AppEvent::UserQuestionRequired {
+                    session_id: local_session_id.clone(),
+                    id: question_id,
+                    questions: vec![crate::types::UserQuestion {
+                        question: question.clone(),
+                        header: String::new(),
+                        options: Vec::new(),
+                        multi_select: false,
+                    }],
+                });
+                let answer = match rx.await {
+                    Ok(event::ApprovalResponse::Answer { answers }) => answers
+                        .get(&question)
+                        .cloned()
+                        .or_else(|| answers.values().next().cloned())
+                        .unwrap_or_default(),
+                    Ok(_) | Err(_) => String::new(),
+                };
+                let answered = !answer.trim().is_empty();
+                let reply = if answered {
+                    slog(&session_log, |l| l.human_response_sent());
+                    answer
+                } else {
+                    "The user dismissed the question without answering. Proceed with \
+                     your best judgment; you can re-ask later if it is still relevant."
+                        .to_string()
+                };
+                const NOT_EXECUTED: &str = "Not executed: this batch paused for the \
+                     user's answer to askHuman. Read the answer from the askHuman \
+                     result and re-issue this command if it is still needed.";
+                let mut first_result_seq: Option<u64> = None;
+                for (call_id, tool_name) in &batch.call_id_names {
+                    if handled_call_ids.contains(call_id) {
+                        continue;
+                    }
+                    let is_ask = tool_name == "ask_human";
+                    let text = if is_ask { reply.as_str() } else { NOT_EXECUTED };
+                    let seq = conversation.add_tool_result(call_id, tool_name, text);
+                    if is_ask {
                         first_result_seq.get_or_insert(seq);
                     }
-                    // Native-tool askHuman answers enter the conversation as
-                    // tool results; project the raw answer into the message
-                    // lane referencing that result's seq (rewind cuts cover
-                    // it through ref_seq).
-                    if answered {
-                        if let Some(seq) = first_result_seq {
-                            slog(&session_log, |l| {
-                                let _ = l.conversation_message_user(
-                                    seq,
-                                    MessageProvenance::AskHumanAnswer,
-                                    &reply,
-                                    Some(seq),
-                                );
-                            });
-                        }
-                    }
-                    continue;
                 }
-                slog(&session_log, |l| {
-                    l.warn(
-                        "askHuman arrived mixed into a command batch; the runtime file \
-                         prompt handles it, which no dashboard surfaces — answer via MCP \
-                         or expect the model to re-ask",
-                    )
-                });
+                // Native-tool askHuman answers enter the conversation as
+                // tool results; project the raw answer into the message
+                // lane referencing the first askHuman result's seq (rewind
+                // cuts cover it through ref_seq).
+                if answered {
+                    if let Some(seq) = first_result_seq {
+                        slog(&session_log, |l| {
+                            let _ = l.conversation_message_user(
+                                seq,
+                                MessageProvenance::AskHumanAnswer,
+                                &reply,
+                                Some(seq),
+                            );
+                        });
+                    }
+                }
+                continue;
             }
 
             // Autonomy / approval check (same as text path)
@@ -1988,9 +2403,19 @@ pub(crate) async fn run_agent_loop(
             let mut should_skip = false;
             if let Some((cat, denied_by_policy)) = needs_approval {
                 let preview = format_command_preview(&json_str);
+                // Approval identity is deliberately separate from the
+                // display preview: content-bearing mutations digest their
+                // content (a preview names only the path), and remembered
+                // approvals are scoped to this session.
+                let dedup_source = autonomy::batch_dedup_source(&json_str);
 
                 // Dedup: skip approval for retries of already-approved commands
-                if !denied_by_policy && autonomy.read().await.was_command_approved(&preview) {
+                if !denied_by_policy
+                    && autonomy
+                        .read()
+                        .await
+                        .was_command_approved(local_session_id.as_deref(), &dedup_source)
+                {
                     slog(&session_log, |l| {
                         l.approval(&cat.to_string(), &preview, "dedup-auto-approved")
                     });
@@ -2011,18 +2436,19 @@ pub(crate) async fn run_agent_loop(
                         return Ok((loop_stats, LoopExitReason::Denied));
                     }
 
+                    let approval_id = event::next_approval_id();
                     if let Some(slot) = json_approval {
                         // JSON mode: emit approval event and wait for stdin response
                         bus.send(AppEvent::ApprovalRequired {
                             session_id: local_session_id.clone(),
-                            id: turn as u64,
+                            id: approval_id,
                             command_preview: preview.clone(),
                             category: cat,
                         });
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         {
                             let mut guard = slot.lock().unwrap();
-                            *guard = Some((turn as u64, tx));
+                            *guard = Some((approval_id, tx));
                         }
                         match rx.await {
                             Ok(event::ApprovalResponse::Approve) => {
@@ -2031,13 +2457,14 @@ pub(crate) async fn run_agent_loop(
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "approve".to_string(),
                                 });
                                 apply_user_approval(
                                     event::ApprovalResponse::Approve,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2049,13 +2476,14 @@ pub(crate) async fn run_agent_loop(
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "approve_all".to_string(),
                                 });
                                 apply_user_approval(
                                     event::ApprovalResponse::ApproveAll,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2067,7 +2495,7 @@ pub(crate) async fn run_agent_loop(
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "skip".to_string(),
                                 });
                                 should_skip = true;
@@ -2084,7 +2512,7 @@ pub(crate) async fn run_agent_loop(
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "deny".to_string(),
                                 });
                                 bus.send(AppEvent::TaskComplete {
@@ -2108,10 +2536,10 @@ pub(crate) async fn run_agent_loop(
                     } else {
                         // Interactive mode (TUI/MCP): approval via registry
                         let (tx, rx) = tokio::sync::oneshot::channel();
-                        approval_registry.lock().unwrap().insert(turn as u64, tx);
+                        approval_registry.lock().unwrap().insert(approval_id, tx);
                         bus.send(AppEvent::ApprovalRequired {
                             session_id: local_session_id.clone(),
-                            id: turn as u64,
+                            id: approval_id,
                             command_preview: preview.clone(),
                             category: cat,
                         });
@@ -2123,7 +2551,8 @@ pub(crate) async fn run_agent_loop(
                                 apply_user_approval(
                                     event::ApprovalResponse::Approve,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2136,7 +2565,8 @@ pub(crate) async fn run_agent_loop(
                                 apply_user_approval(
                                     event::ApprovalResponse::ApproveAll,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2258,6 +2688,25 @@ pub(crate) async fn run_agent_loop(
                 &batch.nonce_to_call_id,
                 &batch.call_id_names,
             );
+            // Sandbox write denials: offer the user a grant on the question
+            // rail and tell the model a prompt was raised (so it retries
+            // after a grant instead of giving up).
+            let (sandbox_offers, sandbox_notes) = sandbox_denials_in_results(
+                &json_str,
+                &tool_results,
+                &batch.nonce_to_call_id,
+                &project.root,
+                log_dir,
+            );
+            raise_sandbox_consent_cards(
+                sandbox_offers,
+                headless,
+                bus,
+                approval_registry,
+                &local_session_id,
+                log_dir,
+                &project.root,
+            );
             // The context-budget line is appended once per turn — on the
             // batch's final result — not on every result: N copies per turn
             // were pure token filler (~25 tokens each, re-billed with the
@@ -2269,11 +2718,14 @@ pub(crate) async fn run_agent_loop(
                 if handled_call_ids.contains(call_id) {
                     continue;
                 }
-                let text = if Some(i) == last_unhandled {
+                let mut text = if Some(i) == last_unhandled {
                     format!("{}\n\n{}", result_text, budget)
                 } else {
                     result_text.clone()
                 };
+                if let Some(note) = sandbox_notes.get(call_id) {
+                    text.push_str(note);
+                }
                 if tool_name == "capture_screen" {
                     if let Some(images) = encode_screenshot(result_text) {
                         conversation.add_tool_result_with_images(call_id, tool_name, &text, images);
@@ -2457,7 +2909,7 @@ Proceed with explicit assumptions and continue without additional questions."
                     .clone()
                     .unwrap_or_else(|| "The agent asked for your input.".to_string());
                 slog(&session_log, |l| l.human_question(&question));
-                let question_id = turn as u64;
+                let question_id = event::next_approval_id();
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 approval_registry.lock().unwrap().insert(question_id, tx);
                 bus.send(AppEvent::UserQuestionRequired {
@@ -2535,9 +2987,19 @@ Proceed with explicit assumptions and continue without additional questions."
             let mut should_skip = false;
             if let Some((cat, denied_by_policy)) = needs_approval {
                 let preview = format_command_preview(&json_str);
+                // Approval identity is deliberately separate from the
+                // display preview: content-bearing mutations digest their
+                // content (a preview names only the path), and remembered
+                // approvals are scoped to this session.
+                let dedup_source = autonomy::batch_dedup_source(&json_str);
 
                 // Dedup: skip approval for retries of already-approved commands
-                if !denied_by_policy && autonomy.read().await.was_command_approved(&preview) {
+                if !denied_by_policy
+                    && autonomy
+                        .read()
+                        .await
+                        .was_command_approved(local_session_id.as_deref(), &dedup_source)
+                {
                     slog(&session_log, |l| {
                         l.approval(&cat.to_string(), &preview, "dedup-auto-approved")
                     });
@@ -2558,18 +3020,19 @@ Proceed with explicit assumptions and continue without additional questions."
                         return Ok((loop_stats, LoopExitReason::Denied));
                     }
 
+                    let approval_id = event::next_approval_id();
                     if let Some(slot) = json_approval {
                         // JSON mode: emit approval event and wait for stdin response
                         bus.send(AppEvent::ApprovalRequired {
                             session_id: local_session_id.clone(),
-                            id: turn as u64,
+                            id: approval_id,
                             command_preview: preview.clone(),
                             category: cat,
                         });
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         {
                             let mut guard = slot.lock().unwrap();
-                            *guard = Some((turn as u64, tx));
+                            *guard = Some((approval_id, tx));
                         }
                         match rx.await {
                             Ok(event::ApprovalResponse::Approve) => {
@@ -2578,13 +3041,14 @@ Proceed with explicit assumptions and continue without additional questions."
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "approve".to_string(),
                                 });
                                 apply_user_approval(
                                     event::ApprovalResponse::Approve,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2596,13 +3060,14 @@ Proceed with explicit assumptions and continue without additional questions."
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "approve_all".to_string(),
                                 });
                                 apply_user_approval(
                                     event::ApprovalResponse::ApproveAll,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2614,7 +3079,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "skip".to_string(),
                                 });
                                 should_skip = true;
@@ -2631,7 +3096,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                 });
                                 bus.send(AppEvent::ApprovalResolved {
                                     session_id: local_session_id.clone(),
-                                    id: turn as u64,
+                                    id: approval_id,
                                     action: "deny".to_string(),
                                 });
                                 bus.send(AppEvent::TaskComplete {
@@ -2655,10 +3120,10 @@ Proceed with explicit assumptions and continue without additional questions."
                     } else {
                         // Interactive mode (TUI/MCP): approval via registry
                         let (tx, rx) = tokio::sync::oneshot::channel();
-                        approval_registry.lock().unwrap().insert(turn as u64, tx);
+                        approval_registry.lock().unwrap().insert(approval_id, tx);
                         bus.send(AppEvent::ApprovalRequired {
                             session_id: local_session_id.clone(),
-                            id: turn as u64,
+                            id: approval_id,
                             command_preview: preview.clone(),
                             category: cat,
                         });
@@ -2670,7 +3135,8 @@ Proceed with explicit assumptions and continue without additional questions."
                                 apply_user_approval(
                                     event::ApprovalResponse::Approve,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2683,7 +3149,8 @@ Proceed with explicit assumptions and continue without additional questions."
                                 apply_user_approval(
                                     event::ApprovalResponse::ApproveAll,
                                     cat,
-                                    &preview,
+                                    local_session_id.as_deref(),
+                                    &dedup_source,
                                     &autonomy,
                                     bus,
                                 )
@@ -2797,10 +3264,32 @@ Proceed with explicit assumptions and continue without additional questions."
                 item_id: None,
             });
 
+            // Sandbox write denials: same consent offer as the tool path,
+            // classified against the combined output.
+            let combined = format!("{}\n{}", output.stdout, output.stderr);
+            let (sandbox_offers, sandbox_note) = sandbox_denials_in_text(
+                &batch_facts.write_paths,
+                &combined,
+                &project.root,
+                log_dir,
+            );
+            raise_sandbox_consent_cards(
+                sandbox_offers,
+                headless,
+                bus,
+                approval_registry,
+                &local_session_id,
+                log_dir,
+                &project.root,
+            );
+
             // Format agent output as next user message, include budget summary
             let mut user_msg = format!("Agent output:\n{}", output.stdout);
             if !output.stderr.is_empty() {
                 user_msg.push_str(&format!("\nStderr:\n{}", output.stderr));
+            }
+            if let Some(note) = sandbox_note {
+                user_msg.push_str(&note);
             }
             user_msg.push_str(&format!("\n\n{}", conversation.budget_summary()));
             conversation.add_user(MessageProvenance::ToolOutput, user_msg);
@@ -3020,6 +3509,7 @@ pub(crate) async fn run_round_loop(
                     round,
                     turns_in_round,
                     native_message_count,
+                    project_root: Some(project.root.clone()),
                 });
 
                 // Parked-steer pickup, half 1 (see claim_steer_injections):
@@ -3341,6 +3831,289 @@ fn messages_json_dump_enabled() -> bool {
     *ENABLED
 }
 
+/// One sandbox write denial worth offering a grant for.
+struct SandboxDenial {
+    /// The path the runtime was refused on, as reported.
+    denied: PathBuf,
+    /// What a grant would actually cover (the denied path or its nearest
+    /// existing ancestor — shown verbatim on the card).
+    target: PathBuf,
+}
+
+/// Scan one runtime batch's results for sandbox write denials worth a
+/// consent offer. `commands_json` is the batch JSON (for structured
+/// `file_path` targets); `results` are the folded per-call results.
+/// Returns offers plus the per-call model-facing note map.
+fn sandbox_denials_in_results(
+    commands_json: &str,
+    results: &[(String, String, String)],
+    nonce_to_call_id: &std::collections::HashMap<u64, String>,
+    workdir: &Path,
+    log_dir: &Path,
+) -> (
+    Vec<SandboxDenial>,
+    std::collections::HashMap<String, String>,
+) {
+    let mut offers: Vec<SandboxDenial> = Vec::new();
+    let mut notes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if !crate::sandbox::sandbox_active()
+        || !results
+            .iter()
+            .any(|(_, _, text)| crate::sandbox::permission_denied_signature(text))
+    {
+        return (offers, notes);
+    }
+    // Effective grant view for this session's spawns: daemon env + the
+    // session's own workdir + prior consent grants.
+    let mut grants = crate::sandbox::effective_write_paths();
+    grants.push(workdir.to_path_buf());
+    grants.extend(crate::agent_runner::session_write_grants_for(log_dir));
+
+    // call_id → (runtime function, structured file_path).
+    let mut call_meta: std::collections::HashMap<String, (String, Option<String>)> =
+        std::collections::HashMap::new();
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(commands_json) {
+        if let Some(commands) = parsed.get("commands").and_then(|c| c.as_array()) {
+            for cmd in commands {
+                let (Some(nonce), Some(function)) = (
+                    cmd.get("nonce").and_then(|n| n.as_u64()),
+                    cmd.get("function").and_then(|f| f.as_str()),
+                ) else {
+                    continue;
+                };
+                if let Some(call_id) = nonce_to_call_id.get(&nonce) {
+                    call_meta.insert(
+                        call_id.clone(),
+                        (
+                            function.to_string(),
+                            cmd.get("file_path")
+                                .and_then(|p| p.as_str())
+                                .map(str::to_string),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    for (call_id, _tool_name, text) in results {
+        let Some((function, file_path)) = call_meta.get(call_id) else {
+            continue;
+        };
+        if let Some(target) = crate::sandbox::sandbox_denial_grant_offer(
+            function,
+            file_path.as_deref(),
+            text,
+            &grants,
+        ) {
+            let denied = file_path
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| target.clone());
+            notes.insert(call_id.clone(), sandbox_denial_note(&denied));
+            if !offers.iter().any(|o| o.target == target) {
+                offers.push(SandboxDenial { denied, target });
+            }
+        }
+    }
+    (offers, notes)
+}
+
+/// Text-path variant of [`sandbox_denials_in_results`]: the raw-JSON
+/// batch shape folds all output into one user message, so denials
+/// classify against the combined text using the batch's structured write
+/// paths plus the exec extraction lane. Returns offers and one combined
+/// note.
+fn sandbox_denials_in_text(
+    structured_write_paths: &[String],
+    combined_text: &str,
+    workdir: &Path,
+    log_dir: &Path,
+) -> (Vec<SandboxDenial>, Option<String>) {
+    let mut offers: Vec<SandboxDenial> = Vec::new();
+    if !crate::sandbox::sandbox_active()
+        || !crate::sandbox::permission_denied_signature(combined_text)
+    {
+        return (offers, None);
+    }
+    let mut grants = crate::sandbox::effective_write_paths();
+    grants.push(workdir.to_path_buf());
+    grants.extend(crate::agent_runner::session_write_grants_for(log_dir));
+
+    let mut denied_paths: Vec<PathBuf> = Vec::new();
+    for wp in structured_write_paths {
+        if let Some(target) = crate::sandbox::sandbox_denial_grant_offer(
+            "writeFile",
+            Some(wp),
+            combined_text,
+            &grants,
+        ) {
+            if !offers.iter().any(|o| o.target == target) {
+                denied_paths.push(PathBuf::from(wp));
+                offers.push(SandboxDenial {
+                    denied: PathBuf::from(wp),
+                    target,
+                });
+            }
+        }
+    }
+    if let Some(target) =
+        crate::sandbox::sandbox_denial_grant_offer("execAsAgent", None, combined_text, &grants)
+    {
+        if !offers.iter().any(|o| o.target == target) {
+            denied_paths.push(target.clone());
+            offers.push(SandboxDenial {
+                denied: target.clone(),
+                target,
+            });
+        }
+    }
+    let note = denied_paths.first().map(|p| sandbox_denial_note(p));
+    (offers, note)
+}
+
+/// The model-facing line appended to a denied result so the model knows
+/// the denial is the sandbox (not the task) and that retrying after a
+/// grant is the move.
+fn sandbox_denial_note(denied: &Path) -> String {
+    format!(
+        "\n\n[intendant] Write blocked by the runtime sandbox: {} is outside the granted \
+         write set. The user has been asked whether to grant it — if they allow, retry the \
+         same command; otherwise work within the project, or the user can add the path to \
+         [sandbox] extra_write_paths / run with --no-sandbox.",
+        denied.display()
+    )
+}
+
+/// Raise one consent card per new denial target and spawn its resolver.
+/// Dedup is daemon-lifetime per (log_dir, target) so a repeatedly denied
+/// path never spams the rail. No-op when headless (no rail to answer on —
+/// the model-facing note alone carries the guidance).
+#[allow(clippy::too_many_arguments)]
+fn raise_sandbox_consent_cards(
+    offers: Vec<SandboxDenial>,
+    headless: bool,
+    bus: &EventBus,
+    approval_registry: &event::ApprovalRegistry,
+    session_id: &Option<String>,
+    log_dir: &Path,
+    project_root: &Path,
+) {
+    if headless || offers.is_empty() {
+        return;
+    }
+    static RAISED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(PathBuf, PathBuf)>>,
+    > = std::sync::OnceLock::new();
+    let raised = RAISED.get_or_init(Default::default);
+    for offer in offers {
+        {
+            let mut seen = raised.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.insert((log_dir.to_path_buf(), offer.target.clone())) {
+                continue;
+            }
+        }
+        let id = event::next_approval_id();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        approval_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, tx);
+        let same_path = offer.target == offer.denied;
+        let question = if same_path {
+            format!(
+                "The agent tried to write outside its sandbox:\n{}\n\nGrant write access?",
+                offer.denied.display()
+            )
+        } else {
+            // The grant covers the nearest existing ancestor — show that
+            // width honestly before the user approves it.
+            format!(
+                "The agent tried to write outside its sandbox:\n{}\n\nGranting requires \
+                 write access to {} (the nearest existing directory). Grant it?",
+                offer.denied.display(),
+                offer.target.display()
+            )
+        };
+        bus.send(AppEvent::UserQuestionRequired {
+            session_id: session_id.clone(),
+            id,
+            questions: vec![crate::types::UserQuestion {
+                question,
+                header: "Sandbox".to_string(),
+                options: vec![
+                    crate::types::UserQuestionOption {
+                        label: "Allow for this session".to_string(),
+                        description: "Grants the path until this daemon restarts.".to_string(),
+                    },
+                    crate::types::UserQuestionOption {
+                        label: "Always allow".to_string(),
+                        description: "Adds the path to [sandbox] extra_write_paths in \
+                                      intendant.toml."
+                            .to_string(),
+                    },
+                    crate::types::UserQuestionOption {
+                        label: "Keep denied".to_string(),
+                        description: String::new(),
+                    },
+                ],
+                multi_select: false,
+            }],
+        });
+        let bus = bus.clone();
+        let session_id = session_id.clone();
+        let log_dir = log_dir.to_path_buf();
+        let project_root = project_root.to_path_buf();
+        let target = offer.target.clone();
+        tokio::spawn(async move {
+            let answer = match rx.await {
+                Ok(event::ApprovalResponse::Answer { answers }) => {
+                    answers.values().next().cloned().unwrap_or_default()
+                }
+                // Deny/skip/dismissal (or a torn-down session dropping the
+                // registry) all resolve to "keep denied".
+                Ok(_) | Err(_) => String::new(),
+            };
+            let resolution = if answer.starts_with("Always") {
+                match crate::sandbox::add_live_write_grant(&target) {
+                    Ok(()) => {
+                        // Persist after the live grant so a save failure
+                        // still leaves the running daemon granted.
+                        if let Err(e) = Project::append_sandbox_extra_write_path(
+                            &project_root,
+                            &target.to_string_lossy(),
+                        ) {
+                            format!(
+                                "granted for this daemon run, but persisting to \
+                                 intendant.toml failed: {e}"
+                            )
+                        } else {
+                            "granted and persisted to [sandbox] extra_write_paths".to_string()
+                        }
+                    }
+                    Err(e) => format!("grant failed: {e}"),
+                }
+            } else if answer.starts_with("Allow") {
+                crate::agent_runner::add_session_write_grant(&log_dir, &target);
+                "granted for this session".to_string()
+            } else {
+                "kept denied".to_string()
+            };
+            bus.send(AppEvent::LogEntry {
+                session_id,
+                level: "info".to_string(),
+                source: "sandbox".to_string(),
+                content: format!(
+                    "sandbox write grant for {}: {}",
+                    target.display(),
+                    resolution
+                ),
+                turn: None,
+            });
+        });
+    }
+}
+
 /// Index of the batch result that carries the per-turn context-budget line:
 /// the final result not already answered out-of-band (skipped/denied).
 /// `None` — empty batch or every result already handled — means no budget
@@ -3434,6 +4207,281 @@ mod steer_dedup {
         );
         assert_eq!(kept.len(), 3, "same-text/new-id and id-less steers stay");
         assert!(dropped.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod controller_tool_gate {
+    //! The controller-tool approval gate: the chokepoint every
+    //! controller-dispatched tool (outbound MCP, invoke_skill,
+    //! spawn_sub_agent, workflow_checkpoint) consults BEFORE any side
+    //! effect. Hermetic: bus + registry only, no daemon.
+
+    use super::*;
+
+    fn test_log() -> (tempfile::TempDir, SharedSessionLog) {
+        let dir = tempfile::tempdir().expect("session log dir");
+        let log = session_log::SessionLog::open(dir.path().join("log")).expect("open session log");
+        (dir, std::sync::Arc::new(std::sync::Mutex::new(log)))
+    }
+
+    fn state_with_tool_rule(level: AutonomyLevel, rule: autonomy::ApprovalRule) -> SharedAutonomy {
+        let mut rules = autonomy::ApprovalConfig::default();
+        rules.tool_call = rule;
+        autonomy::shared_autonomy(autonomy::AutonomyState::new(level, rules))
+    }
+
+    #[tokio::test]
+    async fn policy_deny_refuses_without_prompt_or_dispatch() {
+        let (_dir, log) = test_log();
+        let autonomy = state_with_tool_rule(AutonomyLevel::Medium, autonomy::ApprovalRule::Deny);
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let registry = event::ApprovalRegistry::default();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let outcome = gate_controller_tool_call(
+            "mcp__gh_create_issue",
+            "mcp: mcp__gh_create_issue {}",
+            "tool: mcp__gh_create_issue #0",
+            &autonomy,
+            &bus,
+            &log,
+            None,
+            &registry,
+            false,
+            &token,
+            &Some("sess".to_string()),
+        )
+        .await;
+        let ControllerToolGate::Refuse(text) = outcome else {
+            panic!("tool_call = deny must refuse without dispatching");
+        };
+        assert!(text.contains("deny"), "{text}");
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, AppEvent::ApprovalRequired { .. }),
+                "a policy deny must not raise a prompt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_rule_dispatches_with_audit_event() {
+        let (_dir, log) = test_log();
+        let mut rules = autonomy::ApprovalConfig::default();
+        rules.tool_call = autonomy::ApprovalRule::Auto;
+        let autonomy =
+            autonomy::shared_autonomy(autonomy::AutonomyState::new(AutonomyLevel::Medium, rules));
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let registry = event::ApprovalRegistry::default();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let outcome = gate_controller_tool_call(
+            "mcp__gh_list_issues",
+            "mcp: mcp__gh_list_issues {}",
+            "tool: mcp__gh_list_issues #0",
+            &autonomy,
+            &bus,
+            &log,
+            None,
+            &registry,
+            false,
+            &token,
+            &None,
+        )
+        .await;
+        assert!(matches!(outcome, ControllerToolGate::Dispatch));
+        let mut saw_auto = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, AppEvent::AutoApproved { .. }) {
+                saw_auto = true;
+            }
+        }
+        assert!(saw_auto, "auto dispatch must leave an AutoApproved trail");
+    }
+
+    #[tokio::test]
+    async fn headless_without_approver_fails_closed() {
+        let (_dir, log) = test_log();
+        // Low autonomy: the gate must prompt — and with no approver
+        // surface it must stop, never dispatch.
+        let autonomy = state_with_tool_rule(AutonomyLevel::Low, autonomy::ApprovalRule::Auto);
+        let bus = EventBus::new();
+        let registry = event::ApprovalRegistry::default();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let outcome = gate_controller_tool_call(
+            "mcp__gh_create_issue",
+            "mcp: mcp__gh_create_issue {}",
+            "tool: mcp__gh_create_issue #0",
+            &autonomy,
+            &bus,
+            &log,
+            None,
+            &registry,
+            true,
+            &token,
+            &None,
+        )
+        .await;
+        assert!(matches!(outcome, ControllerToolGate::StopNoApprover));
+    }
+
+    async fn prompt_id(events: &mut tokio::sync::broadcast::Receiver<AppEvent>) -> u64 {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("prompt within 5s")
+                .expect("bus open")
+            {
+                AppEvent::ApprovalRequired { id, category, .. } => {
+                    assert_eq!(category, autonomy::ActionCategory::ToolCall);
+                    return id;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Shipped Medium default, registry lane end to end: prompt → user
+    /// approves → dispatch, and the approval is remembered for the session
+    /// so the identical call dedups without a second prompt.
+    #[tokio::test]
+    async fn medium_default_prompts_then_approve_dispatches_and_dedups() {
+        let (_dir, log) = test_log();
+        let autonomy = autonomy::shared_autonomy(autonomy::AutonomyState::default());
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let registry = event::ApprovalRegistry::default();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let gate = {
+            let autonomy = autonomy.clone();
+            let bus = bus.clone();
+            let log = log.clone();
+            let registry = registry.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                gate_controller_tool_call(
+                    "mcp__gh_create_issue",
+                    "mcp: mcp__gh_create_issue {\"title\":\"x\"}",
+                    "tool: mcp__gh_create_issue #abc",
+                    &autonomy,
+                    &bus,
+                    &log,
+                    None,
+                    &registry,
+                    false,
+                    &token,
+                    &Some("sess-gate".to_string()),
+                )
+                .await
+            })
+        };
+
+        let id = prompt_id(&mut events).await;
+        // The user's click: a direct resolver pops the registry responder.
+        let responder = registry
+            .lock()
+            .unwrap()
+            .remove(&id)
+            .expect("responder armed before the prompt event");
+        responder
+            .send(event::ApprovalResponse::Approve)
+            .expect("gate listening");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), gate)
+            .await
+            .expect("gate returns")
+            .expect("gate task");
+        assert!(matches!(outcome, ControllerToolGate::Dispatch));
+
+        // Session-scoped memory: the identical call dedups...
+        assert!(autonomy
+            .read()
+            .await
+            .was_command_approved(Some("sess-gate"), "tool: mcp__gh_create_issue #abc"));
+        // ...different arguments or another session still prompt.
+        let state = autonomy.read().await;
+        assert!(!state.was_command_approved(Some("sess-gate"), "tool: mcp__gh_create_issue #def"));
+        assert!(!state.was_command_approved(Some("other"), "tool: mcp__gh_create_issue #abc"));
+        drop(state);
+
+        // The dedup hit resolves without arming a new prompt.
+        let outcome = gate_controller_tool_call(
+            "mcp__gh_create_issue",
+            "mcp: mcp__gh_create_issue {\"title\":\"x\"}",
+            "tool: mcp__gh_create_issue #abc",
+            &autonomy,
+            &bus,
+            &log,
+            None,
+            &registry,
+            false,
+            &token,
+            &Some("sess-gate".to_string()),
+        )
+        .await;
+        assert!(matches!(outcome, ControllerToolGate::Dispatch));
+        assert!(
+            registry.lock().unwrap().is_empty(),
+            "dedup hit must not arm a prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_deny_stops_without_dispatch() {
+        let (_dir, log) = test_log();
+        let autonomy = state_with_tool_rule(AutonomyLevel::Low, autonomy::ApprovalRule::Auto);
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let registry = event::ApprovalRegistry::default();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let gate = {
+            let autonomy = autonomy.clone();
+            let bus = bus.clone();
+            let log = log.clone();
+            let registry = registry.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                gate_controller_tool_call(
+                    "spawn_sub_agent",
+                    "spawn_sub_agent: risky task",
+                    "tool: spawn_sub_agent #1",
+                    &autonomy,
+                    &bus,
+                    &log,
+                    None,
+                    &registry,
+                    false,
+                    &token,
+                    &None,
+                )
+                .await
+            })
+        };
+
+        let id = prompt_id(&mut events).await;
+        let responder = registry.lock().unwrap().remove(&id).expect("responder");
+        responder
+            .send(event::ApprovalResponse::Deny)
+            .expect("gate listening");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), gate)
+            .await
+            .expect("gate returns")
+            .expect("gate task");
+        assert!(matches!(outcome, ControllerToolGate::StopDenied));
+        assert!(
+            !autonomy
+                .read()
+                .await
+                .was_command_approved(None, "tool: spawn_sub_agent #1"),
+            "a deny must record nothing"
+        );
     }
 }
 

@@ -1,34 +1,361 @@
-/* ── ui-v2 Activity slice 1: Focus timeline + approval hero ────────────
-   All scoped html.ui-v2. Restyles the EXISTING log-entry scaffold
-   (.log-ts gutter / .log-icon dot / data-level colors) into the design's
-   timeline grammar and the approval panel into the hero card; no DOM
-   builders are rewritten (clone+rewire into session windows keeps
-   working — the same classes style both contexts). Session-window grid
-   and the four sub-tabs keep bridge paint this slice. */
+/* ── ui-v3 Activity ─────────────────────────────────────────────────────
+   A ground-up re-presentation of the Activity tab (all five views) in the
+   "Linear/Raycast-grade" language: calm defaults, one accent, semantic
+   color only for state, power via progressive disclosure.
 
-/* — centered focus column — */
-html.ui-v2 #log-stream {
-  max-width: 880px;
-  margin: 0 auto;
-  padding: 18px 24px 24px;
+   What this file owns:
+     1. the view header (segmented view switch + Timeline tools + the
+        Options popover) — markup lives in 20-shell.html #activity-subtabs;
+     2. the Timeline grammar (log entries: prose / work / meta tiers,
+        command-output groups, reasoning, diffs, separators);
+     3. Focus & Grid surfaces and the session-window cards;
+     4. the strips (steer / attachments / displays) + empty states;
+     5. the action panels (approval / human / question / display-request);
+     6. the Inspector rail (vitals);
+     7. the composer dock (global — styles the shared .global-task-bar).
+
+   Contracts kept (do not break):
+   - .log-entry child ORDER ([icon][ts][host][session][level][anchor?]
+     [content…], createLogScaffold) — the grid below places them explicitly;
+   - every element id JS/QA wires by (all unchanged);
+   - .hidden is display:none !important — the Options popover's .open is
+     deliberately weaker so the router's off-log hide always wins;
+   - the Focus-surface promote/hide mechanics (data-ui2-layout /
+     data-ui2-focus) are behavior, carried over from v2 nearly verbatim. */
+
+html.ui-v2 {
+  /* v3 local rhythm tokens (file-scoped consumers only) */
+  --ui2-measure: 800px;          /* timeline reading column */
+  --ui2-row-gap: 3px;
+  /* v3 elevation (file-scoped): bespoke sizes the global --shadow-* scale
+     doesn't carry. Declared as tokens so the light theme (§11) can remap
+     the ink like 16-styles-v2-tokens does for the global shadows —
+     hardcoded rgba(0,0,0,…) would ship dark-weight shadows to light. */
+  --ui2-shadow-seg: 0 1px 6px rgba(0, 0, 0, .28);      /* segmented active thumb */
+  --ui2-shadow-window: 0 6px 22px rgba(0, 0, 0, .22);  /* session-window cards */
+  --ui2-shadow-rail: 0 8px 28px rgba(0, 0, 0, .24);    /* inspector rail */
+  --ui2-shadow-dock: 0 18px 50px rgba(0, 0, 0, .42);   /* composer dock */
 }
 
-/* — timeline entry grammar — the scaffold's real child order is
-   [icon][ts][host][session][level][anchor?][content…] (createLogScaffold,
-   41:1260). Explicit grid placement turns that into the design's line:
-   [ts gutter][role dot][host][session][ROLE eyebrow][anchor] [body],
-   with every unlisted child (output groups, notices) defaulting into the
-   body column on its own row — a hanging indent for free. */
+/* ═══ 1. View header ═══════════════════════════════════════════════════ */
+
+/* One-row sideways scroller at EVERY width (nowrap outweighs 14-styles'
+   ≤600px flex-wrap rule; the old ui2-chrome phone counter-block folded
+   in here). */
+html.ui-v2 #activity-subtabs {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  position: relative;
+  padding: 10px 18px 0;
+  border-bottom: 0;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  flex-shrink: 0;
+}
+html.ui-v2 #activity-subtabs::-webkit-scrollbar { display: none; }
+
+/* — the five views as one segmented switch — */
+html.ui-v2 #activity-subtabs .ui2-view-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg-1);
+  flex-shrink: 0;
+}
+html.ui-v2 #activity-subtabs .subtab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .01em;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--t-fast), background var(--t-fast), box-shadow var(--t-fast);
+}
+html.ui-v2 #activity-subtabs .subtab-btn svg {
+  width: 13px; height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: .85;
+}
+html.ui-v2 #activity-subtabs .subtab-btn:hover { color: var(--text); background: var(--hover-wash); }
+html.ui-v2 #activity-subtabs .subtab-btn.active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--ui2-shadow-seg), inset 0 0 0 1px var(--line);
+}
+/* the Changes count badge rides the button */
+html.ui-v2 #activity-subtabs .subtab-btn .badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: var(--r-pill);
+  background: rgba(var(--iris-rgb), .18);
+  color: var(--iris-2);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+}
+
+/* — Timeline tools (right side; log sub-tab only) — */
+html.ui-v2 #activity-subtabs .ui2-activity-tools {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+html.ui-v2 #activity-subtabs:has(.subtab-btn[data-activity-tab="log"].active) .ui2-activity-tools {
+  display: inline-flex;
+}
+
+/* session switcher: a quiet ghost select showing the CURRENT selection's
+   label beside the chevron. appearance:none suppresses the UA arrow, so
+   the data-URI chevron IS the dropdown affordance — it rides
+   background-image; keep it when touching `background` (the shorthand
+   would erase it). #6C7482 is the mid-gray that reads on both themes.
+   Width is FIXED, not intrinsic: a select sizes to its widest option, so
+   the control used to jump on every option rebuild (and collapsed to a
+   bare ~40px chevron while option-less); long labels ellipsize inside
+   the stable box instead. */
+html.ui-v2 #activity-subtabs .ui2-session-switcher {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 156px;
+  max-width: 210px;
+  height: 28px;
+  padding: 0 24px 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface)
+    url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="%236C7482" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>')
+    no-repeat right 7px center;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+html.ui-v2 #activity-subtabs .ui2-session-switcher:hover { border-color: var(--line-2); color: var(--text); }
+
+/* Focus/Grid segmented (moved from the oversight bar — same ids) */
+html.ui-v2 #activity-subtabs .ui2-layout-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg-1);
+}
+html.ui-v2 #activity-subtabs .ui2-layout-toggle button {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 23px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 #activity-subtabs .ui2-layout-toggle button:hover { color: var(--text); }
+html.ui-v2 #activity-subtabs .ui2-layout-toggle button[aria-pressed="true"] {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--ui2-shadow-seg), inset 0 0 0 1px var(--line);
+}
+
+/* minimize-done + hide-done: small amber hygiene pills (minimize drops
+   finished sub-agents to header bars; hide closes every hard-done
+   window's card — the sessions stay in Sessions). hide-done is
+   grid-only like the sweep pills below: Focus hides the cards it acts
+   on. */
+html.ui-v2 #activity-subtabs .ui2-minimize-done,
+html.ui-v2 #activity-subtabs .ui2-hide-done {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid rgba(var(--amber-rgb), .3);
+  border-radius: 9px;
+  background: rgba(var(--amber-rgb), .08);
+  color: var(--amber);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background var(--t-fast);
+}
+html.ui-v2 #activity-subtabs .ui2-minimize-done[hidden],
+html.ui-v2 #activity-subtabs .ui2-hide-done[hidden],
+html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-hide-done { display: none; }
+html.ui-v2 #activity-subtabs .ui2-minimize-done:hover,
+html.ui-v2 #activity-subtabs .ui2-hide-done:hover { background: rgba(var(--amber-rgb), .14); }
+html.ui-v2 #activity-subtabs .ui2-minimize-done-count,
+html.ui-v2 #activity-subtabs .ui2-hide-done-count {
+  min-width: 16px; height: 16px;
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 0 4px;
+  border-radius: var(--r-pill);
+  background: rgba(var(--amber-rgb), .2);
+  font-family: var(--mono);
+  font-size: 9.5px;
+}
+
+/* collapse/expand-all + its header-details twin: the grid sweep pills —
+   neutral ink (layout actions, not attention nudges), and grid-only:
+   Focus hides the session windows the sweeps act on (ui2-activity.js
+   keeps each label naming the direction one click will act).
+   .ui2-collapse-all drives the window axis (minimized);
+   .ui2-header-details drives the header-details axis (headerCollapsed). */
+html.ui-v2 #activity-subtabs .ui2-collapse-all,
+html.ui-v2 #activity-subtabs .ui2-header-details {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #activity-subtabs .ui2-collapse-all:hover,
+html.ui-v2 #activity-subtabs .ui2-header-details:hover { color: var(--text); background: var(--hover-wash); }
+html.ui-v2 #activity-subtabs .ui2-collapse-all[hidden],
+html.ui-v2 #activity-subtabs .ui2-header-details[hidden],
+html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-collapse-all,
+html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-header-details { display: none; }
+
+/* Options trigger */
+html.ui-v2 #activity-subtabs .ui2-view-options-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 #activity-subtabs .ui2-view-options-btn svg {
+  width: 13px; height: 13px;
+  fill: none; stroke: currentColor; stroke-width: 1.8;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+html.ui-v2 #activity-subtabs .ui2-view-options-btn:hover { color: var(--text); background: var(--hover-wash); }
+html.ui-v2 #activity-subtabs .ui2-view-options-btn[aria-expanded="true"] {
+  color: var(--text);
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+
+/* the Options popover (verbosity + host filter). .open < .hidden, by design.
+   position:fixed — absolute would be clipped by #activity-subtabs'
+   overflow-x:auto on narrow layouts; JS stamps top/left from the button. */
+html.ui-v2 #activity-log-controls { display: none; }
+html.ui-v2 #activity-log-controls.open {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  position: fixed;
+  z-index: 80;
+  min-width: 210px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow-menu);
+}
+html.ui-v2 #activity-log-controls .subtab-control-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  padding: 0;
+}
+html.ui-v2 #activity-log-controls .verbosity-select,
+html.ui-v2 #activity-log-controls .host-filter-select {
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-1);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+html.ui-v2 #activity-log-controls .hidden { display: none !important; }
+
+/* ═══ 2. Timeline grammar ══════════════════════════════════════════════ */
+
+/* — centered reading column — */
+html.ui-v2 #log-stream {
+  max-width: var(--ui2-measure);
+  margin: 0 auto;
+  padding: 16px 28px 28px;
+}
+
+/* — entry scaffold: the scaffold's real child order is
+     [icon][ts][host][session][level][anchor?][content…] (createLogScaffold).
+     Explicit grid placement turns that into [ts gutter][role dot][host]
+     [session][ROLE][anchor] [body]; unlisted children fall into the body
+     column on their own row (a hanging indent for free). — */
 html.ui-v2 .log-entry {
   display: grid;
-  grid-template-columns: 56px 18px max-content max-content max-content max-content minmax(0, 1fr);
+  grid-template-columns: 52px 16px max-content max-content max-content max-content minmax(0, 1fr);
   align-items: baseline;
   position: relative;
-  padding: 4px 0;
+  padding: var(--ui2-row-gap) 0;
   border: 0;
   background: transparent;
-  font-size: 13.5px;
-  line-height: 1.55;
+  font-size: 13px;
+  line-height: 1.6;
 }
 html.ui-v2 .log-entry > * { grid-column: 7; min-width: 0; }
 /* the grid display above outweighs v1's filter hide — restate it */
@@ -42,64 +369,50 @@ html.ui-v2 .log-entry .log-anchor-btn { grid-column: 6; grid-row: 1; }
 html.ui-v2 .log-entry .log-content { grid-column: 7; }
 html.ui-v2 .log-entry .log-ts {
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 9.5px;
   color: var(--text-3);
+  opacity: .8;
   text-align: right;
   white-space: nowrap;
-  padding-right: 4px;
-  width: auto;    /* v1 fixes .log-ts at width:88px — wider than the 56px
-                     gutter, it would overflow across the dot/badge
-                     columns and mash the row's left side */
+  padding-right: 2px;
+  width: auto;    /* v1 fixes .log-ts at 88px — wider than the gutter */
   min-width: 0;
 }
 html.ui-v2 .log-entry .log-icon {
   font-size: 0;               /* hide the glyph… */
-  width: 6px; height: 6px;    /* …become the role dot */
+  width: 5px; height: 5px;    /* …become the role dot */
   border-radius: 50%;
   background: var(--text-3);
-  /* Pin to the FIRST text line, not the entry's vertical middle —
-     align-self:center floated the dot between lines on wrapped entries.
-     13.5px × 1.55 line box = ~21px; a 6px dot centers at (21−6)/2 ≈ 7px. */
+  /* pin to the first text line: 13px × 1.6 ≈ 21px line box → dot at 8px */
   align-self: start;
-  margin-top: 7px;
+  margin-top: 8px;
   justify-self: center;
 }
-/* Meta chips join the row's shared baseline so they ride line 1 on
-   wrapped entries (center-alignment floated them mid-entry). */
 html.ui-v2 .log-entry .log-host,
 html.ui-v2 .log-entry .log-session { margin-right: 7px; align-self: baseline; }
 html.ui-v2 .log-entry .log-anchor-btn { margin-right: 6px; align-self: baseline; }
-/* the source string becomes the role eyebrow (gap via padding — grid
-   max-content tracks size it reliably even when the glyph is ::after) */
+/* the source string becomes the role eyebrow */
 html.ui-v2 .log-entry .log-level {
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 9px;
   font-weight: 700;
-  letter-spacing: .13em;
+  letter-spacing: .12em;
   text-transform: uppercase;
   color: var(--text-3);
   padding-right: 10px;
   white-space: nowrap;
-  width: auto;    /* v1 fixes .log-level at width:52px — the longer v2
-                     role labels (INTENDANT) would ink past it into the
-                     content column */
-  /* Shared body edge: each entry is its own grid, so a max-content level
-     track makes body columns ragged across rows (ℹ vs INTENDANT). A
-     min-width sized to the longest eyebrow (INTENDANT at 9.5px mono +
-     .13em tracking ≈ 62px) lines every body up without reintroducing
-     v1's overflow. */
-  min-width: 63px;
+  width: auto;    /* v1 fixes .log-level at 52px — the v3 labels overflow it */
+  /* shared body edge: a min-width sized to the longest eyebrow keeps every
+     body column aligned across rows */
+  min-width: 60px;
 }
 /* named roles: label overrides (textContent stays untouched — session
-   windows and Station read it — so the swap is ::after only) */
+   windows and Station read it — the swap is ::after only) */
 html.ui-v2 .log-entry.source-user .log-level,
 html.ui-v2 .log-entry.source-model .log-level,
 html.ui-v2 .log-entry.source-prsnc .log-level,
 html.ui-v2 .log-entry.source-live .log-level { font-size: 0; letter-spacing: 0; }
-html.ui-v2 .log-entry .log-level::after {
-  font-size: 9.5px;
-  letter-spacing: .13em;
-}
+html.ui-v2 .log-entry .log-level::after { font-size: 9px; letter-spacing: .12em; }
 html.ui-v2 .log-entry.source-user .log-level { color: var(--amber); }
 html.ui-v2 .log-entry.source-user .log-level::after { content: 'YOU'; }
 html.ui-v2 .log-entry.source-model .log-level { color: var(--iris-2); }
@@ -108,6 +421,12 @@ html.ui-v2 .log-entry.source-prsnc .log-level { color: var(--green); }
 html.ui-v2 .log-entry.source-prsnc .log-level::after { content: 'PRESENCE'; }
 html.ui-v2 .log-entry.source-live .log-level { color: var(--sky); }
 html.ui-v2 .log-entry.source-live .log-level::after { content: 'VOICE'; }
+/* local attachment echo (47's renderAttachmentReceipt): a status row, not
+   user speech — quiet eyebrow, and deliberately NOT source-user, so it
+   never reads as (or dedupes against) the canonical YOU row */
+html.ui-v2 .log-entry.source-attach .log-level { font-size: 0; letter-spacing: 0; color: var(--text-3); }
+html.ui-v2 .log-entry.source-attach .log-level::after { content: 'ATTACH'; }
+html.ui-v2 .log-entry.source-attach .log-content { color: var(--text-3); }
 /* role dot tints */
 html.ui-v2 .log-entry.level-model .log-icon { background: var(--iris); }
 html.ui-v2 .log-entry.level-agent .log-icon { background: var(--green); }
@@ -117,61 +436,334 @@ html.ui-v2 .log-entry.level-error .log-icon { background: var(--rose); }
 html.ui-v2 .log-entry.level-warn .log-icon { background: var(--amber); }
 html.ui-v2 .log-entry.level-info .log-icon { background: var(--sky); }
 html.ui-v2 .log-entry.source-user .log-icon { background: var(--amber); }
+/* body ink: eyebrow + dot carry the role, the body reads as text ink;
+   warn/error keep their semantic tint */
 html.ui-v2 .log-entry.level-model { color: var(--text); }
 html.ui-v2 .log-entry.level-detail, html.ui-v2 .log-entry.level-debug { color: var(--text-3); }
 html.ui-v2 .log-entry.level-error { color: var(--rose); }
 html.ui-v2 .log-entry.level-warn { color: var(--amber); }
-/* v1 re-tints body prose per role at the child level
-   (.level-model .log-content { color: var(--log-model) } …) which outranks
-   the parent rules above — under v2 the EYEBROW + dot carry the role and
-   the body reads as text ink. Warn/error keep their semantic tint. */
 html.ui-v2 .log-entry.level-model .log-content,
 html.ui-v2 .log-entry.level-agent .log-content,
 html.ui-v2 .log-entry.level-subagent .log-content,
 html.ui-v2 .log-entry.level-presence .log-content { color: var(--text); }
 html.ui-v2 .log-entry.level-detail .log-content,
 html.ui-v2 .log-entry.level-debug .log-content { color: var(--text-3); }
+
+/* — prose tier: what was SAID. Model/presence/subagent prose breathes;
+     the user's own messages get a quiet amber card so a glance separates
+     "what I asked" from "what it's doing". — */
+html.ui-v2 .log-entry.level-model { --ui2-row-gap: 5px; }
+html.ui-v2 .log-entry.source-user .log-content {
+  background: rgba(var(--amber-rgb), .07);
+  border: 1px solid rgba(var(--amber-rgb), .16);
+  border-radius: 12px;
+  padding: 7px 12px;
+  color: var(--text);
+}
+html.ui-v2 .log-entry.source-user { padding-top: 7px; padding-bottom: 7px; }
+/* …and the agent's replies get the same quiet card in the model/iris
+   family — a shade quieter than the user's amber (model prose is the
+   bulk of a transcript), same geometry, so saying reads as cards and
+   doing stays bare work rows. Keyed on the stamped renderer vocabulary
+   exactly like the chapter-nav classifier (57c): level-model minus
+   reasoning; the structural :nots keep entry kinds that ride the model
+   level (thinking rows, diffs, output groups) on their own grammar.
+   Native model rows and external claude-code/codex/gemini prose all
+   stamp level-model, so every surface (grid/Focus, stream, detail,
+   peek) gets the card from this one rule. Steer rows deliberately keep
+   their dimmed meta hairline — not restyled here. */
+html.ui-v2 .log-entry.level-model:not([data-kind="reasoning"]):not(.reasoning-log-entry):not(.diff-log-entry):not(.command-output-group) .log-content {
+  background: rgba(var(--iris-rgb), .05);
+  border: 1px solid rgba(var(--iris-rgb), .12);
+  border-radius: 12px;
+  padding: 7px 12px;
+}
+html.ui-v2 .log-entry.level-model:not([data-kind="reasoning"]):not(.reasoning-log-entry):not(.diff-log-entry):not(.command-output-group) {
+  padding-top: 7px;
+  padding-bottom: 7px;
+}
+/* border-box: a collapsed card's 1.5em clamp would otherwise be eaten by
+   its own padding — keep one text line visible inside collapsed bubbles */
+html.ui-v2 .log-entry.collapsible:not(.expanded).source-user .log-content,
+html.ui-v2 .log-entry.collapsible:not(.expanded).level-model:not([data-kind="reasoning"]):not(.reasoning-log-entry):not(.diff-log-entry):not(.command-output-group) .log-content {
+  max-height: calc(1.5em + 16px);
+}
+
+/* markdown body rhythm */
+html.ui-v2 .log-entry .log-markdown { min-width: 0; }
+html.ui-v2 .log-entry .log-markdown > :first-child { margin-top: 0; }
+html.ui-v2 .log-entry .log-markdown > :last-child { margin-bottom: 0; }
+
 /* hover actions float over the entry instead of joining the grid flow */
 html.ui-v2 .log-entry .log-copy-entry,
 html.ui-v2 .log-entry .log-edit-message {
   position: absolute;
-  top: 2px;
+  top: 3px;
   background: var(--surface);
-  border-color: var(--line);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text-3);
+  opacity: 0;
+  transition: opacity var(--t-fast), color var(--t-fast), border-color var(--t-fast);
 }
-html.ui-v2 .log-entry .log-copy-entry { right: 4px; }
-html.ui-v2 .log-entry .log-edit-message { right: 32px; }
+html.ui-v2 .log-entry:hover .log-copy-entry,
+html.ui-v2 .log-entry:hover .log-edit-message,
+html.ui-v2 .log-entry:focus-within .log-copy-entry,
+html.ui-v2 .log-entry:focus-within .log-edit-message,
+html.ui-v2 .log-entry .log-copy-entry.copied { opacity: 1; }
+/* touch devices have no hover — keep the actions dimly present */
+@media (hover: none) {
+  html.ui-v2 .log-entry .log-copy-entry,
+  html.ui-v2 .log-entry .log-edit-message { opacity: .75; }
+}
+html.ui-v2 .log-entry .log-copy-entry:hover,
+html.ui-v2 .log-entry .log-edit-message:hover { color: var(--text); border-color: var(--line-2); }
+html.ui-v2 .log-entry .log-copy-entry { right: 2px; }
+html.ui-v2 .log-entry .log-edit-message { right: 30px; }
 
 /* code-ish payloads inside entries read as command blocks */
 html.ui-v2 .log-entry pre {
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--code-bg);
-  padding: 10px 13px;
+  padding: 9px 12px;
   font-family: var(--mono);
-  font-size: 12.5px;
-  line-height: 1.6;
-}
-html.ui-v2 .diff-log-entry .diff-log-body {
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  overflow: hidden;
-  background: var(--surface);
+  font-size: 12px;
+  line-height: 1.55;
 }
 
-/* rewind strike-through + superseded keep their meaning, v2 tones */
-html.ui-v2 .log-entry.superseded { opacity: .48; }
+/* — work tier: what it DID. Tool calls + command rows are mono, quiet,
+     riding a hairline spine so a glance separates doing from saying. — */
+html.ui-v2 .log-entry.level-agent,
+html.ui-v2 .log-entry.diff-log-entry { position: relative; }
+html.ui-v2 .log-entry.level-agent::before,
+html.ui-v2 .log-entry.diff-log-entry::before {
+  content: '';
+  position: absolute;
+  left: 62px;               /* between the ts gutter and the dot column */
+  top: 3px;
+  bottom: 3px;
+  width: 2px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--green) 26%, transparent);
+}
+html.ui-v2 .log-entry.level-agent:not(.command-output-group) .log-content {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-2);
+}
+
+/* command rows: the EXEC label is a chip, the command an inline code run */
+html.ui-v2 .log-entry .log-content.log-command {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-family: var(--mono);
+}
+html.ui-v2 .log-command-label {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--sky);
+  background: rgba(var(--sky-rgb), .1);
+  border: 1px solid rgba(var(--sky-rgb), .22);
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+html.ui-v2 .log-command-failed .log-command-label {
+  color: var(--rose);
+  background: rgba(var(--rose-rgb), .1);
+  border-color: rgba(var(--rose-rgb), .26);
+}
+html.ui-v2 code.log-command-code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* rewind strike-through + superseded keep their meaning */
+html.ui-v2 .log-entry.superseded { opacity: .46; }
 html.ui-v2 .log-entry.rollback-marker { color: var(--amber); }
 
-/* — reasoning ("Thinking") rows (41b-reasoning-log.js) ─────────────────
-   Calm by default: violet-dotted, dimmed one-line summary under a plain
-   "Thinking" label; the full text renders lazily on tap. Same classes
-   style the Activity feed, session windows, and the Sessions detail
-   view — the builder is shared across all three. */
-html.ui-v2 .log-entry.reasoning-log-entry .log-icon {
-  background: var(--violet);
-  opacity: .55;
+/* state badges (T<N>, rewind, overwritten, replacement) */
+html.ui-v2 .log-state-badge {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  border-radius: 5px;
+  padding: 1px 5px;
 }
+
+/* — meta tier: bookkeeping + steer receipts as hairline annotations — */
+html.ui-v2 .log-entry.ui2-meta { --ui2-row-gap: 1px; }
+html.ui-v2 .log-entry.ui2-meta .log-content {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  letter-spacing: .01em;
+}
+html.ui-v2 .log-entry.ui2-meta .log-icon {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--text-3);
+  opacity: .5;
+}
+html.ui-v2 .log-entry.source-steer .log-level { color: var(--text-3); }
+
+/* backend stderr: compact dimmed mono rows */
+html.ui-v2 .log-entry.ui2-stderr { --ui2-row-gap: 1px; }
+html.ui-v2 .log-entry.ui2-stderr .log-content {
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--text-3);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* the worker eyebrow names the backend */
+html.ui-v2 .log-entry.source-claude-code .log-level,
+html.ui-v2 .log-entry.source-codex .log-level,
+html.ui-v2 .log-entry.source-gemini .log-level { color: var(--iris-2); }
+html.ui-v2 .log-entry.source-claude-code.level-model .log-icon,
+html.ui-v2 .log-entry.source-codex.level-model .log-icon,
+html.ui-v2 .log-entry.source-gemini.level-model .log-icon { background: var(--iris); }
+
+/* — turn separators: quiet centered breaks — */
+html.ui-v2 .log-turn-sep {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: var(--ui2-measure);
+  margin: 12px auto;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  opacity: .8;
+  border: 0;
+  background: transparent;
+}
+html.ui-v2 .log-turn-sep::before,
+html.ui-v2 .log-turn-sep::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+/* ═══ 3. Entry kinds: output groups, reasoning, diffs ══════════════════ */
+
+/* — command-output groups: a named, chevroned card with a heartbeat — */
+html.ui-v2 .command-output-group .command-output-summary {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+html.ui-v2 .command-output-group .command-output-summary .output-command {
+  color: var(--text-2);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 46ch;
+}
+html.ui-v2 .command-output-group .command-output-summary .output-detail { color: var(--text-3); }
+html.ui-v2 .command-output-group .command-output-summary .status-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  align-self: center;
+  background: var(--green);
+  flex: none;
+}
+/* the live heartbeat: THE signal for "working right now" — one pulse,
+   nowhere else */
+html.ui-v2 .command-output-group:not(.finalized) .command-output-summary .status-dot {
+  background: var(--iris);
+}
+@media (prefers-reduced-motion: no-preference) {
+  html.ui-v2 .command-output-group:not(.finalized) .command-output-summary .status-dot {
+    animation: ui2-pulse 1.6s ease-in-out infinite;
+  }
+}
+html.ui-v2 .command-output-group .command-output-body {
+  display: block;
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--code-bg);
+  overflow: hidden;
+}
+html.ui-v2 .command-output-group .command-output-body:empty { display: none; }
+html.ui-v2 .command-output-group:not(.expanded) .command-output-body { display: none; }
+/* the streaming tail under a collapsed live group — proof of life */
+html.ui-v2 .command-output-group .command-output-tail {
+  display: block;
+  margin-top: 4px;
+  padding-left: 12px;
+  border-left: 2px solid color-mix(in srgb, var(--iris) 30%, transparent);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--text-3);
+  white-space: pre;
+  overflow: hidden;
+  max-height: 4.5em;
+}
+html.ui-v2 .command-output-group .command-output-tail:empty { display: none; }
+html.ui-v2 .command-output-group.expanded .command-output-tail,
+html.ui-v2 .command-output-group.finalized .command-output-tail { display: none; }
+html.ui-v2 .command-output-group .command-output-truncation-note {
+  display: block;
+  padding: 4px 12px 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+}
+html.ui-v2 .command-output-group .command-output-pre {
+  margin: 0;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: 11px;
+  line-height: 1.5;
+  max-height: 320px;
+  overflow: auto;
+}
+
+/* collapse affordances read as controls, not stray glyphs */
+html.ui-v2 .collapse-toggle {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0 6px;
+  transition: color var(--t-fast), border-color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .log-entry:hover .collapse-toggle {
+  color: var(--text-2);
+  border-color: var(--line);
+  background: var(--hover-wash);
+}
+
+/* — reasoning ("Thinking") rows: calm violet one-liners, lazy body — */
+html.ui-v2 .log-entry.reasoning-log-entry .log-icon { background: var(--violet); opacity: .55; }
 html.ui-v2 .log-entry.reasoning-log-entry.expandable { cursor: pointer; }
 html.ui-v2 .reasoning-log-wrap {
   display: flex;
@@ -205,8 +797,6 @@ html.ui-v2 .reasoning-log-text {
   font-style: italic;
   color: var(--text-3);
 }
-/* expanded: the label stays as the header, the summary line yields to the
-   full text (otherwise the first sentence reads twice) */
 html.ui-v2 .reasoning-log-entry.expanded .reasoning-log-text { display: none; }
 html.ui-v2 .reasoning-log-body {
   display: none;
@@ -233,123 +823,39 @@ html.ui-v2 .reasoning-log-entry .collapse-toggle {
 html.ui-v2 .reasoning-log-entry.expanded .collapse-toggle .arrow { display: none; }
 html.ui-v2 .reasoning-log-entry:not(.expanded) .collapse-toggle .arrow-up { display: none; }
 
-/* — approval hero card (design's flagship moment) — */
-html.ui-v2 #approval-panel .approval-card {
-  border: 1px solid rgba(var(--amber-rgb), .32);
-  border-radius: 14px;
-  /* tint over an OPAQUE base — a bare gradient let the stream ghost
-     through the card (pixel-QA 2026-07-08) */
-  background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .02)), var(--surface);
-  box-shadow: var(--shadow-card);
-  padding: 15px 17px;
+/* — diff entries — */
+html.ui-v2 .diff-log-entry .diff-log-summary {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
 }
-html.ui-v2 #approval-panel .approval-icon { display: none; }
-html.ui-v2 #approval-panel .approval-title {
-  font-size: 13px;
-  font-weight: 800;
-  color: var(--amber);
-  display: inline-flex;
-  align-items: center;
-  gap: 9px;
-}
-html.ui-v2 #approval-panel .approval-title::before {
-  content: '';
-  width: 8px; height: 8px; border-radius: 50%;
-  background: var(--amber);
-  box-shadow: 0 0 0 4px rgba(var(--amber-rgb), .14);
-  animation: ui2-pulse 2s infinite;
-}
-html.ui-v2 #approval-panel .approval-command {
+html.ui-v2 .diff-log-entry .diff-log-body {
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: var(--code-bg);
-  padding: 10px 14px;
-  font-family: var(--mono);
-  font-size: 12.5px;
-  margin: 10px 0 6px;
+  overflow: hidden;
+  background: var(--surface);
+  margin-top: 5px;
 }
-html.ui-v2 #approval-panel .approval-category {
-  display: inline-block;
-  font-family: var(--mono);
-  font-size: 10.5px;
-  padding: 2px 8px;
-  border-radius: var(--r-pill);
-  background: rgba(var(--amber-rgb), .14);
-  border: 1px solid rgba(var(--amber-rgb), .26);
-  color: var(--amber);
-  margin-bottom: 11px;
-}
-/* keep v1's empty-hide winning — the display above outranked it and an
-   empty category rendered as a bare amber crumb */
-html.ui-v2 #approval-panel .approval-category:empty { display: none; }
-html.ui-v2 #approval-panel .approval-actions { display: flex; gap: 9px; flex-wrap: wrap; align-items: center; }
-html.ui-v2 #approval-panel .approval-actions button {
-  padding: 9px 15px;
-  border-radius: var(--r-ctl);
+
+/* — attachment strips + image galleries — */
+html.ui-v2 .log-attachment-strip { gap: 6px; }
+html.ui-v2 .log-attachment-thumb,
+html.ui-v2 .log-screenshot {
+  border-radius: 8px;
   border: 1px solid var(--line);
-  background: transparent;
-  color: var(--text-2);
-  font-family: inherit; font-size: 13px; font-weight: 600;
-  cursor: pointer;
-  transition: background var(--t-fast), color var(--t-fast);
 }
-html.ui-v2 #approval-panel .approval-actions button:hover { background: var(--surface-2); color: var(--text); }
-html.ui-v2 #approval-panel .approval-actions button.approve {
-  /* transparent border (not 0): keeps this box the same 37px height as
-     its bordered siblings — the row read 35px vs 37px */
-  border: 1px solid transparent;
-  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
-  color: var(--on-accent);
-  font-weight: 800;
-  box-shadow: 0 8px 22px rgba(var(--iris-rgb), .36);
-}
-html.ui-v2 #approval-panel .approval-actions button.approve:hover { filter: brightness(1.08); }
-html.ui-v2 #approval-panel .approval-actions button.deny {
-  border-color: rgba(var(--rose-rgb), .4);
-  color: var(--rose);
-  font-weight: 700;
-}
-html.ui-v2 #approval-panel .approval-actions button.deny:hover { background: rgba(var(--rose-rgb), .1); }
-html.ui-v2 #approval-panel .approval-actions kbd {
+html.ui-v2 .log-image-badge {
   font-family: var(--mono);
   font-size: 10px;
-  padding: 1px 5px;
-  border-radius: 5px;
-  /* text-toned wash: lightens on dark, darkens on light, so the hint
-     stays legible on the iris-filled Approve in BOTH themes (the old
-     fixed dark wash made dark-theme "y" black-on-black) */
-  background: rgba(var(--text-rgb), .16);
-  /* ride the button's own ink (v1 pins kbd to overlay1/text-3, which
-     washes out on the filled Approve) */
-  color: inherit;
+  color: var(--text-3);
 }
-/* the category-rule action (inserted by ui2-activity.js) */
-html.ui-v2 #approval-panel .ui2-approve-category {
-  border-color: rgba(var(--green-rgb), .34);
-  color: var(--green);
-}
-html.ui-v2 #approval-panel .ui2-approve-category:hover { background: rgba(var(--green-rgb), .08); }
-/* the relabeled autonomy escape reads as the power action it is */
-html.ui-v2 #approval-panel .ui2-full-escape { font-size: 12px; color: var(--text-3); }
 
-/* — Focus layout (default): the FOREGROUND session's timeline ──────────
-   Two surfaces, selected by data-ui2-focus (stamped by ui2ApplyFocusSurface):
+/* ═══ 4. Focus & Grid surfaces + session windows ═══════════════════════ */
 
-     [data-ui2-focus="session"] — a session is targeted. Its session window
-       is promoted out of the grid and becomes the timeline. The window is
-       the ONLY place a resumed / external session's transcript exists —
-       hydration renders it there and never into the combined stream — so
-       promoting it is what makes Focus work at all after a resume, and it
-       reuses the window's live, deduped, virtualized renderer instead of
-       standing up a second copy of one.
-
-     [data-ui2-focus="all"] — nothing targeted. The combined stream is the
-       surface, as before; it also carries the idle / unfueled empty state,
-       which therefore now appears only when there is genuinely nothing to
-       read.
-
-   Grid mode (html[data-ui2-layout="grid"]) leaves v1's machinery fully in
-   charge in both cases. */
+/* Focus layout (default): the FOREGROUND session's timeline. Two surfaces,
+   selected by data-ui2-focus (stamped by ui2ApplyFocusSurface):
+   "session" promotes that window out of the grid; "all" keeps the combined
+   stream. Grid mode leaves v1's machinery in charge. */
 html.ui-v2:not([data-ui2-layout="grid"]) #session-window-grid-resize-handle,
 html.ui-v2:not([data-ui2-layout="grid"]) #concurrent-log-label { display: none; }
 
@@ -400,68 +906,763 @@ html.ui-v2:not([data-ui2-layout="grid"])[data-ui2-focus="session"] #session-wind
   box-shadow: none;
   cursor: default;
 }
-/* The window's log becomes the design's centered timeline column — the same
-   880px measure and padding #log-stream uses on the all-sessions surface.
-   The .log-entry grammar at the top of this file already styles both. */
+/* The window's log becomes the centered timeline column. */
 html.ui-v2:not([data-ui2-layout="grid"])[data-ui2-focus="session"] .session-window.ui2-focus-window .session-window-log {
   flex: 1 1 auto;
   min-height: 0;
   max-height: none;
   width: 100%;
-  max-width: 880px;
+  max-width: var(--ui2-measure);
   margin-inline: auto;
-  padding: 18px 24px 24px;
+  padding: 16px 28px 28px;
 }
-/* The card header keeps carrying session identity, phase, and the window
-   controls; it reads as the timeline's header bar, not as a card's. */
+/* The promoted header reads as the timeline's title bar: identity + phase
+   left, window controls right, one hairline under. */
 html.ui-v2:not([data-ui2-layout="grid"])[data-ui2-focus="session"] .session-window.ui2-focus-window .session-window-header {
   width: 100%;
-  max-width: 880px;
+  max-width: var(--ui2-measure);
   margin-inline: auto;
   background: transparent;
   border-bottom: 1px solid var(--line);
+  padding-top: 10px;
+  padding-bottom: 9px;
 }
 
-/* turn separators read as quiet time breaks */
-html.ui-v2 .log-turn-sep {
-  max-width: 880px;
-  margin: 10px auto;
-  opacity: .75;
+/* — session-window cards (Grid + Focus header share the paint) — */
+html.ui-v2 #session-window-grid .session-window {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--ui2-shadow-window);
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+html.ui-v2 #session-window-grid .session-window:hover { border-color: var(--line-2); }
+html.ui-v2 #session-window-grid .session-window.prompt-target {
+  border-color: rgba(var(--iris-rgb), .4);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .12), var(--ui2-shadow-window);
+}
+html.ui-v2 #session-window-grid .session-window-header {
+  gap: 8px;
+  padding: 8px 11px;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+}
+html.ui-v2 #session-window-grid .session-window.header-collapsed .session-window-header,
+html.ui-v2 #session-window-grid .session-window.minimized .session-window-header {
+  border-bottom-color: transparent;
+}
+/* identity badge */
+html.ui-v2 .session-window .session-window-id {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 6px;
+  padding: 2px 7px;
+}
+/* the task line: one quiet truncated line */
+html.ui-v2 .session-window .session-window-task {
+  font-size: 11.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* phase pill */
+html.ui-v2 .session-window .session-window-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  border-radius: var(--r-pill);
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  color: var(--text-3);
+  background: var(--bg-1);
+}
+html.ui-v2 .session-window .session-window-status.active {
+  color: var(--iris-2);
+  border-color: rgba(var(--iris-rgb), .34);
+  background: rgba(var(--iris-rgb), .1);
+}
+html.ui-v2 .session-window .session-window-status.waiting {
+  color: var(--amber);
+  border-color: rgba(var(--amber-rgb), .34);
+  background: rgba(var(--amber-rgb), .09);
+}
+html.ui-v2 .session-window .session-window-status.done {
+  color: var(--green);
+  border-color: rgba(var(--green-rgb), .3);
+  background: rgba(var(--green-rgb), .08);
+}
+/* goal + tier pills: quiet mono rows */
+html.ui-v2 .session-window .session-window-goal {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+html.ui-v2 .session-window .session-window-tier {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+/* window controls: ghost icon buttons */
+html.ui-v2 .session-window .session-window-minimize,
+html.ui-v2 .session-window .session-window-maximize,
+html.ui-v2 .session-window .session-window-close,
+html.ui-v2 .session-window .session-window-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px; height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .session-window .session-window-minimize:hover,
+html.ui-v2 .session-window .session-window-maximize:hover,
+html.ui-v2 .session-window .session-window-close:hover,
+html.ui-v2 .session-window .session-window-actions:hover {
+  color: var(--text);
+  background: var(--hover-wash);
+}
+/* the window's log: denser than the main timeline */
+html.ui-v2 #session-window-grid .session-window .session-window-log {
+  padding: 8px 14px 12px;
+}
+html.ui-v2 #session-window-grid .session-window .session-window-log .log-entry {
+  grid-template-columns: 52px 14px max-content max-content max-content max-content minmax(0, 1fr);
+  font-size: 12px;
+}
+html.ui-v2 #session-window-grid .session-window .session-window-log .log-entry.level-agent::before,
+html.ui-v2 #session-window-grid .session-window .session-window-log .log-entry.diff-log-entry::before {
+  left: 60px;
+}
+/* jump-to-latest button */
+html.ui-v2 .session-window .session-window-jump-bottom {
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--text-3);
+  box-shadow: var(--shadow-card);
+}
+html.ui-v2 .session-window .session-window-jump-bottom:hover { color: var(--text); }
+/* window empty states */
+html.ui-v2 .session-window .session-window-empty {
+  color: var(--text-3);
+  font-size: 12px;
+}
+html.ui-v2 .session-window .session-window-empty-retry {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-2);
+  padding: 4px 10px;
+  cursor: pointer;
+}
+html.ui-v2 .session-window .session-window-empty-retry:hover { background: var(--surface-2); color: var(--text); }
+
+/* vitals chips: quiet ghost chips — full detail stays one click away in
+   the explainer, the default row is glanceable */
+html.ui-v2 .session-window .session-window-vitals { gap: 4px; }
+html.ui-v2 .session-window .vit-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  padding: 2px 5px;
+  cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .session-window .vit-chip:hover {
+  color: var(--text);
+  background: var(--hover-wash);
+  border-color: var(--line);
+}
+html.ui-v2 .session-window .vit-chip[data-severity="warn"] { color: var(--amber); }
+html.ui-v2 .session-window .vit-chip[data-severity="crit"] { color: var(--rose); }
+html.ui-v2 .session-window .vit-attn {
+  color: var(--amber);
+  border-color: rgba(var(--amber-rgb), .3);
+  background: rgba(var(--amber-rgb), .08);
 }
 
-/* — vitals rail (Focus, Activity tab, ≥1180px) ─────────────────────────
-   The design's right rail: Working tree / Context budget / Prompt cache /
-   Rate limits / Changes for the FOREGROUND session (prompt target →
-   current → daemon), fed by the same session_vitals segments the session
-   windows render. Built by ui2-activity.js inside #activity-log-pane so
-   subtab/tab switching hides it for free. */
+/* relationship chips */
+html.ui-v2 .session-window .session-window-relation-chip {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  border-radius: 6px;
+  padding: 1px 6px;
+  cursor: pointer;
+}
+
+/* worktree finish card */
+html.ui-v2 .session-worktree-card {
+  border: 1px solid rgba(var(--green-rgb), .3);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(var(--green-rgb), .07), rgba(var(--green-rgb), .02)), var(--surface);
+  margin: 8px 12px;
+  padding: 10px 12px;
+}
+
+/* ═══ 5. Concurrent region + resize handle ═════════════════════════════ */
+
+html.ui-v2 .concurrent-log-region { border-top: 1px solid var(--line); }
+html.ui-v2 .concurrent-log-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  background: transparent;
+}
+html.ui-v2 .concurrent-log-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px; height: 20px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+html.ui-v2 .concurrent-log-action:hover { color: var(--text); background: var(--hover-wash); }
+
+/* scroll-to-bottom pill */
+html.ui-v2 .scroll-bottom-btn {
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--text-3);
+  box-shadow: var(--shadow-card);
+  font-size: 13px;
+}
+html.ui-v2 .scroll-bottom-btn:hover { color: var(--text); border-color: var(--iris); }
+
+/* ═══ 6. Strips (steer / attachments / displays) + empty state ═════════ */
+
+/* — steer strip: in-flight message receipts — */
+html.ui-v2 .steer-strip {
+  gap: 4px;
+  padding: 4px 18px;
+}
+html.ui-v2 .steer-strip:empty,
+html.ui-v2 .steer-strip.empty { padding: 0; }
+html.ui-v2 .steer-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  max-width: var(--ui2-measure);
+  margin-inline: auto;
+  font-size: 11px;
+  color: var(--text-3);
+  padding: 2px 4px;
+}
+html.ui-v2 .steer-row .steer-icon { flex-shrink: 0; font-size: 10px; }
+html.ui-v2 .steer-row .steer-text {
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+html.ui-v2 .steer-row .steer-reason { font-family: var(--mono); font-size: 9.5px; }
+html.ui-v2 .steer-row .steer-cancel {
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  border-radius: 5px;
+  padding: 0 4px;
+}
+html.ui-v2 .steer-row .steer-cancel:hover { color: var(--rose); background: rgba(var(--rose-rgb), .1); }
+html.ui-v2 .steer-row.delivered .steer-icon { color: var(--green); }
+html.ui-v2 .steer-row.failed .steer-icon,
+html.ui-v2 .steer-row.cancelled .steer-icon { color: var(--rose); }
+html.ui-v2 .steer-row.fading { opacity: 0; transition: opacity .9s ease; }
+
+/* — pending attachments bar — */
+html.ui-v2 .pending-attachments-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: var(--ui2-measure);
+  margin: 6px auto 0;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+html.ui-v2 .pending-attachments-bar.hidden { display: none !important; }
+html.ui-v2 .pending-attachments-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 .pending-attachments-count {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--iris-2);
+}
+html.ui-v2 .pending-attachments-count.warn { color: var(--amber); }
+html.ui-v2 .pending-attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-1);
+  color: var(--text-2);
+  font-size: 10.5px;
+  padding: 3px 6px;
+}
+html.ui-v2 .pending-attachment-chip .chip-thumb {
+  width: 22px; height: 22px;
+  object-fit: cover;
+  border-radius: 5px;
+}
+html.ui-v2 .pending-attachment-chip .chip-remove {
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 0 3px;
+}
+html.ui-v2 .pending-attachment-chip .chip-remove:hover { color: var(--rose); }
+html.ui-v2 .pending-attachments-clear {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 3px 8px;
+}
+html.ui-v2 .pending-attachments-clear:hover { color: var(--text); background: var(--hover-wash); }
+
+/* — display strip — */
+html.ui-v2 .activity-display-strip {
+  background: transparent;
+  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 .activity-display-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  padding: 6px 18px;
+  cursor: pointer;
+}
+html.ui-v2 .activity-display-header:hover { background: var(--hover-wash); }
+html.ui-v2 .strip-minimize-btn,
+html.ui-v2 .strip-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px; height: 20px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+html.ui-v2 .strip-minimize-btn:hover,
+html.ui-v2 .strip-toggle-btn:hover { color: var(--text); background: var(--hover-wash); }
+html.ui-v2 .activity-display-row { gap: 10px; padding: 4px 18px 10px; }
+html.ui-v2 .activity-display-thumb {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+html.ui-v2 .activity-display-thumb:hover { border-color: rgba(var(--iris-rgb), .4); }
+html.ui-v2 .activity-split-handle { cursor: row-resize; }
+
+/* — shared-view banner — */
+html.ui-v2 .shared-view-banner {
+  border: 1px solid rgba(var(--iris-rgb), .3);
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(var(--iris-rgb), .1), rgba(var(--iris-rgb), .04)), var(--surface);
+  color: var(--text-2);
+}
+html.ui-v2 .shared-view-kicker {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--iris-2);
+}
+html.ui-v2 .shared-view-action {
+  border: 1px solid rgba(var(--iris-rgb), .4);
+  border-radius: 7px;
+  background: rgba(var(--iris-rgb), .12);
+  color: var(--iris-2);
+  font-weight: 700;
+  cursor: pointer;
+}
+html.ui-v2 .shared-view-close {
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+html.ui-v2 .shared-view-close:hover { color: var(--text); }
+
+/* — empty state — */
+html.ui-v2 .log-empty-overlay { background: transparent; }
+html.ui-v2 #log-empty-state .ui-empty-title { font-size: 13px; font-weight: 650; color: var(--text-2); }
+html.ui-v2 #log-empty-state .ui-empty-hint { font-size: 12px; color: var(--text-3); }
+html.ui-v2 #log-empty-state .ui-empty-glyph { opacity: .6; color: var(--text-3); }
+
+/* ═══ 7. Action panels (approval / human / question / display-request) ══ */
+
+/* the shared dock: solid backdrop, reading-column width */
+html.ui-v2 #activity-log-pane .bottom-panel.visible {
+  background: transparent;
+  padding: 10px 16px 14px;
+}
+html.ui-v2 #activity-log-pane .bottom-panel .panel-body,
+html.ui-v2 #activity-log-pane .bottom-panel .panel-header {
+  max-width: var(--ui2-measure);
+  margin-inline: auto;
+}
+
+/* — approval: the flagship card — */
+html.ui-v2 #approval-panel .approval-card {
+  position: relative;
+  border: 1px solid rgba(var(--amber-rgb), .32);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(var(--amber-rgb), .09), rgba(var(--amber-rgb), .025)), var(--surface);
+  box-shadow: var(--shadow-overlay);
+  padding: 16px 18px 14px;
+}
+html.ui-v2 #approval-panel .approval-icon { display: none; }
+html.ui-v2 #approval-panel .approval-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 13px;
+  font-weight: 750;
+  color: var(--amber);
+}
+html.ui-v2 #approval-panel .approval-title::before {
+  content: '';
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 0 4px rgba(var(--amber-rgb), .14);
+  flex-shrink: 0;
+}
+@media (prefers-reduced-motion: no-preference) {
+  html.ui-v2 #approval-panel .approval-title::before { animation: ui2-pulse 2s infinite; }
+}
+html.ui-v2 #approval-panel .approval-pending-count {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  border-radius: var(--r-pill);
+  padding: 2px 8px;
+  background: rgba(var(--amber-rgb), .16);
+  color: var(--amber);
+}
+html.ui-v2 .ui2-approval-session {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--session-badge-border, var(--line));
+  background: var(--session-badge-bg, var(--surface-2));
+  color: var(--session-badge-fg, var(--text-2));
+}
+html.ui-v2 #approval-panel .approval-command {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--code-bg);
+  padding: 10px 13px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  margin: 11px 0 8px;
+  overflow-wrap: anywhere;
+}
+html.ui-v2 #approval-panel .approval-category {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 2px 9px;
+  border-radius: var(--r-pill);
+  background: rgba(var(--amber-rgb), .14);
+  border: 1px solid rgba(var(--amber-rgb), .26);
+  color: var(--amber);
+  margin-bottom: 12px;
+}
+/* keep v1's empty-hide winning */
+html.ui-v2 #approval-panel .approval-category:empty { display: none; }
+html.ui-v2 #approval-panel .approval-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+html.ui-v2 #approval-panel .approval-actions button {
+  height: 33px;
+  padding: 0 14px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast), filter var(--t-fast);
+}
+html.ui-v2 #approval-panel .approval-actions button:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 #approval-panel .approval-actions button.approve {
+  border: 1px solid transparent;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-weight: 750;
+  box-shadow: 0 8px 20px rgba(var(--iris-rgb), .34);
+}
+html.ui-v2 #approval-panel .approval-actions button.approve:hover { filter: brightness(1.08); background: linear-gradient(180deg, var(--iris), var(--iris-deep)); }
+html.ui-v2 #approval-panel .approval-actions button.deny {
+  order: 4;
+  border-color: rgba(var(--rose-rgb), .4);
+  color: var(--rose);
+  font-weight: 700;
+}
+html.ui-v2 #approval-panel .approval-actions button.deny:hover { background: rgba(var(--rose-rgb), .1); }
+html.ui-v2 #approval-panel .approval-actions kbd {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: rgba(var(--text-rgb), .16);
+  color: inherit;
+}
+/* the category-rule action */
+html.ui-v2 #approval-panel .ui2-approve-category {
+  border-color: rgba(var(--green-rgb), .34);
+  color: var(--green);
+}
+html.ui-v2 #approval-panel .ui2-approve-category:hover { background: rgba(var(--green-rgb), .08); }
+/* the autonomy escape reads as the power action it is — pushed to the end */
+html.ui-v2 #approval-panel .ui2-full-escape {
+  order: 5;
+  margin-left: auto;
+  border-color: transparent;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+html.ui-v2 #approval-panel .ui2-full-escape:hover { color: var(--text); }
+/* sending state */
+html.ui-v2 #approval-panel .approval-sending-note {
+  font-size: 11px;
+  color: var(--text-3);
+  font-style: italic;
+}
+html.ui-v2 #approval-panel .approval-actions button:disabled { opacity: .55; cursor: default; }
+
+/* — human panel (ask-human): the same card grammar, sky — */
+html.ui-v2 #human-panel .panel-header {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--sky);
+  padding: 0 3px 6px;
+}
+html.ui-v2 #human-panel .panel-body {
+  border: 1px solid rgba(var(--sky-rgb), .3);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(var(--sky-rgb), .08), rgba(var(--sky-rgb), .02)), var(--surface);
+  box-shadow: var(--shadow-overlay);
+  padding: 14px 16px;
+}
+html.ui-v2 #human-panel .input-question {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+  padding: 0 0 10px;
+}
+html.ui-v2 #human-panel .input-area { gap: 8px; }
+html.ui-v2 #human-panel .input-area textarea {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg-1);
+  color: var(--text);
+  font-size: 13px;
+  padding: 8px 11px;
+  min-height: 38px;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+html.ui-v2 #human-panel .input-area textarea:focus {
+  border-color: rgba(var(--iris-rgb), .45);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+  outline: none;
+}
+html.ui-v2 #human-panel .input-area button {
+  border: 0;
+  border-radius: 9px;
+  padding: 8px 16px;
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-size: 12.5px;
+  font-weight: 750;
+  box-shadow: var(--shadow-primary);
+  transition: filter var(--t-fast);
+}
+html.ui-v2 #human-panel .input-area button:hover { filter: brightness(1.08); opacity: 1; }
+
+/* — structured questions: same sky grammar — */
+html.ui-v2 #question-panel .approval-card {
+  border: 1px solid rgba(var(--sky-rgb), .3);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(var(--sky-rgb), .08), rgba(var(--sky-rgb), .02)), var(--surface);
+  box-shadow: var(--shadow-overlay);
+  padding: 14px 16px;
+}
+html.ui-v2 #question-panel .approval-icon { display: none; }
+html.ui-v2 #question-panel .question-text { color: var(--text); font-size: 13px; }
+html.ui-v2 #question-panel .question-header-chip {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--sky);
+  background: rgba(var(--sky-rgb), .1);
+  border: 1px solid rgba(var(--sky-rgb), .24);
+}
+html.ui-v2 #question-panel .question-option {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg-1);
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 #question-panel .question-option:hover { background: var(--surface-2); border-color: var(--line-2); }
+html.ui-v2 #question-panel .question-option.selected {
+  border-color: rgba(var(--iris-rgb), .5);
+  background: rgba(var(--iris-rgb), .1);
+}
+html.ui-v2 #question-panel .question-free-text {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg-1);
+  color: var(--text);
+}
+html.ui-v2 #question-panel .question-free-text:focus {
+  border-color: rgba(var(--iris-rgb), .45);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+  outline: none;
+}
+html.ui-v2 #question-panel .question-index-chip {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--sky);
+  background: rgba(var(--sky-rgb), .1);
+  border: 1px solid rgba(var(--sky-rgb), .24);
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #question-panel .question-index-chip:hover { background: rgba(var(--sky-rgb), .16); border-color: rgba(var(--sky-rgb), .38); }
+html.ui-v2 #question-panel .question-index-chip.answered {
+  color: var(--green);
+  background: rgba(var(--green-rgb), .1);
+  border-color: rgba(var(--green-rgb), .32);
+}
+html.ui-v2 #question-panel .question-progress { color: var(--text-3); font-size: 11px; font-weight: 650; }
+
+/* — display-request panel: violet grammar — */
+html.ui-v2 #display-request-panel .approval-card {
+  border: 1px solid rgba(var(--violet-rgb), .32);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(var(--violet-rgb), .08), rgba(var(--violet-rgb), .02)), var(--surface);
+  box-shadow: var(--shadow-overlay);
+  padding: 14px 16px;
+}
+html.ui-v2 #display-request-panel .approval-icon { display: none; }
+html.ui-v2 #display-request-panel select {
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-1);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+}
+
+/* ═══ 8. Inspector rail (vitals) ═══════════════════════════════════════ */
+
 html.ui-v2 #ui2-vitals-rail { display: none; }
 @media (min-width: 1180px) {
   html.ui-v2:not([data-ui2-layout="grid"]) #ui2-vitals-rail {
     display: flex;
     flex-direction: column;
-    gap: 11px;
     position: absolute;
     top: 12px;
     right: 14px;
-    width: 248px;
-    padding: 14px 15px 12px;
+    width: 252px;
     border: 1px solid var(--line);
     border-radius: 14px;
     background: var(--surface);
+    box-shadow: var(--ui2-shadow-rail);
     z-index: 5;
+    overflow: hidden;
   }
   html.ui-v2:not([data-ui2-layout="grid"]) #activity-log-pane { padding-right: 288px; }
 }
+html.ui-v2 .ui2-rail-head { padding: 12px 14px 10px; border-bottom: 1px solid var(--line); }
+html.ui-v2 .ui2-rail-eyebrow {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  opacity: .8;
+  margin-bottom: 4px;
+}
 html.ui-v2 .ui2-rail-session {
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 750;
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  padding-bottom: 9px;
-  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 .ui2-rail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 11px 14px;
 }
 html.ui-v2 .ui2-rail-row {
   display: flex;
@@ -475,15 +1676,15 @@ html.ui-v2 .ui2-rail-row {
 }
 html.ui-v2 .ui2-rail-label {
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 8.5px;
   font-weight: 700;
-  letter-spacing: .13em;
+  letter-spacing: .14em;
   text-transform: uppercase;
   color: var(--text-3);
 }
 html.ui-v2 .ui2-rail-value {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 11px;
   color: var(--text-2);
   overflow-wrap: anywhere;
 }
@@ -495,6 +1696,7 @@ html.ui-v2 .ui2-rail-meter {
   border-radius: 3px;
   background: var(--surface-2);
   overflow: hidden;
+  margin-top: 2px;
 }
 html.ui-v2 .ui2-rail-meter i {
   display: block;
@@ -504,69 +1706,300 @@ html.ui-v2 .ui2-rail-meter i {
   background: linear-gradient(90deg, var(--iris), var(--violet));
   transition: width .4s ease;
 }
-html.ui-v2 .ui2-rail-changes { cursor: pointer; }
+html.ui-v2 .ui2-rail-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px 12px;
+  border-top: 1px solid var(--line);
+}
+html.ui-v2 .ui2-rail-changes {
+  cursor: pointer;
+  border-radius: 8px;
+  padding: 5px 7px;
+  margin: -5px -7px 0;
+  transition: background var(--t-fast);
+}
+html.ui-v2 .ui2-rail-changes:hover { background: var(--hover-wash); }
 html.ui-v2 .ui2-rail-changes:hover .ui2-rail-value { color: var(--text); }
 html.ui-v2 .ui2-rail-advanced {
-  margin-top: 2px;
   padding: 7px 10px;
   border: 1px solid var(--line);
-  border-radius: var(--r-ctl);
+  border-radius: 9px;
   background: transparent;
   color: var(--text-3);
   font-family: inherit;
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 650;
   cursor: pointer;
-  transition: background var(--t-fast), color var(--t-fast);
+  text-align: center;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
 }
-html.ui-v2 .ui2-rail-advanced:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 .ui2-rail-advanced:hover { background: var(--surface-2); color: var(--text); border-color: var(--line-2); }
 
-/* — Focus filter + raw-entry hygiene + hero identity (corrective batch,
-     2026-07-08 product-owner review) — */
-html.ui-v2 .log-entry.ui2-stderr .log-content {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  line-height: 1.45;
-  color: var(--text-3);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+/* ═══ 9. Composer dock (global — styles the shared .global-task-bar) ═══ */
+
+html.ui-v2 .global-task-bar {
+  border-radius: 18px;
+  padding: 10px 12px;
+  gap: 8px;
+  box-shadow: var(--ui2-shadow-dock);
 }
-html.ui-v2 .log-entry.ui2-stderr { padding: 2px 0; }
-html.ui-v2 .ui2-approval-session {
+/* The dock wraps ONLY while a full-width row is staged (the edit banner /
+   the attachment strip) — at rest it stays the single shrink-to-fit row,
+   so narrow-viewport layouts never start wrapping. `order` places the
+   full-width rows: edit banner above the input row, attachments below. */
+html.ui-v2 .global-task-bar:has(.edit-message-chip:not(.hidden)),
+html.ui-v2 .global-task-bar:has(.global-pending-attachments:not(.hidden)) {
+  flex-wrap: wrap;
+}
+html.ui-v2 .global-task-input {
+  font-size: 13.5px;
+  padding: 8px 6px;
+}
+html.ui-v2 .global-task-input::placeholder { color: var(--text-3); opacity: .8; }
+/* new-session: quiet ghost pill */
+html.ui-v2 .task-new-session-btn {
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 650;
+  padding: 5px 11px;
+  transition: color var(--t-fast), background var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .task-new-session-btn:hover { color: var(--text); background: var(--surface-2); border-color: var(--line-2); }
+/* target chip + hot-swap button read as one segmented control */
+html.ui-v2 .task-target-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 9px 0 0 9px;
+  background: var(--bg-1);
+  padding: 5px 4px 5px 10px;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+html.ui-v2 .task-target-chip .task-target-label {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 .task-target-switch-btn {
+  border: 1px solid var(--line);
+  border-left: 0;
+  border-radius: 0 9px 9px 0;
+  background: var(--bg-1);
+  color: var(--text-3);
+  width: 22px;
+  padding: 0;
+  cursor: pointer;
+}
+html.ui-v2 .task-target-switch-btn:hover { color: var(--text); background: var(--surface-2); }
+/* chip hidden (auto target): the switch button stands alone.
+   `has-target` is maintained by updateTaskTargetChip (39-session-windows.js)
+   in lockstep with the chip's display toggle — key on it, not on the
+   serialized inline style. */
+html.ui-v2 .task-target-chip:not(.has-target) + .task-target-switch-btn {
+  border-left: 1px solid var(--line);
+  border-radius: 9px;
+  width: 26px;
+}
+/* edit-message state: full-width amber banner above the input row
+   (order:-1 wraps it to the FIRST dock row; the dock's :has rule above
+   enables wrapping while the banner is staged; max-width unpins v1's
+   220px inline-chip cap so the banner really spans). */
+html.ui-v2 .edit-message-chip {
+  flex-basis: 100%;
+  max-width: none;
+  order: -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(var(--amber-rgb), .3);
+  border-radius: 9px;
+  background: rgba(var(--amber-rgb), .08);
+  color: var(--amber);
+  font-size: 11px;
+  font-weight: 650;
+  padding: 5px 10px;
+}
+html.ui-v2 .edit-message-chip.hidden { display: none !important; }
+html.ui-v2 .edit-message-chip button {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--amber);
+  cursor: pointer;
+  border-radius: 5px;
+  padding: 0 4px;
+}
+/* Direct: a small labeled toggle pill */
+html.ui-v2 .global-direct-toggle {
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  padding: 4px 11px;
+  font-size: 10.5px;
+  font-weight: 650;
+  color: var(--text-3);
+  background: transparent;
+}
+html.ui-v2 .global-direct-toggle input {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 13px;
+  height: 13px;
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  background: transparent;
+  margin: 0;
+  display: inline-grid;
+  place-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+html.ui-v2 .global-direct-toggle input:checked {
+  background: var(--iris);
+  border-color: var(--iris);
+}
+html.ui-v2 .global-direct-toggle input:checked::before {
+  content: '';
+  width: 7px;
+  height: 4px;
+  border-left: 1.8px solid var(--on-accent);
+  border-bottom: 1.8px solid var(--on-accent);
+  transform: rotate(-45deg) translate(0.5px, -1px);
+}
+html.ui-v2 .global-direct-toggle:has(input:checked) {
+  border-color: rgba(var(--iris-rgb), .4);
+  color: var(--iris-2);
+  background: rgba(var(--iris-rgb), .09);
+}
+/* attachments staged on the composer: full-width chip row BELOW the
+   input row (order:1 sends it past Send; the dock's :has rule enables
+   wrapping while it's staged; max-width unpins v1's min(360px,32vw)
+   inline cap — v1's overflow-x:auto still scrolls a long chip run). */
+html.ui-v2 .global-pending-attachments {
+  flex-basis: 100%;
+  max-width: none;
+  order: 1;
+  gap: 5px;
+  padding: 2px 2px 0;
+}
+html.ui-v2 .global-pending-attachments.hidden { display: none !important; }
+
+/* ═══ 10. Chapter navigation (carried from v2 — already in-language) ═══ */
+
+html.ui-v2 .chapter-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 3px;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  background: var(--glass);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
   font-family: var(--mono);
   font-size: 10px;
-  font-weight: 700;
-  padding: 1px 7px;
-  border-radius: 5px;
-  border: 1px solid var(--session-badge-border, var(--line));
-  background: var(--session-badge-bg, var(--surface-2));
-  color: var(--session-badge-fg, var(--text-2));
+  line-height: 1;
+  user-select: none;
 }
-/* the bottom panel gets a SOLID backdrop — at 92% the stream still
-   ghosted between the hero's buttons (product bar: no text bleed) */
-html.ui-v2 #activity-log-pane .bottom-panel.visible {
-  background: var(--bg);
-  padding: 10px 14px 12px;
+html.ui-v2 .chapter-nav-pane {
+  position: absolute;
+  right: 10px;
+  bottom: 40px; /* stacked above the jump-to-latest button's corner slot */
+  z-index: 12;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--t-fast);
 }
-/* rail contents pair with the composer column: same 920px cap, centered
-   (the full-pane card dwarfed the dock it sits above) */
-html.ui-v2 #activity-log-pane .bottom-panel .panel-body,
-html.ui-v2 #activity-log-pane .bottom-panel .panel-header {
-  max-width: 920px;
-  margin-inline: auto;
+html.ui-v2 .session-window:hover .chapter-nav-pane,
+html.ui-v2 .session-window:focus-within .chapter-nav-pane,
+html.ui-v2 .chapter-nav-pane.kbd-active {
+  opacity: 1;
+  pointer-events: auto;
+}
+html.ui-v2 .session-window.minimized .chapter-nav-pane { display: none; }
+html.ui-v2 .chapter-nav-detail { margin-right: 6px; }
+html.ui-v2 .chapter-nav button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  cursor: pointer;
+  border-radius: 999px;
+  padding: 0;
+}
+html.ui-v2 .chapter-nav .chapter-nav-mode {
+  padding: 3px 7px;
+  font-size: 9px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--amber);
+  background: rgba(var(--amber-rgb), .12);
+}
+html.ui-v2 .chapter-nav .chapter-nav-mode[data-mode="agent"] {
+  color: var(--iris-2);
+  background: rgba(var(--iris-rgb), .14);
+}
+html.ui-v2 .chapter-nav .chapter-nav-step { width: 18px; height: 18px; font-size: 11px; }
+html.ui-v2 .chapter-nav .chapter-nav-step:hover { color: var(--text); background: var(--hover-wash); }
+html.ui-v2 .chapter-nav-count {
+  min-width: 22px;
+  text-align: center;
+  color: var(--text-3);
+  padding: 0 2px;
+  font-variant-numeric: tabular-nums;
+}
+html.ui-v2 .chapter-nav-count.loading { color: var(--text-2); }
+html.ui-v2 .chapter-nav.empty .chapter-nav-step { opacity: .4; }
+html.ui-v2 .chapter-nav.at-edge { animation: chapterNavEdge .35s ease-out; }
+@keyframes chapterNavEdge {
+  0% { transform: translateY(0); }
+  35% { transform: translateY(-2px); }
+  70% { transform: translateY(1px); }
+  100% { transform: translateY(0); }
+}
+/* jump-target flash: mode-tinted wash + inset marker bar, fading out */
+html.ui-v2 .log-entry.chapter-nav-hit { animation: chapterNavHit 1.4s ease-out; }
+@keyframes chapterNavHit {
+  0% { background: rgba(var(--chapter-hit-rgb), .2); box-shadow: inset 2px 0 0 rgb(var(--chapter-hit-rgb)); }
+  60% { background: rgba(var(--chapter-hit-rgb), .1); box-shadow: inset 2px 0 0 rgb(var(--chapter-hit-rgb)); }
+  100% { background: transparent; box-shadow: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html.ui-v2 .chapter-nav.at-edge { animation: none; }
+  html.ui-v2 .log-entry.chapter-nav-hit {
+    animation: none;
+    box-shadow: inset 2px 0 0 rgb(var(--chapter-hit-rgb));
+  }
 }
 
-/* — light theme: identity-chip legibility (pixel-QA 2026-07-08; widened
-   past this tab per the sessions agent's file request — the .log-entry
-   chip presentation lives here and the same chips render in
-   session-detail logs) ───────────────────────────────────────────────
-   applySessionBadgeStyle mints dark-theme pastels (fg ≈ 78% lightness) as
-   inline --session-badge-* vars; on light surfaces that is pale-on-pale
-   (~1.3:1). Re-derive the consumed colors toward ink while KEEPING each
-   session's hue — a flat token tint would sever the badge ↔ window-ring
-   ↔ switcher color identity. */
+/* ═══ 11. Light theme ══════════════════════════════════════════════════ */
+
+/* v3 elevation, light ink: same geometry as the dark defaults at the top
+   of this file, ink re-derived the way 16-styles-v2-tokens softens the
+   global --shadow-* scale for light (navy-ink, lower alpha). */
+html.ui-v2[data-theme="light"] {
+  --ui2-shadow-seg: 0 1px 6px rgba(23, 28, 50, .12);
+  --ui2-shadow-window: 0 6px 22px rgba(23, 28, 50, .1);
+  --ui2-shadow-rail: 0 8px 28px rgba(23, 28, 50, .14);
+  --ui2-shadow-dock: 0 18px 50px rgba(23, 28, 50, .16);
+}
+
+/* Identity-chip legibility (carried):
+   applySessionBadgeStyle mints dark-theme pastels as inline
+   --session-badge-* vars; on light surfaces that is pale-on-pale.
+   Re-derive toward ink while KEEPING each session's hue. */
 html.ui-v2[data-theme="light"] .log-entry .log-session,
 html.ui-v2[data-theme="light"] .global-task-bar .task-target-session-badge,
 html.ui-v2[data-theme="light"] #ui2-approval-session {
@@ -574,293 +2007,5 @@ html.ui-v2[data-theme="light"] #ui2-approval-session {
   border-color: color-mix(in srgb, var(--session-badge-border, var(--line-2)) 55%, var(--line-2));
 }
 /* Host badge: hash bg is hsl(h, 32%, 58%) with v1 ink var(--base) — in
-   light that base flips to near-white (~2:1 on the midtone bg). Pin the
-   ink to light's text token (dark keeps --base = near-black, ~7:1). */
+   light that base flips to near-white. Pin the ink to light's text token. */
 html.ui-v2[data-theme="light"] .log-entry .log-host { color: var(--text); }
-
-/* — operator-question rail (ask_human parks a session here) — the v2
-   hero grammar, sky-tinted: a question asks for input, not permission. */
-html.ui-v2 #human-panel .panel-header {
-  font-family: var(--mono);
-  font-size: 9.5px;
-  font-weight: 700;
-  letter-spacing: .13em;
-  text-transform: uppercase;
-  color: var(--sky);
-  padding: 0 3px 6px;
-}
-html.ui-v2 #human-panel .panel-body {
-  border: 1px solid rgba(var(--sky-rgb), .3);
-  border-radius: 14px;
-  background: linear-gradient(180deg, rgba(var(--sky-rgb), .08), rgba(var(--sky-rgb), .02)), var(--surface);
-  box-shadow: var(--shadow-card);
-  padding: 13px 15px;
-}
-html.ui-v2 #human-panel .input-question {
-  color: var(--text);
-  font-size: 13.5px;
-  font-weight: 650;
-  padding: 0 0 10px;
-}
-html.ui-v2 #human-panel .input-area { gap: 9px; }
-html.ui-v2 #human-panel .input-area textarea {
-  border: 1px solid var(--line);
-  border-radius: var(--r-ctl);
-  background: var(--surface);
-  color: var(--text);
-  font-size: 13px;
-  padding: 8px 11px;
-  min-height: 38px;
-  transition: border-color var(--t-fast), box-shadow var(--t-fast);
-}
-html.ui-v2 #human-panel .input-area textarea:focus {
-  border-color: rgba(var(--iris-rgb), .45);
-  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
-}
-html.ui-v2 #human-panel .input-area button {
-  border: 0;
-  border-radius: var(--r-ctl);
-  padding: 9px 16px;
-  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
-  color: var(--on-accent);
-  font-size: 13px;
-  font-weight: 800;
-  box-shadow: var(--shadow-primary);
-  transition: filter var(--t-fast);
-}
-html.ui-v2 #human-panel .input-area button:hover { filter: brightness(1.08); opacity: 1; }
-
-/* — structured user questions (#question-panel) share the sky grammar — */
-html.ui-v2 #question-panel .approval-card {
-  border: 1px solid rgba(var(--sky-rgb), .3);
-  border-radius: 14px;
-  background: linear-gradient(180deg, rgba(var(--sky-rgb), .08), rgba(var(--sky-rgb), .02)), var(--surface);
-  box-shadow: var(--shadow-card);
-  padding: 13px 15px;
-}
-html.ui-v2 #question-panel .approval-icon { display: none; }
-html.ui-v2 #question-panel .question-text { color: var(--text); font-size: 13.5px; }
-html.ui-v2 #question-panel .question-header-chip {
-  font-family: var(--mono);
-  font-size: 9.5px;
-  font-weight: 700;
-  letter-spacing: .13em;
-  text-transform: uppercase;
-  color: var(--sky);
-  background: rgba(var(--sky-rgb), .1);
-  border: 1px solid rgba(var(--sky-rgb), .24);
-}
-html.ui-v2 #question-panel .question-option {
-  border: 1px solid var(--line);
-  border-radius: var(--r-ctl);
-  background: var(--surface);
-  transition: background var(--t-fast), border-color var(--t-fast);
-}
-html.ui-v2 #question-panel .question-option:hover {
-  background: var(--surface-2);
-  border-color: var(--line-2);
-}
-html.ui-v2 #question-panel .question-option.selected {
-  border-color: rgba(var(--iris-rgb), .5);
-  background: rgba(var(--iris-rgb), .1);
-}
-html.ui-v2 #question-panel .question-free-text {
-  border: 1px solid var(--line);
-  border-radius: var(--r-ctl);
-  background: var(--surface);
-  color: var(--text);
-}
-html.ui-v2 #question-panel .question-free-text:focus {
-  border-color: rgba(var(--iris-rgb), .45);
-  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
-}
-/* pinned index chips ride the same sky grammar as the header chips;
-   answered flips to the success hue (tick glyph comes from the base rule) */
-html.ui-v2 #question-panel .question-index-chip {
-  font-family: var(--mono);
-  font-size: 9.5px;
-  font-weight: 700;
-  letter-spacing: .13em;
-  text-transform: uppercase;
-  color: var(--sky);
-  background: rgba(var(--sky-rgb), .1);
-  border: 1px solid rgba(var(--sky-rgb), .24);
-  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
-}
-html.ui-v2 #question-panel .question-index-chip:hover {
-  background: rgba(var(--sky-rgb), .16);
-  border-color: rgba(var(--sky-rgb), .38);
-}
-html.ui-v2 #question-panel .question-index-chip.answered {
-  color: var(--green);
-  background: rgba(var(--green-rgb), .1);
-  border-color: rgba(var(--green-rgb), .32);
-}
-html.ui-v2 #question-panel .question-progress {
-  color: var(--text-3);
-  font-size: 11px;
-  font-weight: 650;
-}
-
-/* Inline command code rides the design mono, not the UA's generic
-   monospace (chrome-audit cross-surface sweep). */
-html.ui-v2 code.log-command-code { font-family: var(--mono); }
-
-/* ── The working transcript: three tiers (overhaul 2026-07-13) ─────────
-   Prose (user + worker voice) keeps the base grammar. WORK (tool calls,
-   command output, diffs) gets a spine + mono so a glance separates what
-   the agent SAID from what it DID. META (session bookkeeping, steer
-   receipts) recedes to hairline annotations. Tags come from the entry's
-   own level/kind plus ui2TagEntriesIn — no DOM restructuring, so the
-   virtualizer, clone-and-rewire, and Station text readers are untouched. */
-
-/* — work tier: the spine — */
-html.ui-v2 .log-entry.level-agent,
-html.ui-v2 .log-entry.diff-log-entry {
-  position: relative;
-}
-html.ui-v2 .log-entry.level-agent::before,
-html.ui-v2 .log-entry.diff-log-entry::before {
-  content: '';
-  position: absolute;
-  left: 66px;               /* between the ts gutter (56px) and the dot column */
-  top: 2px;
-  bottom: 2px;
-  width: 2px;
-  border-radius: 2px;
-  background: color-mix(in srgb, var(--green) 32%, transparent);
-}
-/* tool-call rows read as commands: mono, quiet */
-html.ui-v2 .log-entry.level-agent:not(.command-output-group) .log-content {
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.55;
-  color: var(--text-2);
-}
-
-/* — command-output groups: named, chevroned, heartbeat — */
-html.ui-v2 .command-output-group .command-output-summary {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--text-3);
-  display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
-  min-width: 0;
-}
-html.ui-v2 .command-output-group .command-output-summary .output-command {
-  color: var(--text-2);
-  font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 46ch;
-}
-html.ui-v2 .command-output-group .command-output-summary .output-detail { color: var(--text-3); }
-html.ui-v2 .command-output-group .command-output-summary .status-dot {
-  width: 7px; height: 7px;
-  border-radius: 50%;
-  align-self: center;
-  background: var(--green);
-  flex: none;
-}
-/* the live heartbeat: THE signal for "working right now" — one pulse,
-   nowhere else */
-html.ui-v2 .command-output-group:not(.finalized) .command-output-summary .status-dot {
-  background: var(--iris);
-}
-@media (prefers-reduced-motion: no-preference) {
-  html.ui-v2 .command-output-group:not(.finalized) .command-output-summary .status-dot {
-    animation: ui2-pulse 1.6s ease-in-out infinite;
-  }
-}
-html.ui-v2 .command-output-group .command-output-body {
-  display: block;
-  margin-top: 6px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--code-bg);
-  overflow: hidden;
-}
-html.ui-v2 .command-output-group .command-output-body:empty { display: none; }
-/* live groups are collapsible now too (v1 only ever hid finalized
-   bodies): a collapsed streaming group keeps receiving text off-screen */
-html.ui-v2 .command-output-group:not(.expanded) .command-output-body { display: none; }
-/* the streaming tail: last few output lines under a collapsed live group —
-   proof of life while it streams. Gone once expanded (the body takes over)
-   or finalized (the summary row is the record). JS keeps it to ~3 trimmed
-   lines; the max-height is a belt against odd content. */
-html.ui-v2 .command-output-group .command-output-tail {
-  display: block;
-  margin-top: 4px;
-  padding-left: 13px;
-  border-left: 2px solid color-mix(in srgb, var(--iris) 32%, transparent);
-  font-family: var(--mono);
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--text-3);
-  white-space: pre;
-  overflow: hidden;
-  max-height: 4.5em;
-}
-html.ui-v2 .command-output-group .command-output-tail:empty { display: none; }
-html.ui-v2 .command-output-group.expanded .command-output-tail,
-html.ui-v2 .command-output-group.finalized .command-output-tail { display: none; }
-/* verbose-opened truncated rows show their local preview plus this hint */
-html.ui-v2 .command-output-group .command-output-truncation-note {
-  display: block;
-  padding: 4px 12px 6px;
-  font-family: var(--mono);
-  font-size: 10.5px;
-  color: var(--text-3);
-}
-html.ui-v2 .command-output-group .command-output-pre {
-  margin: 0;
-  padding: 8px 12px;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  font-size: 11.5px;
-  line-height: 1.5;
-  max-height: 320px;
-  overflow: auto;
-}
-
-/* collapse affordances read as controls, not stray glyphs */
-html.ui-v2 .collapse-toggle {
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--text-3);
-  border: 1px solid transparent;
-  border-radius: 6px;
-  padding: 0 6px;
-  transition: color var(--t-fast), border-color var(--t-fast), background var(--t-fast);
-}
-html.ui-v2 .log-entry:hover .collapse-toggle {
-  color: var(--text-2);
-  border-color: var(--line);
-  background: var(--hover-wash);
-}
-
-/* — meta tier: bookkeeping + steer receipts as hairline annotations — */
-html.ui-v2 .log-entry.ui2-meta {
-  padding: 1px 0;
-}
-html.ui-v2 .log-entry.ui2-meta .log-content {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  color: var(--text-3);
-  letter-spacing: .02em;
-}
-html.ui-v2 .log-entry.ui2-meta .log-icon { background: transparent; box-shadow: inset 0 0 0 1.5px var(--text-3); opacity: .55; }
-html.ui-v2 .log-entry.source-steer .log-level { color: var(--text-3); }
-
-/* the worker eyebrow names the backend (source string flows through
-   text-transform, so "Claude Code" reads CLAUDE CODE) — tint matches the
-   worker role */
-html.ui-v2 .log-entry.source-claude-code .log-level,
-html.ui-v2 .log-entry.source-codex .log-level,
-html.ui-v2 .log-entry.source-gemini .log-level { color: var(--iris-2); }
-html.ui-v2 .log-entry.source-claude-code.level-model .log-icon,
-html.ui-v2 .log-entry.source-codex.level-model .log-icon,
-html.ui-v2 .log-entry.source-gemini.level-model .log-icon { background: var(--iris); }

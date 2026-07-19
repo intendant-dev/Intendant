@@ -737,6 +737,44 @@ impl Default for LocalIamState {
     }
 }
 
+pub(crate) fn normalize_hosted_lease_bindings(state: &mut LocalIamState) {
+    state.hosted_control.normalize();
+    let now = now_unix_ms();
+    let active_principal_ids = state
+        .hosted_control
+        .leases
+        .iter()
+        .filter(|lease| {
+            lease.status == super::hosted_control::HostedLeaseStatus::Active
+                && lease.document.expires_unix_ms > now
+        })
+        .map(|lease| lease.document.principal_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let active_grant_bindings = state
+        .hosted_control
+        .leases
+        .iter()
+        .filter(|lease| {
+            lease.status == super::hosted_control::HostedLeaseStatus::Active
+                && lease.document.expires_unix_ms > now
+        })
+        .map(|lease| {
+            (
+                lease.document.grant_id.clone(),
+                lease.document.principal_id.clone(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    state.principals.retain(|principal| {
+        principal.source != super::hosted_control::HOSTED_SOURCE
+            || active_principal_ids.contains(&principal.id)
+    });
+    state.grants.retain(|grant| {
+        grant.source != super::hosted_control::HOSTED_SOURCE
+            || active_grant_bindings.contains(&(grant.id.clone(), grant.principal_id.clone()))
+    });
+}
+
 impl LocalIamState {
     fn normalize(mut self) -> Self {
         if self.schema_version < 2 {
@@ -856,7 +894,7 @@ impl LocalIamState {
         self.grants
             .retain(|g| !g.id.trim().is_empty() && !g.principal_id.trim().is_empty());
         self.audit_events.retain(|e| !e.id.trim().is_empty());
-        self.hosted_control.normalize();
+        normalize_hosted_lease_bindings(&mut self);
         // Bound the audit trail to a recent tail, mirroring the credential
         // custody trail's in-memory cap (`credential_audit::MEM_CAP`).
         // Events are appended chronologically, so the head is the oldest.
@@ -931,7 +969,7 @@ fn state_has_browser_mtls_root_history(state: &LocalIamState) -> bool {
 }
 
 fn write_browser_mtls_initialized_marker(cert_dir: &Path) -> AccessResult<()> {
-    std::fs::create_dir_all(cert_dir)?;
+    intendant_core::state_paths::create_private_dir_all(cert_dir)?;
     let path = browser_mtls_initialized_path(cert_dir);
     let mut file = match std::fs::OpenOptions::new()
         .write(true)
@@ -2467,7 +2505,7 @@ fn permission_summary(id: &str) -> &'static str {
         "agenda.read" => "Read the daemon's agenda ledger (parked items and counts).",
         "agenda.write" => "Park, edit, complete, reopen, and retire agenda items.",
         "memory.read" => "Search and read Memory claims (bounded, provenance-labeled).",
-        "memory.write" => "Propose Memory claims (the candidate lane; ephemeral in P1.1).",
+        "memory.write" => "Propose Memory claims (the candidate lane).",
         _ => "Operation permission.",
     }
 }
@@ -3192,7 +3230,9 @@ fn builtin_role_templates() -> Vec<IamRole> {
             id: "role:scoped-human".to_string(),
             label: "Scoped human".to_string(),
             status: "enforced".to_string(),
-            summary: "Minimal user/client IAM role for stable browser mTLS and Connect account request bindings.".to_string(),
+            summary:
+                "Minimal human/client IAM role for stable browser or native mTLS bindings."
+                    .to_string(),
             permissions: vec!["access.inspect".to_string()],
             source: "builtin".to_string(),
         },

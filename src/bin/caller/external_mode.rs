@@ -147,6 +147,9 @@ pub(crate) async fn run_external_agent_mode(
     emit_session_started_after_identity: bool,
     ready_for_thread_actions: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<LoopStats, CallerError> {
+    // Effective root stamped on every RoundComplete this mode emits, so
+    // the file watcher's round listener can route rounds by root.
+    let round_session_root: Option<std::path::PathBuf> = Some(project.root.clone());
     slog(&session_log, |l| {
         l.info(&format!("Mode: external agent ({})", backend));
     });
@@ -818,6 +821,7 @@ pub(crate) async fn run_external_agent_mode(
                                                     round,
                                                     turns_in_round,
                                                     native_message_count: None,
+                                                    project_root: round_session_root.clone(),
                                                 });
                                             }
                                             DrainOutcome::LimitRejected {
@@ -870,6 +874,7 @@ pub(crate) async fn run_external_agent_mode(
                                                     round,
                                                     turns_in_round,
                                                     native_message_count: None,
+                                                    project_root: round_session_root.clone(),
                                                 });
                                                 emit_context_rewind_failure(
                                                     &request,
@@ -899,6 +904,7 @@ pub(crate) async fn run_external_agent_mode(
                                                     round,
                                                     turns_in_round,
                                                     native_message_count: None,
+                                                    project_root: round_session_root.clone(),
                                                 });
                                                 bus.send(AppEvent::LoopError(message));
                                                 stats.terminal_outcome =
@@ -924,6 +930,7 @@ pub(crate) async fn run_external_agent_mode(
                                                     round,
                                                     turns_in_round: stats.turns,
                                                     native_message_count: None,
+                                                    project_root: round_session_root.clone(),
                                                 });
                                             }
                                             DrainOutcome::Terminated { reason, exit_code } => {
@@ -1115,12 +1122,9 @@ pub(crate) async fn run_external_agent_mode(
                                 &drain_config.alias_session_id,
                                 &open_side_threads,
                             ) => {
-                                let followup = FollowUpMessage::with_attachments(
-                                    text,
-                                    UserAttachments::from_items(attachments),
-                                )
-                                .for_target(Some(session_id))
-                                .with_follow_up_id(follow_up_id);
+                                let followup = FollowUpMessage::with_attachments(text, attachments)
+                                    .for_target(Some(session_id))
+                                    .with_follow_up_id(follow_up_id);
                                 if follow_up_message_was_cancelled(
                                     &mut cancelled_follow_ups,
                                     &followup,
@@ -1502,6 +1506,7 @@ pub(crate) async fn run_external_agent_mode(
                 Some(*side_round as u32),
                 Some(user_turn_revision),
                 replacement_for_user_turn_index,
+                &attachments.refs,
                 &turn_text,
             );
             let merged = drain_steer_queue_as_followup(
@@ -1620,6 +1625,7 @@ pub(crate) async fn run_external_agent_mode(
                 Some(*subagent_round as u32),
                 None,
                 None,
+                &attachments.refs,
                 &turn_text,
             );
             let merged = drain_steer_queue_as_followup(
@@ -2146,6 +2152,7 @@ pub(crate) async fn run_external_agent_mode(
                                 round,
                                 turns_in_round,
                                 native_message_count: None,
+                                project_root: round_session_root.clone(),
                             });
                         }
                         DrainOutcome::LimitRejected {
@@ -2193,6 +2200,7 @@ pub(crate) async fn run_external_agent_mode(
                                 round,
                                 turns_in_round,
                                 native_message_count: None,
+                                project_root: round_session_root.clone(),
                             });
                             emit_context_rewind_failure(
                                 &request,
@@ -2219,6 +2227,7 @@ pub(crate) async fn run_external_agent_mode(
                                 round,
                                 turns_in_round: stats.turns,
                                 native_message_count: None,
+                                project_root: round_session_root.clone(),
                             });
                         }
                         DrainOutcome::RecoveryRequired {
@@ -2326,6 +2335,7 @@ pub(crate) async fn run_external_agent_mode(
             Some(round as u32),
             Some(user_turn_revision),
             replacement_for_user_turn_index,
+            &attachments.refs,
             user_log_text,
         );
         slog(&session_log, |l| {
@@ -2512,6 +2522,7 @@ pub(crate) async fn run_external_agent_mode(
                                         round,
                                         turns_in_round,
                                         native_message_count: None,
+                                        project_root: round_session_root.clone(),
                                     });
                                     next_turn = Some(
                                         FollowUpMessage::text(recovery_text)
@@ -2570,6 +2581,7 @@ pub(crate) async fn run_external_agent_mode(
                                                     round,
                                                     turns_in_round,
                                                     native_message_count: None,
+                                                    project_root: round_session_root.clone(),
                                                 });
                                                 next_turn = Some(continuation);
                                                 continue 'outer;
@@ -2607,6 +2619,7 @@ pub(crate) async fn run_external_agent_mode(
                                         round,
                                         turns_in_round,
                                         native_message_count: None,
+                                        project_root: round_session_root.clone(),
                                     });
                                     bus.send(AppEvent::LoopError(message));
                                     stats.terminal_outcome = Some(
@@ -2634,6 +2647,7 @@ pub(crate) async fn run_external_agent_mode(
                                         round,
                                         turns_in_round,
                                         native_message_count: None,
+                                        project_root: round_session_root.clone(),
                                     });
                                     bus.send(AppEvent::LoopError(message));
                                     stats.terminal_outcome =
@@ -2668,6 +2682,7 @@ pub(crate) async fn run_external_agent_mode(
                                         round,
                                         turns_in_round,
                                         native_message_count: None,
+                                        project_root: round_session_root.clone(),
                                     });
                                     next_turn = Some(replay);
                                     continue 'outer;
@@ -2712,6 +2727,7 @@ pub(crate) async fn run_external_agent_mode(
                                             round,
                                             turns_in_round,
                                             native_message_count: None,
+                                            project_root: round_session_root.clone(),
                                         });
                                         next_turn = Some(
                                             FollowUpMessage::text(handoff_text)
@@ -2739,6 +2755,7 @@ pub(crate) async fn run_external_agent_mode(
                                     round,
                                     turns_in_round,
                                     native_message_count: None,
+                                    project_root: round_session_root.clone(),
                                 });
                                 bus.send(AppEvent::LoopError(message));
                                 stats.terminal_outcome =
@@ -2766,6 +2783,7 @@ pub(crate) async fn run_external_agent_mode(
                                     round,
                                     turns_in_round,
                                     native_message_count: None,
+                                    project_root: round_session_root.clone(),
                                 });
                                 bus.send(AppEvent::LoopError(message));
                                 stats.terminal_outcome =
@@ -2800,6 +2818,7 @@ pub(crate) async fn run_external_agent_mode(
                     round,
                     turns_in_round,
                     native_message_count: None,
+                    project_root: round_session_root.clone(),
                 });
             }
             DrainOutcome::LimitRejected {
@@ -2905,6 +2924,7 @@ pub(crate) async fn run_external_agent_mode(
                             round,
                             turns_in_round,
                             native_message_count: None,
+                            project_root: round_session_root.clone(),
                         });
                     }
                     Err(message) => {
@@ -2926,6 +2946,7 @@ pub(crate) async fn run_external_agent_mode(
                             round,
                             turns_in_round,
                             native_message_count: None,
+                            project_root: round_session_root.clone(),
                         });
                     }
                 }
@@ -2984,6 +3005,7 @@ pub(crate) async fn run_external_agent_mode(
                             round,
                             turns_in_round,
                             native_message_count: None,
+                            project_root: round_session_root.clone(),
                         });
                         bus.send(AppEvent::LogEntry {
                             session_id: live_session_id.clone(),
@@ -3043,6 +3065,7 @@ pub(crate) async fn run_external_agent_mode(
                                         round,
                                         turns_in_round,
                                         native_message_count: None,
+                                        project_root: round_session_root.clone(),
                                     });
                                     next_turn = Some(continuation);
                                     continue 'outer;
@@ -3075,6 +3098,7 @@ pub(crate) async fn run_external_agent_mode(
                             round,
                             turns_in_round,
                             native_message_count: None,
+                            project_root: round_session_root.clone(),
                         });
                         bus.send(AppEvent::LogEntry {
                             session_id: live_session_id.clone(),
@@ -3106,6 +3130,7 @@ pub(crate) async fn run_external_agent_mode(
                     round,
                     turns_in_round,
                     native_message_count: None,
+                    project_root: round_session_root.clone(),
                 });
                 bus.send(AppEvent::TaskComplete {
                     session_id: live_session_id.clone(),
@@ -3140,6 +3165,7 @@ pub(crate) async fn run_external_agent_mode(
                     round,
                     turns_in_round: stats.turns,
                     native_message_count: None,
+                    project_root: round_session_root.clone(),
                 });
                 if codex_managed_context_enabled
                     && reason == MANAGED_CONTEXT_DENSITY_BLOCK_INTERRUPT_REASON
@@ -3331,6 +3357,7 @@ pub(crate) async fn run_external_agent_mode(
                                     round,
                                     turns_in_round: stats.turns,
                                     native_message_count: None,
+                                    project_root: round_session_root.clone(),
                                 });
                                 bus.send(AppEvent::LoopError(message));
                                 stats.terminal_outcome = Some(

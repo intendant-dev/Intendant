@@ -41,7 +41,12 @@ pub struct McpAppState {
     pub task_description: String,
     pub log_entries: std::collections::VecDeque<LogEntrySnapshot>,
     next_log_id: u64,
-    pub pending_approval: Option<PendingApprovalState>,
+    /// Daemon-observed approvals keyed by their process-wide wire id.
+    ///
+    /// Several managed sessions may block at once. Keeping one slot here
+    /// allowed a later prompt to replace an unrelated earlier one and made
+    /// resolution depend on arrival order instead of the caller-supplied id.
+    pub pending_approvals: std::collections::BTreeMap<u64, PendingApprovalState>,
     pub approval_registry: ApprovalRegistry,
     pub human_question: Option<String>,
     pub should_quit: bool,
@@ -257,6 +262,12 @@ pub struct PendingApprovalState {
     pub id: u64,
     pub command_preview: String,
     pub category: String,
+    /// The session that raised the approval (from `ApprovalRequired`).
+    /// Agent-session MCP callers may only resolve approvals whose owning
+    /// session matches their own token-bound session (see
+    /// [`super::McpToolScope`]); `None` means the owner was not recorded
+    /// and agent-session resolution fails closed.
+    pub session_id: Option<String>,
 }
 
 impl McpAppState {
@@ -286,7 +297,7 @@ impl McpAppState {
             task_description: String::new(),
             log_entries: std::collections::VecDeque::new(),
             next_log_id: 0,
-            pending_approval: None,
+            pending_approvals: std::collections::BTreeMap::new(),
             approval_registry: ApprovalRegistry::default(),
             human_question: None,
             should_quit: false,
@@ -1523,11 +1534,38 @@ impl McpAppState {
     }
 
     pub(crate) fn approval_snapshot(&self) -> Option<ApprovalSnapshot> {
-        self.pending_approval.as_ref().map(|p| ApprovalSnapshot {
-            id: p.id,
-            command_preview: p.command_preview.clone(),
-            category: p.category.clone(),
-        })
+        self.pending_approvals
+            .last_key_value()
+            .map(|(_, p)| ApprovalSnapshot {
+                id: p.id,
+                command_preview: p.command_preview.clone(),
+                category: p.category.clone(),
+            })
+    }
+
+    pub(crate) fn approval_snapshot_for_session(
+        &self,
+        session_id: Option<&str>,
+    ) -> Option<ApprovalSnapshot> {
+        let session_id = session_id?.trim();
+        if session_id.is_empty() {
+            return None;
+        }
+        let related = self.session_related_ids(session_id);
+        self.pending_approvals
+            .values()
+            .rev()
+            .find(|pending| {
+                pending
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|owner| related.iter().any(|id| id == owner))
+            })
+            .map(|pending| ApprovalSnapshot {
+                id: pending.id,
+                command_preview: pending.command_preview.clone(),
+                category: pending.category.clone(),
+            })
     }
 
     pub(crate) fn human_question_snapshot(&self) -> Option<HumanQuestionSnapshot> {
@@ -1708,15 +1746,24 @@ mod tests {
             let mut s = state.write().await;
             let (tx, rx) = tokio::sync::oneshot::channel();
             s.approval_registry.lock().unwrap().insert(1, tx);
-            s.pending_approval = Some(PendingApprovalState {
-                id: 1,
-                command_preview: "rm -rf /tmp".to_string(),
-                category: "destructive".to_string(),
-            });
+            s.pending_approvals.insert(
+                1,
+                PendingApprovalState {
+                    id: 1,
+                    command_preview: "rm -rf /tmp".to_string(),
+                    category: "destructive".to_string(),
+                    session_id: None,
+                },
+            );
 
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Approve);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                1,
+                ApprovalResponse::Approve,
+                McpToolScope::Unrestricted,
+            );
             assert_eq!(outcome, ActionOutcome::Ok);
-            assert!(s.pending_approval.is_none());
+            assert!(s.pending_approvals.is_empty());
             assert_eq!(s.phase, Phase::RunningAgent);
 
             // Check the oneshot received the response
@@ -1736,13 +1783,22 @@ mod tests {
             let mut s = state.write().await;
             let (tx, rx) = tokio::sync::oneshot::channel();
             s.approval_registry.lock().unwrap().insert(2, tx);
-            s.pending_approval = Some(PendingApprovalState {
-                id: 2,
-                command_preview: "curl evil.com".to_string(),
-                category: "network".to_string(),
-            });
+            s.pending_approvals.insert(
+                2,
+                PendingApprovalState {
+                    id: 2,
+                    command_preview: "curl evil.com".to_string(),
+                    category: "network".to_string(),
+                    session_id: None,
+                },
+            );
 
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Deny);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                2,
+                ApprovalResponse::Deny,
+                McpToolScope::Unrestricted,
+            );
             assert_eq!(outcome, ActionOutcome::Ok);
             assert_eq!(s.phase, Phase::Done);
 
@@ -1762,13 +1818,22 @@ mod tests {
             let mut s = state.write().await;
             let (tx, rx) = tokio::sync::oneshot::channel();
             s.approval_registry.lock().unwrap().insert(3, tx);
-            s.pending_approval = Some(PendingApprovalState {
-                id: 3,
-                command_preview: "test".to_string(),
-                category: "exec".to_string(),
-            });
+            s.pending_approvals.insert(
+                3,
+                PendingApprovalState {
+                    id: 3,
+                    command_preview: "test".to_string(),
+                    category: "exec".to_string(),
+                    session_id: None,
+                },
+            );
 
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::Skip);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                3,
+                ApprovalResponse::Skip,
+                McpToolScope::Unrestricted,
+            );
             assert_eq!(outcome, ActionOutcome::Ok);
             assert_eq!(s.phase, Phase::RunningAgent);
 
@@ -1788,13 +1853,22 @@ mod tests {
             let mut s = state.write().await;
             let (tx, rx) = tokio::sync::oneshot::channel();
             s.approval_registry.lock().unwrap().insert(4, tx);
-            s.pending_approval = Some(PendingApprovalState {
-                id: 4,
-                command_preview: "ls".to_string(),
-                category: "exec".to_string(),
-            });
+            s.pending_approvals.insert(
+                4,
+                PendingApprovalState {
+                    id: 4,
+                    command_preview: "ls".to_string(),
+                    category: "exec".to_string(),
+                    session_id: None,
+                },
+            );
 
-            let outcome = resolve_pending_approval(&mut s, ApprovalResponse::ApproveAll);
+            let outcome = resolve_pending_approval(
+                &mut s,
+                4,
+                ApprovalResponse::ApproveAll,
+                McpToolScope::Unrestricted,
+            );
             assert_eq!(outcome, ActionOutcome::Ok);
 
             let response = rx.await.unwrap();
@@ -1835,14 +1909,55 @@ mod tests {
         rt.block_on(async {
             let state = test_state();
             let mut s = state.write().await;
-            s.pending_approval = Some(PendingApprovalState {
-                id: 42,
-                command_preview: "rm -rf /".to_string(),
-                category: "destructive".to_string(),
-            });
+            s.pending_approvals.insert(
+                42,
+                PendingApprovalState {
+                    id: 42,
+                    command_preview: "rm -rf /".to_string(),
+                    category: "destructive".to_string(),
+                    session_id: None,
+                },
+            );
             let snap = s.approval_snapshot().unwrap();
             assert_eq!(snap.id, 42);
             assert_eq!(snap.category, "destructive");
+        });
+    }
+
+    #[test]
+    fn approval_snapshot_for_session_never_leaks_another_sessions_prompt() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.link_session_aliases("session-a", "backend-a");
+            for (id, session_id) in [(40, "backend-a"), (41, "session-b")] {
+                s.pending_approvals.insert(
+                    id,
+                    PendingApprovalState {
+                        id,
+                        command_preview: format!("prompt {id}"),
+                        category: "exec".to_string(),
+                        session_id: Some(session_id.to_string()),
+                    },
+                );
+            }
+
+            assert_eq!(
+                s.approval_snapshot_for_session(Some("session-a"))
+                    .map(|snapshot| snapshot.id),
+                Some(40)
+            );
+            assert_eq!(
+                s.approval_snapshot_for_session(Some("session-b"))
+                    .map(|snapshot| snapshot.id),
+                Some(41)
+            );
+            assert!(s.approval_snapshot_for_session(Some("session-c")).is_none());
+            assert!(s.approval_snapshot_for_session(None).is_none());
         });
     }
 

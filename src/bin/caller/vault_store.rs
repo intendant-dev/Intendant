@@ -5,7 +5,7 @@
 //! hosted Connect service stores it per account; this module gives a
 //! daemon the same blind storage so a **direct** dashboard (no Connect
 //! service in the loop) has a vault home: the blob lives at
-//! `~/.intendant/vault-blob.json` (0600), the daemon can neither read
+//! `<state-root>/vault-blob.json` (0600 on Unix), the daemon can neither read
 //! nor forge it, and the browser seals/unseals exactly as it does
 //! against the hosted store.
 //!
@@ -22,7 +22,6 @@
 //! - MAC-presence ratchet: once the stored blob carries a client-side
 //!   integrity MAC, a MAC-less replacement is refused.
 
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -76,36 +75,20 @@ fn read_stored(path: &std::path::Path) -> Option<StoredVault> {
     serde_json::from_str(&text).ok()
 }
 
+/// Same private-permissions convention as the custody trail: the temp
+/// file is created 0600 on Unix (never write-then-chmod — the chmod
+/// window exposed the blob at the umask default), then renamed into
+/// place, so the destination is private for its whole lifetime.
 fn write_stored(path: &std::path::Path, record: &StoredVault) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        intendant_core::state_paths::create_private_dir_all(parent)
+            .map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
+    let json = serde_json::to_string(record).map_err(|e| format!("serialize vault blob: {e}"))?;
     let tmp = path.with_extension("json.tmp");
-    {
-        let mut file = std::fs::File::create(&tmp).map_err(|e| format!("write vault blob: {e}"))?;
-        file.write_all(
-            serde_json::to_string(record)
-                .map_err(|e| format!("serialize vault blob: {e}"))?
-                .as_bytes(),
-        )
+    intendant_core::state_paths::write_private_file(&tmp, &json)
         .map_err(|e| format!("write vault blob: {e}"))?;
-    }
-    restrict_file(&tmp);
     std::fs::rename(&tmp, path).map_err(|e| format!("finalize vault blob: {e}"))
-}
-
-/// Same private-permissions convention as the custody trail (0600 on
-/// Unix; Windows relies on the profile ACL).
-fn restrict_file(path: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
-        }
-    }
 }
 
 /// Shape checks replicated from the hosted store. The daemon is blind to
@@ -224,7 +207,7 @@ mod tests {
     /// the explicit-path convention from state_paths.rs: this bin's test
     /// build compiles intendant-core WITHOUT cfg(test), so the bare
     /// `fetch()`/`publish()` would hit the developer's LIVE
-    /// `~/.intendant/vault-blob.json` (and nextest's process-per-test
+    /// live `<state-root>/vault-blob.json` (and nextest's process-per-test
     /// would race it cross-process). Tests never call the bare entry
     /// points.
     struct ScratchBlob(PathBuf);
@@ -332,6 +315,26 @@ mod tests {
 
         // Authenticated publishes keep flowing.
         assert!(publish_in(path, 3, vault_blob_with_mac(3, "d", "bWFj"), 40).unwrap());
+    }
+
+    /// The blob (and the store directory) are owner-only from creation —
+    /// no write-then-chmod window.
+    #[cfg(unix)]
+    #[test]
+    fn stored_blob_is_owner_only_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let blob = ScratchBlob::new("perms");
+        let path = blob.path();
+
+        assert!(publish_in(path, 1, vault_blob(1, "a"), 10).unwrap());
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
     }
 
     #[test]

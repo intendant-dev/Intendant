@@ -389,8 +389,8 @@ pub(crate) const AUTHORITY_CHANGE_CAPACITY: usize = 64;
 /// any other condition is a protocol bug or a stale post-release race
 /// and silent drop is correct.
 ///
-/// The closure is the entire boundary: `display/mod.rs` invokes it when an
-/// event arrives and the display input queue retains it for a second check
+/// The closure is the entire boundary: `intendant-display` invokes it when
+/// an event arrives and the display input queue retains it for a second check
 /// immediately before injection. The caller-supplied `session_authorized`
 /// predicate binds the exact peer/IAM grant and federation-WS lifetime that
 /// admitted the offer; composing it here with the holder check ensures a
@@ -1365,7 +1365,7 @@ mod tests {
 
     /// Closure semantics: non-holder asks → denied.  This is the
     /// silent-drop case — the closure returns false; the gate in
-    /// `display/mod.rs::gated_input_handler` then drops the event.
+    /// `intendant-display`'s gated input handler then drops the event.
     #[test]
     fn local_ws_authorizer_returns_false_for_non_holder() {
         let map = empty_authority_map();

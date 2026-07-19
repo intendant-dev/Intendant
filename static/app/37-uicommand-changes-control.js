@@ -454,15 +454,19 @@ function currentChangesTargetQuery() {
   const win = sessionWindows.get(sid) || null;
   const source = externalSourceForSessionWindow(sid, win)
     || normalizeAgentId(meta.source || meta.backendSource || meta.backend_source || '');
-  if (!source || source === 'intendant') return '';
 
+  // Every selected session is targeted — native sessions included. The
+  // daemon resolves the session's own checkout (worktree sessions probe
+  // their worktree, exactly like the vitals dirty chip); without the id
+  // it can only answer from the daemon head session's watcher, which is
+  // the wrong root for any other session.
   const params = new URLSearchParams();
   params.set('session_id', sid);
   const backendId = String(meta.backendSessionId || meta.backend_session_id || '').trim();
   const intendantId = String(meta.intendantSessionId || meta.intendant_session_id || '').trim();
   if (backendId) params.set('backend_session_id', backendId);
   if (intendantId) params.set('intendant_session_id', intendantId);
-  params.set('source', source);
+  if (source && source !== 'intendant') params.set('source', source);
   return params.toString();
 }
 

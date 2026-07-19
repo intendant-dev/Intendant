@@ -1,23 +1,23 @@
 # CLAUDE.md
 
-> **Living document — reviewed 2026-07-13 for the alpha trust refactor, based on `main` @ `714f24af`.**
+> **Living document — reviewed 2026-07-18 in a source-first documentation audit, based on `main` @ `3221b4d5`.**
 > This is a *tight orientation* for working in the repo. The deep reference lives in
 > the mdBook under `docs/src/` (mapped below). **Both this file and those docs lag the
 > code** — Intendant moves fast (~500 commits/month) and the docs are *not* updated on
 > every change. When this file, the docs, and the source disagree, **trust the source**,
 > then fix the doc. See what changed since this was written with
-> `git log --oneline 714f24af..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
+> `git log --oneline 3221b4d5..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
 > file — when you edit CLAUDE.md, run `cp CLAUDE.md AGENTS.md` in the same commit; CI enforces they match.)
 
 ## What Intendant Is
 
-Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. Beyond running its own agent loop, it **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines**. It is provider-agnostic (OpenAI, Anthropic, Gemini) and cross-platform (macOS, Linux, Windows — all first-class). Its shipped trust anchors are local presence and an independently reached direct-mTLS dashboard; CLI and MCP provide automation, and the dashboard provides visual, voice, and phone control. The packaged macOS app contains a local mTLS bridge, but no Developer ID-signed/notarized release has been published for this alpha. An `-unsigned-dev` app artifact is not a distribution trust anchor.
+Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. A daemon-wide Agenda preserves parked intent, reminders, durable questions, and digest-approved scheduled sessions; the Memory plane preserves explicitly retrieved, provenance-labeled claims over a vendored owner-plane writer/reducer kernel. Beyond running its own agent loop, Intendant **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines**. It is provider-agnostic (OpenAI, Anthropic, Gemini) and cross-platform (macOS, Linux, Windows — all first-class). Its shipped trust anchors are local presence and an independently reached direct-mTLS dashboard; CLI and MCP provide automation, and the dashboard provides visual, voice, and phone control. The packaged macOS app contains a local mTLS bridge, but no Developer ID-signed/notarized release has been published for this alpha. An `-unsigned-dev` app artifact is not a distribution trust anchor.
 
 Past the single box, daemons federate into a **network of agentic networks** — fleets owned by people and organizations, where owners grant other people and other daemons scoped access to their machines, infrastructure, and resources. Three pillars carry it: the **trust architecture** (authority is minted only by the local authority of the governed resource — plane-root capabilities govern plane data, daemon-local IAM governs daemon effects, and Connect mints neither; a hosted claim is discovery/route metadata and creates no principal or grant; the default binary fixes hosted provenance at the zero-permission `role:none` and treats rendezvous-controlled fleet WebPKI names as discovery-only, so shipped daemon control requires a trusted local or independently reached daemon-served direct/mTLS surface; org root keys sign grant documents and revocation lists), **credential custody** (sealed vault stores, time-boxed leases, and client egress exist, but the default build has no bridge from a Connect-origin account vault to a trusted daemon session; `.env` remains supported, and active full-credential OAuth leases temporarily materialize private auth files), and the **zero-install discovery client** (a browser tab can link a daemon with a single-use twelve-word claim code and find the fleet, but cannot control it). Connect remains self-hostable and is not an authority mint, but it is trusted for availability, account/route metadata, and the browser code and installers it serves. The name is the thesis: agents perform, orchestrators conduct, the Intendant runs the house — and answers to the owner.
 
 ## The Three Binaries (security boundary)
 
-- **intendant-runtime** (`src/main.rs`, `src/agent.rs`) — sandboxed executor. Reads one JSON `AgentInput` from stdin, runs commands sequentially, writes JSONL results. Landlock-restricted on Linux, Seatbelt-wrapped on macOS, restricted-token re-exec on Windows (`src/win_sandbox.rs`). **Never holds API keys.**
+- **intendant-runtime** (`src/main.rs`, `src/agent.rs`) — command executor. Reads one JSON `AgentInput` from stdin, runs commands sequentially, writes JSONL results. Its write sandbox uses Landlock on Linux, Seatbelt on macOS, and restricted-token re-exec on Windows (`src/win_sandbox.rs`); it defaults on for macOS/Linux and is opt-in on Windows. **Never holds API keys.**
 - **intendant** (`src/bin/caller/main.rs`) — controller. Drives the LLM loop, calls model APIs, dispatches tool calls to the runtime subprocess, supervises external agents, and runs every frontend.
 - **intendant-connect** (`src/bin/connect/main.rs`) — hosted rendezvous + account/metadata service (deployed to intendant.dev; self-hostable, see `docs/src/self-hosted-rendezvous.md`). Stores what daemons and browsers publish. Fleet records are self-signed: the current browser detects same-key alteration, but there is not yet an owner/device trust set, so a malicious store can substitute a newly self-signed record on another device. That metadata never grants daemon authority. Connect also serves browser code and installers, so malicious served code can alter or exfiltrate what the Connect page sees and a malicious installer can compromise what it installs. It holds no daemon API keys, cannot mint daemon-local IAM, and the default daemon refuses hosted-provenance control at immutable `role:none`.
 
@@ -25,7 +25,7 @@ The runtime/controller split is the load-bearing security decision: a compromise
 
 ## Architecture at a Glance
 
-The controller runs a budget-aware in-process loop in one of several **execution shapes**: Direct (`--direct`, and every non-daemon CLI path), Orchestrate (the same loop with the orchestration prompt; delegates via the `spawn_sub_agent` / `wait_sub_agents` tools), Sub-Agent (a supervised child session that reports back with `submit_result`, optionally in an isolated git worktree), and External-Agent (`--agent`, supervising a third-party coding CLI). Orchestration is a capability of every supervised native session, not a separate mode — the February-era subprocess pipeline (`run_user_mode`, `INTENDANT_ROLE` child processes, result-file polling) is gone. A separate **presence** AI mediates between the user and the worker. A single-writer **control plane** owns shared state — frontends are display-only, emitting intents (`ControlMsg`) rather than mutating state. A persistent **daemon** owns long-lived sessions; the web dashboard is the default frontend (`--web` is on by default).
+The controller runs a budget-aware in-process loop in one of several **execution shapes**: Direct (`--direct`, and every native non-daemon CLI path), Orchestrate (the same loop with the orchestration prompt; delegates via the `spawn_sub_agent` / `wait_sub_agents` tools), Sub-Agent (a supervised child session that reports back with `submit_result`, optionally in an isolated git worktree), and External-Agent (`--agent`, supervising a third-party coding CLI). Orchestration is a capability of every supervised native session, not a separate mode — the February-era subprocess pipeline (`run_user_mode`, `INTENDANT_ROLE` child processes, result-file polling) is gone. A separate **presence** AI mediates between the user and the worker. A single-writer **control plane** owns shared state — frontends are display-only, emitting intents (`ControlMsg`) rather than mutating state. A persistent **daemon** owns long-lived sessions; the web dashboard is the default frontend (`--web` is on by default).
 
 Read the relevant chapter before changing a subsystem:
 
@@ -35,6 +35,7 @@ Read the relevant chapter before changing a subsystem:
 | Native multi-agent orchestration (modes, sub-agents, worktrees) | `docs/src/multi-agent.md` |
 | Supervising Codex / Claude Code | `docs/src/external-agent-orchestration.md` |
 | Control plane, persistent daemon, session lifecycle | `docs/src/control-plane-and-daemon.md` |
+| Daemon-wide Agenda, reminders/schedules, owner-plane Memory | `docs/src/agenda-and-memory.md` |
 | Runtime stdin/stdout JSON protocol | `docs/src/runtime-protocol.md` |
 | WebRTC display (shared encoder pool, tile streaming) | `docs/src/display-pipeline.md` |
 | Peer federation, cross-machine display, LAN/mTLS | `docs/src/peer-federation.md` |
@@ -42,6 +43,7 @@ Read the relevant chapter before changing a subsystem:
 | Trust tiers: which client for which daemon, fleet zones, custody per tier | `docs/src/trust-tiers.md` |
 | Credential custody: leases, vault, egress relay, OAuth modes | `docs/src/credential-custody.md` |
 | Hosted rendezvous (intendant-connect), claims, self-hosting | `docs/src/self-hosted-rendezvous.md` |
+| Optional hosted-control leases, action wall, certificate witnesses | `docs/src/hosted-control.md` |
 | Computer use, live audio, phone/voice-call skills | `docs/src/computer-use-and-audio.md` |
 | Presence layer (server text + browser voice) | `docs/src/presence.md` |
 | The autonomy/approval model | `docs/src/autonomy.md` |
@@ -56,13 +58,15 @@ Read the relevant chapter before changing a subsystem:
 ## Build, Run, Test
 
 ```bash
-cargo build --release     # → target/release/{intendant-runtime, intendant}
+cargo build --release     # → target/release/{intendant-runtime, intendant, intendant-connect}
 cargo build               # debug
 cargo check               # type-check only
-cargo test --bins         # unit tests (no API keys; what CI runs)
-cargo nextest run --bins  # same tests, much faster: one process per test
-                          # (needs cargo-nextest; config in .config/nextest.toml)
-cargo clippy              # lint
+cargo test -p intendant --bins
+cargo test -p intendant-core -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer
+cargo nextest run -p intendant --bins  # faster bin tests; needs cargo-nextest
+                                      # (config in .config/nextest.toml)
+cargo test -p intendant --test e2e
+cargo clippy --workspace -- -D warnings
 ```
 
 Never clear `RUSTC_WRAPPER` or set `RUSTC` for builds in this repo: the
@@ -98,20 +102,25 @@ Common invocations (full flag reference in `docs/src/getting-started.md`):
 ./target/release/intendant org init <handle>       # create an org root key on this daemon (trust model)
 ```
 
-Requires an API key in `.env` (searched: cwd + parents → project root → `~/.config/intendant/.env`). `.env` and `intendant.toml` are git-ignored.
+Native model sessions need provider authority from the process environment,
+an `.env` file (searched: cwd + parents → project root →
+`~/.config/intendant/.env`), or an active lease. Administrative subcommands are
+keyless; external-agent backends use their own auth, and MCP/web can start
+without a native provider until a native task needs one. `.env` and
+`intendant.toml` are git-ignored.
 
 **Operating vs. developing:** to drive a *running* daemon — sessions, approvals,
 displays, screenshots, computer use, federated peers — use `intendant ctl`
 (self-describing: `ctl --help`; agent guide in `skills/intendant-cli/SKILL.md`).
 Read the source to change Intendant, not to operate it.
 
-**Tests:** unit tests are inline `#[cfg(test)]` modules. `tests/e2e/` is the headless end-to-end suite (in CI on all three platforms): it spawns the real binaries against the scripted mock provider (`PROVIDER=mock` + `INTENDANT_MOCK_SCRIPT`, `src/bin/caller/provider_mock.rs`) — keyless, no network, no display; run it with `cargo test --test e2e`. "No display" is enforced by `INTENDANT_MOCK_DISPLAY=synthetic` (honored only alongside `PROVIDER=mock`; fail-closed otherwise), which serves display enumeration/capture from a deterministic 1280×720 synthetic backend (`crates/intendant-display/src/synthetic.rs`) so no native capture API (SCK, GDI/DXGI, X11, Wayland) is ever touched. Real-LLM scenarios live as SKILL.md files under `tests/skills/` and are **not** in CI (real API calls / need a display). `scripts/validate-dashboard.cjs` is the dashboard/Station QA harness (drives a real browser over CDP; also not in CI). Run `cargo test --bins` and `cargo clippy` locally before committing.
+**Tests:** unit tests are inline `#[cfg(test)]` modules. The binary tests do not cover library-only workspace members, so run both invocations above; `owner-plane-core` / `owner-plane-reducer` carry the stamped D0-A conformance gate. `tests/e2e/` is the headless end-to-end suite (in CI on all three platforms): it spawns the real binaries against the scripted mock provider (`PROVIDER=mock` + `INTENDANT_MOCK_SCRIPT`, `src/bin/caller/provider_mock.rs`) — keyless, no network, no display; run it with `cargo test -p intendant --test e2e`. "No display" is enforced by `INTENDANT_MOCK_DISPLAY=synthetic` (honored only alongside `PROVIDER=mock`; fail-closed otherwise), which serves display enumeration/capture from a deterministic 1280×720 synthetic backend (`crates/intendant-display/src/synthetic.rs`) so no native capture API (SCK, GDI/DXGI, X11, Wayland) is ever touched. Real-LLM scenarios live as SKILL.md files under `tests/skills/` and are **not** in CI (real API calls / need a display). `scripts/validate-dashboard.cjs` is the dashboard/Station QA harness (drives a real browser over CDP; also not in CI). Run the keyless battery above before committing.
 
 ## Repository Layout
 
 ```
 src/
-├── main.rs, agent.rs           # intendant-runtime (sandboxed executor)
+├── main.rs, agent.rs           # intendant-runtime (write-sandboxed by platform policy)
 ├── models.rs, error.rs, utils.rs, win_sandbox.rs
 ├── bin/caller/                 # the intendant controller:
 │   ├── main.rs                 # entry: CLI flags/help, panic hook, startup prologue + mode dispatch
@@ -119,33 +128,38 @@ src/
 │   ├── startup/                # web bind/TLS + peer boot; the three mode branches (daemon, mcp_mode, headless)
 │   ├── control_plane.rs, event.rs, frontend.rs   # single-writer state; EventBus + ControlMsg; state snapshots
 │   ├── session_supervisor/, task_dispatch.rs, file_watcher.rs   # daemon: sessions (dispatch/launch/sub_agents/routing/agent_config/registry slices), dispatch, rewind snapshots
+│   ├── agenda/, memory/       # durable parked intent/reminders/schedules; D0-A-format claim plane
 │   ├── provider/, tools.rs, prompts.rs, approval.rs   # provider/: ChatProvider + selection (mod.rs), per-provider openai/anthropic/gemini
 │   ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, agent_runner.rs   # native multi-agent
-│   ├── context_rewind.rs, fission_ledger.rs, fission_lifecycle.rs, lineage_ledger.rs   # managed context: rewinds, fission, lineage
+│   ├── managed_context_ops/, context_rewind.rs, fission_ledger.rs, fission_lifecycle.rs, lineage_ledger.rs   # managed context: pressure/rewinds/fission/lineage
+│   ├── session_fork/, message_search/   # backend-aware fork surgery; cross-backend transcript index
 │   ├── external_agent/         # supervise Codex / Claude Code (+ external_wrapper_index.rs)
 │   ├── access/                 # trust architecture: client keys, IAM, org roots/issuers/ORL, enrollment, peer identity policy + cert pinning, platform keystores
 │   ├── credential_leases.rs, credential_egress.rs, daemon_identity.rs, connect_rendezvous.rs   # credential custody; Connect client
 │   ├── peer/, web_tls.rs       # peer federation (transport, pairing; identity policy lives in access/); native HTTPS/WSS
-│   ├── display/                # WebRTC: encode/{pool,vp8,h264_*}, tile/, capture/, webrtc, {x11,wayland,macos,windows}
-│   ├── computer_use.rs, ax.rs, recording.rs, frames.rs
+│   ├── display_glue.rs, display_requests.rs, shared_view_lifecycle.rs   # controller ↔ intendant-display glue and grants
+│   ├── computer_use.rs, ax.rs, recording.rs
 │   ├── presence.rs, live_audio.rs, audio_routing.rs, transcription.rs, quarantine.rs, schema_validator.rs
 │   ├── web_gateway/                # HTTP/WS gateway: listener (accept/TLS), ws_session (WS tasks), http_dispatch (route dispatch), http, routes_{sessions,files,peers,access}, session_catalog/, settings, access_gates, input_authority, dashboard_presence, connect_bootstrap, peer_requests, agent_card, mcp_gate, static_assets
 │   ├── dashboard_control/, terminal.rs, browser_workspace.rs   # dashboard tunnel (method table + wire/dispatch/api slices); PTY registry; agent browser
 │   ├── mcp/, mcp_client.rs, control.rs
 │   ├── transfer_store.rs, upload_store.rs, peer_file_transfer.rs   # transfer jobs; upload/attachment stores
-│   ├── session_log/, session_names.rs, project.rs, app_state_pricing.rs
+│   ├── session_log/, session_names.rs, session_vitals.rs, background_tasks.rs, project.rs, app_state_pricing.rs
+│   ├── auth_ceremony.rs, codex_auth_ceremony.rs, claude_auth_ceremony.rs, global_store.rs
 │   ├── sandbox.rs, daemon_log_tee.rs, diagnostics.rs, …
 └── bin/connect/                # intendant-connect: hosted rendezvous (accounts, daemon claims, fleet sync, vault blobs, push, transparency log)
 crates/{presence-core, presence-web, station-web}   # WASM: shared presence types/tools/dispatch, browser presence client, Station renderer
 crates/intendant-platform   # OS integration leaf: platform probes/spawn (platform.rs), DisplayTarget, virtual-display mgmt (vision.rs)
-crates/intendant-core       # shared-vocabulary leaf: error, autonomy, frames, net (probes, listener rebind, gateway port), peer_id, usage (TokenUsage), vitals, conversation, knowledge, skills
+crates/intendant-core       # shared-vocabulary leaf: error, autonomy, env scrubbing, frames, net, peer_id, usage, vitals, conversation, state paths, skills
 crates/intendant-display    # the WebRTC display pipeline (encoder pool, tiles, capture backends, per-OS input)
+crates/{owner-plane-core, owner-plane-reducer}   # Gate-A-stamped D0-A writer + independent reader/corpus
+crates/rustc-governor       # machine-wide rustc/link concurrency governor used by dev and CI wrappers
 crates/app-html-assembler   # assembles static/app.html from static/app/ (build.rs + the CI regen gate)
 static/         # dashboard SPA: app/ fragments (source) → generated app.html; compiled wasm-web/ + wasm-station/
 macos-app/      # native macOS WKWebView wrapper (built by scripts/bundle-macos.sh)
 vendor/         # vortex-guest-tools (macOS Vortex Audio HAL plugin)
 scripts/        # setup-{linux,macos,windows}, setup-lan*, bundle-macos, validate-dashboard.cjs (dashboard/Station QA), …
-skills/         # intendant-cli, visual-collaboration, phone-call, voice-call-app, …
+skills/         # agenda, memory, operating/log search, visual collaboration, calls, E2E guides
 docs/src/       # this project's mdBook — the deep reference (see the table above)
 SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, research, implementation, presence, live audio)
 ```
@@ -164,7 +178,11 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   live box (worktree roots, `~/.intendant` session stores) and its outcome
   and duration become machine state. Functions under test take their roots
   as parameters (`home: &Path`, store dirs); the transport edge resolves
-  the real environment, tests inject `tempfile` dirs. A nextest lane or
+  the real environment, tests inject `tempfile` dirs. Avoid mutating
+  process-global environment; when a binary test cannot, hold the crate-wide
+  `crate::test_support::TEST_ENV_LOCK` for the full mutation/restore window
+  (`.lock().await` in async tests, `.blocking_lock()` in sync tests), and give
+  other workspace crates one equivalent shared lock rather than local locks. A nextest lane or
   widened timeout around an environment-dependent test is a smell, not a
   fix.
 - **File size budget:** keep a source file under ~3k lines of non-test code
@@ -213,7 +231,10 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   The v1 chrome, its Catppuccin palette, and the `?ui=v1` escape hatch were
   deleted post-soak; `html.ui-v2` remains as the permanent scoping namespace,
   and the tokens file's alias layer defines the Catppuccin-era var names the
-  base stylesheets still consume.
+  base stylesheets still consume. The current **Activity v3** experience lives
+  inside that permanent namespace (Timeline, Context, Managed, Changes, and
+  Control); “v3” names the Activity interaction revision, not a new global CSS
+  namespace.
 - Pure-safe Rust by default. The Unix (macOS / Linux) code paths keep `unsafe`
   confined to documented islands: small platform probes/signals and display or
   identity queries in `platform.rs` (now `crates/intendant-platform`); macOS Accessibility bindings in `ax.rs`
@@ -228,7 +249,8 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   probes/signals outside `platform.rs`. The Windows backends are the other
   deliberate exception: capture,
   input injection, and H.264 encoding necessarily go through Win32/COM/Media
-  Foundation FFI (`display/windows.rs`, `display/encode/h264_windows.rs`,
+  Foundation FFI (`crates/intendant-display/src/windows.rs`,
+  `crates/intendant-display/src/encode/h264_windows.rs`,
   `platform.rs`), which has no safe alternative. Confine that `unsafe` to those
   `#[cfg(windows)]` blocks, keep each block as small as the FFI call it wraps,
   prefer the `windows` crate's RAII interface types (which Release COM refs on
@@ -282,7 +304,8 @@ in a `#[cfg(unix)]`/`#[cfg(windows)]`-paired helper in `platform.rs` (the existi
 convention) with a portable fallback, and route callers through it. Prefer
 platform-agnostic code; when unavoidable, use `cfg!(target_os = ...)` for small branches
 or `#[cfg(target_os = "...")]` for whole implementations, collected in dedicated modules
-(`platform.rs`, per-platform blocks in `display/`, `vision.rs`, `audio_routing.rs`,
+(`crates/intendant-platform/src/platform.rs`, per-platform blocks in
+`crates/intendant-display/src/`, `vision.rs`, `audio_routing.rs`,
 `computer_use.rs`). Every feature must work or degrade gracefully with a clear error on
 all supported platforms — never panic or silently do nothing. See `docs/src/windows-support.md`.
 
@@ -315,7 +338,8 @@ gh pr merge --merge --auto        # enters the merge queue; merges when checks p
 Do not merge `main` into your branch just to "keep up" before landing — the queue
 validates your PR against the future main for you; merge main into your worktree
 only when you actually need newer code to build on. Still run the local battery
-(`cargo test --bins`, `cargo clippy`, the relevant `tests/skills/` smokes) before
+(`cargo test -p intendant --bins`, the library-crate tests,
+`cargo clippy --workspace -- -D warnings`, and relevant `tests/skills/` smokes) before
 queueing: the queue gate is the deterministic subset, not the full battery, and a
 red queue entry wastes everyone's cycle time. Never bypass the ruleset; if the
 queue itself is wedged, that is an operator (org-owner) decision.
@@ -379,8 +403,9 @@ required checks pass, so a paths-skipped required check blocks queue entry
 (`windows.yml`) has **no push trigger at all** — a push-to-main run would
 revalidate the identical tree the merge group just validated, and the
 external per-listener build caches stay warm from the constant PR + group
-flow. The remaining push triggers (repo-integrity, app.html, audit, docs
-deploy) are cheap and paths-filtered.
+flow. The remaining push triggers (repo-integrity, app.html, audit, CodeQL,
+docs deploy) are cheap and paths-filtered; release automation is tag/manual
+only.
 
 Trusted refs (pushes, merge-queue refs, same-repo PRs) run on the
 **self-hosted fleet** (`dell-206` = `intendant-linux`, `macbook-a` =
@@ -400,14 +425,17 @@ non-admin `ci` users (the Mac via the `scripts/ci` service-account kit —
 and the check *names* stay pinned to the
 `test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os` is
 the name key, `runner` is the fleet placement):
-- **`windows.yml`** — cross-platform `cargo test` (the `intendant` bins + the `intendant-core`/`intendant-display`/`intendant-platform` lib crates) + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Full suites run in exactly two places: the **merge group** (all three platforms — the actual gate) and the **Linux `pull_request` leg** (the pre-queue runtime signal); the non-Linux PR legs are `cargo check` only, and there is no push trigger. The Linux leg is the **whole Linux gate**: after unit tests + e2e it runs the keyless smokes (session-vitals, native-goal, peer-sessions — real binaries under the mock provider) and the dashboard-boot probe (SPA booted in headless Chromium over CDP; promoted from advisory on its 40/40 soak) as tail steps reusing the same checkout and warm tree — these were smokes.yml's jobs until 2026-07-11. The Windows and Linux legs build with debuginfo off (`CARGO_PROFILE_DEV_DEBUG=0` — the Linux leg measured ~95% compile+link vs ~12s of test execution; repro locally with default debuginfo when a CI backtrace is too thin). Jobs are bounded by `timeout-minutes: 60` (no per-test timeout exists under plain `cargo test`, so a single hung test otherwise holds a queue slot indefinitely). Headless-safe: needs no display or API keys. **Required check.**
+- **`windows.yml`** — cross-platform `cargo test` (all `intendant` package bins + the `intendant-core`/`intendant-display`/`intendant-platform`/`owner-plane-core`/`owner-plane-reducer` lib crates) + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Full suites run in exactly two places: the **merge group** (all three platforms — the actual gate) and the **Linux `pull_request` leg** (the pre-queue runtime signal); the non-Linux PR legs are `cargo check` only, and there is no push trigger. The Linux leg is the **whole Linux gate**: after unit tests + e2e it runs workspace Clippy with warnings denied, the keyless smokes (session-vitals, native-goal, peer-sessions — real binaries under the mock provider), and the dashboard-boot probe (SPA booted in headless Chromium over CDP; promoted from advisory on its 40/40 soak) as tail steps reusing the same checkout and warm tree — these were smokes.yml's jobs until 2026-07-11. Every leg builds with debuginfo off (`CARGO_PROFILE_DEV_DEBUG=0`; repro locally with default debuginfo when a CI backtrace is too thin). Jobs are bounded by `timeout-minutes: 60` (no per-test timeout exists under plain `cargo test`, so a single hung test otherwise holds a queue slot indefinitely). Headless-safe: needs no display or API keys. **Required check.**
 - **`app-html.yml`** — the `static/app/` fragments ↔ generated `static/app.html` regen gate. **Required check.**
 - **`wasm-drift.yml`** — the committed `static/wasm-*` artifacts ↔ their crates: rebuilds both WASM crates with the pinned wasm-pack + pinned toolchain and fails on any byte difference (build.rs's mtime staleness check is blind in a fresh checkout, so drift otherwise ships silently). Runs on the **Mac fleet leg**: wasm output is not byte-deterministic across host triples (proven live 2026-07-11), and aarch64-darwin is the canonical artifact host — regenerate wasm artifacts on macOS only. Relevance is two-tier: a GitHub-hosted classifier job gates the Mac leg — only wasm inputs (the two crates, `presence-core`, the artifacts, `Cargo.lock`, the pins, `scripts/build-wasm.sh`, the workflow itself) trigger the rebuild, and everything else skips without occupying a Mac slot; the in-job check is retained as the fail-open backstop (a classifier failure runs the Mac leg, which decides locally). **Required check.**
 - **`agents-md-sync.yml`** — repo integrity: CLAUDE.md ↔ AGENTS.md byte-parity + actionlint over the workflow files (fleet runner labels are declared in `.github/actionlint.yaml`; shellcheck/pyflakes passes await their own baseline pass). **Required check.**
 - **`audit.yml`** — `cargo audit` on push/PR plus a weekly cron (Mondays 08:00 UTC). Advisory only — new upstream advisories must not block unrelated landings.
+- **`codeql.yml`** — build-free Rust + Actions analysis on relevant `main` pushes and a weekly cron (Mondays 09:00 UTC). Advisory and GitHub-hosted; never a merge-queue requirement.
 - **`docs.yml`** — mdBook (`docs/`) deploy to GitHub Pages on push to `main`.
+- **`release.yml`** — macOS app build/sign/notarize/publish plus transparency-log hash submission on `v*` tags or manual dispatch. Tag releases fail closed without signing credentials; a manual credential-less run emits an explicitly `-unsigned-dev` dry-run artifact. Not a merge-queue requirement.
 
 The `tests/skills/` scenarios that need real API calls or a display (the live
 haiku claude-code-e2e, browser/Station probes, the peer smoke's `--browser` leg)
 stay out of CI and run on operator hardware as the post-landing battery. Run
-`cargo test --bins` and `cargo clippy` locally before committing.
+the keyless test and Clippy battery in “Build, Run, Test” locally before
+committing.

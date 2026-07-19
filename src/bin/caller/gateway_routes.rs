@@ -1,8 +1,8 @@
 //! Declarative route table for the web gateway.
 //!
 //! One declaration per HTTP API route (`/api/*`, `/session`, and `/mcp`). Four things
-//! that used to be hand-synchronized across distant regions of
-//! `web_gateway.rs` all derive from this table, so they cannot drift:
+//! that used to be hand-synchronized across distant gateway modules all
+//! derive from this table, so they cannot drift:
 //!
 //! 1. **Dispatch** — the request loop consults [`match_route`] and serves
 //!    a matching route through its [`RouteHandlerId`] arm. The remaining
@@ -27,16 +27,15 @@
 //!    can drift.
 //!
 //! **Never add an API route by editing the dispatch chain**: declare it
-//! here and give it a handler arm in `web_gateway.rs`'s table-dispatch
-//! match. Table invariants (no shadowed routes, non-empty docs, pattern
-//! hygiene, posture consistency) are enforced by unit tests in this
-//! module.
+//! here and give its [`RouteHandlerId`] a handler arm in
+//! `web_gateway/http_dispatch.rs`. Table invariants (no shadowed routes,
+//! non-empty docs, pattern hygiene, posture consistency) are enforced by
+//! unit tests in this module.
 //!
-//! `BodyPolicy` (and response-header emission generally) is still
-//! declarative: handlers read their own bodies exactly as their legacy
-//! arms did. Moving body consumption and response serialization into
-//! dispatch is the planned follow-up (phase 4 of the route-table
-//! design), not yet mechanical.
+//! `BodyPolicy` is declarative and enforced before a handler runs:
+//! dispatch rejects bodies where none are allowed and reads bounded
+//! bodies using the row's cap. Response serialization remains with the
+//! route handler.
 
 use crate::peer::access_policy::PeerOperation;
 use crate::web_gateway::path_is_or_under;
@@ -190,6 +189,10 @@ pub(crate) enum BodyPolicy {
 /// Content-Length. Generous headroom over every legitimate payload.
 pub(crate) const DEFAULT_BODY_CAP_BYTES: usize = 4 * 1024 * 1024;
 
+/// Browser-key request and poll proofs are compact JSON documents. Keep these
+/// unauthenticated hosted entry points well below the generic command-body cap.
+pub(crate) const HOSTED_CONTROL_REQUEST_BODY_CAP_BYTES: usize = 64 * 1024;
+
 /// Body cap for `POST /mcp` — JSON-RPC tool calls can legitimately carry
 /// file-sized arguments (fs tools, upload-adjacent flows).
 pub(crate) const MCP_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
@@ -197,6 +200,11 @@ pub(crate) const MCP_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
 /// Body cap for the visual-freshness diagnostics sink (NDJSON transcript
 /// batches).
 pub(crate) const DIAGNOSTICS_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
+
+/// WebAuthn registration/assertion envelopes. Attestation is requested as
+/// `none`; 128 KiB leaves ample authenticator headroom without exposing the
+/// public ceremony endpoints to the generic 4 MiB command-body allowance.
+pub(crate) const CUSTOM_DOMAIN_PASSKEY_BODY_CAP_BYTES: usize = 128 * 1024;
 
 /// Body cap for the Claude sign-in ceremony start (`{"mode": …}` only).
 pub(crate) const CLAUDE_AUTH_START_BODY_CAP_BYTES: usize = 4 * 1024;
@@ -208,12 +216,13 @@ pub(crate) const CLAUDE_AUTH_CODE_BODY_CAP_BYTES: usize = 2 * 1024;
 /// Body cap for the Codex sign-in ceremony start (`{"mode": …}` only).
 pub(crate) const CODEX_AUTH_START_BODY_CAP_BYTES: usize = 4 * 1024;
 
-/// Links a table row to its dispatch arm in `web_gateway.rs`. The match
-/// there is exhaustive, so a declared route without an arm — or an arm
-/// whose route was deleted — fails to compile; the uniqueness invariant
-/// test catches a handler bound to two rows unintentionally (deliberate
-/// shared-handler groups — one handler serving several adjacent
-/// method/shape rows — are listed there explicitly).
+/// Links a table row to its dispatch arm in
+/// `web_gateway/http_dispatch.rs`. The match there is exhaustive, so a
+/// declared route without an arm — or an arm whose route was deleted —
+/// fails to compile; the uniqueness invariant test catches a handler bound
+/// to two rows unintentionally (deliberate shared-handler groups — one
+/// handler serving several adjacent method/shape rows — are listed there
+/// explicitly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RouteHandlerId {
     FsStat,
@@ -304,6 +313,9 @@ pub(crate) enum RouteHandlerId {
     HostedControlRequestCreate,
     HostedControlRequestPoll,
     HostedControlAnchorDecision,
+    HostedControlCertificateLedger,
+    HostedControlWitnessReport,
+    CustomDomainPasskey,
     HostedControlWsTicket,
     HostedControlManagement,
     /// Shared by the user-client-grants / grants-update pair (one legacy
@@ -614,6 +626,28 @@ const fn public_route(
     }
 }
 
+/// Public authentication ceremony whose browser surface must still be the
+/// exact request origin. WebAuthn supplies the authority; own-origin CORS
+/// keeps foreign pages from driving the ceremony.
+const fn public_own_origin_route(
+    method: RouteMethod,
+    pattern: PathPattern,
+    body: BodyPolicy,
+    handler: RouteHandlerId,
+    doc: &'static str,
+) -> Route {
+    Route {
+        method,
+        pattern,
+        authz: RouteAuthz::Public,
+        cors: CorsPosture::OwnOrigin,
+        body,
+        handler,
+        doc,
+        tunnel: None,
+    }
+}
+
 /// Federation-surface rows: the IAM operation delegates to
 /// `federation_http_operation` (see `RouteAuthz::PeerFederation`).
 const fn federation_route(
@@ -899,7 +933,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::MemoryWrite,
         BodyPolicy::Default,
         RouteHandlerId::MemoryPropose,
-        "Propose one Memory claim (candidate lane; ephemeral plane in P1.1)",
+        "Propose one Memory claim (candidate lane; response reports effective durability)",
     )
     .with_tunnel(tunnel_method("api_memory_propose")),
     op_route(
@@ -1418,13 +1452,17 @@ pub(crate) static ROUTES: &[Route] = &[
         "Current runtime settings",
     )
     .with_tunnel(tunnel_method("api_settings")),
+    // Writing provider keys is credential custody, not a runtime
+    // preference: gate it like the sign-in ceremonies below, so no peer
+    // profile (peer-root included) and no scoped default can durably
+    // rewrite the daemon's provider credentials.
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/api-keys"),
-        PeerOperation::Settings,
+        PeerOperation::CredentialsManage,
         BodyPolicy::Default,
         RouteHandlerId::ApiKeysPost,
-        "Store provider API keys in the project .env",
+        "Store provider API keys in the daemon-config .env",
     )
     .with_tunnel(tunnel_method("api_api_keys_save")),
     op_route(
@@ -1565,14 +1603,14 @@ pub(crate) static ROUTES: &[Route] = &[
     public_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/hosted-control/requests"),
-        BodyPolicy::Default,
+        BodyPolicy::Capped(HOSTED_CONTROL_REQUEST_BODY_CAP_BYTES),
         RouteHandlerId::HostedControlRequestCreate,
         "Submit a bounded hosted-control lease request to daemon-local IAM",
     ),
     public_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/hosted-control/requests/poll"),
-        BodyPolicy::Default,
+        BodyPolicy::Capped(HOSTED_CONTROL_REQUEST_BODY_CAP_BYTES),
         RouteHandlerId::HostedControlRequestPoll,
         "Poll one hosted-control request with proof by its browser key",
     ),
@@ -1582,6 +1620,50 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Default,
         RouteHandlerId::HostedControlAnchorDecision,
         "Present a signed application-anchor decision document",
+    ),
+    public_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/hosted-control/certificate-ledger"),
+        BodyPolicy::None,
+        RouteHandlerId::HostedControlCertificateLedger,
+        "Read the daemon-signed fleet-certificate ledger (no authority)",
+    ),
+    public_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/witness-reports"),
+        BodyPolicy::Capped(
+            crate::access::hosted_control::HOSTED_WITNESS_REPORT_BODY_CAP_BYTES,
+        ),
+        RouteHandlerId::HostedControlWitnessReport,
+        "Present a certificate observation signed by an enrolled application witness",
+    ),
+    public_own_origin_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/passkey/register/start"),
+        BodyPolicy::Capped(CUSTOM_DOMAIN_PASSKEY_BODY_CAP_BYTES),
+        RouteHandlerId::CustomDomainPasskey,
+        "Consume an owner-authorized custom-domain passkey enrollment invitation",
+    ),
+    public_own_origin_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/passkey/register/finish"),
+        BodyPolicy::Capped(CUSTOM_DOMAIN_PASSKEY_BODY_CAP_BYTES),
+        RouteHandlerId::CustomDomainPasskey,
+        "Finish passkey enrollment at the exact configured custom-domain rp_id",
+    ),
+    public_own_origin_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/passkey/start"),
+        BodyPolicy::Capped(CUSTOM_DOMAIN_PASSKEY_BODY_CAP_BYTES),
+        RouteHandlerId::CustomDomainPasskey,
+        "Start an exact-rp_id WebAuthn ceremony for a custom-domain bounded lease",
+    ),
+    public_own_origin_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/passkey/finish"),
+        BodyPolicy::Capped(CUSTOM_DOMAIN_PASSKEY_BODY_CAP_BYTES),
+        RouteHandlerId::CustomDomainPasskey,
+        "Finish custom-domain WebAuthn and issue the requested bounded lease",
     ),
     op_route(
         RouteMethod::Post,
@@ -1770,7 +1852,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AccessManage,
         BodyPolicy::None,
         RouteHandlerId::HostedControlManagement,
-        "Hosted-control policy, pending request, active lease, and signed-app anchor state",
+        "Hosted-control policy, lease, signed-app anchor, certificate-guard, custom-domain certificate, and passkey state",
     ),
     op_route(
         RouteMethod::Post,
@@ -1778,7 +1860,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AccessManage,
         BodyPolicy::Default,
         RouteHandlerId::HostedControlManagement,
-        "Decide requests, revoke leases, change policy, or mark hosted-eligible sessions",
+        "Decide requests, revoke leases, change policy, mark hosted-eligible sessions, act on certificate evidence, or manage custom-domain passkeys",
     ),
     // ── Connect rendezvous administration. Status is inspect-grade but
     //    never carries the one-time claim code; revealing the code is its own
@@ -2574,6 +2656,7 @@ mod tests {
             RouteHandlerId::PeersSubRouter,
             RouteHandlerId::McpStream,
             RouteHandlerId::HostedControlManagement,
+            RouteHandlerId::CustomDomainPasskey,
         ];
         let mut seen: HashSet<RouteHandlerId> = HashSet::new();
         let mut previous: Option<RouteHandlerId> = None;
@@ -2725,6 +2808,29 @@ mod tests {
             policy("POST", "/api/access/org-grants/renew"),
             BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES)
         );
+        assert_eq!(
+            policy("POST", "/api/hosted-control/requests"),
+            BodyPolicy::Capped(HOSTED_CONTROL_REQUEST_BODY_CAP_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/hosted-control/requests/poll"),
+            BodyPolicy::Capped(HOSTED_CONTROL_REQUEST_BODY_CAP_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/hosted-control/witness-reports"),
+            BodyPolicy::Capped(crate::access::hosted_control::HOSTED_WITNESS_REPORT_BODY_CAP_BYTES,)
+        );
+        for path in [
+            "/api/hosted-control/passkey/register/start",
+            "/api/hosted-control/passkey/register/finish",
+            "/api/hosted-control/passkey/start",
+            "/api/hosted-control/passkey/finish",
+        ] {
+            assert_eq!(
+                policy("POST", path),
+                BodyPolicy::Capped(CUSTOM_DOMAIN_PASSKEY_BODY_CAP_BYTES)
+            );
+        }
         // Handler-owned streams: uploads spool to a tempfile; the doorbell's
         // cap is runtime config the table cannot carry.
         assert_eq!(
@@ -2976,11 +3082,13 @@ mod tests {
             classify("GET", "/api/transfers/j1/chunk"),
             TableClassification::NoMatch
         ));
-        // The sign-in ceremonies are credential custody: every leaf —
-        // the status reads included — classifies CredentialsManage, the
-        // operation no peer profile (peer-root included) and no scoped
-        // default carries. A widening here is a custody regression.
+        // The sign-in ceremonies and the provider-key write are
+        // credential custody: every leaf — the status reads included —
+        // classifies CredentialsManage, the operation no peer profile
+        // (peer-root included) and no scoped default carries. A widening
+        // here is a custody regression.
         for (method, path) in [
+            ("POST", "/api/api-keys"),
             ("POST", "/api/claude-auth/start"),
             ("GET", "/api/claude-auth/status"),
             ("POST", "/api/claude-auth/code"),

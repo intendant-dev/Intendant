@@ -1,8 +1,11 @@
 use crate::types::truncate_str;
 use chrono::{Local, Utc};
+use intendant_core::state_paths::{
+    create_private_dir_all, private_file_options, write_private_file,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
@@ -242,6 +245,24 @@ fn unregister_open_session_log_dir(dir: &Path) {
     lock_open_session_log_dirs().remove(dir);
 }
 
+/// Atomically replace `session_meta.json` in `dir`: write a uniquely named
+/// temp file in the same directory, then rename it over the destination.
+///
+/// Every production writer of `session_meta.json` must route through here.
+/// A plain `fs::write` truncates the file before filling it, so a
+/// concurrent reader — the session catalog scan, `intendant ctl`, the e2e
+/// suite — can observe a torn half-write and fail to parse it (a diagnosed
+/// CI flake). A same-directory rename replaces the file atomically on both
+/// Unix and Windows, so readers see the old meta or the new meta, never a
+/// mix. Concurrent writers (e.g. session launch racing a rename) each get
+/// their own temp file and the last rename wins — the same last-write-wins
+/// outcome plain `fs::write` had.
+pub(crate) fn write_session_meta_atomic(dir: &Path, json: &str) -> std::io::Result<()> {
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(json.as_bytes())?;
+    crate::file_watcher::persist_tempfile(tmp, &dir.join("session_meta.json"))
+}
+
 fn mark_session_meta_interrupted(dir: &Path, last_turn: Option<usize>) -> bool {
     let meta_path = dir.join("session_meta.json");
     if let Ok(meta_str) = fs::read_to_string(&meta_path) {
@@ -250,7 +271,7 @@ fn mark_session_meta_interrupted(dir: &Path, last_turn: Option<usize>) -> bool {
                 meta.status = Some("interrupted".to_string());
                 meta.last_turn = Some(last_turn.or(meta.last_turn).unwrap_or(0));
                 if let Ok(json) = serde_json::to_string_pretty(&meta) {
-                    let _ = fs::write(&meta_path, &json);
+                    let _ = write_session_meta_atomic(dir, &json);
                     return true;
                 }
             }
@@ -282,7 +303,7 @@ fn update_session_meta_after_round_complete(
         meta.rounds = Some(meta.rounds.unwrap_or(0).max(rounds));
     }
     if let Ok(json) = serde_json::to_string_pretty(&meta) {
-        if let Err(e) = fs::write(&meta_path, &json) {
+        if let Err(e) = write_session_meta_atomic(dir, &json) {
             eprintln!("session_log: failed to update session_meta.json: {}", e);
         }
     }
@@ -318,7 +339,8 @@ pub fn mark_registered_session_logs_interrupted_now() -> Vec<PathBuf> {
 /// - `turns/turn_NNN_agent_in.json` — JSON commands sent to agent for turn N
 /// - `turns/turn_NNN_stdout.txt`    — agent stdout for turn N
 /// - `turns/turn_NNN_stderr.txt`    — agent stderr for turn N (if non-empty)
-/// - `summary.json`     — written at session end
+/// - `summary.json`                 — task/outcome/turn summary at session end
+/// - `session_summary.json`         — rich usage/voice/CU statistics
 ///
 /// AI agents can: read session.jsonl for an overview, grep by event/turn/level,
 /// then drill into specific turn files for full content.
@@ -486,8 +508,11 @@ impl SessionLog {
         dir: PathBuf,
         keep_all_context_snapshots: bool,
     ) -> std::io::Result<Self> {
-        fs::create_dir_all(&dir)?;
-        fs::create_dir_all(dir.join("turns"))?;
+        // Session logs hold conversation content (transcripts, tool I/O,
+        // context snapshots) — owner-only from creation: 0700 dirs, 0600
+        // files on Unix (Windows relies on the profile ACL).
+        create_private_dir_all(&dir)?;
+        create_private_dir_all(&dir.join("turns"))?;
         let log_dir = dir.clone();
 
         // Try to read existing session_id from meta, or derive from directory name
@@ -505,12 +530,10 @@ impl SessionLog {
                 .unwrap_or_else(|| Uuid::new_v4().to_string())
         };
 
-        let file = OpenOptions::new()
-            .create(true)
+        let file = private_file_options()
             .append(true)
             .open(dir.join("session.jsonl"))?;
-        let transcript_file = OpenOptions::new()
-            .create(true)
+        let transcript_file = private_file_options()
             .append(true)
             .open(dir.join("transcript.jsonl"))
             .ok()
@@ -613,7 +636,7 @@ impl SessionLog {
             worktree: existing_worktree,
         };
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
-            if let Err(e) = fs::write(self.dir.join("session_meta.json"), json) {
+            if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
                 eprintln!("session_log: failed to write session_meta.json: {}", e);
             }
         }
@@ -635,7 +658,7 @@ impl SessionLog {
         };
         meta.worktree = Some(worktree.clone());
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
-            if let Err(e) = fs::write(&meta_path, json) {
+            if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
                 eprintln!("session_log: failed to write session_meta.json: {}", e);
             }
         }
@@ -643,7 +666,8 @@ impl SessionLog {
 
     /// Resolve the session log directory.
     /// If `override_path` is set (via --log-file), use that as the directory.
-    /// Otherwise, pick a fresh UUID-named directory under `~/.intendant/logs`.
+    /// Otherwise, pick a fresh UUID-named directory under
+    /// `<INTENDANT_HOME or ~/.intendant>/logs`.
     ///
     /// Pure path computation — nothing is created on disk until `open()`,
     /// so a caller that bails before opening can't strand an empty session
@@ -676,8 +700,8 @@ impl SessionLog {
     }
 
     /// Find the most recent session for a given project root.
-    /// Scans `~/.intendant/logs/*/session_meta.json`, filters by project_root,
-    /// and returns the most recently created session.
+    /// Scans the ambient state root's `logs/*/session_meta.json`, filters by
+    /// project_root, and returns the most recently created session.
     pub fn find_latest_session(project_root: &Path) -> Option<(String, PathBuf)> {
         let logs_dir = crate::platform::intendant_home().join("logs");
         if !logs_dir.is_dir() {
@@ -722,7 +746,8 @@ impl SessionLog {
     }
 
     /// Find a session by its ID (UUID prefix or full UUID).
-    /// Checks `~/.intendant/logs/{id}/` directly, then scans for prefix matches.
+    /// Checks the ambient state root's `logs/{id}/` directly, then scans for
+    /// prefix matches.
     pub fn find_session_by_id(session_id: &str) -> Option<PathBuf> {
         Self::find_session_by_id_in_home(&crate::platform::home_dir(), session_id)
     }
@@ -1117,7 +1142,7 @@ impl SessionLog {
         };
         let path = self.dir.join("session_summary.json");
         if let Ok(json) = serde_json::to_string_pretty(&summary) {
-            if let Err(e) = fs::write(&path, &json) {
+            if let Err(e) = write_private_file(&path, &json) {
                 eprintln!("session_log: failed to write session_summary.json: {}", e);
             }
         }
@@ -1132,7 +1157,7 @@ impl SessionLog {
     fn write_turn_file(&self, suffix: &str, content: &str) -> Option<String> {
         let relative = format!("turns/turn_{:03}_{}", self.current_turn, suffix);
         let path = self.dir.join(&relative);
-        if fs::write(&path, content).is_ok() {
+        if write_private_file(&path, content).is_ok() {
             Some(relative)
         } else {
             None
@@ -1154,11 +1179,7 @@ impl SessionLog {
     fn append_turn_file_span(&self, suffix: &str, content: &str) -> Option<TurnFileSpan> {
         let relative = format!("turns/turn_{:03}_{}", self.current_turn, suffix);
         let path = self.dir.join(&relative);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .ok()?;
+        let mut file = private_file_options().append(true).open(&path).ok()?;
         // One post-open fstat serves both the has-content test and the
         // span offset (the pre-open stat was a wasted syscall on this
         // per-output-chunk path).
@@ -1210,6 +1231,56 @@ impl SessionLog {
             level: Some("warn".to_string()),
             message: Some(msg.to_string()),
             data: None,
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Log a user message row (`[user] …`) with the live lane's turn
+    /// metadata and renderable attachment refs in `data`, so replay can
+    /// serve the row tagged exactly like the live `UserMessageLog` wire
+    /// row (the cross-lane dedupe key). Stays an ordinary `info` event —
+    /// old readers that ignore `data` render it exactly as before — and
+    /// when there is no metadata at all the emitted line is byte-shaped
+    /// like a plain `info(&format!("[user] {msg}"))`.
+    pub fn user_message(
+        &mut self,
+        msg: &str,
+        user_turn_index: Option<u32>,
+        user_turn_revision: Option<u32>,
+        replacement_for_user_turn_index: Option<u32>,
+        attachments: &[crate::types::SessionNoteAttachment],
+    ) {
+        let mut data = serde_json::Map::new();
+        if let Some(index) = user_turn_index {
+            data.insert("user_turn_index".to_string(), index.into());
+        }
+        if let Some(revision) = user_turn_revision {
+            data.insert("user_turn_revision".to_string(), revision.into());
+        }
+        if let Some(replaced) = replacement_for_user_turn_index {
+            data.insert(
+                "replacement_for_user_turn_index".to_string(),
+                replaced.into(),
+            );
+        }
+        if !attachments.is_empty() {
+            if let Ok(refs) = serde_json::to_value(attachments) {
+                data.insert("attachments".to_string(), refs);
+            }
+        }
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
+            event: "info".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("[user] {}", msg)),
+            data: (!data.is_empty()).then_some(serde_json::Value::Object(data)),
             file: None,
             file2: None,
         });
@@ -1471,7 +1542,7 @@ impl SessionLog {
         // Overwrite transcript.jsonl with clean aggregated version
         if !entries.is_empty() {
             let transcript_path = self.dir.join("transcript.jsonl");
-            if let Ok(f) = File::create(&transcript_path) {
+            if let Ok(f) = private_file_options().truncate(true).open(&transcript_path) {
                 let mut w = BufWriter::new(f);
                 for entry in &entries {
                     if let Ok(json) = serde_json::to_string(entry) {
@@ -1563,6 +1634,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn write_session_meta_atomic_writes_replaces_and_leaves_no_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("session_meta.json");
+
+        // Fresh write creates the file with the exact contents.
+        write_session_meta_atomic(dir.path(), r#"{"session_id":"first"}"#).unwrap();
+        assert_eq!(
+            fs::read_to_string(&meta_path).unwrap(),
+            r#"{"session_id":"first"}"#
+        );
+
+        // A second write replaces the existing file wholesale.
+        write_session_meta_atomic(dir.path(), r#"{"session_id":"second"}"#).unwrap();
+        assert_eq!(
+            fs::read_to_string(&meta_path).unwrap(),
+            r#"{"session_id":"second"}"#
+        );
+
+        // No temp residue: the dir holds exactly session_meta.json.
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["session_meta.json".to_string()]);
+    }
+
+    #[test]
     fn open_creates_directory_structure() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
@@ -1605,6 +1703,32 @@ mod tests {
                 .to_string();
             assert!(!id.starts_with('-'), "session id not flag-safe: {id}");
         }
+    }
+
+    /// Session log dirs and every file class written under them are
+    /// owner-only from creation (no chmod-after-write window).
+    #[cfg(unix)]
+    #[test]
+    fn session_log_artifacts_are_owner_only_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+
+        assert_eq!(mode_of(&log_dir), 0o700);
+        assert_eq!(mode_of(&log_dir.join("turns")), 0o700);
+        assert_eq!(mode_of(&log_dir.join("session.jsonl")), 0o600);
+        assert_eq!(mode_of(&log_dir.join("transcript.jsonl")), 0o600);
+
+        let rel = log.write_turn_file("out.txt", "content").unwrap();
+        assert_eq!(mode_of(&log_dir.join(&rel)), 0o600);
+        let rel = log.append_turn_file("stream.txt", "chunk").unwrap();
+        assert_eq!(mode_of(&log_dir.join(&rel)), 0o600);
+
+        log.write_summary("task", "done", 1);
+        assert_eq!(mode_of(&log_dir.join("summary.json")), 0o600);
     }
 
     #[test]

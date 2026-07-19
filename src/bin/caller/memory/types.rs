@@ -123,8 +123,7 @@ pub struct ClaimView {
     pub created_ms: u64,
     /// Gate-derived authorship — see [`ClaimProvenance`].
     pub proposed_by: ClaimProvenance,
-    /// Always `"ephemeral"` in this build (the P1 write bar): the
-    /// claim does not survive a daemon restart.
+    /// Effective storage mode: `"durable"` or `"ephemeral"`.
     pub durability: String,
 }
 

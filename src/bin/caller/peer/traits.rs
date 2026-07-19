@@ -32,6 +32,15 @@ use crate::peer::event::{
 use crate::peer::PeerError;
 use async_trait::async_trait;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerWitnessVantage {
+    SameLan,
+    Remote,
+    #[default]
+    Unknown,
+}
+
 // ---------------------------------------------------------------------------
 // TransportFeatures
 // ---------------------------------------------------------------------------
@@ -86,6 +95,9 @@ pub struct TransportFeatures {
     /// Transport supports relaying direct browser-to-peer dashboard-control
     /// WebRTC signaling frames.
     pub dashboard_control_signal: bool,
+    /// Transport supports sending an authenticated hosted-certificate
+    /// observation to the peer daemon.
+    pub certificate_witness: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +149,9 @@ pub enum PeerOp {
         session_id: WebRtcSessionId,
         signal: WebRtcSignal,
     },
+    HostedCertificateWitness {
+        report: crate::access::hosted_control::HostedCertificateWitnessReport,
+    },
 }
 
 impl PeerOp {
@@ -152,6 +167,7 @@ impl PeerOp {
             Self::WebRtcSignal { .. } => "webrtc_signal",
             Self::PeerFileTransferSignal { .. } => "peer_file_transfer_signal",
             Self::PeerDashboardControlSignal { .. } => "peer_dashboard_control_signal",
+            Self::HostedCertificateWitness { .. } => "hosted_certificate_witness",
         }
     }
 }
@@ -234,6 +250,7 @@ pub fn check_feature(features: &TransportFeatures, op: &PeerOp) -> Result<(), Pe
         PeerOp::WebRtcSignal { .. } => features.webrtc_signal,
         PeerOp::PeerFileTransferSignal { .. } => features.file_transfer_signal,
         PeerOp::PeerDashboardControlSignal { .. } => features.dashboard_control_signal,
+        PeerOp::HostedCertificateWitness { .. } => features.certificate_witness,
     };
     if !supported {
         return Err(PeerError::UnsupportedCapability(op.name().to_string()));

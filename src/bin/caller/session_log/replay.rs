@@ -1090,6 +1090,9 @@ pub fn session_log_entry_to_app_event(
                 round,
                 turns_in_round,
                 native_message_count: None,
+                // Replayed logs carry no live root; the file watcher's
+                // round routing fails open on `None`.
+                project_root: None,
             })
         }
         "safety_cap_reached" => Some(AppEvent::SafetyCapReached),
@@ -1268,6 +1271,44 @@ pub fn session_log_entry_to_app_event(
             if event_type == "info" {
                 if let Some((session_id, source)) = parse_session_attached_message(message) {
                     return Some(AppEvent::SessionAttached { session_id, source });
+                }
+                // User rows written by `SessionLog::user_message` carry the
+                // live lane's turn metadata (and renderable attachment
+                // refs) in `data`. Replay them as `UserMessageLog` so the
+                // served row is identically tagged to the live wire row —
+                // the frontend's transcript-signature dedupe then pairs
+                // the copies (`turn: None` on purpose: the live row never
+                // carried a turn). Legacy `[user]` rows without any of
+                // these fields fall through to the untagged `LogEntry`
+                // below and render exactly as before.
+                if let Some(rest) = message.strip_prefix("[user] ") {
+                    let user_turn_index = u32_from_data(data, "user_turn_index");
+                    let user_turn_revision = u32_from_data(data, "user_turn_revision");
+                    let replacement_for_user_turn_index =
+                        u32_from_data(data, "replacement_for_user_turn_index");
+                    let attachments = data
+                        .and_then(|d| d.get("attachments"))
+                        .and_then(|value| {
+                            serde_json::from_value::<Vec<crate::types::SessionNoteAttachment>>(
+                                value.clone(),
+                            )
+                            .ok()
+                        })
+                        .unwrap_or_default();
+                    if user_turn_index.is_some()
+                        || user_turn_revision.is_some()
+                        || replacement_for_user_turn_index.is_some()
+                        || !attachments.is_empty()
+                    {
+                        return Some(AppEvent::UserMessageLog {
+                            session_id: None,
+                            content: rest.to_string(),
+                            user_turn_index,
+                            user_turn_revision,
+                            replacement_for_user_turn_index,
+                            attachments,
+                        });
+                    }
                 }
             }
             let (source, content) = if let Some(rest) = message.strip_prefix("[user] ") {
@@ -1471,6 +1512,145 @@ mod tests {
                 assert_eq!(replayed, text);
             }
             other => panic!("expected SteerRequested, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_user_message_row_replays_turn_metadata_and_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        let refs = vec![crate::types::SessionNoteAttachment {
+            upload_id: "u-9".to_string(),
+            name: "shot.png".to_string(),
+            mime: "image/png".to_string(),
+            url: "/api/session/current/uploads/u-9/raw".to_string(),
+        }];
+        log.user_message("Look at this", Some(3), Some(2), Some(3), &refs);
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "info");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::UserMessageLog {
+                session_id,
+                content,
+                user_turn_index,
+                user_turn_revision,
+                replacement_for_user_turn_index,
+                attachments,
+            } => {
+                // Session id is stamped later by the replay-metadata
+                // injector, exactly like untagged log rows.
+                assert_eq!(session_id, None);
+                assert_eq!(content, "Look at this");
+                assert_eq!(user_turn_index, Some(3));
+                assert_eq!(user_turn_revision, Some(2));
+                assert_eq!(replacement_for_user_turn_index, Some(3));
+                assert_eq!(attachments, refs);
+            }
+            other => panic!("expected UserMessageLog, got {:?}", other),
+        }
+
+        // The served wire row matches the live lane's shape: log_entry with
+        // source User, no turn, tagged with the same turn metadata.
+        let outbound = crate::event::app_event_to_outbound(
+            &session_log_entry_to_app_event(&entry, &log_dir).unwrap(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&outbound).unwrap();
+        assert_eq!(
+            json.get("event").and_then(|v| v.as_str()),
+            Some("log_entry")
+        );
+        assert_eq!(json.get("source").and_then(|v| v.as_str()), Some("User"));
+        assert_eq!(json.get("turn"), None);
+        assert_eq!(
+            json.get("user_turn_index").and_then(|v| v.as_u64()),
+            Some(3)
+        );
+        assert_eq!(
+            json.pointer("/attachments/0/upload_id")
+                .and_then(|v| v.as_str()),
+            Some("u-9")
+        );
+    }
+
+    #[test]
+    fn rt_user_message_row_partial_metadata_still_replays_tagged() {
+        // The mid-turn-steer shape: index/revision absent, but a written
+        // attachment ref must still tag the row (and vice versa — turn
+        // metadata without attachments, the subagent shape).
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.user_message("subagent prompt", Some(2), None, None, &[]);
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "info");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::UserMessageLog {
+                user_turn_index,
+                user_turn_revision,
+                attachments,
+                ..
+            } => {
+                assert_eq!(user_turn_index, Some(2));
+                assert_eq!(user_turn_revision, None);
+                assert!(attachments.is_empty());
+            }
+            other => panic!("expected UserMessageLog, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_user_message_row_without_metadata_replays_untagged_like_legacy() {
+        // BACKWARD COMPAT: a metadata-less user_message write emits the
+        // same line shape as the historical `info("[user] …")` write (no
+        // `data` key), and BOTH replay as the untagged `LogEntry` old
+        // logs always produced — no tags, turn preserved.
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(2, 0.0, 200_000);
+        log.user_message("bare prompt", None, None, None, &[]);
+        log.info("[user] legacy prompt");
+        drop(log);
+
+        let contents = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let rows: Vec<serde_json::Value> = contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| {
+                entry
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|m| m.starts_with("[user] "))
+            })
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get("data"),
+            None,
+            "metadata-less user_message must keep the legacy line shape"
+        );
+
+        for (row, expected) in rows.iter().zip(["bare prompt", "legacy prompt"]) {
+            match session_log_entry_to_app_event(row, &log_dir).unwrap() {
+                AppEvent::LogEntry {
+                    session_id,
+                    level,
+                    source,
+                    content,
+                    turn,
+                } => {
+                    assert_eq!(session_id, None);
+                    assert_eq!(level, "info");
+                    assert_eq!(source, "User");
+                    assert_eq!(content, expected);
+                    assert_eq!(turn, Some(2));
+                }
+                other => panic!("expected untagged LogEntry, got {:?}", other),
+            }
         }
     }
 

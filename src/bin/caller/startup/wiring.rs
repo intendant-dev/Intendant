@@ -333,12 +333,8 @@ pub(crate) fn spawn_mode_web_gateway(
             None
         }
     };
-    // The P1 Memory service: an EPHEMERAL local plane (ratified write
-    // bar — nothing durable until Gate-B-lite custody + P0.5 + the
-    // tombed cutover). Bootstrap failure degrades to "memory
-    // unavailable" instead of failing the gateway; the plane id is
-    // logged so operators can tell incarnations apart across restarts.
-    // P1.8: the durable plane runs on the proven-custody OS (macOS);
+    // The P1 Memory service. The durable plane runs on the
+    // proven-custody OS (macOS);
     // multi-platform custody stays full Gate B, so other OSes run
     // ephemeral and say so on every view. INTENDANT_MEMORY_EPHEMERAL=1
     // is the operator kill switch. Durable bootstrap failure fails
@@ -423,6 +419,10 @@ pub(crate) fn spawn_mode_web_gateway(
         web_tls_client_cert_required,
         web_tls_acceptor.clone(),
     );
+    // The runtime sandbox walls this port off from model-driven shells
+    // (see sandbox::seatbelt_loopback_guard_clause) — recorded here, the
+    // one place every gateway-bearing startup shape passes through.
+    crate::sandbox::record_gateway_loopback_port(web_port);
     Ok(GatewaySpawn {
         _handle: handle,
         shared_session,

@@ -8,6 +8,85 @@ use tokio_util::sync::CancellationToken;
 
 type LocalDisplayInputAuthorizer = Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// Live lane predicate carried beside the immutable opening grant. IAM
+/// records already revalidate themselves; a custom-domain session also
+/// depends on owner-name provenance that can change without an IAM edit.
+#[derive(Clone, Default)]
+pub(crate) struct WsAuthorityGuard {
+    custom_domain: Option<Arc<crate::custom_domain::CustomDomainRuntime>>,
+}
+
+impl WsAuthorityGuard {
+    pub(crate) fn new(
+        custom_domain: Option<Arc<crate::custom_domain::CustomDomainRuntime>>,
+    ) -> Self {
+        Self { custom_domain }
+    }
+
+    fn opening_authority_is_current(
+        &self,
+        grant: &crate::dashboard_control::DashboardControlGrant,
+    ) -> bool {
+        self.custom_domain
+            .as_ref()
+            .is_none_or(|runtime| runtime.enabled())
+            && grant.opening_authority_is_current()
+    }
+}
+
+/// Send one outbound frame without letting socket backpressure postpone live
+/// authority revocation. The authority tick remains active while the sink is
+/// pending; cancellation drops the send future immediately so the inbound
+/// task can tear down display peers independently of writer progress.
+async fn send_ws_with_live_authority<S>(
+    sink: &mut S,
+    message: Message,
+    authority_guard: &WsAuthorityGuard,
+    grant: &crate::dashboard_control::DashboardControlGrant,
+    session_cancel: &CancellationToken,
+) -> Result<(), ()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    if !authority_guard.opening_authority_is_current(grant) {
+        session_cancel.cancel();
+        return Err(());
+    }
+    let send = sink.send(message);
+    tokio::pin!(send);
+    let start =
+        tokio::time::Instant::now() + crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL;
+    let mut authority_tick = tokio::time::interval_at(
+        start,
+        crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+    );
+    authority_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = session_cancel.cancelled() => return Err(()),
+            result = &mut send => return result.map_err(|_| ()),
+            _ = authority_tick.tick() => {
+                if !authority_guard.opening_authority_is_current(grant) {
+                    session_cancel.cancel();
+                    return Err(());
+                }
+            }
+        }
+    }
+}
+
+async fn send_ws_close_bounded<S>(sink: &mut S)
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let _ = tokio::time::timeout(
+        crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL,
+        sink.send(Message::Close(None)),
+    )
+    .await;
+}
+
 fn websocket_owns_dashboard_control_session(session_ids: &[String], session_id: &str) -> bool {
     !session_id.is_empty() && session_ids.iter().any(|owned| owned == session_id)
 }
@@ -20,6 +99,7 @@ fn websocket_owns_dashboard_control_session(session_ids: &[String], session_id: 
 fn bind_input_authorizer_to_ws_session(
     holder_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
     grant: Arc<crate::dashboard_control::DashboardControlGrant>,
+    authority_guard: WsAuthorityGuard,
     session_cancel: CancellationToken,
 ) -> Arc<dyn Fn() -> bool + Send + Sync> {
     // Display signaling itself requires only DisplayView. Freeze an explicit
@@ -33,7 +113,7 @@ fn bind_input_authorizer_to_ws_session(
     Arc::new(move || {
         interactive_at_open
             && !session_cancel.is_cancelled()
-            && grant.opening_authority_is_current()
+            && authority_guard.opening_authority_is_current(&grant)
             && holder_authorized()
     })
 }
@@ -185,6 +265,7 @@ pub(crate) async fn ws_outbound_task(
     bootstrap_caches: crate::dashboard_control::DashboardBootstrapCaches,
     mut bootstrap_flushed_rx: tokio::sync::oneshot::Receiver<()>,
     grant: crate::dashboard_control::DashboardControlGrant,
+    authority_guard: WsAuthorityGuard,
     session_cancel: CancellationToken,
 ) {
     let mut bootstrap_flushed = false;
@@ -197,25 +278,30 @@ pub(crate) async fn ws_outbound_task(
             biased;
             _ = session_cancel.cancelled() => break,
             _ = authority_tick.tick() => {
-                if !grant.opening_authority_is_current() {
-                    let _ = ws_tx.send(Message::Close(None)).await;
+                if !authority_guard.opening_authority_is_current(&grant) {
                     session_cancel.cancel();
+                    send_ws_close_bounded(&mut ws_tx).await;
                     break;
                 }
             }
             msg = direct_rx.recv() => {
                 match msg {
                     Some(line) => {
-                        if !grant.opening_authority_is_current() {
-                            let _ = ws_tx.send(Message::Close(None)).await;
+                        if !authority_guard.opening_authority_is_current(&grant) {
                             session_cancel.cancel();
+                            send_ws_close_bounded(&mut ws_tx).await;
                             break;
                         }
                         if !grant.allows_dashboard_event_line(&line) {
                             continue;
                         }
-                        if ws_tx
-                            .send(Message::Text(line.into()))
+                        if send_ws_with_live_authority(
+                            &mut ws_tx,
+                            Message::Text(line.into()),
+                            &authority_guard,
+                            &grant,
+                            &session_cancel,
+                        )
                             .await
                             .is_err()
                         {
@@ -235,16 +321,21 @@ pub(crate) async fn ws_outbound_task(
             msg = terminal_forward_rx.recv(), if terminal_lane_open => {
                 match msg {
                     Some(line) => {
-                        if !grant.opening_authority_is_current() {
-                            let _ = ws_tx.send(Message::Close(None)).await;
+                        if !authority_guard.opening_authority_is_current(&grant) {
                             session_cancel.cancel();
+                            send_ws_close_bounded(&mut ws_tx).await;
                             break;
                         }
                         if !grant.allows_dashboard_event_line(&line) {
                             continue;
                         }
-                        if ws_tx
-                            .send(Message::Text(line.into()))
+                        if send_ws_with_live_authority(
+                            &mut ws_tx,
+                            Message::Text(line.into()),
+                            &authority_guard,
+                            &grant,
+                            &session_cancel,
+                        )
                             .await
                             .is_err()
                         {
@@ -273,16 +364,16 @@ pub(crate) async fn ws_outbound_task(
                         // so part of the bootstrap may already be on the wire
                         // — fail closed and end the connection rather than
                         // follow a partial bootstrap with live events.
-                        let _ = ws_tx.send(Message::Close(None)).await;
                         session_cancel.cancel();
+                        send_ws_close_bounded(&mut ws_tx).await;
                         break;
                     }
                 }
             }
             msg = outbound_rx.recv(), if bootstrap_flushed => {
-                if !grant.opening_authority_is_current() {
-                    let _ = ws_tx.send(Message::Close(None)).await;
+                if !authority_guard.opening_authority_is_current(&grant) {
                     session_cancel.cancel();
+                    send_ws_close_bounded(&mut ws_tx).await;
                     break;
                 }
                 match msg {
@@ -299,8 +390,13 @@ pub(crate) async fn ws_outbound_task(
                                 }
                             }
                         }
-                        if ws_tx
-                            .send(Message::Text(line.into()))
+                        if send_ws_with_live_authority(
+                            &mut ws_tx,
+                            Message::Text(line.into()),
+                            &authority_guard,
+                            &grant,
+                            &session_cancel,
+                        )
                             .await
                             .is_err()
                         {
@@ -349,7 +445,16 @@ pub(crate) async fn ws_outbound_task(
                         }
                         let mut send_failed = false;
                         for frame in frames {
-                            if ws_tx.send(Message::Text(frame.into())).await.is_err() {
+                            if send_ws_with_live_authority(
+                                &mut ws_tx,
+                                Message::Text(frame.into()),
+                                &authority_guard,
+                                &grant,
+                                &session_cancel,
+                            )
+                            .await
+                            .is_err()
+                            {
                                 send_failed = true;
                                 break;
                             }
@@ -368,9 +473,9 @@ pub(crate) async fn ws_outbound_task(
             // buffer in the receiver until the flush; `is_current` skips
             // superseded revisions on drain, and the Lagged arm re-snapshots.
             msg = authority_change_rx.recv(), if bootstrap_flushed => {
-                if !grant.opening_authority_is_current() {
-                    let _ = ws_tx.send(Message::Close(None)).await;
+                if !authority_guard.opening_authority_is_current(&grant) {
                     session_cancel.cancel();
+                    send_ws_close_bounded(&mut ws_tx).await;
                     break;
                 }
                 match msg {
@@ -402,8 +507,13 @@ pub(crate) async fn ws_outbound_task(
                             "display_id": change.display_id,
                             "state": state,
                         }).to_string();
-                        if ws_tx
-                            .send(Message::Text(frame.into()))
+                        if send_ws_with_live_authority(
+                            &mut ws_tx,
+                            Message::Text(frame.into()),
+                            &authority_guard,
+                            &grant,
+                            &session_cancel,
+                        )
                             .await
                             .is_err()
                         {
@@ -445,8 +555,13 @@ pub(crate) async fn ws_outbound_task(
                                 "display_id": did,
                                 "state": state,
                             }).to_string();
-                            if ws_tx
-                                .send(Message::Text(frame.into()))
+                            if send_ws_with_live_authority(
+                                &mut ws_tx,
+                                Message::Text(frame.into()),
+                                &authority_guard,
+                                &grant,
+                                &session_cancel,
+                            )
                                 .await
                                 .is_err()
                             {
@@ -492,8 +607,10 @@ pub(crate) struct WsInboundCtx {
     pub(crate) terminal_registry: Arc<crate::terminal::TerminalRegistry>,
     pub(crate) dashboard_control: Arc<crate::dashboard_control::DashboardControlRegistry>,
     pub(crate) dashboard_control_grant: crate::dashboard_control::DashboardControlGrant,
+    pub(crate) authority_guard: WsAuthorityGuard,
     pub(crate) peer_file_transfer_registry:
         Arc<crate::peer_file_transfer::PeerFileTransferRegistry>,
+    pub(crate) hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
     pub(crate) peer_identity: Option<PeerConnectionIdentity>,
     pub(crate) browser_host_ip: Option<std::net::IpAddr>,
     pub(crate) ice_config: crate::display::IceConfig,
@@ -536,7 +653,9 @@ pub(crate) async fn ws_inbound_task(
         terminal_registry: terminal_registry_inbound,
         dashboard_control: dashboard_control_inbound,
         dashboard_control_grant: dashboard_control_grant_inbound,
+        authority_guard: authority_guard_inbound,
         peer_file_transfer_registry: peer_file_transfer_registry_inbound,
+        hosted_control: hosted_control_inbound,
         peer_identity: peer_identity_inbound,
         browser_host_ip,
         ice_config,
@@ -601,7 +720,7 @@ pub(crate) async fn ws_inbound_task(
         let Some(Ok(msg)) = next else {
             break;
         };
-        if !dashboard_control_grant_inbound.opening_authority_is_current() {
+        if !authority_guard_inbound.opening_authority_is_current(&dashboard_control_grant_inbound) {
             session_cancel.cancel();
             break;
         }
@@ -1085,6 +1204,13 @@ pub(crate) async fn ws_inbound_task(
                         // the tunnel's api_presence_video_frame commits
                         // through (fire-and-forget: no response frame).
                         let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
+                        if reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "frame_id",
+                            &frame_id,
+                        ) {
+                            continue;
+                        }
                         let stream = json["stream"].as_str().unwrap_or("cam0").to_string();
                         if let Some(data_b64) = json["data"].as_str() {
                             use base64::Engine;
@@ -1113,6 +1239,13 @@ pub(crate) async fn ws_inbound_task(
                         // are independent of any running task. Same store fn as
                         // the tunnel's api_media_annotation_attach.
                         let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
+                        if reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "frame_id",
+                            &frame_id,
+                        ) {
+                            continue;
+                        }
                         let stream = json["stream"].as_str().unwrap_or("annotation").to_string();
                         let note = json["note"].as_str().unwrap_or("").to_string();
                         if let Some(data_b64) = json["data"].as_str() {
@@ -1161,6 +1294,13 @@ pub(crate) async fn ws_inbound_task(
                         // through the same store fns as the tunnel's
                         // api_media_annotation_submit.
                         let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
+                        if reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "frame_id",
+                            &frame_id,
+                        ) {
+                            continue;
+                        }
                         let stream = json["stream"].as_str().unwrap_or("annotation").to_string();
                         let note = json["note"].as_str().unwrap_or("").to_string();
                         let inject = json["inject"].as_bool().unwrap_or(false);
@@ -1223,13 +1363,34 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("clip_start") => {
                         let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
+                        if reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "clip_id",
+                            &clip_id,
+                        ) {
+                            continue;
+                        }
                         let stream = json["stream"].as_str().unwrap_or("recording").to_string();
                         let note = json["note"].as_str().unwrap_or("").to_string();
                         let inject = json["inject"].as_bool().unwrap_or(false);
                         let in_secs = json["in_secs"].as_f64().unwrap_or(0.0);
                         let out_secs = json["out_secs"].as_f64().unwrap_or(0.0);
                         let fps = json["fps"].as_u64().unwrap_or(2) as u32;
-                        let total = json["total_frames"].as_u64().unwrap_or(0) as usize;
+                        let total = json["total_frames"].as_u64().unwrap_or(0);
+                        let total = match validate_dashboard_clip_frame_count(total) {
+                            Ok(total) => total,
+                            Err(error) => {
+                                let _ = direct_tx_inbound.send(
+                                    serde_json::json!({
+                                        "t": "media_error",
+                                        "ok": false,
+                                        "error": error,
+                                    })
+                                    .to_string(),
+                                );
+                                continue;
+                            }
+                        };
                         clip_accumulators.insert(
                             clip_id.clone(),
                             DashboardMediaClipOperation {
@@ -1255,6 +1416,17 @@ pub(crate) async fn ws_inbound_task(
                     Some("clip_frame") => {
                         let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
                         let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
+                        if reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "clip_id",
+                            &clip_id,
+                        ) || reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "frame_id",
+                            &frame_id,
+                        ) {
+                            continue;
+                        }
                         if let Some(data_b64) = json["data"].as_str() {
                             // Register frame in frame registry — the same
                             // store fn as the tunnel's api_media_clip_frame.
@@ -1280,6 +1452,13 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("clip_end") => {
                         let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
+                        if reject_invalid_dashboard_media_id(
+                            &direct_tx_inbound,
+                            "clip_id",
+                            &clip_id,
+                        ) {
+                            continue;
+                        }
 
                         if let Some(acc) = clip_accumulators.remove(&clip_id) {
                             let frames_registered = acc.frames.len();
@@ -1549,7 +1728,7 @@ pub(crate) async fn ws_inbound_task(
                             // returns true when this connection is the
                             // authority holder OR when the display has no
                             // holder (unclaimed = pre-phase-5 default).
-                            // `display/mod.rs` only sees this boolean; it
+                            // `intendant-display` only sees this boolean; it
                             // never learns about DisplayInputHolder, the
                             // map, or connection IDs.  See
                             // [`build_local_ws_input_authorizer`] for the
@@ -1566,6 +1745,7 @@ pub(crate) async fn ws_inbound_task(
                                         Arc::clone(&display_input_authority_inbound),
                                     ),
                                     Arc::clone(&dashboard_control_grant_live),
+                                    authority_guard_inbound.clone(),
                                     session_cancel.clone(),
                                 )
                             });
@@ -2043,6 +2223,7 @@ pub(crate) async fn ws_inbound_task(
                                             Arc::clone(&display_input_authority_inbound),
                                         ),
                                         Arc::clone(&dashboard_control_grant_live),
+                                        authority_guard_inbound.clone(),
                                         session_cancel.clone(),
                                     )
                                 },
@@ -2151,6 +2332,7 @@ pub(crate) async fn ws_inbound_task(
                                     bind_input_authorizer_to_ws_session(
                                         Arc::new(|| true),
                                         Arc::clone(&dashboard_control_grant_live),
+                                        authority_guard_inbound.clone(),
                                         session_cancel.clone(),
                                     );
                                 handle_federated_webrtc_signal(
@@ -2197,6 +2379,36 @@ pub(crate) async fn ws_inbound_task(
                                     &bus_inbound,
                                 )
                                 .await;
+                            }
+                            Ok(ControlMsg::HostedCertificateWitness { report }) => {
+                                let Some(identity) = peer_identity_inbound.as_ref() else {
+                                    continue;
+                                };
+                                match hosted_control_inbound.receive_peer_witness(
+                                    report,
+                                    &identity.fingerprint,
+                                    &identity.label,
+                                ) {
+                                    Ok(guard) => {
+                                        bus_inbound.send(AppEvent::PresenceLog {
+                                            message: format!(
+                                                "[hosted-control] peer certificate witness recorded; lane guard={}",
+                                                guard.status.as_str(),
+                                            ),
+                                            level: Some(LogLevel::Info),
+                                            turn: None,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        bus_inbound.send(AppEvent::PresenceLog {
+                                            message: format!(
+                                                "[hosted-control] rejected peer certificate witness: {error}"
+                                            ),
+                                            level: Some(LogLevel::Warn),
+                                            turn: None,
+                                        });
+                                    }
+                                }
                             }
                             Ok(ControlMsg::RequestDisplayInputAuthority { display_id }) => {
                                 // Phase 5a.1: handler body lives in
@@ -2676,9 +2888,46 @@ mod input_authorizer_cache_tests {
 #[cfg(test)]
 mod signaling_ownership_tests {
     use super::{bind_input_authorizer_to_ws_session, websocket_owns_dashboard_control_session};
+    use futures_util::Sink;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::task::{Context, Poll};
     use tokio_util::sync::CancellationToken;
+
+    struct PendingMessageSink;
+
+    impl Sink<tokio_tungstenite::tungstenite::Message> for PendingMessageSink {
+        type Error = ();
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            _item: tokio_tungstenite::tungstenite::Message,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+    }
 
     #[test]
     fn websocket_rejects_cross_connection_dashboard_control_session_ids() {
@@ -2702,6 +2951,7 @@ mod signaling_ownership_tests {
         let guard = bind_input_authorizer_to_ws_session(
             Arc::new(move || holder_for_guard.load(Ordering::SeqCst)),
             Arc::new(crate::dashboard_control::DashboardControlGrant::TrustedLocal),
+            super::WsAuthorityGuard::default(),
             cancel.clone(),
         );
         assert!(guard());
@@ -2710,6 +2960,88 @@ mod signaling_ownership_tests {
         holder.store(true, Ordering::SeqCst);
         cancel.cancel();
         assert!(!guard(), "transport teardown must invalidate queued input");
+    }
+
+    #[test]
+    fn custom_domain_ws_authority_dies_when_the_live_zone_gate_falls() {
+        let dir = tempfile::tempdir().unwrap();
+        let observed = Arc::new(AtomicBool::new(true));
+        let hosted = Arc::new(crate::access::hosted_control::HostedControlRuntime::new(
+            false,
+            dir.path().to_path_buf(),
+            None,
+            None,
+            String::new(),
+            false,
+        ));
+        let runtime = Arc::new(crate::custom_domain::CustomDomainRuntime::new(
+            &crate::project::CustomDomainConfig {
+                enabled: true,
+                name: Some("box.owner.example.test".to_string()),
+                ..Default::default()
+            },
+            dir.path().to_path_buf(),
+            hosted,
+            Some(Arc::clone(&observed)),
+        ));
+        let guard = super::WsAuthorityGuard::new(Some(runtime));
+        let grant = crate::dashboard_control::DashboardControlGrant::TrustedLocal;
+        assert!(guard.opening_authority_is_current(&grant));
+        observed.store(false, Ordering::SeqCst);
+        assert!(
+            !guard.opening_authority_is_current(&grant),
+            "an active custom-domain socket must lose authority with the live lane gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn backpressured_ws_send_cannot_delay_live_authority_teardown() {
+        let dir = tempfile::tempdir().unwrap();
+        let observed = Arc::new(AtomicBool::new(true));
+        let hosted = Arc::new(crate::access::hosted_control::HostedControlRuntime::new(
+            false,
+            dir.path().to_path_buf(),
+            None,
+            None,
+            String::new(),
+            false,
+        ));
+        let runtime = Arc::new(crate::custom_domain::CustomDomainRuntime::new(
+            &crate::project::CustomDomainConfig {
+                enabled: true,
+                name: Some("box.owner.example.test".to_string()),
+                ..Default::default()
+            },
+            dir.path().to_path_buf(),
+            hosted,
+            Some(Arc::clone(&observed)),
+        ));
+        let guard = super::WsAuthorityGuard::new(Some(runtime));
+        let grant = crate::dashboard_control::DashboardControlGrant::TrustedLocal;
+        let cancel = CancellationToken::new();
+        let close = Arc::clone(&observed);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            close.store(false, Ordering::SeqCst);
+        });
+        let mut sink = PendingMessageSink;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::send_ws_with_live_authority(
+                &mut sink,
+                tokio_tungstenite::tungstenite::Message::Text("blocked".into()),
+                &guard,
+                &grant,
+                &cancel,
+            ),
+        )
+        .await
+        .expect("the live authority tick must interrupt a backpressured writer");
+        assert!(result.is_err());
+        assert!(
+            cancel.is_cancelled(),
+            "peer cleanup must be released independently of writer progress"
+        );
     }
 
     #[test]
@@ -2753,6 +3085,7 @@ mod signaling_ownership_tests {
         let guard = bind_input_authorizer_to_ws_session(
             Arc::new(|| true),
             Arc::new(grant),
+            super::WsAuthorityGuard::default(),
             CancellationToken::new(),
         );
         assert!(
@@ -2849,6 +3182,7 @@ mod outbound_bootstrap_ordering_tests {
             crate::dashboard_control::DashboardBootstrapCaches::default(),
             flush_rx,
             crate::dashboard_control::DashboardControlGrant::TrustedLocal,
+            WsAuthorityGuard::default(),
             CancellationToken::new(),
         ));
         OutboundHarness {

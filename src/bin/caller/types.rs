@@ -879,6 +879,13 @@ pub enum OutboundEvent {
         user_turn_revision: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         replacement_for_user_turn_index: Option<u32>,
+        /// Renderable upload refs for a user row's delivered attachments
+        /// (`UserMessageLog` lane). Same reference shape session notes use
+        /// — never inline bytes. Additive: absent when empty, so rows
+        /// without attachments serialize byte-identically to the
+        /// pre-field wire format.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<SessionNoteAttachment>,
     },
     /// Display-only note an agent posted into its session transcript
     /// (`post_session_note` MCP tool / `intendant ctl session note`).

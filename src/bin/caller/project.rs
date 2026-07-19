@@ -105,7 +105,7 @@ pub struct ComputerUseConfig {
     #[serde(default)]
     pub model: Option<String>,
     /// Display backend for input/screenshot. Default: "auto" (detect from env).
-    /// Values: "x11", "wayland", "macos", "auto".
+    /// Values: "x11", "wayland", "macos", "windows", "auto".
     #[serde(default = "default_backend")]
     pub backend: String,
 }
@@ -670,6 +670,237 @@ pub struct ProjectConfig {
 /// rendezvous_url = "https://connect.intendant.dev"
 /// daemon_id = "my-laptop"
 /// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CustomDomainConfig {
+    /// Master switch for the user-owned-name lane. There is deliberately no
+    /// environment override: a checked-in/default config cannot turn this on.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Exact user-owned DNS name served by this daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// WebAuthn relying-party id. When omitted it is the exact `name`; when
+    /// present it must still equal `name` so credentials cannot widen to a
+    /// parent domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rp_id: Option<String>,
+    /// Separate issuance ceremony. Leave false while the daemon creates its
+    /// ACME account and exposes the account URI; enable only after publishing
+    /// the accounturi + dns-01 CAA policy.
+    #[serde(default)]
+    pub acme_issuance_enabled: bool,
+    /// DNS-01 provider. Credentials are supplied by the daemon's credential
+    /// lease store or the named environment variable, never inline here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<CustomDomainDnsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum CustomDomainDnsConfig {
+    Cloudflare {
+        zone_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_env: Option<String>,
+        #[serde(default = "default_cloudflare_propagation_delay_secs")]
+        propagation_delay_secs: u64,
+    },
+    Rfc2136 {
+        /// Authoritative update endpoint (`host:port`; TCP).
+        server: String,
+        /// Zone apex that accepts the update.
+        zone: String,
+        /// TSIG key name.
+        key_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_env: Option<String>,
+        #[serde(default = "default_custom_dns_ttl_secs")]
+        ttl_secs: u32,
+        #[serde(default = "default_rfc2136_propagation_delay_secs")]
+        propagation_delay_secs: u64,
+    },
+}
+
+fn default_cloudflare_propagation_delay_secs() -> u64 {
+    10
+}
+
+fn default_rfc2136_propagation_delay_secs() -> u64 {
+    2
+}
+
+fn default_custom_dns_ttl_secs() -> u32 {
+    60
+}
+
+const MAX_CUSTOM_DNS_PROPAGATION_DELAY_SECS: u64 = 60 * 60;
+
+fn validate_custom_dns_propagation_delay(delay_secs: u64) -> Result<(), String> {
+    if delay_secs > MAX_CUSTOM_DNS_PROPAGATION_DELAY_SECS {
+        return Err(format!(
+            "custom_domain.dns.propagation_delay_secs must be at most {MAX_CUSTOM_DNS_PROPAGATION_DELAY_SECS} seconds"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedCustomDomain {
+    pub name: String,
+    pub rp_id: String,
+    pub origin: String,
+}
+
+fn normalize_custom_domain_name(value: &str) -> Result<String, String> {
+    let normalized = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > 253
+        || !normalized.is_ascii()
+        || normalized.contains('*')
+    {
+        return Err("custom domain must be one exact ASCII DNS name".to_string());
+    }
+    let labels: Vec<&str> = normalized.split('.').collect();
+    if labels.len() < 2
+        || normalized.parse::<std::net::IpAddr>().is_ok()
+        || labels.first().is_some_and(|label| {
+            label.strip_prefix("d-").is_some_and(|digest| {
+                digest.len() == 20 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        })
+        || labels
+            .last()
+            .is_some_and(|label| label.bytes().all(|byte| byte.is_ascii_digit()))
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(
+            "custom domain must contain valid DNS labels (use the ASCII/punycode form)".to_string(),
+        );
+    }
+    let parsed = url::Url::parse(&format!("https://{normalized}"))
+        .map_err(|_| "custom domain is not a canonical ASCII/punycode DNS name".to_string())?;
+    if parsed.host_str() != Some(normalized.as_str()) {
+        return Err("custom domain is not a canonical ASCII/punycode DNS name".to_string());
+    }
+    Ok(normalized)
+}
+
+impl CustomDomainConfig {
+    pub fn validated(&self) -> Result<Option<ValidatedCustomDomain>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let name = self
+            .name
+            .as_deref()
+            .ok_or_else(|| "custom_domain.name is required when enabled".to_string())
+            .and_then(normalize_custom_domain_name)?;
+        let rp_id = self
+            .rp_id
+            .as_deref()
+            .map(normalize_custom_domain_name)
+            .transpose()?
+            .unwrap_or_else(|| name.clone());
+        if rp_id != name {
+            return Err("custom_domain.rp_id must equal the exact custom domain name".to_string());
+        }
+        if let Some(dns) = &self.dns {
+            match dns {
+                CustomDomainDnsConfig::Cloudflare {
+                    token_env,
+                    propagation_delay_secs,
+                    ..
+                } => {
+                    validate_custom_dns_propagation_delay(*propagation_delay_secs)?;
+                    crate::credential_leases::dns_credential_env_name(
+                        token_env.as_deref(),
+                        "CLOUDFLARE_API_TOKEN",
+                        "_API_TOKEN",
+                    )?;
+                }
+                CustomDomainDnsConfig::Rfc2136 {
+                    secret_env,
+                    propagation_delay_secs,
+                    ..
+                } => {
+                    validate_custom_dns_propagation_delay(*propagation_delay_secs)?;
+                    crate::credential_leases::dns_credential_env_name(
+                        secret_env.as_deref(),
+                        "INTENDANT_RFC2136_TSIG_SECRET",
+                        "_TSIG_SECRET",
+                    )?;
+                }
+            }
+        }
+        Ok(Some(ValidatedCustomDomain {
+            origin: format!("https://{name}"),
+            name,
+            rp_id,
+        }))
+    }
+
+    pub(crate) fn validated_dns_credential_fallback(
+        &self,
+    ) -> Result<Option<(&'static str, String)>, String> {
+        if self.validated()?.is_none() {
+            return Ok(None);
+        }
+        match &self.dns {
+            Some(CustomDomainDnsConfig::Cloudflare { token_env, .. }) => {
+                crate::credential_leases::dns_credential_env_name(
+                    token_env.as_deref(),
+                    "CLOUDFLARE_API_TOKEN",
+                    "_API_TOKEN",
+                )
+                .map(|name| Some(("dns:cloudflare", name)))
+            }
+            Some(CustomDomainDnsConfig::Rfc2136 { secret_env, .. }) => {
+                crate::credential_leases::dns_credential_env_name(
+                    secret_env.as_deref(),
+                    "INTENDANT_RFC2136_TSIG_SECRET",
+                    "_TSIG_SECRET",
+                )
+                .map(|name| Some(("dns:rfc2136", name)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Environment entry to remove from supervised child processes. This is
+    /// intentionally derived without validating the domain name: a malformed
+    /// lane must fail closed instead of handing its configured DNS credential
+    /// to a coding-agent child.
+    pub(crate) fn dns_credential_env_for_child_scrub(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        let (configured, default) = match &self.dns {
+            Some(CustomDomainDnsConfig::Cloudflare { token_env, .. }) => {
+                (token_env.as_deref(), "CLOUDFLARE_API_TOKEN")
+            }
+            Some(CustomDomainDnsConfig::Rfc2136 { secret_env, .. }) => {
+                (secret_env.as_deref(), "INTENDANT_RFC2136_TSIG_SECRET")
+            }
+            None => return None,
+        };
+        Some(
+            configured
+                .map(str::trim)
+                .filter(|name| !name.is_empty() && !name.contains('=') && !name.contains('\0'))
+                .unwrap_or(default)
+                .to_string(),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectConfig {
     /// Master switch. Environment variable
@@ -701,9 +932,8 @@ pub struct ConnectConfig {
     #[serde(default)]
     pub relay_enabled: bool,
     /// `host:port` of the relay's raw passthrough port, where this daemon dials
-    /// back browser connections (e.g. `relay.example.com:443`). Learned from
-    /// the register response when the rendezvous advertises one; this override
-    /// pins it explicitly.
+    /// back browser connections (e.g. `relay.example.com:443`). Configure this
+    /// explicitly here or with `INTENDANT_CONNECT_RELAY_ENDPOINT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_endpoint: Option<String>,
     /// Optional daemon-local hosted-control lane. This switch is deliberately
@@ -712,6 +942,9 @@ pub struct ConnectConfig {
     /// behavior. There is intentionally no environment-variable override.
     #[serde(default)]
     pub hosted_control_enabled: bool,
+    /// Opt-in user-owned-name control lane.
+    #[serde(default)]
+    pub custom_domain: CustomDomainConfig,
 }
 
 /// Rendezvous applied when `[connect] enabled = true` names no
@@ -782,6 +1015,7 @@ impl Default for ConnectConfig {
             relay_enabled: false,
             relay_endpoint: None,
             hosted_control_enabled: false,
+            custom_domain: CustomDomainConfig::default(),
         }
     }
 }
@@ -852,21 +1086,30 @@ pub fn save_daemon_connect_config_in(path: &Path, config: &ConnectConfig) -> Res
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    restrict_connect_file(&tmp);
+    write_owner_only(&tmp, &text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("finalize {}: {e}", path.display()))
 }
 
-fn restrict_connect_file(path: &Path) {
+/// Write `contents` to `path` with owner-only permissions from the first
+/// byte: the file is *created* 0600 on Unix, so there is no window where a
+/// default-umask file briefly exposes the secret before a follow-up chmod
+/// (the old write-then-chmod shape). A leftover file at `path` is removed
+/// first — `OpenOptions::mode` only applies at creation, so truncating an
+/// existing wider-mode leftover would keep its old permissions. On Windows
+/// the file inherits the profile directory's default ACLs, which are
+/// already private to the user.
+fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let _ = std::fs::remove_file(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
-        }
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())
 }
 
 /// Which store a Connect config round-trips through — resolved once from
@@ -918,10 +1161,10 @@ impl ConnectConfigStore {
 /// and what it requires of inbound peer connections.
 /// Lives under `[server]` in intendant.toml.
 ///
-/// The CLI flag `--advertise-url` (repeatable) is *additive* over the
-/// `advertise` field via `web_gateway::resolve_advertise_urls`:
-/// operator overrides come first, auto-detected interface URLs append
-/// behind them.
+/// The CLI flag `--advertise-url` (repeatable) replaces the `advertise`
+/// field when present. The selected operator list is then passed to
+/// `web_gateway::resolve_advertise_urls`, where auto-detected interface
+/// URLs append behind it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// IP address the web dashboard listens on. Empty/default means the
@@ -1355,6 +1598,14 @@ pub struct PeerConfig {
     /// identical behavior to slice 3a.2 before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_tcp_via_url: Option<String>,
+    /// Operator-declared network relationship from this daemon to the peer
+    /// for certificate witnessing. Public destination addresses alone are
+    /// not evidence that the observer is outside the peer's LAN, so the
+    /// default is `unknown`. Set `remote` only when this daemon is
+    /// independently operated from another network; `same_lan` is always a
+    /// weak witness.
+    #[serde(default)]
+    pub certificate_witness_vantage: crate::peer::PeerWitnessVantage,
 }
 
 /// Recording configuration in intendant.toml.
@@ -1443,8 +1694,12 @@ impl Default for LiveAudioConfig {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct SandboxProjectConfig {
-    #[serde(default)]
-    pub enabled: bool,
+    /// Explicit write-sandbox opt-in/opt-out. Unset (`None`) means the
+    /// platform default applies: ON for macOS/Linux, OFF for Windows. The
+    /// effective resolution (CLI flags override this value) lives in
+    /// `configure_sandbox_env` / `sandbox_enabled` in the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     #[serde(default)]
     pub extra_write_paths: Vec<String>,
 }
@@ -1530,6 +1785,28 @@ impl Project {
         crate::file_watcher::atomic_write(&config_path, content.as_bytes())
             .map_err(|e| CallerError::Config(format!("Failed to write intendant.toml: {}", e)))?;
         Ok(())
+    }
+
+    /// Append one grant to `[sandbox] extra_write_paths` in this
+    /// project's intendant.toml — the consent flow's "always allow"
+    /// persistence. Reloads from disk first so a concurrent settings save
+    /// is not clobbered wholesale; duplicate entries no-op.
+    pub fn append_sandbox_extra_write_path(root: &Path, entry: &str) -> Result<(), CallerError> {
+        let mut proj = Self::from_root(root.to_path_buf())?;
+        if proj
+            .config
+            .sandbox
+            .extra_write_paths
+            .iter()
+            .any(|p| p == entry)
+        {
+            return Ok(());
+        }
+        proj.config
+            .sandbox
+            .extra_write_paths
+            .push(entry.to_string());
+        proj.save_config()
     }
 
     #[allow(dead_code)]
@@ -1708,6 +1985,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     client_key: None,
                     pinned_fingerprints: Vec::new(),
                     browser_tcp_via_url: None,
+                    certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
                 },
                 PeerConfig {
                     card_url: "http://b.local/.well-known/agent-card.json".into(),
@@ -1720,6 +1998,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                         "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
                     ],
                     browser_tcp_via_url: Some("ws://192.168.1.42:8766/ws".into()),
+                    certificate_witness_vantage: crate::peer::PeerWitnessVantage::Remote,
                 },
             ],
             ..ProjectConfig::default()
@@ -1760,6 +2039,14 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
         assert_eq!(
             parsed.peers[1].browser_tcp_via_url.as_deref(),
             Some("ws://192.168.1.42:8766/ws"),
+        );
+        assert_eq!(
+            parsed.peers[0].certificate_witness_vantage,
+            crate::peer::PeerWitnessVantage::Unknown
+        );
+        assert_eq!(
+            parsed.peers[1].certificate_witness_vantage,
+            crate::peer::PeerWitnessVantage::Remote
         );
     }
 
@@ -1918,7 +2205,7 @@ args = ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
         );
         assert_eq!(
             config.approval.tool_call,
-            crate::autonomy::ApprovalRule::Auto
+            crate::autonomy::ApprovalRule::Ask
         );
     }
 
@@ -2366,6 +2653,190 @@ context_recovery = "managed"
         config.enabled = false;
         save_daemon_connect_config_in(&path, &config).unwrap();
         assert!(!load_daemon_connect_config_in(&path).unwrap().enabled);
+    }
+
+    /// The connect config can carry `auth_token`; it must be created with
+    /// owner-only permissions from the first byte — including when it
+    /// replaces a leftover wider-mode file (the chmod-after-write shape
+    /// this guards against).
+    #[cfg(unix)]
+    #[test]
+    fn daemon_connect_config_is_owner_only_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("connect.toml");
+
+        // A stale world-readable tmp leftover must not donate its mode.
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, "leftover").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut config = ConnectConfig::default();
+        config.auth_token = Some("secret-token".to_string());
+        save_daemon_connect_config_in(&path, &config).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "connect.toml mode {mode:o}");
+    }
+
+    #[test]
+    fn custom_domain_is_dark_and_exact_by_default() {
+        let config = ConnectConfig::default();
+        assert!(!config.custom_domain.enabled);
+        assert!(!config.custom_domain.acme_issuance_enabled);
+        assert_eq!(config.custom_domain.validated().unwrap(), None);
+
+        let enabled = CustomDomainConfig {
+            enabled: true,
+            name: Some("Box.Example.COM.".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            enabled.validated().unwrap(),
+            Some(ValidatedCustomDomain {
+                name: "box.example.com".to_string(),
+                rp_id: "box.example.com".to_string(),
+                origin: "https://box.example.com".to_string(),
+            })
+        );
+
+        let widened = CustomDomainConfig {
+            rp_id: Some("example.com".to_string()),
+            ..enabled.clone()
+        };
+        assert!(widened.validated().unwrap_err().contains("must equal"));
+        let wildcard = CustomDomainConfig {
+            name: Some("*.example.com".to_string()),
+            ..enabled
+        };
+        assert!(wildcard.validated().is_err());
+        let ip_literal = CustomDomainConfig {
+            enabled: true,
+            name: Some("127.0.0.1".to_string()),
+            ..Default::default()
+        };
+        assert!(ip_literal.validated().is_err());
+        let fleet_shaped = CustomDomainConfig {
+            enabled: true,
+            name: Some("d-30a08371a38c1b447038.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(fleet_shaped.validated().is_err());
+    }
+
+    #[test]
+    fn custom_domain_provider_config_round_trips_without_inline_secrets() {
+        let text = r#"
+[connect]
+enabled = true
+relay_enabled = true
+relay_endpoint = "relay.example.com:443"
+
+[connect.custom_domain]
+enabled = true
+name = "box.example.com"
+acme_issuance_enabled = true
+
+[connect.custom_domain.dns]
+provider = "cloudflare"
+zone_id = "zone-id"
+        token_env = "CLOUDFLARE_API_TOKEN"
+"#;
+        let parsed: ProjectConfig = toml::from_str(text).unwrap();
+        let custom = &parsed.connect.custom_domain;
+        assert_eq!(
+            custom.validated().unwrap().unwrap().rp_id,
+            "box.example.com"
+        );
+        assert!(custom.acme_issuance_enabled);
+        assert!(matches!(
+            &custom.dns,
+            Some(CustomDomainDnsConfig::Cloudflare { zone_id, .. }) if zone_id == "zone-id"
+        ));
+        assert_eq!(
+            custom.validated_dns_credential_fallback().unwrap(),
+            Some(("dns:cloudflare", "CLOUDFLARE_API_TOKEN".to_string()))
+        );
+        let serialized = toml::to_string(&parsed.connect).unwrap();
+        assert!(!serialized.to_ascii_lowercase().contains("secret ="));
+        assert!(!serialized.to_ascii_lowercase().contains("token ="));
+
+        let mut invalid = (*custom).clone();
+        invalid.dns = Some(CustomDomainDnsConfig::Cloudflare {
+            zone_id: "zone-id".to_string(),
+            token_env: Some("INTENDANT_UNSCRUBBED_TOKEN".to_string()),
+            propagation_delay_secs: 10,
+        });
+        assert!(invalid.validated().is_err());
+        assert!(invalid.validated_dns_credential_fallback().is_err());
+        assert_eq!(
+            invalid.dns_credential_env_for_child_scrub().as_deref(),
+            Some("INTENDANT_UNSCRUBBED_TOKEN")
+        );
+
+        let malformed_domain = CustomDomainConfig {
+            enabled: true,
+            name: Some("*.example.com".to_string()),
+            dns: Some(CustomDomainDnsConfig::Cloudflare {
+                zone_id: "zone-id".to_string(),
+                token_env: Some("OWNER_DNS_API_TOKEN".to_string()),
+                propagation_delay_secs: 10,
+            }),
+            ..Default::default()
+        };
+        assert!(malformed_domain.validated().is_err());
+        assert_eq!(
+            malformed_domain
+                .dns_credential_env_for_child_scrub()
+                .as_deref(),
+            Some("OWNER_DNS_API_TOKEN")
+        );
+    }
+
+    #[test]
+    fn custom_domain_propagation_delay_is_bounded_for_each_provider() {
+        let base = CustomDomainConfig {
+            enabled: true,
+            name: Some("box.example.com".to_string()),
+            ..Default::default()
+        };
+        for (delay_secs, should_pass) in [
+            (0, true),
+            (MAX_CUSTOM_DNS_PROPAGATION_DELAY_SECS, true),
+            (u64::MAX, false),
+        ] {
+            for dns in [
+                CustomDomainDnsConfig::Cloudflare {
+                    zone_id: "zone-id".to_string(),
+                    token_env: None,
+                    propagation_delay_secs: delay_secs,
+                },
+                CustomDomainDnsConfig::Rfc2136 {
+                    server: "ns1.example.com:53".to_string(),
+                    zone: "example.com".to_string(),
+                    key_name: "intendant-acme.".to_string(),
+                    secret_env: None,
+                    ttl_secs: 60,
+                    propagation_delay_secs: delay_secs,
+                },
+            ] {
+                let config = CustomDomainConfig {
+                    dns: Some(dns),
+                    ..base.clone()
+                };
+                let result = config.validated();
+                assert_eq!(
+                    result.is_ok(),
+                    should_pass,
+                    "delay {delay_secs} validation result: {result:?}"
+                );
+                if !should_pass {
+                    assert!(result
+                        .unwrap_err()
+                        .contains("propagation_delay_secs must be at most 3600 seconds"));
+                }
+            }
+        }
     }
 
     #[test]

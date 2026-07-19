@@ -65,6 +65,24 @@
 }
 .hosted-control-status { min-height: 20px; margin-top: 14px; color: var(--yellow, #f9e2af); }
 .hosted-control-status.error { color: var(--red, #f38ba8); }
+.hosted-control-guard {
+  margin: 14px 0;
+  padding: 11px 13px;
+  border: 1px solid var(--yellow, #f9e2af);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--yellow, #f9e2af) 12%, transparent);
+  color: var(--yellow, #f9e2af);
+  line-height: 1.45;
+}
+.hosted-control-guard.suspended {
+  border-color: var(--red, #f38ba8);
+  background: color-mix(in srgb, var(--red, #f38ba8) 14%, transparent);
+  color: var(--red, #f38ba8);
+}
+.hosted-control-guard.overridden {
+  border-color: var(--peach, #fab387);
+  color: var(--peach, #fab387);
+}
 .hosted-control-fingerprint {
   overflow-wrap: anywhere;
   padding: 9px 11px;
@@ -105,6 +123,56 @@
   border-radius: 7px;
   background: var(--base, #11111b);
   color: var(--text, #cdd6f4);
+}
+.hosted-control-guard-section {
+  border-color: var(--green, #a6e3a1);
+}
+.hosted-control-guard-section.alert {
+  border-color: var(--yellow, #f9e2af);
+}
+.hosted-control-guard-section.suspended {
+  border-color: var(--red, #f38ba8);
+  box-shadow: inset 3px 0 var(--red, #f38ba8);
+}
+.hosted-control-guard-section.overridden {
+  border-color: var(--peach, #fab387);
+}
+.hosted-control-guard-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.hosted-control-guard-status {
+  padding: 4px 8px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font: 700 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-transform: uppercase;
+}
+.hosted-control-witnesses {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+}
+.hosted-control-evidence-sources {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+.hosted-control-witness-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(120px, auto) auto;
+  gap: 9px;
+  align-items: center;
+  padding: 8px 0;
+  border-top: 1px solid var(--surface0, #313244);
+  color: var(--subtext0, #a6adc8);
+  font-size: 12px;
+}
+.hosted-control-serial {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 /* Immutable hosted floor: these destinations never appear on a lease. */
@@ -147,4 +215,5 @@ html[data-hosted-preset="tasks"] [data-tab="files"] {
 @media (max-width: 620px) {
   .hosted-control-grid { grid-template-columns: 1fr; }
   .hosted-control-card { padding: 18px; }
+  .hosted-control-witness-row { grid-template-columns: 1fr; }
 }

@@ -256,6 +256,12 @@ pub(crate) fn try_buffered_idle_agent_event(
     }
 }
 
+/// Emit one canonical user-message row: a session-log `[user]` line that
+/// persists the turn metadata + renderable attachment refs in `data`, and
+/// the live `UserMessageLog` bus event carrying the same fields — so the
+/// live wire row and its replayed copy are identically tagged and the
+/// dashboard's transcript-signature dedupe collapses them across lanes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_user_message_log(
     bus: &EventBus,
     session_log: &SharedSessionLog,
@@ -263,19 +269,29 @@ pub(crate) fn emit_user_message_log(
     user_turn_index: Option<u32>,
     user_turn_revision: Option<u32>,
     replacement_for_user_turn_index: Option<u32>,
+    attachments: &[crate::types::SessionNoteAttachment],
     text: &str,
 ) {
     let text = text.trim();
     if text.is_empty() {
         return;
     }
-    slog(session_log, |l| l.info(&format!("[user] {}", text)));
+    slog(session_log, |l| {
+        l.user_message(
+            text,
+            user_turn_index,
+            user_turn_revision,
+            replacement_for_user_turn_index,
+            attachments,
+        )
+    });
     bus.send(AppEvent::UserMessageLog {
         session_id: session_id.map(str::to_string),
         content: text.to_string(),
         user_turn_index,
         user_turn_revision,
         replacement_for_user_turn_index,
+        attachments: attachments.to_vec(),
     });
 }
 
@@ -698,6 +714,17 @@ pub(crate) async fn create_external_agent(
     let mcp_session_id = mcp_session_id.or_else(|| session_log_id(session_log));
     let mcp_auth_token =
         web_port.map(|_| crate::web_gateway::loopback_mcp_auth_token().to_string());
+    // Daemon-side MCP status ground truth: the gate reports this session's
+    // first `/mcp` serves (initialize, tools/list) into its timeline the
+    // moment they happen — the backend's own MCP status echo only arrives
+    // at turn boundaries. Registered before the spawn below so the
+    // client's very first request is attributable; a respawn re-registers
+    // and reports afresh.
+    if mcp_auth_token.is_some() {
+        if let Some(session_id) = mcp_session_id.as_deref() {
+            crate::web_gateway::register_supervised_mcp_session(session_id, session_log);
+        }
+    }
     // A spawn is the INITIAL fork of another thread exactly while the wrapper
     // still resumes the parent id recorded as `forked_from`; once the child's
     // own native id is persisted, resume moves to the child id and the same
@@ -751,6 +778,7 @@ pub(crate) async fn create_external_agent(
         (None, None)
     };
 
+    let dns_credential_store = Some(crate::access::backend::select_backend().cert_dir());
     let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend {
         AgentBackend::Codex => {
             let cfg = &project.config.agent.codex;
@@ -813,6 +841,9 @@ pub(crate) async fn create_external_agent(
                 codex_managed_context,
                 web_port,
                 mcp_auth_token: mcp_auth_token.clone(),
+                dns_credential_env: crate::credential_leases::configured_dns_credential_child_scrub(
+                ),
+                dns_credential_store: dns_credential_store.clone(),
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
                 fork_resume,
@@ -858,6 +889,9 @@ pub(crate) async fn create_external_agent(
                 codex_managed_context: false,
                 web_port,
                 mcp_auth_token: mcp_auth_token.clone(),
+                dns_credential_env: crate::credential_leases::configured_dns_credential_child_scrub(
+                ),
+                dns_credential_store,
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
                 fork_resume,

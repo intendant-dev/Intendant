@@ -315,6 +315,15 @@ pub fn spawn_event_listener(
                         ref backend_session_id,
                     } => {
                         s.link_session_aliases(session_id, backend_session_id);
+                        // Custody hook (live pump only — hydration replays
+                        // must not touch lease state): an external session
+                        // announcing itself while its source's oauth lease
+                        // is active runs on the materialized home, so its
+                        // expiry cleanup must wait for the session's end.
+                        crate::credential_leases::note_leased_session_running(
+                            source,
+                            &[session_id.as_str(), backend_session_id.as_str()],
+                        );
                         if !session_id.is_empty() {
                             s.session_sources.insert(session_id.clone(), source.clone());
                         }
@@ -621,11 +630,15 @@ pub fn spawn_event_listener(
                             LogLevel::Info,
                             format!("Approval required [{}]: {}", category, command_preview),
                         );
-                        s.pending_approval = Some(PendingApprovalState {
+                        s.pending_approvals.insert(
                             id,
-                            command_preview,
-                            category: category.to_string(),
-                        });
+                            PendingApprovalState {
+                                id,
+                                command_preview,
+                                category: category.to_string(),
+                                session_id: session_id.clone(),
+                            },
+                        );
                         resource_changed = Some("intendant://pending-approval");
                     }
 
@@ -748,8 +761,10 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::ApprovalResolved { id, ref action, .. } => {
-                        s.pending_approval = None;
-                        if action == "deny" {
+                        s.pending_approvals.remove(&id);
+                        if !s.pending_approvals.is_empty() {
+                            s.set_phase(Phase::WaitingApproval);
+                        } else if action == "deny" {
                             s.set_phase(Phase::Done);
                         } else {
                             s.set_phase(Phase::RunningAgent);
@@ -925,6 +940,14 @@ pub fn spawn_event_listener(
                         ref reason,
                         ..
                     } => {
+                        // Custody hook (live pump only): release the
+                        // session's leased-home registration under every
+                        // alias BEFORE note_session_ended may prune the
+                        // alias table; a deferred expired home is deleted
+                        // at this exit instead of the next timer sweep.
+                        let related = s.session_related_ids(session_id);
+                        let related: Vec<&str> = related.iter().map(String::as_str).collect();
+                        crate::credential_leases::note_session_ended_for_leases(&related);
                         s.note_session_ended(session_id);
                         s.push_log(
                             LogLevel::Info,
@@ -1604,7 +1627,7 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
     // (presence_*, external_agent, configured_codex_managed_context,
     // log_dir) — re-audit when the replay converter grows a producer; and
     // fields with replayable producers that the hydration applier never
-    // writes (pending_approval, human_question — ApprovalRequired's arm
+    // writes (pending_approvals, human_question — ApprovalRequired's arm
     // writes only phase state, HumanQuestionDetected has no applier arm) —
     // re-audit when the applier grows a write to them.
     let provider_name = s.provider_name.clone();
@@ -2438,6 +2461,7 @@ mod tests {
                 round: 3,
                 turns_in_round: 2,
                 native_message_count: None,
+                project_root: None,
             },
         );
 
@@ -4134,6 +4158,7 @@ mod tests {
                         round: 14,
                         turns_in_round: 1,
                         native_message_count: None,
+                        project_root: None,
                     },
                 );
             }

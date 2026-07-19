@@ -197,6 +197,26 @@ pub struct SettingsPayload {
     // Live Audio
     pub live_audio_enabled: bool,
     pub live_audio_timeout_secs: u64,
+    // Runtime write sandbox (the native agent's shell/file-tool write
+    // confinement, persisted to `[sandbox]` — distinct from the
+    // Codex-specific `codex_sandbox` below). Live state is resolved at
+    // the transport edge ([`SandboxSettingsView`]).
+    /// GET: the effective live state. POST: `Some` persists intent to
+    /// `[sandbox] enabled` and — unless a CLI flag pins the state —
+    /// live-applies via `crate::sandbox::apply_sandbox_state`.
+    #[serde(default)]
+    pub sandbox_enabled: Option<bool>,
+    /// Read-only: `--sandbox`/`--no-sandbox` pinned the live state for
+    /// this daemon run; saves then only persist intent for the next start.
+    #[serde(default)]
+    pub sandbox_locked_by_flag: bool,
+    /// Read-only: the effective write-grant set the next spawn sees.
+    #[serde(default)]
+    pub sandbox_write_paths: Vec<String>,
+    /// GET: the configured `[sandbox] extra_write_paths`. POST: `Some`
+    /// replaces the config list (entries trimmed, empties dropped).
+    #[serde(default)]
+    pub sandbox_extra_write_paths: Option<Vec<String>>,
     // External agent default (persisted to `[agent] default_backend`).
     // Values: "codex" | "claude-code" | "gemini" | None (internal agent).
     #[serde(default)]
@@ -334,6 +354,12 @@ pub(crate) fn settings_payload_from_config(
         recording_quality: config.recording.quality.clone(),
         live_audio_enabled: config.live_audio.enabled,
         live_audio_timeout_secs: config.live_audio.default_timeout_secs,
+        // Live sandbox state is overlaid at the transport edge; the pure
+        // config view carries only the persisted extras.
+        sandbox_enabled: None,
+        sandbox_locked_by_flag: false,
+        sandbox_write_paths: Vec::new(),
+        sandbox_extra_write_paths: Some(config.sandbox.extra_write_paths.clone()),
         external_agent: config.agent.default_backend.clone(),
         codex_command: Some(config.agent.codex.command.clone()),
         codex_managed_command: config.agent.codex.managed_command.clone(),
@@ -429,16 +455,56 @@ pub(crate) async fn settings_payload_with_runtime_overrides(
     payload
 }
 
+/// Live runtime-write-sandbox state as the settings GET reports it. The
+/// transport edge resolves it from the process ([`Self::live`]); the
+/// response core takes it as a parameter so tests inject a fixed view
+/// instead of reading process state (the hermeticity convention).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SandboxSettingsView {
+    pub(crate) enabled: bool,
+    pub(crate) locked_by_flag: bool,
+    pub(crate) write_paths: Vec<String>,
+}
+
+impl SandboxSettingsView {
+    pub(crate) fn live() -> Self {
+        Self {
+            enabled: crate::sandbox::sandbox_active(),
+            locked_by_flag: crate::sandbox::sandbox_flag_lock().is_some(),
+            write_paths: crate::sandbox::effective_write_paths()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+        }
+    }
+}
+
 pub(crate) async fn settings_get_response_body(
     project_root: Option<&Path>,
     runtime_settings: &RuntimeSettingsState,
+) -> String {
+    settings_get_response_body_with_sandbox(
+        project_root,
+        runtime_settings,
+        SandboxSettingsView::live(),
+    )
+    .await
+}
+
+pub(crate) async fn settings_get_response_body_with_sandbox(
+    project_root: Option<&Path>,
+    runtime_settings: &RuntimeSettingsState,
+    sandbox: SandboxSettingsView,
 ) -> String {
     let settings_root = runtime_settings.settings_root.as_deref().or(project_root);
     match settings_root {
         Some(root) => match crate::project::Project::from_root(root.to_path_buf()) {
             Ok(proj) => {
-                let payload =
+                let mut payload =
                     settings_payload_with_runtime_overrides(&proj.config, runtime_settings).await;
+                payload.sandbox_enabled = Some(sandbox.enabled);
+                payload.sandbox_locked_by_flag = sandbox.locked_by_flag;
+                payload.sandbox_write_paths = sandbox.write_paths;
                 serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
             }
             Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
@@ -469,6 +535,18 @@ pub(crate) fn apply_settings_payload(
     config.recording.quality = payload.recording_quality.clone();
     config.live_audio.enabled = payload.live_audio_enabled;
     config.live_audio.default_timeout_secs = payload.live_audio_timeout_secs;
+    if let Some(enabled) = payload.sandbox_enabled {
+        // Persist intent even when a CLI flag pins the live state — the
+        // flag lock only skips the live apply (settings_post_result).
+        config.sandbox.enabled = Some(enabled);
+    }
+    if let Some(paths) = payload.sandbox_extra_write_paths.as_ref() {
+        config.sandbox.extra_write_paths = paths
+            .iter()
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty())
+            .collect();
+    }
     // Normalize empty strings to None so the TOML doesn't end up with
     // `default_backend = ""` — the loader treats "" as a valid override
     // and would try to resolve it to a backend.
@@ -565,6 +643,82 @@ pub(crate) fn settings_post_result(
     body_text: &str,
     project_root: Option<&Path>,
     bus: &EventBus,
+    caller_may_manage_credentials: bool,
+) -> (u16, String) {
+    settings_post_result_with_sandbox_apply(
+        body_text,
+        project_root,
+        bus,
+        caller_may_manage_credentials,
+        live_apply_sandbox_settings,
+    )
+}
+
+/// The executable-repointing fields whose CHANGE `payload` would apply
+/// against the currently persisted `config` — the credential-adjacent
+/// subset of the settings surface (which binary external-agent sessions
+/// spawn with the owner's credentials and workspace). Values compare
+/// post-normalization, so a full-payload round trip that echoes the
+/// current values (the dashboard's save shape) never trips the gate; only
+/// an actual repoint does. The ControlMsg lane enforces the same rule via
+/// `control_msg_operation` (SetCodexCommand / SetCodexManagedCommand
+/// classify as credentials.manage).
+fn executable_repoint_denials(
+    payload: &SettingsPayload,
+    config: &crate::project::ProjectConfig,
+) -> Vec<&'static str> {
+    let mut denied = Vec::new();
+    if payload.codex_command.is_some() {
+        let next = normalize_settings_codex_command(payload.codex_command.as_deref());
+        if next != config.agent.codex.command {
+            denied.push("codex_command");
+        }
+    }
+    if payload.codex_managed_command.is_some() {
+        let next = payload
+            .codex_managed_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|cmd| !cmd.is_empty())
+            .map(str::to_string);
+        if next != config.agent.codex.managed_command {
+            denied.push("codex_managed_command");
+        }
+    }
+    if payload.claude_command.is_some() {
+        let next = normalize_settings_agent_command(payload.claude_command.as_deref(), "claude");
+        if next != config.agent.claude_code.command {
+            denied.push("claude_command");
+        }
+    }
+    denied
+}
+
+/// The write-sandbox live-apply seam `settings_post_result` runs after a
+/// successful save: recompute + apply the grant environment so the next
+/// runtime spawn picks the change up, unless a CLI flag pins the state
+/// (then the save only persisted intent for the next start). Standalone
+/// so the POST core's tests inject a recorder instead of mutating
+/// process env (hermeticity convention); this seam itself is covered by
+/// the sandbox e2e.
+fn live_apply_sandbox_settings(
+    sandbox: &crate::project::SandboxProjectConfig,
+) -> Result<(), String> {
+    if crate::sandbox::sandbox_flag_lock().is_some() {
+        return Ok(());
+    }
+    // Unset means the default applies: the write sandbox is ON (the
+    // startup resolution in `sandbox_enabled`, minus the CLI flags).
+    crate::sandbox::apply_sandbox_state(sandbox.enabled.unwrap_or(true), &sandbox.extra_write_paths)
+        .map(|_| ())
+}
+
+pub(crate) fn settings_post_result_with_sandbox_apply(
+    body_text: &str,
+    project_root: Option<&Path>,
+    bus: &EventBus,
+    caller_may_manage_credentials: bool,
+    sandbox_live_apply: impl FnOnce(&crate::project::SandboxProjectConfig) -> Result<(), String>,
 ) -> (u16, String) {
     let Some(root) = project_root else {
         return (
@@ -587,11 +741,46 @@ pub(crate) fn settings_post_result(
             return (500, serde_json::json!({"error": e.to_string()}).to_string());
         }
     };
+    if !caller_may_manage_credentials {
+        let denied = executable_repoint_denials(&payload, &proj.config);
+        if !denied.is_empty() {
+            return (
+                403,
+                serde_json::json!({
+                    "error": format!(
+                        "changing {} requires credential-management authority \
+                         (credentials.manage, the /api/api-keys gate): the command \
+                         path decides which executable runs with this machine's \
+                         credentials. Save it from an owner surface.",
+                        denied.join(", ")
+                    ),
+                    "denied_fields": denied,
+                })
+                .to_string(),
+            );
+        }
+    }
     apply_settings_payload(&mut proj.config, &payload);
     match proj.save_config() {
         Ok(()) => {
             dispatch_agent_settings_control_msgs(bus, &payload);
-            (200, serde_json::json!({"ok": true}).to_string())
+            // Live-apply the write sandbox only when the payload touched
+            // it — an older client's partial save must not re-apply (or
+            // clear) grant state it never mentioned. A failed apply after
+            // a successful save still answers 200: the save happened, and
+            // the body reports the apply verdict.
+            let applied = if payload.sandbox_enabled.is_some()
+                || payload.sandbox_extra_write_paths.is_some()
+            {
+                sandbox_live_apply(&proj.config.sandbox)
+            } else {
+                Ok(())
+            };
+            let body = match applied {
+                Ok(()) => serde_json::json!({"ok": true, "applied": true}),
+                Err(e) => serde_json::json!({"ok": true, "applied": false, "apply_error": e}),
+            };
+            (200, body.to_string())
         }
         Err(e) => (500, serde_json::json!({"error": e.to_string()}).to_string()),
     }
@@ -779,8 +968,16 @@ pub(crate) fn api_keys_env_path() -> Option<PathBuf> {
 /// authoritative provider key list, persist to `env_path`, and set the
 /// keys in the current process so future provider instantiations pick
 /// them up without a restart. Failures report in the body — the
-/// endpoint's historical contract answers 200 either way.
-pub(crate) fn set_api_keys_result(env_path: Option<&Path>, body: &str) -> String {
+/// endpoint's historical contract answers 200 either way. A successful
+/// write lands in the custody-audit trail (key names only) attributed to
+/// `audit_actor`/`audit_origin`, which the transport edge derives from
+/// the gate-bound principal.
+pub(crate) fn set_api_keys_result(
+    env_path: Option<&Path>,
+    body: &str,
+    audit_actor: &str,
+    audit_origin: &str,
+) -> String {
     let payload: SetApiKeysPayload = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(e) => {
@@ -847,6 +1044,22 @@ pub(crate) fn set_api_keys_result(env_path: Option<&Path>, body: &str) -> String
         std::env::set_var(key, val);
     }
 
+    if !payload.keys.is_empty() {
+        let mut names: Vec<&str> = payload.keys.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        crate::credential_audit::record_with_origin(
+            crate::credential_audit::EVENT_PROVIDER_KEYS_WRITTEN,
+            "provider_env",
+            &names.join(", "),
+            audit_actor,
+            audit_origin,
+            format!(
+                "{} provider key(s) replaced in the daemon .env",
+                payload.keys.len()
+            ),
+        );
+    }
+
     serde_json::json!({"ok": true}).to_string()
 }
 
@@ -885,8 +1098,10 @@ pub(crate) fn settings_post_api_response(
     body_text: &str,
     project_root: Option<&Path>,
     bus: &EventBus,
+    caller_may_manage_credentials: bool,
 ) -> ApiResponse {
-    let (status, body) = settings_post_result(body_text, project_root, bus);
+    let (status, body) =
+        settings_post_result(body_text, project_root, bus, caller_may_manage_credentials);
     ApiResponse::json(status, JsonBody::PreSerialized(body))
 }
 
@@ -894,8 +1109,16 @@ pub(crate) fn settings_post_api_response(
 /// the historical lane reports failures in the body — under the bare
 /// tail. `env_path` arrives from the transport edge
 /// ([`api_keys_env_path`]).
-pub(crate) fn api_keys_save_api_response(env_path: Option<&Path>, body_text: &str) -> ApiResponse {
-    bare_json_response(200, set_api_keys_result(env_path, body_text))
+pub(crate) fn api_keys_save_api_response(
+    env_path: Option<&Path>,
+    body_text: &str,
+    audit_actor: &str,
+    audit_origin: &str,
+) -> ApiResponse {
+    bare_json_response(
+        200,
+        set_api_keys_result(env_path, body_text, audit_actor, audit_origin),
+    )
 }
 
 /// GET /api/api-key-status + the tunnel's `api_key_status`.
@@ -949,10 +1172,16 @@ pub(crate) async fn handle_settings_post(
     body_text: String,
     bus: EventBus,
     project_root: Option<PathBuf>,
+    caller_may_manage_credentials: bool,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = settings_post_api_response(&body_text, project_root.as_deref(), &bus);
+    let response = settings_post_api_response(
+        &body_text,
+        project_root.as_deref(),
+        &bus,
+        caller_may_manage_credentials,
+    );
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -970,12 +1199,19 @@ pub(crate) async fn handle_settings_get(
 pub(crate) async fn handle_api_keys_post(
     stream: DemuxStream,
     body_text: String,
+    audit_actor: String,
+    audit_origin: &'static str,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
     // The transport edge resolves the ambient env path; the neutral core
     // below it is path-parameterized (hermeticity convention).
-    let response = api_keys_save_api_response(api_keys_env_path().as_deref(), &body_text);
+    let response = api_keys_save_api_response(
+        api_keys_env_path().as_deref(),
+        &body_text,
+        &audit_actor,
+        audit_origin,
+    );
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -1150,6 +1386,8 @@ mod tests {
         assert_eq!(payload.codex_sandbox, None);
         assert_eq!(payload.codex_approval_policy, None);
         assert_eq!(payload.codex_managed_context, None);
+        assert_eq!(payload.sandbox_enabled, None);
+        assert_eq!(payload.sandbox_extra_write_paths, None);
 
         let mut config = crate::project::ProjectConfig::default();
         config.agent.codex.command = "/opt/codex/bin/codex".to_string();
@@ -1157,6 +1395,8 @@ mod tests {
         config.agent.codex.approval_policy = "never".to_string();
         config.agent.codex.managed_context = "managed".to_string();
         config.agent.codex.service_tier = Some("priority".to_string());
+        config.sandbox.enabled = Some(false);
+        config.sandbox.extra_write_paths = vec!["/keep/me".to_string()];
         apply_settings_payload(&mut config, &payload);
 
         assert_eq!(config.agent.default_backend.as_deref(), Some("codex"));
@@ -1165,6 +1405,10 @@ mod tests {
         assert_eq!(config.agent.codex.approval_policy, "never");
         assert_eq!(config.agent.codex.managed_context, "managed");
         assert_eq!(config.agent.codex.service_tier.as_deref(), Some("priority"));
+        // Older clients that omit the runtime-sandbox fields must not
+        // clear the persisted [sandbox] config.
+        assert_eq!(config.sandbox.enabled, Some(false));
+        assert_eq!(config.sandbox.extra_write_paths, vec!["/keep/me"]);
     }
 
     #[test]
@@ -1253,6 +1497,7 @@ mod tests {
             "{\"external_agent\":",
             Some(Path::new(".")),
             &EventBus::new(),
+            true,
         );
 
         assert_eq!(status, 400);
@@ -1261,7 +1506,7 @@ mod tests {
 
     #[test]
     fn settings_post_result_rejects_missing_project_root_with_bad_request() {
-        let (status, body) = settings_post_result("{}", None, &EventBus::new());
+        let (status, body) = settings_post_result("{}", None, &EventBus::new(), true);
 
         assert_eq!(status, 400);
         assert!(body.contains("No project root"));
@@ -1313,7 +1558,7 @@ mod tests {
         })
         .to_string();
 
-        let (status, _) = settings_post_result(&body, Some(dir.path()), &bus);
+        let (status, _) = settings_post_result(&body, Some(dir.path()), &bus, true);
         assert_eq!(status, 200);
 
         let mut saw_command = false;
@@ -1540,7 +1785,15 @@ mod tests {
         let cors = settings_route_cors("POST", "/api/settings");
         // Missing project root: 400 under the canonical tail.
         let response = collect_settings_handler_response(|stream| {
-            handle_settings_post(stream, "{}".to_string(), EventBus::new(), None, cors, None)
+            handle_settings_post(
+                stream,
+                "{}".to_string(),
+                EventBus::new(),
+                None,
+                true,
+                cors,
+                None,
+            )
         })
         .await;
         assert_eq!(
@@ -1562,6 +1815,7 @@ mod tests {
                 invalid.to_string(),
                 EventBus::new(),
                 Some(parse_dir.path().to_path_buf()),
+                true,
                 cors,
                 None,
             )
@@ -1603,14 +1857,17 @@ mod tests {
                 body,
                 EventBus::new(),
                 Some(root.clone()),
+                true,
                 cors,
                 None,
             )
         })
         .await;
+        // serde_json's default map serializes keys sorted, hence
+        // "applied" before "ok".
         assert_eq!(
             golden_settings_transcript(&response),
-            golden_settings_json_transcript("200 OK", r#"{"ok":true}"#)
+            golden_settings_json_transcript("200 OK", r#"{"applied":true,"ok":true}"#)
         );
         assert!(root.join("intendant.toml").exists());
     }
@@ -1625,6 +1882,8 @@ mod tests {
             handle_api_keys_post(
                 stream,
                 r#"{"keys":{"NOT_A_KNOWN_KEY":"x"}}"#.to_string(),
+                "test-actor".to_string(),
+                "local",
                 cors,
                 None,
             )
@@ -1648,7 +1907,14 @@ mod tests {
         let expected_body =
             serde_json::json!({"error": format!("Invalid payload: {}", serde_error)}).to_string();
         let response = collect_settings_handler_response(|stream| {
-            handle_api_keys_post(stream, invalid.to_string(), cors, None)
+            handle_api_keys_post(
+                stream,
+                invalid.to_string(),
+                "test-actor".to_string(),
+                "local",
+                cors,
+                None,
+            )
         })
         .await;
         assert_eq!(
@@ -1666,7 +1932,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let env_path = dir.path().join("intendant").join(".env");
         let body = serde_json::json!({"keys": {}}).to_string();
-        let result = set_api_keys_result(Some(&env_path), &body);
+        let result = set_api_keys_result(Some(&env_path), &body, "test-actor", "local");
         assert_eq!(result, r#"{"ok":true}"#);
         assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "\n");
     }
@@ -1677,7 +1943,7 @@ mod tests {
     fn set_api_keys_without_config_dir_reports_error_body() {
         let body = serde_json::json!({"keys": {}}).to_string();
         assert_eq!(
-            set_api_keys_result(None, &body),
+            set_api_keys_result(None, &body, "test-actor", "local"),
             r#"{"error":"Cannot determine config directory"}"#
         );
     }
@@ -1775,7 +2041,7 @@ mod tests {
         })
         .to_string();
 
-        let (status, _) = settings_post_result(&body, Some(dir.path()), &bus);
+        let (status, _) = settings_post_result(&body, Some(dir.path()), &bus, true);
         assert_eq!(status, 200);
 
         while let Ok(event) = rx.try_recv() {
@@ -1802,5 +2068,237 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Runtime write sandbox: GET view + POST persistence/live-apply ──
+    //
+    // The live grant environment is process state, so these tests stay on
+    // the injected seams: the GET core takes a SandboxSettingsView, the
+    // POST core takes the live-apply closure. The real seam
+    // (live_apply_sandbox_settings → apply_sandbox_state) mutates
+    // process env and is covered by the sandbox e2e, not here.
+
+    /// The minimal valid settings body (exactly the fields without a
+    /// serde default), extended per test.
+    fn minimal_settings_body() -> serde_json::Value {
+        serde_json::json!({
+            "cu_provider": null,
+            "cu_model": null,
+            "cu_backend": "auto",
+            "presence_enabled": true,
+            "presence_provider": null,
+            "presence_model": null,
+            "presence_live_provider": null,
+            "presence_live_model": null,
+            "transcription_enabled": false,
+            "transcription_provider": "openai",
+            "transcription_model": "whisper-1",
+            "transcription_endpoint": null,
+            "transcription_language": null,
+            "recording_enabled": false,
+            "recording_framerate": 15,
+            "recording_quality": "medium",
+            "live_audio_enabled": false,
+            "live_audio_timeout_secs": 300,
+            "external_agent": null
+        })
+    }
+
+    #[tokio::test]
+    async fn settings_get_reports_the_injected_sandbox_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = crate::project::Project::from_root(dir.path().to_path_buf()).unwrap();
+        project.config.sandbox.extra_write_paths = vec!["notes".to_string()];
+        project.save_config().unwrap();
+
+        let body = settings_get_response_body_with_sandbox(
+            Some(dir.path()),
+            &RuntimeSettingsState::default(),
+            SandboxSettingsView {
+                enabled: true,
+                locked_by_flag: true,
+                write_paths: vec!["/granted/root".to_string()],
+            },
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(value["sandbox_enabled"], true);
+        assert_eq!(value["sandbox_locked_by_flag"], true);
+        assert_eq!(
+            value["sandbox_write_paths"],
+            serde_json::json!(["/granted/root"])
+        );
+        assert_eq!(
+            value["sandbox_extra_write_paths"],
+            serde_json::json!(["notes"])
+        );
+    }
+
+    #[test]
+    fn settings_post_persists_sandbox_fields_and_runs_the_live_apply_seam() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = minimal_settings_body();
+        body["sandbox_enabled"] = serde_json::json!(false);
+        body["sandbox_extra_write_paths"] = serde_json::json!([" /x/tools ", "", "rel/dir"]);
+
+        let seen = std::cell::RefCell::new(None);
+        let (status, response) = settings_post_result_with_sandbox_apply(
+            &body.to_string(),
+            Some(dir.path()),
+            &EventBus::new(),
+            true,
+            |sandbox| {
+                *seen.borrow_mut() = Some((sandbox.enabled, sandbox.extra_write_paths.clone()));
+                Ok(())
+            },
+        );
+
+        assert_eq!(status, 200);
+        assert_eq!(response, r#"{"applied":true,"ok":true}"#);
+        // The seam sees the just-persisted config (trimmed, empties
+        // dropped) — the same values the next daemon start resolves.
+        assert_eq!(
+            seen.into_inner(),
+            Some((
+                Some(false),
+                vec!["/x/tools".to_string(), "rel/dir".to_string()]
+            ))
+        );
+        let saved = std::fs::read_to_string(dir.path().join("intendant.toml")).unwrap();
+        assert!(saved.contains("[sandbox]"), "{saved}");
+        assert!(saved.contains("enabled = false"), "{saved}");
+        // Formatting-agnostic persistence check: the reloaded config
+        // carries the normalized list.
+        let reloaded = crate::project::Project::from_root(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.config.sandbox.enabled, Some(false));
+        assert_eq!(
+            reloaded.config.sandbox.extra_write_paths,
+            vec!["/x/tools", "rel/dir"]
+        );
+    }
+
+    #[test]
+    fn settings_post_without_sandbox_fields_skips_the_live_apply_seam() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = crate::project::Project::from_root(dir.path().to_path_buf()).unwrap();
+        project.config.sandbox.enabled = Some(false);
+        project.config.sandbox.extra_write_paths = vec!["/keep/me".to_string()];
+        project.save_config().unwrap();
+
+        // An older client's payload (no sandbox fields) must neither
+        // clear the persisted [sandbox] config nor re-apply live state.
+        let (status, response) = settings_post_result_with_sandbox_apply(
+            &minimal_settings_body().to_string(),
+            Some(dir.path()),
+            &EventBus::new(),
+            true,
+            |_| panic!("live apply must not run for a payload without sandbox fields"),
+        );
+
+        assert_eq!(status, 200);
+        assert_eq!(response, r#"{"applied":true,"ok":true}"#);
+        let reloaded = crate::project::Project::from_root(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.config.sandbox.enabled, Some(false));
+        assert_eq!(reloaded.config.sandbox.extra_write_paths, vec!["/keep/me"]);
+    }
+
+    #[test]
+    fn settings_post_reports_sandbox_apply_error_in_the_ok_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = minimal_settings_body();
+        body["sandbox_enabled"] = serde_json::json!(true);
+
+        let (status, response) = settings_post_result_with_sandbox_apply(
+            &body.to_string(),
+            Some(dir.path()),
+            &EventBus::new(),
+            true,
+            |_| Err("no runtime state".to_string()),
+        );
+
+        // The save succeeded, so the lane stays 200 — the body carries
+        // the apply verdict.
+        assert_eq!(status, 200);
+        assert_eq!(
+            response,
+            r#"{"applied":false,"apply_error":"no runtime state","ok":true}"#
+        );
+        assert!(dir.path().join("intendant.toml").exists());
+    }
+
+    #[test]
+    fn executable_repoint_requires_credentials_manage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = minimal_settings_body();
+        body["codex_command"] = serde_json::json!("/tmp/evil-codex");
+        body["claude_command"] = serde_json::json!("/tmp/evil-claude");
+
+        let (status, response) = settings_post_result_with_sandbox_apply(
+            &body.to_string(),
+            Some(dir.path()),
+            &EventBus::new(),
+            false,
+            |_| Ok(()),
+        );
+        assert_eq!(status, 403, "{response}");
+        assert!(response.contains("codex_command"), "{response}");
+        assert!(response.contains("claude_command"), "{response}");
+        assert!(
+            !dir.path().join("intendant.toml").exists(),
+            "denied save must not persist config"
+        );
+
+        // The same save succeeds with credential-management authority.
+        let (status, response) = settings_post_result_with_sandbox_apply(
+            &body.to_string(),
+            Some(dir.path()),
+            &EventBus::new(),
+            true,
+            |_| Ok(()),
+        );
+        assert_eq!(status, 200, "{response}");
+        let reloaded = crate::project::Project::from_root(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.config.agent.codex.command, "/tmp/evil-codex");
+        assert_eq!(
+            reloaded.config.agent.claude_code.command,
+            "/tmp/evil-claude"
+        );
+    }
+
+    #[test]
+    fn executable_echo_saves_without_credentials_manage() {
+        let dir = tempfile::tempdir().unwrap();
+        // Persist a non-default command first (an owner action).
+        let mut project = crate::project::Project::from_root(dir.path().to_path_buf()).unwrap();
+        project.config.agent.codex.command = "my-codex".to_string();
+        project.save_config().unwrap();
+
+        // A Settings-only caller echoing the current value (the dashboard's
+        // full-payload round trip) is not repointing anything — normalized
+        // comparison, so whitespace never trips the gate.
+        let mut body = minimal_settings_body();
+        body["codex_command"] = serde_json::json!(" my-codex ");
+        let (status, response) = settings_post_result_with_sandbox_apply(
+            &body.to_string(),
+            Some(dir.path()),
+            &EventBus::new(),
+            false,
+            |_| Ok(()),
+        );
+        assert_eq!(status, 200, "{response}");
+
+        // Changing it without the authority is refused and nothing persists.
+        body["codex_command"] = serde_json::json!("other-codex");
+        let (status, response) = settings_post_result_with_sandbox_apply(
+            &body.to_string(),
+            Some(dir.path()),
+            &EventBus::new(),
+            false,
+            |_| Ok(()),
+        );
+        assert_eq!(status, 403, "{response}");
+        let reloaded = crate::project::Project::from_root(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.config.agent.codex.command, "my-codex");
     }
 }

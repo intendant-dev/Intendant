@@ -1,6 +1,13 @@
 # Tile-Based Display Streaming — Design Doc (#82, D-0)
 
-Status: design only. No implementation has started. D-1 is gated on review of this document.
+> **Status: historical design and implementation record.** D-1 through D-5
+> landed on 2026-05-03, followed by Wayland, recovery, queue-bounding,
+> capture-pacing, and macOS dirty-rect hardening. The canonical current
+> description is [`docs/src/display-pipeline.md`](src/display-pipeline.md).
+> Production Rust now lives in `crates/intendant-display/src/{capture,tile,webrtc}/`
+> and the browser compositor in `static/app/51-peer-approvals.js`; never edit
+> generated `static/app.html`. Future-tense slice text below is preserved as
+> the decision record for how the implementation was staged.
 
 ## Problem statement
 
@@ -220,18 +227,12 @@ Snapshot completion resets every tile to `(epoch, snapshot_seq)`. Subsequent upd
 ## Source-side modules (Rust)
 
 ```
-src/bin/caller/display/
-├── capture/damage.rs           NEW   trait DamageBackend, capability enum
-├── capture/x11_damage.rs       NEW   X11 XDamage impl
-├── capture/wayland_damage.rs   NEW   stub returning DamageCapability::None initially
-├── capture/macos_damage.rs     NEW   stub returning DamageCapability::None initially
-├── tile/grid.rs                NEW   damage rects → tile id set
-├── tile/synthetic_dirty.rs     NEW   cursor + marker dirty injection
-├── tile/encode.rs              NEW   raw_bgra / rle_bgra encoders, dispatch
-├── tile/policy.rs              NEW   fallback decision + hysteresis
-├── tile/transport.rs           NEW   wire-format + chunking + backpressure
-├── tile/snapshot.rs            NEW   periodic snapshot generator + ringbuffer
-└── webrtc.rs                   MODIFY add tile data channels alongside video track
+crates/intendant-display/src/
+├── capture/{damage,frame_diff,x11_damage,pacing}.rs
+├── tile/{grid,synthetic_dirty,encode,policy}.rs
+├── tile/{transport,recovery,backpressure}.rs
+├── webrtc/{mod,driver,offer}.rs
+└── aggregator.rs               capture → damage → tile publication
 ```
 
 Trait sketches:
@@ -282,7 +283,9 @@ pub struct TileTransport {
 
 ## Browser-side compositor (JS)
 
-`TileCompositor` class in `static/app.html`, owned by `PeerDisplayConnection` alongside (not instead of) the existing `<video>` element.
+`TileCompositor` class in `static/app/51-peer-approvals.js` (assembled into
+generated `static/app.html`), owned by `PeerDisplayConnection` alongside (not
+instead of) the existing `<video>` element.
 
 ```js
 class TileCompositor {
@@ -471,6 +474,9 @@ D-1 ships X11 only on the source side. The `DamageBackend` trait + `DamageCapabi
 
 ## Implementation slices
 
+This table records the original landing plan. All D-1 through D-5 slices
+subsequently landed; paths shown here are conceptual unless updated above.
+
 | slice | scope | exit criteria |
 |---|---|---|
 | **D-0** | This document, reviewed and locked. | Sign-off. Threshold values + slice boundaries + must-fix points agreed. |
@@ -496,7 +502,7 @@ experience everywhere.
 | **Recovery drills** | Exercise snapshot throttling, GapReport replay, data-channel close/reopen, resize, and peer disconnect. | Corrupt or missing tiles self-heal within the bounded recovery window; no runaway snapshot loop. |
 | **UX polish** | Make the canvas/video switch visually seamless; keep input coordinate mapping identical across modes; avoid diagnostic marker leaks when `?diag=1` is off. | A user cannot tell which rendering path is active except via debug metrics. |
 
-## Open questions for review
+## Original open questions for review
 
 1. **Tile size.** 64×64 vs 32×32 vs 128×128. Smaller = finer granularity but more per-frame overhead (more TileRecords, more decode calls). Larger = coarser (small dirty regions over-include surrounding pixels). 64 feels right; D-5 can re-tune if measurements suggest.
 2. **Encoding heuristic for D-4.** Entropy-based dispatch (raw/RLE/WebP) vs always-RLE vs WebP-everywhere. D-3 measurements (CPU + bytes per encoding type) inform the D-4 dispatch policy.
@@ -506,4 +512,5 @@ experience everywhere.
 6. **Mixed-mode rendering** (tiles for static area + video for high-motion sub-region of the same frame) — interesting later optimization, deliberately out of scope for D-0 through D-5. Potential D-6 if there's still p99 latency to chase after D-5 lands.
 7. **Compression of small tiles via combined encoding** (e.g. a frame's worth of TileRecords run through a single deflate stream for cross-tile redundancy). Not in v1; the per-tile encoding cost is bounded and the cross-tile redundancy is typically low for desktop content.
 
-End of D-0 (revised). Pause for review per request. No code touched.
+End of the original D-0 record. See the status note at the top and the current
+display-pipeline chapter before changing production code.

@@ -2385,7 +2385,7 @@ function isLoopbackUrl(url) {
 // `a=simulcast:send <rids>` (one or many). RIDs are part of the wire
 // contract — values here MUST be drawn from the set
 // `LayerSpec::vp8_simulcast` produces server-side
-// (display/encode/pool.rs); drift between this constant and the
+// (crates/intendant-display/src/encode/pool/mod.rs); drift between this
 // encoder pool means the answer SDP advertises RIDs the browser
 // doesn't recognize and the track never wires up.
 //
@@ -2417,7 +2417,7 @@ const DISPLAY_SIMULCAST_RIDS = ['f'];
 // peer answers with a single floor RID.
 //
 // **Mirror of**: `inject_recv_simulcast_into_video_offer` in
-// `src/bin/caller/display/forward.rs`. The Rust impl is the
+// `crates/intendant-display/src/forward.rs`. The Rust impl is the
 // canonical source — it has the unit tests pinning the corner cases
 // (video as final m= section with trailing CRLF; video followed by
 // m=application; idempotent re-call). Drift here vs Rust means the

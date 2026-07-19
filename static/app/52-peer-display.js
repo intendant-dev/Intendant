@@ -257,7 +257,7 @@ class PeerDisplayConnection {
     // F-2: input data channels. Same wire format as the local
     // DisplaySlot path — raw `InputEvent` JSON ({t:'kd', ...},
     // {t:'mm', ...}, etc.) so the peer's existing
-    // `display/webrtc.rs::handle_message` parser dispatches them
+    // `crates/intendant-display/src/webrtc/` parser dispatches them
     // through one input handler regardless of whether they came from
     // a local browser's WS or a federated peer's WebRTC. F-2's
     // server-side gate
@@ -815,7 +815,8 @@ class PeerDisplayConnection {
     // `unknown` indefinitely.
     //
     // Channel name matches `AUTHORITY_CHANNEL_LABEL` on the peer
-    // side (see `display/webrtc.rs::AUTHORITY_CHANNEL_LABEL`). Wire
+    // side (see
+    // `crates/intendant-display/src/webrtc/mod.rs::AUTHORITY_CHANNEL_LABEL`). Wire
     // format pinned by `parse_authority_channel_message_round_trip`:
     //   { "t": "display_input_authority_request", "display_id": N }
     //   { "t": "display_input_authority_release", "display_id": N }
@@ -1374,7 +1375,7 @@ class PeerDisplayConnection {
     this._heldKeys = new Set();
 
     // Wire format identical to local DisplaySlot's: raw `InputEvent`
-    // JSON. The peer's `display/webrtc.rs::handle_message` already
+    // JSON. The peer's `crates/intendant-display/src/webrtc/` driver already
     // dispatches `control` and `pointer` channels through the same
     // `serde_json::from_str::<InputEvent>` parser. F-2 changes
     // nothing about the wire shape — only the gate that decides

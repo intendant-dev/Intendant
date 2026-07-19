@@ -52,6 +52,11 @@ Common lifecycle rows:
 - `session_relationship`: parent/child or related session relationship.
 - `session_capabilities`: frontend/backend capabilities for a session.
 - `session_goal`: current goal state for a session.
+- `session_vitals`: merged git/cache/rate-limit vitals for a session.
+- `session_note`: a display-only transcript note, optionally with image
+  attachments.
+- `user_notification`: a fire-and-forget notification recorded in the
+  session transcript.
 - `turn_start`: model/agent turn boundary.
 - `round_complete`: native multi-agent round boundary.
 - `done_signal`: agent signaled done.
@@ -106,6 +111,7 @@ Steering/follow-up rows:
 - `steer_accepted`
 - `steer_delivered`
 - `steer_cancelled`
+- `steer_cancel_failed`
 
 Some interrupt and follow-up state changes are persisted as generic `info` rows.
 
@@ -124,6 +130,7 @@ Assistant/user activity:
 - External user messages can appear as replay/transcript entries and native backend JSONL rows.
 - External tool starts often emit `agent_started`.
 - External tool output emits `agent_output` with `output_id`.
+- External/native child completion can emit `sub_agent_result`.
 
 Backend stderr:
 
@@ -181,6 +188,7 @@ Voice/presence rows:
 - `voice_frame`
 - `voice_usage`
 - `voice_error`
+- `voice_diagnostic` (legacy rows retained for old-log compatibility)
 - `presence_log`
 - `presence_usage_update`
 - `live_usage_update`
@@ -223,6 +231,8 @@ Use `context_snapshot` plus sidecars when investigating context pressure, fissio
 - `messages_input`
 - `json_extracted`
 - `agent_input`
+- `summary`
+- `interrupted`
 - `voice_audio`
 - `voice_frame`
 - summary/interrupted internals

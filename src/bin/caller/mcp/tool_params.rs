@@ -506,8 +506,9 @@ pub struct TakeScreenshotParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadScreenParams {
-    /// Display target: "user_session" (the only target supported on macOS).
-    /// Defaults to the user session display.
+    /// Display target. Accessibility reads are user-session only on every
+    /// supported platform: macOS AX, Linux AT-SPI, and Windows UIA.
+    /// Defaults to the user session.
     #[serde(default)]
     pub display_target: Option<String>,
     /// "text" (default) for the compact indented tree, or "json".

@@ -12,13 +12,11 @@ use crate::{mcp_client, provider, tools};
 /// runtime spawn on the hottest controller path.
 #[derive(Debug, Clone, Default)]
 pub struct BatchFacts {
-    /// Any command is `askHuman` (selects the runtime's no-timeout path).
+    /// Any command is `askHuman` (selects the runtime's no-timeout path;
+    /// under the daemon, the question rail consumes the whole batch —
+    /// mixed batches included, whose other commands answer with a
+    /// re-issue note).
     pub has_ask_human: bool,
-    /// The batch consists ENTIRELY of `askHuman` commands — the shape models
-    /// actually emit for a blocking question. The question-rail interception
-    /// only fires for this shape; a mixed batch would need the controller to
-    /// reorder execution around the runtime. `false` for an empty batch.
-    pub all_ask_human: bool,
     /// Question text of the first `askHuman` command that carries one.
     pub ask_human_question: Option<String>,
     /// Any command is `captureScreen` (Xvfb auto-launch trigger).
@@ -45,10 +43,7 @@ impl BatchFacts {
         let Some(commands) = parsed.get("commands").and_then(|v| v.as_array()) else {
             return Self::opaque(json_str);
         };
-        let mut facts = BatchFacts {
-            all_ask_human: !commands.is_empty(),
-            ..Self::default()
-        };
+        let mut facts = Self::default();
         let mut preview_parts: Vec<String> = Vec::with_capacity(commands.len());
         for cmd in commands {
             let function = cmd.get("function").and_then(|v| v.as_str()).unwrap_or("?");
@@ -70,9 +65,6 @@ impl BatchFacts {
                     }
                 }
                 _ => {}
-            }
-            if function != "askHuman" {
-                facts.all_ask_human = false;
             }
             if let Some(part) = command_preview_part(function, cmd) {
                 preview_parts.push(part);
@@ -136,7 +128,9 @@ pub struct ToolBatchResult {
     /// All tool call IDs and their names (for result routing).
     pub call_id_names: Vec<(String, String)>,
     /// MCP tool calls that should be routed through the MCP client manager.
-    /// Vec of (call_id, tool_name, arguments_json).
+    /// Vec of (call_id, tool_name, arguments_json). The agent loop
+    /// dispatches these behind the controller-tool approval gate
+    /// (`[approval] tool_call`), never directly.
     pub mcp_calls: Vec<(String, String, String)>,
     /// Tool-level validation errors generated before runtime execution.
     pub precomputed_results: Vec<(String, String, String)>,
@@ -429,14 +423,12 @@ mod tests {
             r#"{"commands":[{"function":"askHuman","nonce":1,"question":"Which DB?"}]}"#,
         );
         assert!(solo.has_ask_human);
-        assert!(solo.all_ask_human);
         assert_eq!(solo.ask_human_question.as_deref(), Some("Which DB?"));
 
         let mixed = BatchFacts::from_json(
             r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"},{"function":"askHuman","nonce":2,"question":"ok?"}]}"#,
         );
-        assert!(mixed.has_ask_human);
-        assert!(!mixed.all_ask_human, "mixed batch is not all-askHuman");
+        assert!(mixed.has_ask_human, "mixed batches detect askHuman too");
         assert_eq!(mixed.ask_human_question.as_deref(), Some("ok?"));
 
         // The question comes from the first askHuman that HAS one (the old
@@ -454,10 +446,9 @@ mod tests {
             r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"echo \"askHuman\""}]}"#,
         );
         assert!(!embedded.has_ask_human);
-        assert!(!embedded.all_ask_human);
 
         let empty = BatchFacts::from_json(r#"{"commands":[]}"#);
-        assert!(!empty.all_ask_human, "empty batch is not all-askHuman");
+        assert!(!empty.has_ask_human);
     }
 
     #[test]

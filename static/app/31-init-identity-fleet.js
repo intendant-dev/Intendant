@@ -412,6 +412,15 @@ function applyExternalAgentAvailabilityToNewSessionPicker() {
       ? `${agent.command || agent.id} was not found on the daemon host`
       : '';
   }
+  // A backend restored from last-used prefs (or picked before this probe
+  // landed) may just have been greyed out — fall back to the inherit
+  // default instead of leaving a doomed launch selected. The re-render
+  // sees the reset value, so this cannot recurse.
+  const selected = select.options[select.selectedIndex];
+  if (selected && selected.disabled) {
+    select.value = '';
+    renderNewSessionAgentControls();
+  }
 }
 
 let unfueledCheckInFlight = false;
@@ -587,6 +596,19 @@ let sessionVitalsTicker = null;
 // Cache-expiry alert dedupe: session id → the lastActivityEpoch already
 // alerted for (one alert per idle period).
 const sessionCacheExpiryAlerts = new Map();
+// Rate-limit status transition tracking: session id → Map(window label →
+// last-seen status severity '', 'warn', 'crit'). First observation per
+// session seeds silently (no toasts for pre-existing warnings on page
+// load); alerts fire only on live escalations. See
+// maybeAlertLimitTransitions (39-session-windows.js).
+const sessionLimitStatusSeen = new Map();
+// Escalations awaiting the coalesced limit toast: session id → worst
+// pending entry. Flushed on a debounce so near-simultaneous warnings
+// from many sessions (one account limit hits them together) become ONE
+// toast, with a cooldown between flushes.
+const pendingLimitAlerts = new Map();
+let limitAlertFlushTimer = null;
+let lastLimitAlertFlushMs = 0;
 const SESSION_WINDOW_RENDER_LIMIT = 600;
 const SESSION_WINDOW_PREPEND_CHUNK = 300;
 // In-memory history behind the render window. Long-running sessions used

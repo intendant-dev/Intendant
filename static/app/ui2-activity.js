@@ -53,7 +53,7 @@ function ui2AugmentApprovalPanel() {
   if (allBtn) {
     allBtn.classList.add('ui2-full-escape');
     allBtn.innerHTML = 'Switch to Full autonomy';
-    allBtn.title = 'The previous "Approve all": flips autonomy to Full — everything runs unattended from here.';
+    allBtn.title = 'The previous "Approve all": flips daemon autonomy to Full. Native explicit Deny rules and hard consent gates remain; external-agent policy has separate caveats.';
   }
 
   // `a` follows the category semantics under the flag. Capture phase so
@@ -135,6 +135,132 @@ function ui2RefreshMinimizeDoneControl() {
   btn.title = count === 1
     ? 'Minimize the finished sub-agent window'
     : `Minimize all ${count} finished sub-agent windows`;
+  // The hide-done, collapse-all, and header-details pills ride the same
+  // freshness passes (badge refresh, relationship render, every minimize
+  // state change routes here).
+  ui2RefreshHideDoneControl();
+  ui2RefreshCollapseAllControl();
+  ui2RefreshHeaderDetailsControl();
+}
+
+// ── "Hide done" close sweep pill ───────────────────────────────────────
+// Beside "Minimize done" but the stronger hygiene action: CLOSE every
+// hard-done window's card (41's hideDoneSessionWindows — the same path
+// as the × button's "Hide card" choice), sub-agent or top-level alike.
+// Hard done evidence only (ended / phase done|interrupted — never bare
+// idle), so idle-parked and live windows always survive, and the closed
+// cards' sessions stay in the Sessions list, reopenable and replayable.
+// Hidden while nothing qualifies; grid-only via the stylesheet layout
+// gate like the sweep pills.
+function ui2CountHardDoneWindows() {
+  if (typeof sessionWindows === 'undefined'
+      || typeof sessionWindowHasHardDoneEvidence !== 'function') return 0;
+  let count = 0;
+  for (const sid of sessionWindows.keys()) {
+    if (sessionWindowHasHardDoneEvidence(sid)) count += 1;
+  }
+  return count;
+}
+
+function ui2RefreshHideDoneControl() {
+  const btn = document.getElementById('ui2-hide-done-btn');
+  if (!btn) return;
+  const count = ui2CountHardDoneWindows();
+  const countEl = document.getElementById('ui2-hide-done-count');
+  if (countEl) countEl.textContent = String(count);
+  btn.hidden = count === 0;
+  btn.title = count === 1
+    ? 'Hide the finished session card (its session stays in Sessions)'
+    : `Hide all ${count} finished session cards (their sessions stay in Sessions)`;
+}
+
+// ── "Collapse all / Expand all" grid sweep pill ────────────────────────
+// Beside "Minimize done", acting on EVERY session window (41's
+// setAllSessionWindowsMinimized): one click drops the grid to a stack of
+// header bars for an all-sessions glance, the next restores it. The
+// label always names the direction one click will act — any expanded
+// window means Collapse all, an all-minimized grid means Expand all.
+// Grid-only surface: Focus hides the session windows the sweep acts on,
+// so the stylesheet layout-gates the pill (html[data-ui2-layout]).
+function ui2RefreshCollapseAllControl() {
+  const btn = document.getElementById('ui2-collapse-all-btn');
+  if (!btn) return;
+  const windows = typeof sessionWindows !== 'undefined' ? sessionWindows : null;
+  if (!windows || windows.size === 0) {
+    btn.hidden = true;
+    return;
+  }
+  let expanded = 0;
+  for (const win of windows.values()) {
+    if (win && !win.minimized) expanded += 1;
+  }
+  const collapse = expanded > 0;
+  btn.hidden = false;
+  btn.dataset.direction = collapse ? 'collapse' : 'expand';
+  btn.textContent = collapse ? 'Collapse all' : 'Expand all';
+  btn.title = collapse
+    ? (expanded === 1
+        ? 'Minimize the session window to its header bar'
+        : `Minimize all ${expanded} session windows to their header bars`)
+    : 'Restore every minimized session window';
+  btn.setAttribute('aria-label', btn.title);
+}
+
+function ui2WireCollapseAllControl() {
+  const btn = document.getElementById('ui2-collapse-all-btn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const collapse = btn.dataset.direction !== 'expand';
+    if (typeof setAllSessionWindowsMinimized === 'function') {
+      setAllSessionWindowsMinimized(collapse);
+    }
+    ui2RefreshMinimizeDoneControl();
+  });
+}
+
+// ── "Expand details / Collapse details" header sweep pill ──────────────
+// Beside "Collapse all", driving the OTHER axis: every window's
+// click-to-expand header-details strip (41's
+// setAllSessionWindowHeadersCollapsed) — vitals chips, git indicators,
+// paths, goal, tier, relationships — while the windows themselves stay
+// put. Direction counts NON-minimized windows only (the same visibility
+// boundary the sibling counts with); the sweep still flips minimized
+// windows so a later restore honors the choice. Grid-only via the same
+// stylesheet layout gate as its neighbor.
+function ui2RefreshHeaderDetailsControl() {
+  const btn = document.getElementById('ui2-header-details-btn');
+  if (!btn) return;
+  const windows = typeof sessionWindows !== 'undefined' ? sessionWindows : null;
+  if (!windows || windows.size === 0) {
+    btn.hidden = true;
+    return;
+  }
+  let expanded = 0;
+  for (const win of windows.values()) {
+    if (win && !win.minimized && !win.headerCollapsed) expanded += 1;
+  }
+  const collapse = expanded > 0;
+  btn.hidden = false;
+  btn.dataset.direction = collapse ? 'collapse' : 'expand';
+  btn.textContent = collapse ? 'Collapse details' : 'Expand details';
+  btn.title = collapse
+    ? (expanded === 1
+        ? 'Collapse header details on the expanded session window'
+        : `Collapse header details on all ${expanded} expanded session windows`)
+    : 'Expand header details on every session window';
+  btn.setAttribute('aria-label', btn.title);
+}
+
+function ui2WireHeaderDetailsControl() {
+  const btn = document.getElementById('ui2-header-details-btn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const collapse = btn.dataset.direction !== 'expand';
+    if (typeof setAllSessionWindowHeadersCollapsed === 'function') {
+      setAllSessionWindowHeadersCollapsed(collapse);
+    }
+    ui2RefreshMinimizeDoneControl();
+  });
 }
 
 let ui2MinimizeDoneRefreshQueued = false;
@@ -155,6 +281,15 @@ function ui2WireMinimizeDoneControl() {
     ui2RefreshMinimizeDoneControl();
   });
   ui2RefreshMinimizeDoneControl();
+}
+
+function ui2WireHideDoneControl() {
+  const btn = document.getElementById('ui2-hide-done-btn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    if (typeof hideDoneSessionWindows === 'function') hideDoneSessionWindows();
+    ui2RefreshMinimizeDoneControl();
+  });
 }
 
 // Composer dressing: placeholder copy + the attach glyph. The send
@@ -236,6 +371,54 @@ function ui2ApplyFocusSurface() {
     Promise.resolve(hydrateSessionWindowIfEmpty(sid)).catch(() => {});
   }
 }
+
+// QA drive hooks (window.qa convention): the dashboard validator runs
+// outside the module scope, so the timeline probes need window-visible
+// seams onto the transcript machinery — synthetic entries through the
+// REAL pipelines (processCommands / renderRestoredSessionWindowEntries),
+// plus the minimize/layout/placeholder controls the boot probe asserts.
+// Side-effect-free readback in windowState; the drive hooks mutate only
+// the session windows the probe itself seeds.
+window.qa = Object.assign(window.qa || {}, {
+  timeline: {
+    seedLog: (c) => { processCommands([{ cmd: 'add_log_entry', ...c }]); return true; },
+    seedReplay: (sid, entries) => {
+      const win = sessionWindows.get(sid) || ensureSessionWindow(sid);
+      if (!win) return -1;
+      return renderRestoredSessionWindowEntries(win, entries, sid);
+    },
+    ensureWindow: (sid) => !!ensureSessionWindow(sid),
+    windowState: (sid) => {
+      const win = sessionWindows.get(sid);
+      if (!win) return null;
+      return {
+        mounted: win.log ? win.log.childElementCount : -1,
+        history: Array.isArray(win.logHistory) ? win.logHistory.length : 0,
+        minimized: !!win.minimized,
+        text: win.log ? (win.log.textContent || '') : '',
+        rows: win.log
+          ? [...win.log.querySelectorAll('.log-entry')].map(r => ({
+              text: (r.textContent || '').slice(0, 160),
+              userTurnIndex: r.dataset.userTurnIndex || '',
+            }))
+          : [],
+      };
+    },
+    setMinimized: (sid, minimized) => { setSessionWindowMinimized(sid, minimized); return true; },
+    // try/catch: focus repaints the Context pane, whose three.js renderer
+    // throws in WebGL-less validator browsers — the focus/foreground state
+    // this hook exists for is set before that repaint.
+    focusSession: (sid) => { try { focusSessionWindow(sid); } catch (_) {} return true; },
+    applyLayout: (mode) => { ui2ApplyLayout(mode); return true; },
+    setHydrateError: (sid, message) => {
+      const win = sessionWindows.get(sid);
+      if (!win) return false;
+      win.hydrateError = String(message || '');
+      renderSessionWindowLogPlaceholder(win);
+      return true;
+    },
+  },
+});
 
 // QA readback (window.qa convention): the Focus surface's inputs and its
 // verdict. The interesting regression is silent — Focus renders an empty
@@ -432,15 +615,25 @@ function ui2BuildVitalsRail() {
   if (!pane || document.getElementById('ui2-vitals-rail')) return;
   const rail = document.createElement('aside');
   rail.id = 'ui2-vitals-rail';
-  rail.setAttribute('aria-label', 'Session vitals');
+  rail.setAttribute('aria-label', 'Session inspector');
+  // v3 inspector: grouped sections, same row ids — ui2RailTick writes by
+  // id and ui2RailSetRow queries .ui2-rail-value inside each row, so the
+  // 1 Hz refresh path is unchanged by the re-chrome.
   rail.innerHTML = `
-    <div class="ui2-rail-session" id="ui2-rail-session">No session yet</div>
-    <div class="ui2-rail-row" id="ui2-rail-git"><span class="ui2-rail-label">Working tree</span><span class="ui2-rail-value">—</span></div>
-    <div class="ui2-rail-row" id="ui2-rail-ctx"><span class="ui2-rail-label">Context budget</span><span class="ui2-rail-value">—</span><div class="ui2-rail-meter"><i id="ui2-rail-ctx-fill"></i></div></div>
-    <div class="ui2-rail-row" id="ui2-rail-cache"><span class="ui2-rail-label">Prompt cache</span><span class="ui2-rail-value">—</span></div>
-    <div class="ui2-rail-row" id="ui2-rail-limits"><span class="ui2-rail-label">Rate limits</span><span class="ui2-rail-value">—</span></div>
-    <button type="button" class="ui2-rail-row ui2-rail-changes" id="ui2-rail-changes" title="Open the Changes sub-tab"><span class="ui2-rail-label">Changes</span><span class="ui2-rail-value">—</span></button>
-    <button type="button" class="ui2-rail-advanced" id="ui2-rail-advanced" title="Raw state and observers live on the Debug tab">Advanced &amp; raw state</button>`;
+    <div class="ui2-rail-head">
+      <div class="ui2-rail-eyebrow">Inspector</div>
+      <div class="ui2-rail-session" id="ui2-rail-session">No session yet</div>
+    </div>
+    <div class="ui2-rail-section">
+      <div class="ui2-rail-row" id="ui2-rail-git"><span class="ui2-rail-label">Working tree</span><span class="ui2-rail-value">—</span></div>
+      <div class="ui2-rail-row" id="ui2-rail-ctx"><span class="ui2-rail-label">Context budget</span><span class="ui2-rail-value">—</span><div class="ui2-rail-meter"><i id="ui2-rail-ctx-fill"></i></div></div>
+      <div class="ui2-rail-row" id="ui2-rail-cache"><span class="ui2-rail-label">Prompt cache</span><span class="ui2-rail-value">—</span></div>
+      <div class="ui2-rail-row" id="ui2-rail-limits"><span class="ui2-rail-label">Rate limits</span><span class="ui2-rail-value">—</span></div>
+    </div>
+    <div class="ui2-rail-foot">
+      <button type="button" class="ui2-rail-row ui2-rail-changes" id="ui2-rail-changes" title="Open the Changes sub-tab"><span class="ui2-rail-label">Changes</span><span class="ui2-rail-value">—</span></button>
+      <button type="button" class="ui2-rail-advanced" id="ui2-rail-advanced" title="Raw state and observers live on the Debug tab">Advanced &amp; raw state</button>
+    </div>`;
   pane.appendChild(rail);
   const changes = document.getElementById('ui2-rail-changes');
   if (changes) changes.addEventListener('click', () => {
@@ -451,6 +644,50 @@ function ui2BuildVitalsRail() {
   if (advanced) advanced.addEventListener('click', () => {
     if (typeof routeTo === 'function') routeTo('debug');
     else if (typeof switchTab === 'function') switchTab('debug');
+  });
+}
+
+// ── Timeline "Options" popover (verbosity + host filter) ───────────────
+// The panel is #activity-log-controls — the router hides it off-log with
+// .hidden (display:none !important), which deliberately beats .open, so a
+// stale open state can never leak the panel onto another sub-tab.
+function ui2WireViewOptions() {
+  const btn = document.getElementById('ui2-view-options-btn');
+  const panel = document.getElementById('activity-log-controls');
+  if (!btn || !panel) return;
+  const setOpen = (open) => {
+    if (open) {
+      // Anchor to the trigger's bottom-right (position:fixed — see CSS).
+      const r = btn.getBoundingClientRect();
+      panel.style.top = `${Math.round(r.bottom + 6)}px`;
+      panel.style.left = '';
+      panel.style.right = `${Math.max(8, Math.round(window.innerWidth - r.right))}px`;
+    }
+    panel.classList.toggle('open', open);
+    btn.setAttribute('aria-expanded', String(open));
+  };
+  btn.addEventListener('click', () => setOpen(!panel.classList.contains('open')));
+  document.addEventListener('pointerdown', (e) => {
+    if (!panel.classList.contains('open')) return;
+    if (panel.contains(e.target) || btn.contains(e.target)) return;
+    setOpen(false);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || !panel.classList.contains('open')) return;
+    setOpen(false);
+    btn.focus();
+  });
+  // The router's off-log hide (.hidden) only STACKS over .open — fully
+  // close instead, so aria-expanded and the stamped anchor don't go stale
+  // and returning to the Timeline doesn't resurface an unrequested popover.
+  // (Removing .open here re-fires the observer once; it no-ops on a panel
+  // that is no longer .open.)
+  new MutationObserver(() => {
+    if (panel.classList.contains('hidden') && panel.classList.contains('open')) setOpen(false);
+  }).observe(panel, { attributes: true, attributeFilter: ['class'] });
+  // position:fixed captures the anchor at open time — track resizes.
+  window.addEventListener('resize', () => {
+    if (panel.classList.contains('open')) setOpen(true);
   });
 }
 
@@ -536,6 +773,10 @@ function ui2RailTick(force) {
     ui2AugmentApprovalPanel();
     ui2WireLayoutToggle();
     ui2WireMinimizeDoneControl();
+    ui2WireHideDoneControl();
+    ui2WireCollapseAllControl();
+    ui2WireHeaderDetailsControl();
+    ui2WireViewOptions();
     ui2DressComposer();
     ui2BuildVitalsRail();
     ui2RailTick(true);

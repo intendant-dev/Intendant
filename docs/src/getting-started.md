@@ -54,7 +54,8 @@ What happens next is the whole story in four steps:
    API-key lease (or relay provider calls through your browser). API-key leases
    are memory-only, but this is not a blanket disk guarantee: `.env` is still
    supported and a full-credential OAuth lease temporarily materializes a
-   private auth home under `~/.intendant/leased-auth` until cleanup.
+   private auth home under `<state-root>/leased-auth`
+   (`~/.intendant/leased-auth` by default) until cleanup.
    [Credential Custody](./credential-custody.md) is the
    full story.
    Then send the first task from the composer, watch it in Activity, and dial
@@ -139,9 +140,10 @@ Managed browser setup accepts `--check`, `--force`,
 
 A release build produces three binaries:
 
-- `target/release/intendant-runtime` — the sandboxed command executor. Reads
-  JSON commands on stdin, runs them, writes JSON results to stdout. Never holds
-  API keys.
+- `target/release/intendant-runtime` — the command executor. Reads JSON
+  commands on stdin, runs them, writes JSON results to stdout, and never holds
+  API keys. Its write sandbox defaults on for macOS/Linux and is opt-in on
+  Windows.
 - `target/release/intendant` — the controller. Manages the LLM conversation,
   calls model APIs, dispatches tool calls to the runtime subprocess, and hosts
   every frontend (web dashboard, MCP, control socket).
@@ -207,7 +209,8 @@ and camera) would be unavailable. Serving from a registered custom scheme
 restores the secure context the live-voice and camera features need.
 
 When the generated access cert set is readable in
-`~/.intendant/access-certs`, the wrapper automatically starts the bundled daemon
+`<state-root>/access-certs` (`~/.intendant/access-certs` by default), the wrapper
+automatically starts the bundled daemon
 with native `--mtls`. The in-app `intendant://` bridge then speaks HTTPS/WSS to
 the local backend, pins the generated server certificate, and presents the
 generated `client.p12` for its own local bridge. Remote browsers use
@@ -404,8 +407,9 @@ flags:
   gateway, then falls through to the daemon loop when it ends.
 - `--mcp` turns the process into an MCP server on stdio (no dashboard).
 - `--json` emits JSONL events to stdout (headless stdio; no dashboard).
-- `--no-web` runs headless in the terminal: a single round, log output to
-  stderr, no UI (`--json` adds scripted stdin follow-ups and approvals).
+- `--no-web` runs one headless task/session in the terminal (the agent loop may
+  take many model/tool turns), with log output on stderr and no UI. `--json`
+  adds scripted stdin follow-ups and approvals.
 
 So a plain `intendant "task"` on a desktop gives you a dashboard URL; the
 terminal itself is a launcher and log tail. (`--no-tui` from the retired
@@ -437,7 +441,7 @@ terminal UI era is still accepted as a no-op.)
 # Explicit local/plaintext debug escape
 ./target/release/intendant --no-tls --bind 127.0.0.1
 
-# Headless single round (dashboard off)
+# Headless task/session (dashboard off)
 ./target/release/intendant --no-web "task"
 
 # MCP server on stdio
@@ -467,7 +471,7 @@ value is missing.
 | `--model` | `<name>` | Override the model (sets `MODEL_NAME`) |
 | `--task-file` | `<path>` | Read the initial task from a file instead of argv |
 | `--autonomy` | `<level>` | Autonomy level: `low`, `medium`, `high`, `full` (loose parse; unknown → `medium`) |
-| `--log-file` | `<dir>` | Override the session log directory (default `~/.intendant/logs/<uuid>/`) |
+| `--log-file` | `<dir>` | Override the session log directory (default `$INTENDANT_HOME/logs/<uuid>/`, falling back to `~/.intendant/logs/<uuid>/`) |
 | `--continue`, `-c` | — | Resume the most recent session for this project |
 | `--resume`, `-r` | `[id]` | Resume a session by id, prefix, or path; with no id behaves like `--continue` |
 | `--no-tui` | — | Deprecated no-op (the terminal TUI was removed); headless is `--no-web` |
@@ -475,7 +479,8 @@ value is missing.
 | `--verbose`, `-v` | — | Show debug-level log entries |
 | `--control-socket` | — | Enable the Unix control socket at `/tmp/intendant-<pid>.sock` |
 | `--json` | — | Emit JSONL events to stdout (headless stdio; disables the dashboard) |
-| `--sandbox` | — | Enable filesystem sandboxing for the runtime (Landlock on Linux 5.13+, Seatbelt on macOS, restricted tokens on Windows) |
+| `--sandbox` | — | Force filesystem sandboxing on for the runtime (Landlock on Linux 5.13+, Seatbelt on macOS, restricted tokens on Windows). Wins even if `--no-sandbox` is also present |
+| `--no-sandbox` | — | Force the runtime write sandbox off. With neither flag, `[sandbox] enabled` wins when set; otherwise the platform default is on for macOS/Linux and off for Windows |
 | `--direct` | — | Force single-agent mode (skip the orchestrator / sub-agent delegation) |
 | `--no-presence` | — | Disable the presence layer (talk to the worker agent directly) |
 | `--web` | `[port]` | Start the web dashboard. **On by default**; optional numeric port (default 8765) |
@@ -528,8 +533,8 @@ then falls back to minting a self-signed certificate at startup (SAN = bind IP +
 `--tls-key`.
 
 `intendant access setup` stores the access CA, server cert, and client identity in
-the current user's native cert store (`~/.intendant/access-certs` on Unix-like
-hosts). Run setup as the same user that launches the daemon; the native gateway
+the current user's native cert store (`<state-root>/access-certs` on macOS/Linux,
+the OS data directory on Windows). Run setup as the same user that launches the daemon; the native gateway
 reads `server.crt` / `server.key` directly from that store.
 
 To be explicit about the default, pass `--mtls`:
@@ -651,19 +656,24 @@ Android and desktop Chrome/Firefox also import the Apple-compatible bundle.
 ## Testing
 
 ```bash
-cargo test --bins         # unit tests (fast, no API keys)
-cargo test -- --list      # list all test names
+cargo test -p intendant --bins
+cargo test -p intendant-core -p intendant-display -p intendant-platform \
+  -p owner-plane-core -p owner-plane-reducer
+cargo test -p intendant --test e2e
+cargo clippy --workspace -- -D warnings
 ```
 
-Unit tests are inline `#[cfg(test)]` modules across the binaries and library
-crates. The `#[tokio::test]` cases in `tests/e2e/main.rs` spawn the real
-binaries against the deterministic scripted mock provider (`PROVIDER=mock` +
+These keyless commands cover all three package binaries, the workspace library
+gates (including the stamped owner-plane corpus), the real-binary E2E suite,
+and workspace-wide Clippy. Unit tests are inline `#[cfg(test)]` modules. The
+`#[tokio::test]` cases in `tests/e2e/main.rs` spawn the real binaries against
+the deterministic scripted mock provider (`PROVIDER=mock` +
 `INTENDANT_MOCK_SCRIPT`). They need no API key or network, use the synthetic
 1280×720 display backend rather than native capture, and run in CI on macOS,
-Linux, and Windows; run them locally with `cargo test --test e2e`. Real-LLM or
-headed-display scenarios live under `tests/skills/` and are deliberately
-outside CI. See [Session Logging](./session-logging.md) for the logging/search
-coverage exercised through that real-binary suite.
+Linux, and Windows. Real-LLM or headed-display scenarios live under
+`tests/skills/` and are deliberately outside CI. See
+[Session Logging](./session-logging.md) for the logging/search coverage
+exercised through that real-binary suite.
 
 ## Runtime (standalone)
 

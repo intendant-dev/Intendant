@@ -103,11 +103,46 @@ fn git_version_at_least(version_line: &str, want_major: u32, want_minor: u32) ->
 /// on the next tick — cheap insurance against daemon-lifetime growth.
 const PROBER_CACHE_CAP: usize = 256;
 
+/// The one `git status` invocation both dirty-state surfaces run: the
+/// vitals prober (async, per-tick) and the Changes tab's working-tree
+/// fallback (sync, per request) spawn exactly these arguments and feed
+/// the output to [`parse_status_v2`], so "what counts as dirty" — the
+/// chip's count and the tab's file list — is a single definition.
+pub(crate) const GIT_STATUS_ARGS: [&str; 4] = [
+    "--no-optional-locks",
+    "status",
+    "--porcelain=v2",
+    "--branch",
+];
+
+/// How one working-tree entry differs from HEAD, collapsed to the
+/// Changes-tab kind vocabulary (created / modified / deleted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitStatusEntryKind {
+    Created,
+    Modified,
+    Deleted,
+}
+
+/// One non-header line of `git status --porcelain=v2` — the per-file
+/// truth behind the `dirty_files` count. The count IS `entries.len()`,
+/// so a consumer listing these can never disagree with a consumer
+/// counting them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitStatusEntry {
+    /// Path relative to the checkout toplevel (the rename *target* for
+    /// rename entries — one line per rename, matching the count). Git's
+    /// C-style quoting is undone; an untracked directory keeps its
+    /// trailing `/` (git spends one line on the whole directory).
+    pub(crate) path: String,
+    pub(crate) kind: GitStatusEntryKind,
+}
+
 /// Facts one `git status --porcelain=v2 --branch` run yields — the
 /// collapsed replacement for the old separate branch / dirty-count /
 /// upstream-verify / unpushed-count subprocess chain.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct StatusFacts {
+pub(crate) struct StatusFacts {
     /// `branch.head`, mapped to the spellings the old
     /// `rev-parse --abbrev-ref HEAD` emitted: `HEAD` when detached, empty
     /// on an unborn branch (where the old probe failed).
@@ -120,13 +155,110 @@ struct StatusFacts {
     /// `@{upstream}` verify condition — and the ahead column IS the
     /// unpushed count, so `None` here means "no upstream to check".
     upstream_ab: Option<(u32, u32)>,
-    /// Non-header entry lines: changed + unmerged + untracked. One line
+    /// Non-header entry lines: changed + unmerged + untracked. One entry
     /// per path, matching porcelain v1's line count (renames included —
     /// both formats spend one line per rename).
-    dirty_files: u32,
+    pub(crate) entries: Vec<GitStatusEntry>,
 }
 
-fn parse_status_v2(output: &str) -> StatusFacts {
+impl StatusFacts {
+    /// The vitals dirty count, derived from the entry list — the chip's
+    /// number and the Changes tab's row count are the same length.
+    pub(crate) fn dirty_files(&self) -> u32 {
+        self.entries.len() as u32
+    }
+}
+
+/// Undo git's C-style path quoting (`core.quotePath` wraps paths with
+/// special or non-ASCII bytes in `"…"` with backslash escapes). Unquoted
+/// paths pass through untouched; a malformed quoted path falls back to
+/// the raw spelling rather than dropping the entry.
+pub(crate) fn unquote_git_path(raw: &str) -> String {
+    let inner = match raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(inner) => inner,
+        None => return raw.to_string(),
+    };
+    let mut bytes: Vec<u8> = Vec::with_capacity(inner.len());
+    let mut chars = inner.bytes().peekable();
+    while let Some(b) = chars.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        match chars.next() {
+            Some(b'n') => bytes.push(b'\n'),
+            Some(b't') => bytes.push(b'\t'),
+            Some(b'r') => bytes.push(b'\r'),
+            Some(b'\\') => bytes.push(b'\\'),
+            Some(b'"') => bytes.push(b'"'),
+            Some(d @ b'0'..=b'7') => {
+                // Up to three octal digits encode one raw byte.
+                let mut value = (d - b'0') as u32;
+                for _ in 0..2 {
+                    match chars.peek() {
+                        Some(d @ b'0'..=b'7') => {
+                            value = value * 8 + (*d - b'0') as u32;
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                bytes.push(value as u8);
+            }
+            Some(other) => bytes.push(other),
+            None => break,
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Kind for a tracked entry's two-letter `XY` state field. Deletion on
+/// either side wins (the file is gone from the working tree or staged
+/// away); a pure addition is a creation; everything else — including
+/// renames and unmerged conflict states — reads as modified.
+fn status_xy_kind(xy: &str) -> GitStatusEntryKind {
+    if xy.contains('D') {
+        GitStatusEntryKind::Deleted
+    } else if xy.contains('A') {
+        GitStatusEntryKind::Created
+    } else {
+        GitStatusEntryKind::Modified
+    }
+}
+
+/// One porcelain-v2 entry line → its path + kind. Field counts per line
+/// type come from the format spec: ordinary `1` lines carry 8 fields
+/// before the path, rename `2` lines 9 (path `\t` origPath — the target
+/// leads), unmerged `u` lines 10, and `?`/`!` prefix the bare path.
+fn parse_status_entry(line: &str) -> Option<GitStatusEntry> {
+    let (path, kind) = if let Some(rest) = line.strip_prefix("? ") {
+        (rest.to_string(), GitStatusEntryKind::Created)
+    } else if let Some(rest) = line.strip_prefix("! ") {
+        (rest.to_string(), GitStatusEntryKind::Modified)
+    } else if line.starts_with("1 ") {
+        let path = line.splitn(9, ' ').nth(8)?;
+        let xy = line.split(' ').nth(1).unwrap_or("");
+        (path.to_string(), status_xy_kind(xy))
+    } else if line.starts_with("2 ") {
+        let pair = line.splitn(10, ' ').nth(9)?;
+        let target = pair.split('\t').next().unwrap_or(pair);
+        let xy = line.split(' ').nth(1).unwrap_or("");
+        (target.to_string(), status_xy_kind(xy))
+    } else if line.starts_with("u ") {
+        let path = line.splitn(11, ' ').nth(10)?;
+        (path.to_string(), GitStatusEntryKind::Modified)
+    } else {
+        // Unknown non-header line: count it (the old counter did), shown
+        // as a modification.
+        (line.to_string(), GitStatusEntryKind::Modified)
+    };
+    Some(GitStatusEntry {
+        path: unquote_git_path(&path),
+        kind,
+    })
+}
+
+pub(crate) fn parse_status_v2(output: &str) -> StatusFacts {
     let mut facts = StatusFacts::default();
     let mut unborn = false;
     for line in output.lines() {
@@ -145,7 +277,9 @@ fn parse_status_v2(output: &str) -> StatusFacts {
                 facts.upstream_ab = parse_status_ab(ab);
             }
         } else if !line.trim().is_empty() {
-            facts.dirty_files += 1;
+            if let Some(entry) = parse_status_entry(line) {
+                facts.entries.push(entry);
+            }
         }
     }
     if unborn {
@@ -154,6 +288,24 @@ fn parse_status_v2(output: &str) -> StatusFacts {
         facts.branch = String::new();
     }
     facts
+}
+
+/// Synchronous working-tree status for `root` — the Changes tab's
+/// fallback lane runs this on blocking paths (HTTP handler thread,
+/// tunnel `spawn_blocking`). Same arguments, same parser as the async
+/// vitals probe, so both surfaces state the same dirty set. `None` when
+/// `root` is not a git checkout or git itself fails.
+pub(crate) fn git_working_tree_status(root: &Path) -> Option<StatusFacts> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(GIT_STATUS_ARGS)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_status_v2(&String::from_utf8_lossy(&output.stdout)))
 }
 
 /// `branch.ab` payload: `+<ahead> -<behind>`.
@@ -260,17 +412,7 @@ impl GitVitalsProber {
 
     async fn probe_checkout(&mut self, toplevel: &Path) -> Option<SessionGitVitals> {
         self.checkout_probes += 1;
-        let status = self
-            .git(
-                toplevel,
-                &[
-                    "--no-optional-locks",
-                    "status",
-                    "--porcelain=v2",
-                    "--branch",
-                ],
-            )
-            .await?;
+        let status = self.git(toplevel, &GIT_STATUS_ARGS).await?;
         let facts = parse_status_v2(&status);
         let unpushed = facts.upstream_ab.map(|(ahead, _)| ahead);
 
@@ -323,8 +465,8 @@ impl GitVitalsProber {
         }
 
         Some(SessionGitVitals {
+            dirty_files: facts.dirty_files(),
             branch: facts.branch,
-            dirty_files: facts.dirty_files,
             ahead,
             behind,
             primary_ref,
@@ -1190,7 +1332,23 @@ mod tests {
             Some("2066c7d7db74e9e097ad8526b47c53a0fa0c39a9")
         );
         assert_eq!(facts.upstream_ab, Some((3, 1)));
-        assert_eq!(facts.dirty_files, 4);
+        assert_eq!(facts.dirty_files(), 4);
+        // The count derives from the entry list — path + kind per line,
+        // renames keyed by their target.
+        let listed: Vec<(&str, GitStatusEntryKind)> = facts
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.kind))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("src/lib.rs", GitStatusEntryKind::Modified),
+                ("new.rs", GitStatusEntryKind::Modified),
+                ("conflict.rs", GitStatusEntryKind::Modified),
+                ("scratch.txt", GitStatusEntryKind::Created),
+            ]
+        );
 
         // Upstream configured but its ref gone: git prints branch.upstream
         // without branch.ab — exactly the old failed `@{upstream}` verify,
@@ -1199,7 +1357,7 @@ mod tests {
             "# branch.oid 2066c7d7\n# branch.head main\n# branch.upstream origin/main\n",
         );
         assert_eq!(facts.upstream_ab, None);
-        assert_eq!(facts.dirty_files, 0);
+        assert_eq!(facts.dirty_files(), 0);
 
         // Detached HEAD keeps the old `rev-parse --abbrev-ref` spelling.
         let facts = parse_status_v2("# branch.oid 2066c7d7\n# branch.head (detached)\n");
@@ -1211,7 +1369,44 @@ mod tests {
         let facts = parse_status_v2("# branch.oid (initial)\n# branch.head main\n? f.txt\n");
         assert_eq!(facts.branch, "");
         assert_eq!(facts.head_oid, None);
-        assert_eq!(facts.dirty_files, 1);
+        assert_eq!(facts.dirty_files(), 1);
+    }
+
+    #[test]
+    fn status_v2_entry_kinds_and_quoting() {
+        // Staged add / staged+worktree deletions map to created/deleted;
+        // git's C-style quoting (spaces stay bare, specials escape) is
+        // undone so entry paths match real files.
+        let facts = parse_status_v2(concat!(
+            "1 A. N... 000000 100644 100644 0000 aaaa fresh.rs\n",
+            "1 .D N... 100644 100644 000000 aaaa aaaa gone.rs\n",
+            "1 D. N... 100644 000000 000000 aaaa 0000 staged-gone.rs\n",
+            "1 .M N... 100644 100644 100644 aaaa bbbb has space.rs\n",
+            "? \"we\\ttab.rs\"\n",
+            "? untracked-dir/\n",
+        ));
+        let listed: Vec<(&str, GitStatusEntryKind)> = facts
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.kind))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("fresh.rs", GitStatusEntryKind::Created),
+                ("gone.rs", GitStatusEntryKind::Deleted),
+                ("staged-gone.rs", GitStatusEntryKind::Deleted),
+                ("has space.rs", GitStatusEntryKind::Modified),
+                ("we\ttab.rs", GitStatusEntryKind::Created),
+                ("untracked-dir/", GitStatusEntryKind::Created),
+            ]
+        );
+        assert_eq!(facts.dirty_files(), listed.len() as u32);
+
+        // Octal escapes decode to their bytes (non-ASCII paths under the
+        // default core.quotePath).
+        assert_eq!(unquote_git_path("\"caf\\303\\251.rs\""), "café.rs");
+        assert_eq!(unquote_git_path("plain.rs"), "plain.rs");
     }
 
     /// Build a repo with a local bare `origin` whose `main` is pushed and

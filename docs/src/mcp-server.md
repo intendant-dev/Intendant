@@ -2,9 +2,10 @@
 
 The `--mcp` flag runs Intendant as a [Model Context Protocol](https://modelcontextprotocol.io/)
 server over stdio JSON-RPC (`src/bin/caller/mcp/`). It lets an external agent
-(Claude Code, Codex, etc.) observe and control Intendant: every action a human
-can take in the dashboard is exposed as an MCP tool, plus display/CU/frame
-tools, live audio, and a controller-orchestration surface.
+(Claude Code, Codex, etc.) observe and control Intendant through a broad
+operational tool surface: session actions, display/CU/frame tools, shared-view
+collaboration, live audio, managed context, and controller orchestration.
+Presentation-only dashboard affordances are not necessarily one-for-one tools.
 
 Architecturally the MCP server is a **frontend peer of the dashboard**: it
 subscribes to the same `EventBus`, and user intents are
@@ -53,16 +54,22 @@ Add Intendant to your MCP client config (Claude Code
 The full MCP tool surface (dispatched in `call_tool_by_name`) is broad. For
 model clients that front-load tool schemas into every request, prefer the
 HTTP transport's `tool_profile=core` query parameter and the `intendant ctl`
-CLI for lazy discovery. `tool_profile=core` advertises the bootstrap set:
-status, shared-view collaboration, and the minimal real-display/CU tools
-(`list_displays`, `grant_user_display`, `request_user_display`,
-`revoke_user_display`, `read_screen`,
-`take_screenshot`, `execute_cu_actions`) — managed and vanilla alike; managed
-context additionally advertises the managed-context rewind/backout and fission
-tools. Omitting `tool_profile` keeps the historical full tool list. Profile
-filtering applies to `tools/list` only — hidden tools remain callable (that
-is the lazy `ctl tools call` path). *Authorization* is separate: see the next
-section.
+CLI for lazy discovery. `tool_profile=core` advertises `get_status`; the
+agent-to-user collaboration primitives (`post_session_note`, `ask_user`,
+`notify_user`); Agenda and Memory list/read/propose tools; the shared-view
+tools; and the minimal real-display/CU set (`list_displays`,
+`grant_user_display`, `request_user_display`, `revoke_user_display`,
+`take_screenshot`, `read_screen`, `execute_cu_actions`,
+`display_readiness`) — managed and vanilla alike. Managed context additionally
+advertises rewind/backout and fission tools. Omitting `tool_profile` keeps the
+historical full tool list. Profile filtering applies to `tools/list` only —
+hidden HTTP tools remain callable (the lazy `ctl tools call` path).
+*Authorization* is separate: see the next section.
+
+The tables below describe the full daemon HTTP MCP surface as well as the
+stdio-backed tools. Bare `--mcp` stdio mode does not carry the daemon's Agenda
+or Memory service handles and does not advertise those HTTP-only definitions;
+the wired daemon `/mcp` surface is the shape that exposes them.
 
 ### /mcp authorization
 
@@ -83,12 +90,15 @@ wired up by the owner's own client config, always counts as an owner surface. Se
 [Computer Use](./computer-use-and-audio.md#display-targets). Binding order:
 
 1. **Peer daemons** (mTLS peer identity) use their peer-profile principal.
-2. **Supervised backends** present the token in their injected
-   `INTENDANT_MCP_URL`. It is *session-scoped* — derived from the daemon's
-   per-process token and the `session_id` — so it authenticates exactly that
-   agent session (`principal:agent-session:<id>`). Possession of the raw
-   per-process token remains root-equivalent. Explicit-but-wrong tokens are
-   refused with 401. A session whose binding is known but whose grant has
+2. **Supervised backends** receive a bearer only in their cleared child
+   environment and send it in the `Authorization` header. Their argv-visible
+   MCP config contains the environment-variable name, never the value.
+   `INTENDANT_MCP_URL` remains the private environment bootstrap for `ctl`.
+   The bearer is *session-scoped* — derived from the daemon's per-process token
+   and the `session_id` — so it authenticates exactly that agent session
+   (`principal:agent-session:<id>`). Possession of the raw per-process token
+   remains root-equivalent. Explicit-but-wrong tokens are refused with 401. A
+   session whose binding is known but whose grant has
    *lapsed* (expired or revoked) binds the scoped principal and is denied
    with the real reason — it does not fall back to default trust; only
    sessions with no binding at all do.
@@ -115,7 +125,24 @@ auditable, rather than by timer or revocation side effect.
 
 By default the supervised-agent, token-holder, and local-loopback principals
 are root-compatible, so bare `intendant ctl` on the daemon host and existing
-supervised backends keep working with zero ceremony. The point of the
+supervised backends keep working with zero ceremony. Root-compatible does
+**not** mean unconstrained, though: independent of IAM, agent-session
+provenance is contained on the approval/settings surface. A caller bound as
+an agent session (session-scoped token, or the process token naming a
+session) is refused `set_autonomy` and `approve_all` outright — both rewrite
+the daemon-global shared autonomy, which would let a supervised agent widen
+its own approval policy — and `approve`/`deny`/`skip` resolve only approvals
+raised by the caller's own session (cross-session resolution is denied;
+unknown ownership fails closed). The same containment covers daemon
+lifecycle: `quit`, `schedule_controller_restart`, and
+`cancel_controller_restart` are refused to agent-session callers (a
+supervised agent must not stop or bounce its supervisor), while
+`controller_turn_complete` (the session's own completion signal inside an
+owner-scheduled restart) and the controller-loop halt tools (the autonomous
+loop's self-stop verbs) stay open. This mirrors `grant_user_display`'s
+owner-surface rule: owner surfaces (dashboard, `intendant ctl` on loopback,
+enrolled root mTLS clients, the stdio transport) and deliberately granted
+non-agent principals keep the full surface. The point of the
 binding is that the owner can now *scope* them: an
 `agent_session` grant (exact `session_id`, or `"*"` for every supervised
 agent) or a `local_process` grant against
@@ -181,34 +208,94 @@ Full MCP tool groups:
 
 | Tool            | Description | Params |
 |-----------------|-------------|--------|
-| `approve`       | Approve a pending command. | `id` |
-| `deny`          | Deny and stop. | `id` |
-| `skip`          | Skip, continue with the next command. | `id` |
-| `approve_all`   | Approve and set autonomy to Full. | `id` |
+| `approve`       | Approve a pending command. Agent-session callers may only resolve their own session's approvals. | `id` |
+| `deny`          | Deny and stop. Agent-session callers may only resolve their own session's approvals. | `id` |
+| `skip`          | Skip, continue with the next command. Agent-session callers may only resolve their own session's approvals. | `id` |
+| `approve_all`   | Approve and set autonomy to Full. Denied to agent-session callers (daemon-global autonomy escalation). | `id` |
 | `respond`       | Answer an `askHuman` question. | `text` |
 | `post_session_note` | Post a **display-only note** into the session transcript — rendered live in the dashboard and persisted for replay, never added to any model's context. Optional base64 images are committed to the session upload store and rendered as clickable thumbnails. Caps: 16 KB text, 6 images, 4 MB per image, 8 MB total; raster types only (`image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/bmp`). Session-scoped callers post into their own session by default. | `text`, `images?` (`[{media_type, data, name?}]`), `session_id?`, `source?` |
 | `ask_user`      | Ask the user one **structured question** on the dashboard question rail and **block** until answered or the wait expires. A question requests *input*, never permission: it is never auto-approved and answering it never widens autonomy. 0–4 options; free-text answers are always accepted (zero options = free-text only). Returns `{status, answer, answers}` — `answered` carries the choice(s); `timeout`/`dismissed`/`pass` carry best-judgment guidance; shapes with no answerable frontend auto-answer immediately with the same guidance. Session-scoped callers ask as their own session. Also `intendant ctl ask`. | `question`, `options?` (`[{label, description?}]`), `header?`, `multi_select?`, `wait_seconds?` (default 300, max 900), `session_id?` |
 | `notify_user`   | Fire-and-forget **notification** to the user; returns immediately, renders as a dashboard toast plus a transcript row (persisted for replay), never enters model context. `urgency` escalates delivery: `info` (default) dashboard-only; `attention` + tab badge and hidden-tab browser notification; `urgent` + an immediate content-free push nudge to the owner's opted-in browsers. Cap: 4 KB text. Also `intendant ctl notify`. | `text`, `title?`, `urgency?` (`info`/`attention`/`urgent`), `session_id?` |
-| `set_autonomy`  | Set autonomy. | `level`: `low`/`medium`/`high`/`full` |
+| `set_autonomy`  | Set autonomy. Denied to agent-session callers — the setting is daemon-global. | `level`: `low`/`medium`/`high`/`full` |
 | `set_verbosity` | Set log verbosity. | `level`: `quiet`/`normal`/`verbose`/`debug` |
-| `start_task`    | Start a new agent task (also used as follow-up when waiting). | `task` |
+| `start_task`    | Start work, route a follow-up to `session_id`, or resume a persisted external-agent wrapper. A non-empty `reference_frame_ids` list is the supervisor's CU-routing gate; `display_target` selects the display for that grounded request but is not sufficient by itself. | `task`, `session_id?`, `orchestrate?`, `reference_frame_ids?`, `display_target?` |
 | `quit`          | Shut down the agent. | — |
+
+`start_task` currently has two routing caveats. A new-session CU request needs
+at least one frame id that resolves in the frame registry: a `display_target`
+alone, or only stale/unknown frame ids, is accepted and acknowledged as “CU
+task dispatched” by the MCP edge but falls through to an ordinary task in the
+supervisor. With `session_id`, any supplied frame ids and `display_target` are
+discarded and only the text is routed as a follow-up. Treat those acknowledgments
+as enqueue acknowledgments, not proof that grounded CU started; both behaviors
+are tracked implementation defects.
+
+### Agenda & Memory
+
+Agenda is the durable, append-only parking ledger; Memory is a bounded
+provenance-labeled claim plane. Both render their text as quoted data, never
+instructions. Agenda effect approval/revocation is owner-only even though
+agents and peers may propose an effect. Memory proposals enter the candidate
+lane; this slice exposes no judgment command.
+
+| Tool | Description | Params |
+|------|-------------|--------|
+| `agenda_list` | List oldest-first items plus Open / Done / Retired counts; optionally filter by status. | `status?` |
+| `agenda_op` | Apply one tagged operation: `add`, `answer`, `patch`, `complete`, `reopen`, `retire`, `propose_effect`, `approve_effect`, or `revoke_effect`. | operation-specific `op` shape |
+| `memory_search` | Bounded claim search (default 10, maximum 50); candidates are excluded unless explicitly requested. Responses report effective durability. | `query?`, `limit?`, `include_candidates?` |
+| `memory_read` | Read one claim by an id prefix of at least eight hex characters. | `id` |
+| `memory_propose` | Propose a typed, sensitivity-labeled candidate. Authorship comes from the gate-bound caller, not writer-supplied context fields. | `kind`, `statement`, `sensitivity?`, `session?`, `project?`, `model?`, `labels?` |
 
 ### Display, computer use & frames
 
 | Tool                 | Description | Params |
 |----------------------|-------------|--------|
 | `list_displays`      | Enumerate displays with their session state. | — |
-| `take_display`       | Take control of a display. | `display_id` |
+| `take_display`       | Optional dashboard signal that an agent is using a display; it neither grants input authority nor is required before screenshot/CU calls. | `display_id` |
 | `release_display`    | Release control of a display. | `display_id`, `note?` |
 | `grant_user_display` | Grant access to the user's real display session (owner surfaces only — this call *is* the opt-in); on Wayland, enable **Allow Remote Interaction** in the GNOME portal before clicking **Share** so CU input works. | `display_id?` |
 | `request_user_display` | Ask the user for their display: raises the dashboard doorbell popup with your reason and blocks for their click — the only thing that can grant it (never auto-approved; see [Autonomy — the display request rail](./autonomy.md#the-display-request-rail-doorbell)). `access="view"` shares the stream without CU input; `"view_and_control"` requests the full grant. | `reason`, `access?`, `wait_seconds?`, `session_id?` |
 | `revoke_user_display` | Revoke access to the user's real display session. | `display_id?`, `note?` |
 | `take_screenshot`    | Capture a screenshot (returns image content). | display params |
-| `read_screen`        | Frontmost app's accessibility element tree — cheap textual grounding (macOS user session). | `display_target?`, `format?` |
+| `read_screen`        | User session's frontmost-app accessibility tree — macOS AX, Linux AT-SPI, or Windows UIA. | `display_target?`, `format?`, `full_values?` |
+| `display_readiness`  | Probe display authority, capture/accessibility permission, target availability, and input backend live; names each missing layer. | `display_target?` |
 | `execute_cu_actions` | Run a batch of [computer-use](./computer-use-and-audio.md) actions. | CU action params |
 | `list_frames`        | List captured video frames. | filter params |
 | `read_frame`         | Read a specific frame. | `frame_id` |
+
+### Shared-view collaboration
+
+These tools control the agent-owned display presentation the user sees. They
+do not silently grant keyboard/mouse authority: in particular,
+`request_shared_view_input` only raises an advisory request and the user must
+click the dashboard control.
+
+| Tool | Description | Params |
+|------|-------------|--------|
+| `show_shared_view` | Open/foreground a shared display, optionally with an initial highlighted region. | `display_target?`, `display_id?`, `reason?`, `focus_region?` |
+| `hide_shared_view` | Dismiss the shared-view banner and focus overlay. | `reason?` |
+| `focus_shared_view` | Highlight a normalized region and optional note. | `region`, `display_target?`, `display_id?`, `note?` |
+| `clear_shared_view_focus` | Clear only the focus annotation; safe when none exists. | `reason?` |
+| `request_shared_view_input` | Ask the dashboard user to take input authority; never grants it. | `display_target?`, `display_id?`, `reason?` |
+| `capture_shared_view_frame` | Foreground the shared view and return its current frame as an MCP image. | `display_target?`, `display_id?`, `reason?` |
+
+### Managed context & fission
+
+These definitions are advertised only for sessions whose Codex managed-context
+mode is enabled; calls against a vanilla session fail with an explicit
+disabled-mode error. Rewind tools operate on exact Codex item ids. Fission
+forks the completed-turn context into real sibling sessions and records their
+group/canonical state in the lineage ledger.
+
+| Tool | Description | Params |
+|------|-------------|--------|
+| `list_rewind_anchors` | Return bounded exact rewind anchors, with optional paging/search and density/recovery estimates. | `session_id?`, paging/filter/density flags |
+| `inspect_rewind_anchor` | Inspect a compact window around one exact anchor. | `item_id`, `session_id?`, `radius?` |
+| `rewind_context` | Schedule rollback to `anchor.position` (`before`/`after`) and inject a required carry-forward primer. | `anchor`, `reason`, `primer`, `session_id?`, `preserve?`, `discard?`, `artifacts?`, `next_steps?` |
+| `rewind_backout` | Inspect, restore, or fork/back out a prior rewind record. | `record_id`, `session_id?`, `mode?`, `name?` |
+| `fission_spawn` | Fork 1–4 full-context sibling branches; write-scoped branches use isolated worktrees by default. | `branches`, `session_id?`, `use_worktree?` |
+| `fission_control` | `wait`, `import`, `cancel`, or `detach` one fission branch/group. | `group_id`, `op`, `session_id?`, `branch_session_id?`, `timeout_s?` |
+| `claim_fission_canonical` | Claim or compare-and-swap the group's canonical continuation. | `group_id`, `branch_session_id`, `expected_canonical_session_id?` |
 
 ### Browser workspaces
 
@@ -403,6 +490,17 @@ tools, and registers them as `mcp__<server>_<tool>` (e.g. a `filesystem` server'
 `read_file` → `mcp__filesystem_read_file`). Tool calls with the `mcp__` prefix
 are routed to the right server. If a server fails to connect, it is skipped with
 a warning; other servers and native tools keep working.
+
+Outbound calls pass the controller's `tool_call` approval gate before dispatch.
+That category defaults to `ask`, so Medium autonomy prompts unless the owner
+explicitly configures `tool_call = "auto"`.
+
+Returned text is not inserted raw. Intendant preserves `is_error`, quotes and
+labels the content as untrusted external data, normalizes or exposes control
+and invisible formatting, and caps the complete rendered result at 64 KiB.
+Transport error text uses the same boundary; non-text and structured payloads
+are omitted from this text bridge. This reduces prompt-injection and context
+exhaustion risk but cannot make the server's data or claims trustworthy.
 
 ### Trust model — read this before adding a server
 

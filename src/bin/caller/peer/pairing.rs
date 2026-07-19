@@ -408,6 +408,10 @@ async fn cmd_request(args: PeerArgs) -> Result<(), CallerError> {
     println!(":: request id: {}", outgoing.request_id);
     println!(":: approval code: {}", outgoing.code);
     println!(
+        ":: pinned target cert fingerprint: {} (compare out-of-band with the target operator)",
+        outgoing.server_cert_fingerprint
+    );
+    println!(
         ":: approve on the target with: intendant peer approve {}",
         outgoing.code
     );
@@ -742,6 +746,7 @@ pub(crate) fn join_peer_invite(
                 client_key: Some(key_path.to_string_lossy().into_owned()),
                 pinned_fingerprints: pins,
                 browser_tcp_via_url: None,
+                certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
             });
         }
     }
@@ -1134,6 +1139,7 @@ mod tests {
                     client_key: None,
                     pinned_fingerprints: Vec::new(),
                     browser_tcp_via_url: Some("ws://browser-via/ws".into()),
+                    certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
                 }],
                 ..ProjectConfig::default()
             },

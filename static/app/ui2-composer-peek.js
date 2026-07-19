@@ -6,6 +6,15 @@
 // ids), so it never mutates session state; interactive affordances that
 // need the live wiring (collapse, copy, retry) are hidden by the peek
 // stylesheet in favor of "Open in Activity".
+// MINIMIZED target: a minimized window keeps its transcript UNMOUNTED
+// (data-only appends; 41's setSessionWindowMinimized), so the clone
+// mirror has nothing to mirror. The peek then materializes its tail
+// straight from win.logHistory via the record builder — the same nodes
+// restore would mount — and re-renders on the
+// 'ui2:session-window-history-append' signal the data-only append paths
+// dispatch (no DOM mutations means the MutationObserver never fires).
+// Chosen over "restore the window for the peek": peeking must not undo
+// the user's (or the auto-rule's) minimize.
 // Boot follows the ui2-chrome single-boot idiom; every entry point is a
 // no-op when the mount is missing so a stub build stays inert.
 {
@@ -30,9 +39,13 @@
   let peekBoundLog = null;
   let peekRendered = []; // [{ source, clone }] in list order
   let peekFollow = true;
-  // Explicit close suppresses auto-open until the working streak ends or
-  // the target changes — otherwise the next phase mutation would fight
-  // the user's dismissal.
+  // Explicit close is real state, not a render artifact: every automatic
+  // open stays suppressed until a deliberate trigger clears it — the
+  // working streak ending (so a NEW turn may auto-open), the prompt
+  // target changing, or the user re-entering the dock from outside via a
+  // gesture off the peek (the focusin entry in peekWire). Renders and
+  // live events for the target must never resurrect a dismissed peek —
+  // otherwise the next phase mutation would fight the user's dismissal.
   let peekDismissed = false;
   let peekLastTarget = '';
   let peekLastPhaseCat = null;
@@ -75,21 +88,62 @@
     return out.reverse();
   }
 
+  // Minimized-target fallback: the bound log is unmounted, so build the
+  // tail from win.logHistory records — node-backed items clone their
+  // retained node, record-backed items go through the same record
+  // builder restore uses. Fresh nodes every render (no reconcile): the
+  // tail is ≤ PEEK_TAIL_CAP entries behind a 120ms throttle, and the
+  // surgical reconcile exists for aria-live continuity on the LIVE
+  // mirror, which this lane is not.
+  function peekMaterializedTail() {
+    const win = peekTargetWindow(peekBoundSid);
+    if (!win || !win.minimized || !Array.isArray(win.logHistory) || win.logHistory.length === 0) {
+      return [];
+    }
+    if (typeof buildSessionWindowLogEntry !== 'function') return [];
+    const out = [];
+    for (let i = win.logHistory.length - 1; i >= 0 && out.length < PEEK_TAIL_CAP; i--) {
+      const item = win.logHistory[i];
+      let node = null;
+      try {
+        if (typeof sessionWindowHistoryNode === 'function' && sessionWindowHistoryNode(item)) {
+          node = peekCloneEntry(sessionWindowHistoryNode(item));
+        } else {
+          const record = typeof sessionWindowHistoryRecord === 'function'
+            ? sessionWindowHistoryRecord(item) : null;
+          if (record) node = buildSessionWindowLogEntry(record);
+        }
+      } catch (_) { node = null; }
+      if (node) out.push(node);
+    }
+    return out.reverse();
+  }
+
   function peekEmptyText() {
     if (!peekBoundLog) return 'No transcript yet — send a message below.';
     const ph = peekBoundLog.querySelector('.session-window-empty');
     if (ph && ph.classList.contains('session-window-empty-loading')) return 'Loading transcript…';
-    if (ph && ph.classList.contains('session-window-empty-error')) return 'Transcript failed to load — open Activity to retry.';
+    if (ph && ph.classList.contains('session-window-empty-error')) {
+      // Same visibility rule as the window placeholder: name the reason
+      // (win.hydrateError, the source the placeholder rendered from)
+      // instead of a generic line.
+      const win = peekTargetWindow(peekBoundSid);
+      const reason = String((win && win.hydrateError) || '').trim();
+      return reason
+        ? `Transcript failed to load — ${reason} (open Activity to retry)`
+        : 'Transcript failed to load — open Activity to retry.';
+    }
     return 'No output yet';
   }
 
-  // CSS cannot see overflow: entries whose body actually clips get the
-  // fade tag; short ones keep their last line un-washed.
-  function peekTagClamped(clone) {
-    const content = clone.querySelector('.log-content');
-    if (content && content.scrollHeight > content.clientHeight + 1) {
-      clone.classList.add('ui2-peek-clamped');
-    }
+  // The container-level "more below" fade must never obscure the tail:
+  // it shows only while unread content sits below the viewport and goes
+  // away at scroll-bottom. Re-synced on scroll and after every render
+  // (content growth changes scrollHeight without firing scroll).
+  function peekSyncMoreBelow() {
+    if (!peekRoot || !peekList) return;
+    const more = peekList.scrollHeight - peekList.scrollTop - peekList.clientHeight > 1;
+    peekRoot.classList.toggle('ui2-peek-more-below', more);
   }
 
   function peekRenderTail() {
@@ -98,15 +152,22 @@
     if (sources.length === 0) {
       peekRendered = [];
       peekPendingDirty.clear();
+      const materialized = peekMaterializedTail();
+      if (materialized.length > 0) {
+        peekList.replaceChildren(...materialized);
+        if (peekFollow) peekList.scrollTop = peekList.scrollHeight;
+        peekSyncMoreBelow();
+        return;
+      }
       const empty = document.createElement('div');
       empty.className = 'ui2-peek-empty';
       empty.textContent = peekEmptyText();
       peekList.replaceChildren(empty);
+      peekSyncMoreBelow();
       return;
     }
     const prev = new Map(peekRendered.map(r => [r.source, r]));
     const next = [];
-    const fresh = [];
     for (const source of sources) {
       const kept = prev.get(source);
       if (kept && !peekPendingDirty.has(source)) {
@@ -115,7 +176,6 @@
       }
       const clone = peekCloneEntry(source);
       next.push({ source, clone });
-      fresh.push(clone);
     }
     peekRendered = next;
     // Surgical reconcile instead of replaceChildren: kept nodes never
@@ -132,9 +192,9 @@
       if (r.clone === cursor) cursor = cursor.nextElementSibling;
       else peekList.insertBefore(r.clone, cursor);
     }
-    for (const clone of fresh) peekTagClamped(clone);
     peekPendingDirty.clear();
     if (peekFollow) peekList.scrollTop = peekList.scrollHeight;
+    peekSyncMoreBelow();
   }
 
   function peekFlush() {
@@ -156,11 +216,13 @@
       const clone = peekCloneEntry(r.source);
       r.clone.replaceWith(clone);
       r.clone = clone;
-      peekTagClamped(clone);
       touched = true;
     }
     peekPendingDirty.clear();
-    if (touched && peekFollow) peekList.scrollTop = peekList.scrollHeight;
+    if (touched) {
+      if (peekFollow) peekList.scrollTop = peekList.scrollHeight;
+      peekSyncMoreBelow();
+    }
   }
 
   function peekSchedule() {
@@ -241,6 +303,7 @@
       peekFlushTimer = 0;
     }
     if (peekList) peekList.replaceChildren();
+    peekRoot.classList.remove('ui2-peek-more-below');
   }
 
   // "Open in Activity" is a lie when the user is ALREADY on Activity —
@@ -335,6 +398,19 @@
     peekOpen();
   }
 
+  // Every explicit dismissal — the ✕, Esc, outside-click, the QA hook —
+  // funnels through here so the surfaces cannot drift apart again: latch
+  // plus close, plus the ✕'s keep-typing refocus when asked. That refocus
+  // is safe against the open-on-focus entry rule only because of the
+  // gesture guard in peekWire's focusin handler — add dismissal
+  // side-effects here, never at the call sites.
+  function peekDismiss(refocus) {
+    peekClose(true);
+    if (!refocus) return;
+    const input = document.getElementById('activity-task-input');
+    if (input) input.focus({ preventScroll: true });
+  }
+
   function peekBuild(root) {
     const icon = (name, size) => (typeof ui2Icon === 'function' ? ui2Icon(name, size) : '');
     root.setAttribute('role', 'region');
@@ -400,12 +476,11 @@
     });
     closeBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      peekClose(true);
-      const input = document.getElementById('activity-task-input');
-      if (input) input.focus({ preventScroll: true });
+      peekDismiss(true);
     });
     peekList.addEventListener('scroll', () => {
       peekFollow = peekList.scrollTop + peekList.clientHeight >= peekList.scrollHeight - 24;
+      peekSyncMoreBelow();
     });
   }
 
@@ -414,6 +489,11 @@
   // content on every load of a dashboard with history is a surprise, not
   // an affordance. Focus counts as intent only after a real gesture.
   let peekSawUserGesture = false;
+  // Target of the most recent pointerdown/keydown: gesture state the
+  // focus-entry rule can trust when focus-event bookkeeping cannot be —
+  // WebKit never mouse-focuses buttons, so a focusin caused by clicking
+  // the peek's own chrome arrives with a null/outside relatedTarget.
+  let peekGestureTarget = null;
 
   const peekWire = () => {
     const root = document.getElementById('ui2-composer-peek');
@@ -423,16 +503,28 @@
     peekBarEl = bar;
     peekBuild(root);
 
-    document.addEventListener('pointerdown', () => { peekSawUserGesture = true; }, { capture: true, passive: true });
-    document.addEventListener('keydown', () => { peekSawUserGesture = true; }, { capture: true });
+    const noteGesture = (e) => {
+      peekSawUserGesture = true;
+      peekGestureTarget = e.target instanceof Node ? e.target : null;
+    };
+    document.addEventListener('pointerdown', noteGesture, { capture: true, passive: true });
+    document.addEventListener('keydown', noteGesture, { capture: true });
 
     bar.addEventListener('focusin', (e) => {
       if (!peekSawUserGesture) return;
       if (peekIsOpen() || peekComposerPill()) return;
-      // Focus moving WITHIN the dock (input → Send, the close button's
-      // refocus) is not an entry — reopening there would undo an Esc/×
-      // dismissal the user just made.
+      // Focus moving WITHIN the dock (Tab from input to Send, engines
+      // that focus buttons on click) is not an entry — reopening there
+      // would undo an Esc/× dismissal the user just made.
       if (e.relatedTarget instanceof Node && bar.contains(e.relatedTarget)) return;
+      // relatedTarget alone cannot carry that rule on WebKit: Safari
+      // never mouse-focuses buttons, so the ✕ handler's keep-typing
+      // refocus of the input lands here with a null/body relatedTarget —
+      // and used to reopen the sheet in the very click that dismissed it.
+      // Gesture state instead of focus-event timing: a focus produced by
+      // interacting with the peek itself is peek interaction, never an
+      // entry into the composer.
+      if (peekGestureTarget && peekRoot.contains(peekGestureTarget)) return;
       // Focus landing on the target-switch chrome is retargeting intent,
       // not composition — opening the peek under that popover just stacks
       // two overlays (and made Esc close the hidden one first).
@@ -459,16 +551,16 @@
       if (e.target instanceof Node && peekBarEl.contains(e.target)) {
         e.preventDefault();
         e.stopImmediatePropagation();
-        peekClose(true);
+        peekDismiss(false);
         return;
       }
-      peekClose(true);
+      peekDismiss(false);
     }, true);
 
     document.addEventListener('pointerdown', (e) => {
       if (!peekIsOpen()) return;
       if (e.target instanceof Node && peekBarEl.contains(e.target)) return;
-      peekClose(true);
+      peekDismiss(false);
     }, true);
 
     window.addEventListener('ui2:composer-state', (e) => {
@@ -479,6 +571,16 @@
     // Open-in-Activity label honest for wherever the user now is.
     window.addEventListener('ui2:tab-changed', () => {
       if (peekIsOpen()) peekSyncOpenLabel();
+    });
+
+    // Minimized-target appends are data-only (no DOM mutations for the
+    // log observer to see) — the append paths dispatch this instead;
+    // re-render the materialized tail through the same throttle.
+    window.addEventListener('ui2:session-window-history-append', (e) => {
+      const sid = (e && e.detail && e.detail.sessionId) || '';
+      if (!peekIsOpen() || !sid || sid !== peekBoundSid) return;
+      peekPendingStructural = true;
+      peekSchedule();
     });
 
     if (typeof ui2Mirror === 'function') {
@@ -500,7 +602,7 @@
     window.__ui2Peek = {
       isOpen: peekIsOpen,
       open: peekOpen,
-      close: () => peekClose(true),
+      close: () => peekDismiss(false),
       sessionId: () => peekBoundSid,
     };
   };
