@@ -3328,6 +3328,17 @@ html.ui-v2[data-theme="light"] .control-toast {
   flex-wrap: wrap;
   gap: 5px;
   min-width: 0;
+  cursor: pointer;
+  border-radius: 3px;
+}
+.session-detail-title .sd-fork-point:hover {
+  background: color-mix(in srgb, var(--mauve) 8%, transparent);
+}
+/* Jump-target highlight: pulse the row a fork-point click landed on. */
+.log-entry.fork-jump-flash {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--mauve) 70%, transparent);
+  background: color-mix(in srgb, var(--mauve) 14%, transparent);
+  transition: background 0.5s ease, box-shadow 0.5s ease;
 }
 .session-detail-title .sd-fork-kind {
   flex: 0 0 auto;

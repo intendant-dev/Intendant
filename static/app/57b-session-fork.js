@@ -117,6 +117,11 @@ async function loadSessionForkPoints(session, sessionId, body) {
 function sessionForkPointRow(source, sessionId, point, statusEl) {
   const row = document.createElement('div');
   row.className = 'sd-fork-point';
+  row.title = 'Jump to this point in the transcript';
+  row.addEventListener('click', (ev) => {
+    if (ev.target?.closest?.('button, .sd-fork-form')) return;
+    sessionForkJumpToPoint(source, sessionId, point, statusEl);
+  });
   const kind = document.createElement('span');
   kind.className = `sd-fork-kind sd-fork-kind-${point.kind || 'point'}`;
   kind.textContent =
@@ -255,10 +260,61 @@ function sessionForkRefreshDetailAffordances(sessionId) {
   });
 }
 
-// A prompt row's fork point is the boundary just BEFORE it — "the child
-// keeps everything before this message and redoes from here" — on both
-// backends: claude-code points carry the row uuid as at_message_uuid;
-// codex prompt rows for turn k map to the turn-boundary after turn k-1.
+// The point↔row rule, usable from the row side (inline affordances via
+// the byRow index) and from the point side (panel jump): claude-code
+// points display on the row whose uuid is at_message_uuid; codex
+// turn-boundary k displays on the prompt row of turn k+1 ("the child
+// keeps everything before this message and redoes from here"); codex
+// item anchors match their item row (jump-only — no inline button).
+function sessionForkRowMatchesPoint(source, record, point) {
+  if (!record || record.superseded || !point) return false;
+  if (source === 'claude-code') {
+    const at = point.at_message_uuid || point.message_uuid;
+    return !!at && record.message_uuid === at;
+  }
+  if (source === 'codex') {
+    if (point.kind === 'turn-boundary' && point.turn != null) {
+      return record.user_turn_index === point.turn + 1;
+    }
+    if (point.kind === 'item-anchor' && point.item_id) {
+      return record.item_id === point.item_id;
+    }
+  }
+  return false;
+}
+
+function sessionForkJumpToPoint(source, sessionId, point, statusEl) {
+  const view = typeof sessionDetailLogView !== 'undefined' ? sessionDetailLogView : null;
+  if (!view || view.sessionId !== sessionId || !Array.isArray(view.rows) || !view.scroller) {
+    sessionForkSetStatus(statusEl, 'Transcript view is not open for this session.', 'error');
+    return;
+  }
+  let target = -1;
+  for (let i = 0; i < view.rows.length; i++) {
+    const row = view.rows[i];
+    if (row?.kind === 'entry' && sessionForkRowMatchesPoint(source, row.record, point)) {
+      target = i;
+      break;
+    }
+  }
+  if (target < 0) {
+    sessionForkSetStatus(
+      statusEl,
+      'This anchor is older than the loaded transcript pages (use First to load older history).',
+      'error'
+    );
+    return;
+  }
+  renderSessionDetailRange(view, Math.max(0, Math.min(target - 40, sessionDetailMaxRenderStart(view))));
+  const node = view.scroller.querySelector(`[data-detail-row-index="${target}"]`);
+  if (node) {
+    node.scrollIntoView({ block: 'center' });
+    node.classList.add('fork-jump-flash');
+    setTimeout(() => node.classList.remove('fork-jump-flash'), 1600);
+  }
+  sessionForkSetStatus(statusEl, '', '');
+}
+
 function sessionForkInlinePointForRecord(sessionId, record) {
   if (!sessionId || !record || record.superseded) return null;
   const idx = _sessionForkInlineIndexes.get(sessionId);
