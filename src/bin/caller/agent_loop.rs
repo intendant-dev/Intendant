@@ -2003,9 +2003,9 @@ pub(crate) async fn run_agent_loop(
 
             // Spawn supervised sub-agent sessions (spawn_sub_agent).
             // Controller-side: same approval gate as MCP calls, before the
-            // child session exists. The default `tool_call = auto` rule
-            // keeps orchestration usable at normal autonomy; Low prompts
-            // and an explicit deny refuses.
+            // child session exists. The default `tool_call = ask` rule
+            // prompts at Medium/Low; an explicit auto allows it and an
+            // explicit deny refuses.
             for (call_id, args) in &batch.sub_agent_spawns {
                 handled_call_ids.insert(call_id.clone());
                 let task_line = args.get("task").and_then(|t| t.as_str()).unwrap_or("");
@@ -4247,8 +4247,10 @@ mod controller_tool_gate {
     #[tokio::test]
     async fn auto_rule_dispatches_with_audit_event() {
         let (_dir, log) = test_log();
-        // Default: Medium + tool_call = auto.
-        let autonomy = autonomy::shared_autonomy(autonomy::AutonomyState::default());
+        let mut rules = autonomy::ApprovalConfig::default();
+        rules.tool_call = autonomy::ApprovalRule::Auto;
+        let autonomy =
+            autonomy::shared_autonomy(autonomy::AutonomyState::new(AutonomyLevel::Medium, rules));
         let bus = EventBus::new();
         let mut events = bus.subscribe();
         let registry = event::ApprovalRegistry::default();
@@ -4321,13 +4323,13 @@ mod controller_tool_gate {
         }
     }
 
-    /// Registry lane end to end: prompt → user approves → dispatch, and
-    /// the approval is remembered for the session so the identical call
-    /// dedups without a second prompt.
+    /// Shipped Medium default, registry lane end to end: prompt → user
+    /// approves → dispatch, and the approval is remembered for the session
+    /// so the identical call dedups without a second prompt.
     #[tokio::test]
-    async fn registry_approve_dispatches_and_dedups_identical_call() {
+    async fn medium_default_prompts_then_approve_dispatches_and_dedups() {
         let (_dir, log) = test_log();
-        let autonomy = state_with_tool_rule(AutonomyLevel::Low, autonomy::ApprovalRule::Auto);
+        let autonomy = autonomy::shared_autonomy(autonomy::AutonomyState::default());
         let bus = EventBus::new();
         let mut events = bus.subscribe();
         let registry = event::ApprovalRegistry::default();

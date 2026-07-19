@@ -491,6 +491,17 @@ tools, and registers them as `mcp__<server>_<tool>` (e.g. a `filesystem` server'
 are routed to the right server. If a server fails to connect, it is skipped with
 a warning; other servers and native tools keep working.
 
+Outbound calls pass the controller's `tool_call` approval gate before dispatch.
+That category defaults to `ask`, so Medium autonomy prompts unless the owner
+explicitly configures `tool_call = "auto"`.
+
+Returned text is not inserted raw. Intendant preserves `is_error`, quotes and
+labels the content as untrusted external data, normalizes or exposes control
+and invisible formatting, and caps the complete rendered result at 64 KiB.
+Transport error text uses the same boundary; non-text and structured payloads
+are omitted from this text bridge. This reduces prompt-injection and context
+exhaustion risk but cannot make the server's data or claims trustworthy.
+
 ### Trust model — read this before adding a server
 
 Each `[[mcp_servers]]` entry is launched as a **child process with the user's
