@@ -224,6 +224,46 @@ pub(crate) fn remote_dashboard_client_auth_missing(
         && peer_identity.is_none()
 }
 
+/// THE cleartext-loopback admission predicate — deliberately the single
+/// copy of this logic (ratified transport ruling, 2026-07-20), consulted
+/// by BOTH the listener's strict-TLS 426 peek and the HTTP dispatch
+/// mTLS/remote-auth gate. A cleartext connection on a TLS-posture daemon
+/// is admitted only when it is host-local AND credentialed:
+///
+/// - `Direct` ingress admits the `/mcp` token carve-out (supervised
+///   backends' bootstrap URLs, which cannot do custom-CA HTTPS) and —
+///   the ruling's widening — any loopback request presenting the
+///   per-boot loopback admission token: CLI-class owner clients (`ctl`,
+///   rigs) stay cleartext-with-token until the credential-custody
+///   migration gives them TLS client identity, at which point
+///   ctl-over-HTTPS arrives with actual payoff.
+/// - `SessionMcp` ingress stays exactly the `/mcp` carve-out — its own
+///   single-rung session-token ladder governs past transport, and the
+///   owner token must never widen that listener.
+/// - Reachability-relay ingress admits nothing.
+///
+/// Browser-originated requests never qualify (origin markers excluded):
+/// browsers keep the 426 on cleartext and keep the printed https URL.
+pub(crate) fn cleartext_loopback_admitted(
+    gateway_ingress: GatewayIngress,
+    peer_addr: std::net::SocketAddr,
+    is_tls: bool,
+    header_text: &str,
+) -> bool {
+    let mcp_carveout = is_loopback_cleartext_mcp_request(peer_addr, is_tls, header_text);
+    match gateway_ingress {
+        GatewayIngress::Direct => {
+            mcp_carveout
+                || (!is_tls
+                    && client_ip_is_loopback(peer_addr.ip())
+                    && !has_browser_origin_headers(header_text)
+                    && crate::loopback_token::loopback_token_presented(header_text))
+        }
+        GatewayIngress::SessionMcp => mcp_carveout,
+        GatewayIngress::ReachabilityRelay => false,
+    }
+}
+
 /// True when this request sits on the direct-loopback transport lane but
 /// did not present the per-boot admission token: the caller is local, so
 /// the refusal should be the named, actionable token error
@@ -700,6 +740,85 @@ mod tests {
     fn verify_bearer_token_passes_when_no_token_configured() {
         let header = "GET /api/peers HTTP/1.1\r\nHost: x\r\n\r\n";
         assert!(verify_bearer_token(header, None).is_ok());
+    }
+
+    /// The ONE cleartext admission predicate (ratified transport
+    /// ruling): Direct loopback admits the /mcp carve-out or the
+    /// per-boot token; the session-MCP ingress admits only its own
+    /// /mcp lane (the owner token must never widen it); relay admits
+    /// nothing; browser-origin markers and remote peers never qualify.
+    #[test]
+    fn cleartext_admission_is_local_credentialed_and_ingress_scoped() {
+        let loopback: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let token = crate::loopback_token::loopback_admission_token();
+        let tokened = format!(
+            "GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
+             x-intendant-loopback-token: {token}\r\n\r\n"
+        );
+
+        assert!(cleartext_loopback_admitted(
+            GatewayIngress::Direct,
+            loopback,
+            false,
+            &tokened
+        ));
+        // The mcp carve-out still rides on both eligible ingresses.
+        let mcp = format!(
+            "POST /mcp?mcp_token={} HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n",
+            loopback_mcp_auth_token()
+        );
+        assert!(cleartext_loopback_admitted(
+            GatewayIngress::Direct,
+            loopback,
+            false,
+            &mcp
+        ));
+        assert!(cleartext_loopback_admitted(
+            GatewayIngress::SessionMcp,
+            loopback,
+            false,
+            &mcp
+        ));
+
+        // The owner token never widens the session-MCP listener.
+        assert!(!cleartext_loopback_admitted(
+            GatewayIngress::SessionMcp,
+            loopback,
+            false,
+            &tokened
+        ));
+        // Relay ingress admits nothing.
+        assert!(!cleartext_loopback_admitted(
+            GatewayIngress::ReachabilityRelay,
+            loopback,
+            false,
+            &tokened
+        ));
+        // Tokenless, browser-origin, and remote callers never qualify.
+        assert!(!cleartext_loopback_admitted(
+            GatewayIngress::Direct,
+            loopback,
+            false,
+            "GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n"
+        ));
+        let browser = format!(
+            "GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
+             Origin: http://127.0.0.1:8765\r\n\
+             x-intendant-loopback-token: {token}\r\n\r\n"
+        );
+        assert!(!cleartext_loopback_admitted(
+            GatewayIngress::Direct,
+            loopback,
+            false,
+            &browser
+        ));
+        let remote: std::net::SocketAddr = "192.168.1.9:5555".parse().unwrap();
+        assert!(!cleartext_loopback_admitted(
+            GatewayIngress::Direct,
+            remote,
+            false,
+            &tokened
+        ));
     }
 
     /// The trusted-local owner lane requires possession of the per-boot

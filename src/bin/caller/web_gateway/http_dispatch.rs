@@ -531,7 +531,7 @@ pub(crate) async fn serve_http_request(
         peer_connection_identity.as_ref(),
     );
     if ((tls_client_cert_required && !tls_client_cert_present) || remote_client_auth_missing)
-        && !is_loopback_cleartext_mcp_request(peer_addr, is_tls, header_text)
+        && !cleartext_loopback_admitted(gateway_ingress, peer_addr, is_tls, header_text)
         && !authority_free_request
         && hosted_verified.is_none()
     {

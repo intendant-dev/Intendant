@@ -1780,14 +1780,16 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                 } else {
                     String::from_utf8_lossy(&buf[..peeked]).to_string()
                 };
-                // The dedicated session-MCP ingress is loopback cleartext
-                // /mcp BY DESIGN (its clients are sandboxed local shells
-                // that cannot present the dashboard certificate), so it
-                // shares the Direct listener's loopback-/mcp exception.
-                let allow_loopback_cleartext_mcp = matches!(
+                // Cleartext admission is the ONE shared predicate
+                // (`cleartext_loopback_admitted`): the /mcp token
+                // carve-out (Direct + the session-MCP ingress, whose
+                // clients are sandboxed local shells that cannot present
+                // the dashboard certificate) and — per the ratified
+                // transport ruling — Direct loopback requests bearing
+                // the per-boot loopback admission token (CLI-class owner
+                // clients). Browsers and relay ingress never qualify.
+                let allow_loopback_cleartext = cleartext_loopback_admitted(
                     gateway_ingress,
-                    GatewayIngress::Direct | GatewayIngress::SessionMcp
-                ) && is_loopback_cleartext_mcp_request(
                     peer_addr,
                     is_tls,
                     &cleartext_header_text,
@@ -1801,13 +1803,13 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                 // WebSocket client dialing the secure port in the clear.
                 // Opportunistic TLS — quietly serving such a client over plain
                 // HTTP — would undercut the project's "no unencrypted traffic"
-                // guarantee, so we refuse it. The one exception is the local
-                // loopback `/mcp` endpoint used by managed child CLIs: those
-                // clients cannot present the dashboard mTLS certificate, and
-                // their transport never leaves the host. Browser-originated
-                // requests and reachability-relay ingress do not qualify for
-                // that exception.
-                if tls_acceptor.is_some() && !is_tls && !allow_loopback_cleartext_mcp {
+                // guarantee, so we refuse it. The exceptions are host-local
+                // and credentialed only (`cleartext_loopback_admitted`): the
+                // loopback `/mcp` lane used by managed child CLIs, and
+                // token-bearing loopback owner clients — neither transport
+                // ever leaves the host. Browser-originated requests and
+                // reachability-relay ingress do not qualify.
+                if tls_acceptor.is_some() && !is_tls && !allow_loopback_cleartext {
                     use tokio::io::AsyncWriteExt;
                     log_tls_failure_rate_limited(
                         &tls_failure_log_state,

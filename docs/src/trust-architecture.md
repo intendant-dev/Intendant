@@ -782,6 +782,21 @@ token ladder: `mcp_token` credentials keep working unchanged, and the
 dedicated session-MCP listener's single-rung session-token ladder is
 untouched.
 
+Transport interaction with the TLS posture (ratified 2026-07-20): a
+TLS-enforcing daemon still refuses cleartext with `426 Upgrade
+Required`, through one shared admission predicate whose only exceptions
+are host-local and credentialed — the token-gated loopback `/mcp` lane
+supervised backends bootstrap through, and (the ruling's widening)
+loopback requests presenting the per-boot admission token. That admits
+exactly the CLI-class owner clients (`ctl`, rigs) whose traffic never
+leaves the host and who today hold no TLS client identity; browsers
+never qualify (browser-origin markers are excluded, so they keep the
+426 and the printed https URL), remote surfaces are unchanged, and the
+dedicated session-MCP listener stays exactly its own `/mcp` ladder —
+the owner token never widens it. ctl-over-HTTPS was deliberately not
+built now: it arrives for free with the credential-custody migration,
+when TLS client identity gives the ceremony actual payoff.
+
 The honest security envelope, per platform:
 
 - **macOS — strong.** The default (sandbox-on) runtime profile denies

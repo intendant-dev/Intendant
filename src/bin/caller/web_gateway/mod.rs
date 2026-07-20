@@ -3404,7 +3404,13 @@ mod tests {
     #[tokio::test]
     async fn test_strict_tls_rejects_cleartext_http() {
         let (port, handle) = spawn_test_gateway_tls(None).await;
-        let resp = http_request(port, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        // Credential-less cleartext (the tokenless marker keeps the
+        // funnel from attaching this process's admission token).
+        let resp = http_request(
+            port,
+            &format!("GET / HTTP/1.1\r\nHost: localhost\r\n{TEST_TOKENLESS_MARKER}\r\n"),
+        )
+        .await;
         assert!(
             resp.contains("426"),
             "cleartext HTTP to a --tls gateway must get 426, got: {resp}"
@@ -3412,6 +3418,18 @@ mod tests {
         assert!(
             !resp.contains("200 OK"),
             "must not serve the dashboard over cleartext, got: {resp}"
+        );
+        // The ratified carve-out: the same cleartext request bearing the
+        // per-boot loopback admission token is admitted (CLI-class owner
+        // clients; ruling (i) 2026-07-20) — the funnel attaches it.
+        let admitted = http_request(
+            port,
+            "GET /api/dashboard/targets HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            admitted.starts_with("HTTP/1.1 200 OK"),
+            "token'd cleartext loopback must be admitted on a --tls gateway, got: {admitted}"
         );
         handle.abort();
     }
@@ -3424,12 +3442,15 @@ mod tests {
         let (port, handle) = spawn_test_gateway_tls(None).await;
         let resp = http_request(
             port,
-            "GET /ws HTTP/1.1\r\n\
-             Host: localhost\r\n\
-             Upgrade: websocket\r\n\
-             Connection: Upgrade\r\n\
-             Sec-WebSocket-Key: dGVzdA==\r\n\
-             Sec-WebSocket-Version: 13\r\n\r\n",
+            &format!(
+                "GET /ws HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 {TEST_TOKENLESS_MARKER}\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Key: dGVzdA==\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n"
+            ),
         )
         .await;
         assert!(
@@ -3482,14 +3503,19 @@ mod tests {
     #[tokio::test]
     async fn test_strict_tls_rejects_loopback_cleartext_mcp_without_token() {
         let (port, handle) = spawn_test_gateway_tls_with_client_cert_requirement(None, true).await;
+        // No mcp_token AND no loopback admission token (marker): the
+        // credential-less cleartext /mcp shape stays refused.
         let resp = http_request(
             port,
-            "POST /mcp?session_id=child HTTP/1.1\r\n\
-             Host: localhost\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: 2\r\n\
-             \r\n\
-             {}",
+            &format!(
+                "POST /mcp?session_id=child HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 {TEST_TOKENLESS_MARKER}\
+                 Content-Type: application/json\r\n\
+                 Content-Length: 2\r\n\
+                 \r\n\
+                 {{}}"
+            ),
         )
         .await;
         assert!(

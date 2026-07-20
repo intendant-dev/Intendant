@@ -566,6 +566,24 @@ async fn loopback_token_closes_tokenless_drive_by_on_no_tls_daemons() {
         ok.status()
     );
 
+    // The admitted write recorded the unchanged owner actor: the token
+    // authenticates admission to the loopback posture, it does not mint
+    // a new principal class.
+    let agenda = http_get_json(&authed, &format!("http://127.0.0.1:{port}/api/agenda"))
+        .await
+        .expect("GET /api/agenda");
+    let item = agenda["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|item| item["title"] == "token accepted")
+        .cloned()
+        .unwrap_or_else(|| panic!("added item missing from agenda: {agenda}"));
+    assert_eq!(
+        item["provenance"]["kind"], "local_process",
+        "token'd ctl must record the local_process actor: {item}"
+    );
+
     // The env override is a first-class discovery rung: a foreign home
     // WITH the exported token succeeds.
     let mut cmd = foreign.command();
@@ -583,6 +601,76 @@ async fn loopback_token_closes_tokenless_drive_by_on_no_tls_daemons() {
         output.status.success(),
         "env-override ctl must succeed:\n{}",
         text_of(&output)
+    );
+}
+
+/// Acceptance for the ratified transport ruling (option (i),
+/// 2026-07-20): a TLS-posture daemon admits token'd CLEARTEXT loopback
+/// for CLI-class owner clients through the one shared admission
+/// predicate — so an unsupervised shell driving a TLS daemon
+/// out-of-session (the original failure shape behind the loopback
+/// program) round-trips for the first time. Tokenless cleartext keeps
+/// the strict-TLS 426.
+#[tokio::test]
+async fn tls_daemon_admits_tokened_cleartext_ctl_round_trip() {
+    let insecure_probe = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("probe client");
+    let rig = TestRig::new();
+    std::fs::write(rig.project.path().join("intendant.toml"), "")
+        .expect("mark the daemon rig's project root");
+    let setup = {
+        let mut cmd = rig.command();
+        cmd.args([
+            "access",
+            "setup",
+            "--ip",
+            "127.0.0.1",
+            "--host",
+            "localhost",
+            "--name",
+            "loopback-token-tls",
+            "--no-serve-certs",
+            "--force",
+        ]);
+        rig.run(cmd).await
+    };
+    assert!(
+        setup.status.success(),
+        "access setup failed:\n{}",
+        text_of(&setup)
+    );
+    let idle_script = serde_json::json!({ "profiles": [] });
+    let daemon = spawn_daemon_on_rig(&insecure_probe, rig, &idle_script, true).await;
+    let port = daemon.port;
+
+    // Tokenless cleartext to the secure port keeps the 426 refusal.
+    let plain = reqwest::Client::new();
+    let refused = plain
+        .get(format!("http://127.0.0.1:{port}/api/sessions"))
+        .send()
+        .await
+        .expect("tokenless cleartext request completes");
+    assert_eq!(
+        refused.status(),
+        426,
+        "tokenless cleartext must keep the strict-TLS refusal"
+    );
+
+    // The unsupervised-shell shape: explicit binary path, scrubbed
+    // session env, HOME = the daemon's home. ctl auto-discovers the
+    // per-boot token and speaks token'd cleartext through the shared
+    // admission predicate — 426 carved out, mTLS gate exempted, the
+    // /mcp ladder binds local_process.
+    let added = ctl(&daemon, &["agenda", "add", "tls cleartext admitted"]).await;
+    assert!(added.status.success(), "{}", text_of(&added));
+    let listed = ctl(&daemon, &["agenda", "list", "--open", "--json"]).await;
+    assert!(listed.status.success(), "{}", text_of(&listed));
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("tls cleartext admitted"),
+        "agenda write must round-trip over token'd cleartext:\n{}",
+        text_of(&listed)
     );
 }
 
@@ -1587,15 +1675,19 @@ async fn native_session_ctl_agenda_add_attributes_to_the_session() {
         .expect("http client");
     let daemon = spawn_daemon(&client, &script).await;
     let port = daemon.port;
+    let client = daemon.authed_client();
 
     // A SUPERVISED session (the dashboard's create_session lane — the
     // supervisor launch arm that computes the bootstrap), not the daemon's
     // resident head session. First control message can race startup on a
     // saturated box; retry until session_started.
     use futures_util::SinkExt;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        daemon.loopback_token()
+    ))
+    .await
+    .expect("connect /ws");
     let mut started = None;
     for _ in 0..6 {
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -1804,6 +1896,7 @@ async fn agenda_start_now_fires_one_occurrence_and_writes_back() {
         .expect("http client");
     let daemon = spawn_daemon(&client, &script).await;
     let port = daemon.port;
+    let client = daemon.authed_client();
 
     let added = ctl(
         &daemon,
