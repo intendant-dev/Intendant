@@ -3656,21 +3656,6 @@ impl ExternalAgent for ClaudeCodeAgent {
             args.push(self.intendant_mcp_config(port).to_string());
         }
 
-        // Materialize the daemon's skill catalog into the project's
-        // standard scan paths (Claude Code reads `.claude/skills/`) so
-        // this backend discovers the same skills native sessions do.
-        match super::skills_sync::provision_project_skills(&config.working_dir) {
-            Ok(report) => {
-                if let Some(summary) = super::skills_sync::describe_report(&report) {
-                    eprintln!("[skills] {} in {}", summary, config.working_dir.display());
-                }
-            }
-            Err(e) => eprintln!(
-                "[skills] provisioning failed in {}: {e}",
-                config.working_dir.display()
-            ),
-        }
-
         // Spawn the process
         let mut command = crate::platform::spawn_command(&self.command);
         command

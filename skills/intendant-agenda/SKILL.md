@@ -2,7 +2,6 @@
 name: intendant-agenda
 description: When you defer work, promise a follow-up ("I'll also…", "later we should…", "worth revisiting"), hit something out of scope, have a question only the owner can answer but don't need to block on it, or want the owner to see a note that must survive your context window — park it on the daemon's agenda instead of losing it. Also use at session start to check what's parked and whether earlier questions got answered.
 compatibility: Requires a reachable Intendant daemon (supervised sessions have $INTENDANT and INTENDANT_MCP_URL injected).
-distribution: global
 ---
 
 > If `$INTENDANT`/`INTENDANT_MCP_URL` is unset and no local Intendant daemon answers, this skill does not apply — say so and stop.

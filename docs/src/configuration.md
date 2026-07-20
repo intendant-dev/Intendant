@@ -1165,11 +1165,8 @@ frontmatter. Discovery checks these locations in order; the first skill with a
 given name wins:
 
 1. `<project-root>/.agents/skills/<name>/SKILL.md` (Agent Skills standard)
-2. `<project-root>/.intendant/skills/<name>/SKILL.md` (legacy project path)
-3. `<project-root>/skills/<name>/SKILL.md` (visible repository path)
-4. `~/.agents/skills/<name>/SKILL.md` (personal standard path)
-5. `<state-root>/skills/<name>/SKILL.md` (legacy personal path; default
-   `~/.intendant/skills`)
+2. `<project-root>/skills/<name>/SKILL.md` (visible repository path)
+3. `~/.agents/skills/<name>/SKILL.md` (personal standard path)
 
 ```yaml
 ---
@@ -1193,42 +1190,33 @@ sections), `compatibility` (free-text environment requirements, surfaced
 verbatim in the injected catalog after the description so the model can rule
 a skill out *before* invoking it — descriptions stay purpose-only; other
 harnesses currently drop this field before the model sees it, so a one-line
-guard at the top of the body remains the late gate for them), and
-`distribution` (Intendant extension: `global` marks a skill the daemon
-installs machine-wide — see below). `disable-model-invocation` and
-`allowed-tools` are accepted for forward compatibility but are **not yet
-interpreted**. Project skills take precedence over personal skills of the
-same name.
+guard at the top of the body remains the late gate for them).
+`disable-model-invocation` and `allowed-tools` are accepted for forward
+compatibility but are **not yet interpreted**. Project skills take precedence
+over personal skills of the same name.
 
 ### Global distribution
 
-At startup (daemon, headless, and MCP modes), the daemon installs every
-builtin skill marked `distribution: global` into `~/.agents/skills/` — the
-Agent Skills standard personal path that Codex, Intendant itself, and (via
-the setup scripts' `~/.claude/skills` symlink) Claude Code all read, so the
-skills reach every agent on the machine, supervised or not. The skills are
-embedded in the binary (`builtin_skills.rs`, pinned to `skills/` by test),
-must be single-file, and follow the same ownership contract as project
-materialization: marker-owned copies, content-identical installs are no-ops,
-stale marked copies are swept on upgrade, and a user-authored directory with
-the same name always wins. `INTENDANT_SKIP_SKILL_PROVISION=1` disables this
-along with project materialization.
+At startup (daemon, headless, and MCP modes), the daemon installs every skill
+shipped inside the Intendant binary into `~/.agents/skills/` — the Agent
+Skills standard personal path that Codex and Intendant read. The setup
+scripts make `~/.claude/skills` an alias of that same directory on macOS,
+Linux, and Windows, so Claude Code sees the identical catalog. Installation
+is machine-scoped and idempotent: content-identical installs are no-ops,
+stale marked copies are swept on upgrade, and an unmarked user-authored
+directory with the same name always wins.
 
-### Materialization for supervised external agents
+The shipped sources remain tracked under this repository's `skills/` and are
+embedded in the binary (`builtin_skills.rs`, pinned to that directory by
+test). Starting a supervised Claude Code or Codex session performs no skill
+copying and writes nothing into the project.
 
-On every supervised external spawn, the daemon materializes the effective
-skill catalog into the session project's standard scan paths so Claude
-Code (`<project>/.claude/skills/`) and Codex (`<project>/.agents/skills/`)
-discover the same skills native sessions do. Materialized directories are
-derived copies: each carries an `.intendant-materialized` marker, is
-refreshed (swept and rewritten) on the next spawn, is skipped by
-Intendant's own discovery so a copy never shadows its source, and is
-hidden from `git status` through a managed block in the checkout's shared
-`.git/info/exclude` — never a committed ignore file. A user-authored
-directory with the same name in a target path always wins; the copy is
-skipped. Per-skill copies are capped at 4 MB; symlinked entries are never
-followed. Set `INTENDANT_SKIP_SKILL_PROVISION=1` to disable
-materialization entirely.
+Personal global skills are installed manually under `~/.agents/skills/`.
+Personal project-scoped skills are installed manually in the backend's project
+path (`<project>/.agents/skills/` for Codex and Intendant, or
+`<project>/.claude/skills/` for Claude Code) and must be covered by that
+project's ignore rules; this repository ignores both. Intendant does not
+mirror private project skills between backend-specific paths.
 
 ## INTENDANT.md project instructions
 

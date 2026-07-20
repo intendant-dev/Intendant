@@ -10,7 +10,6 @@ use tokio::sync::mpsc;
 pub mod claude_code;
 pub mod codex;
 pub(crate) mod protocol_watch;
-pub(crate) mod skills_sync;
 pub(crate) mod transcript_text;
 
 /// Backend-neutral side-conversation contract: what a `/side`/`/btw` child

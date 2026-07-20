@@ -2,7 +2,6 @@
 name: intendant-cli
 description: Use to operate a running Intendant daemon from the CLI — sessions, approvals, displays and screenshots, computer-use input, browser workspaces, audio, and federated peers (message or delegate to another machine's agent, or drive its screen directly with --peer). Prefer `intendant ctl` over broad MCP tools to keep model context small.
 compatibility: Requires a reachable Intendant daemon (supervised sessions have $INTENDANT and INTENDANT_MCP_URL injected).
-distribution: global
 ---
 
 > If `$INTENDANT`/`INTENDANT_MCP_URL` is unset and no local Intendant daemon answers, this skill does not apply — say so and stop.

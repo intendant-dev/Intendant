@@ -860,36 +860,20 @@ external CLI's own away-from-keyboard fallback.
 
 ## Skills
 
-Supervised backends discover the daemon's skill catalog through
-**project-path materialization**: on every spawn, the effective catalog
-(`intendant_core::skills::discover_skills`, the same set native sessions
-get injected) is copied into the session project's standard scan paths —
-`<project>/.claude/skills/` for Claude Code and
-`<project>/.agents/skills/` for Codex (scan behavior verified live
-2026-07-19 on claude 2.1.215 / codex 0.144.6). Home-directory injection
-is deliberately not the mechanism: `CODEX_HOME`/`CLAUDE_CONFIG_DIR` are
-passthrough env that only vault leases override, so in the common
-subscription mode the CLIs run on the user's real homes, which the
-daemon never mutates.
+Intendant installs every shipped skill machine-wide into
+`~/.agents/skills/` at daemon startup. The setup scripts alias
+`~/.claude/skills` to the same directory on every supported platform, so
+supervised and bare Codex or Claude Code sessions see the shipped catalog
+through their normal personal discovery. Installs are marker-owned and
+idempotent; an unmarked user-authored collision always wins.
 
-The ownership contract lives in
-`src/bin/caller/external_agent/skills_sync.rs`: every materialized
-directory carries an `.intendant-materialized` marker (written before
-the copy, so a crash leaves a sweepable partial); only marked
-directories are ever deleted or rewritten; a user-authored directory
-with the same name always wins; Intendant's own discovery skips marked
-directories so a derived copy can never shadow its source; and
-materialized names are hidden from git via a managed block in the
-checkout's shared `.git/info/exclude` (one block covers all worktrees).
-Caps and the `INTENDANT_SKIP_SKILL_PROVISION` kill switch are documented
-in the configuration chapter's Skills section.
-
-Separately from per-project materialization, daemon startup installs the
-builtin `distribution: global` skills into `~/.agents/skills/` (same
-ownership contract), so they reach every agent on the machine — including
-unsupervised ones, whose actual authority over the daemon remains whatever
-IAM grants their principal. See "Global distribution" in the configuration
-chapter.
+Starting an external session never copies skills into its project. Personal
+global skills remain user-owned under `~/.agents/skills/`; personal
+project-scoped skills remain user-owned under the backend's normal project
+path and belong in that project's ignore rules. There is no
+Intendant-specific legacy skill path and no automatic mirroring between
+Claude Code's `.claude/skills/` and the Agent Skills standard
+`.agents/skills/`. See "Global distribution" in the configuration chapter.
 
 ## Configuration
 

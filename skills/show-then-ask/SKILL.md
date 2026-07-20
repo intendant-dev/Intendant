@@ -2,7 +2,6 @@
 name: show-then-ask
 description: Use when asking the user to choose between design or implementation variants, judge a before/after, or approve a visual change — show rendered previews on the dashboard question rail instead of describing them. Attach prototype HTML pages (interactive, sandboxed), images, or text snippets to a blocking `intendant ctl ask`; the user's choice or free-text reply returns as the command's stdout.
 compatibility: Requires a reachable Intendant daemon (supervised sessions have $INTENDANT and INTENDANT_MCP_URL injected).
-distribution: global
 ---
 
 > If `$INTENDANT`/`INTENDANT_MCP_URL` is unset and no local Intendant daemon answers, this skill does not apply — say so and stop.
