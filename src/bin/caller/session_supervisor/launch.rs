@@ -1264,6 +1264,22 @@ impl SessionSupervisor {
                     sub_agent_identity: sub_agent_wiring
                         .as_ref()
                         .map(|w| (w.child_name.clone(), w.role.clone())),
+                    // The native twin of the external bootstrap injection:
+                    // with a gateway up, every supervised native session's
+                    // runtime children see a session-scoped INTENDANT_MCP_URL
+                    // (a daemon-loopback capability token — never a provider
+                    // key), so `ctl` writes attribute to this session instead
+                    // of `local_process`. Sub-agents pass through here too,
+                    // each under its own minted id.
+                    runtime_mcp_env: web_port.map(|port| crate::agent_runner::RuntimeMcpEnv {
+                        url: crate::external_agent::intendant_bootstrap_mcp_url(
+                            port,
+                            Some(&session_id),
+                            None,
+                            Some(crate::web_gateway::loopback_mcp_auth_token()),
+                        ),
+                        session_id: session_id.clone(),
+                    }),
                 };
                 run_direct_mode(
                     provider,

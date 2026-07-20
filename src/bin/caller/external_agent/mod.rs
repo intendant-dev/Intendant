@@ -117,8 +117,10 @@ pub(super) fn intendant_mcp_bearer_token(
 /// session id is present the token is *session-scoped* (derived from the
 /// per-process token and the session id), so the backend authenticates as
 /// exactly that supervised agent session to the daemon's IAM layer and cannot
-/// present another session's identity.
-pub(super) fn intendant_bootstrap_mcp_url(
+/// present another session's identity. `pub(crate)`: the supervised NATIVE
+/// launch arm reuses the same builder for the runtime child's bootstrap
+/// ([`crate::agent_runner::RuntimeMcpEnv`]) so both lanes stay one shape.
+pub(crate) fn intendant_bootstrap_mcp_url(
     port: u16,
     session_id: Option<&str>,
     managed_context: Option<&str>,

@@ -663,6 +663,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: Some(due_ms),
+                    source: None,
                 },
                 None,
             )
@@ -710,16 +711,29 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: Some(now_ms() + 3_600_000),
+                    source: None,
                 },
                 None,
             )
             .unwrap();
         handle
-            .apply(AgendaCommand::Complete { id: future.id }, None)
+            .apply(
+                AgendaCommand::Complete {
+                    id: future.id,
+                    source: None,
+                },
+                None,
+            )
             .unwrap();
         // And completing the first item is fine even though it fired.
         handle
-            .apply(AgendaCommand::Complete { id: item_id }, None)
+            .apply(
+                AgendaCommand::Complete {
+                    id: item_id,
+                    source: None,
+                },
+                None,
+            )
             .unwrap();
         let wake = run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
         assert_eq!(wake, None, "no open due items ⇒ nothing scheduled");
@@ -808,6 +822,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    source: None,
                 },
                 None,
             )
@@ -819,6 +834,7 @@ mod tests {
                     goal: "run the nightly sweep".into(),
                     fire_at_ms,
                     orchestrate: false,
+                    source: None,
                 },
                 None,
             )
@@ -864,6 +880,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    source: None,
                 },
                 None,
             )
@@ -875,6 +892,7 @@ mod tests {
                     goal: "must not run".into(),
                     fire_at_ms: now_ms() - 60_000,
                     orchestrate: false,
+                    source: None,
                 },
                 None,
             )
@@ -974,6 +992,7 @@ mod tests {
                     goal: "run the nightly sweep, rev 2".into(),
                     fire_at_ms: now_ms() - 30_000,
                     orchestrate: false,
+                    source: None,
                 },
                 None,
             )

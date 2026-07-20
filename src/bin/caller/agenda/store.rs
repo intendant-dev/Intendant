@@ -5,8 +5,8 @@
 
 use super::types::{
     apply_op, counts, AgendaActor, AgendaCommand, AgendaCounts, AgendaItem, AgendaOp,
-    AgendaOpRecord, AgendaPatch, AgendaStatus, AGENDA_LOG_VERSION, MAX_BODY_BYTES, MAX_TAGS,
-    MAX_TAG_CHARS, MAX_TITLE_CHARS,
+    AgendaOpRecord, AgendaPatch, AgendaStatus, AGENDA_LOG_VERSION, MAX_BODY_BYTES,
+    MAX_SOURCE_CHARS, MAX_TAGS, MAX_TAG_CHARS, MAX_TITLE_CHARS,
 };
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -197,20 +197,22 @@ impl AgendaStore {
     /// fold. (`record_occurrence` is the one daemon-internal sibling.)
     pub(crate) fn apply_command(
         &mut self,
-        cmd: AgendaCommand,
+        mut cmd: AgendaCommand,
         actor: Option<AgendaActor>,
         now_ms: u64,
     ) -> Result<AgendaItem, AgendaError> {
         // Validate against the freshest state another instance may have left.
         self.refresh_if_stale()?;
+        let source = validate_source(cmd.take_source())?;
         let op = self.command_to_op(cmd)?;
-        self.append_op(op, actor, now_ms)
+        self.append_op(op, actor, source, now_ms)
     }
 
     fn append_op(
         &mut self,
         op: AgendaOp,
         actor: Option<AgendaActor>,
+        source: Option<String>,
         now_ms: u64,
     ) -> Result<AgendaItem, AgendaError> {
         let item_id = op.item_id().to_string();
@@ -218,6 +220,7 @@ impl AgendaStore {
             v: AGENDA_LOG_VERSION,
             at_ms: now_ms,
             actor,
+            source,
             op,
         };
         let mut line = serde_json::to_string(&record)
@@ -243,6 +246,8 @@ impl AgendaStore {
     }
 
     fn command_to_op(&mut self, cmd: AgendaCommand) -> Result<AgendaOp, AgendaError> {
+        // `source` is detached (and validated) in `apply_command` before the
+        // translation — the remaining fields are the op's.
         match cmd {
             AgendaCommand::Add {
                 kind,
@@ -250,6 +255,7 @@ impl AgendaStore {
                 body,
                 tags,
                 due_ms,
+                source: _,
             } => Ok(AgendaOp::Add {
                 id: self.mint_id()?,
                 kind,
@@ -258,7 +264,11 @@ impl AgendaStore {
                 tags: validate_tags(tags)?,
                 due_ms,
             }),
-            AgendaCommand::Patch { id, patch } => {
+            AgendaCommand::Patch {
+                id,
+                patch,
+                source: _,
+            } => {
                 self.require(&id)?;
                 if patch.is_empty() {
                     return Err(AgendaError::Invalid("patch changes nothing".into()));
@@ -277,24 +287,28 @@ impl AgendaStore {
                 };
                 Ok(AgendaOp::Patch { id, patch })
             }
-            AgendaCommand::Complete { id } => match self.require(&id)?.status {
+            AgendaCommand::Complete { id, source: _ } => match self.require(&id)?.status {
                 AgendaStatus::Open => Ok(AgendaOp::Complete { id }),
                 AgendaStatus::Done => Err(AgendaError::Transition(format!("{id} is already done"))),
                 AgendaStatus::Retired => Err(AgendaError::Transition(format!(
                     "{id} is retired — reopen it first"
                 ))),
             },
-            AgendaCommand::Reopen { id } => match self.require(&id)?.status {
+            AgendaCommand::Reopen { id, source: _ } => match self.require(&id)?.status {
                 AgendaStatus::Done | AgendaStatus::Retired => Ok(AgendaOp::Reopen { id }),
                 AgendaStatus::Open => Err(AgendaError::Transition(format!("{id} is already open"))),
             },
-            AgendaCommand::Retire { id } => match self.require(&id)?.status {
+            AgendaCommand::Retire { id, source: _ } => match self.require(&id)?.status {
                 AgendaStatus::Retired => {
                     Err(AgendaError::Transition(format!("{id} is already retired")))
                 }
                 AgendaStatus::Open | AgendaStatus::Done => Ok(AgendaOp::Retire { id }),
             },
-            AgendaCommand::Answer { id, text } => {
+            AgendaCommand::Answer {
+                id,
+                text,
+                source: _,
+            } => {
                 let item = self.require(&id)?;
                 if item.kind != super::types::AgendaKind::Question {
                     return Err(AgendaError::Invalid(format!(
@@ -319,6 +333,7 @@ impl AgendaStore {
                 goal,
                 fire_at_ms,
                 orchestrate,
+                source: _,
             } => {
                 let item = self.require(&id)?;
                 if item.status != AgendaStatus::Open {
@@ -431,7 +446,7 @@ impl AgendaStore {
             session_id: write.session_id,
             note: write.note.map(|n| n.chars().take(500).collect()),
         };
-        self.append_op(op, None, now_ms)
+        self.append_op(op, None, None, now_ms)
     }
 
     fn require(&self, id: &str) -> Result<&AgendaItem, AgendaError> {
@@ -525,6 +540,26 @@ fn parse_record(line: &str) -> Result<AgendaOpRecord, String> {
     serde_json::from_value(value).map_err(|err| format!("malformed {op_type} op: {err}"))
 }
 
+/// The self-described `--source` label: trimmed, bounded, present-or-absent
+/// — an empty label is a caller mistake, not "no label".
+fn validate_source(source: Option<String>) -> Result<Option<String>, AgendaError> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let source = source.trim();
+    if source.is_empty() {
+        return Err(AgendaError::Invalid(
+            "source label must not be empty — omit it instead".into(),
+        ));
+    }
+    if source.chars().count() > MAX_SOURCE_CHARS {
+        return Err(AgendaError::Invalid(format!(
+            "source label exceeds {MAX_SOURCE_CHARS} characters"
+        )));
+    }
+    Ok(Some(source.to_string()))
+}
+
 fn validate_title(title: &str) -> Result<String, AgendaError> {
     let title = title.trim();
     if title.is_empty() {
@@ -596,6 +631,7 @@ mod tests {
             body: String::new(),
             tags: Vec::new(),
             due_ms: None,
+            source: None,
         }
     }
 
@@ -621,6 +657,7 @@ mod tests {
                     body: "whole, not oat".into(),
                     tags: vec![" grocery ".into(), "grocery".into(), "later".into()],
                     due_ms: Some(1_752_000_000_000),
+                    source: None,
                 },
                 owner(),
                 1000,
@@ -637,6 +674,7 @@ mod tests {
             .apply_command(
                 AgendaCommand::Complete {
                     id: item.id.clone(),
+                    source: None,
                 },
                 None,
                 2000,
@@ -718,14 +756,24 @@ mod tests {
         let mut store = AgendaStore::open(dir.path()).unwrap();
         let id = store.apply_command(add_cmd("t"), None, 1).unwrap().id;
 
-        let complete = AgendaCommand::Complete { id: id.clone() };
-        let reopen = AgendaCommand::Reopen { id: id.clone() };
-        let retire = AgendaCommand::Retire { id: id.clone() };
+        let complete = AgendaCommand::Complete {
+            id: id.clone(),
+            source: None,
+        };
+        let reopen = AgendaCommand::Reopen {
+            id: id.clone(),
+            source: None,
+        };
+        let retire = AgendaCommand::Retire {
+            id: id.clone(),
+            source: None,
+        };
 
         assert!(matches!(
             store.apply_command(
                 AgendaCommand::Complete {
-                    id: "01UNKNOWN".into()
+                    id: "01UNKNOWN".into(),
+                    source: None,
                 },
                 None,
                 2
@@ -770,6 +818,7 @@ mod tests {
                 body: "b".repeat(MAX_BODY_BYTES + 1),
                 tags: Vec::new(),
                 due_ms: None,
+                source: None,
             },
             AgendaCommand::Add {
                 kind: AgendaKind::Note,
@@ -777,6 +826,7 @@ mod tests {
                 body: String::new(),
                 tags: vec!["  ".into()],
                 due_ms: None,
+                source: None,
             },
             AgendaCommand::Add {
                 kind: AgendaKind::Note,
@@ -784,6 +834,7 @@ mod tests {
                 body: String::new(),
                 tags: (0..=MAX_TAGS).map(|i| format!("t{i}")).collect(),
                 due_ms: None,
+                source: None,
             },
         ] {
             assert!(matches!(
@@ -797,6 +848,7 @@ mod tests {
                 AgendaCommand::Patch {
                     id,
                     patch: AgendaPatch::default(),
+                    source: None,
                 },
                 None,
                 3,
@@ -825,6 +877,7 @@ mod tests {
                         due_ms: Some(Some(42)),
                         ..AgendaPatch::default()
                     },
+                    source: None,
                 },
                 None,
                 2,
@@ -840,6 +893,7 @@ mod tests {
                         due_ms: Some(None),
                         ..AgendaPatch::default()
                     },
+                    source: None,
                 },
                 None,
                 3,
@@ -897,6 +951,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    source: None,
                 },
                 None,
                 1,
@@ -911,7 +966,8 @@ mod tests {
             store.apply_command(
                 AgendaCommand::Answer {
                     id: task.id.clone(),
-                    text: "irrelevant".into()
+                    text: "irrelevant".into(),
+                    source: None,
                 },
                 None,
                 3,
@@ -922,7 +978,8 @@ mod tests {
             store.apply_command(
                 AgendaCommand::Answer {
                     id: question.id.clone(),
-                    text: "   ".into()
+                    text: "   ".into(),
+                    source: None,
                 },
                 None,
                 4,
@@ -934,6 +991,7 @@ mod tests {
                 AgendaCommand::Answer {
                     id: question.id.clone(),
                     text: "yes, before Friday".into(),
+                    source: None,
                 },
                 owner(),
                 5,
@@ -950,7 +1008,8 @@ mod tests {
             store.apply_command(
                 AgendaCommand::Answer {
                     id: question.id.clone(),
-                    text: "again".into()
+                    text: "again".into(),
+                    source: None,
                 },
                 None,
                 6,
@@ -963,6 +1022,77 @@ mod tests {
         let reloaded = store.get(&question.id).unwrap();
         assert_eq!(reloaded.answer.as_ref().unwrap().text, "yes, before Friday");
         assert_eq!(reloaded.status, AgendaStatus::Done);
+    }
+
+    /// `--source` labels: validated at intake (trimmed, bounded, never
+    /// empty), recorded on the envelope, folded into add provenance, and
+    /// persistent across reopen. Owner-surface verbs have no such field.
+    #[test]
+    fn source_labels_validate_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+
+        let item = store
+            .apply_command(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Task,
+                    title: "rotate certs".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: Some("  deploy-hook  ".into()),
+                },
+                None,
+                1,
+            )
+            .unwrap();
+        assert_eq!(item.provenance.source.as_deref(), Some("deploy-hook"));
+
+        // Whitespace-only and oversized labels are caller mistakes.
+        for bad in [" ".to_string(), "x".repeat(MAX_SOURCE_CHARS + 1)] {
+            assert!(matches!(
+                store.apply_command(
+                    AgendaCommand::Add {
+                        kind: AgendaKind::Task,
+                        title: "t".into(),
+                        body: String::new(),
+                        tags: Vec::new(),
+                        due_ms: None,
+                        source: Some(bad),
+                    },
+                    None,
+                    2,
+                ),
+                Err(AgendaError::Invalid(_))
+            ));
+        }
+
+        // A labeled non-add op records the label on its envelope line.
+        store
+            .apply_command(
+                AgendaCommand::Complete {
+                    id: item.id.clone(),
+                    source: Some("deploy-hook".into()),
+                },
+                None,
+                3,
+            )
+            .unwrap();
+        let raw = std::fs::read_to_string(store.log_path()).unwrap();
+        let completes: Vec<&str> = raw
+            .lines()
+            .filter(|line| line.contains(r#""type":"complete""#))
+            .collect();
+        assert_eq!(completes.len(), 1);
+        assert!(completes[0].contains(r#""source":"deploy-hook""#));
+
+        // Reopen the store: the folded provenance still carries the label.
+        drop(store);
+        let store = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.get(&item.id).unwrap().provenance.source.as_deref(),
+            Some("deploy-hook")
+        );
     }
 
     /// Two daemons on one home share the log; each converges on the
@@ -978,6 +1108,7 @@ mod tests {
         b.apply_command(
             AgendaCommand::Complete {
                 id: from_a.id.clone(),
+                source: None,
             },
             None,
             2,

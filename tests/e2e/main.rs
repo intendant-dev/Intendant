@@ -1354,6 +1354,135 @@ async fn ctl_session_note_posts_a_display_only_note_with_image() {
     .await;
 }
 
+/// F1 attribution coverage, end to end: a NATIVE supervised session runs
+/// `intendant ctl agenda add` as an ordinary shell command through the
+/// sandboxed runtime, and the parked item's durable actor is
+/// `agent_session` with that session's id — proof the session-scoped
+/// `INTENDANT_MCP_URL` injection reaches the runtime's command env and the
+/// gate resolves it (before this, native-session ctl recorded an anonymous
+/// `local_process`). The in-session command refuses to run without the
+/// injected URL, so a broken injection fails HERE and can never fall back
+/// onto some other daemon's default port.
+#[tokio::test]
+async fn native_session_ctl_agenda_add_attributes_to_the_session() {
+    let intendant = intendant_bin();
+    let script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Parking the follow-up on the agenda.",
+                  "tool_calls": [{ "name": "exec_command",
+                                   "arguments": { "nonce": 1, "command": format!(
+                                       "[ -n \"$INTENDANT_MCP_URL\" ] || {{ echo NO_INJECTED_MCP_URL >&2; exit 1; }}; \
+                                        \"{intendant}\" ctl agenda add parked-from-inside --task"
+                                   ) } }] },
+                { "content": "Parked.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "agenda write done" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let daemon = spawn_daemon(&client, &script).await;
+    let port = daemon.port;
+
+    let started = ctl(
+        &daemon,
+        &[
+            "task",
+            "start",
+            "--direct",
+            "--task",
+            "park an agenda follow-up",
+        ],
+    )
+    .await;
+    assert!(started.status.success(), "{}", text_of(&started));
+
+    // The durable proof: the item exists with session-grade attribution.
+    let item = poll_until(
+        "the agenda item parked from inside the session",
+        RUN_TIMEOUT,
+        || async {
+            let agenda =
+                http_get_json(&client, &format!("http://127.0.0.1:{port}/api/agenda")).await?;
+            agenda
+                .get("items")?
+                .as_array()?
+                .iter()
+                .find(|item| item["title"] == "parked-from-inside")
+                .cloned()
+        },
+        || {
+            format!(
+                "--- session logs ---\n{}\n--- daemon log tail ---\n{}",
+                tail(&daemon.rig.session_logs(), 2000),
+                daemon.log_tail()
+            )
+        },
+    )
+    .await;
+    let provenance = &item["provenance"];
+    assert_eq!(
+        provenance["kind"], "agent_session",
+        "ctl from inside a native session must attribute as the session, \
+         not local_process: {item}"
+    );
+    let recorded_sid = provenance["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("provenance must carry the session id: {item}"));
+
+    // And it is THIS daemon's real session, not an echoed or foreign id.
+    let sessions = http_get_json(&client, &format!("http://127.0.0.1:{port}/api/sessions"))
+        .await
+        .expect("GET /api/sessions");
+    let listed: Vec<String> = sessions["sessions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["session_id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        listed.iter().any(|sid| sid == recorded_sid),
+        "recorded session id {recorded_sid} not among the daemon's sessions {listed:?}"
+    );
+
+    // `--source` from an UNSUPERVISED caller (the ctl helper scrubs the
+    // bootstrap env): the item records `local_process` plus the
+    // self-described label as data beside the attribution — the exact
+    // inputs the card renders as "local ctl — self-described: LABEL".
+    let labeled = ctl(
+        &daemon,
+        &[
+            "agenda",
+            "add",
+            "labeled-from-hook",
+            "--task",
+            "--source",
+            "deploy-hook",
+        ],
+    )
+    .await;
+    assert!(labeled.status.success(), "{}", text_of(&labeled));
+    let agenda = http_get_json(&client, &format!("http://127.0.0.1:{port}/api/agenda"))
+        .await
+        .expect("GET /api/agenda");
+    let labeled_item = agenda["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|item| item["title"] == "labeled-from-hook")
+        .unwrap_or_else(|| panic!("labeled item missing from {agenda}"));
+    assert_eq!(labeled_item["provenance"]["source"], "deploy-hook");
+    assert_eq!(labeled_item["provenance"]["kind"], "local_process");
+    assert!(
+        labeled_item["provenance"].get("session_id").is_none(),
+        "a self-described label must never become session attribution: {labeled_item}"
+    );
+}
+
 /// Task #6 end to end, against the real binaries: a resumable upload
 /// rides direct HTTP as job create → capped raw chunks → commit,
 /// survives a "client restart" (re-list by handle, resume at the

@@ -418,6 +418,32 @@ fn apply_runtime_child_env_policy_from(
     }
 }
 
+/// Session-scoped MCP bootstrap injected into the runtime child's env
+/// (`INTENDANT_MCP_URL` + `INTENDANT_SESSION_ID`), the native twin of the
+/// external-backend injection (`external_agent::add_intendant_bootstrap_env`):
+/// `intendant ctl` run by any shell command inside a supervised native
+/// session then auto-attributes its writes to that session. The URL's
+/// `mcp_token` is a daemon-loopback capability token derived per session
+/// (`web_gateway::session_scoped_mcp_token`) — never a provider key, so the
+/// runtime-never-holds-API-keys boundary is untouched, and it grants nothing
+/// the session's own tool loop cannot already do.
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeMcpEnv {
+    pub(crate) url: String,
+    pub(crate) session_id: String,
+}
+
+/// Deliberate post-clear injection of the session's MCP bootstrap (see
+/// [`RuntimeMcpEnv`]). Call after [`apply_runtime_child_env_policy`] — the
+/// allowlist default-denies `INTENDANT_*` precisely so these values can only
+/// arrive through this explicit set, never from ambient process state.
+fn apply_runtime_mcp_env(command: &mut Command, mcp_env: Option<&RuntimeMcpEnv>) {
+    if let Some(mcp_env) = mcp_env {
+        command.env("INTENDANT_MCP_URL", &mcp_env.url);
+        command.env("INTENDANT_SESSION_ID", &mcp_env.session_id);
+    }
+}
+
 pub struct AgentOutput {
     pub stdout: String,
     pub stderr: String,
@@ -582,6 +608,7 @@ pub async fn run_agent(
     workdir: &std::path::Path,
     user_display_granted: bool,
     has_ask_human: bool,
+    mcp_env: Option<&RuntimeMcpEnv>,
 ) -> Result<AgentOutput, CallerError> {
     // Linux enforces this via Landlock inside the runtime; macOS wraps the
     // runtime in sandbox-exec; Windows re-execs inside the runtime under a
@@ -634,6 +661,7 @@ pub async fn run_agent(
                 Some(&sandbox),
                 user_display_granted,
                 has_ask_human,
+                mcp_env,
             )
             .await;
         }
@@ -645,6 +673,7 @@ pub async fn run_agent(
         None,
         user_display_granted,
         has_ask_human,
+        mcp_env,
     )
     .await
 }
@@ -665,10 +694,12 @@ pub async fn run_agent_sandboxed(
         Some(sandbox),
         user_display_granted,
         has_ask_human,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_inner(
     json_input: &str,
     log_dir: &std::path::Path,
@@ -676,6 +707,7 @@ async fn run_agent_inner(
     sandbox: Option<&crate::sandbox::SandboxConfig>,
     user_display_granted: bool,
     has_ask_human: bool,
+    mcp_env: Option<&RuntimeMcpEnv>,
 ) -> Result<AgentOutput, CallerError> {
     // Authenticate every result line with a fresh, controller-minted
     // secret. Arm askHuman after it so both internal fields ride the same
@@ -721,6 +753,7 @@ async fn run_agent_inner(
     let mut cmd = Command::new(&agent_path);
 
     apply_runtime_child_env_policy(&mut cmd);
+    apply_runtime_mcp_env(&mut cmd, mcp_env);
     cmd.env("INTENDANT_LOG_DIR", log_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1186,6 +1219,68 @@ mod tests {
             envs.iter()
                 .all(|(key, value)| key != OsStr::new("SHOULD_BE_CLEARED") || value.is_none()),
             "env_clear must discard entries set before the policy"
+        );
+    }
+
+    /// The session MCP bootstrap is a deliberate post-clear injection (the
+    /// native twin of the external
+    /// `external_child_env_policy_copies_allowed_and_keeps_later_injections`
+    /// pin): an ambient `INTENDANT_MCP_URL` never crosses the clear, and the
+    /// injected values do.
+    #[test]
+    fn runtime_mcp_env_injection_survives_the_clear() {
+        use std::ffi::OsString;
+
+        let inherited: Vec<(OsString, OsString)> = [
+            ("PATH", "/usr/bin"),
+            (
+                "INTENDANT_MCP_URL",
+                "http://localhost:1/mcp?mcp_token=stale",
+            ),
+            ("INTENDANT_SESSION_ID", "stale-session"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect();
+        let passthrough = intendant_core::env_scrub::env_passthrough_set(None);
+
+        let mut cleared_only = Command::new("true");
+        apply_runtime_child_env_policy_from(&mut cleared_only, inherited.clone(), &passthrough);
+        apply_runtime_mcp_env(&mut cleared_only, None);
+        let absent = |cmd: &Command, name: &str| {
+            cmd.as_std()
+                .get_envs()
+                .all(|(key, value)| key.to_string_lossy() != name || value.is_none())
+        };
+        assert!(
+            absent(&cleared_only, "INTENDANT_MCP_URL")
+                && absent(&cleared_only, "INTENDANT_SESSION_ID"),
+            "ambient bootstrap vars must not cross the clear"
+        );
+
+        let mut injected = Command::new("true");
+        apply_runtime_child_env_policy_from(&mut injected, inherited, &passthrough);
+        apply_runtime_mcp_env(
+            &mut injected,
+            Some(&RuntimeMcpEnv {
+                url: "http://localhost:8765/mcp?session_id=sess-1&mcp_token=derived".to_string(),
+                session_id: "sess-1".to_string(),
+            }),
+        );
+        let value_of = |cmd: &Command, name: &str| {
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| key.to_string_lossy() == name)
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(
+            value_of(&injected, "INTENDANT_MCP_URL").as_deref(),
+            Some("http://localhost:8765/mcp?session_id=sess-1&mcp_token=derived"),
+            "the session-scoped URL must be exactly the injected one"
+        );
+        assert_eq!(
+            value_of(&injected, "INTENDANT_SESSION_ID").as_deref(),
+            Some("sess-1")
         );
     }
 
