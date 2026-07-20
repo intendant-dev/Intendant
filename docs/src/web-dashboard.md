@@ -1888,6 +1888,7 @@ response omits the header.
 | GET | `/api/settings` | Settings | own origin | none | Current runtime settings |
 | POST | `/api/api-keys` | CredentialsManage | own origin | bounded | Store provider API keys in the daemon-config .env |
 | GET | `/api/api-key-status` | Settings | own origin | none | Which provider keys are configured (presence only) |
+| GET | `/api/local-daemons/tokens` | CredentialsManage | own origin | none | Loopback admission tokens for same-home daemon instances (owner handoff) |
 | POST | `/api/claude-auth/start` | CredentialsManage | own origin | ≤ 4 KiB | Start the Claude sign-in ceremony (`claude auth login` on a daemon-private PTY) |
 | GET | `/api/claude-auth/status` | CredentialsManage | own origin | none | Claude sign-in ceremony state (validated sign-in URL; account info on success) |
 | POST | `/api/claude-auth/code` | CredentialsManage | own origin | ≤ 2 KiB | Submit the pasted authorization code to the Claude sign-in ceremony |

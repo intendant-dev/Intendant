@@ -674,6 +674,114 @@ async fn tls_daemon_admits_tokened_cleartext_ctl_round_trip() {
     );
 }
 
+/// The same-home sibling-token handoff (ratified follow-up to the
+/// loopback admission token): an owner-posture caller on daemon A asks
+/// `/api/local-daemons/tokens` and receives the per-instance tokens A's
+/// state root holds — including sibling daemon B booted on the SAME
+/// home — and B's returned token admits B's owner surfaces. The route
+/// itself is owner-posture: tokenless callers are refused before it.
+#[tokio::test]
+async fn same_home_sibling_token_handoff_admits_the_sibling() {
+    let client = reqwest::Client::new();
+    let idle_script = serde_json::json!({ "profiles": [] });
+    let daemon_a = spawn_daemon(&client, &idle_script).await;
+    let port_a = daemon_a.port;
+
+    // Daemon B: booted by hand against the SAME rig home (`--web 0`,
+    // its own log file for the port parse).
+    let script_path = daemon_a.rig.write_script(&idle_script);
+    let log_b = daemon_a.rig.home.path().join("daemon-b.log");
+    let log_file = std::fs::File::create(&log_b).expect("daemon-b log");
+    let mut cmd = daemon_a.rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script_path)
+        .stdout(log_file.try_clone().expect("clone daemon-b log"))
+        .stderr(log_file)
+        .arg("--web")
+        .arg("0")
+        .args([
+            "--bind",
+            "127.0.0.1",
+            "--no-tui",
+            "--no-tls",
+            "--autonomy",
+            "full",
+        ]);
+    let mut child_b = cmd.spawn().expect("spawn sibling daemon");
+    let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
+    let port_b = loop {
+        let contents = std::fs::read_to_string(&log_b).unwrap_or_default();
+        if let Some(port) = dashboard_port(&contents) {
+            break port;
+        }
+        if let Ok(Some(status)) = child_b.try_wait() {
+            panic!("sibling daemon exited during startup ({status}):\n{contents}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sibling daemon never printed its Dashboard line:\n{contents}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert_ne!(port_a, port_b);
+
+    // Tokenless callers never reach the handoff (owner-posture only).
+    let refused = client
+        .get(format!(
+            "http://127.0.0.1:{port_a}/api/local-daemons/tokens"
+        ))
+        .send()
+        .await
+        .expect("tokenless handoff request completes");
+    assert_eq!(refused.status(), 401);
+
+    // The owner-posture caller receives both same-home instances…
+    let authed = daemon_a.authed_client();
+    let payload: serde_json::Value = authed
+        .get(format!(
+            "http://127.0.0.1:{port_a}/api/local-daemons/tokens"
+        ))
+        .send()
+        .await
+        .expect("handoff request completes")
+        .error_for_status()
+        .expect("handoff must serve the owner")
+        .json()
+        .await
+        .expect("handoff JSON");
+    let instances = payload["instances"].as_array().expect("instances array");
+    let entry = |port: u16| {
+        instances
+            .iter()
+            .find(|inst| inst["port"] == port)
+            .unwrap_or_else(|| panic!("port {port} missing from handoff: {payload}"))
+    };
+    assert_eq!(entry(port_a)["self"], true);
+    let sibling = entry(port_b);
+    assert_eq!(sibling["self"], false);
+    let sibling_token = sibling["token"].as_str().expect("sibling token");
+
+    // …and the sibling's token admits the sibling's owner surface.
+    let admitted = client
+        .get(format!("http://127.0.0.1:{port_b}/api/sessions"))
+        .header("x-intendant-loopback-token", sibling_token)
+        .send()
+        .await
+        .expect("sibling request completes");
+    assert!(
+        admitted.status().is_success(),
+        "sibling token must admit the sibling: {}",
+        admitted.status()
+    );
+    let denied = client
+        .get(format!("http://127.0.0.1:{port_b}/api/sessions"))
+        .send()
+        .await
+        .expect("tokenless sibling request completes");
+    assert_eq!(denied.status(), 401);
+
+    let _ = child_b.start_kill();
+}
+
 /// Parse a ctl run's stdout as the single JSON document the command prints.
 fn stdout_json(output: &std::process::Output) -> serde_json::Value {
     let stdout = String::from_utf8_lossy(&output.stdout);

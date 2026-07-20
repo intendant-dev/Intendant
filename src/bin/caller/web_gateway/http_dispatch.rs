@@ -1921,6 +1921,9 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::LocalDaemonTokens => {
+                return handle_local_daemon_tokens(stream, route.cors).await;
+            }
             RouteHandlerId::DashboardTabs => {
                 let response =
                     crate::web_gateway::dashboard_tabs_api_response(dashboard_control.tabs());

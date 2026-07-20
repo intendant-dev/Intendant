@@ -358,6 +358,9 @@ pub(crate) enum RouteHandlerId {
     /// connect status payload).
     AccessFleetCertRequest,
     DashboardTargets,
+    /// Same-home sibling loopback-token handoff (owner surfaces open
+    /// sibling daemons friction-free).
+    LocalDaemonTokens,
     /// Live dashboard connections (tab presence): the tabs registry
     /// snapshot with voice/input-authority ownership joined in.
     DashboardTabs,
@@ -1512,6 +1515,21 @@ pub(crate) static ROUTES: &[Route] = &[
         "Which provider keys are configured (presence only)",
     )
     .with_tunnel(tunnel_method("api_key_status")),
+    // ── Same-home sibling loopback-token handoff (ratified 2026-07-20):
+    //    the response contains per-boot loopback admission tokens, so
+    //    the route rides the credential-custody operation like the
+    //    sign-in ceremonies below — no peer profile (peer-root included)
+    //    and no scoped default carries it. HTTP-only, no tunnel twin:
+    //    the consumer is the trusted dashboard's open-sibling action,
+    //    and the payload must never leave the daemon's own origin.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/local-daemons/tokens"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::LocalDaemonTokens,
+        "Loopback admission tokens for same-home daemon instances (owner handoff)",
+    ),
     // ── Claude sign-in ceremony (claude_auth_ceremony.rs): the dashboard
     //    walks the owner through `claude auth login` on a daemon-private
     //    PTY. Gated on the credential-custody operation — the same class
