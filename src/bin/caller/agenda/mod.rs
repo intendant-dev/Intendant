@@ -29,12 +29,16 @@
 //! later D0-Agenda-Data gate can migrate this local log into the owner
 //! plane without a vocabulary break.
 
+mod ask;
+mod blobs;
 mod handle;
 mod reminders;
 mod scheduler;
 mod store;
 mod types;
 
+pub(crate) use ask::{agenda_ask_pending, spawn_ask_resolver};
+pub(crate) use blobs::find_blob;
 pub(crate) use handle::AgendaHandle;
 pub(crate) use reminders::ReminderPolicyPatch;
 pub(crate) use scheduler::spawn_reminder_scheduler;

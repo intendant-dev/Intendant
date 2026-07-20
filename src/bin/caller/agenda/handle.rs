@@ -119,7 +119,17 @@ impl AgendaHandle {
                 ..
             }
         );
+        let parked_ask = matches!(&cmd, AgendaCommand::Ask { .. });
+        let reopened = matches!(&cmd, AgendaCommand::Reopen { .. });
+        let closing = match &cmd {
+            AgendaCommand::Answer { .. } => Some("answer"),
+            // Complete/Retire from another surface (the Agenda tab, ctl)
+            // still clears every rail holding the ask.
+            AgendaCommand::Complete { .. } | AgendaCommand::Retire { .. } => Some("skip"),
+            _ => None,
+        };
         let proposed = matches!(&cmd, AgendaCommand::ProposeEffect { .. });
+        let actor_session = actor.as_ref().and_then(|actor| actor.session_id.clone());
         let (item, counts) = {
             let mut store = self.lock();
             let item = store.apply_command(cmd, actor, now_ms())?;
@@ -144,6 +154,31 @@ impl AgendaHandle {
                 ts: now_ms(),
             });
         }
+        // A parked RICH ask rides the live question rail instead: the
+        // existing UserQuestionRequired pipeline (panel, previews,
+        // state-line reconnect replay, attention nudge) renders it exactly
+        // like a blocking ask — no daemon-side deadline, nothing waiting.
+        // Reopen re-asks: the same emission surfaces the question again.
+        if parked_ask {
+            self.announce_ask(&item, actor_session);
+        } else if reopened {
+            let session = item.provenance.session_id.clone();
+            self.announce_ask(&item, session);
+        }
+        // Any resolution of an ask-backed item — a rail answer recorded by
+        // the resolver, a text answer typed on the Agenda tab, a
+        // complete/retire — clears every connected rail.
+        if let Some(action) = closing {
+            if item.status != super::types::AgendaStatus::Open {
+                if let Some(ask) = &item.ask {
+                    self.bus.send(AppEvent::ApprovalResolved {
+                        session_id: item.provenance.session_id.clone(),
+                        id: ask.ask_id,
+                        action: action.to_string(),
+                    });
+                }
+            }
+        }
         // A proposed manifest is a pending owner decision: badge the
         // attention rail so it gets reviewed. Nothing fires unapproved.
         if proposed {
@@ -163,6 +198,92 @@ impl AgendaHandle {
         }
         self.reminder_nudge.notify_waiters();
         Ok(item)
+    }
+
+    /// Emit the rail announcement for an open ask-backed item. `session`
+    /// attributes the question to the asking session while it lives; the
+    /// panel copes with a gone session (answers match on the ask id
+    /// alone).
+    fn announce_ask(&self, item: &AgendaItem, session: Option<String>) {
+        let Some(ask) = &item.ask else { return };
+        if item.status != super::types::AgendaStatus::Open {
+            return;
+        }
+        self.bus.send(AppEvent::UserQuestionRequired {
+            session_id: session,
+            id: ask.ask_id,
+            questions: ask.questions.clone(),
+            // Parked questions never expire and cannot be held — the
+            // whole point is durability.
+            expires_at_ms: None,
+            held: false,
+        });
+    }
+
+    /// Record the rail's structured answer on the open ask-backed item
+    /// holding `ask_id`, completing it. The joined text summary is built
+    /// in item-question order; `ApprovalResolved` (emitted by
+    /// [`AgendaHandle::apply`]'s closing path) clears every connected
+    /// rail. The write is unattributed: the uniform `ControlCommand` bus
+    /// lane carries no gate-resolved actor (see `agenda/ask.rs`).
+    pub(crate) fn answer_ask(
+        &self,
+        ask_id: u64,
+        resolution: super::types::AgendaAskResolution,
+    ) -> Result<AgendaItem, AgendaError> {
+        let item = self
+            .open_ask_item(ask_id)
+            .ok_or_else(|| AgendaError::NotFound(format!("no open ask {ask_id}")))?;
+        let questions = item
+            .ask
+            .as_ref()
+            .map(|ask| ask.questions.as_slice())
+            .unwrap_or_default();
+        let text = super::ask::answer_summary(questions, &resolution);
+        if text.trim().is_empty() {
+            return Err(AgendaError::Invalid("empty answer".into()));
+        }
+        self.apply(
+            AgendaCommand::Answer {
+                id: item.id.clone(),
+                text,
+                structured: Some(resolution),
+            },
+            None,
+        )
+    }
+
+    /// Record a rail dismissal (skip/deny/approve verbs) on the open
+    /// ask-backed item holding `ask_id`: a marker in the log, the item
+    /// stays OPEN — a parked question survives dismissal. Emits
+    /// `ApprovalResolved` so every connected rail clears now; the question
+    /// re-surfaces on the next dashboard load while it stays open.
+    pub(crate) fn dismiss_ask(&self, ask_id: u64, action: &str) -> Result<AgendaItem, AgendaError> {
+        let target = self
+            .open_ask_item(ask_id)
+            .ok_or_else(|| AgendaError::NotFound(format!("no open ask {ask_id}")))?;
+        let (item, counts) = {
+            let mut store = self.lock();
+            let item = store.dismiss_question(&target.id, action, None, now_ms())?;
+            let counts = store.counts();
+            (item, counts)
+        };
+        self.bus.send(AppEvent::AgendaChanged {
+            item: item.clone(),
+            counts,
+        });
+        self.bus.send(AppEvent::ApprovalResolved {
+            session_id: item.provenance.session_id.clone(),
+            id: ask_id,
+            action: action.to_string(),
+        });
+        self.reminder_nudge.notify_waiters();
+        Ok(item)
+    }
+
+    /// The item currently holding `ask_id` as an OPEN rich ask, if any.
+    pub(crate) fn open_ask_item(&self, ask_id: u64) -> Option<AgendaItem> {
+        self.lock().open_ask(ask_id)
     }
 
     /// Daemon-internal occurrence write-back (scheduler only): appends the
@@ -385,6 +506,244 @@ mod tests {
             )
             .unwrap();
         assert!(revoked.effects[0].approval.is_none());
+    }
+
+    fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<AppEvent>) -> Vec<AppEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// Slice 1's rail contract at handle level: parking a rich ask emits
+    /// the exact live-ask announcement (no deadline, not held, attributed
+    /// to the asking session); a structured answer completes the item and
+    /// clears every rail via ApprovalResolved; dismissal keeps it open
+    /// (marker + rail clear); reopen re-announces.
+    #[tokio::test]
+    async fn parked_ask_rides_the_question_rail_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+
+        let parked = handle
+            .apply(
+                AgendaCommand::Ask {
+                    questions: vec![crate::mcp::AskUserQuestionParams {
+                        question: "Which grid?".into(),
+                        header: Some("Grid".into()),
+                        options: vec![crate::mcp::AskUserOptionParams {
+                            label: "A".into(),
+                            description: None,
+                        }],
+                        previews: Vec::new(),
+                        pick_min: None,
+                        pick_max: None,
+                        free_text: None,
+                    }],
+                },
+                actor("agent_session", Some("sess-park")),
+            )
+            .unwrap();
+        let ask_id = parked.ask.as_ref().unwrap().ask_id;
+        let events = drain_events(&mut rx);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AppEvent::AgendaChanged { .. })));
+        let announced = events.iter().find_map(|event| match event {
+            AppEvent::UserQuestionRequired {
+                session_id,
+                id,
+                questions,
+                expires_at_ms,
+                held,
+            } => Some((
+                session_id.clone(),
+                *id,
+                questions.clone(),
+                *expires_at_ms,
+                *held,
+            )),
+            _ => None,
+        });
+        let (session, id, questions, expires, held) = announced.expect("rail announcement");
+        assert_eq!(session.as_deref(), Some("sess-park"));
+        assert_eq!(id, ask_id);
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].question, "Which grid?");
+        assert_eq!(expires, None, "parked asks never expire");
+        assert!(!held);
+        // No parked-question notification for rich asks — the rail (and
+        // its attention nudge) is the surface.
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AppEvent::UserNotification { .. })));
+
+        // Rail dismissal: marker recorded, still open, rails cleared.
+        let dismissed = handle.dismiss_ask(ask_id, "skip").unwrap();
+        assert_eq!(dismissed.status, crate::agenda::AgendaStatus::Open);
+        assert_eq!(dismissed.dismissed.as_ref().unwrap().action, "skip");
+        let events = drain_events(&mut rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AppEvent::ApprovalResolved { id, action, .. }
+                if *id == ask_id && action == "skip"
+        )));
+
+        // Structured answer: completes, records both forms, clears rails.
+        let resolution = super::super::ask::resolution_from_wire(
+            std::collections::HashMap::from([("Which grid?".to_string(), "A".to_string())]),
+            std::collections::HashMap::from([("Which grid?".to_string(), vec!["A".to_string()])]),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        );
+        let answered = handle.answer_ask(ask_id, resolution).unwrap();
+        assert_eq!(answered.status, crate::agenda::AgendaStatus::Done);
+        assert_eq!(answered.answer.as_ref().unwrap().text, "A");
+        assert!(answered
+            .answer
+            .as_ref()
+            .unwrap()
+            .structured
+            .as_ref()
+            .is_some_and(|s| s.selections["Which grid?"] == vec!["A".to_string()]));
+        let events = drain_events(&mut rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AppEvent::ApprovalResolved { id, action, .. }
+                if *id == ask_id && action == "answer"
+        )));
+        // Answer on a resolved ask is refused (no open item holds the id).
+        assert!(handle
+            .answer_ask(
+                ask_id,
+                super::super::ask::resolution_from_wire(
+                    std::collections::HashMap::from([("Which grid?".to_string(), "B".into())]),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                )
+            )
+            .is_err());
+
+        // Reopen re-asks: the rail announcement fires again.
+        handle
+            .apply(
+                AgendaCommand::Reopen {
+                    id: parked.id.clone(),
+                },
+                None,
+            )
+            .unwrap();
+        let events = drain_events(&mut rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AppEvent::UserQuestionRequired { id, .. } if *id == ask_id
+        )));
+
+        // Complete from the Agenda tab clears rails too (action "skip").
+        handle
+            .apply(
+                AgendaCommand::Complete {
+                    id: parked.id.clone(),
+                },
+                None,
+            )
+            .unwrap();
+        let events = drain_events(&mut rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AppEvent::ApprovalResolved { id, action, .. }
+                if *id == ask_id && action == "skip"
+        )));
+    }
+
+    /// The daemon-side resolver end to end: an `AnswerQuestion`
+    /// ControlCommand naming a parked ask's id records the structured
+    /// answer and completes the item; a `Skip` records a dismissal and
+    /// leaves it open.
+    #[tokio::test]
+    async fn ask_resolver_records_rail_answers_and_dismissals() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = std::sync::Arc::new(AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus.clone(),
+            dir.path(),
+        ));
+        let _resolver = super::super::ask::spawn_ask_resolver(handle.clone());
+
+        let park = |text: &str| {
+            handle
+                .apply(
+                    AgendaCommand::Ask {
+                        questions: vec![crate::mcp::AskUserQuestionParams {
+                            question: text.to_string(),
+                            header: None,
+                            options: Vec::new(),
+                            previews: Vec::new(),
+                            pick_min: None,
+                            pick_max: None,
+                            free_text: None,
+                        }],
+                    },
+                    None,
+                )
+                .unwrap()
+        };
+        let answered_item = park("Ship it?");
+        let skipped_item = park("Rename it?");
+        let answered_ask = answered_item.ask.as_ref().unwrap().ask_id;
+        let skipped_ask = skipped_item.ask.as_ref().unwrap().ask_id;
+
+        bus.send(AppEvent::ControlCommand(
+            crate::event::ControlMsg::AnswerQuestion {
+                session_id: None,
+                id: answered_ask,
+                answers: std::collections::HashMap::from([(
+                    "Ship it?".to_string(),
+                    "yes".to_string(),
+                )]),
+                selections: std::collections::HashMap::new(),
+                followups: std::collections::HashMap::new(),
+                annotations: std::collections::HashMap::new(),
+            },
+        ));
+        bus.send(AppEvent::ControlCommand(crate::event::ControlMsg::Skip {
+            session_id: None,
+            id: skipped_ask,
+        }));
+
+        // The resolver runs async off the bus: poll the fold briefly.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (items, _, _) = handle.snapshot();
+            let answered = items
+                .iter()
+                .find(|item| item.id == answered_item.id)
+                .unwrap();
+            let skipped = items
+                .iter()
+                .find(|item| item.id == skipped_item.id)
+                .unwrap();
+            if answered.status == crate::agenda::AgendaStatus::Done && skipped.dismissed.is_some() {
+                assert_eq!(answered.answer.as_ref().unwrap().text, "yes");
+                assert_eq!(skipped.status, crate::agenda::AgendaStatus::Open);
+                assert_eq!(skipped.dismissed.as_ref().unwrap().action, "skip");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "resolver did not record the outcomes in time: answered={answered:?} skipped={skipped:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // The answered id left the pending registry; the skipped one
+        // stays (still open).
+        assert!(!super::super::ask::agenda_ask_pending(answered_ask));
+        assert!(super::super::ask::agenda_ask_pending(skipped_ask));
     }
 
     /// Approval binds the digest: an edit (re-propose) voids it, and a

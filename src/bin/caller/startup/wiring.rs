@@ -323,6 +323,10 @@ pub(crate) fn spawn_mode_web_gateway(
             ));
             // Detaches on drop like the mode listeners; one per daemon.
             let _scheduler = crate::agenda::spawn_reminder_scheduler(handle.clone());
+            // Resolves rail answers/dismissals for parked (agenda-backed)
+            // asks — nothing blocks on them, so the daemon records the
+            // outcome. Detaches on drop like the scheduler.
+            let _ask_resolver = crate::agenda::spawn_ask_resolver(handle.clone());
             Some(handle)
         }
         Err(err) => {

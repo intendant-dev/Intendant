@@ -197,6 +197,13 @@ pub(crate) const HOSTED_CONTROL_REQUEST_BODY_CAP_BYTES: usize = 64 * 1024;
 /// file-sized arguments (fs tools, upload-adjacent flows).
 pub(crate) const MCP_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
 
+/// Body cap for `POST /api/agenda/op` — the rich-ask park command carries
+/// inline preview payloads (≤8 MB decoded per ask, budgeted by the
+/// ask_user validator) as base64 inside JSON: 8 MB × 4/3 plus envelope
+/// overhead needs more than the default command cap; 16 MB matches the
+/// `/mcp` lane the ctl park path rides.
+pub(crate) const AGENDA_OP_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
+
 /// Body cap for the visual-freshness diagnostics sink (NDJSON transcript
 /// batches).
 pub(crate) const DIAGNOSTICS_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
@@ -348,8 +355,10 @@ pub(crate) enum RouteHandlerId {
     DashboardTabs,
     /// Agenda ledger snapshot (items + counts).
     AgendaList,
-    /// Apply one agenda command (add/answer/patch/transitions/effects).
+    /// Apply one agenda command (add/ask/answer/patch/transitions/effects).
     AgendaOp,
+    /// Raw bytes of one parked-ask preview blob (agenda blob store).
+    AgendaBlobRaw,
     /// Merge-patch the owner's reminder delivery policy.
     AgendaReminderPolicy,
     /// Bounded Memory claim search (q/limit/candidates query params).
@@ -887,15 +896,36 @@ pub(crate) static ROUTES: &[Route] = &[
         "Agenda ledger snapshot: items (oldest first) plus status counts",
     )
     .with_tunnel(tunnel_method("api_agenda_list")),
+    // Capped above Default: the rich-ask park command (`op:"ask"`)
+    // legitimately carries the ≤8 MB preview budget as base64 JSON.
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/agenda/op"),
         PeerOperation::AgendaWrite,
-        BodyPolicy::Default,
+        BodyPolicy::Capped(AGENDA_OP_BODY_CAP_BYTES),
         RouteHandlerId::AgendaOp,
-        "Apply one agenda command (add, answer, patch, transitions, or scheduled-session propose/approve/revoke)",
+        "Apply one agenda command (add, ask, answer, patch, transitions, or scheduled-session propose/approve/revoke)",
     )
     .with_tunnel(tunnel_method("api_agenda_op")),
+    // Parked-ask preview bytes (agenda blob store). Served with the same
+    // attachment + nosniff posture as the session-upload raw route; the
+    // dashboard consumes via authenticated fetch. HTTP-only for now — the
+    // rail's preview loader fetches plain URLs on every transport.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/agenda/blobs",
+            &[
+                SegmentSpec::Capture("item_id"),
+                SegmentSpec::Capture("blob_id"),
+                SegmentSpec::Literal("raw"),
+            ],
+        ),
+        PeerOperation::AgendaRead,
+        BodyPolicy::None,
+        RouteHandlerId::AgendaBlobRaw,
+        "Fetch one parked-ask preview blob's raw bytes (attachment; MIME sniffing disabled)",
+    ),
     // Reminder delivery policy is owner policy, not agenda authorship:
     // it rides the Settings operation (quiet hours and urgency decide how
     // loudly the daemon speaks — the same class as its other knobs), so
@@ -2782,6 +2812,13 @@ mod tests {
             policy("POST", "/api/diagnostics/visual-freshness"),
             BodyPolicy::Capped(DIAGNOSTICS_BODY_CAP_BYTES)
         );
+        // The agenda command lane accepts the rich-ask park payload: the
+        // ≤8 MB preview budget as base64 JSON needs more than Default.
+        assert_eq!(
+            policy("POST", "/api/agenda/op"),
+            BodyPolicy::Capped(AGENDA_OP_BODY_CAP_BYTES)
+        );
+        assert_eq!(AGENDA_OP_BODY_CAP_BYTES, 16 * 1024 * 1024);
         assert_eq!(
             policy("POST", "/api/claude-auth/start"),
             BodyPolicy::Capped(CLAUDE_AUTH_START_BODY_CAP_BYTES)
@@ -2946,6 +2983,16 @@ mod tests {
             PathPattern::Under("/api/session/current/uploads")
         );
         assert!(route.tunnel.is_none());
+        // Parked-ask preview blobs: two captures, literal raw tail.
+        let (route, captures) = match_route("GET", "/api/agenda/blobs/01ITEM/blob1/raw").unwrap();
+        assert_eq!(route.handler, RouteHandlerId::AgendaBlobRaw);
+        assert_eq!(
+            route.authz,
+            RouteAuthz::Operation(PeerOperation::AgendaRead)
+        );
+        assert_eq!(captures, vec!["01ITEM", "blob1"]);
+        assert!(match_route("GET", "/api/agenda/blobs/01ITEM/blob1/other").is_none());
+        assert!(match_route("POST", "/api/agenda/blobs/01ITEM/blob1/raw").is_none());
         // Agent-output: current-exact row first, then the by-id row.
         let (route, _) = match_route("POST", "/api/session/current/agent-output").unwrap();
         assert_eq!(route.handler, RouteHandlerId::CurrentAgentOutput);

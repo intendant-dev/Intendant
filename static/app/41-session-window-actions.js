@@ -4216,15 +4216,22 @@ function stopQuestionDeadlineTicker() {
   }
 }
 
-function showUserQuestion(id, questions, sessionId, expiresAtMs, held) {
+function showUserQuestion(id, questions, sessionId, expiresAtMs, held, opts) {
   if (processingLogReplay) return;
   const list = Array.isArray(questions) ? questions : [];
   if (!list.length) return;
+  // Agenda-backed (parked) ask re-shown on boot: nothing waits in any
+  // session — answers match on the ask id alone — so skip session
+  // attribution entirely (the asking session may be long gone, and the
+  // current-session fallback would mark an unrelated window "waiting"
+  // and expose the detached-session submit guard).
+  const agendaBacked = !!(opts && opts.agendaBacked);
   // Same-id re-delivery — a reconnect's state-line replay, the presence
-  // bootstrap, or the waiter's hold-flip refresh. The question content is
-  // immutable per id: fold in the countdown state and leave the built
-  // panel (including the user's tuck-away) untouched. Only a genuinely
-  // new question id rebuilds and force-surfaces the panel.
+  // bootstrap, the agenda boot announce, or the waiter's hold-flip
+  // refresh. The question content is immutable per id: fold in the
+  // countdown state and leave the built panel (including the user's
+  // tuck-away) untouched. Only a genuinely new question id rebuilds and
+  // force-surfaces the panel.
   if (pendingQuestion?.id === id
       && document.getElementById('question-panel')?.classList.contains('visible')) {
     applyQuestionDeadline(expiresAtMs, held);
@@ -4233,11 +4240,12 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held) {
   hideAllPanels();
   pendingQuestion = {
     id,
-    sessionId:
-      sessionId
-      || approvalSessionIds.get(String(id))
-      || currentSessionFullId
-      || '',
+    sessionId: agendaBacked
+      ? ''
+      : (sessionId
+        || approvalSessionIds.get(String(id))
+        || currentSessionFullId
+        || ''),
     questions: list,
   };
   if (pendingQuestion.sessionId) {

@@ -1331,6 +1331,11 @@ async fn run_ask(client: &reqwest::Client, config: &Config, raw: &[String]) -> R
         return Ok(());
     }
     let arguments = ask_args(raw)?;
+    // `--park` built the agenda command instead of ask_user args: the
+    // question becomes a durable agenda item and this returns immediately.
+    if arguments.get("op").and_then(Value::as_str) == Some("ask") {
+        return run_ask_park(client, config, arguments).await;
+    }
     let response = call_tool(client, config, "ask_user", arguments).await?;
     if config.raw {
         return print_json(&response);
@@ -1419,6 +1424,61 @@ async fn run_ask(client: &reqwest::Client, config: &Config, raw: &[String]) -> R
         Some("timeout") => Err("timed out waiting for an answer".to_string()),
         _ => Ok(()),
     }
+}
+
+/// `ask --park`: send the built agenda command, print `{status:"parked",
+/// item_id, ask_id}` (or the plain line). The rail id lets scripts watch
+/// for the eventual `answer` on the item.
+async fn run_ask_park(
+    client: &reqwest::Client,
+    config: &Config,
+    arguments: Value,
+) -> Result<(), String> {
+    let response = call_tool(client, config, "agenda_op", arguments).await?;
+    if config.raw {
+        return print_json(&response);
+    }
+    if let Some(error) = response.get("error") {
+        print_json(error)?;
+        return Err("MCP tool call failed".to_string());
+    }
+    let result = response
+        .get("result")
+        .ok_or_else(|| "JSON-RPC response missing result".to_string())?;
+    let text = single_text_content(result)
+        .ok_or_else(|| format!("unexpected agenda_op result shape: {result}"))?;
+    if result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        println!("{text}");
+        return Err("tool returned isError=true".to_string());
+    }
+    let outcome: Value = serde_json::from_str(text)
+        .map_err(|e| format!("unexpected agenda_op result payload: {e}: {text}"))?;
+    let item = outcome
+        .get("item")
+        .ok_or_else(|| format!("agenda_op returned no item: {outcome}"))?;
+    let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+    let ask_id = item
+        .get("ask")
+        .and_then(|ask| ask.get("ask_id"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if config.json {
+        print_json(&serde_json::json!({
+            "status": "parked",
+            "item_id": item_id,
+            "ask_id": ask_id,
+        }))?;
+    } else {
+        println!(
+            "parked {item_id} (ask {ask_id}) — the question is on the dashboard rail and the \
+             agenda; read the reply later with `intendant ctl agenda list --all`"
+        );
+    }
+    Ok(())
 }
 
 /// Split one `--preview-*` value: `LABEL=VALUE` (VALUE is a path or
@@ -1519,6 +1579,9 @@ fn collect_preview_args(args: &CommandArgs) -> Result<Vec<Value>, String> {
 /// Build `ask_user` arguments from `ask` flags. Options arrive as
 /// repeatable `--option "Label"` / `--option "Label:what it means"`;
 /// preview cards as repeatable `--preview-html/-image/-text LABEL=VALUE`.
+/// With `--park` the same flags build the `agenda_op` park command
+/// (`{"op":"ask","questions":[...]}`) instead: the question becomes a
+/// durable agenda item and nothing blocks.
 fn ask_args(raw: &[String]) -> Result<Value, String> {
     let args = parse_command_args(
         raw,
@@ -1533,8 +1596,22 @@ fn ask_args(raw: &[String]) -> Result<Value, String> {
             "--preview-image",
             "--preview-text",
         ],
-        &["--multi", "--free-text"],
+        &["--multi", "--free-text", "--park"],
     )?;
+    if args.has("--park") {
+        // Parked asks don't wait, and attribution comes from the calling
+        // session's gate binding — the blocking-only flags are refused.
+        if args.one("--wait").is_some() {
+            return Err("--park doesn't wait — drop --wait (parked questions never expire)".into());
+        }
+        if args.one("--session").is_some() {
+            return Err(
+                "--park attributes the question to the calling session automatically — drop \
+                 --session"
+                    .into(),
+            );
+        }
+    }
     if let Some(schema) = args.one("--schema") {
         // Full multi-question form from JSON — the single-question sugar
         // flags would be ambiguous next to it, so they are refused.
@@ -1571,6 +1648,9 @@ fn ask_args(raw: &[String]) -> Result<Value, String> {
                 ));
             }
             map.insert("wait_seconds".to_string(), Value::from(seconds));
+        }
+        if args.has("--park") {
+            return Ok(ask_park_command(map));
         }
         return Ok(Value::Object(map));
     }
@@ -1642,7 +1722,59 @@ fn ask_args(raw: &[String]) -> Result<Value, String> {
     if !previews.is_empty() {
         map.insert("previews".to_string(), Value::Array(previews));
     }
+    if args.has("--park") {
+        return Ok(ask_park_command(map));
+    }
     Ok(Value::Object(map))
+}
+
+/// Turn built `ask_user` arguments (flat or `questions` form) into the
+/// `agenda_op` park command. Call-level fields (wait, session) are
+/// dropped — a parked ask never waits, and attribution rides the gate;
+/// the flat form's `--multi` sugar becomes explicit pick bounds (the
+/// park wire speaks the precise per-question vocabulary only).
+fn ask_park_command(mut map: Map<String, Value>) -> Value {
+    map.remove("wait_seconds");
+    map.remove("session_id");
+    let questions = match map.remove("questions") {
+        Some(Value::Array(questions)) => questions,
+        _ => {
+            let mut question = Map::new();
+            for key in [
+                "question",
+                "header",
+                "options",
+                "previews",
+                "pick_min",
+                "pick_max",
+                "free_text",
+            ] {
+                if let Some(value) = map.remove(key) {
+                    question.insert(key.to_string(), value);
+                }
+            }
+            let multi = map
+                .remove("multi_select")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if multi && !question.contains_key("pick_max") {
+                let option_count = question
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|options| options.len())
+                    .unwrap_or(0);
+                if option_count > 0 {
+                    question.insert("pick_min".to_string(), Value::from(1));
+                    question.insert("pick_max".to_string(), Value::from(option_count));
+                }
+            }
+            vec![Value::Object(question)]
+        }
+    };
+    let mut command = Map::new();
+    command.insert("op".to_string(), Value::String("ask".to_string()));
+    command.insert("questions".to_string(), Value::Array(questions));
+    Value::Object(command)
 }
 
 /// Parse `--pick MIN[-MAX]` (e.g. "1", "0-3", "2-2" — MIN alone means
@@ -3578,10 +3710,18 @@ Examples:\n\
 fn help_ask() {
     println!(
         "Usage: intendant ctl ask \"QUESTION\" [--option \"Label[:desc]\"]... [--multi | --pick MIN[-MAX]] \\\n\
-\x20                          [--header TEXT] [--free-text] [--wait SECONDS] [--json] \\\n\
+\x20                          [--header TEXT] [--free-text] [--wait SECONDS] [--park] [--json] \\\n\
 \x20                          [--preview-html LABEL=FILE]... [--preview-image LABEL=FILE]... \\\n\
 \x20                          [--preview-text LABEL=TEXT]...\n\
-\x20      intendant ctl ask --schema FILE|- [--wait SECONDS] [--json]\n\
+\x20      intendant ctl ask --schema FILE|- [--wait SECONDS] [--park] [--json]\n\
+\n\
+--park makes the question DURABLE instead of blocking: it becomes an agenda\n\
+question item carrying the full payload (options, pick bounds, previews),\n\
+returns {{status:\"parked\", item_id, ask_id}} immediately, and stays on the\n\
+dashboard question rail until actually answered — surviving your session and\n\
+daemon restarts. Dismissal hides it from the rails but keeps it open; read\n\
+the reply later via `intendant ctl agenda list --all`. --wait and --session\n\
+don't combine with --park.\n\
 \n\
 --pick constrains selections (\"1\" exactly one, \"0-3\" up to three; 0 minimum\n\
 makes the question optional). --schema takes the multi-question JSON form —\n\
@@ -3880,6 +4020,67 @@ mod tests {
         assert_eq!(options[0]["description"], "Existing infra");
         assert_eq!(options[1]["label"], "sqlite");
         assert!(options[1].get("description").is_none());
+    }
+
+    /// `--park`: the same flags build the agenda park command — flat form
+    /// becomes one question object (with `--multi` translated to explicit
+    /// pick bounds), the schema form passes its questions through, and the
+    /// blocking-only flags are refused.
+    #[test]
+    fn ask_park_builds_agenda_command() {
+        let value = ask_args(&args(&[
+            "Which", "grid?", "--park", "--option", "A:dense", "--option", "B", "--multi",
+            "--header", "Grid",
+        ]))
+        .expect("park args");
+        assert_eq!(value["op"], "ask");
+        let questions = value["questions"].as_array().unwrap();
+        assert_eq!(questions.len(), 1);
+        let q = &questions[0];
+        assert_eq!(q["question"], "Which grid?");
+        assert_eq!(q["header"], "Grid");
+        assert_eq!(q["options"].as_array().unwrap().len(), 2);
+        // --multi sugar became precise bounds; the legacy switch is gone.
+        assert_eq!(q["pick_min"], 1);
+        assert_eq!(q["pick_max"], 2);
+        assert!(q.get("multi_select").is_none());
+        assert!(value.get("wait_seconds").is_none());
+        assert!(value.get("session_id").is_none());
+
+        // --pick rides through untranslated.
+        let value = ask_args(&args(&["Q", "--park", "--option", "A", "--pick", "0-1"])).unwrap();
+        assert_eq!(value["questions"][0]["pick_min"], 0);
+        assert_eq!(value["questions"][0]["pick_max"], 1);
+
+        // Blocking-only flags are refused with --park.
+        let err = ask_args(&args(&["Q", "--park", "--wait", "60"])).unwrap_err();
+        assert!(err.contains("--park doesn't wait"), "{err}");
+        let err = ask_args(&args(&["Q", "--park", "--session", "sess-1"])).unwrap_err();
+        assert!(err.contains("drop --session"), "{err}");
+    }
+
+    #[test]
+    fn ask_park_schema_form_passes_questions_and_drops_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = dir.path().join("ask.json");
+        std::fs::write(
+            &schema,
+            serde_json::json!({
+                "questions": [
+                    {"question": "Which lineage?", "options": [{"label": "A"}]},
+                    {"question": "Anything else?", "pick_min": 0}
+                ],
+                "wait_seconds": 240
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let value = ask_args(&args(&["--schema", schema.to_str().unwrap(), "--park"])).unwrap();
+        assert_eq!(value["op"], "ask");
+        let questions = value["questions"].as_array().unwrap();
+        assert_eq!(questions.len(), 2);
+        // The schema file's wait is call-level noise for a parked ask.
+        assert!(value.get("wait_seconds").is_none());
     }
 
     #[test]
