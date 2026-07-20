@@ -82,14 +82,20 @@ impl CredentialRefreshMonitor {
         let state = std::sync::Arc::new(std::sync::Mutex::new(mirror));
         let task_state = std::sync::Arc::clone(&state);
         let handle = tokio::spawn(async move {
+            let mut reported_error = false;
             loop {
                 tokio::time::sleep(CREDENTIAL_REFRESH_POLL_INTERVAL).await;
-                let result = task_state
-                    .lock()
-                    .map_err(|_| io::Error::other("Kimi credential refresh lock poisoned"))
-                    .and_then(|mut mirror| mirror.sync_once());
+                let state = std::sync::Arc::clone(&task_state);
+                let result = tokio::task::spawn_blocking(move || sync_refresh_state(&state))
+                    .await
+                    .map_err(|error| {
+                        io::Error::other(format!("Kimi credential refresh task panicked: {error}"))
+                    })
+                    .and_then(|result| result);
                 match result {
-                    Ok(CredentialRefreshSync::Unchanged | CredentialRefreshSync::Updated) => {}
+                    Ok(CredentialRefreshSync::Unchanged | CredentialRefreshSync::Updated) => {
+                        reported_error = false;
+                    }
                     Ok(CredentialRefreshSync::SourceChanged) => {
                         let _ = event_tx.send(super::AgentEvent::Log {
                             level: "warn".into(),
@@ -101,13 +107,15 @@ impl CredentialRefreshMonitor {
                         break;
                     }
                     Err(error) => {
-                        let _ = event_tx.send(super::AgentEvent::Log {
-                            level: "warn".into(),
-                            message: format!(
-                                "Could not persist a Kimi copy-fallback OAuth refresh: {error}"
-                            ),
-                        });
-                        break;
+                        if !reported_error {
+                            let _ = event_tx.send(super::AgentEvent::Log {
+                                level: "warn".into(),
+                                message: format!(
+                                    "Could not persist a Kimi copy-fallback OAuth refresh: {error}"
+                                ),
+                            });
+                            reported_error = true;
+                        }
                     }
                 }
             }
@@ -119,22 +127,26 @@ impl CredentialRefreshMonitor {
         self.handle.abort();
         let _ = (&mut self.handle).await;
         let state = std::sync::Arc::clone(&self.state);
-        tokio::task::spawn_blocking(move || {
-            let mut mirror = state
-                .lock()
-                .map_err(|_| io::Error::other("Kimi credential refresh lock poisoned"))?;
-            mirror.sync_once().map(|_| ())
-        })
-        .await
-        .map_err(|error| io::Error::other(format!("Kimi credential sync task panicked: {error}")))?
+        tokio::task::spawn_blocking(move || sync_refresh_state(&state).map(|_| ()))
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("Kimi credential sync task panicked: {error}"))
+            })?
     }
 
     pub(super) fn sync_on_drop(self) {
         self.handle.abort();
-        if let Ok(mut mirror) = self.state.lock() {
-            let _ = mirror.sync_once();
-        }
+        let _ = sync_refresh_state(&self.state);
     }
+}
+
+fn sync_refresh_state(
+    state: &std::sync::Arc<std::sync::Mutex<CredentialRefreshMirror>>,
+) -> io::Result<CredentialRefreshSync> {
+    state
+        .lock()
+        .map_err(|_| io::Error::other("Kimi credential refresh lock poisoned"))?
+        .sync_once()
 }
 
 fn prepare_credential_refresh_mirror(
@@ -225,11 +237,20 @@ impl CredentialRefreshMirror {
             return Ok(CredentialRefreshSync::SourceChanged);
         }
         validate_managed_bridge_path(&self.bridge_home)?;
-        let _lock = BridgeSyncLock::acquire(&self.primary_home)?;
-
         let mut bridge =
             read_regular_credential(&self.bridge_credential, "Kimi bridge credential")?;
-        let bridge_digest = credential_digest(&bridge);
+        let mut bridge_digest = credential_digest(&bridge);
+        if bridge_digest == self.synchronized_digest {
+            bridge.fill(0);
+            return Ok(CredentialRefreshSync::Unchanged);
+        }
+
+        let _lock = BridgeSyncLock::acquire(&self.primary_home)?;
+        // Another supervised session may have held the lock long enough for
+        // Kimi to rotate this bridge again. Adopt the newest complete file.
+        bridge.fill(0);
+        bridge = read_regular_credential(&self.bridge_credential, "Kimi bridge credential")?;
+        bridge_digest = credential_digest(&bridge);
         if bridge_digest == self.synchronized_digest {
             bridge.fill(0);
             return Ok(CredentialRefreshSync::Unchanged);
@@ -330,11 +351,17 @@ fn replace_private_credential(path: &Path, content: &[u8]) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("Kimi credential has no parent"))?;
     require_real_directory(parent, "Kimi primary credential directory")?;
     let (mut file, staged) = crate::file_watcher::stage_in(parent)?;
+    let staged_write = file.write_all(content).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = staged_write {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    if let Err(error) = set_private_file_permissions(&staged) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
     let result = (|| {
-        file.write_all(content)?;
-        file.sync_all()?;
-        set_private_file_permissions(&staged)?;
-        drop(file);
         let metadata = fs::symlink_metadata(path)?;
         reject_non_symlink_reparse(path, &metadata, "Kimi primary credential")?;
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
@@ -344,12 +371,23 @@ fn replace_private_credential(path: &Path, content: &[u8]) -> io::Result<()> {
             ));
         }
         crate::file_watcher::persist_staged(&staged, path)?;
-        set_private_file_permissions(path)
+        set_private_file_permissions(path)?;
+        sync_parent_directory(parent)
     })();
     if result.is_err() {
         let _ = fs::remove_file(staged);
     }
     result
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Pick the conventional `intendant` name unless a higher-precedence project
