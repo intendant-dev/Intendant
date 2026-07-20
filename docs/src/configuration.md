@@ -1198,25 +1198,27 @@ over personal skills of the same name.
 ### Global distribution
 
 At startup (daemon, headless, and MCP modes), the daemon installs every skill
-shipped inside the Intendant binary into `~/.agents/skills/` — the Agent
-Skills standard personal path that Codex and Intendant read. The setup
-scripts make `~/.claude/skills` an alias of that same directory on macOS,
-Linux, and Windows, so Claude Code sees the identical catalog. Installation
-is machine-scoped and idempotent: content-identical installs are no-ops,
-stale marked copies are swept on upgrade, and an unmarked user-authored
-directory with the same name always wins.
+shipped inside the Intendant binary independently into `~/.agents/skills/`
+for Codex and Intendant and `~/.claude/skills/` for Claude Code. Intendant
+never aliases, replaces, or otherwise takes ownership of either global root.
+If a root is a symlink, junction, file, or other non-directory object, it is
+left untouched and reported. Inside a normal directory, only per-skill
+directories carrying `.intendant-installed` are refreshed or removed;
+content-identical installs are no-ops, stale marked copies are swept on
+upgrade, and an unmarked user-authored directory with the same name always
+wins.
 
 The shipped sources remain tracked under this repository's `skills/` and are
 embedded in the binary (`builtin_skills.rs`, pinned to that directory by
 test). Starting a supervised Claude Code or Codex session performs no skill
 copying and writes nothing into the project.
 
-Personal global skills are installed manually under `~/.agents/skills/`.
-Personal project-scoped skills are installed manually in the backend's project
-path (`<project>/.agents/skills/` for Codex and Intendant, or
-`<project>/.claude/skills/` for Claude Code) and must be covered by that
-project's ignore rules; this repository ignores both. Intendant does not
-mirror private project skills between backend-specific paths.
+Personal global skills are installed manually in the backend's own path
+(`~/.agents/skills/` for Codex and Intendant or `~/.claude/skills/` for
+Claude Code). Personal project-scoped skills likewise stay in the backend's
+project path (`<project>/.agents/skills/` or `<project>/.claude/skills/`) and
+must be covered by that project's ignore rules; this repository ignores both.
+Intendant does not mirror personal skills between backend-specific paths.
 
 ## INTENDANT.md project instructions
 

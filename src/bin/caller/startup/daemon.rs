@@ -92,9 +92,8 @@ pub(crate) async fn run_daemon(
     daemon_startup_resume_dir: Option<PathBuf>,
     provider_identity: crate::usage_rail::ProviderIdentity,
 ) -> Result<(), CallerError> {
-    // Install every shipped builtin skill into ~/.agents/skills
-    // (marker-owned, no-op when unchanged) so every agent on this machine —
-    // supervised or not — can discover them.
+    // Install every shipped builtin skill independently for Agent Skills
+    // consumers and Claude Code (marker-owned, no-op when unchanged).
     crate::skill_install::install_global_skills_at_startup();
 
     // Retention guard for the daemon-global fallback store (projectless

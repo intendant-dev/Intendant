@@ -860,20 +860,20 @@ external CLI's own away-from-keyboard fallback.
 
 ## Skills
 
-Intendant installs every shipped skill machine-wide into
-`~/.agents/skills/` at daemon startup. The setup scripts alias
-`~/.claude/skills` to the same directory on every supported platform, so
+Intendant installs every shipped skill machine-wide into the independent
+`~/.agents/skills/` and `~/.claude/skills/` roots at daemon startup, so
 supervised and bare Codex or Claude Code sessions see the shipped catalog
-through their normal personal discovery. Installs are marker-owned and
-idempotent; an unmarked user-authored collision always wins.
+through their normal personal discovery. Intendant manages only marked
+per-skill directories: the roots themselves and unmarked user-authored
+collisions are always left untouched.
 
 Starting an external session never copies skills into its project. Personal
-global skills remain user-owned under `~/.agents/skills/`; personal
-project-scoped skills remain user-owned under the backend's normal project
-path and belong in that project's ignore rules. There is no
-Intendant-specific legacy skill path and no automatic mirroring between
-Claude Code's `.claude/skills/` and the Agent Skills standard
-`.agents/skills/`. See "Global distribution" in the configuration chapter.
+global and project-scoped skills remain user-owned under the backend's normal
+global or project path and belong in that project's ignore rules where
+applicable. There is no Intendant-specific legacy skill path and no automatic
+mirroring between Claude Code's `.claude/skills/` and the Agent Skills
+standard `.agents/skills/`. See "Global distribution" in the configuration
+chapter.
 
 ## Configuration
 

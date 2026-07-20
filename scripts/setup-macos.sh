@@ -474,21 +474,6 @@ run_check() {
     echo ""
 }
 
-
-# Claude Code reads ~/.claude/skills; point it at the Agent Skills
-# standard dir (~/.agents/skills) so personal and daemon-installed
-# skills reach it too. Never replaces a real user directory.
-link_claude_skills() {
-    mkdir -p "$HOME/.agents/skills"
-    if [ -e "$HOME/.claude/skills" ] && [ ! -L "$HOME/.claude/skills" ]; then
-        warn "~/.claude/skills is a real directory — leaving it; merge it into ~/.agents/skills to unify"
-        return 0
-    fi
-    mkdir -p "$HOME/.claude"
-    ln -sfn "$HOME/.agents/skills" "$HOME/.claude/skills"
-    ok "~/.claude/skills -> ~/.agents/skills"
-}
-
 run_install() {
     echo ""
     echo "════════════════════════════════════════════════════════"
@@ -525,9 +510,6 @@ run_install() {
 
     # Phase 6: Disable screensaver so the agent isn't interrupted
     disable_screen_lock
-
-    # Phase 6.5: unified skills dir for Claude Code
-    link_claude_skills
 
     # Phase 7: App bundle
     echo ""
