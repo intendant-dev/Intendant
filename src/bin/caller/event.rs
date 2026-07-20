@@ -425,6 +425,18 @@ pub enum AppEvent {
         session_id: Option<String>,
         activity: crate::types::SessionActivityVitals,
     },
+    /// A backend reported its provider rate-limit windows (Claude Code
+    /// `rate_limit_event`, Codex `account/rateLimits/updated`), delivered
+    /// at the report itself instead of riding the next usage snapshot — a
+    /// rejected turn produces no usage, and a between-turns warning would
+    /// otherwise wait for the next call. Keyed like `UsageSnapshot`.
+    /// Hub-internal like `SessionActivity`: the vitals hub folds it into
+    /// `SessionVitals.limits` (and its per-backend account view), which is
+    /// what reaches frontends — no outbound twin, never persisted.
+    SessionRateLimits {
+        session_id: Option<String>,
+        windows: Vec<crate::types::SessionLimitWindow>,
+    },
     /// Partial session-config facts (model / effort / permission mode)
     /// from a backend's protocol seams — launch config, init echoes,
     /// mid-session switches. Hub-internal like `SessionActivity`: the
@@ -2617,6 +2629,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         // Hub-internal: the vitals hub folds these into SessionVitals,
         // which is the outbound (and session-logged) carrier.
         AppEvent::SessionActivity { .. } => None,
+        AppEvent::SessionRateLimits { .. } => None,
         AppEvent::SessionConfigFacts { .. } => None,
         AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {
             session_id: session_id.clone(),

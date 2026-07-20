@@ -253,6 +253,7 @@ pub fn spawn_event_listener(
                     | AppEvent::SessionGoal { .. }
                     | AppEvent::SessionVitals { .. }
                     | AppEvent::SessionActivity { .. }
+                    | AppEvent::SessionRateLimits { .. }
                     | AppEvent::SessionConfigFacts { .. }
                     | AppEvent::SessionRenameResult { .. }
                     | AppEvent::SessionAgentConfigResult { .. }

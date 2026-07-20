@@ -83,6 +83,12 @@ struct MockStep {
     /// limit gauges keyless.
     #[serde(default)]
     limit_used_pct: Option<u8>,
+    /// Optional provider status for the scripted "5h" window
+    /// ("allowed_warning", "rejected", …) — exercises the status-driven
+    /// severity path (warning ingestion) keyless. Only meaningful
+    /// alongside `limit_used_pct`.
+    #[serde(default)]
+    limit_status: Option<String>,
     /// Scripted think-time before this step answers. E2e rigs use it to
     /// hold a boot-started task's first step until their dashboard
     /// connection is up — nothing replays missed rail events (e.g.
@@ -232,20 +238,19 @@ impl ChatProvider for MockProvider {
         } else {
             prompt_tokens / 2
         };
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let rate_limit_windows = step
             .limit_used_pct
             .map(|used_pct| {
                 vec![crate::types::SessionLimitWindow {
                     label: "5h".to_string(),
                     used_pct: Some(used_pct),
-                    resets_at_epoch: Some(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0)
-                            + 7200,
-                    ),
-                    status: None,
+                    resets_at_epoch: Some(now_epoch + 7200),
+                    status: step.limit_status.clone(),
+                    observed_at_epoch: Some(now_epoch),
                 }]
             })
             .unwrap_or_default();

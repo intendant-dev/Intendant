@@ -28,8 +28,24 @@
 //!   native loop directly), and this one consumer covers them all.
 //!   Epochs + raw state ride the wire; elapsed/stall derivation ticks
 //!   client-side.
+//! - **Limits segment**: rate-limit windows arrive both attached to usage
+//!   snapshots and as dedicated `AppEvent::SessionRateLimits` reports
+//!   (the carrier for the cases with no usage to ride — a rejected turn,
+//!   a between-turns warning). Provider windows are ACCOUNT-scoped truth,
+//!   not per-session: a subscription's 5h/7d window state is announced
+//!   only to sessions that happen to make a model call, so per-session
+//!   tracking left every other live session's chip claiming a stale
+//!   "allowed" through a warned span (observed live 2026-07-19). The hub
+//!   therefore keeps one window store per backend source ("claude-code",
+//!   "codex" — one authenticated account per backend per daemon, the
+//!   auth-ceremony model), folds every report into it freshest-first (per
+//!   label, by `observed_at_epoch`), and mirrors the merged account view
+//!   into every session of that source — including sessions that start
+//!   after the report. Native sessions have no backend source and keep
+//!   per-session windows (their per-minute API-key headers churn too fast
+//!   to be worth sharing).
 //!
-//! The two producers arrive keyed by different members of an external
+//! The producers arrive keyed by different members of an external
 //! session's identity group (git = wrapper/log id, usage = backend-native
 //! id), so the hub folds `SessionIdentity` linkages and canonicalizes
 //! every write — one entry, and one complete emitted snapshot, per
@@ -41,7 +57,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::event::{AppEvent, EventBus};
 use crate::frontend::ModelUsageSnapshot;
-use crate::types::{SessionCacheVitals, SessionConfigVitals, SessionGitVitals, SessionVitals};
+use crate::types::{
+    SessionCacheVitals, SessionConfigVitals, SessionGitVitals, SessionLimitWindow, SessionVitals,
+};
 
 /// Probe cadence. Each tick is a couple of subprocess ref reads per
 /// distinct checkout; emission only happens when the probed state changes.
@@ -620,6 +638,15 @@ struct SessionVitalsHub {
     /// wrapper). Chains are flattened at link time so `resolve` is one
     /// hop in practice; the hop cap is a cycle guard only.
     aliases: Mutex<HashMap<String, String>>,
+    /// canonical id → backend source ("claude-code", "codex"), fed by
+    /// `SessionIdentity`. Membership key for the account-scoped limits
+    /// fold; native sessions never appear here.
+    session_sources: Mutex<HashMap<String, String>>,
+    /// Per backend source: the account's latest known rate-limit windows,
+    /// by label, freshest report per window (`observed_at_epoch`). The
+    /// account outlives any one session, so a session starting mid-warning
+    /// inherits the known state instead of claiming ignorance.
+    account_limits: Mutex<HashMap<String, std::collections::BTreeMap<String, SessionLimitWindow>>>,
 }
 
 impl SessionVitalsHub {
@@ -628,6 +655,8 @@ impl SessionVitalsHub {
             bus,
             sessions: Mutex::new(HashMap::new()),
             aliases: Mutex::new(HashMap::new()),
+            session_sources: Mutex::new(HashMap::new()),
+            account_limits: Mutex::new(HashMap::new()),
         })
     }
 
@@ -687,6 +716,79 @@ impl SessionVitalsHub {
                     vitals.config = orphan.config;
                 }
             });
+        }
+    }
+
+    /// Full `SessionIdentity` fold: alias linkage plus account-scope
+    /// membership. Recording the source seeds the account's known window
+    /// state into the session (a session starting mid-warning must not
+    /// claim "ok"), and any windows the session accumulated before its
+    /// identity landed seed the account store in turn.
+    fn link_identity(&self, alias: &str, canonical: &str, source: &str) {
+        self.link_alias(alias, canonical);
+        let source = source.trim();
+        if source.is_empty() {
+            return;
+        }
+        let canonical = self.resolve(canonical);
+        if canonical.is_empty() {
+            return;
+        }
+        self.session_sources
+            .lock()
+            .expect("vitals source lock")
+            .insert(canonical.clone(), source.to_string());
+        let pre_identity = self
+            .sessions
+            .lock()
+            .expect("vitals state lock")
+            .get(&canonical)
+            .map(|vitals| vitals.limits.clone())
+            .unwrap_or_default();
+        self.apply_rate_limit_windows(&canonical, pre_identity);
+    }
+
+    /// Fold a rate-limit report from `session_id` into the vitals limit
+    /// gauges. Sessions with a backend source share one ACCOUNT view: the
+    /// report merges into the source's window store (per label, freshest
+    /// `observed_at_epoch` wins) and the merged view mirrors into every
+    /// session of that source. Sourceless (native) sessions keep
+    /// per-session windows. An empty report still mirrors the account
+    /// view — that is how a newly linked session inherits known state.
+    fn apply_rate_limit_windows(&self, session_id: &str, windows: Vec<SessionLimitWindow>) {
+        let session_id = self.resolve(session_id);
+        let source = self
+            .session_sources
+            .lock()
+            .expect("vitals source lock")
+            .get(&session_id)
+            .cloned();
+        let Some(source) = source else {
+            if !windows.is_empty() {
+                self.apply(&session_id, |vitals| vitals.limits = windows);
+            }
+            return;
+        };
+        let merged: Vec<SessionLimitWindow> = {
+            let mut accounts = self.account_limits.lock().expect("vitals account lock");
+            let store = accounts.entry(source.clone()).or_default();
+            fold_limit_windows(store, &windows);
+            store.values().cloned().collect()
+        };
+        if merged.is_empty() {
+            return;
+        }
+        let members: Vec<String> = {
+            let sources = self.session_sources.lock().expect("vitals source lock");
+            sources
+                .iter()
+                .filter(|(_, member_source)| member_source.as_str() == source)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for member in members {
+            let view = merged.clone();
+            self.apply(&member, |vitals| vitals.limits = view);
         }
     }
 
@@ -765,14 +867,47 @@ impl SessionVitalsHub {
             sessions.remove(session_id.trim());
             sessions.remove(&canonical);
         }
+        {
+            let mut sources = self.session_sources.lock().expect("vitals source lock");
+            sources.remove(session_id.trim());
+            sources.remove(&canonical);
+        }
         // Drop the group's alias records too — an ended session's ids
         // never come back, and the map otherwise grows for daemon-life.
+        // The account window stores deliberately survive: they are account
+        // truth, and the next session of that backend inherits them.
         self.aliases
             .lock()
             .expect("vitals alias lock")
             .retain(|alias, target| {
                 alias != session_id.trim() && target != &canonical && alias != &canonical
             });
+    }
+}
+
+/// Merge one rate-limit report into a per-account window store: per
+/// label, the freshest report wins (`observed_at_epoch`; an unstamped
+/// incumbent — legacy emissions predate the stamp — always yields to a
+/// report). Windows the report does not mention persist: providers
+/// announce one window per event (Claude Code), and an unmentioned
+/// window's last known state is still the account's best truth.
+fn fold_limit_windows(
+    store: &mut std::collections::BTreeMap<String, SessionLimitWindow>,
+    incoming: &[SessionLimitWindow],
+) {
+    for window in incoming {
+        let label = window.label.trim();
+        if label.is_empty() {
+            continue;
+        }
+        match store.get(label) {
+            Some(existing)
+                if existing.observed_at_epoch.unwrap_or(0)
+                    > window.observed_at_epoch.unwrap_or(0) => {}
+            _ => {
+                store.insert(label.to_string(), window.clone());
+            }
+        }
     }
 }
 
@@ -817,14 +952,17 @@ fn cache_vitals_from_usage(
     })
 }
 
-/// Bus listener feeding the cache and activity sections: every backend's
-/// usage rail converges on `AppEvent::UsageSnapshot` and every activity
-/// machine on `AppEvent::SessionActivity`, so this one consumer covers
-/// native, Claude Code, and Codex sessions alike. `SessionIdentity`
-/// linkages feed the hub's alias map so usage keyed by the backend-native
-/// id and git probes keyed by the wrapper id land in one entry (split
-/// entries emit half-empty snapshots that blank each other's chips).
-/// Sessions are pruned on `SessionEnded`.
+/// Bus listener feeding the cache, limits, and activity sections: every
+/// backend's usage rail converges on `AppEvent::UsageSnapshot`, rate-limit
+/// reports on `AppEvent::SessionRateLimits` (plus the usage-attached
+/// copies), and every activity machine on `AppEvent::SessionActivity`, so
+/// this one consumer covers native, Claude Code, and Codex sessions
+/// alike. `SessionIdentity` linkages feed the hub's alias map so usage
+/// keyed by the backend-native id and git probes keyed by the wrapper id
+/// land in one entry (split entries emit half-empty snapshots that blank
+/// each other's chips) — and record each session's backend source, the
+/// membership key of the account-scoped limits fold. Sessions are pruned
+/// on `SessionEnded`.
 fn spawn_cache_vitals_listener(
     bus: EventBus,
     hub: Arc<SessionVitalsHub>,
@@ -838,6 +976,15 @@ fn spawn_cache_vitals_listener(
                     main,
                     ..
                 }) => {
+                    // Sticky: rate limits move slowly and not every usage
+                    // emission re-states them. Routed through the account
+                    // fold so one session's report reaches every session
+                    // sharing the backend account — and folded FIRST, so
+                    // the cache apply below emits one complete snapshot
+                    // (limits + cache) rather than a cache-only interim.
+                    if !main.limits.is_empty() {
+                        hub.apply_rate_limit_windows(&session_id, main.limits.clone());
+                    }
                     hub.apply(&session_id, |vitals| {
                         let previous_ttl = vitals.cache.as_ref().and_then(|c| c.ttl_seconds);
                         if let Some(cache) =
@@ -845,12 +992,16 @@ fn spawn_cache_vitals_listener(
                         {
                             vitals.cache = Some(cache);
                         }
-                        // Sticky: rate limits move slowly and not every
-                        // usage emission re-states them.
-                        if !main.limits.is_empty() {
-                            vitals.limits = main.limits.clone();
-                        }
                     });
+                }
+                // Rate-limit windows at the report itself — the carrier
+                // for updates with no usage to ride (a rejected turn, a
+                // between-turns warning).
+                Ok(AppEvent::SessionRateLimits {
+                    session_id: Some(session_id),
+                    windows,
+                }) => {
+                    hub.apply_rate_limit_windows(&session_id, windows);
                 }
                 Ok(AppEvent::SessionActivity {
                     session_id: Some(session_id),
@@ -871,8 +1022,8 @@ fn spawn_cache_vitals_listener(
                 Ok(AppEvent::SessionIdentity {
                     session_id,
                     backend_session_id,
-                    ..
-                }) => hub.link_alias(&backend_session_id, &session_id),
+                    source,
+                }) => hub.link_identity(&backend_session_id, &session_id, &source),
                 Ok(AppEvent::SessionEnded { session_id, .. }) => hub.remove(&session_id),
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -2771,17 +2922,24 @@ mod tests {
             used_pct: Some(49),
             resets_at_epoch: Some(1_783_807_200),
             status: None,
+            observed_at_epoch: Some(1_783_800_000),
         }];
         bus.send(AppEvent::UsageSnapshot {
             session_id: Some("s7".into()),
             main: with_limits,
             presence: None,
         });
+        // The limits fold may emit a limits-only snapshot first (the
+        // account fan-out); the cache apply that follows emits the
+        // complete one — scan for it. Frontends merge per section, so the
+        // interim emission blanks nothing.
         let vitals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
                     assert_eq!(session_id, "s7");
-                    return vitals;
+                    if vitals.cache.is_some() {
+                        return vitals;
+                    }
                 }
             }
         })
@@ -2816,6 +2974,232 @@ mod tests {
         .expect("listener emits updated vitals");
         assert_eq!(vitals.limits.len(), 1, "limits survive limit-less usage");
         assert_eq!(vitals.limits[0].label, "7d");
+    }
+
+    fn warn_window(observed_at: u64) -> crate::types::SessionLimitWindow {
+        crate::types::SessionLimitWindow {
+            label: "5h".into(),
+            // No percentage: the provider didn't report one, and nothing
+            // downstream may invent it (the honesty rule under test).
+            used_pct: None,
+            resets_at_epoch: Some(observed_at + 3_600),
+            status: Some("allowed_warning".into()),
+            observed_at_epoch: Some(observed_at),
+        }
+    }
+
+    /// The reported live mismatch (2026-07-19): a warning-status report
+    /// reaching the daemon through ONE session's backend must elevate the
+    /// limit section of EVERY session sharing that backend account — the
+    /// chip next to the toast may not keep claiming "ok". Also pins the
+    /// dedicated `SessionRateLimits` carrier (a rejected turn has no
+    /// usage snapshot to ride) and the no-synthesized-percentage rule
+    /// through the fold.
+    #[tokio::test]
+    async fn rate_limit_reports_fold_account_wide_across_sessions() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+        let _listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
+        let mut rx = bus.subscribe();
+
+        // Two live Claude Code sessions on one daemon (one account).
+        bus.send(AppEvent::SessionIdentity {
+            session_id: "wrapper-a".into(),
+            source: "claude-code".into(),
+            backend_session_id: "native-a".into(),
+        });
+        bus.send(AppEvent::SessionIdentity {
+            session_id: "wrapper-b".into(),
+            source: "claude-code".into(),
+            backend_session_id: "native-b".into(),
+        });
+
+        // Session A's CLI announces the account-wide warning (keyed by the
+        // backend-native id, as the drains stamp it).
+        bus.send(AppEvent::SessionRateLimits {
+            session_id: Some("native-a".into()),
+            windows: vec![warn_window(1_000_000)],
+        });
+
+        let deadline = std::time::Duration::from_secs(5);
+        let mut warned: std::collections::HashSet<String> = Default::default();
+        tokio::time::timeout(deadline, async {
+            while warned.len() < 2 {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    let window = vitals.limits.iter().find(|w| w.label == "5h");
+                    if let Some(window) = window {
+                        assert_eq!(window.status.as_deref(), Some("allowed_warning"));
+                        assert_eq!(
+                            window.used_pct, None,
+                            "no percentage was reported; none may be synthesized"
+                        );
+                        assert_eq!(window.resets_at_epoch, Some(1_003_600));
+                        warned.insert(session_id);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("both sessions' vitals elevate");
+        assert!(warned.contains("wrapper-a") && warned.contains("wrapper-b"));
+
+        // A session that starts AFTER the report inherits the account
+        // state the moment its identity lands — no "ok" claim while the
+        // account is warned.
+        bus.send(AppEvent::SessionIdentity {
+            session_id: "wrapper-c".into(),
+            source: "claude-code".into(),
+            backend_session_id: "native-c".into(),
+        });
+        tokio::time::timeout(deadline, async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    if session_id == "wrapper-c" {
+                        let window = vitals.limits.iter().find(|w| w.label == "5h");
+                        if window.map(|w| w.status.as_deref()) == Some(Some("allowed_warning")) {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("a late session inherits the account's known window state");
+    }
+
+    /// Freshest report wins per window label: a stale report (an idle
+    /// session flushing old state) must not roll back a newer one, and a
+    /// newer recovery must clear the warning everywhere.
+    #[tokio::test]
+    async fn account_fold_prefers_the_freshest_report_per_window() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+        let _listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
+        let mut rx = bus.subscribe();
+
+        bus.send(AppEvent::SessionIdentity {
+            session_id: "wrapper-a".into(),
+            source: "claude-code".into(),
+            backend_session_id: "native-a".into(),
+        });
+        bus.send(AppEvent::SessionRateLimits {
+            session_id: Some("native-a".into()),
+            windows: vec![warn_window(2_000_000)],
+        });
+        // Stale report from the same account (older observed_at): ignored.
+        bus.send(AppEvent::SessionRateLimits {
+            session_id: Some("native-a".into()),
+            windows: vec![crate::types::SessionLimitWindow {
+                status: Some("allowed".into()),
+                ..warn_window(1_999_000)
+            }],
+        });
+        // Fresh recovery: wins.
+        bus.send(AppEvent::SessionRateLimits {
+            session_id: Some("native-a".into()),
+            windows: vec![crate::types::SessionLimitWindow {
+                status: Some("allowed".into()),
+                ..warn_window(2_000_100)
+            }],
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    if session_id != "wrapper-a" {
+                        continue;
+                    }
+                    let Some(window) = vitals.limits.iter().find(|w| w.label == "5h") else {
+                        continue;
+                    };
+                    if window.observed_at_epoch == Some(2_000_100) {
+                        assert_eq!(window.status.as_deref(), Some("allowed"));
+                        return;
+                    }
+                    // Until the fresh recovery lands, the warning must
+                    // hold — the stale allowed may never surface.
+                    assert_eq!(
+                        window.status.as_deref(),
+                        Some("allowed_warning"),
+                        "stale report rolled back a fresher window"
+                    );
+                }
+            }
+        })
+        .await
+        .expect("fresh recovery reaches the vitals");
+    }
+
+    /// The pure fold: union by label, freshest wins, unstamped incumbents
+    /// yield, unmentioned windows persist (Claude Code announces one
+    /// window per event — a five_hour report must not erase the known
+    /// seven_day state).
+    #[test]
+    fn fold_limit_windows_unions_by_label_and_keeps_unmentioned_windows() {
+        let mut store = std::collections::BTreeMap::new();
+        fold_limit_windows(&mut store, &[warn_window(1_000)]);
+        let seven_day = crate::types::SessionLimitWindow {
+            label: "7d".into(),
+            status: Some("allowed_warning".into()),
+            observed_at_epoch: Some(900),
+            ..Default::default()
+        };
+        fold_limit_windows(&mut store, &[seven_day.clone()]);
+        assert_eq!(store.len(), 2, "windows union by label");
+
+        // A fresher five_hour report replaces only its own label.
+        fold_limit_windows(
+            &mut store,
+            &[crate::types::SessionLimitWindow {
+                status: Some("allowed".into()),
+                ..warn_window(1_100)
+            }],
+        );
+        assert_eq!(store["5h"].status.as_deref(), Some("allowed"));
+        assert_eq!(store["7d"], seven_day, "unmentioned window persists");
+
+        // Unstamped incumbent (legacy emission) yields to a report.
+        let mut legacy = std::collections::BTreeMap::new();
+        legacy.insert(
+            "5h".to_string(),
+            crate::types::SessionLimitWindow {
+                label: "5h".into(),
+                status: Some("allowed".into()),
+                observed_at_epoch: None,
+                ..Default::default()
+            },
+        );
+        fold_limit_windows(&mut legacy, &[warn_window(5)]);
+        assert_eq!(legacy["5h"].status.as_deref(), Some("allowed_warning"));
+
+        // Unlabeled windows are dropped, never folded under "".
+        fold_limit_windows(&mut legacy, &[crate::types::SessionLimitWindow::default()]);
+        assert!(!legacy.contains_key(""));
+    }
+
+    /// Sourceless (native) sessions keep per-session windows: no account
+    /// to share, and their per-minute header gauges must not leak into
+    /// other sessions.
+    #[tokio::test]
+    async fn sourceless_sessions_keep_per_session_windows() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+
+        hub.apply_rate_limit_windows(
+            "native-anthropic",
+            vec![crate::types::SessionLimitWindow {
+                label: "req/min".into(),
+                used_pct: Some(12),
+                ..Default::default()
+            }],
+        );
+        let sessions = hub.sessions.lock().expect("state lock");
+        let vitals = sessions.get("native-anthropic").expect("entry");
+        assert_eq!(vitals.limits.len(), 1);
+        assert_eq!(vitals.limits[0].label, "req/min");
+        assert!(
+            !sessions.contains_key(""),
+            "no account fan-out for sourceless sessions"
+        );
     }
 
     #[tokio::test]
@@ -2981,6 +3365,7 @@ mod tests {
             "usedPct",
             "resetsAtEpoch",
             "status",
+            "observedAtEpoch",
             "label",
             "state",
             "sinceEpoch",
