@@ -1667,15 +1667,19 @@ html.ui-v2 #question-panel .question-preview-note-btn.open {
   background: var(--surface-2);
   color: var(--text);
 }
+/* Block header = a quiet eyebrow LABEL. It must not share the index
+   chips' pill styling — a pill that ignores clicks reads as a broken
+   button (live finding 2026-07-20). */
 html.ui-v2 #question-panel .question-header-chip {
   font-family: var(--mono);
   font-size: 9px;
   font-weight: 700;
-  letter-spacing: .12em;
+  letter-spacing: .14em;
   text-transform: uppercase;
-  color: var(--sky);
-  background: rgba(var(--sky-rgb), .1);
-  border: 1px solid rgba(var(--sky-rgb), .24);
+  color: var(--text-3);
+  background: transparent;
+  border: 0;
+  padding: 0;
 }
 html.ui-v2 #question-panel .question-option {
   border: 1px solid var(--line);

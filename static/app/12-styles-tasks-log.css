@@ -3106,7 +3106,25 @@ body.context-focus-active {
   cursor: pointer;
 }
 .question-tuck:hover { background: var(--surface1); color: var(--text); }
-#question-panel.question-minimized { display: none; }
+/* !important on purpose (router-hide precedent): the dock geometry rule
+   `#activity-log-pane .bottom-panel.visible { display:flex }` outranks any
+   id+class selector, and a tuck that silently loses the cascade is exactly
+   the "minimize does nothing" bug shipped once already. */
+#question-panel.question-minimized { display: none !important; }
+/* Preview-bearing questions own the WHOLE pane — the comparison is the
+   content, and the tuck chip is the escape hatch. On narrow (mobile)
+   viewports every question panel takes the full pane: the bottom-dock
+   sliver layout is too cramped there. */
+#activity-log-pane #question-panel.has-previews.visible {
+  top: 0;
+  max-height: none;
+}
+@media (max-width: 900px) {
+  #activity-log-pane #question-panel.visible {
+    top: 0;
+    max-height: none;
+  }
+}
 #question-restore-chip {
   position: fixed;
   right: 20px;
