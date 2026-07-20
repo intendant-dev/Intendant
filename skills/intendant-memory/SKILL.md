@@ -2,7 +2,6 @@
 name: intendant-memory
 description: When you learn something durable about this machine, its owner, or its projects — a fact observed, a decision made, a procedure that works, a preference stated, an episode worth remembering — propose it as a claim on the daemon's Memory plane. Also use at task start when earlier sessions may have learned something relevant; search before re-deriving or assuming a machine-wide fact.
 compatibility: Requires a reachable Intendant daemon (supervised sessions have $INTENDANT and INTENDANT_MCP_URL injected).
-distribution: global
 ---
 
 > If `$INTENDANT`/`INTENDANT_MCP_URL` is unset and no local Intendant daemon answers, this skill does not apply — say so and stop.

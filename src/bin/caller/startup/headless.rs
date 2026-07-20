@@ -34,8 +34,8 @@ pub(crate) async fn run_headless_mode(
     recording_registry: Arc<tokio::sync::RwLock<recording::RecordingRegistry>>,
     startup_external_resume_session: Option<String>,
 ) -> Result<(), CallerError> {
-    // Install `distribution: global` builtin skills (see run_daemon).
-    crate::external_agent::skills_sync::install_global_skills_at_startup();
+    // Install every shipped builtin skill globally (see run_daemon).
+    crate::skill_install::install_global_skills_at_startup();
 
     // This mode always has a task (enforced by task resolution in main).
     let task = task.unwrap();

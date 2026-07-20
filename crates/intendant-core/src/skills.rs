@@ -5,10 +5,8 @@
 //! They are discovered from these locations (first match wins per name):
 //!
 //! 1. `<project_root>/.agents/skills/<name>/SKILL.md`  (standard path)
-//! 2. `<project_root>/.intendant/skills/<name>/SKILL.md`
-//! 3. `<project_root>/skills/<name>/SKILL.md`
-//! 4. `~/.agents/skills/<name>/SKILL.md`  (standard path)
-//! 5. `~/.intendant/skills/<name>/SKILL.md`
+//! 2. `<project_root>/skills/<name>/SKILL.md`
+//! 3. `~/.agents/skills/<name>/SKILL.md`  (standard path)
 //!
 //! The model can invoke skills via the `invoke_skill` tool, or the user can
 //! trigger them via the control socket / TUI / presence layer.
@@ -41,33 +39,13 @@ pub struct SkillConfig {
     /// 2026-07-19 on claude 2.1.215 / codex 0.144.6).
     #[serde(default)]
     pub compatibility: Option<String>,
-    /// Intendant extension: `distribution: global` marks a skill the
-    /// daemon installs machine-wide into `~/.agents/skills/` at startup.
-    /// Unknown values are kept verbatim and treated as not-global.
-    #[serde(default)]
-    pub distribution: Option<String>,
 }
-
-impl SkillConfig {
-    /// Whether the daemon should install this skill machine-wide.
-    pub fn is_global(&self) -> bool {
-        self.distribution.as_deref() == Some("global")
-    }
-}
-
-/// Where a skill was discovered.
-/// Marker file naming a skill directory as a *derived copy* materialized
-/// for supervised external backends (the caller's `skills_sync`). Marked
-/// directories are invisible to Intendant's own discovery — the source
-/// directory stays authoritative, so a stale copy can never shadow it —
-/// and are the only directories provisioning may delete and rewrite.
-pub const MATERIALIZED_MARKER: &str = ".intendant-materialized";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkillSource {
-    /// `<project_root>/.agents/skills/` or `<project_root>/.intendant/skills/` or `<project_root>/skills/`
+    /// `<project_root>/.agents/skills/` or `<project_root>/skills/`
     Project,
-    /// `~/.agents/skills/` or `~/.intendant/skills/`
+    /// `~/.agents/skills/`
     Personal,
 }
 
@@ -134,7 +112,6 @@ fn parse_frontmatter(yaml: &str) -> Result<SkillConfig, String> {
     let mut disable_auto_invocation = false;
     let mut sandbox: Option<bool> = None;
     let mut compatibility: Option<String> = None;
-    let mut distribution: Option<String> = None;
 
     let lines: Vec<&str> = yaml.lines().collect();
     let mut i = 0;
@@ -194,7 +171,6 @@ fn parse_frontmatter(yaml: &str) -> Result<SkillConfig, String> {
             }
             "sandbox" => sandbox = Some(value == "true"),
             "compatibility" => compatibility = Some(value),
-            "distribution" => distribution = Some(value),
             _ => {} // Ignore unknown fields for forward compatibility
         }
     }
@@ -209,40 +185,30 @@ fn parse_frontmatter(yaml: &str) -> Result<SkillConfig, String> {
         disable_auto_invocation,
         sandbox,
         compatibility: compatibility.filter(|c| !c.is_empty()),
-        distribution: distribution.filter(|d| !d.is_empty()),
     })
 }
 
 /// Discover skills from project and personal directories.
 ///
 /// Project skills take precedence over personal skills with the same name.
-/// Scans the Agent Skills standard path (`.agents/skills/`) first, then
-/// Intendant-specific paths for backward compatibility.
+/// Scans the Agent Skills standard path (`.agents/skills/`) first.
 pub fn discover_skills(project_root: Option<&Path>) -> Vec<Skill> {
     discover_skills_in(project_root, dirs::home_dir().as_deref())
 }
 
-/// Home-injectable core of [`discover_skills`]. Tests and the
-/// external-backend skill provisioning pin `home` (usually to `None` or a
-/// temp dir) so personal skills on the running machine leak into no
-/// assertion — the self-hosted CI runners share a real `$HOME` that
+/// Home-injectable core of [`discover_skills`]. Tests pin `home` (usually to
+/// `None` or a temp dir) so personal skills on the running machine leak into
+/// no assertion — the self-hosted CI runners share a real `$HOME` that
 /// legitimately contains `~/.agents/skills/`.
 pub fn discover_skills_in(project_root: Option<&Path>, home: Option<&Path>) -> Vec<Skill> {
     let mut skills = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
 
-    // 1. Project-scoped skills (standard path first, then legacy paths)
+    // 1. Project-scoped skills.
     if let Some(root) = project_root {
         // Standard: .agents/skills/
         load_skills_from_dir(
             &root.join(".agents").join("skills"),
-            SkillSource::Project,
-            &mut skills,
-            &mut seen_names,
-        );
-        // Legacy: .intendant/skills/
-        load_skills_from_dir(
-            &root.join(".intendant").join("skills"),
             SkillSource::Project,
             &mut skills,
             &mut seen_names,
@@ -259,18 +225,10 @@ pub fn discover_skills_in(project_root: Option<&Path>, home: Option<&Path>) -> V
         );
     }
 
-    // 2. Personal skills (standard path first, then legacy)
+    // 2. Personal skills.
     if let Some(home) = home {
-        // Standard: ~/.agents/skills/
         load_skills_from_dir(
             &home.join(".agents").join("skills"),
-            SkillSource::Personal,
-            &mut skills,
-            &mut seen_names,
-        );
-        // Legacy: ~/.intendant/skills/
-        load_skills_from_dir(
-            &crate::state_paths::intendant_home_in(home).join("skills"),
             SkillSource::Personal,
             &mut skills,
             &mut seen_names,
@@ -293,13 +251,6 @@ fn load_skills_from_dir(
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
-            continue;
-        }
-
-        // Derived copies materialized for external backends are invisible
-        // here: their source directory is also on the discovery path and
-        // stays authoritative (see [`MATERIALIZED_MARKER`]).
-        if path.join(MATERIALIZED_MARKER).exists() {
             continue;
         }
 
@@ -493,31 +444,21 @@ Instructions here.
     }
 
     #[test]
-    fn parse_compatibility_and_distribution() {
-        let content = "---\nname: caller\ndescription: Operate the daemon\ncompatibility: >\n  Requires a reachable Intendant daemon.\n  Supervised sessions have $INTENDANT injected.\ndistribution: global\n---\nbody\n";
+    fn parse_compatibility() {
+        let content = "---\nname: caller\ndescription: Operate the daemon\ncompatibility: >\n  Requires a reachable Intendant daemon.\n  Supervised sessions have $INTENDANT injected.\n---\nbody\n";
         let (config, _) = parse_skill_md(content, Path::new("test/SKILL.md")).unwrap();
         assert_eq!(
             config.compatibility.as_deref(),
             Some("Requires a reachable Intendant daemon. Supervised sessions have $INTENDANT injected.")
         );
-        assert!(config.is_global());
 
-        // Absent / empty fields normalize to None; unknown distribution
-        // values are kept but are not global.
+        // Absent / empty fields normalize to None.
         let (config, _) = parse_skill_md(
             "---\nname: a\ndescription: b\ncompatibility:\n---\nbody\n",
             Path::new("test/SKILL.md"),
         )
         .unwrap();
         assert_eq!(config.compatibility, None);
-        assert!(!config.is_global());
-        let (config, _) = parse_skill_md(
-            "---\nname: a\ndescription: b\ndistribution: project\n---\nbody\n",
-            Path::new("test/SKILL.md"),
-        )
-        .unwrap();
-        assert_eq!(config.distribution.as_deref(), Some("project"));
-        assert!(!config.is_global());
     }
 
     #[test]
@@ -552,31 +493,6 @@ Instructions here.
     }
 
     #[test]
-    fn discovery_skips_materialized_copies() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let live = root.join("skills").join("live-skill");
-        std::fs::create_dir_all(&live).unwrap();
-        std::fs::write(
-            live.join("SKILL.md"),
-            "---\nname: live-skill\ndescription: real\n---\nbody\n",
-        )
-        .unwrap();
-        let derived = root.join(".agents").join("skills").join("derived-skill");
-        std::fs::create_dir_all(&derived).unwrap();
-        std::fs::write(
-            derived.join("SKILL.md"),
-            "---\nname: derived-skill\ndescription: copy\n---\nbody\n",
-        )
-        .unwrap();
-        std::fs::write(derived.join(MATERIALIZED_MARKER), "source: elsewhere\n").unwrap();
-
-        let skills = discover_skills_in(Some(root), None);
-        let names: Vec<&str> = skills.iter().map(|s| s.config.name.as_str()).collect();
-        assert_eq!(names, vec!["live-skill"], "marked copy must be invisible");
-    }
-
-    #[test]
     fn parse_missing_frontmatter() {
         let content = "# Just a markdown file\n\nNo frontmatter here.";
         let result = parse_skill_md(content, Path::new("test/SKILL.md"));
@@ -605,23 +521,6 @@ Instructions here.
         let tmp = tempfile::tempdir().unwrap();
         let skills = discover_skills_in(Some(tmp.path()), None);
         assert!(skills.is_empty());
-    }
-
-    #[test]
-    fn discover_skills_project_legacy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let skill_dir = tmp
-            .path()
-            .join(".intendant")
-            .join("skills")
-            .join("my-skill");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(skill_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
-
-        let skills = discover_skills_in(Some(tmp.path()), None);
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].config.name, "lint");
-        assert_eq!(skills[0].source, SkillSource::Project);
     }
 
     #[test]
@@ -661,24 +560,18 @@ Instructions here.
     }
 
     #[test]
-    fn discover_skills_standard_takes_precedence() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn discover_skills_ignores_removed_intendant_specific_paths() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for skill_dir in [
+            project.path().join(".intendant/skills/project-skill"),
+            home.path().join(".intendant/skills/personal-skill"),
+        ] {
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(skill_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
+        }
 
-        // Same skill name in both standard and legacy paths
-        let standard_dir = tmp.path().join(".agents").join("skills").join("lint");
-        std::fs::create_dir_all(&standard_dir).unwrap();
-        std::fs::write(standard_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
-
-        // Legacy path has the same skill name ("lint")
-        let legacy_dir = tmp.path().join(".intendant").join("skills").join("lint");
-        std::fs::create_dir_all(&legacy_dir).unwrap();
-        std::fs::write(legacy_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
-
-        let skills = discover_skills_in(Some(tmp.path()), None);
-        // Standard path wins — only 1 skill loaded, from .agents/skills/
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].config.name, "lint");
-        assert!(skills[0].source_path.to_string_lossy().contains(".agents"));
+        assert!(discover_skills_in(Some(project.path()), Some(home.path())).is_empty());
     }
 
     #[test]
@@ -720,7 +613,6 @@ Instructions here.
                     disable_auto_invocation: false,
                     sandbox: None,
                     compatibility: None,
-                    distribution: None,
                 },
                 body: String::new(),
                 source_path: PathBuf::new(),
@@ -734,7 +626,6 @@ Instructions here.
                     disable_auto_invocation: true,
                     sandbox: None,
                     compatibility: None,
-                    distribution: None,
                 },
                 body: String::new(),
                 source_path: PathBuf::new(),
@@ -759,7 +650,6 @@ Instructions here.
                 disable_auto_invocation: false,
                 sandbox: None,
                 compatibility: None,
-                distribution: None,
             },
             body: "Deploy $ARGUMENTS to staging.".to_string(),
             source_path: PathBuf::new(),
@@ -782,7 +672,6 @@ Instructions here.
                 disable_auto_invocation: false,
                 sandbox: None,
                 compatibility: None,
-                distribution: None,
             },
             body: "Just run clippy.".to_string(),
             source_path: PathBuf::new(),
@@ -802,7 +691,6 @@ Instructions here.
                 disable_auto_invocation: false,
                 sandbox: None,
                 compatibility: None,
-                distribution: None,
             },
             body: "Deploy $ARGUMENTS now.".to_string(),
             source_path: PathBuf::new(),
@@ -826,7 +714,6 @@ Instructions here.
                 disable_auto_invocation: false,
                 sandbox: None,
                 compatibility: None,
-                distribution: None,
             },
             body: String::new(),
             source_path: PathBuf::new(),

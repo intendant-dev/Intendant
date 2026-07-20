@@ -2,7 +2,6 @@
 name: visual-collaboration
 description: "Use when the user should see an agent-owned display through Intendant's shared view: demoing a finished result, letting the user watch live GUI/browser work, focusing attention on a region, capturing a display frame, or asking the user to take input authority."
 compatibility: Requires a reachable Intendant daemon (supervised sessions have $INTENDANT and INTENDANT_MCP_URL injected).
-distribution: global
 ---
 
 > If `$INTENDANT`/`INTENDANT_MCP_URL` is unset and no local Intendant daemon answers, this skill does not apply — say so and stop.

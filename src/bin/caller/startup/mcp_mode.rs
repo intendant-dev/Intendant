@@ -30,8 +30,8 @@ pub(crate) async fn run_mcp_mode(
     session_registry: display::SharedSessionRegistry,
     recording_registry: Arc<tokio::sync::RwLock<recording::RecordingRegistry>>,
 ) -> Result<(), CallerError> {
-    // Install `distribution: global` builtin skills (see run_daemon).
-    crate::external_agent::skills_sync::install_global_skills_at_startup();
+    // Install every shipped builtin skill globally (see run_daemon).
+    crate::skill_install::install_global_skills_at_startup();
 
     // MCP mode — speaks Model Context Protocol on stdio.
     // Architecturally a frontend peer of the dashboard: same EventBus,

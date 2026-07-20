@@ -5,7 +5,6 @@ description: >
   using computer use to navigate the UI and spawn_live_audio for the
   AI voice conversation. Returns typed structured data.
 compatibility: Requires a reachable Intendant daemon. macOS or Linux with a display and supported virtual-audio bridge; macOS needs a GUI session with TCC mic permission.
-distribution: global
 ---
 
 > If `$INTENDANT`/`INTENDANT_MCP_URL` is unset and no local Intendant daemon answers, this skill does not apply — say so and stop.
