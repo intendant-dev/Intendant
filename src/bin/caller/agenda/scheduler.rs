@@ -1055,6 +1055,116 @@ mod tests {
         assert_eq!(run.session_id.as_deref(), Some("sess-run-2"));
     }
 
+    /// F3 start-now rides the ordinary scheduled lane end to end at unit
+    /// level: the gesture's approved now-manifest dispatches exactly one
+    /// delegation-tagged StartTask on the next pass, the receipt journals
+    /// `started`, DoneSignal journals `completed` with the write-back —
+    /// one occurrence arc, no bypass, and the spent occurrence never
+    /// re-fires.
+    #[tokio::test]
+    async fn start_now_dispatches_one_occurrence_through_the_standard_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = Arc::new(AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus,
+            dir.path(),
+        ));
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Task,
+                    title: "start me now".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        handle
+            .apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                },
+                owner(),
+            )
+            .unwrap();
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut dispatched = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                task,
+                delegation_id: Some(delegation_id),
+                ..
+            }) = event
+            {
+                dispatched.push((task, delegation_id));
+            }
+        }
+        assert_eq!(dispatched.len(), 1, "exactly one occurrence dispatches");
+        assert!(dispatched[0].0.contains("start me now"));
+        assert!(dispatched[0].0.contains(&item.id));
+        let occurrence_id = dispatched[0]
+            .1
+            .strip_prefix(DELEGATION_PREFIX)
+            .unwrap()
+            .to_string();
+
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id: dispatched[0].1.clone(),
+                session_id: "sess-now".into(),
+            },
+        );
+        assert_eq!(
+            journal.progress(&occurrence_id).started.as_deref(),
+            Some("sess-now")
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::DoneSignal {
+                session_id: Some("sess-now".into()),
+                message: Some("follow-through done".into()),
+            },
+        );
+        assert_eq!(
+            journal.progress(&occurrence_id).terminal,
+            Some(OccurrenceState::Completed)
+        );
+        let (items, _, _) = handle.snapshot();
+        let run = items.iter().find(|i| i.id == item.id).unwrap().effects[0]
+            .last_run
+            .clone()
+            .unwrap();
+        assert_eq!(run.state, "completed");
+        assert_eq!(run.session_id.as_deref(), Some("sess-now"));
+        assert_eq!(run.note.as_deref(), Some("follow-through done"));
+
+        // Spent: another pass dispatches nothing.
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    AppEvent::ControlCommand(ControlMsg::StartTask { .. })
+                ),
+                "spent start-now occurrence must not re-dispatch"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn event_lag_resolves_awaiting_and_running_occurrences_fail_closed() {
         let dir = tempfile::tempdir().unwrap();

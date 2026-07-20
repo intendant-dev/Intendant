@@ -2140,6 +2140,29 @@ async fn run_agenda(
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
         }
+        "start" => {
+            // Owner start-now: an owner-shell act (local_process is an
+            // owner surface). Mints the manifest from the item, approves
+            // it in the same daemon-side act, and fires through the
+            // standard scheduled lane.
+            let args = parse_command_args(&raw[1..], &[], &[])?;
+            let id = agenda_resolve_id(
+                client,
+                config,
+                &args,
+                "agenda start requires an item id (a unique prefix is enough)",
+            )
+            .await?;
+            let mut map = Map::new();
+            map.insert("op".to_string(), Value::String("start_now".to_string()));
+            map.insert("id".to_string(), Value::String(id));
+            let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+            println!(
+                "started — the session fires through the scheduled lane; its outcome \
+                 writes back to the item (effects[].last_run)"
+            );
+        }
         "revoke-schedule" => {
             let args = parse_command_args(&raw[1..], &[], &[])?;
             let id = agenda_resolve_id(
@@ -3966,6 +3989,7 @@ fn help_agenda() {
   intendant ctl agenda schedule ID_PREFIX --goal TEXT --at WHEN [--orchestrate] [--source LABEL]\n\
   intendant ctl agenda approve ID_PREFIX [--digest HEX]\n\
   intendant ctl agenda revoke-schedule ID_PREFIX\n\
+  intendant ctl agenda start ID_PREFIX\n\
 \n\
 The agenda is this daemon's durable ledger of parked intent — tasks, notes,\n\
 questions, and deferred follow-ups that survive session and context death.\n\
@@ -4000,7 +4024,15 @@ owner shell) — agent and peer callers may propose but never approve, and\n\
 approval binds the exact manifest digest, so any revision voids it.\n\
 `approve` without --digest prints the manifest and its digest for review;\n\
 re-run with --digest to bind exactly what you read. Results write back to\n\
-the item (state, session id, note)."
+the item (state, session id, note).\n\
+\n\
+`start` is the owner's one-gesture act-on-item: the daemon mints a\n\
+manifest from the item (goal = title + body quoted, with the item id),\n\
+binds the approval to that exact manifest in the same act, and fires it\n\
+immediately through the SAME scheduled lane (occurrence journal +\n\
+supervised session) — never a bypass. Owner surfaces only (dashboard or\n\
+an owner shell); agent and peer callers are refused. Revises the item's\n\
+pending schedule if one exists (fresh digest, prior approval void)."
     );
 }
 

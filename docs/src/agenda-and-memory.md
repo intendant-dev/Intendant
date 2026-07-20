@@ -149,6 +149,24 @@ revoke them. Revising a manifest changes the digest and voids the previous
 approval. The spawned session gets ordinary session authority; the approval
 does not bypass its sandbox, IAM, autonomy policy, or action approvals.
 
+**Start now** (`start_now`, `ctl agenda start`, the card's button) is the
+owner's one-gesture act-on-item: the daemon mints a manifest from the item —
+goal is the title and body quoted as data, carrying the item id so the
+spawned session's own attributed `ctl` can annotate or complete it — and
+appends the propose and approve operations atomically, the approval binding
+the digest of exactly that minted manifest. With its fire time set to now,
+the ordinary scheduler pass journals the occurrence and dispatches through
+the same StartTask lane as any scheduled firing — start now is scheduled
+firing with a zero-length wait, never a bypass, and the outcome writes back
+to the item identically. It is owner-surface-only exactly like the approval
+it embeds, and it revises the item's single pending schedule if one exists
+(standing re-propose semantics). The dashboard additionally shows a
+**follow up** affordance when the item's recording conversation is still
+live and composer-targetable: it opens the composer aimed at that
+conversation with the item quoted — a pure navigation affordance, no daemon
+write; fresh-start is the primary path because items must outlive their
+sessions.
+
 > **Current execution-shape defect:** the scheduler forwards the manifest's
 > `orchestrate` value but also sets `direct=true`; session launch gives
 > `direct` precedence. Approved scheduled sessions therefore run Direct today,

@@ -612,6 +612,16 @@ pub enum AgendaCommand {
     ApproveEffect { id: String, digest: String },
     /// Withdraw the approval (owner-surface, like granting it).
     RevokeEffect { id: String },
+    /// Owner "start session now" (F3): mint a manifest from the item —
+    /// goal is the item's title + body quoted as data with its id — and
+    /// approve it in the same atomic act, firing through the ordinary
+    /// scheduled lane (occurrence journal + StartTask), never a bypass.
+    /// **Owner-surface only**, like the approval it embeds: the gesture IS
+    /// the owner act, and the appended approve op binds the digest of
+    /// exactly the manifest minted under the same lock. Revises the item's
+    /// single session effect if one exists (stable lineage, fresh digest,
+    /// prior approval void — the standing re-propose semantics).
+    StartNow { id: String },
 }
 
 impl AgendaItem {
@@ -655,7 +665,8 @@ impl AgendaCommand {
             | AgendaCommand::RemoveReliesOn { source, .. } => source.take(),
             AgendaCommand::Ask { .. }
             | AgendaCommand::ApproveEffect { .. }
-            | AgendaCommand::RevokeEffect { .. } => None,
+            | AgendaCommand::RevokeEffect { .. }
+            | AgendaCommand::StartNow { .. } => None,
         }
     }
 }
