@@ -72,11 +72,11 @@ trust framing applies to the MCP *server* side — see
 ## External coding-agent CLIs
 
 Instead of the native agent loop, Intendant can delegate coding work to an
-external CLI agent — **Codex** or **Claude Code** — selected per-invocation with
-`--agent <codex|claude-code>` or by default via
+external CLI agent — **Codex**, **Claude Code**, or **Kimi Code** — selected
+per-invocation with `--agent <codex|claude-code|kimi>` or by default via
 `[agent] default_backend`. Each backend's binary path, model, sandbox/approval
-policy, and tool restrictions are configured under `[agent.codex]` and
-`[agent.claude_code]` (full key reference in
+policy, and tool restrictions are configured under `[agent.codex]`,
+`[agent.claude_code]`, and `[agent.kimi]` (full key reference in
 [Configuration](./configuration.md#agent-and-external-backends)).
 
 Notable details:
@@ -85,6 +85,14 @@ Notable details:
   `approval_policy`, `reasoning_effort`, `web_search`, `network_access`, and
   `writable_roots` keys map onto Codex's own CLI flags. Approval prompts from
   Codex are surfaced through Intendant's normal approval UI.
+- **Claude Code** runs its stream-json protocol over stdio. Intendant lifts
+  tool approvals and structured questions, preserves its native session id,
+  and surfaces async `Agent`/`Task` children as session relationships.
+- **Kimi Code** runs an isolated local `kimi server` and uses its authenticated
+  REST/WebSocket surface. This retains native queued steering, undo, fork,
+  `:btw`/swarm sub-agents, goals, live model/thinking/permission/plan/swarm
+  changes, structured interactions, file upload, and reconnect snapshots that
+  Kimi's narrower ACP facade does not expose.
 
 This is a deep topic with its own chapter — see
 [External Agent Orchestration](./external-agent-orchestration.md).

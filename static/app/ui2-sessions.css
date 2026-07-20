@@ -470,7 +470,7 @@ html.ui-v2 #tab-sessions .session-card .ui-chip.muted {
   color: var(--text-2);
 }
 
-/* Source badges: native = iris, Codex = neutral, Claude Code = amber
+/* Source badges: native = iris, Codex = neutral, Claude Code = amber, Kimi = sky
    (radius-6 chips in the reference; keyed off the gated data-src). */
 html.ui-v2 #tab-sessions .session-card .sc-source {
   border-radius: 6px;
@@ -488,6 +488,10 @@ html.ui-v2 #tab-sessions .session-card .sc-source[data-src="claude-code"] {
 html.ui-v2 #tab-sessions .session-card .sc-source[data-src="codex"] {
   background: var(--surface-3);
   color: var(--text-2);
+}
+html.ui-v2 #tab-sessions .session-card .sc-source[data-src="kimi"] {
+  background: rgba(var(--sky-rgb), .12);
+  color: var(--sky);
 }
 
 /* Lineage chips are clickable — give them the interactive voice. */

@@ -1,4 +1,4 @@
-//! Fork-point catalog builders for the codex and native backends.
+//! Fork-point catalog builders for the Codex, Kimi, and native backends.
 //!
 //! Codex derives from the same rollout scan the managed-context rewind
 //! machinery uses (`shared_context_rewind_anchor_scan` — cached, racy-write
@@ -133,6 +133,144 @@ pub(crate) fn codex_fork_points_from_parts(
         notes: vec![
             "item anchors cut exactly on the managed codex binary; on the vanilla binary a fork rounds down to the annotated effective_cut turn boundary".to_string(),
             "turn-boundary points fork on any binary".to_string(),
+        ],
+        total: 0,
+        offset: 0,
+        limit: 0,
+        next_offset: None,
+        fork_points: Vec::new(),
+    };
+    page_fork_points(&mut catalog, points, query);
+    catalog
+}
+
+/// Fork points for a persisted Kimi session.
+///
+/// Kimi 0.27 exposes a native head fork and an atomic whole-user-turn undo.
+/// An anchor fork therefore composes those two source-native operations:
+/// fork the current head, then undo `head_active_turns - kept_turns` on the
+/// idle child before its first prompt. Only active real-user prompts count;
+/// system-trigger prompts and `context.undo`-superseded revisions do not.
+pub(crate) fn kimi_fork_points_from_history(
+    session_id: &str,
+    backend_session_id: &str,
+    history: &crate::web_gateway::session_catalog::kimi_history::KimiSessionHistory,
+    query: &ForkPointQuery,
+) -> ForkPointCatalog {
+    if crate::web_gateway::session_catalog::kimi_history::split_kimi_session_id(backend_session_id)
+        .is_some_and(|(_, agent_id)| agent_id.is_some())
+    {
+        return ForkPointCatalog::unsupported(
+            session_id,
+            "kimi",
+            Some(backend_session_id),
+            "Kimi 0.27 cannot fork or undo one child agent independently",
+        );
+    }
+
+    let Some(main) = history.selected_agent(backend_session_id) else {
+        return ForkPointCatalog::unsupported(
+            session_id,
+            "kimi",
+            Some(backend_session_id),
+            "the persisted Kimi main-agent wire could not be resolved",
+        );
+    };
+    let mut prompts = std::collections::BTreeMap::<u32, String>::new();
+    for entry in &main.entries {
+        if entry.get("role").and_then(serde_json::Value::as_str) != Some("user")
+            || entry.get("kind").and_then(serde_json::Value::as_str) == Some("steer")
+            || entry.get("superseded").and_then(serde_json::Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let Some(turn) = entry
+            .get("user_turn_index")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|turn| u32::try_from(turn).ok())
+        else {
+            continue;
+        };
+        let Some(text) = entry
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        prompts.insert(turn, text.to_string());
+    }
+    let active_turns = main.active_real_user_turns;
+    let earliest_kept_turn = active_turns.saturating_sub(main.undoable_real_user_turns);
+    let head_preview = main
+        .entries
+        .iter()
+        .rev()
+        .filter(|entry| entry.get("superseded").and_then(serde_json::Value::as_bool) != Some(true))
+        .find_map(|entry| {
+            entry
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| entry.get("stdout").and_then(serde_json::Value::as_str))
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        })
+        .or(history.location.last_prompt.as_deref())
+        .or(history.location.title.as_deref())
+        .unwrap_or("Kimi session head");
+
+    let mut points = vec![ForkPoint {
+        id: "head".to_string(),
+        kind: "head",
+        granularity: "turn",
+        turn: Some(active_turns),
+        seq: None,
+        item_id: None,
+        position: None,
+        message_uuid: None,
+        at_message_uuid: None,
+        pre_compaction: false,
+        preview: fork_point_preview(head_preview),
+        eligible: true,
+        eligibility_reasons: Vec::new(),
+        effective_cut: None,
+    }];
+    // A boundary keeping every active turn is the head point above. A
+    // boundary keeping zero turns has no useful inherited history.
+    for kept_turns in (earliest_kept_turn.max(1)..active_turns).rev() {
+        let preview = prompts
+            .get(&kept_turns.saturating_add(1))
+            .map(String::as_str)
+            .unwrap_or("next Kimi user turn");
+        points.push(ForkPoint {
+            id: format!("turn:{kept_turns}"),
+            kind: "turn-boundary",
+            granularity: "turn",
+            turn: Some(kept_turns),
+            seq: None,
+            item_id: None,
+            position: None,
+            message_uuid: None,
+            at_message_uuid: None,
+            pre_compaction: false,
+            preview: fork_point_preview(preview),
+            eligible: true,
+            eligibility_reasons: Vec::new(),
+            effective_cut: None,
+        });
+    }
+
+    let mut catalog = ForkPointCatalog {
+        session_id: session_id.to_string(),
+        source: "kimi".to_string(),
+        backend_session_id: Some(backend_session_id.to_string()),
+        supported: true,
+        unsupported_reason: None,
+        notes: vec![
+            "head and active real-user turn-boundary anchors are exact: Intendant composes a native Kimi head fork with atomic undo on the idle child".to_string(),
+            "anchors before the latest compaction/clear boundary are omitted because native undo cannot cross it; item/message and child-agent anchors are unsupported".to_string(),
+            "system-trigger prompts and superseded revisions do not count toward rollback depth".to_string(),
         ],
         total: 0,
         offset: 0,
@@ -720,6 +858,126 @@ mod tests {
         assert_eq!(catalog.fork_points[1].preview, "round three");
         assert_eq!(catalog.fork_points[2].turn, Some(1));
         assert!(catalog.fork_points.iter().all(|point| point.eligible));
+    }
+
+    fn kimi_history_fixture(
+    ) -> crate::web_gateway::session_catalog::kimi_history::KimiSessionHistory {
+        use crate::web_gateway::session_catalog::kimi_history::{
+            KimiAgentHistory, KimiSessionHistory, KimiSessionLocation,
+        };
+        let session_id = "session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        KimiSessionHistory {
+            location: KimiSessionLocation {
+                session_id: session_id.to_string(),
+                session_dir: std::path::PathBuf::new(),
+                state_path: std::path::PathBuf::new(),
+                created_at: None,
+                updated_at: None,
+                title: Some("Kimi fixture".to_string()),
+                last_prompt: Some("second active prompt".to_string()),
+                work_dir: None,
+                agents: Vec::new(),
+            },
+            agents: vec![KimiAgentHistory {
+                agent_id: "main".to_string(),
+                active_real_user_turns: 2,
+                undoable_real_user_turns: 2,
+                entries: vec![
+                    serde_json::json!({
+                        "role":"user", "content":"abandoned prompt",
+                        "user_turn_index":1, "user_turn_revision":1,
+                        "superseded":true
+                    }),
+                    serde_json::json!({
+                        "role":"user", "content":"replacement prompt",
+                        "user_turn_index":1, "user_turn_revision":2
+                    }),
+                    serde_json::json!({
+                        "role":"user", "content":"second active prompt",
+                        "user_turn_index":2, "user_turn_revision":1
+                    }),
+                    serde_json::json!({
+                        "role":"assistant", "content":"current Kimi head",
+                        "user_turn_index":2, "user_turn_revision":1
+                    }),
+                ],
+                ..KimiAgentHistory::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn kimi_points_are_exact_active_turn_boundaries_and_head() {
+        let session_id = "session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let history = kimi_history_fixture();
+        let catalog = kimi_fork_points_from_history(
+            "wrapper",
+            session_id,
+            &history,
+            &ForkPointQuery::default(),
+        );
+        assert!(catalog.supported);
+        assert_eq!(catalog.source, "kimi");
+        assert_eq!(catalog.total, 2);
+        assert_eq!(catalog.fork_points[0].id, "head");
+        assert_eq!(catalog.fork_points[0].turn, Some(2));
+        assert_eq!(catalog.fork_points[0].preview, "current Kimi head");
+        assert_eq!(catalog.fork_points[1].id, "turn:1");
+        assert_eq!(catalog.fork_points[1].turn, Some(1));
+        assert_eq!(catalog.fork_points[1].preview, "second active prompt");
+        assert!(catalog
+            .notes
+            .iter()
+            .any(|note| note.contains("atomic undo")));
+    }
+
+    #[test]
+    fn kimi_child_composite_fork_points_fail_closed() {
+        let history = kimi_history_fixture();
+        let catalog = kimi_fork_points_from_history(
+            "wrapper",
+            "session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:agent-0",
+            &history,
+            &ForkPointQuery::default(),
+        );
+        assert!(!catalog.supported);
+        assert!(catalog
+            .unsupported_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("child")));
+    }
+
+    #[test]
+    fn kimi_points_stop_at_the_latest_compaction_floor() {
+        let session_id = "session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let mut history = kimi_history_fixture();
+        let main = &mut history.agents[0];
+        main.entries.push(serde_json::json!({
+            "role":"user", "content":"post-compaction prompt",
+            "user_turn_index":3, "user_turn_revision":1
+        }));
+        main.entries.push(serde_json::json!({
+            "role":"assistant", "content":"post-compaction answer",
+            "user_turn_index":3, "user_turn_revision":1
+        }));
+        main.has_undo_boundary = true;
+        main.active_real_user_turns = 3;
+        main.undoable_real_user_turns = 1;
+
+        let catalog = kimi_fork_points_from_history(
+            "wrapper",
+            session_id,
+            &history,
+            &ForkPointQuery::default(),
+        );
+        let ids = catalog
+            .fork_points
+            .iter()
+            .map(|point| point.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["head", "turn:2"]);
+        assert!(!ids.contains(&"turn:1"));
+        assert!(catalog.notes.iter().any(|note| note.contains("compaction")));
     }
 
     #[test]

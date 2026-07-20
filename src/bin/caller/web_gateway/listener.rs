@@ -1197,7 +1197,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     // Cache all currently externally-attached sessions so refreshed browsers
     // can rehydrate every open Activity window with the same compact
     // transcript shown in the Sessions tab. This must be a set, not "last
-    // attached", because multiple Codex/Claude/Gemini session windows may be
+    // attached", because multiple Codex/Claude/Kimi/Gemini session windows may be
     // open at once.
     let attached_external_sessions = bootstrap_caches.attached_external_sessions.clone();
     // Cache the latest user_display_granted event. The authoritative

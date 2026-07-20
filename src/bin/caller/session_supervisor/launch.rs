@@ -88,6 +88,12 @@ impl SessionSupervisor {
         claude_model: Option<String>,
         claude_permission_mode: Option<String>,
         claude_effort: Option<String>,
+        kimi_model: Option<String>,
+        kimi_thinking: Option<String>,
+        kimi_permission_mode: Option<String>,
+        kimi_allowed_tools: Option<String>,
+        kimi_plan_mode: Option<bool>,
+        kimi_swarm_mode: Option<bool>,
         codex_model: Option<String>,
         codex_reasoning_effort: Option<String>,
         codex_sandbox: Option<String>,
@@ -372,6 +378,87 @@ impl SessionSupervisor {
             };
             if let Err(e) = apply_session_claude_effort(&mut project, backend, effort.to_string()) {
                 self.loop_error(format!("Session create failed: {}", e));
+                return None;
+            }
+        }
+        if let Some(model) = kimi_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error("Session create failed: kimi_model requires Kimi".to_string());
+                return None;
+            };
+            if let Err(e) = apply_session_kimi_model(&mut project, backend, model.to_string()) {
+                self.loop_error(format!("Session create failed: {e}"));
+                return None;
+            }
+        }
+        if let Some(thinking) = kimi_thinking
+            .as_deref()
+            .map(str::trim)
+            .filter(|thinking| !thinking.is_empty())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error("Session create failed: kimi_thinking requires Kimi".to_string());
+                return None;
+            };
+            if let Err(e) = apply_session_kimi_thinking(&mut project, backend, thinking.to_string())
+            {
+                self.loop_error(format!("Session create failed: {e}"));
+                return None;
+            }
+        }
+        if let Some(mode) = kimi_permission_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|mode| !mode.is_empty())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error(
+                    "Session create failed: kimi_permission_mode requires Kimi".to_string(),
+                );
+                return None;
+            };
+            if let Err(e) =
+                apply_session_kimi_permission_mode(&mut project, backend, mode.to_string())
+            {
+                self.loop_error(format!("Session create failed: {e}"));
+                return None;
+            }
+        }
+        if let Some(tools) =
+            crate::session_config::normalize_kimi_allowed_tools(kimi_allowed_tools.as_deref())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error(
+                    "Session create failed: kimi_allowed_tools requires Kimi".to_string(),
+                );
+                return None;
+            };
+            if let Err(e) = apply_session_kimi_allowed_tools(&mut project, backend, tools) {
+                self.loop_error(format!("Session create failed: {e}"));
+                return None;
+            }
+        }
+        if let Some(enabled) = kimi_plan_mode {
+            let Some(ref backend) = backend else {
+                self.loop_error("Session create failed: kimi_plan_mode requires Kimi".to_string());
+                return None;
+            };
+            if let Err(e) = apply_session_kimi_plan_mode(&mut project, backend, enabled) {
+                self.loop_error(format!("Session create failed: {e}"));
+                return None;
+            }
+        }
+        if let Some(enabled) = kimi_swarm_mode {
+            let Some(ref backend) = backend else {
+                self.loop_error("Session create failed: kimi_swarm_mode requires Kimi".to_string());
+                return None;
+            };
+            if let Err(e) = apply_session_kimi_swarm_mode(&mut project, backend, enabled) {
+                self.loop_error(format!("Session create failed: {e}"));
                 return None;
             }
         }
@@ -1991,6 +2078,13 @@ pub(crate) fn resumed_transcript_cwd(
                 None => crate::codex_history::find_codex_session_file_for_main(home, token),
             }?;
             latest_recorded_cwd(&rollout, codex_line_cwd)
+        }
+        external_agent::AgentBackend::Kimi => {
+            crate::web_gateway::session_catalog::kimi_history::find_kimi_session_from_home(
+                home, token,
+            )?
+            .work_dir
+            .map(PathBuf::from)
         }
     }
 }

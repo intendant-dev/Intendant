@@ -26,7 +26,6 @@
 //! → backend routing, not presence-internal LLM tool calls.
 
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -63,7 +62,9 @@ pub struct Dispatcher {
 impl Dispatcher {
     /// Spawn a background task that consumes the bus's lossless intent lane
     /// ([`EventBus::subscribe_intents`]) and routes task dispatch commands.
-    /// The handle is aborted on session end.
+    /// A primary-session dispatcher drains every intent before its ordered
+    /// `SessionEnded` marker, then exits without observing anything after it;
+    /// this is the foreground-to-supervisor exactly-once handoff boundary.
     ///
     /// The lane — not the lossy broadcast ring — because a dropped
     /// `StartTask`/`FollowUp`/`Interrupt` is an unrecoverable lost user
@@ -71,72 +72,41 @@ impl Dispatcher {
     pub fn spawn(self, bus: EventBus) -> JoinHandle<()> {
         let mut intent_rx = bus.subscribe_intents();
         let bus_for_log = bus.clone();
-        let accepted = Arc::new(RwLock::new(
-            self.primary_session_id
-                .iter()
-                .cloned()
-                .collect::<HashSet<String>>(),
-        ));
-        if self.primary_session_id.is_some() {
-            // Identity listener: fold backend-native ids into the accepted
-            // set as sessions upgrade their address. The broadcast lane is
-            // LOSSY: a lagged receiver has permanently dropped events, and a
-            // `SessionIdentity` among them is forfeited — commands addressed
-            // to that backend-native id are then silently ignored until some
-            // later announcement re-links it (the wrapper id keeps working
-            // regardless). No cheap authoritative snapshot of announced
-            // identities exists in-process (they persist per-session-dir in
-            // `session.jsonl`), so the honest response is to say so loudly.
-            let accepted = accepted.clone();
-            let mut identity_rx = bus.subscribe();
-            let lag_bus = bus.clone();
-            let lag_session_id = self.primary_session_id.clone();
-            tokio::spawn(async move {
-                loop {
-                    match identity_rx.recv().await {
-                        Ok(AppEvent::SessionIdentity {
-                            session_id,
-                            backend_session_id,
-                            ..
-                        }) => {
-                            let mut ids = accepted.write().expect("dispatcher alias lock");
-                            if ids.contains(&session_id) || ids.contains(&backend_session_id) {
-                                ids.insert(session_id);
-                                ids.insert(backend_session_id);
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            lag_bus.send(AppEvent::LogEntry {
-                                session_id: lag_session_id.clone(),
-                                level: "warn".to_string(),
-                                source: "system".to_string(),
-                                content: format!(
-                                    "Dispatcher identity listener lagged; {} dropped event(s) — a missed SessionIdentity means commands targeting the backend-native id may be ignored until the next announcement (session {})",
-                                    n,
-                                    lag_session_id.as_deref().unwrap_or("?")
-                                ),
-                                turn: None,
-                            });
-                            continue;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
-        }
-        let arc = Arc::new(self);
+        let mut accepted = self
+            .primary_session_id
+            .iter()
+            .cloned()
+            .collect::<HashSet<String>>();
 
         tokio::spawn(async move {
             while let Some(event) = intent_rx.recv().await {
-                if let AppEvent::ControlCommand(msg) = event {
-                    arc.route(msg, &bus_for_log, &accepted).await;
+                match event {
+                    AppEvent::ControlCommand(msg) => {
+                        self.route(msg, &bus_for_log, &accepted).await;
+                    }
+                    AppEvent::SessionIdentity {
+                        session_id,
+                        backend_session_id,
+                        ..
+                    } if self.primary_session_id.is_some()
+                        && (accepted.contains(&session_id)
+                            || accepted.contains(&backend_session_id)) =>
+                    {
+                        accepted.insert(session_id);
+                        accepted.insert(backend_session_id);
+                    }
+                    AppEvent::SessionEnded { session_id, .. }
+                        if self.primary_session_id.is_some() && accepted.contains(&session_id) =>
+                    {
+                        break;
+                    }
+                    _ => {}
                 }
             }
         })
     }
 
-    async fn route(&self, msg: ControlMsg, bus: &EventBus, accepted: &RwLock<HashSet<String>>) {
+    async fn route(&self, msg: ControlMsg, bus: &EventBus, accepted: &HashSet<String>) {
         if let Some(target_session_id) = control_target_session_id(&msg) {
             if !self.handles_target_session_in(target_session_id, accepted) {
                 return;
@@ -372,6 +342,18 @@ impl Dispatcher {
                 });
             }
 
+            ControlMsg::StopSession { session_id } if self.primary_session_id.is_some() => {
+                // The foreground/headless startup session is not registered
+                // in SessionSupervisor. Its dispatcher owns the primary
+                // identity group, so route Stop directly to the running loop;
+                // otherwise the supervisor truthfully reports "not managed"
+                // while the foreground backend keeps running forever.
+                bus.send(AppEvent::SessionStopRequested {
+                    session_id: Some(session_id),
+                    reason: "stopped by user".to_string(),
+                });
+            }
+
             _ => {
                 // Not a task-dispatch command — ignore.
             }
@@ -389,18 +371,11 @@ impl Dispatcher {
         });
     }
 
-    fn handles_target_session_in(
-        &self,
-        session_id: &str,
-        accepted: &RwLock<HashSet<String>>,
-    ) -> bool {
+    fn handles_target_session_in(&self, session_id: &str, accepted: &HashSet<String>) -> bool {
         if self.primary_session_id.is_none() {
             return true;
         }
-        accepted
-            .read()
-            .expect("dispatcher alias lock")
-            .contains(session_id)
+        accepted.contains(session_id)
     }
 }
 
@@ -694,6 +669,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn primary_dispatcher_uses_session_end_as_ordered_cutover() {
+        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<FollowUpMessage>(4);
+        let bus = make_test_bus();
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: None,
+            follow_up_tx: Some(follow_up_tx),
+            primary_session_id: Some("wrapper-id".to_string()),
+        };
+        let handle = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::SessionIdentity {
+            session_id: "wrapper-id".into(),
+            source: "kimi".into(),
+            backend_session_id: "native-id".into(),
+        });
+        let start_task = |task: &str| {
+            AppEvent::ControlCommand(ControlMsg::StartTask {
+                session_id: Some("native-id".into()),
+                task: task.into(),
+                orchestrate: None,
+                direct: Some(true),
+                reference_frame_ids: vec![],
+                display_target: None,
+                attachments: vec![],
+                follow_up_id: None,
+                delegation_id: None,
+            })
+        };
+        bus.send(start_task("before cutover"));
+        bus.send(AppEvent::SessionEnded {
+            session_id: "wrapper-id".into(),
+            reason: "complete".into(),
+            error_kind: None,
+        });
+        bus.send(start_task("after cutover"));
+
+        let message =
+            tokio::time::timeout(std::time::Duration::from_millis(200), follow_up_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(message.text, "before cutover");
+        tokio::time::timeout(std::time::Duration::from_millis(200), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(follow_up_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn orchestrate_false_implies_direct() {
         let (task_tx, mut task_rx) = mpsc::channel::<presence_core::TaskEnvelope>(4);
         let (presence_tx, mut presence_rx) = mpsc::channel::<String>(4);
@@ -787,6 +814,46 @@ mod tests {
         assert!(
             saw_interrupt_requested,
             "expected AppEvent::InterruptRequested to be emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_for_foreground_primary_emits_stop_requested() {
+        let bus = make_test_bus();
+        let mut rx = bus.subscribe();
+
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: None,
+            follow_up_tx: None,
+            primary_session_id: Some("wrapper-id".to_string()),
+        };
+        let _h = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::StopSession {
+            session_id: "wrapper-id".to_string(),
+        }));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut saw_stop_requested = false;
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::SessionStopRequested { session_id, reason })) => {
+                    assert_eq!(session_id.as_deref(), Some("wrapper-id"));
+                    assert_eq!(reason, "stopped by user");
+                    saw_stop_requested = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_stop_requested,
+            "expected foreground SessionStopRequested"
         );
     }
 

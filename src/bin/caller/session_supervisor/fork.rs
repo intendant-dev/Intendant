@@ -88,6 +88,23 @@ impl SessionSupervisor {
                 }
                 Err(error) => error,
             },
+            "kimi" => match self.plan_kimi_fork(&token, &anchor).await {
+                Ok((backend_id, rollback_turns, expected_horizon)) => {
+                    self.spawn_kimi_fork(
+                        &source,
+                        backend_id,
+                        &anchor,
+                        task,
+                        project_root,
+                        request_id,
+                        rollback_turns,
+                        expected_horizon,
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => error,
+            },
             other => format!("fork is not supported for {other} sessions"),
         };
 
@@ -298,6 +315,155 @@ impl SessionSupervisor {
         )
         .await;
     }
+
+    /// Resolve a Kimi main session and translate an exact turn-boundary
+    /// anchor into the one-shot atomic undo count applied after Kimi's native
+    /// fork-at-head. Child-agent composite ids are deliberately rejected:
+    /// Kimi 0.27's fork and undo REST endpoints address the main session.
+    async fn plan_kimi_fork(
+        &self,
+        token: &str,
+        anchor: &ForkAnchorSpec,
+    ) -> Result<
+        (
+            String,
+            u32,
+            crate::web_gateway::session_catalog::kimi_history::KimiTurnHorizon,
+        ),
+        String,
+    > {
+        let home = self.logs_home();
+        let backend_id = match persisted_external_identity_for_session_in_home(&home, token) {
+            Some((source, id)) if source == "kimi" => id,
+            Some((source, _)) => {
+                return Err(format!("session {token} is a {source} session, not kimi"));
+            }
+            None => token.to_string(),
+        };
+        let Some((_, child_agent)) =
+            crate::web_gateway::session_catalog::kimi_history::split_kimi_session_id(&backend_id)
+        else {
+            return Err(format!(
+                "session {backend_id} is not a canonical Kimi session id"
+            ));
+        };
+        if child_agent.is_some() {
+            return Err(
+                "Kimi child-agent sessions cannot be forked independently; fork the main session"
+                    .to_string(),
+            );
+        }
+
+        let horizon =
+            crate::web_gateway::session_catalog::kimi_history::kimi_turn_horizon_from_history(
+                &home,
+                &backend_id,
+            )
+            .ok_or_else(|| format!("session {backend_id} not found in the Kimi session store"))?;
+        let turns = horizon.active_turns;
+
+        let rollback = match anchor.kind.trim() {
+            "head" => 0,
+            "turn-boundary" => {
+                let kept = anchor
+                    .turn
+                    .ok_or_else(|| "a Kimi turn-boundary anchor needs `turn`".to_string())?;
+                if kept == 0 || kept > turns {
+                    return Err(format!(
+                        "Kimi turn boundary {kept} is outside the session's 1..={turns} history"
+                    ));
+                }
+                let rollback = turns - kept;
+                if rollback > horizon.undoable_turns {
+                    let earliest = turns.saturating_sub(horizon.undoable_turns);
+                    let boundary = if horizon.has_boundary {
+                        "latest compaction/clear boundary"
+                    } else {
+                        "native undo horizon"
+                    };
+                    return Err(format!(
+                        "Kimi turn boundary {kept} is before the {boundary}; the earliest \
+                         native-undo-reachable boundary keeps turn {earliest}"
+                    ));
+                }
+                rollback
+            }
+            other => {
+                return Err(format!(
+                    "Kimi anchor kind `{other}` is unsupported; use `head` or `turn-boundary`"
+                ));
+            }
+        };
+        Ok((backend_id, rollback, horizon))
+    }
+
+    /// Activate a Kimi anchor fork through the ordinary resume funnel.
+    /// Kimi creates the child at the parent's head, then the adapter applies
+    /// `kimi_fork_rollback_turns` atomically before subscribing or accepting
+    /// the optional first task. The child id arrives on the normal identity
+    /// event, so this immediate result intentionally carries no child id.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_kimi_fork(
+        &self,
+        source: &str,
+        backend_id: String,
+        anchor: &ForkAnchorSpec,
+        task: Option<String>,
+        project_root: Option<String>,
+        request_id: Option<String>,
+        rollback_turns: u32,
+        expected_horizon: crate::web_gateway::session_catalog::kimi_history::KimiTurnHorizon,
+    ) {
+        let expected_horizon = match serde_json::to_string(&expected_horizon) {
+            Ok(expected_horizon) => expected_horizon,
+            Err(error) => {
+                self.config.bus.send(AppEvent::SessionForkResult {
+                    request_id,
+                    parent_session_id: backend_id,
+                    child_session_id: None,
+                    source: source.to_string(),
+                    relationship: "anchor-fork".to_string(),
+                    anchor_summary: anchor.summary(),
+                    error: Some(format!(
+                        "failed to encode Kimi expected-head horizon: {error}"
+                    )),
+                });
+                return;
+            }
+        };
+        self.config.bus.send(AppEvent::SessionForkResult {
+            request_id,
+            parent_session_id: backend_id.clone(),
+            child_session_id: None,
+            source: source.to_string(),
+            relationship: "anchor-fork".to_string(),
+            anchor_summary: anchor.summary(),
+            error: None,
+        });
+        let overrides = LaunchOverrides {
+            fork_relationship: Some("anchor-fork".to_string()),
+            fork_anchor: serde_json::to_string(anchor).ok(),
+            kimi_fork_rollback_turns: (rollback_turns > 0).then_some(rollback_turns),
+            kimi_fork_expected_horizon: Some(expected_horizon),
+            ..Default::default()
+        };
+        self.resume_session(
+            source.to_string(),
+            backend_id.clone(),
+            Some(backend_id),
+            project_root,
+            task,
+            Some(true),
+            Vec::new(),
+            true,
+            None,
+            overrides,
+            false,
+            false,
+        )
+        .await;
+    }
+
     /// Chain-slice the parent transcript into a fresh child uuid in the
     /// same project dir. Returns `(parent_backend_id, child_uuid,
     /// kept_lines, parent_project_root)`.
@@ -542,6 +708,181 @@ mod tests {
             "message": {"role": kind, "content": [{"type": "text", "text": text}]},
         })
         .to_string()
+    }
+
+    fn seed_kimi_main_session(home: &Path, session_id: &str, prompts: &[&str]) -> PathBuf {
+        let dir = home
+            .join(".kimi-code")
+            .join("sessions")
+            .join("project")
+            .join(session_id);
+        let wire_dir = dir.join("agents").join("main");
+        std::fs::create_dir_all(&wire_dir).unwrap();
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::json!({
+                "workDir": "/tmp/project",
+                "agents": {"main": {"type": "main"}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let body = prompts
+            .iter()
+            .enumerate()
+            .map(|(index, prompt)| {
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "type": "turn.prompt",
+                        "input": [{"type": "text", "text": prompt}],
+                        "origin": {"kind": "user"},
+                        "time": index as u64 + 1,
+                    })
+                )
+            })
+            .collect::<String>();
+        let wire_path = wire_dir.join("wire.jsonl");
+        std::fs::write(&wire_path, body).unwrap();
+        wire_path
+    }
+
+    #[tokio::test]
+    async fn kimi_anchor_plan_computes_atomic_undo_and_rejects_non_turn_cuts() {
+        let project = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor(project.path().to_path_buf(), EventBus::new());
+        let home = supervisor.logs_home();
+        let session_id = "session_anchor_plan";
+        seed_kimi_main_session(&home, session_id, &["one", "two", "three"]);
+
+        let (backend_id, rollback, expected) = supervisor
+            .plan_kimi_fork(
+                session_id,
+                &ForkAnchorSpec {
+                    kind: "turn-boundary".to_string(),
+                    turn: Some(1),
+                    item_id: None,
+                    position: None,
+                    seq: None,
+                    message_uuid: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend_id, session_id);
+        assert_eq!(rollback, 2);
+        assert_eq!(expected.active_turns, 3);
+        assert!(!expected.head_fingerprint.is_empty());
+
+        let (_, head_rollback, head_expected) = supervisor
+            .plan_kimi_fork(
+                session_id,
+                &ForkAnchorSpec {
+                    kind: "head".to_string(),
+                    turn: Some(3),
+                    item_id: None,
+                    position: None,
+                    seq: None,
+                    message_uuid: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(head_rollback, 0);
+        assert_eq!(head_expected, expected);
+
+        let unsupported = supervisor
+            .plan_kimi_fork(
+                session_id,
+                &ForkAnchorSpec {
+                    kind: "item-anchor".to_string(),
+                    turn: None,
+                    item_id: Some("item-1".to_string()),
+                    position: Some("after".to_string()),
+                    seq: None,
+                    message_uuid: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(unsupported.contains("unsupported"), "{unsupported}");
+        let child = supervisor
+            .plan_kimi_fork(
+                &format!("{session_id}:side-agent"),
+                &ForkAnchorSpec {
+                    kind: "head".to_string(),
+                    turn: None,
+                    item_id: None,
+                    position: None,
+                    seq: None,
+                    message_uuid: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(child.contains("cannot be forked independently"), "{child}");
+    }
+
+    #[tokio::test]
+    async fn kimi_anchor_plan_rejects_a_direct_pre_compaction_boundary() {
+        let project = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor(project.path().to_path_buf(), EventBus::new());
+        let home = supervisor.logs_home();
+        let session_id = "session_anchor_compacted";
+        let wire_path = seed_kimi_main_session(&home, session_id, &["one", "two"]);
+        let mut body = std::fs::read_to_string(&wire_path).unwrap();
+        body.push_str(
+            &serde_json::json!({
+                "type": "context.apply_compaction",
+                "summary": "turns one and two",
+                "time": 3,
+            })
+            .to_string(),
+        );
+        body.push('\n');
+        body.push_str(
+            &serde_json::json!({
+                "type": "turn.prompt",
+                "input": [{"type": "text", "text": "three"}],
+                "origin": {"kind": "user"},
+                "time": 4,
+            })
+            .to_string(),
+        );
+        body.push('\n');
+        std::fs::write(wire_path, body).unwrap();
+
+        let reachable = supervisor
+            .plan_kimi_fork(
+                session_id,
+                &ForkAnchorSpec {
+                    kind: "turn-boundary".to_string(),
+                    turn: Some(2),
+                    item_id: None,
+                    position: None,
+                    seq: None,
+                    message_uuid: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(reachable.1, 1);
+
+        let error = supervisor
+            .plan_kimi_fork(
+                session_id,
+                &ForkAnchorSpec {
+                    kind: "turn-boundary".to_string(),
+                    turn: Some(1),
+                    item_id: None,
+                    position: None,
+                    seq: None,
+                    message_uuid: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("before the latest compaction"), "{error}");
     }
 
     /// The edit-as-branch path must hand the request's attachment ids to

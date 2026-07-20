@@ -109,9 +109,10 @@ Known seams — the honest gap between the vision and the pixels:
   running pulse).
 - **The scene is a backdrop.** All operational UI is screen-space 2D HUD
   paint; nothing interactive lives in world space yet.
-- **Both backends have rendered runtime blocks** in the controls panel
-  (Codex: approval policy / managed-context / fork-binary warning;
-  Claude Code: model aliases / permission modes).
+- **All external backends have rendered runtime blocks** in the controls
+  panel (Codex: approval policy / managed-context / fork-binary warning;
+  Claude Code: model aliases / permission modes; Kimi: model, thinking,
+  permission, plan, and swarm modes).
 - **Wireframe-only rendering** (no depth buffer or shading), plus a stack of
   WebGPU-reliability fallbacks (auto Canvas-2D, scene-on-HUD underlay, a
   liveness watchdog) that reflect real-world driver flakiness.
@@ -125,12 +126,11 @@ concrete; C and D set the trajectory.
 
 **Landed.** The per-session operational features (goal chips, per-window
 action menus, relationship wiring) were built against Codex first. The
-transports are already backend-neutral; Claude Code caught up by
-*producing into those rails* — thread actions, the wrapper goal engine,
-in-band Task sub-agents as `task-*` child sessions, the per-session launch
-overlay, and the controls-panel Claude runtime block. Native sessions
-remain the open producer. The concrete matrix lives in
-[Dashboard and Station parity](./external-agent-orchestration.md#dashboard-and-station-parity-codex-vs-claude-code).
+transports are already backend-neutral; Claude Code and Kimi caught up by
+*producing into those rails* — thread actions, goals, native sub-agents,
+per-session launch overlays, and controls-panel runtime blocks. Native
+sessions remain the open producer. The concrete matrix lives in
+[Dashboard and Station parity](./external-agent-orchestration.md#dashboard-and-station-parity).
 
 ### Phase B — the session graph becomes real
 

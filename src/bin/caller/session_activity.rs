@@ -2,7 +2,7 @@
 //! model actually doing something right now" signal behind the vitals
 //! `activity` section.
 //!
-//! Every adapter (Claude Code reader, Codex reader, the native loop)
+//! Every adapter (Claude Code reader, Codex reader, Kimi server events, the native loop)
 //! owns one [`ActivityMachine`] per session and feeds it
 //! [`ActivityObservation`]s at the exact wire seams: our own dispatch
 //! writes, stream deltas, item/tool transitions, rate-limit events, turn

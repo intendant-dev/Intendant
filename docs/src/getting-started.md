@@ -495,7 +495,7 @@ value is missing.
 | `--mtls-ca` | `<path>` | PEM CA bundle for `--mtls` client certificate verification |
 | `--transcription` | — | Enable server-side speech transcription (overrides `[transcription] enabled`) |
 | `--record-display` | `<id>` | Record an existing X11 display, e.g. `50` for `:50` (repeatable) |
-| `--agent` | `<backend>` | Use an external coding-agent backend: `codex` or `claude-code` |
+| `--agent` | `<backend>` | Use an external coding-agent backend: `codex`, `claude-code`, or `kimi` |
 | `--advertise-url` | `<url>` | WebSocket URL to advertise to federation peers in this daemon's Agent Card (repeatable, preference order; overrides `[server.advertise]`) |
 | `--help`, `-h` | — | Print help and exit |
 | `--version`, `-V` | — | Print version + build provenance (package version, commit short SHA with `-dirty` marker, build timestamp, target triple) and exit. Also accepted by `intendant-runtime`; the daemon reports the same line as `daemon_version` in `intendant ctl status` |

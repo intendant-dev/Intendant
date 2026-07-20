@@ -51,6 +51,40 @@ pub struct SessionAgentConfig {
     pub claude_allowed_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_effort: Option<String>,
+    /// Kimi launch pins. `None` inherits the current global setting; booleans
+    /// use `Some(false)` for an explicit per-session disable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_permission_mode: Option<String>,
+    /// `None` = inherit Kimi's active profile, `Some([])` = explicitly no
+    /// optional tools, `Some(list)` = exact active-tool override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_allowed_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_plan_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_swarm_mode: Option<bool>,
+    /// Exact Kimi data home used by the supervised server. Intendant runs
+    /// each server in a private bridge below the selected primary/leased
+    /// Kimi home, so history readers must use this path rather than assuming
+    /// `$HOME/.kimi-code`.
+    ///
+    /// Internal-only: public configure/restart fields never accept it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_home: Option<String>,
+    /// One-shot Kimi anchor-fork trim. The child is forked at head, then
+    /// atomically undone by this many user turns before its first prompt.
+    /// Internal-only: never accepted from public configure/restart fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_fork_rollback_turns: Option<u32>,
+    /// Serialized source-of-truth Kimi head horizon captured by the internal
+    /// anchor-fork planner. The adapter validates it both immediately before
+    /// and immediately after the native fork, before any undo is attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_fork_expected_horizon: Option<String>,
     /// Canonical native id of the thread this session was FORKED from
     /// (backend-neutral lineage record). While the fork's own native id is
     /// still unknown, `resume == forked_from` also tells the spawner to add
@@ -106,6 +140,15 @@ impl SessionAgentConfig {
             && self.claude_permission_mode.is_none()
             && self.claude_allowed_tools.is_none()
             && self.claude_effort.is_none()
+            && self.kimi_model.is_none()
+            && self.kimi_thinking.is_none()
+            && self.kimi_permission_mode.is_none()
+            && self.kimi_allowed_tools.is_none()
+            && self.kimi_plan_mode.is_none()
+            && self.kimi_swarm_mode.is_none()
+            && self.kimi_home.is_none()
+            && self.kimi_fork_rollback_turns.is_none()
+            && self.kimi_fork_expected_horizon.is_none()
             && self.forked_from.is_none()
             && self.fork_relationship.is_none()
             && self.fork_anchor.is_none()
@@ -161,6 +204,33 @@ impl SessionAgentConfig {
         if self.claude_effort.is_none() {
             self.claude_effort = fallback.claude_effort;
         }
+        if self.kimi_model.is_none() {
+            self.kimi_model = fallback.kimi_model;
+        }
+        if self.kimi_thinking.is_none() {
+            self.kimi_thinking = fallback.kimi_thinking;
+        }
+        if self.kimi_permission_mode.is_none() {
+            self.kimi_permission_mode = fallback.kimi_permission_mode;
+        }
+        if self.kimi_allowed_tools.is_none() {
+            self.kimi_allowed_tools = fallback.kimi_allowed_tools;
+        }
+        if self.kimi_plan_mode.is_none() {
+            self.kimi_plan_mode = fallback.kimi_plan_mode;
+        }
+        if self.kimi_swarm_mode.is_none() {
+            self.kimi_swarm_mode = fallback.kimi_swarm_mode;
+        }
+        if self.kimi_home.is_none() {
+            self.kimi_home = fallback.kimi_home;
+        }
+        if self.kimi_fork_rollback_turns.is_none() {
+            self.kimi_fork_rollback_turns = fallback.kimi_fork_rollback_turns;
+        }
+        if self.kimi_fork_expected_horizon.is_none() {
+            self.kimi_fork_expected_horizon = fallback.kimi_fork_expected_horizon;
+        }
         if self.forked_from.is_none() {
             self.forked_from = fallback.forked_from;
         }
@@ -215,6 +285,7 @@ pub fn agent_command_conflicts_with_source(source: &str, command: &str) -> Optio
     let owner = match stem.to_ascii_lowercase().as_str() {
         "codex" => AgentBackend::Codex,
         "claude" => AgentBackend::ClaudeCode,
+        "kimi" => AgentBackend::Kimi,
         _ => return None,
     };
     (owner != source_backend).then(|| owner.as_short_str())
@@ -271,6 +342,12 @@ pub fn normalize_codex_reasoning_effort(effort: Option<&str>) -> Option<String> 
 }
 
 pub fn normalize_codex_home(home: Option<&str>) -> Option<String> {
+    home.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+pub fn normalize_kimi_home(home: Option<&str>) -> Option<String> {
     home.map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
@@ -371,6 +448,65 @@ pub fn normalize_claude_effort(effort: Option<&str>) -> Option<String> {
     crate::project::normalize_claude_effort(Some(trimmed))
 }
 
+/// Per-session Kimi model pin. Explicit inherit sentinels clear the pin.
+pub fn normalize_kimi_model(model: Option<&str>) -> Option<String> {
+    let trimmed = model.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "inherit" | "default" | "global"
+    ) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Per-session Kimi thinking pin.
+pub fn normalize_kimi_thinking(thinking: Option<&str>) -> Option<String> {
+    crate::project::normalize_kimi_thinking(thinking)
+}
+
+/// Per-session Kimi permission-mode pin. `manual` and its `default` alias are
+/// real settings; only explicit inherit sentinels clear the pin.
+pub fn normalize_kimi_permission_mode(mode: Option<&str>) -> Option<String> {
+    let trimmed = mode.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(trimmed.to_ascii_lowercase().as_str(), "inherit" | "global") {
+        return None;
+    }
+    Some(crate::project::normalize_kimi_permission_mode(trimmed))
+}
+
+/// Parse Kimi's exact active-tool override. The wire accepts comma- or
+/// newline-separated names. Inherit sentinels clear the pin while `none`
+/// deliberately preserves `Some([])` as "no optional tools".
+pub fn normalize_kimi_allowed_tools(tools: Option<&str>) -> Option<Vec<String>> {
+    let trimmed = tools.map(str::trim).filter(|value| !value.is_empty())?;
+    match trimmed.to_ascii_lowercase().as_str() {
+        "inherit" | "default" | "global" => return None,
+        "none" => return Some(Vec::new()),
+        _ => {}
+    }
+    Some(crate::project::normalize_kimi_allowed_tools(
+        &trimmed
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|tool| !tool.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+/// Parse a per-session Kimi feature toggle. Unknown values are ignored
+/// rather than silently enabling a capability.
+pub fn normalize_kimi_bool(value: Option<&str>) -> Option<bool> {
+    let trimmed = value.map(str::trim).filter(|value| !value.is_empty())?;
+    match trimmed.to_ascii_lowercase().as_str() {
+        "inherit" | "default" | "global" => None,
+        "true" | "1" | "yes" | "on" | "enabled" => Some(true),
+        "false" | "0" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
 pub fn effective_codex_home() -> Option<String> {
     let from_env = std::env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
@@ -398,6 +534,12 @@ pub struct WireSessionAgentFields<'a> {
     pub claude_permission_mode: Option<&'a str>,
     pub claude_allowed_tools: Option<&'a str>,
     pub claude_effort: Option<&'a str>,
+    pub kimi_model: Option<&'a str>,
+    pub kimi_thinking: Option<&'a str>,
+    pub kimi_permission_mode: Option<&'a str>,
+    pub kimi_allowed_tools: Option<&'a str>,
+    pub kimi_plan_mode: Option<&'a str>,
+    pub kimi_swarm_mode: Option<&'a str>,
 }
 
 pub fn from_wire(
@@ -428,6 +570,7 @@ pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
         .filter(|value| !value.is_empty());
     let is_codex = source.as_deref() == Some("codex");
     let is_claude = source.as_deref() == Some("claude-code");
+    let is_kimi = source.as_deref() == Some("kimi");
     let agent_command = sanitize_agent_command_for_source(
         source.as_deref(),
         normalize_agent_command(fields.agent_command),
@@ -477,6 +620,29 @@ pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
         claude_effort: is_claude
             .then(|| normalize_claude_effort(fields.claude_effort))
             .flatten(),
+        kimi_model: is_kimi
+            .then(|| normalize_kimi_model(fields.kimi_model))
+            .flatten(),
+        kimi_thinking: is_kimi
+            .then(|| normalize_kimi_thinking(fields.kimi_thinking))
+            .flatten(),
+        kimi_permission_mode: is_kimi
+            .then(|| normalize_kimi_permission_mode(fields.kimi_permission_mode))
+            .flatten(),
+        kimi_allowed_tools: is_kimi
+            .then(|| normalize_kimi_allowed_tools(fields.kimi_allowed_tools))
+            .flatten(),
+        kimi_plan_mode: is_kimi
+            .then(|| normalize_kimi_bool(fields.kimi_plan_mode))
+            .flatten(),
+        kimi_swarm_mode: is_kimi
+            .then(|| normalize_kimi_bool(fields.kimi_swarm_mode))
+            .flatten(),
+        // The bridge home is selected and persisted by the adapter after it
+        // has prepared the private server home. It is never a wire input.
+        kimi_home: None,
+        kimi_fork_rollback_turns: None,
+        kimi_fork_expected_horizon: None,
         forked_from: None,
         fork_relationship: None,
     }
@@ -512,6 +678,15 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             claude_permission_mode: None,
             claude_allowed_tools: None,
             claude_effort: None,
+            kimi_model: None,
+            kimi_thinking: None,
+            kimi_permission_mode: None,
+            kimi_allowed_tools: None,
+            kimi_plan_mode: None,
+            kimi_swarm_mode: None,
+            kimi_home: None,
+            kimi_fork_rollback_turns: None,
+            kimi_fork_expected_horizon: None,
             forked_from: None,
             fork_relationship: None,
             fork_anchor: None,
@@ -543,6 +718,53 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 )),
                 claude_allowed_tools: Some(claude.allowed_tools.clone()),
                 claude_effort: crate::project::normalize_claude_effort(claude.effort.as_deref()),
+                kimi_model: None,
+                kimi_thinking: None,
+                kimi_permission_mode: None,
+                kimi_allowed_tools: None,
+                kimi_plan_mode: None,
+                kimi_swarm_mode: None,
+                kimi_home: None,
+                kimi_fork_rollback_turns: None,
+                kimi_fork_expected_horizon: None,
+                forked_from: None,
+                fork_relationship: None,
+                fork_anchor: None,
+                codex_fork_rollout_path: None,
+                codex_fork_rollback_turns: None,
+                codex_fork_rollback_item_id: None,
+                codex_fork_rollback_position: None,
+            }
+        }
+        AgentBackend::Kimi => {
+            let kimi = &project.config.agent.kimi;
+            SessionAgentConfig {
+                source: Some("kimi".to_string()),
+                project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
+                agent_command: Some(kimi.command.clone()),
+                codex_model: None,
+                codex_reasoning_effort: None,
+                codex_sandbox: None,
+                codex_approval_policy: None,
+                codex_managed_context: None,
+                codex_context_archive: None,
+                codex_service_tier: None,
+                codex_home: None,
+                claude_model: None,
+                claude_permission_mode: None,
+                claude_allowed_tools: None,
+                claude_effort: None,
+                kimi_model: normalize_kimi_model(kimi.model.as_deref()),
+                kimi_thinking: normalize_kimi_thinking(kimi.thinking.as_deref()),
+                kimi_permission_mode: Some(crate::project::normalize_kimi_permission_mode(
+                    &kimi.permission_mode,
+                )),
+                kimi_allowed_tools: kimi.allowed_tools.clone(),
+                kimi_plan_mode: Some(kimi.plan_mode),
+                kimi_swarm_mode: Some(kimi.swarm_mode),
+                kimi_home: None,
+                kimi_fork_rollback_turns: kimi.kimi_fork_rollback_turns,
+                kimi_fork_expected_horizon: kimi.kimi_fork_expected_horizon.clone(),
                 forked_from: None,
                 fork_relationship: None,
                 fork_anchor: None,
@@ -605,6 +827,34 @@ pub fn apply_to_project(
                 claude.effort = crate::project::normalize_claude_effort(Some(effort));
             }
         }
+        AgentBackend::Kimi => {
+            let kimi = &mut project.config.agent.kimi;
+            if let Some(command) = config.agent_command.clone() {
+                kimi.command = command;
+            }
+            if let Some(model) = config.kimi_model.clone() {
+                kimi.model = Some(model);
+            }
+            if let Some(thinking) = config.kimi_thinking.as_deref() {
+                kimi.thinking = crate::project::normalize_kimi_thinking(Some(thinking));
+            }
+            if let Some(mode) = config.kimi_permission_mode.as_deref() {
+                kimi.permission_mode = crate::project::normalize_kimi_permission_mode(mode);
+            }
+            if let Some(tools) = config.kimi_allowed_tools.as_ref() {
+                kimi.allowed_tools = Some(crate::project::normalize_kimi_allowed_tools(
+                    tools.as_slice(),
+                ));
+            }
+            if let Some(enabled) = config.kimi_plan_mode {
+                kimi.plan_mode = enabled;
+            }
+            if let Some(enabled) = config.kimi_swarm_mode {
+                kimi.swarm_mode = enabled;
+            }
+            kimi.kimi_fork_rollback_turns = config.kimi_fork_rollback_turns;
+            kimi.kimi_fork_expected_horizon = config.kimi_fork_expected_horizon.clone();
+        }
     }
 }
 
@@ -627,6 +877,49 @@ pub fn read_log_dir_config(log_dir: &Path) -> Option<SessionAgentConfig> {
         config.project_root = read_log_dir_project_root(log_dir);
     }
     (!config.is_empty()).then_some(config)
+}
+
+/// Kimi bridge homes persisted by supervised sessions.
+///
+/// The bridge path contains only a hashed Intendant session identity; this
+/// reader never opens credential or server-token files. Both wrapper configs
+/// and backend-id overlays are considered so a live bridge remains
+/// discoverable after a daemon restart even if one of the two indices had
+/// not yet been refreshed when the process exited.
+fn push_persisted_kimi_home(out: &mut Vec<PathBuf>, raw: Option<&str>) {
+    let Some(home) = normalize_kimi_home(raw).map(PathBuf::from) else {
+        return;
+    };
+    if home.is_dir() && !out.contains(&home) {
+        out.push(home);
+    }
+}
+
+pub fn persisted_kimi_homes_in_logs(logs: &Path) -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(logs) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            if let Some(config) = read_log_dir_config(&dir) {
+                push_persisted_kimi_home(&mut homes, config.kimi_home.as_deref());
+            }
+        }
+    }
+    homes
+}
+
+pub fn persisted_kimi_homes_in(home: &Path) -> Vec<PathBuf> {
+    let logs = crate::platform::intendant_home_in(home).join("logs");
+    let mut homes = persisted_kimi_homes_in_logs(&logs);
+    if let Some(by_id) = read_overlay_map(home).get("kimi") {
+        for config in by_id.values() {
+            push_persisted_kimi_home(&mut homes, config.kimi_home.as_deref());
+        }
+    }
+    homes
 }
 
 fn read_log_dir_project_root(log_dir: &Path) -> Option<String> {
@@ -698,6 +991,22 @@ fn normalize_session_agent_config(
     }
     if let Some(effort) = config.claude_effort.take() {
         config.claude_effort = normalize_claude_effort(Some(&effort));
+    }
+    if let Some(model) = config.kimi_model.take() {
+        config.kimi_model = normalize_kimi_model(Some(&model));
+    }
+    if let Some(thinking) = config.kimi_thinking.take() {
+        config.kimi_thinking = normalize_kimi_thinking(Some(&thinking));
+    }
+    if let Some(mode) = config.kimi_permission_mode.take() {
+        config.kimi_permission_mode = normalize_kimi_permission_mode(Some(&mode));
+    }
+    if let Some(tools) = config.kimi_allowed_tools.take() {
+        // Keep Some([]): this is the explicit no-tools pin.
+        config.kimi_allowed_tools = Some(crate::project::normalize_kimi_allowed_tools(&tools));
+    }
+    if let Some(home) = config.kimi_home.take() {
+        config.kimi_home = normalize_kimi_home(Some(&home));
     }
     config
 }
@@ -990,6 +1299,41 @@ pub fn apply_config_to_session_json(session: &mut Value, config: &SessionAgentCo
             "claude_effort".to_string(),
             Value::String(effort.to_string()),
         );
+    }
+    if let Some(model) = config.kimi_model.as_deref() {
+        obj.insert("kimi_model".to_string(), Value::String(model.to_string()));
+    }
+    if let Some(thinking) = config.kimi_thinking.as_deref() {
+        obj.insert(
+            "kimi_thinking".to_string(),
+            Value::String(thinking.to_string()),
+        );
+    }
+    if let Some(mode) = config.kimi_permission_mode.as_deref() {
+        obj.insert(
+            "kimi_permission_mode".to_string(),
+            Value::String(mode.to_string()),
+        );
+    }
+    if let Some(tools) = config.kimi_allowed_tools.as_ref() {
+        obj.insert(
+            "kimi_allowed_tools".to_string(),
+            Value::Array(
+                tools
+                    .iter()
+                    .map(|tool| Value::String(tool.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(enabled) = config.kimi_plan_mode {
+        obj.insert("kimi_plan_mode".to_string(), Value::Bool(enabled));
+    }
+    if let Some(enabled) = config.kimi_swarm_mode {
+        obj.insert("kimi_swarm_mode".to_string(), Value::Bool(enabled));
+    }
+    if let Some(home) = config.kimi_home.as_deref() {
+        obj.insert("kimi_home".to_string(), Value::String(home.to_string()));
     }
 }
 
@@ -1673,6 +2017,53 @@ mod tests {
     }
 
     #[test]
+    fn kimi_bridge_home_round_trips_applies_and_is_discoverable() {
+        let user_home = tempfile::tempdir().unwrap();
+        let bridge = user_home.path().join("leased-kimi").join("bridge");
+        std::fs::create_dir_all(&bridge).unwrap();
+        let log_dir = user_home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper");
+        let mut config = from_wire_fields(WireSessionAgentFields {
+            source: Some("kimi"),
+            agent_command: Some("kimi"),
+            ..Default::default()
+        });
+        config.kimi_home = Some(format!("  {}  ", bridge.display()));
+        write_log_dir_config(&log_dir, &config).unwrap();
+
+        let loaded = read_log_dir_config(&log_dir).unwrap();
+        assert_eq!(
+            loaded.kimi_home.as_deref(),
+            Some(bridge.to_string_lossy().as_ref())
+        );
+        let mut row = serde_json::json!({"source":"kimi","session_id":"session_test"});
+        apply_config_to_session_json(&mut row, &loaded);
+        assert_eq!(
+            row.get("kimi_home").and_then(Value::as_str),
+            Some(bridge.to_string_lossy().as_ref())
+        );
+
+        // The backend overlay may carry the same bridge after native
+        // identity announcement; root discovery de-duplicates it.
+        write_external_overlay(user_home.path(), "kimi", "session_test", &loaded).unwrap();
+        assert_eq!(
+            persisted_kimi_homes_in(user_home.path()),
+            vec![bridge.clone()]
+        );
+
+        // Public launch fields cannot inject an arbitrary history root.
+        assert!(from_wire_fields(WireSessionAgentFields {
+            source: Some("kimi"),
+            ..Default::default()
+        })
+        .kimi_home
+        .is_none());
+    }
+
+    #[test]
     fn log_config_uses_session_meta_project_root_for_legacy_config() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = from_wire(
@@ -2122,6 +2513,181 @@ mod tests {
         assert_eq!(
             session.get("claude_effort").and_then(|v| v.as_str()),
             Some("max")
+        );
+    }
+
+    #[test]
+    fn kimi_wire_overlay_and_project_application_are_backend_gated() {
+        let cfg = from_wire_fields(WireSessionAgentFields {
+            source: Some("kimi-code"),
+            agent_command: Some(" /opt/kimi "),
+            kimi_model: Some(" k2.7-coding "),
+            kimi_thinking: Some(" HIGH "),
+            kimi_permission_mode: Some("bypassPermissions"),
+            kimi_allowed_tools: Some(" Read,\nWrite,Read "),
+            kimi_plan_mode: Some("yes"),
+            kimi_swarm_mode: Some("off"),
+            ..Default::default()
+        });
+        assert_eq!(cfg.source.as_deref(), Some("kimi"));
+        assert_eq!(cfg.agent_command.as_deref(), Some("/opt/kimi"));
+        assert_eq!(cfg.kimi_model.as_deref(), Some("k2.7-coding"));
+        assert_eq!(cfg.kimi_thinking.as_deref(), Some("high"));
+        assert_eq!(cfg.kimi_permission_mode.as_deref(), Some("yolo"));
+        assert_eq!(
+            cfg.kimi_allowed_tools.as_deref(),
+            Some(&["Read".to_string(), "Write".to_string()][..])
+        );
+        assert_eq!(cfg.kimi_plan_mode, Some(true));
+        assert_eq!(cfg.kimi_swarm_mode, Some(false));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("intendant.toml"), "").unwrap();
+        let mut project = Project::from_root(dir.path().to_path_buf()).unwrap();
+        apply_to_project(&mut project, &AgentBackend::Kimi, &cfg);
+        assert_eq!(project.config.agent.kimi.command, "/opt/kimi");
+        assert_eq!(
+            project.config.agent.kimi.model.as_deref(),
+            Some("k2.7-coding")
+        );
+        assert_eq!(project.config.agent.kimi.thinking.as_deref(), Some("high"));
+        assert_eq!(project.config.agent.kimi.permission_mode, "yolo");
+        assert_eq!(
+            project.config.agent.kimi.allowed_tools.as_deref(),
+            Some(&["Read".to_string(), "Write".to_string()][..])
+        );
+        assert!(project.config.agent.kimi.plan_mode);
+        assert!(!project.config.agent.kimi.swarm_mode);
+
+        let mut session = serde_json::json!({"source": "kimi", "session_id": "sess-1"});
+        apply_config_to_session_json(&mut session, &cfg);
+        assert_eq!(
+            session.get("kimi_model").and_then(Value::as_str),
+            Some("k2.7-coding")
+        );
+        assert_eq!(
+            session.get("kimi_thinking").and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            session.get("kimi_permission_mode").and_then(Value::as_str),
+            Some("yolo")
+        );
+        assert_eq!(
+            session
+                .get("kimi_allowed_tools")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            session.get("kimi_plan_mode").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            session.get("kimi_swarm_mode").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let cross = from_wire_fields(WireSessionAgentFields {
+            source: Some("codex"),
+            kimi_model: Some("k2.7-coding"),
+            kimi_allowed_tools: Some("Read"),
+            kimi_plan_mode: Some("true"),
+            ..Default::default()
+        });
+        assert!(cross.kimi_model.is_none());
+        assert!(cross.kimi_allowed_tools.is_none());
+        assert!(cross.kimi_plan_mode.is_none());
+    }
+
+    #[test]
+    fn kimi_inherit_sentinels_clear_pins_but_manual_remains_real() {
+        let cfg = from_wire_fields(WireSessionAgentFields {
+            source: Some("kimi"),
+            kimi_model: Some("inherit"),
+            kimi_thinking: Some("default"),
+            kimi_permission_mode: Some("global"),
+            kimi_allowed_tools: Some("inherit"),
+            kimi_plan_mode: Some("inherit"),
+            kimi_swarm_mode: Some("default"),
+            ..Default::default()
+        });
+        assert!(cfg.kimi_model.is_none());
+        assert!(cfg.kimi_thinking.is_none());
+        assert!(cfg.kimi_permission_mode.is_none());
+        assert!(cfg.kimi_allowed_tools.is_none());
+        assert!(cfg.kimi_plan_mode.is_none());
+        assert!(cfg.kimi_swarm_mode.is_none());
+
+        let manual = from_wire_fields(WireSessionAgentFields {
+            source: Some("kimi"),
+            kimi_permission_mode: Some("default"),
+            ..Default::default()
+        });
+        assert_eq!(manual.kimi_permission_mode.as_deref(), Some("manual"));
+
+        let no_tools = from_wire_fields(WireSessionAgentFields {
+            source: Some("kimi"),
+            kimi_allowed_tools: Some("NoNe"),
+            ..Default::default()
+        });
+        assert_eq!(no_tools.kimi_allowed_tools, Some(Vec::new()));
+
+        let dir = tempfile::tempdir().unwrap();
+        write_log_dir_config(dir.path(), &no_tools).unwrap();
+        assert_eq!(
+            read_log_dir_config(dir.path()).and_then(|cfg| cfg.kimi_allowed_tools),
+            Some(Vec::new()),
+            "the explicit no-tools pin must survive persistence"
+        );
+    }
+
+    #[test]
+    fn kimi_anchor_rollback_is_internal_but_survives_launch_config_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = from_project(
+            &AgentBackend::Kimi,
+            &Project {
+                root: dir.path().to_path_buf(),
+                config: crate::project::ProjectConfig::default(),
+            },
+        );
+        cfg.kimi_fork_rollback_turns = Some(3);
+        cfg.kimi_fork_expected_horizon =
+            Some("{\"active_turns\":4,\"head_fingerprint\":\"abc\"}".to_string());
+        write_log_dir_config(dir.path(), &cfg).unwrap();
+        let loaded = read_log_dir_config(dir.path()).unwrap();
+        assert_eq!(loaded.kimi_fork_rollback_turns, Some(3));
+        assert_eq!(
+            loaded.kimi_fork_expected_horizon.as_deref(),
+            Some("{\"active_turns\":4,\"head_fingerprint\":\"abc\"}")
+        );
+
+        let mut project = Project {
+            root: dir.path().to_path_buf(),
+            config: crate::project::ProjectConfig::default(),
+        };
+        apply_to_project(&mut project, &AgentBackend::Kimi, &loaded);
+        assert_eq!(project.config.agent.kimi.kimi_fork_rollback_turns, Some(3));
+        assert_eq!(
+            project
+                .config
+                .agent
+                .kimi
+                .kimi_fork_expected_horizon
+                .as_deref(),
+            Some("{\"active_turns\":4,\"head_fingerprint\":\"abc\"}")
+        );
+        let mut session = serde_json::json!({"source": "kimi", "session_id": "session_1"});
+        apply_config_to_session_json(&mut session, &loaded);
+        assert!(
+            session.get("kimi_fork_rollback_turns").is_none(),
+            "internal one-shot must not leak into the public session catalog"
+        );
+        assert!(
+            session.get("kimi_fork_expected_horizon").is_none(),
+            "internal expected head must not leak into the public session catalog"
         );
     }
 

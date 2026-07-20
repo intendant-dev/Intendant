@@ -83,6 +83,7 @@ pub(crate) fn parse_sources(raw: &str) -> Option<Vec<Source>> {
             "intendant" => Some(Source::Intendant),
             "codex" => Some(Source::Codex),
             "claude-code" => Some(Source::ClaudeCode),
+            "kimi" | "kimi-code" => Some(Source::Kimi),
             _ => None,
         })
         .collect();
@@ -371,6 +372,7 @@ fn source_of_key(session_key: &str) -> Option<Source> {
         "intendant" => Some(Source::Intendant),
         "codex" => Some(Source::Codex),
         "claude-code" => Some(Source::ClaudeCode),
+        "kimi" => Some(Source::Kimi),
         _ => None,
     }
 }
@@ -948,6 +950,16 @@ mod tests {
             .map(|s| s["session_key"].as_str().unwrap())
             .collect();
         assert_eq!(keys, vec!["intendant:n-1"]);
+    }
+
+    #[test]
+    fn kimi_source_filter_and_session_key_use_the_canonical_source() {
+        assert_eq!(parse_sources("kimi"), Some(vec![Source::Kimi]));
+        assert_eq!(parse_sources("kimi-code"), Some(vec![Source::Kimi]));
+        assert_eq!(
+            source_of_key("kimi:session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            Some(Source::Kimi)
+        );
     }
 
     #[test]

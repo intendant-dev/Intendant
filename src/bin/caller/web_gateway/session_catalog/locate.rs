@@ -530,7 +530,7 @@ fn native_locator_outcome(
 }
 
 // ---------------------------------------------------------------------
-// External (Codex / Claude Code) resolution
+// External (Codex / Claude Code / Kimi Code / legacy Gemini) resolution
 // ---------------------------------------------------------------------
 
 /// The transcript file the detail view renders — the same dispatch as
@@ -543,6 +543,10 @@ fn external_transcript_path(home: &Path, source: &str, session_id: &str) -> Opti
         "claude-code" => find_claude_session_file_for_transcript(home, session_id)
             .or_else(|| find_claude_task_subagent_transcript(home, session_id)),
         "gemini" => find_gemini_session_file_for_transcript(home, session_id),
+        "kimi" => find_kimi_subagent_wire(home, session_id).or_else(|| {
+            let location = kimi_history::find_kimi_session_from_home(home, session_id)?;
+            Some(location.selected_agent(session_id)?.wire_path.clone())
+        }),
         _ => None,
     }
 }
@@ -741,9 +745,12 @@ fn external_locator_outcome(
 ) -> LocateOutcome {
     match locator {
         Locator::ExternalRecordId { record_id } => {
-            // Codex message entries carry the real response_item id.
+            // Codex message entries carry the real response_item id; Kimi
+            // entries carry a stable `<agent-id>:<wire-id>` record id.
             if let Some(index) = entries.iter().position(|entry| {
                 entry.get("item_id").and_then(|value| value.as_str()) == Some(record_id.as_str())
+                    || entry.get("record_id").and_then(|value| value.as_str())
+                        == Some(record_id.as_str())
             }) {
                 return LocateOutcome::Resolved {
                     total_index: index,
@@ -756,6 +763,9 @@ fn external_locator_outcome(
             match source {
                 "claude-code" => claude_record_outcome(entries, &path, record_id),
                 "codex" => codex_record_outcome(entries, &path, record_id),
+                "kimi" => {
+                    LocateOutcome::unavailable("record not found in the selected Kimi agent wire")
+                }
                 other => LocateOutcome::unavailable(format!(
                     "locate is not supported for {other} sessions"
                 )),
@@ -1387,6 +1397,59 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not found"));
+    }
+
+    #[test]
+    fn kimi_composite_record_id_locates_main_wire_entry() {
+        const SESSION: &str = "session_99999999-8888-7777-6666-555555555555";
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".kimi-code/sessions/wd_repo")
+            .join(SESSION);
+        std::fs::create_dir_all(dir.join("agents/main")).unwrap();
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::json!({
+                "createdAt":"2026-07-19T10:00:00.000Z",
+                "updatedAt":"2026-07-19T10:01:00.000Z",
+                "workDir":"/repo",
+                "agents":{"main":{"type":"main","parentAgentId":null}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let lines = [
+            serde_json::json!({"type":"turn.prompt","input":[{"type":"text","text":"locate Kimi"}],"origin":{"kind":"user"},"time":1784455200000i64}),
+            serde_json::json!({"type":"context.append_loop_event","event":{"type":"content.part","uuid":"answer-1","part":{"type":"text","text":"located Kimi answer"}},"time":1784455201000i64}),
+        ];
+        std::fs::write(
+            dir.join("agents/main/wire.jsonl"),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let locator =
+            parse_locate_param(r#"{"kind":"external_record_id","record_id":"main:answer-1"}"#)
+                .unwrap();
+        let body = body_json(&session_detail_response_body_with_locate(
+            home.path(),
+            SESSION,
+            "kimi",
+            None,
+            None,
+            &locator,
+        ));
+        let (entry_index, _) = assert_resolved(&body, "exact");
+        assert_eq!(
+            body["entries"][entry_index]["content"],
+            "located Kimi answer"
+        );
     }
 
     // ------------------------------------------------------------------

@@ -11,6 +11,5 @@ pub(crate) mod peer_boot;
 pub(crate) mod web;
 pub(crate) mod wiring;
 
-pub(crate) use daemon::*;
 pub(crate) use peer_boot::*;
 pub(crate) use web::*;

@@ -401,6 +401,29 @@ pub enum UiCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         allowed_tools: Option<Vec<String>>,
     },
+    /// Kimi Code runtime config changed.
+    KimiConfigChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        model_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        thinking_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        plan_mode: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        swarm_mode: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_tools: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allowed_tools_cleared: bool,
+    },
     /// Session history changed (snapshot_created / rolled_back / redone /
     /// history_pruned). The JS layer re-fetches `/api/session/current/history`
     /// and re-renders the Timeline UI in the Changes sub-tab.
@@ -1085,7 +1108,7 @@ fn source_label(source: &str) -> &str {
         "live" => "Live",
         "sub" => "Sub",
         "orch" => "Orch",
-        // External agent sources pass through as-is (e.g. "Codex", "Claude Code")
+        // External agent sources pass through as-is (e.g. "Codex", "Claude Code", "Kimi")
         other if !other.is_empty() => other,
         _ => "\u{2139}",
     }
@@ -2469,6 +2492,50 @@ impl AppState {
                     model_cleared,
                     permission_mode,
                     allowed_tools,
+                });
+            }
+
+            "kimi_config_changed" => {
+                cmds.push(UiCommand::KimiConfigChanged {
+                    command: msg
+                        .get("command")
+                        .and_then(|value| value.as_str())
+                        .map(String::from),
+                    model: msg
+                        .get("model")
+                        .and_then(|value| value.as_str())
+                        .map(String::from),
+                    model_cleared: msg
+                        .get("model_cleared")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
+                    thinking: msg
+                        .get("thinking")
+                        .and_then(|value| value.as_str())
+                        .map(String::from),
+                    thinking_cleared: msg
+                        .get("thinking_cleared")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
+                    permission_mode: msg
+                        .get("permission_mode")
+                        .and_then(|value| value.as_str())
+                        .map(String::from),
+                    plan_mode: msg.get("plan_mode").and_then(|value| value.as_bool()),
+                    swarm_mode: msg.get("swarm_mode").and_then(|value| value.as_bool()),
+                    allowed_tools: msg
+                        .get("allowed_tools")
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str().map(String::from))
+                                .collect()
+                        }),
+                    allowed_tools_cleared: msg
+                        .get("allowed_tools_cleared")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
                 });
             }
 
@@ -6965,5 +7032,55 @@ mod tests {
             found,
             "expected ClaudeConfigChanged UiCommand, got {cmds:?}"
         );
+    }
+
+    #[test]
+    fn kimi_config_changed_translates_every_runtime_knob() {
+        let mut state = AppState::new();
+        let commands = state.handle_event(&json!({
+            "event": "kimi_config_changed",
+            "command": "/opt/kimi",
+            "model": "kimi-code/kimi-for-coding",
+            "thinking": "high",
+            "permission_mode": "auto",
+            "plan_mode": true,
+            "swarm_mode": true,
+            "allowed_tools": [],
+        }));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            UiCommand::KimiConfigChanged {
+                command: Some(binary),
+                model: Some(model),
+                thinking: Some(thinking),
+                permission_mode: Some(permission),
+                plan_mode: Some(true),
+                swarm_mode: Some(true),
+                allowed_tools: Some(tools),
+                allowed_tools_cleared: false,
+                ..
+            } if binary == "/opt/kimi"
+                && model == "kimi-code/kimi-for-coding"
+                && thinking == "high"
+                && permission == "auto"
+                && tools.is_empty()
+        )));
+    }
+
+    #[test]
+    fn kimi_config_changed_distinguishes_native_default_from_no_change() {
+        let mut state = AppState::new();
+        let commands = state.handle_event(&json!({
+            "event": "kimi_config_changed",
+            "allowed_tools_cleared": true,
+        }));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            UiCommand::KimiConfigChanged {
+                allowed_tools: None,
+                allowed_tools_cleared: true,
+                ..
+            }
+        )));
     }
 }

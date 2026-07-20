@@ -3,7 +3,7 @@
 Intendant runs a task one of three ways. The simplest is a single native agent
 loop; the richest is an orchestration session that decomposes a task and
 delegates pieces to sub-agents, each a fully supervised session of its own. The
-third hands the whole task to a third-party coding CLI (Codex or Claude Code)
+third hands the whole task to a third-party coding CLI (Codex, Claude Code, or Kimi Code)
 and supervises it — that path has its own chapter,
 [External-Agent Orchestration](./external-agent-orchestration.md).
 
@@ -69,7 +69,7 @@ SessionSupervisor::start_sub_agent_session
     ├─ optional git worktree branched off the parent project's HEAD
     ├─ records the parent link ("subagent" relationship — the same kind
     │  Codex-spawned children use, so the dashboard renders both alike)
-    └─ spawns the child session: internal loop, or codex / claude-code
+    └─ spawns the child session: internal loop, or codex / claude-code / kimi
     ▼
 Child session — its own dashboard row, live activity, approvals under the
 daemon's autonomy, steerable, stoppable, lineage-tracked
@@ -98,7 +98,7 @@ Parent's wait_sub_agents call returns the structured results
   `sub_agent.rs`). A child that finishes without submitting gets a result
   synthesized from its final message and exit state; usage always comes from
   session accounting, not self-report.
-- **Backends compose**: `backend: "codex"` / `"claude-code"` runs the child as
+- **Backends compose**: `backend: "codex"` / `"claude-code"` / `"kimi"` runs the child as
   a supervised external agent instead of the internal loop. The
   orchestrator/worker matrix is fully general — native conducting Codex
   workers, or (via the MCP `start_task` tool external agents already have)

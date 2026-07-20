@@ -25,6 +25,7 @@ mod control_plane;
 mod coordination;
 mod custom_domain;
 mod cutover_absence;
+mod kimi_auth_ceremony;
 pub(crate) use intendant_core::conversation;
 mod cli_descriptor;
 mod credential_audit;
@@ -326,7 +327,7 @@ struct CliFlags {
     /// --record-display <ID>: Record an existing X11 display (repeatable).
     record_displays: Vec<u32>,
 
-    /// --agent <BACKEND>: Use external agent backend (codex, claude-code).
+    /// --agent <BACKEND>: Use external agent backend (codex, claude-code, kimi).
     agent_backend: Option<external_agent::AgentBackend>,
 
     /// --no-web: Disable web gateway (on by default).
@@ -384,7 +385,7 @@ fn print_help() {
     println!(
         "    --record-display <ID> Record an existing X11 display (e.g. 50 for :50, repeatable)"
     );
-    println!("    --agent <BACKEND>     Use external agent backend (codex, claude-code)");
+    println!("    --agent <BACKEND>     Use external agent backend (codex, claude-code, kimi)");
     println!("    --advertise-url <URL> WebSocket URL to advertise to peers in this daemon's");
     println!("                          Agent Card (repeatable, preference order). Overrides");
     println!("                          [server.advertise] in intendant.toml when given.");
@@ -709,7 +710,7 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
                     let backend = external_agent::AgentBackend::from_str_loose(&args[i + 1])
                         .ok_or_else(|| {
                             CallerError::Config(format!(
-                                "Unknown agent backend: '{}'. Valid options: codex, claude-code",
+                                "Unknown agent backend: '{}'. Valid options: codex, claude-code, kimi",
                                 args[i + 1]
                             ))
                         })?;
@@ -1282,7 +1283,7 @@ async fn start_external_display_recordings(
 /// External-agent approvals deliberately do NOT route here: their
 /// "Approve all" is Intendant-enforced per external session
 /// (`approve_all_session` in the agent event loop) instead of flipping
-/// global autonomy — a button on one Codex/Claude session must not
+/// global autonomy — a button on one Codex/Claude/Kimi session must not
 /// escalate every other surface of the daemon.
 async fn apply_user_approval(
     response: event::ApprovalResponse,
@@ -3427,7 +3428,7 @@ async fn main() -> Result<(), CallerError> {
     // the sweep's own GC rides a slow cadence).
     message_search::startup_gc();
     // The message-search indexer: a 30s cursor-driven sweep over this
-    // box's session logs, Codex/Claude homes (including leased-active
+    // box's session logs, Codex/Claude/Kimi homes (including leased-active
     // ones), and staged lease remnants. First sweep runs one interval
     // after boot, so one-shot CLI runs exit before paying for it.
     message_search::spawn_indexer();
@@ -3620,7 +3621,7 @@ async fn main() -> Result<(), CallerError> {
             } else {
                 eprintln!(
                     "Note: starting without a model provider — the built-in agent stays off until an API key is configured. \
-                     External agents signed in with their own accounts (Claude Code, Codex) still work, \
+                     External agents signed in with their own accounts (Claude Code, Codex, Kimi Code) still work, \
                      as do the dashboard, display control, and session browsing.",
                 );
             }

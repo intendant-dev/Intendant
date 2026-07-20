@@ -1180,7 +1180,7 @@ async function stationHandleThreadAction(action) {
   const sessionId = String(action.session_id || action.sessionId || '').trim();
   const spec = codexThreadActionSpec(op);
   if (!spec) {
-    showControlToast?.('error', `Unknown Codex thread action /${op}`);
+    showControlToast?.('error', `Unknown thread action /${op}`);
     return;
   }
   await runCodexThreadActionFromUi(op, spec, sessionId);
@@ -1486,7 +1486,7 @@ function stationHandleControlsAction(action) {
   if (op.startsWith('backend:')) {
     const agent = op.slice('backend:'.length).trim();
     const value = agent === 'internal' ? null : agent;
-    if (value && !['codex', 'claude-code'].includes(value)) return;
+    if (value && !['codex', 'claude-code', 'kimi'].includes(value)) return;
     dispatchControlMsg({ action: 'set_external_agent', agent: value });
     showControlToast?.('success', `Backend: ${value || 'intendant'}`);
     return;
@@ -1518,6 +1518,63 @@ function stationHandleControlsAction(action) {
     if (!['default', 'acceptEdits', 'plan', 'auto', 'dontAsk', 'bypassPermissions'].includes(mode)) return;
     dispatchControlMsg({ action: 'set_claude_permission_mode', mode });
     showControlToast?.('success', `Claude permissions: ${mode}`);
+    return;
+  }
+  if (op.startsWith('kimi-model:')) {
+    const choice = op.slice('kimi-model:'.length).trim();
+    const models = {
+      default: null,
+      'k2.7': 'kimi-code/kimi-for-coding',
+      'k2.7-fast': 'kimi-code/kimi-for-coding-highspeed',
+      k3: 'kimi-code/k3',
+    };
+    if (!Object.prototype.hasOwnProperty.call(models, choice)) return;
+    const model = models[choice];
+    dispatchControlMsg({ action: 'set_kimi_model', model });
+    showControlToast?.('success', `Kimi model: ${choice}`);
+    return;
+  }
+  if (op.startsWith('kimi-thinking:')) {
+    const thinking = op.slice('kimi-thinking:'.length).trim();
+    if (!['default', 'off', 'low', 'medium', 'high', 'xhigh', 'max'].includes(thinking)) return;
+    dispatchControlMsg({
+      action: 'set_kimi_thinking',
+      thinking: thinking === 'default' ? null : thinking,
+    });
+    showControlToast?.('success', `Kimi thinking: ${thinking}`);
+    return;
+  }
+  if (op.startsWith('kimi-permission:')) {
+    const mode = op.slice('kimi-permission:'.length).trim();
+    if (!['manual', 'auto', 'yolo'].includes(mode)) return;
+    dispatchControlMsg({ action: 'set_kimi_permission_mode', mode });
+    showControlToast?.('success', `Kimi permissions: ${mode}`);
+    return;
+  }
+  if (op.startsWith('kimi-plan:')) {
+    const enabled = op.slice('kimi-plan:'.length).trim() === 'on';
+    dispatchControlMsg({ action: 'set_kimi_plan_mode', enabled });
+    showControlToast?.('success', `Kimi plan mode: ${enabled ? 'on' : 'off'}`);
+    return;
+  }
+  if (op.startsWith('kimi-swarm:')) {
+    const enabled = op.slice('kimi-swarm:'.length).trim() === 'on';
+    dispatchControlMsg({ action: 'set_kimi_swarm_mode', enabled });
+    showControlToast?.('success', `Kimi swarm mode: ${enabled ? 'on' : 'off'}`);
+    return;
+  }
+  if (op.startsWith('kimi-tools:')) {
+    const choice = op.slice('kimi-tools:'.length).trim();
+    if (choice === 'default') {
+      dispatchControlMsg({ action: 'set_kimi_allowed_tools', tools: null });
+      showControlToast?.('success', 'Kimi tools: profile default');
+    } else if (choice === 'none') {
+      dispatchControlMsg({ action: 'set_kimi_allowed_tools', tools: [] });
+      showControlToast?.('success', 'Kimi tools: no optional tools');
+    } else if (choice === 'edit') {
+      if (typeof switchActivitySubtab === 'function') switchActivitySubtab('control');
+      setTimeout(() => document.getElementById('control-kimi-tools-mode')?.focus(), 0);
+    }
     return;
   }
   if (op.startsWith('launch-agent:')) {
@@ -1969,4 +2026,3 @@ function stationMaybeRefreshTranscript(force = false) {
   live.lastEventKey = key;
   stationOpenTranscript(live.sessionId, { source: live.source, refresh: true });
 }
-

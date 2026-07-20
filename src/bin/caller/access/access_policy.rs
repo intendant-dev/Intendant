@@ -950,7 +950,9 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         // peer profile grants). POST /api/settings enforces the same rule
         // per-field (`executable_repoint_denials`); `claude_command` has no
         // ControlMsg twin and is covered there alone.
-        ControlMsg::SetCodexCommand { .. } | ControlMsg::SetCodexManagedCommand { .. } => {
+        ControlMsg::SetCodexCommand { .. }
+        | ControlMsg::SetCodexManagedCommand { .. }
+        | ControlMsg::SetKimiCommand { .. } => {
             PeerOperation::CredentialsManage
         }
         ControlMsg::SetAutonomy { .. }
@@ -970,6 +972,12 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::SetClaudeModel { .. }
         | ControlMsg::SetClaudePermissionMode { .. }
         | ControlMsg::SetClaudeAllowedTools { .. }
+        | ControlMsg::SetKimiModel { .. }
+        | ControlMsg::SetKimiThinking { .. }
+        | ControlMsg::SetKimiPermissionMode { .. }
+        | ControlMsg::SetKimiPlanMode { .. }
+        | ControlMsg::SetKimiSwarmMode { .. }
+        | ControlMsg::SetKimiAllowedTools { .. }
         | ControlMsg::SetVerbosity { .. } => PeerOperation::Settings,
         ControlMsg::CodexThreadAction { .. }
         | ControlMsg::RenameSession { .. }

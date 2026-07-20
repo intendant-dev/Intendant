@@ -54,11 +54,29 @@ pub struct ClaudeRuntimeConfig {
 
 pub type SharedClaudeConfig = Arc<RwLock<ClaudeRuntimeConfig>>;
 
+/// Runtime-adjustable Kimi launch settings. The server adapter applies these
+/// when it creates or resumes a Kimi session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KimiRuntimeConfig {
+    pub command: String,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+    pub permission_mode: String,
+    pub plan_mode: bool,
+    pub swarm_mode: bool,
+    /// `None` preserves Kimi's native profile defaults; `Some([])` disables
+    /// every optional tool; a non-empty list is the exact active-tool set.
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+pub type SharedKimiConfig = Arc<RwLock<KimiRuntimeConfig>>;
+
 pub struct ControlPlaneState {
     pub autonomy: SharedAutonomy,
     pub external_agent: Arc<RwLock<Option<external_agent::AgentBackend>>>,
     pub codex_config: SharedCodexConfig,
     pub claude_config: SharedClaudeConfig,
+    pub kimi_config: SharedKimiConfig,
     pub bus: EventBus,
     /// Config root for `intendant.toml` writes: the project root on a
     /// rooted daemon, or the daemon state root when projectless. This is
@@ -202,7 +220,7 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             // Persist to intendant.toml so the setting survives daemon
             // restarts. Any frontend (dashboard, TUI, MCP) that sends
             // this control message gets persistence for free. Always
-            // write the canonical SHORT form ("codex" | "claude-code") —
+            // write the canonical SHORT form ("codex" | "claude-code" | "kimi") —
             // the TOML round-trip must preserve identity, and
             // from_str_loose needs a form it'll parse back. The Display
             // form ("Claude Code") used to slip through here, which broke
@@ -610,6 +628,134 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     allowed_tools: Some(normalized),
                     ..Default::default()
                 }));
+        }
+        ControlMsg::SetKimiCommand { command } => {
+            let normalized = normalize_kimi_command(Some(command));
+            {
+                let mut guard = state.kimi_config.write().await;
+                guard.command = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_kimi_field(root, |cfg| {
+                    cfg.command = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist kimi.command to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(kimi_config_changed_event(KimiConfigDelta {
+                command: Some(normalized),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetKimiModel { model } => {
+            let normalized = model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            {
+                let mut guard = state.kimi_config.write().await;
+                guard.model = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_kimi_field(root, |cfg| cfg.model = normalized.clone()) {
+                    eprintln!(
+                        "[control_plane] failed to persist kimi.model to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(kimi_config_changed_event(KimiConfigDelta {
+                model: normalized.clone(),
+                model_cleared: normalized.is_none(),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetKimiThinking { thinking } => {
+            let normalized = crate::project::normalize_kimi_thinking(thinking.as_deref());
+            {
+                let mut guard = state.kimi_config.write().await;
+                guard.thinking = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_kimi_field(root, |cfg| cfg.thinking = normalized.clone()) {
+                    eprintln!(
+                        "[control_plane] failed to persist kimi.thinking to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(kimi_config_changed_event(KimiConfigDelta {
+                thinking: normalized.clone(),
+                thinking_cleared: normalized.is_none(),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetKimiPermissionMode { mode } => {
+            let normalized = crate::project::normalize_kimi_permission_mode(mode);
+            {
+                let mut guard = state.kimi_config.write().await;
+                guard.permission_mode = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_kimi_field(root, |cfg| {
+                    cfg.permission_mode = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist kimi.permission_mode to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(kimi_config_changed_event(KimiConfigDelta {
+                permission_mode: Some(normalized),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetKimiPlanMode { enabled } => {
+            state.kimi_config.write().await.plan_mode = *enabled;
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_kimi_field(root, |cfg| cfg.plan_mode = *enabled) {
+                    eprintln!(
+                        "[control_plane] failed to persist kimi.plan_mode to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(kimi_config_changed_event(KimiConfigDelta {
+                plan_mode: Some(*enabled),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetKimiSwarmMode { enabled } => {
+            state.kimi_config.write().await.swarm_mode = *enabled;
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_kimi_field(root, |cfg| cfg.swarm_mode = *enabled) {
+                    eprintln!(
+                        "[control_plane] failed to persist kimi.swarm_mode to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(kimi_config_changed_event(KimiConfigDelta {
+                swarm_mode: Some(*enabled),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetKimiAllowedTools { tools } => {
+            let normalized = normalize_kimi_allowed_tools(tools.as_deref());
+            state.kimi_config.write().await.allowed_tools = normalized.clone();
+            if let Some(ref root) = state.project_root {
+                if let Err(e) =
+                    persist_kimi_field(root, |cfg| cfg.allowed_tools = normalized.clone())
+                {
+                    eprintln!(
+                        "[control_plane] failed to persist kimi.allowed_tools to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(kimi_config_changed_event(KimiConfigDelta {
+                allowed_tools: normalized.clone(),
+                allowed_tools_cleared: normalized.is_none(),
+                ..Default::default()
+            }));
         }
         ControlMsg::ResumeSession { .. }
         | ControlMsg::RestartSession { .. }
@@ -1036,6 +1182,28 @@ fn normalize_codex_command(input: Option<&str>) -> String {
     }
 }
 
+fn normalize_kimi_command(input: Option<&str>) -> String {
+    let trimmed = input.map(str::trim).unwrap_or("");
+    if trimmed.is_empty() {
+        "kimi".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_kimi_allowed_tools(input: Option<&[String]>) -> Option<Vec<String>> {
+    input.map(|tools| {
+        let mut normalized = Vec::new();
+        for tool in tools {
+            let tool = tool.trim();
+            if !tool.is_empty() && !normalized.iter().any(|candidate| candidate == tool) {
+                normalized.push(tool.to_string());
+            }
+        }
+        normalized
+    })
+}
+
 /// Re-read `intendant.toml`, apply a closure to the `[agent.codex]` section,
 /// and save. Re-reading (rather than mutating a cached config) is the
 /// simplest way to avoid stepping on concurrent writes from other parts of
@@ -1064,6 +1232,18 @@ where
     proj.save_config()
 }
 
+fn persist_kimi_field<F>(
+    project_root: &std::path::Path,
+    mutate: F,
+) -> Result<(), crate::error::CallerError>
+where
+    F: FnOnce(&mut crate::project::KimiConfig),
+{
+    let mut proj = crate::project::Project::from_root(project_root.to_path_buf())?;
+    mutate(&mut proj.config.agent.kimi);
+    proj.save_config()
+}
+
 /// Delta describing which Claude Code config fields changed. Mirrors
 /// `CodexConfigDelta`; `Option::None` across the board means "no change".
 #[derive(Debug, Default)]
@@ -1080,6 +1260,35 @@ fn claude_config_changed_event(delta: ClaudeConfigDelta) -> AppEvent {
         model_cleared: delta.model_cleared,
         permission_mode: delta.permission_mode,
         allowed_tools: delta.allowed_tools,
+    }
+}
+
+#[derive(Debug, Default)]
+struct KimiConfigDelta {
+    command: Option<String>,
+    model: Option<String>,
+    model_cleared: bool,
+    thinking: Option<String>,
+    thinking_cleared: bool,
+    permission_mode: Option<String>,
+    plan_mode: Option<bool>,
+    swarm_mode: Option<bool>,
+    allowed_tools: Option<Vec<String>>,
+    allowed_tools_cleared: bool,
+}
+
+fn kimi_config_changed_event(delta: KimiConfigDelta) -> AppEvent {
+    AppEvent::KimiConfigChanged {
+        command: delta.command,
+        model: delta.model,
+        model_cleared: delta.model_cleared,
+        thinking: delta.thinking,
+        thinking_cleared: delta.thinking_cleared,
+        permission_mode: delta.permission_mode,
+        plan_mode: delta.plan_mode,
+        swarm_mode: delta.swarm_mode,
+        allowed_tools: delta.allowed_tools,
+        allowed_tools_cleared: delta.allowed_tools_cleared,
     }
 }
 
@@ -1139,6 +1348,18 @@ mod tests {
         }))
     }
 
+    fn test_kimi_config() -> SharedKimiConfig {
+        Arc::new(RwLock::new(KimiRuntimeConfig {
+            command: "kimi".to_string(),
+            model: None,
+            thinking: None,
+            permission_mode: "manual".to_string(),
+            plan_mode: false,
+            swarm_mode: false,
+            allowed_tools: None,
+        }))
+    }
+
     #[tokio::test]
     async fn grant_user_display_agent_visibility_controls_autonomy_grant() {
         let bus = EventBus::new();
@@ -1149,6 +1370,7 @@ mod tests {
             external_agent: Arc::new(RwLock::new(None)),
             codex_config: test_codex_config(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         };
@@ -1225,6 +1447,7 @@ mod tests {
             external_agent: Arc::new(RwLock::new(None)),
             codex_config: test_codex_config(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         };
@@ -1705,6 +1928,7 @@ mod tests {
             external_agent: external_agent.clone(),
             codex_config: test_codex_config(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -1748,6 +1972,7 @@ mod tests {
             external_agent: external_agent.clone(),
             codex_config: test_codex_config(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -1778,6 +2003,7 @@ mod tests {
             external_agent: external_agent.clone(),
             codex_config: test_codex_config(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -1820,6 +2046,7 @@ mod tests {
             external_agent: external_agent.clone(),
             codex_config: test_codex_config(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -1848,6 +2075,7 @@ mod tests {
             external_agent: external_agent.clone(),
             codex_config: test_codex_config(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -1876,6 +2104,7 @@ mod tests {
             external_agent,
             codex_config: codex_config.clone(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -1907,6 +2136,7 @@ mod tests {
             external_agent,
             codex_config: codex_config.clone(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -1941,6 +2171,7 @@ mod tests {
             external_agent,
             codex_config: codex_config.clone(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -1968,6 +2199,7 @@ mod tests {
             external_agent,
             codex_config: codex_config.clone(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -2000,6 +2232,7 @@ mod tests {
             external_agent,
             codex_config: codex_config.clone(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -2039,6 +2272,7 @@ mod tests {
             external_agent,
             codex_config: codex_config.clone(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -2082,6 +2316,7 @@ mod tests {
             external_agent,
             codex_config: codex_config.clone(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -2122,6 +2357,7 @@ mod tests {
             external_agent,
             codex_config,
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -2175,6 +2411,7 @@ mod tests {
             external_agent,
             codex_config,
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -2229,6 +2466,7 @@ mod tests {
             external_agent,
             codex_config: codex_config.clone(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -2263,6 +2501,7 @@ mod tests {
             external_agent,
             codex_config: codex_config.clone(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -2298,6 +2537,7 @@ mod tests {
             external_agent,
             codex_config: codex_config.clone(),
             claude_config: test_claude_config(),
+            kimi_config: test_kimi_config(),
             bus: bus.clone(),
             project_root: None,
         });
@@ -2319,5 +2559,128 @@ mod tests {
         assert_eq!(codex_config.read().await.context_archive, "off");
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn kimi_controls_update_runtime_persist_config_and_emit_deltas() {
+        let root = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let kimi_config = test_kimi_config();
+        let state = ControlPlaneState {
+            autonomy: crate::autonomy::shared_autonomy(AutonomyState::default()),
+            external_agent: Arc::new(RwLock::new(None)),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            kimi_config: kimi_config.clone(),
+            bus,
+            project_root: Some(root.path().to_path_buf()),
+        };
+
+        for message in [
+            ControlMsg::SetKimiCommand {
+                command: "  /opt/kimi  ".to_string(),
+            },
+            ControlMsg::SetKimiModel {
+                model: Some(" k2.7 coding ".to_string()),
+            },
+            ControlMsg::SetKimiThinking {
+                thinking: Some(" HIGH ".to_string()),
+            },
+            ControlMsg::SetKimiPermissionMode {
+                mode: "bypass-permissions".to_string(),
+            },
+            ControlMsg::SetKimiPlanMode { enabled: true },
+            ControlMsg::SetKimiSwarmMode { enabled: true },
+            ControlMsg::SetKimiAllowedTools {
+                tools: Some(vec![
+                    " Read ".to_string(),
+                    "Write".to_string(),
+                    "Read".to_string(),
+                ]),
+            },
+        ] {
+            handle_control_msg(&message, &state).await;
+        }
+
+        assert_eq!(
+            *kimi_config.read().await,
+            KimiRuntimeConfig {
+                command: "/opt/kimi".to_string(),
+                model: Some("k2.7 coding".to_string()),
+                thinking: Some("high".to_string()),
+                permission_mode: "yolo".to_string(),
+                plan_mode: true,
+                swarm_mode: true,
+                allowed_tools: Some(vec!["Read".to_string(), "Write".to_string()]),
+            }
+        );
+        let persisted = crate::project::Project::from_root(root.path().to_path_buf()).unwrap();
+        assert_eq!(persisted.config.agent.kimi.command, "/opt/kimi");
+        assert_eq!(
+            persisted.config.agent.kimi.model.as_deref(),
+            Some("k2.7 coding")
+        );
+        assert_eq!(
+            persisted.config.agent.kimi.thinking.as_deref(),
+            Some("high")
+        );
+        assert_eq!(persisted.config.agent.kimi.permission_mode, "yolo");
+        assert!(persisted.config.agent.kimi.plan_mode);
+        assert!(persisted.config.agent.kimi.swarm_mode);
+        assert_eq!(
+            persisted.config.agent.kimi.allowed_tools,
+            Some(vec!["Read".to_string(), "Write".to_string()])
+        );
+
+        let deltas = drain_events(&mut events)
+            .into_iter()
+            .filter(|event| matches!(event, AppEvent::KimiConfigChanged { .. }))
+            .count();
+        assert_eq!(deltas, 7);
+    }
+
+    #[tokio::test]
+    async fn kimi_allowed_tools_preserve_explicit_empty_and_clear() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let kimi_config = test_kimi_config();
+        let state = ControlPlaneState {
+            autonomy: crate::autonomy::shared_autonomy(AutonomyState::default()),
+            external_agent: Arc::new(RwLock::new(None)),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            kimi_config: kimi_config.clone(),
+            bus,
+            project_root: None,
+        };
+
+        handle_control_msg(
+            &ControlMsg::SetKimiAllowedTools {
+                tools: Some(Vec::new()),
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(kimi_config.read().await.allowed_tools, Some(Vec::new()));
+        assert!(drain_events(&mut events).into_iter().any(|event| matches!(
+            event,
+            AppEvent::KimiConfigChanged {
+                allowed_tools: Some(tools),
+                allowed_tools_cleared: false,
+                ..
+            } if tools.is_empty()
+        )));
+
+        handle_control_msg(&ControlMsg::SetKimiAllowedTools { tools: None }, &state).await;
+        assert_eq!(kimi_config.read().await.allowed_tools, None);
+        assert!(drain_events(&mut events).into_iter().any(|event| matches!(
+            event,
+            AppEvent::KimiConfigChanged {
+                allowed_tools: None,
+                allowed_tools_cleared: true,
+                ..
+            }
+        )));
     }
 }

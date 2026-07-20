@@ -2,8 +2,8 @@
 // INLINE: the unified catalog — GET /api/session/{id}/fork-points —
 // loads when the detail opens and is joined onto the rendered transcript
 // rows (claude-code by message uuid via the catalog's at_message_uuid
-// display anchor; codex turn boundaries by user_turn_index), so every
-// eligible log entry grows a hover "fork from here" affordance and
+// display anchor; codex and kimi turn boundaries by user_turn_index), so
+// every eligible log entry grows a hover "fork from here" affordance and
 // abandoned claude branches render as resumable off-chain rows. The
 // "Fork points" panel remains as the complete-catalog fallback: native
 // sessions (no exact row key in the daemon session log), codex item
@@ -230,10 +230,11 @@ function sessionForkStoreInlineIndex(sessionId, catalog) {
     if (source === 'claude-code') {
       const at = point.at_message_uuid || point.message_uuid;
       if (at && !byRow.has(`uuid:${at}`)) byRow.set(`uuid:${at}`, point);
-    } else if (source === 'codex') {
+    } else if (source === 'codex' || source === 'kimi') {
       // Only whole-turn boundaries join inline: their rows are the plain
       // user prompts. Item anchors live on shared live-lane row builders
-      // (command output / reasoning) and stay in the panel.
+      // (command output / reasoning) and stay in the panel; kimi exposes
+      // whole-turn boundaries only.
       if (point.kind === 'turn-boundary' && point.turn != null && !byRow.has(`turn:${point.turn}`)) {
         byRow.set(`turn:${point.turn}`, point);
       }
@@ -262,7 +263,7 @@ function sessionForkRefreshDetailAffordances(sessionId) {
 
 // The point↔row rule, usable from the row side (inline affordances via
 // the byRow index) and from the point side (panel jump): claude-code
-// points display on the row whose uuid is at_message_uuid; codex
+// points display on the row whose uuid is at_message_uuid; codex/kimi
 // turn-boundary k displays on the prompt row of turn k+1 ("the child
 // keeps everything before this message and redoes from here"); codex
 // item anchors match their item row (jump-only — no inline button).
@@ -272,11 +273,11 @@ function sessionForkRowMatchesPoint(source, record, point) {
     const at = point.at_message_uuid || point.message_uuid;
     return !!at && record.message_uuid === at;
   }
-  if (source === 'codex') {
+  if (source === 'codex' || source === 'kimi') {
     if (point.kind === 'turn-boundary' && point.turn != null) {
       return record.user_turn_index === point.turn + 1;
     }
-    if (point.kind === 'item-anchor' && point.item_id) {
+    if (source === 'codex' && point.kind === 'item-anchor' && point.item_id) {
       return record.item_id === point.item_id;
     }
   }
@@ -323,7 +324,7 @@ function sessionForkInlinePointForRecord(sessionId, record) {
     const uuid = record.message_uuid;
     return uuid ? idx.byRow.get(`uuid:${uuid}`) || null : null;
   }
-  if (idx.source === 'codex') {
+  if (idx.source === 'codex' || idx.source === 'kimi') {
     const turn = record.user_turn_index;
     if (turn == null || turn <= 1) return null;
     return idx.byRow.get(`turn:${turn - 1}`) || null;

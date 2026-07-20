@@ -382,6 +382,7 @@ const IGNORED_DIRS: &[&str] = &[
     ".codex",
     ".gemini",
     ".claude",
+    ".kimi-code",
     ".agents",
     "dist",
     "build",
@@ -3563,6 +3564,9 @@ mod tests {
         assert!(should_ignore(Path::new("images/logo.png")));
         assert!(should_ignore(Path::new("archive.tar.gz")));
         assert!(should_ignore(Path::new(".claude/settings.json")));
+        assert!(should_ignore(Path::new(
+            ".kimi-code/sessions/wd/session/state.json"
+        )));
         assert!(should_ignore(Path::new(".worktrees/feature/src/main.rs")));
 
         assert!(!should_ignore(Path::new("src/main.rs")));
