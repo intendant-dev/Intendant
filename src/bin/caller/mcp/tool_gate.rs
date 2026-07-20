@@ -443,7 +443,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "agenda_op",
         manual_http_tool_definition!(
             "agenda_op",
-            "Apply one agenda operation, keyed by op: add (park a note, task, or question: kind, title, body?, tags?, due_ms?), ask (park a RICH multi-question ask as a durable question item: questions is the ask_user vocabulary — up to 4 of {question, header?, options?, pick_min?, pick_max?, free_text?, previews?} with the same preview kinds and caps; it renders on the dashboard question rail exactly like a live ask, returns immediately with the item and its rail ask_id, and the structured reply lands on the item), answer (id + text — reply to an open question; resolves it; structured? carries a rich-ask breakdown), patch (id + {title?, body?, tags?, due_ms? — null due_ms clears}), complete (id), reopen (id — resurrects done or retired; re-asking a question clears its reply view and re-surfaces a rich ask on the rail), retire (id — also deletes a rich ask's preview blobs), propose_effect (id + goal + fire_at_ms + orchestrate? — propose a scheduled session on the item: at that instant the daemon spawns a normal supervised session with that goal; NOTHING fires until the owner approves, so propose and move on), approve_effect (id + digest), or revoke_effect (id). Approval is the owner's act alone — dashboard and owner-shell surfaces only; agent and peer callers may propose but are refused approval by policy, so never attempt to approve (or revoke) a manifest, including your own. Approval binds the exact manifest digest: re-proposing revises the manifest and voids any approval. Session outcomes write back to the item (effects[].last_run). A question is a durable non-blocking ask: it badges the owner's attention rail and the reply is readable in a later session. due_ms delivers a reminder at that instant (owner policy controls loudness). Returns the item as it now stands; add returns its minted id. History is append-only — nothing is ever destroyed.",
+            "Apply one agenda operation, keyed by op: add (park a note, task, or question: kind, title, body?, tags?, due_ms?), ask (park a RICH multi-question ask as a durable question item: questions is the ask_user vocabulary — up to 4 of {question, header?, options?, pick_min?, pick_max?, free_text?, previews?} with the same preview kinds and caps; it renders on the dashboard question rail exactly like a live ask, returns immediately with the item and its rail ask_id, and the structured reply lands on the item), answer (id + text — reply to an open question; resolves it; structured? carries a rich-ask breakdown), patch (id + {title?, body?, tags?, due_ms? — null due_ms clears}), complete (id), reopen (id — resurrects done or retired; re-asking a question clears its reply view and re-surfaces a rich ask on the rail), retire (id — also deletes a rich ask's preview blobs), annotate (id + text — append an attributed note to the item's thread, any status), set_blocker (id + criterion — state a human blocking criterion on an open item; NOTHING evaluates it, no watcher exists; the daemon mints the blocker id), clear_blocker (id + blocker_id — an op recorded as history, never a deletion; you have no duty to review blockers and clear only when the owner asks or your mandate says so — otherwise annotate with evidence instead), add_relies_on / remove_relies_on (id + target_id — dependency edges; a done prerequisite satisfies by pure recomputation, a retired one flags the dependent for review; blocked is derived at read time and never notifies), propose_effect (id + goal + fire_at_ms + orchestrate? — propose a scheduled session on the item: at that instant the daemon spawns a normal supervised session with that goal; NOTHING fires until the owner approves, so propose and move on), approve_effect (id + digest), or revoke_effect (id). Approval is the owner's act alone — dashboard and owner-shell surfaces only; agent and peer callers may propose but are refused approval by policy, so never attempt to approve (or revoke) a manifest, including your own. Approval binds the exact manifest digest: re-proposing revises the manifest and voids any approval. Session outcomes write back to the item (effects[].last_run). A question is a durable non-blocking ask: it badges the owner's attention rail and the reply is readable in a later session. due_ms delivers a reminder at that instant (owner policy controls loudness). Non-owner ops accept source? — a self-described, UNVERIFIED caller label for unsupervised processes; it renders visibly as self-described and never becomes attribution (supervised sessions are attributed automatically; omit it). Returns the item as it now stands; add returns its minted id. History is append-only — nothing is ever destroyed.",
             crate::agenda::AgendaCommand
         ),
     );
@@ -1313,15 +1313,20 @@ mod tests {
                 ops,
                 [
                     "add",
+                    "add_relies_on",
+                    "annotate",
                     "answer",
                     "approve_effect",
                     "ask",
+                    "clear_blocker",
                     "complete",
                     "patch",
                     "propose_effect",
+                    "remove_relies_on",
                     "reopen",
                     "retire",
-                    "revoke_effect"
+                    "revoke_effect",
+                    "set_blocker"
                 ],
                 "agenda_op's served oneOf must keep the full AgendaCommand vocabulary"
             );

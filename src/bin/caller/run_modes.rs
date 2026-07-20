@@ -3567,6 +3567,7 @@ pub(crate) async fn run_with_presence(
                 peer_registry.as_ref(),
                 false, // not headless
                 None,  // presence mode has no session supervisor
+                None,  // foreground shape: no per-session runtime MCP bootstrap
             )
             .await;
 
@@ -3636,6 +3637,10 @@ pub(crate) struct NativeSessionConfig {
     /// Present when this session runs as a sub-agent child: (name, role).
     /// Children end when their task ends instead of idling for follow-ups.
     pub(crate) sub_agent_identity: Option<(String, sub_agent::SubAgentRole)>,
+    /// Session-scoped MCP bootstrap for the runtime child env
+    /// ([`agent_runner::RuntimeMcpEnv`]): present on supervised daemon
+    /// sessions with a web gateway, absent on gateway-less shapes.
+    pub(crate) runtime_mcp_env: Option<agent_runner::RuntimeMcpEnv>,
 }
 
 impl NativeSessionConfig {
@@ -3648,6 +3653,7 @@ impl NativeSessionConfig {
             system_prompt_override: None,
             orchestration: None,
             sub_agent_identity: None,
+            runtime_mcp_env: None,
         }
     }
 }
@@ -3881,6 +3887,7 @@ pub(crate) async fn run_direct_mode(
         peer_registry.as_ref(),
         headless,
         native.orchestration.as_ref(),
+        native.runtime_mcp_env.as_ref(),
     )
     .await
 }

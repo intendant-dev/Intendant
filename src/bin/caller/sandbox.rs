@@ -177,6 +177,13 @@ pub(crate) fn gateway_loopback_port() -> Option<u16> {
 /// Scoped to the daemon's own port; every other network destination
 /// stays open. Rides only the write-restricted (sandbox-on) profile:
 /// `--no-sandbox` keeps its whole-escape-hatch contract.
+///
+/// Legitimate in-session `ctl` does not need this port: supervised
+/// sessions' runtime env carries an `INTENDANT_MCP_URL` aimed at the
+/// dedicated session-MCP loopback listener (`GatewayIngress::SessionMcp`),
+/// which serves only `/mcp` to session-scoped tokens — it can never mint
+/// the root principal this deny exists to protect, so it stays outside
+/// the guard.
 #[cfg(target_os = "macos")]
 fn seatbelt_loopback_guard_clause() -> String {
     match gateway_loopback_port() {

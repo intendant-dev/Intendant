@@ -99,6 +99,29 @@ fn overlay_lookup(
         .cloned()
 }
 
+/// Point lookup of an external session's overlay name (the by-id twin of
+/// [`apply_session_name_overlays`], for read paths that hold one id — e.g.
+/// agenda provenance — instead of a row list).
+pub fn external_session_name(home: &Path, source: &str, session_id: &str) -> Option<String> {
+    let source = normalize_source(source);
+    overlay_lookup(&read_overlay_map(home), &source, session_id.trim())
+}
+
+/// Resolve an Intendant-native session id for display: `None` when no
+/// session log dir with metadata exists (the caller degrades to the raw
+/// id); `Some(name)` when it does, `name` being the human name if one was
+/// ever set.
+pub fn intendant_session_name(home: &Path, session_id: &str) -> Option<Option<String>> {
+    let dir = intendant_session_dir_from_home(home, session_id)?;
+    let raw = std::fs::read_to_string(dir.join("session_meta.json")).ok()?;
+    let meta = serde_json::from_str::<Value>(&raw).ok()?;
+    Some(
+        meta.get("name")
+            .and_then(|v| v.as_str())
+            .and_then(|name| normalize_session_name(name).ok()),
+    )
+}
+
 fn overlay_path(home: &Path) -> PathBuf {
     crate::platform::intendant_home_in(home).join(OVERLAY_FILE)
 }

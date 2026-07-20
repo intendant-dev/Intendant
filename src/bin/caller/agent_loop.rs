@@ -1104,6 +1104,9 @@ pub(crate) async fn run_agent_loop(
     // spawn_sub_agent / wait_sub_agents / submit_result tools. None outside
     // the daemon, where those tools answer with a clear error.
     orchestration: Option<&session_supervisor::SessionOrchestration>,
+    // Session-scoped MCP bootstrap for the runtime child's env: `ctl` run
+    // by shell commands inside this session then auto-attributes to it.
+    runtime_mcp_env: Option<&agent_runner::RuntimeMcpEnv>,
 ) -> Result<(LoopStats, LoopExitReason), CallerError> {
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
@@ -2677,6 +2680,7 @@ pub(crate) async fn run_agent_loop(
                 &project.root,
                 user_display_granted,
                 batch_facts.has_ask_human,
+                runtime_mcp_env,
             )
             .await?;
             let output_id = event::next_agent_output_id();
@@ -3271,6 +3275,7 @@ Proceed with explicit assumptions and continue without additional questions."
                 &project.root,
                 user_display_granted,
                 batch_facts.has_ask_human,
+                runtime_mcp_env,
             )
             .await?;
             let output_id = event::next_agent_output_id();
@@ -3458,6 +3463,7 @@ pub(crate) async fn run_round_loop(
     peer_registry: Option<&crate::peer::PeerRegistry>,
     headless: bool,
     orchestration: Option<&session_supervisor::SessionOrchestration>,
+    runtime_mcp_env: Option<&agent_runner::RuntimeMcpEnv>,
 ) -> Result<LoopStats, CallerError> {
     let mut round = 1usize;
     let mut cumulative_stats = LoopStats::default();
@@ -3495,6 +3501,7 @@ pub(crate) async fn run_round_loop(
             peer_registry,
             headless,
             orchestration,
+            runtime_mcp_env,
         )
         .await?;
 
