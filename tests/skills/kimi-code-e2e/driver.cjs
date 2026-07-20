@@ -1849,7 +1849,13 @@ async function scenario(run, port, kimiVersion) {
     modelResult.message || MODEL_DISPLAY,
   );
   await expectAction(run, sessionId, "thinking", { thinking: "medium" });
-  await expectAction(run, sessionId, "thinking", { thinking: "high" });
+  const highThinking = await expectAction(run, sessionId, "thinking", {
+    thinking: "high",
+  });
+  const expectedKimiThinking =
+    (highThinking.message || "").match(
+      /\b(?:applied|switched to)\s+([a-z0-9_-]+)/i,
+    )?.[1]?.toLowerCase() || "high";
   await expectAction(run, sessionId, "permission-mode", { mode: "yolo" });
   await expectAction(run, sessionId, "plan-mode", { enabled: true });
   await expectAction(run, sessionId, "plan-mode", { enabled: false });
@@ -2133,7 +2139,7 @@ async function scenario(run, port, kimiVersion) {
       const row = sessionRowForId(body, sessionId);
       return Boolean(
         row?.kimi_model &&
-          row?.kimi_thinking &&
+          row?.kimi_thinking === expectedKimiThinking &&
           row?.kimi_permission_mode &&
           Array.isArray(row?.kimi_allowed_tools),
       );
@@ -2148,7 +2154,7 @@ async function scenario(run, port, kimiVersion) {
     .sort();
   check(
     "effective-thinking-is-backend-echoed",
-    ["high", "on"].includes(parentProfileRow?.kimi_thinking),
+    parentProfileRow?.kimi_thinking === expectedKimiThinking,
     JSON.stringify(parentProfileRow).slice(0, 1_200),
   );
   const headForkMark = run.mark();
