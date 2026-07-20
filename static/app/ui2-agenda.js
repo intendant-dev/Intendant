@@ -922,6 +922,22 @@ function agendaPositionCard() {
     }
     agendaBuildCard();
     agendaRefresh();
+    // Follow-up affordance liveness: the button is derived at render time
+    // from session-window state the agenda has no event lane for, so a
+    // visible tab re-renders when (and only when) the eligibility
+    // signature changes — the target-switch poll idiom, write-guarded.
+    let followUpSig = '';
+    setInterval(() => {
+      if (!agendaTabVisible() || !Array.isArray(agendaItems)) return;
+      const sig = agendaItems
+        .filter((item) => item.status === 'open')
+        .map((item) => `${item.id}:${agendaFollowUpSid(item) || ''}`)
+        .join('|');
+      if (sig !== followUpSig) {
+        followUpSig = sig;
+        agendaRenderTab();
+      }
+    }, 2000);
     // Pane-gated: the card lives in #activity-log-pane, so with the
     // Activity tab parked (another tab, or document.hidden) the reposition
     // tick used to write data-rail-hidden into a display:none subtree once

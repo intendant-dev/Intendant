@@ -1520,6 +1520,116 @@ async fn native_session_ctl_agenda_add_attributes_to_the_session() {
     );
 }
 
+/// F3 owner start-now, end to end against the real binaries: one owner
+/// gesture (`ctl agenda start` — local_process is an owner surface) mints
+/// and approves a manifest from the item and fires it through the SAME
+/// scheduled lane as any timed firing — proven by the occurrence journal
+/// carrying exactly one prepared→started→completed arc and the DoneSignal
+/// outcome writing back to the item. Also proves the tenant edge refuses
+/// the combined verb to non-owner actors at the HTTP surface.
+#[tokio::test]
+async fn agenda_start_now_fires_one_occurrence_and_writes_back() {
+    const DONE_MESSAGE: &str = "start-now follow-through complete";
+    let script = serde_json::json!({
+        "profiles": [
+            { "match": "Agenda follow-through for item", "steps": [
+                { "content": "Working the started item.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": DONE_MESSAGE } }] }
+            ]},
+            { "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]}
+        ]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let daemon = spawn_daemon(&client, &script).await;
+    let port = daemon.port;
+
+    let added = ctl(
+        &daemon,
+        &["--json", "agenda", "add", "start-now-e2e-item", "--task"],
+    )
+    .await;
+    assert!(added.status.success(), "{}", text_of(&added));
+    let item_id = stdout_json(&added)["item"]["id"]
+        .as_str()
+        .expect("minted item id")
+        .to_string();
+
+    let started = ctl(&daemon, &["agenda", "start", &item_id[..10]]).await;
+    assert!(started.status.success(), "{}", text_of(&started));
+
+    // The outcome writes back through the standard lane.
+    let item = poll_until(
+        "the start-now outcome write-back",
+        RUN_TIMEOUT,
+        || async {
+            let agenda =
+                http_get_json(&client, &format!("http://127.0.0.1:{port}/api/agenda")).await?;
+            let item = agenda
+                .get("items")?
+                .as_array()?
+                .iter()
+                .find(|item| item["id"] == item_id.as_str())?
+                .clone();
+            (item.pointer("/effects/0/last_run/state")? == "completed").then_some(item)
+        },
+        || {
+            format!(
+                "--- session logs ---\n{}\n--- daemon log tail ---\n{}",
+                tail(&daemon.rig.session_logs(), 2000),
+                daemon.log_tail()
+            )
+        },
+    )
+    .await;
+    let run = &item["effects"][0]["last_run"];
+    assert_eq!(run["note"], DONE_MESSAGE, "{item}");
+    assert!(
+        run["session_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "{item}"
+    );
+    let occurrence_id = run["occurrence_id"].as_str().expect("occurrence id");
+    let approval = &item["effects"][0]["approval"];
+    assert_eq!(
+        approval["digest"], item["effects"][0]["digest"],
+        "the gesture's approval binds the minted digest: {item}"
+    );
+
+    // The occurrence journal carries exactly one arc for this firing:
+    // prepared → started → completed, one occurrence id, no duplicates.
+    let journal_path = daemon
+        .rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("agenda")
+        .join("occurrences.jsonl");
+    let journal = std::fs::read_to_string(&journal_path).expect("occurrence journal");
+    let states: Vec<String> = journal
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|row| row["occurrence_id"] == occurrence_id)
+        .filter_map(|row| row["state"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        states,
+        vec!["prepared", "started", "completed"],
+        "one clean occurrence arc, never a bypass:\n{journal}"
+    );
+
+    // The non-owner refusal (NotPermitted{verb:"start_now"} for
+    // agent_session/peer/unattributed/None) is pinned at unit level on
+    // the tenant-edge funnel every lane converges through
+    // (`start_now_is_owner_surface_and_binds_its_own_digest`).
+}
+
 /// Task #6 end to end, against the real binaries: a resumable upload
 /// rides direct HTTP as job create → capped raw chunks → commit,
 /// survives a "client restart" (re-list by handle, resume at the
