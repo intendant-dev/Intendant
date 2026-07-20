@@ -654,7 +654,7 @@ pub(crate) fn manifest_hash_hex(artifacts: &[ArtifactRecord]) -> String {
     sha256_hex(canonical.as_bytes())
 }
 
-pub(crate) fn latest_artifact_manifest_hash(store: &Store) -> Option<String> {
+fn latest_artifact_manifest_identity(store: &Store) -> Option<(String, Option<String>)> {
     store
         .log_entries
         .iter()
@@ -662,21 +662,29 @@ pub(crate) fn latest_artifact_manifest_hash(store: &Store) -> Option<String> {
         .find(|entry| entry.kind == ARTIFACT_MANIFEST_KIND)
         .and_then(|entry| serde_json::from_str::<serde_json::Value>(&entry.leaf_json).ok())
         .and_then(|leaf| {
-            leaf.get("manifest_hash")
+            let manifest_hash = leaf
+                .get("manifest_hash")
                 .and_then(|hash| hash.as_str())
-                .map(str::to_string)
+                .map(str::to_string)?;
+            let artifact_origin = leaf
+                .get("artifact_origin")
+                .and_then(|origin| origin.as_str())
+                .map(str::to_string);
+            Some((manifest_hash, artifact_origin))
         })
 }
 
 /// Compute the served-artifact manifest and append an
-/// `artifact_manifest` entry when it differs from the latest logged one.
+/// `artifact_manifest` entry when its bytes or canonical serving origin
+/// differ from the latest logged one.
 /// Returns whether an entry was appended (the caller persists). Called
 /// at startup, inside the same single-threaded window that loads the
 /// store — the log and what the process serves cannot disagree.
 pub(crate) fn record_artifact_manifest(store: &mut Store, config: &ServiceConfig) -> bool {
     let artifacts = served_artifact_manifest(config);
     let manifest_hash = manifest_hash_hex(&artifacts);
-    if latest_artifact_manifest_hash(store).as_deref() == Some(manifest_hash.as_str()) {
+    let identity = (manifest_hash.clone(), Some(config.public_origin.clone()));
+    if latest_artifact_manifest_identity(store).as_ref() == Some(&identity) {
         eprintln!(
             "[connect] artifact manifest unchanged ({} artifacts, {})",
             artifacts.len(),
@@ -698,6 +706,11 @@ pub(crate) fn record_artifact_manifest(store: &mut Store, config: &ServiceConfig
             "bundle_version": env!("CARGO_PKG_VERSION"),
             "git_sha": env!("INTENDANT_GIT_SHA"),
             "manifest_hash": manifest_hash,
+            // Inclusion in the signed tree authenticates this canonical
+            // serving origin alongside the artifact list. Keep the v1
+            // manifest hash bytes-only so older verifiers can parse new
+            // leaves during a rolling upgrade.
+            "artifact_origin": config.public_origin,
             "artifacts": artifacts,
         }),
     );
@@ -1709,6 +1722,37 @@ mod tests {
     }
 
     #[test]
+    fn legacy_artifact_manifest_is_relogged_with_its_serving_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let artifacts = served_artifact_manifest(&config);
+        let manifest_hash = manifest_hash_hex(&artifacts);
+        let mut store = Store::default();
+        append_log_entry(
+            &mut store,
+            ARTIFACT_MANIFEST_KIND,
+            json!({
+                "bundle_version": env!("CARGO_PKG_VERSION"),
+                "git_sha": env!("INTENDANT_GIT_SHA"),
+                "manifest_hash": manifest_hash,
+                "artifacts": artifacts,
+            }),
+        );
+
+        assert!(record_artifact_manifest(&mut store, &config));
+        assert_eq!(store.log_entries.len(), 2);
+        assert!(!record_artifact_manifest(&mut store, &config));
+        let latest: serde_json::Value =
+            serde_json::from_str(&store.log_entries.last().unwrap().leaf_json).unwrap();
+        assert_eq!(
+            latest
+                .get("artifact_origin")
+                .and_then(|value| value.as_str()),
+            Some(config.public_origin.as_str())
+        );
+    }
+
+    #[test]
     fn artifact_manifest_entries_append_dedupe_and_prove() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
@@ -1748,6 +1792,10 @@ mod tests {
         assert_eq!(
             leaf.get("git_sha").and_then(|v| v.as_str()),
             Some(env!("INTENDANT_GIT_SHA"))
+        );
+        assert_eq!(
+            leaf.get("artifact_origin").and_then(|v| v.as_str()),
+            Some(config.public_origin.as_str())
         );
         let artifacts: Vec<ArtifactRecord> =
             serde_json::from_value(leaf.get("artifacts").cloned().unwrap()).unwrap();
