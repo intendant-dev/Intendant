@@ -231,6 +231,31 @@ pub(crate) async fn handle_control_command_mcp(
             );
             Some(RESOURCE_APPROVAL_URI)
         }
+        ControlMsg::HoldQuestion { id, held, .. } => {
+            // The hold flip itself is consumed by the blocked ask's waiter
+            // (this message already rode the bus as a `ControlCommand`);
+            // here we only acknowledge whether such an ask is pending.
+            let pending = super::tools_ask::ask_user_question_pending(id);
+            emit_control_result(
+                control_tx,
+                "hold_question",
+                pending,
+                if pending {
+                    format!(
+                        "question {id} {}",
+                        if held {
+                            "held open"
+                        } else {
+                            "countdown resumed"
+                        }
+                    )
+                } else {
+                    format!("question {id} is not pending")
+                },
+                None,
+            );
+            None
+        }
         ControlMsg::Input { text } => {
             let mut s = state.write().await;
             let outcome = respond_to_human_question(&mut s, &text);

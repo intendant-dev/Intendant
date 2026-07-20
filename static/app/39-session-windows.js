@@ -798,6 +798,7 @@ const VITALS_SEVERITY_RANK = { '': 0, ok: 0, warn: 1, crit: 2 };
 function vitalsLimitLabelLong(label) {
   if (label === '5h') return '5-hour';
   if (label === '7d') return '7-day';
+  if (label === '7d-overage') return '7-day overage';
   // Unknown window names arrive as raw provider vocabulary — keep every
   // word (the pane owns the full name), just soften the wire spelling.
   return String(label || '').replace(/_/g, ' ').trim();
@@ -1248,38 +1249,50 @@ const VITALS_SYMBOLS = {
     priority: 80,
     // Percentages render only when the provider actually reported one
     // (Claude Code 2.1.2xx dropped `utilization` from rate_limit_event in
-    // normal operation, and its statusline feed — which does carry
-    // used_percentage — never fires in the print mode we drive it in).
-    // Without one the chip stays honest: named window, status mark, and
-    // the reset countdown we DO know — never a synthesized number.
-    // Chips always speak the SHORT window grammar ("▮95% 7d-overage ·
-    // ↻6h") — a full provider sentence in a header chip is the failure
-    // mode; the pane keeps the full name.
+    // normal operation — live wire re-verified on 2.1.215: {"status",
+    // "resetsAt","rateLimitType","overageStatus",…}, no utilization — and
+    // its statusline feed, which does carry used_percentage, never fires
+    // in the print mode we drive it in). Without one the chip stays
+    // honest: named window, status mark, and the reset countdown we DO
+    // know — never a synthesized number. The countdown is EXACT from the
+    // provider's reset epoch and ticks client-side; a window whose reset
+    // epoch passed reads "reset" (its last report describes the previous
+    // window) until the next report. Chips always speak the SHORT window
+    // grammar ("▮95% 7d-overage · ↻6:12:03") — a full provider sentence
+    // in a header chip is the failure mode; the pane keeps the full name.
     chip: (v) => {
-      const reset = v.reset ? ` · ↻${v.reset}` : '';
       const label = vitalsLimitLabelShort(v.label);
+      if (v.rolled) return `${label} reset`;
+      const reset = v.reset ? ` · ↻${v.reset}` : '';
       if (v.usedPct !== null) return `▮${v.usedPct}% ${label}${reset}`;
       const mark = v.severity === 'crit' ? '⛔' : v.severity === 'warn' ? '⚠' : v.statusWord;
       return `${label} ${mark}${reset}`;
     },
     explain: (v) => {
       const lines = [];
+      const wall = formatLimitResetWallClock(v.resetsAtEpoch);
+      if (v.rolled) {
+        lines.push(`The provider's ${vitalsLimitLabelLong(v.label)} window has reset${wall ? ` (at ${wall})` : ''} — the last report predates it, so current usage is unknown until the agent's next model call refreshes it.`);
+        return lines;
+      }
       if (v.usedPct !== null) {
         lines.push(`${v.usedPct}% of the provider's ${vitalsLimitLabelLong(v.label)} usage allowance is used.`);
       } else {
         lines.push(`The provider reports its ${vitalsLimitLabelLong(v.label)} allowance as “${v.statusWord}” — it doesn't share an exact percentage.`);
       }
-      if (v.reset) lines.push(`The window resets in ~${v.reset}.`);
+      if (v.reset) lines.push(`The window resets in ${v.reset}${wall ? ` — at ${wall}` : ''}.`);
       if (v.severity === 'crit') lines.push('When an allowance runs out, the provider pauses this agent until the window resets.');
       else if (v.severity === 'warn') lines.push('If the window fills up, the provider will pause this agent until it resets.');
+      if (v.observedAgo) lines.push(`Last provider report: ${v.observedAgo} ago. Windows are account-wide, so any session's report updates this.`);
       return lines;
     },
     brief: (v) => {
+      if (v.rolled) return `${vitalsLimitLabelLong(v.label)} limit: window reset — awaiting a fresh report`;
       // Name the driver: a hard status outranks the percentage.
       const what = v.usedPct !== null && v.usedPct >= 90 ? `${v.usedPct}% used`
         : v.statusWord !== 'ok' ? v.statusWord
           : `${v.usedPct}% used`;
-      return `${vitalsLimitLabelLong(v.label)} limit: ${what}${v.reset ? ` — resets in ~${v.reset}` : ''}`;
+      return `${vitalsLimitLabelLong(v.label)} limit: ${what}${v.reset ? ` — resets in ${v.reset}` : ''}`;
     },
   },
 };
@@ -1308,6 +1321,8 @@ function formatCacheCountdown(seconds) {
   return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 }
 
+// Coarse "~2h" grammar for moment-in-time prose (toast lines). Chips and
+// pane sentences use formatLimitResetExact instead — they tick.
 function formatLimitReset(resetsAtEpoch) {
   const remaining = Number(resetsAtEpoch) - Date.now() / 1000;
   if (!Number.isFinite(remaining) || remaining <= 0) return '';
@@ -1316,11 +1331,59 @@ function formatLimitReset(resetsAtEpoch) {
   return `${Math.max(1, Math.round(remaining / 60))}m`;
 }
 
+// Exact countdown from the provider's own reset epoch, precision scaled
+// to magnitude: "2d 6h" a day+ out, "3:38:12" under a day, "38:12" under
+// an hour — never a rounded "~2h". Empty once the epoch passes (the
+// window rolled). Ticks client-side from the server-stamped epoch, the
+// cache-ttl pattern: no per-second wire traffic.
+function formatLimitResetExact(resetsAtEpoch) {
+  const remaining = Math.floor(Number(resetsAtEpoch) - Date.now() / 1000);
+  if (!Number.isFinite(remaining) || remaining <= 0) return '';
+  if (remaining >= 86400) {
+    return `${Math.floor(remaining / 86400)}d ${Math.floor((remaining % 86400) / 3600)}h`;
+  }
+  const hours = Math.floor(remaining / 3600);
+  const minutes = Math.floor((remaining % 3600) / 60);
+  const seconds = remaining % 60;
+  const mmss = `${minutes}:${String(seconds).padStart(2, '0')}`;
+  return hours > 0 ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}` : mmss;
+}
+
+// Absolute wall-clock form of a reset epoch for pane sentences ("3:30 PM",
+// "Jul 22, 6:00 AM" when not today), in the viewer's locale. Empty when
+// the epoch is absent.
+function formatLimitResetWallClock(resetsAtEpoch) {
+  const epoch = Number(resetsAtEpoch);
+  if (!Number.isFinite(epoch) || epoch <= 0) return '';
+  const at = new Date(epoch * 1000);
+  const time = at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return at.toDateString() === new Date().toDateString()
+    ? time
+    : `${at.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${time}`;
+}
+
+// A window whose provider-stated reset epoch has passed: its last report
+// (status AND percentage) describes the PREVIOUS window, so nothing in it
+// may keep claiming the current one — severity drops and the chip says
+// "reset" until the next report replaces it.
+function limitWindowRolled(w) {
+  const resetsAt = Number(w?.resetsAtEpoch);
+  return Number.isFinite(resetsAt) && resetsAt > 0 && resetsAt <= Date.now() / 1000;
+}
+
 function limitStatusSeverity(status) {
   const s = String(status || '').trim().toLowerCase();
   if (!s || s === 'allowed') return '';
   if (s === 'allowed_warning') return 'warn';
   return 'crit'; // rejected / limited / queueing / anything non-allowed
+}
+
+// Status severity with the rolled degradation applied — the one severity
+// derivation for the chip model AND the escalation alerts, so the toast
+// and the chip can never disagree about a window again.
+function effectiveLimitSeverity(w) {
+  if (limitWindowRolled(w)) return '';
+  return limitStatusSeverity(w?.status);
 }
 
 function limitStatusWord(status, severity) {
@@ -1378,7 +1441,7 @@ function vitalsChipModels(vitals, meta, sessionId) {
       hasHeartbeat: act.hasHeartbeat,
       elapsedText: formatActivityElapsed(act.elapsed),
       quietText: formatActivityElapsed(act.quiet),
-      reset: act.resetsAtEpoch ? formatLimitReset(act.resetsAtEpoch) : '',
+      reset: act.resetsAtEpoch ? formatLimitResetExact(act.resetsAtEpoch) : '',
       bgTasks: act.backgroundTasks,
       bgCount: act.backgroundTasks.length,
     }, {
@@ -1485,23 +1548,42 @@ function vitalsChipModels(vitals, meta, sessionId) {
   const limits = Array.isArray(vitals?.limits) ? vitals.limits : [];
   for (const w of limits) {
     const label = String(w?.label || '').trim() || 'window';
+    const rolled = limitWindowRolled(w);
     const pctRaw = Number(w?.usedPct);
-    const usedPct = Number.isFinite(pctRaw) && w?.usedPct !== null && w?.usedPct !== undefined
+    const usedPct = !rolled && Number.isFinite(pctRaw) && w?.usedPct !== null && w?.usedPct !== undefined
       ? Math.max(0, Math.min(100, pctRaw))
       : null;
-    const statusSeverity = limitStatusSeverity(w?.status);
+    const statusSeverity = effectiveLimitSeverity(w);
     let severity = statusSeverity;
     if (usedPct !== null) {
       if (usedPct >= 90) severity = 'crit';
       else if (usedPct >= 70 && severity !== 'crit') severity = 'warn';
     }
+    const reset = rolled ? '' : (w?.resetsAtEpoch ? formatLimitResetExact(w.resetsAtEpoch) : '');
+    // "Last reported" honesty, only once it matters: providers announce
+    // windows on model calls, so a couple of minutes of quiet is normal.
+    const observedAt = Number(w?.observedAtEpoch);
+    const observedAgoSecs = Number.isFinite(observedAt) && observedAt > 0
+      ? Math.floor(Date.now() / 1000 - observedAt)
+      : null;
     push('limit', `limit:${label}`, {
       label,
       usedPct,
       statusWord: limitStatusWord(w?.status, statusSeverity),
-      reset: w?.resetsAtEpoch ? formatLimitReset(w.resetsAtEpoch) : '',
+      reset,
+      resetsAtEpoch: Number(w?.resetsAtEpoch) || 0,
+      rolled,
+      observedAgo: observedAgoSecs !== null && observedAgoSecs > 120
+        ? formatActivityElapsed(observedAgoSecs)
+        : '',
       severity,
-    }, { severity });
+    }, {
+      severity,
+      // The countdown ticks in place (cache-ttl pattern): the sig excludes
+      // it so the 1 Hz ticker hits the stable-DOM fast path.
+      ticking: !!reset,
+      sig: `${label}|${usedPct}|${w?.status || ''}|${severity}|${rolled ? 1 : 0}`,
+    });
   }
 
   const order = new Map(VITALS_SYMBOL_ORDER.map((key, index) => [key, index]));
@@ -1650,10 +1732,13 @@ function renderSessionWindowVitals(win, vitals) {
     .map((m) => `${m.id}${m.key === 'cache-ttl' ? (m.text === '✗' ? 'cold' : 'warm') : (m.sig ?? m.text)}${m.tone}${m.elevated ? 1 : 0}`)
     .join('|');
   if (win.vitals.dataset.vitSig === signature) {
-    for (const key of ['cache-ttl', 'activity']) {
-      const model = models.find((m) => m.key === key);
-      const chip = win.vitals.querySelector(`[data-chip="${key}"]`);
-      if (model && chip) {
+    // Every ticking model updates in place by id — cache-ttl, activity,
+    // and each limit window's exact reset countdown.
+    const tickingById = new Map(models.filter((m) => m.ticking).map((m) => [m.id, m]));
+    if (tickingById.size) {
+      for (const chip of win.vitals.querySelectorAll('.vit-chip')) {
+        const model = tickingById.get(chip.dataset.chip || '');
+        if (!model) continue;
         chip.textContent = model.text;
         chip.title = model.explainLines[0] || model.label;
       }
@@ -2818,7 +2903,10 @@ function maybeAlertLimitTransitions(sid, limits, { replay = false } = {}) {
   }
   for (const w of limits) {
     const label = String(w?.label || '').trim() || 'window';
-    const severity = limitStatusSeverity(w?.status);
+    // Same rolled-aware derivation as the chip: a stale pre-reset status
+    // neither alerts nor blocks the re-arm, so the toast and the chip can
+    // never disagree about a window.
+    const severity = effectiveLimitSeverity(w);
     const prev = seen.get(label) || '';
     seen.set(label, severity);
     if (replay || firstObservation) continue;
@@ -2938,12 +3026,12 @@ function lineForLimitEntryTitle(e) {
 }
 
 // Cheap per-tick predicate: does this session's vitals row need a 1 Hz
-// repaint at all? True for the warm-cache countdown (the only `ticking`
-// model vitalsChipModels emits) and for status-only rate-limit chips whose
-// "resets in ~Xm" text is time-derived. Everything else changes only on
-// real vitals/metadata events, which re-render directly — so the ticker no
-// longer rebuilds every window's full chip-model array each second just to
-// hit the stable-DOM fast path.
+// repaint at all? True for the warm-cache countdown, a live activity
+// state, and any rate-limit window with a future reset epoch (its exact
+// countdown ticks every second — percentage-bearing windows included).
+// Everything else changes only on real vitals/metadata events, which
+// re-render directly — so the ticker no longer rebuilds every window's
+// full chip-model array each second just to hit the stable-DOM fast path.
 function sessionVitalsNeedsTick(vitals) {
   if (!vitals || typeof vitals !== 'object') return false;
   // A live activity state ticks: elapsed counts up and the stalled
@@ -2952,13 +3040,7 @@ function sessionVitalsNeedsTick(vitals) {
   const remaining = sessionCacheCountdownSeconds(vitals.cache);
   if (remaining !== null && remaining > 0) return true;
   const limits = Array.isArray(vitals.limits) ? vitals.limits : [];
-  return limits.some((w) => {
-    // Mirrors the chip model: the reset countdown only renders when the
-    // provider reports no percentage (status-only limits).
-    const pctRaw = Number(w?.usedPct);
-    const hasPct = Number.isFinite(pctRaw) && w?.usedPct !== null && w?.usedPct !== undefined;
-    return !hasPct && Number(w?.resetsAtEpoch) > Date.now() / 1000;
-  });
+  return limits.some((w) => Number(w?.resetsAtEpoch) > Date.now() / 1000);
 }
 
 function refreshSessionVitalsTicker() {
@@ -4388,6 +4470,7 @@ async function hydrateRestoredSessionWindow(win, record) {
     updateSessionWindowRemotePageState(targetWin, data, source, sid);
     const rendered = renderRestoredSessionWindowEntries(targetWin, entries, targetSid);
     clearSessionWindowHydrateError(targetWin || win);
+    fillRestoredSessionWindowTaskFromEntries(targetSid, entries);
     if (rendered > 0) {
       updateSessionWindow(targetSid, {
         phase: restoredSessionWindowPhaseFromEntries(entries, targetSid),
@@ -4438,6 +4521,37 @@ function restoredSessionWindowPhaseFromEntries(entries, fallbackSessionId) {
     }
   }
   return 'idle';
+}
+
+// Restored windows can show "initial message pending" forever: the
+// persisted record is identity/topology only (no task text), and a dead
+// task child is absent from the session registry, so nothing ever fills
+// the header. The hydrated transcript knows better — its first live user
+// prompt IS the task — so once hydration succeeds, fill the metadata
+// through the ordinary update path (normalize → merge → header render).
+// Anything already present wins: live SessionStarted metadata, registry
+// rows, and later fills all outrank this backstop, which only writes
+// into a blank.
+const SESSION_WINDOW_RESTORED_TASK_CHAR_LIMIT = 240;
+function fillRestoredSessionWindowTaskFromEntries(sessionId, entries) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !Array.isArray(entries) || !entries.length) return;
+  const meta = sessionMetadataById.get(sid) || {};
+  if (compactSessionText(meta.task)) return;
+  for (const entry of entries) {
+    const record = sessionWindowRecordFromReplayEntry(entry, sid);
+    if (!record || record.superseded) continue;
+    const source = String(record.source || '').trim().toLowerCase();
+    const level = String(record.level || '').trim().toLowerCase();
+    if (source !== 'user' && level !== 'user') continue;
+    const task = compactSessionTextBounded(
+      record.content,
+      SESSION_WINDOW_RESTORED_TASK_CHAR_LIMIT
+    );
+    if (!task) continue;
+    updateSessionWindow(sid, { task });
+    return;
+  }
 }
 
 function sessionWindowHydrationRecord(sessionId) {

@@ -38,13 +38,14 @@ pub(crate) enum AgendaError {
 /// preserved on disk but skipped at load (forward compatibility: a newer
 /// build's vocabulary — effects, journal curation — must not brick an older
 /// daemon's ledger).
-const KNOWN_OPS: [&str; 10] = [
+const KNOWN_OPS: [&str; 11] = [
     "add",
     "patch",
     "complete",
     "reopen",
     "retire",
     "answer",
+    "dismiss",
     "propose_effect",
     "approve_effect",
     "revoke_effect",
@@ -54,6 +55,8 @@ const KNOWN_OPS: [&str; 10] = [
 const LOG_FILE: &str = "agenda.jsonl";
 
 pub(crate) struct AgendaStore {
+    /// The agenda dir this store lives in (op log, blob store).
+    dir: PathBuf,
     log_path: PathBuf,
     log: std::fs::File,
     items: BTreeMap<String, AgendaItem>,
@@ -145,7 +148,8 @@ impl AgendaStore {
             folded_len += 1;
         }
         let last_id = max_item_id(&items);
-        Ok(Self {
+        let store = Self {
+            dir: dir.to_path_buf(),
             log_path,
             log,
             items,
@@ -153,7 +157,25 @@ impl AgendaStore {
             ops,
             skipped_lines,
             folded_len,
-        })
+        };
+        store.sync_ask_state();
+        Ok(store)
+    }
+
+    /// Post-fold bookkeeping for persisted rich asks: floor the process
+    /// approval-id allocator above every ask id ever folded (a restarted
+    /// daemon's counter must never re-mint a persisted rail id), and
+    /// reconcile the open-ask registry the supervisor consults.
+    fn sync_ask_state(&self) {
+        let max_ask_id = self
+            .items
+            .values()
+            .filter_map(|item| item.ask.as_ref().map(|ask| ask.ask_id))
+            .max();
+        if let Some(max_ask_id) = max_ask_id {
+            crate::event::ensure_approval_id_floor(max_ask_id);
+        }
+        super::ask::sync_open_asks(self.items.values());
     }
 
     /// Refold when the on-disk log has bytes this store has not seen.
@@ -188,6 +210,8 @@ impl AgendaStore {
             self.log.write_all(b"\n")?;
             self.folded_len += 1;
         }
+        // Another instance may have parked or resolved asks.
+        self.sync_ask_state();
         Ok(())
     }
 
@@ -203,8 +227,190 @@ impl AgendaStore {
     ) -> Result<AgendaItem, AgendaError> {
         // Validate against the freshest state another instance may have left.
         self.refresh_if_stale()?;
+        // Rich-ask park: blob commits interleave with the id mint and need
+        // rollback on any later failure, so it has its own arm.
+        if let AgendaCommand::Ask { questions } = cmd {
+            return self.apply_ask(questions, actor, now_ms);
+        }
+        let deletes_blobs = matches!(&cmd, AgendaCommand::Retire { .. });
         let op = self.command_to_op(cmd)?;
+        let item = self.append_op(op, actor, now_ms)?;
+        // Retention is tied to the item lifecycle: preview blobs die with
+        // RETIREMENT — not completion, because answered questions remain
+        // visible in the archive with their previews.
+        if deletes_blobs && item.ask.is_some() {
+            if let Err(err) = super::blobs::delete_item_blobs(&self.dir, &item.id) {
+                eprintln!("[agenda] deleting blobs of retired {}: {err}", item.id);
+            }
+        }
+        Ok(item)
+    }
+
+    /// Park one validated rich ask: build the questions through the same
+    /// validator the blocking `ask_user` uses, mint the item id, commit
+    /// preview blobs into the agenda blob store (rolling back every blob
+    /// of this park on any failure — mirrors `ask_user_inner`'s
+    /// cross-question rollback), mint the rail `ask_id`, and append the
+    /// `add`.
+    fn apply_ask(
+        &mut self,
+        questions: Vec<crate::mcp::AskUserQuestionParams>,
+        actor: Option<AgendaActor>,
+        now_ms: u64,
+    ) -> Result<AgendaItem, AgendaError> {
+        if questions.is_empty() {
+            return Err(AgendaError::Invalid(
+                "ask requires at least one question".into(),
+            ));
+        }
+        // The exact ask_user validation (counts, pick bounds, preview
+        // decode, the shared ≤8 MB preview budget) — derive, don't mirror.
+        let params = crate::mcp::AskUserParams {
+            question: String::new(),
+            header: None,
+            options: Vec::new(),
+            previews: Vec::new(),
+            multi_select: None,
+            pick_min: None,
+            pick_max: None,
+            free_text: None,
+            questions,
+            wait_seconds: None,
+            session_id: None,
+        };
+        let (built, _wait) =
+            crate::mcp::build_ask_user_questions(&params).map_err(AgendaError::Invalid)?;
+
+        let item_id = self.mint_id()?;
+        // Title = the first question, clipped to the title cap (questions
+        // may legally exceed it; the full text lives on the ask payload).
+        let title: String = built
+            .first()
+            .map(|(q, _)| q.question.chars().take(MAX_TITLE_CHARS).collect())
+            .unwrap_or_default();
+        let title = validate_title(&title)?;
+
+        // Commit preview blobs; on any failure delete everything this park
+        // committed so a refused ask strands nothing.
+        let mut questions: Vec<crate::types::UserQuestion> = Vec::with_capacity(built.len());
+        let mut commit_error: Option<String> = None;
+        'questions: for (mut question, previews) in built {
+            let mut committed: Vec<crate::types::QuestionPreview> = Vec::new();
+            for preview in previews {
+                let source = match preview.source {
+                    crate::mcp::DecodedPreviewSource::Text(content) => {
+                        Ok(crate::types::QuestionPreviewSource::Text { content })
+                    }
+                    crate::mcp::DecodedPreviewSource::Html(html) => super::blobs::commit_blob(
+                        &self.dir,
+                        &item_id,
+                        &preview.label,
+                        "html",
+                        "text/html",
+                        html.as_bytes(),
+                    )
+                    .map(|descriptor| crate::types::QuestionPreviewSource::Html {
+                        url: super::blobs::agenda_blob_raw_url(&item_id, &descriptor.id),
+                        upload_id: descriptor.id,
+                    }),
+                    crate::mcp::DecodedPreviewSource::Image { mime, bytes } => {
+                        super::blobs::commit_blob(
+                            &self.dir,
+                            &item_id,
+                            &preview.label,
+                            crate::mcp::note_image_extension(mime),
+                            mime,
+                            &bytes,
+                        )
+                        .map(|descriptor| {
+                            crate::types::QuestionPreviewSource::Image {
+                                url: super::blobs::agenda_blob_raw_url(&item_id, &descriptor.id),
+                                upload_id: descriptor.id,
+                                mime: mime.to_string(),
+                            }
+                        })
+                    }
+                };
+                match source {
+                    Ok(source) => committed.push(crate::types::QuestionPreview {
+                        label: preview.label,
+                        source,
+                    }),
+                    Err(message) => {
+                        commit_error = Some(message);
+                        break 'questions;
+                    }
+                }
+            }
+            question.previews = committed;
+            questions.push(question);
+        }
+        if let Some(message) = commit_error {
+            if let Err(err) = super::blobs::delete_item_blobs(&self.dir, &item_id) {
+                eprintln!("[agenda] rollback of {item_id} blobs: {err}");
+            }
+            return Err(AgendaError::Invalid(message));
+        }
+
+        let ask_id = crate::event::next_approval_id();
+        let op = AgendaOp::Add {
+            id: item_id.clone(),
+            kind: super::types::AgendaKind::Question,
+            title,
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            ask: Some(super::types::AgendaAsk { ask_id, questions }),
+        };
+        match self.append_op(op, actor, now_ms) {
+            Ok(item) => Ok(item),
+            Err(err) => {
+                // The append never made it to disk: the blobs are orphans.
+                if let Err(cleanup) = super::blobs::delete_item_blobs(&self.dir, &item_id) {
+                    eprintln!("[agenda] rollback of {item_id} blobs: {cleanup}");
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Daemon-internal dismissal of an open rich question (rail
+    /// skip/deny/approve — the resolver's lane; no command twin, mirroring
+    /// `record_occurrence`). Records the marker; the item stays OPEN.
+    pub(crate) fn dismiss_question(
+        &mut self,
+        item_id: &str,
+        action: &str,
+        actor: Option<AgendaActor>,
+        now_ms: u64,
+    ) -> Result<AgendaItem, AgendaError> {
+        self.refresh_if_stale()?;
+        let item = self.require(item_id)?;
+        if item.kind != super::types::AgendaKind::Question {
+            return Err(AgendaError::Invalid(format!("{item_id} is not a question")));
+        }
+        if item.status != AgendaStatus::Open {
+            return Err(AgendaError::Transition(format!("{item_id} is not open")));
+        }
+        let op = AgendaOp::Dismiss {
+            id: item_id.to_string(),
+            action: action.to_string(),
+        };
         self.append_op(op, actor, now_ms)
+    }
+
+    /// The item currently holding `ask_id` as an OPEN rich ask, if any.
+    pub(crate) fn open_ask(&mut self, ask_id: u64) -> Option<AgendaItem> {
+        if let Err(err) = self.refresh_if_stale() {
+            eprintln!("[agenda] refresh before ask lookup failed: {err}");
+        }
+        self.items
+            .values()
+            .find(|item| {
+                item.status == AgendaStatus::Open
+                    && item.ask.as_ref().is_some_and(|ask| ask.ask_id == ask_id)
+            })
+            .cloned()
     }
 
     fn append_op(
@@ -236,6 +442,7 @@ impl AgendaStore {
             eprintln!("[agenda] fold rejected a validated op: {reason}");
         }
         self.ops += 1;
+        self.sync_ask_state();
         self.items
             .get(&item_id)
             .cloned()
@@ -257,7 +464,13 @@ impl AgendaStore {
                 body: validate_body(body)?,
                 tags: validate_tags(tags)?,
                 due_ms,
+                ask: None,
             }),
+            // Handled by `apply_command`'s dedicated arm (blob commits +
+            // rollback); reaching here is a daemon bug, not a caller error.
+            AgendaCommand::Ask { .. } => Err(AgendaError::Invalid(
+                "internal: ask must route through apply_command".into(),
+            )),
             AgendaCommand::Patch { id, patch } => {
                 self.require(&id)?;
                 if patch.is_empty() {
@@ -294,7 +507,11 @@ impl AgendaStore {
                 }
                 AgendaStatus::Open | AgendaStatus::Done => Ok(AgendaOp::Retire { id }),
             },
-            AgendaCommand::Answer { id, text } => {
+            AgendaCommand::Answer {
+                id,
+                text,
+                structured,
+            } => {
                 let item = self.require(&id)?;
                 if item.kind != super::types::AgendaKind::Question {
                     return Err(AgendaError::Invalid(format!(
@@ -305,6 +522,7 @@ impl AgendaStore {
                     AgendaStatus::Open => Ok(AgendaOp::Answer {
                         id,
                         text: validate_answer(&text)?,
+                        structured: structured.filter(|s| !s.is_empty()),
                     }),
                     AgendaStatus::Done => Err(AgendaError::Transition(format!(
                         "{id} is already answered — reopen it to re-ask"
@@ -911,7 +1129,8 @@ mod tests {
             store.apply_command(
                 AgendaCommand::Answer {
                     id: task.id.clone(),
-                    text: "irrelevant".into()
+                    text: "irrelevant".into(),
+                    structured: None,
                 },
                 None,
                 3,
@@ -922,7 +1141,8 @@ mod tests {
             store.apply_command(
                 AgendaCommand::Answer {
                     id: question.id.clone(),
-                    text: "   ".into()
+                    text: "   ".into(),
+                    structured: None,
                 },
                 None,
                 4,
@@ -934,6 +1154,7 @@ mod tests {
                 AgendaCommand::Answer {
                     id: question.id.clone(),
                     text: "yes, before Friday".into(),
+                    structured: None,
                 },
                 owner(),
                 5,
@@ -950,7 +1171,8 @@ mod tests {
             store.apply_command(
                 AgendaCommand::Answer {
                     id: question.id.clone(),
-                    text: "again".into()
+                    text: "again".into(),
+                    structured: None,
                 },
                 None,
                 6,
@@ -1020,5 +1242,234 @@ mod tests {
         assert_eq!(store.snapshot().len(), 1);
         assert_eq!(store.ops(), 1);
         assert_eq!(store.skipped_lines(), 3);
+    }
+
+    fn ask_question(text: &str) -> crate::mcp::AskUserQuestionParams {
+        crate::mcp::AskUserQuestionParams {
+            question: text.to_string(),
+            header: None,
+            options: Vec::new(),
+            previews: Vec::new(),
+            pick_min: None,
+            pick_max: None,
+            free_text: None,
+        }
+    }
+
+    fn ask_cmd(questions: Vec<crate::mcp::AskUserQuestionParams>) -> AgendaCommand {
+        AgendaCommand::Ask { questions }
+    }
+
+    /// Slice 1's park path end to end at store level: validation rides the
+    /// ask_user validator, ids are daemon-minted, preview blobs land in the
+    /// agenda blob store as references, and the whole thing survives a
+    /// store reopen.
+    #[test]
+    fn park_ask_commits_blobs_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+
+        let mut question = ask_question("Which grid layout should the dashboard use?");
+        question.header = Some("Grid".into());
+        question.options = vec![crate::mcp::AskUserOptionParams {
+            label: "A".into(),
+            description: Some("dense".into()),
+        }];
+        question.previews = vec![
+            crate::mcp::AskUserPreviewParams {
+                label: "A".into(),
+                html: Some("<html><body>A</body></html>".into()),
+                image: None,
+                media_type: None,
+                text: None,
+            },
+            crate::mcp::AskUserPreviewParams {
+                label: "notes".into(),
+                html: None,
+                image: None,
+                media_type: None,
+                text: Some("inline snippet".into()),
+            },
+        ];
+        let item = store
+            .apply_command(
+                ask_cmd(vec![question, ask_question("Second question?")]),
+                None,
+                5,
+            )
+            .unwrap();
+        assert_eq!(item.kind, AgendaKind::Question);
+        assert_eq!(item.status, AgendaStatus::Open);
+        assert_eq!(item.title, "Which grid layout should the dashboard use?");
+        let ask = item.ask.as_ref().unwrap();
+        assert!(ask.ask_id >= (1 << 44));
+        assert_eq!(ask.questions.len(), 2);
+        // The html preview became an agenda blob reference; text stayed inline.
+        let previews = &ask.questions[0].previews;
+        assert_eq!(previews.len(), 2);
+        match &previews[0].source {
+            crate::types::QuestionPreviewSource::Html { upload_id, url } => {
+                assert_eq!(
+                    url,
+                    &format!("/api/agenda/blobs/{}/{}/raw", item.id, upload_id)
+                );
+                let (descriptor, path) =
+                    super::super::blobs::find_blob(dir.path(), &item.id, upload_id).unwrap();
+                assert_eq!(descriptor.mime, "text/html");
+                assert!(std::fs::read_to_string(path).unwrap().contains("A"));
+            }
+            other => panic!("expected html blob reference, got {other:?}"),
+        }
+        assert!(matches!(
+            previews[1].source,
+            crate::types::QuestionPreviewSource::Text { .. }
+        ));
+        // The registry sees the open ask; the allocator floor is above it.
+        assert!(super::super::ask::agenda_ask_pending(ask.ask_id));
+        assert!(crate::event::next_approval_id() > ask.ask_id);
+
+        // Reopen the store: the ask payload and blob survive.
+        drop(store);
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let reloaded = store.open_ask(ask.ask_id).unwrap();
+        assert_eq!(reloaded.id, item.id);
+        assert_eq!(reloaded.ask.as_ref().unwrap().questions.len(), 2);
+    }
+
+    /// Refused validation strands nothing: no blobs dir, no log line.
+    #[test]
+    fn refused_ask_leaves_no_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        // Empty questions list.
+        assert!(matches!(
+            store.apply_command(ask_cmd(Vec::new()), None, 1),
+            Err(AgendaError::Invalid(_))
+        ));
+        // Bad pick bounds (validator error surfaces verbatim).
+        let mut bad = ask_question("Pick?");
+        bad.pick_max = Some(3);
+        assert!(matches!(
+            store.apply_command(ask_cmd(vec![bad]), None, 2),
+            Err(AgendaError::Invalid(_))
+        ));
+        assert_eq!(store.ops(), 0);
+        assert!(!super::super::blobs::blobs_root(dir.path()).exists());
+    }
+
+    /// Answer with structured fields completes the item and records both
+    /// forms; dismissal leaves it open with the marker; retire deletes the
+    /// blobs (completion does NOT).
+    #[test]
+    fn ask_answer_dismiss_and_retire_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let mut question = ask_question("Ship it?");
+        question.previews = vec![crate::mcp::AskUserPreviewParams {
+            label: "diff".into(),
+            html: Some("<html>diff</html>".into()),
+            image: None,
+            media_type: None,
+            text: None,
+        }];
+        let item = store
+            .apply_command(ask_cmd(vec![question]), None, 1)
+            .unwrap();
+        let ask_id = item.ask.as_ref().unwrap().ask_id;
+        let blob_id = match &item.ask.as_ref().unwrap().questions[0].previews[0].source {
+            crate::types::QuestionPreviewSource::Html { upload_id, .. } => upload_id.clone(),
+            other => panic!("unexpected {other:?}"),
+        };
+
+        // Dismiss (rail skip): marker recorded, still open, still pending.
+        let dismissed = store.dismiss_question(&item.id, "skip", None, 2).unwrap();
+        assert_eq!(dismissed.status, AgendaStatus::Open);
+        assert_eq!(dismissed.dismissed.as_ref().unwrap().action, "skip");
+        assert!(super::super::ask::agenda_ask_pending(ask_id));
+        assert!(store.open_ask(ask_id).is_some());
+
+        // Structured answer completes it; blobs SURVIVE completion (the
+        // archive shows previews).
+        let structured = super::super::types::AgendaAskResolution {
+            answers: [("Ship it?".to_string(), "yes".to_string())].into(),
+            selections: [("Ship it?".to_string(), vec!["yes".to_string()])].into(),
+            followups: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+        };
+        let answered = store
+            .apply_command(
+                AgendaCommand::Answer {
+                    id: item.id.clone(),
+                    text: "yes".into(),
+                    structured: Some(structured.clone()),
+                },
+                owner(),
+                3,
+            )
+            .unwrap();
+        assert_eq!(answered.status, AgendaStatus::Done);
+        assert!(answered.dismissed.is_none());
+        assert_eq!(
+            answered
+                .answer
+                .as_ref()
+                .unwrap()
+                .structured
+                .as_ref()
+                .unwrap(),
+            &structured
+        );
+        assert!(!super::super::ask::agenda_ask_pending(ask_id));
+        assert!(store.open_ask(ask_id).is_none());
+        assert!(super::super::blobs::find_blob(dir.path(), &item.id, &blob_id).is_some());
+
+        // Dismissal of a resolved item is refused at intake.
+        assert!(matches!(
+            store.dismiss_question(&item.id, "skip", None, 4),
+            Err(AgendaError::Transition(_))
+        ));
+
+        // Retire: retention ends, blobs are deleted.
+        store
+            .apply_command(
+                AgendaCommand::Retire {
+                    id: item.id.clone(),
+                },
+                None,
+                5,
+            )
+            .unwrap();
+        assert!(super::super::blobs::find_blob(dir.path(), &item.id, &blob_id).is_none());
+
+        // Reopen re-asks: the ask becomes pending again (payload intact,
+        // blob gone — the rail shows the missing-preview chip).
+        let reopened = store
+            .apply_command(
+                AgendaCommand::Reopen {
+                    id: item.id.clone(),
+                },
+                None,
+                6,
+            )
+            .unwrap();
+        assert_eq!(reopened.status, AgendaStatus::Open);
+        assert!(super::super::ask::agenda_ask_pending(ask_id));
+    }
+
+    /// Restart-collision guard: a fresh process whose allocator would
+    /// re-mint a persisted ask id is floored above it at fold time.
+    #[test]
+    fn persisted_ask_ids_floor_the_approval_allocator() {
+        let dir = tempfile::tempdir().unwrap();
+        // Forge a log with an enormous ask id (far above anything this
+        // process has minted).
+        let forged_ask_id: u64 = (1 << 50) + 123;
+        let line = format!(
+            "{{\"v\":1,\"at_ms\":1,\"op\":{{\"type\":\"add\",\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"kind\":\"question\",\"title\":\"forged\",\"ask\":{{\"ask_id\":{forged_ask_id},\"questions\":[{{\"question\":\"forged?\"}}]}}}}}}\n"
+        );
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join(LOG_FILE), line).unwrap();
+        let _store = AgendaStore::open(dir.path()).unwrap();
+        assert!(crate::event::next_approval_id() > forged_ask_id);
     }
 }

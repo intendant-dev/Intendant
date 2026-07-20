@@ -418,13 +418,14 @@ pub(crate) fn native_fork_points(
 /// wire, so an edit is serviced as an anchor-fork branch — and the
 /// edited row's original text is the address: match it against the
 /// active chain's user turns and anchor at the unique match's parent.
-/// Text stays the anchor key even though plain resumes now seed the
-/// live lane's `user_turn_index` from the transcript
-/// (`claude_user_turn_state_from_history`): the seed is best-effort
-/// (`--fork-session` resumes start on the placeholder id and re-count
-/// this supervision run), while prose matching addresses the chain
-/// regardless. Ambiguity or absence is a refusal, never a guess — the
-/// transcript's inline fork affordance covers those cases exactly.
+/// Text stays the anchor key even though resumes now seed the live
+/// lane's `user_turn_index` from the transcript
+/// (`claude_user_turn_state_from_history`; `--fork-session` resumes
+/// seed from the fork source via
+/// `claude_user_turn_state_from_fork_source`): the seed is best-effort,
+/// while prose matching addresses the chain regardless. Ambiguity or
+/// absence is a refusal, never a guess — the transcript's inline fork
+/// affordance covers those cases exactly.
 pub(crate) fn claude_edit_branch_anchor(
     transcript_path: &Path,
     original_text: &str,

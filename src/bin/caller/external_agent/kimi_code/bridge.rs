@@ -22,12 +22,334 @@ const SESSION_INDEX_NAME: &str = "session_index.jsonl";
 const PRIVATE_NAMES: &[&str] = &["mcp.json", "server.token", "server", SYNC_LOCK_NAME];
 const HISTORY_NAMES: &[&str] = &["sessions", SESSION_INDEX_NAME];
 const SYNC_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
+const KIMI_CREDENTIAL_PATH: &str = "credentials/kimi-code.json";
+const MAX_KIMI_CREDENTIAL_BYTES: u64 = 64 * 1024;
+const CREDENTIAL_REFRESH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub(crate) struct BridgeMcpConfig {
     pub(crate) server_name: String,
     pub(crate) url: String,
     pub(crate) bearer_token_env_var: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialRefreshSync {
+    Unchanged,
+    Updated,
+    SourceChanged,
+}
+
+/// Compare-and-swap state for one refreshable credential mirrored by copy.
+///
+/// A normal Unix bridge symlinks `credentials/` and needs no monitor. Windows
+/// commonly falls back to a real copy; Kimi's OAuth provider may then rotate
+/// its refresh grant in the bridge, invalidating the primary copy. This state
+/// adopts only a bridge change whose primary still byte-matches the last value
+/// synchronized by this monitor. A logout, login, or concurrent refresh
+/// detaches the mirror permanently rather than resurrecting or overwriting
+/// authority.
+pub(super) struct CredentialRefreshMirror {
+    primary_home: PathBuf,
+    bridge_home: PathBuf,
+    primary_credential: PathBuf,
+    bridge_credential: PathBuf,
+    synchronized_digest: [u8; 32],
+    detached: bool,
+}
+
+/// Live poller for copy-fallback OAuth rotation. The polling window bounds the
+/// amount of refreshed authority that can exist only in a bridge if the
+/// controller is abruptly killed; graceful shutdown always performs one final
+/// synchronized pass after the child process has stopped.
+pub(super) struct CredentialRefreshMonitor {
+    state: std::sync::Arc<std::sync::Mutex<CredentialRefreshMirror>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl CredentialRefreshMonitor {
+    pub(super) fn prepare(
+        primary_home: &Path,
+        bridge_home: &Path,
+    ) -> io::Result<Option<CredentialRefreshMirror>> {
+        prepare_credential_refresh_mirror(primary_home, bridge_home)
+    }
+
+    pub(super) fn start(
+        mirror: CredentialRefreshMirror,
+        event_tx: tokio::sync::mpsc::UnboundedSender<super::AgentEvent>,
+    ) -> Self {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(mirror));
+        let task_state = std::sync::Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CREDENTIAL_REFRESH_POLL_INTERVAL).await;
+                let result = task_state
+                    .lock()
+                    .map_err(|_| io::Error::other("Kimi credential refresh lock poisoned"))
+                    .and_then(|mut mirror| mirror.sync_once());
+                match result {
+                    Ok(CredentialRefreshSync::Unchanged | CredentialRefreshSync::Updated) => {}
+                    Ok(CredentialRefreshSync::SourceChanged) => {
+                        let _ = event_tx.send(super::AgentEvent::Log {
+                            level: "warn".into(),
+                            message: "Kimi credential source changed while a copy-fallback bridge \
+                                      was active; refusing to overwrite it with refreshed bridge \
+                                      authority"
+                                .into(),
+                        });
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(super::AgentEvent::Log {
+                            level: "warn".into(),
+                            message: format!(
+                                "Could not persist a Kimi copy-fallback OAuth refresh: {error}"
+                            ),
+                        });
+                        break;
+                    }
+                }
+            }
+        });
+        Self { state, handle }
+    }
+
+    pub(super) async fn shutdown(mut self) -> io::Result<()> {
+        self.handle.abort();
+        let _ = (&mut self.handle).await;
+        let state = std::sync::Arc::clone(&self.state);
+        tokio::task::spawn_blocking(move || {
+            let mut mirror = state
+                .lock()
+                .map_err(|_| io::Error::other("Kimi credential refresh lock poisoned"))?;
+            mirror.sync_once().map(|_| ())
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("Kimi credential sync task panicked: {error}")))?
+    }
+
+    pub(super) fn sync_on_drop(self) {
+        self.handle.abort();
+        if let Ok(mut mirror) = self.state.lock() {
+            let _ = mirror.sync_once();
+        }
+    }
+}
+
+fn prepare_credential_refresh_mirror(
+    primary_home: &Path,
+    bridge_home: &Path,
+) -> io::Result<Option<CredentialRefreshMirror>> {
+    validate_managed_bridge_path(bridge_home)?;
+    let primary_credential = primary_home.join(KIMI_CREDENTIAL_PATH);
+    let bridge_credential = bridge_home.join(KIMI_CREDENTIAL_PATH);
+    let primary_present = match fs::symlink_metadata(&primary_credential) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    let bridge_present = match fs::symlink_metadata(&bridge_credential) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if !primary_present {
+        // A logged-out primary is authoritative. Never recover a credential
+        // merely because an older bridge still has one.
+        return Ok(None);
+    }
+    if !bridge_present {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Kimi bridge omitted the primary credential",
+        ));
+    }
+    if same_canonical_path(&primary_credential, &bridge_credential) {
+        return Ok(None);
+    }
+
+    let primary_parent = primary_credential
+        .parent()
+        .ok_or_else(|| io::Error::other("Kimi primary credential has no parent"))?;
+    let bridge_parent = bridge_credential
+        .parent()
+        .ok_or_else(|| io::Error::other("Kimi bridge credential has no parent"))?;
+    require_real_directory(primary_parent, "Kimi primary credential directory")?;
+    require_real_directory(bridge_parent, "Kimi bridge credential directory")?;
+    let canonical_primary_home = fs::canonicalize(primary_home)?;
+    let canonical_primary_parent = fs::canonicalize(primary_parent)?;
+    let canonical_bridge = fs::canonicalize(bridge_home)?;
+    let canonical_bridge_parent = fs::canonicalize(bridge_parent)?;
+    if canonical_primary_parent.parent() != Some(canonical_primary_home.as_path())
+        || canonical_bridge_parent.parent() != Some(canonical_bridge.as_path())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Kimi credential copy escaped its expected home",
+        ));
+    }
+
+    let canonical_primary_credential =
+        canonical_primary_parent.join(primary_credential.file_name().unwrap_or_default());
+    let canonical_bridge_credential =
+        canonical_bridge_parent.join(bridge_credential.file_name().unwrap_or_default());
+    let mut primary =
+        read_regular_credential(&canonical_primary_credential, "Kimi primary credential")?;
+    let mut bridge =
+        read_regular_credential(&canonical_bridge_credential, "Kimi bridge credential")?;
+    let primary_digest = credential_digest(&primary);
+    let bridge_digest = credential_digest(&bridge);
+    primary.fill(0);
+    bridge.fill(0);
+    if primary_digest != bridge_digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Kimi credential copy did not match its primary baseline",
+        ));
+    }
+
+    Ok(Some(CredentialRefreshMirror {
+        primary_home: canonical_primary_home,
+        bridge_home: canonical_bridge,
+        primary_credential: canonical_primary_credential,
+        bridge_credential: canonical_bridge_credential,
+        synchronized_digest: primary_digest,
+        detached: false,
+    }))
+}
+
+impl CredentialRefreshMirror {
+    fn sync_once(&mut self) -> io::Result<CredentialRefreshSync> {
+        if self.detached {
+            return Ok(CredentialRefreshSync::SourceChanged);
+        }
+        validate_managed_bridge_path(&self.bridge_home)?;
+        let _lock = BridgeSyncLock::acquire(&self.primary_home)?;
+
+        let mut bridge =
+            read_regular_credential(&self.bridge_credential, "Kimi bridge credential")?;
+        let bridge_digest = credential_digest(&bridge);
+        if bridge_digest == self.synchronized_digest {
+            bridge.fill(0);
+            return Ok(CredentialRefreshSync::Unchanged);
+        }
+
+        let mut primary =
+            match read_regular_credential(&self.primary_credential, "Kimi primary credential") {
+                Ok(primary) => primary,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+                    ) =>
+                {
+                    bridge.fill(0);
+                    self.detached = true;
+                    return Ok(CredentialRefreshSync::SourceChanged);
+                }
+                Err(error) => {
+                    bridge.fill(0);
+                    return Err(error);
+                }
+            };
+        let primary_digest = credential_digest(&primary);
+        primary.fill(0);
+        if primary_digest != self.synchronized_digest {
+            bridge.fill(0);
+            self.detached = true;
+            return Ok(CredentialRefreshSync::SourceChanged);
+        }
+
+        // Confirm the CAS input immediately before staging the replacement.
+        // Intendant instances serialize on BridgeSyncLock. An unrelated
+        // process can still race this tiny check/rename window, but a changed
+        // or removed source observed at either read is never recreated.
+        let mut confirmation =
+            read_regular_credential(&self.primary_credential, "Kimi primary credential")?;
+        let confirmed_digest = credential_digest(&confirmation);
+        confirmation.fill(0);
+        if confirmed_digest != self.synchronized_digest {
+            bridge.fill(0);
+            self.detached = true;
+            return Ok(CredentialRefreshSync::SourceChanged);
+        }
+
+        replace_private_credential(&self.primary_credential, &bridge)?;
+        let mut installed =
+            read_regular_credential(&self.primary_credential, "refreshed Kimi credential")?;
+        let installed_digest = credential_digest(&installed);
+        installed.fill(0);
+        bridge.fill(0);
+        if installed_digest != bridge_digest {
+            return Err(io::Error::other(
+                "Kimi credential refresh failed post-write verification",
+            ));
+        }
+        self.synchronized_digest = bridge_digest;
+        Ok(CredentialRefreshSync::Updated)
+    }
+}
+
+fn read_regular_credential(path: &Path, label: &str) -> io::Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    reject_non_symlink_reparse(path, &metadata, label)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} {} is not a regular file", path.display()),
+        ));
+    }
+    if metadata.len() > MAX_KIMI_CREDENTIAL_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} {} exceeds the size limit", path.display()),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    fs::File::open(path)?
+        .take(MAX_KIMI_CREDENTIAL_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_KIMI_CREDENTIAL_BYTES {
+        bytes.fill(0);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} {} exceeds the size limit", path.display()),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn credential_digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn replace_private_credential(path: &Path, content: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("Kimi credential has no parent"))?;
+    require_real_directory(parent, "Kimi primary credential directory")?;
+    let (mut file, staged) = crate::file_watcher::stage_in(parent)?;
+    let result = (|| {
+        file.write_all(content)?;
+        file.sync_all()?;
+        set_private_file_permissions(&staged)?;
+        drop(file);
+        let metadata = fs::symlink_metadata(path)?;
+        reject_non_symlink_reparse(path, &metadata, "Kimi primary credential")?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Kimi primary credential changed before refresh replacement",
+            ));
+        }
+        crate::file_watcher::persist_staged(&staged, path)?;
+        set_private_file_permissions(path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(staged);
+    }
+    result
 }
 
 /// Pick the conventional `intendant` name unless a higher-precedence project
@@ -1784,6 +2106,114 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first, "intendant");
         assert!(first.starts_with("intendant_managed_"));
+    }
+
+    fn credential_copy_pair(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let primary = temp.path().join("kimi");
+        let bridge = primary.join(BRIDGE_PARENT).join("session-test");
+        fs::create_dir_all(primary.join("credentials")).unwrap();
+        fs::create_dir_all(bridge.join("credentials")).unwrap();
+        fs::write(primary.join(KIMI_CREDENTIAL_PATH), b"synthetic-initial").unwrap();
+        fs::write(bridge.join(KIMI_CREDENTIAL_PATH), b"synthetic-initial").unwrap();
+        (primary, bridge)
+    }
+
+    #[test]
+    fn copy_fallback_adopts_rotated_oauth_credential_by_cas() {
+        let temp = tempfile::tempdir().unwrap();
+        let (primary, bridge) = credential_copy_pair(&temp);
+        let mut mirror = prepare_credential_refresh_mirror(&primary, &bridge)
+            .unwrap()
+            .expect("real credential copy needs a refresh mirror");
+
+        fs::write(bridge.join(KIMI_CREDENTIAL_PATH), b"synthetic-rotated").unwrap();
+        assert_eq!(mirror.sync_once().unwrap(), CredentialRefreshSync::Updated);
+        assert_eq!(
+            fs::read(primary.join(KIMI_CREDENTIAL_PATH)).unwrap(),
+            b"synthetic-rotated"
+        );
+        assert_eq!(
+            mirror.sync_once().unwrap(),
+            CredentialRefreshSync::Unchanged
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(primary.join(KIMI_CREDENTIAL_PATH))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn copy_fallback_never_overwrites_concurrent_login_or_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let (primary, bridge) = credential_copy_pair(&temp);
+        let mut mirror = prepare_credential_refresh_mirror(&primary, &bridge)
+            .unwrap()
+            .expect("real credential copy needs a refresh mirror");
+
+        fs::write(bridge.join(KIMI_CREDENTIAL_PATH), b"synthetic-rotated").unwrap();
+        fs::write(primary.join(KIMI_CREDENTIAL_PATH), b"synthetic-concurrent").unwrap();
+        assert_eq!(
+            mirror.sync_once().unwrap(),
+            CredentialRefreshSync::SourceChanged
+        );
+        assert_eq!(
+            fs::read(primary.join(KIMI_CREDENTIAL_PATH)).unwrap(),
+            b"synthetic-concurrent"
+        );
+
+        // Detachment is sticky: even if the source later happens to match the
+        // old bytes again, stale bridge authority cannot be replayed.
+        fs::write(primary.join(KIMI_CREDENTIAL_PATH), b"synthetic-initial").unwrap();
+        assert_eq!(
+            mirror.sync_once().unwrap(),
+            CredentialRefreshSync::SourceChanged
+        );
+        assert_eq!(
+            fs::read(primary.join(KIMI_CREDENTIAL_PATH)).unwrap(),
+            b"synthetic-initial"
+        );
+    }
+
+    #[test]
+    fn copy_fallback_never_resurrects_logged_out_credential() {
+        let temp = tempfile::tempdir().unwrap();
+        let (primary, bridge) = credential_copy_pair(&temp);
+        let mut mirror = prepare_credential_refresh_mirror(&primary, &bridge)
+            .unwrap()
+            .expect("real credential copy needs a refresh mirror");
+
+        fs::write(bridge.join(KIMI_CREDENTIAL_PATH), b"synthetic-rotated").unwrap();
+        fs::remove_file(primary.join(KIMI_CREDENTIAL_PATH)).unwrap();
+        assert_eq!(
+            mirror.sync_once().unwrap(),
+            CredentialRefreshSync::SourceChanged
+        );
+        assert!(!primary.join(KIMI_CREDENTIAL_PATH).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_backed_credential_needs_no_refresh_monitor() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("kimi");
+        fs::create_dir_all(primary.join("credentials")).unwrap();
+        fs::write(primary.join(KIMI_CREDENTIAL_PATH), b"synthetic-initial").unwrap();
+        let bridge = prepare_bridge_home(&primary, "session", None).unwrap();
+
+        assert!(
+            prepare_credential_refresh_mirror(&primary, &bridge)
+                .unwrap()
+                .is_none(),
+            "the bridge and primary resolve to the same live credential"
+        );
     }
 
     #[test]

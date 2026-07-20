@@ -91,11 +91,18 @@ pub enum UiCommand {
     /// Structured user question: JS renders the option buttons and free-text
     /// input, and answers with `{action: "answer_question", id, answers}`.
     /// `questions` is the raw `UserQuestion[]` JSON from the wire event.
+    /// `expires_at_ms`/`held` mirror the wire event's countdown state
+    /// (absent on lanes that don't know it — JS treats "no info" as
+    /// keep-current for an already-shown id).
     ShowUserQuestion {
         id: u64,
         questions: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_ms: Option<u64>,
+        #[serde(default)]
+        held: bool,
     },
     ShowHumanInput {
         question: String,
@@ -1553,6 +1560,11 @@ impl AppState {
                         id,
                         questions: pq["questions"].clone(),
                         session_id: None,
+                        // The presence bootstrap snapshot carries no
+                        // countdown state — "no info", not "no deadline";
+                        // JS keeps whatever the event lane already showed.
+                        expires_at_ms: None,
+                        held: false,
                     });
                 }
             }
@@ -1977,6 +1989,8 @@ impl AppState {
                     id,
                     questions: questions.clone(),
                     session_id: self.event_session_id.clone(),
+                    expires_at_ms: msg["expires_at_ms"].as_u64(),
+                    held: msg["held"].as_bool().unwrap_or(false),
                 });
                 cmds.push(UiCommand::SetPhase {
                     phase: "waiting".into(),
@@ -4379,6 +4393,8 @@ mod tests {
             "event": "user_question",
             "id": 11,
             "session_id": "sess-q",
+            "expires_at_ms": 1_784_500_000_000u64,
+            "held": false,
             "questions": [{
                 "question": "Which DB?",
                 "header": "Database",
@@ -4393,9 +4409,11 @@ mod tests {
         assert_eq!(s.pending_question_id, Some(11));
         assert!(cmds.iter().any(|c| matches!(
             c,
-            UiCommand::ShowUserQuestion { id: 11, questions, session_id }
+            UiCommand::ShowUserQuestion { id: 11, questions, session_id, expires_at_ms, held }
                 if questions[0]["question"] == "Which DB?"
                     && session_id.as_deref() == Some("sess-q")
+                    && *expires_at_ms == Some(1_784_500_000_000)
+                    && !*held
         )));
         // The panel answer produces the answer_question control message
         // and clears the pending id.

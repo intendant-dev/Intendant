@@ -39,6 +39,20 @@ pub(crate) fn next_approval_id() -> u64 {
     id
 }
 
+/// Raise the allocator's floor above `persisted`, so ids minted after this
+/// call sort strictly above it. Stores that persist approval-space ids
+/// across restarts (the agenda's parked asks) call this at fold time — a
+/// fresh process's counter restarts at the base and could otherwise
+/// re-mint a persisted rail id for an unrelated approval. Values at or
+/// beyond the JavaScript-safe ceiling are ignored (a tampered log must
+/// not brick the allocator).
+pub(crate) fn ensure_approval_id_floor(persisted: u64) {
+    if persisted >= MAX_SAFE_WIRE_ID {
+        return;
+    }
+    NEXT_APPROVAL_ID.fetch_max(persisted + 1, Ordering::Relaxed);
+}
+
 /// Source of a context injection item.
 ///
 /// Used by the agent loop to decide which queued injections to discard between
@@ -265,8 +279,9 @@ pub enum AppEvent {
     SteerAccepted {
         session_id: Option<String>,
         id: String,
-        /// Short human-readable detail for UI display, e.g. "Codex accepted
-        /// the steer; waiting for the next runtime checkpoint".
+        /// Short human-readable detail for UI display, e.g. "Codex injected
+        /// the message into the running turn — awaiting the model's next
+        /// activity".
         reason: String,
     },
     /// Mid-turn steering could not be delivered natively by the current
@@ -425,6 +440,18 @@ pub enum AppEvent {
         session_id: Option<String>,
         activity: crate::types::SessionActivityVitals,
     },
+    /// A backend reported its provider rate-limit windows (Claude Code
+    /// `rate_limit_event`, Codex `account/rateLimits/updated`), delivered
+    /// at the report itself instead of riding the next usage snapshot — a
+    /// rejected turn produces no usage, and a between-turns warning would
+    /// otherwise wait for the next call. Keyed like `UsageSnapshot`.
+    /// Hub-internal like `SessionActivity`: the vitals hub folds it into
+    /// `SessionVitals.limits` (and its per-backend account view), which is
+    /// what reaches frontends — no outbound twin, never persisted.
+    SessionRateLimits {
+        session_id: Option<String>,
+        windows: Vec<crate::types::SessionLimitWindow>,
+    },
     /// Partial session-config facts (model / effort / permission mode)
     /// from a backend's protocol seams — launch config, init echoes,
     /// mid-session switches. Hub-internal like `SessionActivity`: the
@@ -480,11 +507,21 @@ pub enum AppEvent {
     /// id space and registry, but is a request for *input*, not permission:
     /// autonomy policy never auto-resolves it. Resolved by
     /// `ControlMsg::AnswerQuestion` (or deny/skip to dismiss), reported back
-    /// as `ApprovalResolved`.
+    /// as `ApprovalResolved`. Re-emitted with the same `id` when the hold
+    /// state flips (`ControlMsg::HoldQuestion`) — same-id re-emissions are
+    /// refreshes, not new questions (frontends update in place, the
+    /// attention nudge dedups by id).
     UserQuestionRequired {
         session_id: Option<String>,
         id: u64,
         questions: Vec<crate::types::UserQuestion>,
+        /// Wall-clock instant the asking waiter gives up (unix ms). `None`
+        /// when no daemon-side deadline exists (external backends wait on
+        /// their own) or while the question is held open.
+        expires_at_ms: Option<u64>,
+        /// User held the question open: the waiter's deadline is suspended
+        /// until a `HoldQuestion { held: false }` resumes it.
+        held: bool,
     },
     ApprovalResolved {
         session_id: Option<String>,
@@ -1297,6 +1334,35 @@ pub enum ControlMsg {
         id: u64,
         #[serde(default)]
         answers: std::collections::HashMap<String, String>,
+        /// Structured per-question selections (question text → chosen
+        /// option labels, unjoined). Additive: `answers` remains the
+        /// authoritative legacy form; this preserves labels that contain
+        /// the ", " join sequence and feeds the per-question result.
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        selections: std::collections::HashMap<String, Vec<String>>,
+        /// Per-question follow-up text (question text → what the user
+        /// wrote back). A follow-up may accompany an answer or stand in
+        /// for one — a question submitted with only a follow-up waives
+        /// its pick minimum, and the agent addresses it in chat or with a
+        /// narrowed re-ask.
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        followups: std::collections::HashMap<String, String>,
+        /// Per-question preview annotations (question text → notes
+        /// anchored to that question's preview cards by label).
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        annotations: std::collections::HashMap<String, Vec<crate::types::QuestionAnnotation>>,
+    },
+    /// Hold a pending `user_question` open (suspend its expiry) or resume
+    /// its countdown. Strictly weaker than `AnswerQuestion` — it changes
+    /// when a question may time out, never what it answers — and rides the
+    /// same authority class. The asking waiter re-emits the question with
+    /// the updated hold state.
+    HoldQuestion {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: u64,
+        #[serde(default)]
+        held: bool,
     },
     Input {
         text: String,
@@ -2708,6 +2774,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         // Hub-internal: the vitals hub folds these into SessionVitals,
         // which is the outbound (and session-logged) carrier.
         AppEvent::SessionActivity { .. } => None,
+        AppEvent::SessionRateLimits { .. } => None,
         AppEvent::SessionConfigFacts { .. } => None,
         AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {
             session_id: session_id.clone(),
@@ -2742,10 +2809,14 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id,
             id,
             questions,
+            expires_at_ms,
+            held,
         } => Some(OutboundEvent::UserQuestion {
             session_id: session_id.clone(),
             id: *id,
             questions: questions.clone(),
+            expires_at_ms: *expires_at_ms,
+            held: *held,
         }),
         AppEvent::UserNotification {
             session_id,
@@ -4592,10 +4663,17 @@ mod tests {
                 session_id,
                 id,
                 answers,
+                selections,
+                followups,
+                annotations,
             } => {
                 assert_eq!(session_id.as_deref(), Some("sess-1"));
                 assert_eq!(id, 3);
                 assert_eq!(answers["Which DB?"], "PostgreSQL");
+                // Absent on the legacy wire — defaults empty.
+                assert!(selections.is_empty());
+                assert!(followups.is_empty());
+                assert!(annotations.is_empty());
             }
             _ => panic!("expected AnswerQuestion"),
         }
@@ -4614,18 +4692,28 @@ mod tests {
                     description: "Relational".into(),
                 }],
                 multi_select: false,
+                pick_min: None,
+                pick_max: None,
+                free_text: None,
                 previews: Vec::new(),
             }],
+            expires_at_ms: Some(1_784_500_000_000),
+            held: true,
         };
         match app_event_to_outbound(&event).unwrap() {
             crate::types::OutboundEvent::UserQuestion {
                 session_id,
                 id,
                 questions,
+                expires_at_ms,
+                held,
             } => {
                 assert_eq!(session_id.as_deref(), Some("sess-1"));
                 assert_eq!(id, 5);
                 assert_eq!(questions.len(), 1);
+                // Countdown state rides through untouched.
+                assert_eq!(expires_at_ms, Some(1_784_500_000_000));
+                assert!(held);
                 // Wire shape the dashboard renders from.
                 let json = serde_json::to_value(&questions[0]).unwrap();
                 assert_eq!(json["question"], "Which DB?");
@@ -4634,6 +4722,29 @@ mod tests {
             }
             other => panic!("expected UserQuestion, got {:?}", other),
         }
+    }
+
+    /// The hold verb parses from the dashboard's wire shape, and an absent
+    /// `held` fails closed to `false` (resume) rather than erroring.
+    #[test]
+    fn control_msg_hold_question_deserialize() {
+        let json = r#"{"action":"hold_question","id":7,"session_id":"sess-1","held":true}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::HoldQuestion {
+                session_id,
+                id,
+                held,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(id, 7);
+                assert!(held);
+            }
+            _ => panic!("expected HoldQuestion"),
+        }
+        let bare: ControlMsg =
+            serde_json::from_str(r#"{"action":"hold_question","id":7}"#).unwrap();
+        assert!(matches!(bare, ControlMsg::HoldQuestion { held: false, .. }));
     }
 
     #[test]

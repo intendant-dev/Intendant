@@ -151,6 +151,18 @@ pub struct SharedViewRegion {
     pub height: f64,
 }
 
+/// One user note anchored to a preview card of a [`UserQuestion`] —
+/// "B: the rails are too faint" lands attached to candidate B instead of
+/// floating in prose. Rides `answer_question` alongside the answers.
+/// (`JsonSchema`: the agenda's structured-answer command embeds it.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct QuestionAnnotation {
+    /// The preview card's label, exactly as rendered.
+    pub preview: String,
+    /// The user's note about that card.
+    pub note: String,
+}
+
 /// One selectable option of a [`UserQuestion`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserQuestionOption {
@@ -212,16 +224,60 @@ pub struct UserQuestion {
     /// Very short topic chip (e.g. "Auth method"). May be empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub header: String,
-    /// Offered choices. Free-text answers are always allowed on top.
+    /// Offered choices. Free-text answers are always allowed on top
+    /// (unless `free_text` says otherwise).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<UserQuestionOption>,
     /// Multiple options may be selected (answers join with ", ").
+    /// Legacy switch — `pick_min`/`pick_max` are the precise form; when
+    /// they are absent this still decides the bounds (see
+    /// [`UserQuestion::pick_bounds`]).
     #[serde(default)]
     pub multi_select: bool,
+    /// Minimum selections required to submit (0 = optional question).
+    /// Absent → 1 (an answer is required; free text satisfies it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pick_min: Option<u8>,
+    /// Maximum selections allowed. Absent → 1, or `options.len()` under
+    /// `multi_select`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pick_max: Option<u8>,
+    /// Whether a typed free-text answer is accepted. Absent → allowed
+    /// (the rail's historic behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_text: Option<bool>,
     /// Rendered preview cards shown above the options — show, then ask
     /// (prototype variants, before/after states). See [`QuestionPreview`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub previews: Vec<QuestionPreview>,
+}
+
+impl UserQuestion {
+    /// Effective selection bounds: explicit `pick_min`/`pick_max` win;
+    /// otherwise the legacy rule (exactly one, or any-number-at-least-one
+    /// under `multi_select`). Bounds are clamped to the option count so a
+    /// malformed producer can never demand the impossible.
+    pub fn pick_bounds(&self) -> (u8, u8) {
+        let option_count = self.options.len().min(u8::MAX as usize) as u8;
+        let default_max = if self.multi_select {
+            option_count.max(1)
+        } else {
+            1
+        };
+        let max = self.pick_max.unwrap_or(default_max).max(1);
+        let max = if option_count > 0 {
+            max.min(option_count)
+        } else {
+            max
+        };
+        let min = self.pick_min.unwrap_or(1).min(max);
+        (min, max)
+    }
+
+    /// Whether typed free-text answers are accepted for this question.
+    pub fn free_text_allowed(&self) -> bool {
+        self.free_text.unwrap_or(true)
+    }
 }
 
 /// Urgency of an agent→user notification (`notify_user`). A closed
@@ -385,12 +441,22 @@ pub enum OutboundEvent {
     },
     /// The agent asks the human structured question(s) and blocks until
     /// answered via `{"action":"answer_question","id":…,"answers":{…}}`
-    /// (or dismissed via deny/skip on the same id).
+    /// (or dismissed via deny/skip on the same id). The user may suspend
+    /// the expiry via `{"action":"hold_question","id":…,"held":true}`;
+    /// hold flips re-emit this event with the same `id` (a refresh, not a
+    /// new question).
     UserQuestion {
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         id: u64,
         questions: Vec<UserQuestion>,
+        /// Unix-ms deadline of the asking waiter; absent when no
+        /// daemon-side deadline exists or while held.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_ms: Option<u64>,
+        /// The user held this question open (countdown suspended).
+        #[serde(default)]
+        held: bool,
     },
     AskHuman {
         question: String,

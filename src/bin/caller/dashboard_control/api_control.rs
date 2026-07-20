@@ -1718,6 +1718,7 @@ pub(crate) fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::Skip { .. }
             | ControlMsg::ApproveAll { .. }
             | ControlMsg::AnswerQuestion { .. }
+            | ControlMsg::HoldQuestion { .. }
             | ControlMsg::RenameSession { .. }
             | ControlMsg::ConfigureSessionAgent { .. }
             | ControlMsg::StopSession { .. }
@@ -1779,6 +1780,7 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::Skip { .. } => "skip",
         ControlMsg::ApproveAll { .. } => "approve_all",
         ControlMsg::AnswerQuestion { .. } => "answer_question",
+        ControlMsg::HoldQuestion { .. } => "hold_question",
         ControlMsg::Input { .. } => "input",
         ControlMsg::SetAutonomy { .. } => "set_autonomy",
         ControlMsg::SetApprovalRule { .. } => "set_approval_rule",

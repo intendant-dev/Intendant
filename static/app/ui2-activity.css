@@ -1581,16 +1581,105 @@ html.ui-v2 #question-panel .approval-card {
   padding: 14px 16px;
 }
 html.ui-v2 #question-panel .approval-icon { display: none; }
+/* Preview-bearing questions escape the reading-column measure: the
+   side-by-side comparison IS the content, so the card owns the pane.
+   Explicit width, not just max-width — the dock is a flex column whose
+   auto inline margins make the body fit-content, and a fit-content
+   container lets the preview grid collapse to one column. */
+html.ui-v2 #activity-log-pane #question-panel.has-previews .panel-body,
+html.ui-v2 #activity-log-pane #question-panel.has-previews .panel-header {
+  width: min(1560px, 96%);
+  max-width: none;
+}
 html.ui-v2 #question-panel .question-text { color: var(--text); font-size: 13px; }
+html.ui-v2 #question-panel .question-deadline {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 650;
+  padding: 2px 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+html.ui-v2 #question-panel .question-deadline.warn {
+  color: var(--amber);
+  border-color: rgba(var(--amber-rgb), .3);
+  background: rgba(var(--amber-rgb), .1);
+}
+html.ui-v2 #question-panel .question-hold {
+  height: 24px;
+  padding: 0 11px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-2);
+  font: 600 11px var(--sans);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 #question-panel .question-hold:hover { background: var(--surface-2); color: var(--text); }
+html.ui-v2 #question-panel .question-hold:disabled { opacity: .55; }
+html.ui-v2 #question-panel .question-pick-count {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+}
+html.ui-v2 #question-panel .question-pick-count.warn { color: var(--amber); }
+html.ui-v2 #question-panel .question-optional-chip {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  background: transparent;
+}
+html.ui-v2 #question-panel .question-followup-toggle {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+}
+html.ui-v2 #question-panel .question-followup-toggle:hover,
+html.ui-v2 #question-panel .question-followup-toggle.open { color: var(--iris-2); }
+html.ui-v2 #question-panel .question-followup-input,
+html.ui-v2 #question-panel .question-preview-note {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg-1);
+  color: var(--text);
+}
+html.ui-v2 #question-panel .question-followup-input:focus,
+html.ui-v2 #question-panel .question-preview-note:focus {
+  border-color: rgba(var(--iris-rgb), .45);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+  outline: none;
+}
+html.ui-v2 #question-panel .question-preview-note-btn {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+}
+html.ui-v2 #question-panel .question-preview-note-btn:hover,
+html.ui-v2 #question-panel .question-preview-note-btn.open {
+  background: var(--surface-2);
+  color: var(--text);
+}
+/* Block header = a quiet eyebrow LABEL. It must not share the index
+   chips' pill styling — a pill that ignores clicks reads as a broken
+   button (live finding 2026-07-20). */
 html.ui-v2 #question-panel .question-header-chip {
   font-family: var(--mono);
   font-size: 9px;
   font-weight: 700;
-  letter-spacing: .12em;
+  letter-spacing: .14em;
   text-transform: uppercase;
-  color: var(--sky);
-  background: rgba(var(--sky-rgb), .1);
-  border: 1px solid rgba(var(--sky-rgb), .24);
+  color: var(--text-3);
+  background: transparent;
+  border: 0;
+  padding: 0;
 }
 html.ui-v2 #question-panel .question-option {
   border: 1px solid var(--line);

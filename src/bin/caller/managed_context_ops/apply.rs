@@ -311,6 +311,9 @@ pub(crate) async fn send_external_context_rewind_resume_turn(
         resume.cancelled_follow_ups,
         resume.codex_thread_action_dedupe,
         resume.side_sessions.as_deref_mut(),
+        // The rewind-resume drain runs only in run_modes' persistent
+        // external thread lane, which has no primary ordinal tracking.
+        None,
         followup.managed_context_recovery_kickstart,
         followup.managed_context_density_handoff,
         followup.managed_context_density_handoff_completed,
@@ -529,9 +532,25 @@ pub(crate) async fn start_external_side_followup_turn(
     true
 }
 
+/// Deliver a steer to an idle primary session as an immediate follow-up
+/// turn (the backend reported no active turn to inject into).
+///
+/// Turn numbering: unlike a mid-turn steer — whose `steer_accepted` /
+/// `steer_delivered { mid_turn: true }` arc enters the transcript lane's
+/// steer ledger (`session_catalog::steer_ledger`) and therefore renders
+/// TURNLESS in hydration — this path ends in `SteerDelivered
+/// { mid_turn: false }`, which the ledger deliberately excludes. The
+/// backend transcript records the steer as a plain user prompt, so the
+/// replay/hydration parsers assign it the NEXT PROMPT ORDINAL. The live
+/// emit must burn that same ordinal from the session's revision state, or
+/// live rows lag the transcript by one per idle-delivered steer until the
+/// next resume re-seeds. Callers without primary ordinal tracking (child
+/// turn drains; the native loop's persistent external thread lane, which
+/// emits no user ordinals at all) pass `None` and keep the turnless emit.
 pub(crate) async fn start_external_primary_steer_followup_turn(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     config: &DrainConfig<'_>,
+    primary_turn_revisions: Option<&mut UserTurnRevisionState>,
     session_id: String,
     text: String,
     steer_id: String,
@@ -543,12 +562,15 @@ pub(crate) async fn start_external_primary_steer_followup_turn(
     let send_result = agent.send_message(&thread, &text).await;
     match send_result {
         Ok(()) => {
+            // Recorded only after the send succeeded: a failed delivery
+            // must not burn an ordinal the backend never saw.
+            let turn = primary_turn_revisions.map(|state| state.record_next_turn());
             emit_user_message_log(
                 config.bus,
                 config.session_log,
                 Some(&session_id),
-                None,
-                None,
+                turn.map(|(user_turn_index, _)| user_turn_index),
+                turn.map(|(_, user_turn_revision)| user_turn_revision),
                 None,
                 &[],
                 &text,
@@ -732,8 +754,42 @@ mod tests {
         }
     }
 
+    fn steer_test_drain_config<'a>(
+        bus: &'a EventBus,
+        dir: &'a tempfile::TempDir,
+        log_dir: &'a PathBuf,
+        session_log: &'a SharedSessionLog,
+        approval_registry: &'a event::ApprovalRegistry,
+        context_injection: &'a event::ContextInjectionQueue,
+    ) -> DrainConfig<'a> {
+        DrainConfig {
+            bus,
+            web_port: None,
+            session_id: Some("thread-1".to_string()),
+            alias_session_id: None,
+            backend_thread_id: None,
+            autonomy: autonomy::shared_autonomy(AutonomyState::default()),
+            session_log,
+            project_root: dir.path(),
+            log_dir,
+            approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection,
+            reload_credentials: None,
+        }
+    }
+
+    /// Idle-delivered steers are counted prompts in the transcript lane
+    /// (the steer ledger admits only accepted / mid-turn-delivered arcs,
+    /// never `mid_turn: false` deliveries), so the live emit must carry
+    /// the session's next prompt ordinal — and only when the send
+    /// actually reached the backend.
     #[tokio::test]
-    async fn primary_steer_followup_sends_turn_and_marks_delivered() {
+    async fn primary_steer_followup_sends_turn_with_next_ordinal_and_marks_delivered() {
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
         let dir = tempfile::tempdir().unwrap();
@@ -743,35 +799,26 @@ mod tests {
         ));
         let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
         let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
-        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
-        let config = DrainConfig {
-            bus: &bus,
-            web_port: None,
-            session_id: Some("thread-1".to_string()),
-            alias_session_id: None,
-            backend_thread_id: None,
-            autonomy,
-            session_log: &session_log,
-            project_root: dir.path(),
-            log_dir: &log_dir,
-            approval_registry: &approval_registry,
-            json_approval: None,
-            agent_source: Some("Codex".to_string()),
-            suppress_agent_started: false,
-            persist_model_responses_inline: true,
-            headless: true,
-            context_injection: &context_injection,
-            reload_credentials: None,
-        };
+        let config = steer_test_drain_config(
+            &bus,
+            &dir,
+            &log_dir,
+            &session_log,
+            &approval_registry,
+            &context_injection,
+        );
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(RecordingExternalAgent {
             sent: sent.clone(),
             fail_send: false,
         });
+        let mut turn_state = UserTurnRevisionState::default();
+        turn_state.seed_active_turns_to(3);
 
         start_external_primary_steer_followup_turn(
             &mut agent,
             &config,
+            Some(&mut turn_state),
             "thread-1".to_string(),
             "continue on signed main".to_string(),
             "steer-1".to_string(),
@@ -788,9 +835,15 @@ mod tests {
                 "continue on signed main".to_string()
             )]
         );
+        assert_eq!(
+            turn_state.active_count(),
+            4,
+            "the delivered steer burns the next prompt ordinal"
+        );
 
         let mut saw_queued = false;
         let mut saw_delivered = false;
+        let mut saw_user_message = false;
         while let Ok(event) = rx.try_recv() {
             match event {
                 AppEvent::SteerQueued {
@@ -813,10 +866,108 @@ mod tests {
                     assert_eq!(id, "steer-1");
                     assert!(!mid_turn);
                 }
+                AppEvent::UserMessageLog {
+                    session_id,
+                    content,
+                    user_turn_index,
+                    user_turn_revision,
+                    ..
+                } => {
+                    saw_user_message = true;
+                    assert_eq!(session_id.as_deref(), Some("thread-1"));
+                    assert_eq!(content, "continue on signed main");
+                    assert_eq!(
+                        (user_turn_index, user_turn_revision),
+                        (Some(4), Some(1)),
+                        "the emitted row must carry the transcript lane's next ordinal"
+                    );
+                }
                 _ => {}
             }
         }
         assert!(saw_queued, "expected SteerQueued");
         assert!(saw_delivered, "expected SteerDelivered");
+        assert!(saw_user_message, "expected UserMessageLog");
+    }
+
+    /// Without primary ordinal tracking (child drains, the persistent
+    /// external thread lane) the emit stays turnless; a failed send never
+    /// burns an ordinal.
+    #[tokio::test]
+    async fn primary_steer_followup_without_state_stays_turnless_and_failure_burns_nothing() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let config = steer_test_drain_config(
+            &bus,
+            &dir,
+            &log_dir,
+            &session_log,
+            &approval_registry,
+            &context_injection,
+        );
+
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(RecordingExternalAgent {
+            sent: sent.clone(),
+            fail_send: false,
+        });
+        start_external_primary_steer_followup_turn(
+            &mut agent,
+            &config,
+            None,
+            "thread-1".to_string(),
+            "no ordinal lane here".to_string(),
+            "steer-2".to_string(),
+            "no active parent turn".to_string(),
+        )
+        .await
+        .unwrap();
+        let mut saw_turnless_user_message = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::UserMessageLog {
+                user_turn_index,
+                user_turn_revision,
+                ..
+            } = event
+            {
+                saw_turnless_user_message = true;
+                assert_eq!((user_turn_index, user_turn_revision), (None, None));
+            }
+        }
+        assert!(
+            saw_turnless_user_message,
+            "expected turnless UserMessageLog"
+        );
+
+        let mut failing_agent: Box<dyn external_agent::ExternalAgent> =
+            Box::new(RecordingExternalAgent {
+                sent: sent.clone(),
+                fail_send: true,
+            });
+        let mut turn_state = UserTurnRevisionState::default();
+        turn_state.seed_active_turns_to(2);
+        let result = start_external_primary_steer_followup_turn(
+            &mut failing_agent,
+            &config,
+            Some(&mut turn_state),
+            "thread-1".to_string(),
+            "will not send".to_string(),
+            "steer-3".to_string(),
+            "no active parent turn".to_string(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            turn_state.active_count(),
+            2,
+            "a failed delivery must not burn an ordinal the backend never saw"
+        );
     }
 }

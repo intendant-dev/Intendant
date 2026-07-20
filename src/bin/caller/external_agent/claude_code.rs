@@ -516,6 +516,11 @@ fn parse_user_questions(input: &serde_json::Value) -> Option<Vec<crate::types::U
                     .get("multiSelect")
                     .and_then(|m| m.as_bool())
                     .unwrap_or(false),
+                // CC's AskUserQuestion speaks multiSelect only — the
+                // legacy bounds derivation applies.
+                pick_min: None,
+                pick_max: None,
+                free_text: None,
                 previews,
             })
         })
@@ -3011,11 +3016,20 @@ impl CcReader {
         if !status.is_empty() {
             window.status = Some(status.to_string());
         }
+        window.observed_at_epoch = Some(crate::session_activity::epoch_seconds());
+        let resets_at_epoch = window.resets_at_epoch;
+        // Deliver the change NOW, not only on the next usage snapshot: a
+        // rejected turn produces no usage at all, and a warning arriving
+        // between calls would otherwise sit invisible while the chip keeps
+        // claiming the previous status. Same per-model-call cadence as the
+        // usage rail; the vitals hub emits only on actual change.
+        out.events.push(AgentEvent::RateLimitWindows {
+            windows: self.current_limit_windows(),
+        });
         // Activity: a non-allowed status while a turn runs is the honest
         // "rate-limited" claim (with the reset countdown when carried);
         // an explicit allowed status retires it. `allowed_warning` still
         // allows requests — the limits gauge carries the warning.
-        let resets_at_epoch = window.resets_at_epoch;
         match status {
             "" => {}
             "allowed" | "allowed_warning" => {
@@ -3096,11 +3110,16 @@ impl CcReader {
     }
 }
 
-/// Compact gauge label for a Claude Code `rateLimitType`.
+/// Compact gauge label for a Claude Code `rateLimitType`. The mapped
+/// types are the ones observed on the live wire (2.1.2xx announces
+/// `five_hour` on every call, and `seven_day` /
+/// `seven_day_overage_included` once those windows are elevated); unknown
+/// vocabulary passes through softened, never truncated.
 fn cc_rate_limit_label(kind: &str) -> String {
     match kind {
         "five_hour" => "5h".to_string(),
         "seven_day" => "7d".to_string(),
+        "seven_day_overage_included" => "7d-overage".to_string(),
         other => other.replace('_', " "),
     }
 }
@@ -3356,12 +3375,13 @@ impl ClaudeCodeAgent {
     }
 
     /// Deliver an operator-goal notice to the model: queued as a prelude on
-    /// the next user message, always. Mid-turn stdin writes were the old
-    /// delivery for running turns, but 2.1.2xx discards user lines while a
-    /// turn runs (see `steer_turn`) — the notice would silently vanish. A
-    /// standalone user message is no better: it would start — and pay for —
-    /// a whole turn. The prelude path costs nothing and cannot be dropped;
-    /// a notice raced by an in-flight turn reaches the model one turn later.
+    /// the next user message, always. Mid-turn stdin absorption exists again
+    /// on current CLIs (see `steer_turn`), but its delivery is unconfirmable
+    /// (no stdout echo) and one CLI era (2.1.207) was observed discarding
+    /// such lines — a goal notice must never silently vanish, and a
+    /// standalone user message would start (and pay for) a whole turn. The
+    /// prelude path costs nothing and cannot be dropped; a notice raced by
+    /// an in-flight turn reaches the model one turn later.
     async fn deliver_goal_notice(&mut self, notice: String) -> Result<(), CallerError> {
         self.pending_goal_notice = match self.pending_goal_notice.take() {
             // Coalesce an undelivered notice instead of overwriting it —
@@ -3863,26 +3883,26 @@ impl ExternalAgent for ClaudeCodeAgent {
     }
 
     async fn steer_turn(&mut self, text: &str) -> Result<(), CallerError> {
-        // 2.1.200 absorbed a user message written mid-turn into the running
-        // turn; that was a bug, and 2.1.2xx removed it — the CLI silently
-        // DISCARDS stdin user lines while a turn is running (probed live on
-        // 2.1.207: the text never enters the conversation, no ack, no next
-        // turn; init capabilities advertise no replacement protocol yet).
-        // Writing the bytes anyway produced phantom "delivered" steers. So:
-        // report the truth and let the drain queue the steer for the turn
-        // boundary (the load-bearing "mid-turn steering not supported"
-        // wording — see external_steer_queue_reason), or, when no turn is
-        // running, hand it back as an immediate follow-up ("no active
-        // turn" marker).
-        let _ = text;
+        // A stdin user message written mid-turn is absorbed into the RUNNING
+        // turn at the CLI's next checkpoint (probed live on 2.1.215: a
+        // message injected during a tool call shaped that same turn's final
+        // reply; 2.1.207 was observed discarding such lines, 2.1.200
+        // absorbed them). The CLI never echoes the injected message on
+        // stream-json stdout, so delivery is inferred at the next model
+        // checkpoint via the drain's pending-runtime-steer tracking, and a
+        // line a discarding CLI eats would still be marked delivered at turn
+        // completion — accepted imprecision; the alternative is refusing
+        // native steering entirely and parking every steer until turn end.
         if !self.shared.turn_active.load(Ordering::SeqCst) {
             return Err(CallerError::ExternalAgent(
                 "claude-code has no active turn to steer".into(),
             ));
         }
-        Err(CallerError::ExternalAgent(
-            "mid-turn steering not supported by Claude Code 2.1.x — stream-json input applies user messages only at turn boundaries".into(),
-        ))
+        // Benign race: if the turn ends between the check above and this
+        // write, the CLI treats the line as the next turn's prompt — a
+        // spontaneous round the drain already supervises (same shape as a
+        // task-notification turn).
+        self.write_user_message(text).await
     }
 
     async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
@@ -4862,12 +4882,13 @@ mod tests {
     }
 
     /// The steer contract the drain keys on: idle → "no active turn"
-    /// (immediate follow-up path); running → "mid-turn steering not
-    /// supported" (queue-for-turn-boundary path). CC 2.1.2xx discards
-    /// stdin user lines mid-turn, so steer_turn never writes — writing
-    /// produced phantom "delivered" steers the model never saw.
+    /// (immediate follow-up path); running → write the user message onto
+    /// stdin (the CLI absorbs it into the running turn at its next
+    /// checkpoint — verified live on 2.1.215). Uninitialized here, so the
+    /// running case must fail on the WRITE (no writer yet), never with the
+    /// old "steering not supported" refusal.
     #[tokio::test]
-    async fn steer_reports_queue_semantics_instead_of_writing() {
+    async fn steer_writes_mid_turn_and_requires_active_turn() {
         let mut agent =
             ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
         let idle_err = agent.steer_turn("more context").await.unwrap_err();
@@ -4878,16 +4899,19 @@ mod tests {
         agent.shared.turn_active.store(true, Ordering::SeqCst);
         let running_err = agent.steer_turn("more context").await.unwrap_err();
         assert!(
-            running_err
-                .to_string()
-                .contains("mid-turn steering not supported"),
-            "got: {running_err}"
+            running_err.to_string().contains("Not initialized"),
+            "running steer should reach the stdin write path, got: {running_err}"
+        );
+        assert!(
+            !running_err.to_string().contains("not supported"),
+            "steering must no longer be refused as unsupported: {running_err}"
         );
     }
 
     /// Goal notices always queue as the next prompt's prelude — a mid-turn
-    /// stdin write would be discarded by the CLI, and consecutive notices
-    /// coalesce in order instead of overwriting each other.
+    /// stdin write is unconfirmable (and one CLI era discarded them), and
+    /// consecutive notices coalesce in order instead of overwriting each
+    /// other.
     #[tokio::test]
     async fn goal_notices_queue_and_coalesce() {
         let mut agent =
@@ -7437,9 +7461,9 @@ mod tests {
     }
 
     /// 2.1.2xx dropped `utilization` from rate_limit_event in normal
-    /// operation (live wire probed on 2.1.207: status/resetsAt/
-    /// rateLimitType/overageStatus only). The window still feeds the gauge
-    /// — status and reset, no pct — instead of vanishing.
+    /// operation (live wire probed on 2.1.207 and re-verified on 2.1.215:
+    /// status/resetsAt/rateLimitType/overageStatus only). The window still
+    /// feeds the gauge — status and reset, no pct — instead of vanishing.
     #[test]
     fn utilization_less_rate_limit_event_still_builds_window() {
         let mut reader = test_reader();
@@ -7467,6 +7491,69 @@ mod tests {
         assert_eq!(windows[0].used_pct, Some(34));
         assert_eq!(windows[0].resets_at_epoch, Some(1_783_929_800));
         assert_eq!(windows[0].status.as_deref(), Some("allowed_warning"));
+    }
+
+    /// Window updates reach the vitals at the event itself, not only on
+    /// the next usage snapshot: a rejected turn produces NO usage (the
+    /// all-zero result is dropped), and a between-turns warning would
+    /// otherwise wait for the next call while the chip kept claiming the
+    /// previous status (the 2026-07-19 ok-vs-warning mismatch). Every
+    /// `rate_limit_event` must push a `RateLimitWindows` with the current
+    /// store, stamped with the observation time.
+    #[test]
+    fn rate_limit_events_deliver_windows_without_a_usage_snapshot() {
+        fn window_events(out: &CcLineOutcome) -> Vec<Vec<crate::types::SessionLimitWindow>> {
+            out.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::RateLimitWindows { windows } => Some(windows.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1783929600,"rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        let emitted = window_events(&out);
+        assert_eq!(emitted.len(), 1, "the event itself carries the windows");
+        assert_eq!(emitted[0].len(), 1);
+        assert_eq!(emitted[0][0].label, "5h");
+        assert_eq!(emitted[0][0].status.as_deref(), Some("allowed_warning"));
+        assert_eq!(emitted[0][0].resets_at_epoch, Some(1_783_929_600));
+        assert_eq!(
+            emitted[0][0].used_pct, None,
+            "no reported percentage, none synthesized"
+        );
+        assert!(
+            emitted[0][0].observed_at_epoch.is_some(),
+            "windows carry their observation stamp"
+        );
+
+        // The rejected case: no usage will follow this turn, so the event
+        // emission is the ONLY carrier.
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        let emitted = window_events(&out);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0][0].status.as_deref(), Some("rejected"));
+
+        // The weekly overage window observed live (2026-07-19 logs) maps
+        // to the chip grammar and joins the store alongside five_hour.
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1784716800,"rateLimitType":"seven_day_overage_included"},"session_id":"s1"}"#,
+        );
+        let emitted = window_events(&out);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].len(), 2, "windows union across types");
+        let overage = emitted[0]
+            .iter()
+            .find(|w| w.label == "7d-overage")
+            .expect("overage window labeled for the chip grammar");
+        assert_eq!(overage.status.as_deref(), Some("allowed_warning"));
+        assert_eq!(overage.resets_at_epoch, Some(1_784_716_800));
     }
 
     /// A resumed big-context session reports usage before the first result

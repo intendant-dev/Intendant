@@ -435,6 +435,17 @@ pub(crate) fn parse_codex_session_entries(
     let mut current_turn_id: Option<String> = None;
     let mut synthetic_item_seq = 0_u64;
     let mut command_calls: HashMap<String, serde_json::Value> = HashMap::new();
+    // Subagent completed-terminal evidence (the Codex twin of the Claude
+    // Code task-notification synthesis in `task_threads.rs`): whether the
+    // FILE'S OWN session_meta (the first one — later metas describe the
+    // fork source) marks this rollout a subagent thread, and the last
+    // `task_complete` boundary seen — its row timestamp, its
+    // `last_agent_message`, and the entry count at that point, so
+    // anything rendered after it (a resumed child) suppresses the stale
+    // completion. `turn_aborted` (an interrupt) retracts it outright.
+    let mut session_meta_seen = false;
+    let mut is_subagent_rollout = false;
+    let mut subagent_completed: Option<(String, Option<String>, usize)> = None;
     // One combined probe pass (early-exits once both lanes are proven)
     // instead of two independent full-file scans before the main parse.
     let (canonical_user_message_events, canonical_assistant_response_items) =
@@ -457,6 +468,11 @@ pub(crate) fn parse_codex_session_entries(
         };
         if obj.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
             if let Some(payload) = obj.get("payload") {
+                if !session_meta_seen {
+                    session_meta_seen = true;
+                    is_subagent_rollout =
+                        codex_thread_source_from_payload(payload).as_deref() == Some("subagent");
+                }
                 rollout_session_id = rollout_session_id.or_else(|| value_str(payload, "id"));
             }
         }
@@ -467,6 +483,19 @@ pub(crate) fn parse_codex_session_entries(
                     current_turn_id = value_str(payload, "turn_id")
                         .or_else(|| value_str(payload, "turnId"))
                         .or(current_turn_id);
+                    continue;
+                }
+                if payload_type == "task_complete" {
+                    subagent_completed = Some((
+                        value_str(&obj, "timestamp").unwrap_or_default(),
+                        value_str(payload, "last_agent_message")
+                            .or_else(|| value_str(payload, "lastAgentMessage")),
+                        entries.len(),
+                    ));
+                    continue;
+                }
+                if payload_type == "turn_aborted" {
+                    subagent_completed = None;
                     continue;
                 }
                 if payload_type == "thread_goal_updated" {
@@ -778,7 +807,54 @@ pub(crate) fn parse_codex_session_entries(
         }
     }
 
+    // A subagent rollout whose LAST turn-boundary event is `task_complete`
+    // — nothing rendered after it, no later abort — is a completed child:
+    // synthesize the terminal row the live drain emitted
+    // (`emit_external_subagent_state`'s completed arm), so hydration and
+    // replay read DONE the way the live window did. The live "Task
+    // complete" LogEntry is bus-only, and unlike the Claude Code lane the
+    // evidence here lives in the SAME file as the transcript, so the
+    // ordinary (len, mtime) cache key already re-derives on change and
+    // ordering doubles as the staleness guard: a resumed child's rows (or
+    // its interrupt's `turn_aborted`) land after the stale completion and
+    // suppress it. Top-level rollouts never synthesize — completion of a
+    // turn is not completion of a session.
+    if is_subagent_rollout {
+        if let Some((ts, message, entries_len_at_boundary)) = subagent_completed {
+            if entries_len_at_boundary == entries.len() {
+                entries.push(codex_subagent_terminal_entry(&ts, message.as_deref()));
+            }
+        }
+    }
+
     Some(entries)
+}
+
+/// The synthesized completed-terminal row for a Codex subagent thread —
+/// the same grammar as the live emit (`emit_external_subagent_state`,
+/// completed arm, backend label "Codex") and the same row contract as the
+/// Claude Code synthesis (`claude_task_terminal_entry`): the dashboard
+/// merge guard keys on the shared kind, and its restored-phase derivation
+/// keys on the "Task complete:" prefix.
+fn codex_subagent_terminal_entry(ts: &str, message: Option<&str>) -> serde_json::Value {
+    let label = crate::external_agent::AgentBackend::Codex.to_string();
+    let content = match message.and_then(task_terminal_summary_snippet) {
+        Some(summary) => format!("Task complete: {label} subagent completed: {summary}"),
+        None => format!("Task complete: {label} subagent completed"),
+    };
+    let mut entry = serde_json::json!({
+        "level": "info",
+        "source": label,
+        "kind": SUBAGENT_TERMINAL_KIND,
+        "content": content,
+    });
+    if !ts.is_empty() {
+        entry["ts"] = serde_json::Value::String(ts.to_string());
+        if let Some(ts_ms) = timestamp_millis_from_str(ts) {
+            entry["ts_ms"] = serde_json::Value::from(ts_ms);
+        }
+    }
+    entry
 }
 
 /// Whole-file facts the codex projection needs before line 1:
@@ -1315,7 +1391,9 @@ pub(crate) fn external_session_entries_from_home_arc(
         // task-aware lane, which also appends the completed-terminal row
         // the subagent file itself never carries (Codex sub-threads need
         // no fallback — they get first-class rollouts under their own
-        // thread ids).
+        // thread ids, and their completed-terminal row is synthesized
+        // inside the ordinary parse from the rollout's own
+        // `task_complete` boundary).
         "claude-code" => match find_claude_session_file_for_transcript(home, session_id) {
             Some(path) => Some(path),
             None => {
@@ -1379,7 +1457,7 @@ fn claude_task_child_entries_arc(
     let key = external_transcript_cache_key(source, session_id, &artifacts.transcript)?;
     if let Some(entries) = cached_external_transcript_entries(&key) {
         let has_terminal = entries.iter().any(|entry| {
-            entry.get("kind").and_then(|v| v.as_str()) == Some(CLAUDE_TASK_TERMINAL_KIND)
+            entry.get("kind").and_then(|v| v.as_str()) == Some(SUBAGENT_TERMINAL_KIND)
         });
         if has_terminal {
             return Some(entries);
@@ -2098,6 +2176,271 @@ mod tests {
         );
         assert_eq!(row["item_id"].as_str(), Some("rs_1"));
         assert_eq!(row["session_id"].as_str(), Some(session_id));
+    }
+
+    // ---- Codex subagent completed-terminal synthesis ----
+
+    /// The file's own session_meta for a Codex subagent thread rollout
+    /// (observed shape: `thread_source: "subagent"` plus the
+    /// `source.subagent.thread_spawn` record).
+    fn codex_subagent_session_meta(session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": "2026-05-17T16:48:52Z",
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "parent_thread_id": "019e37b2-0000-7000-8000-parentthread",
+                "thread_source": "subagent",
+                "agent_path": "/root/doc_audit",
+                "agent_nickname": "Synthia",
+                "source": { "subagent": { "thread_spawn": {
+                    "parent_thread_id": "019e37b2-0000-7000-8000-parentthread",
+                    "depth": 1,
+                    "agent_path": "/root/doc_audit",
+                    "agent_nickname": "Synthia",
+                } } },
+            }
+        })
+    }
+
+    fn codex_event(ts: &str, payload: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "timestamp": ts, "type": "event_msg", "payload": payload })
+    }
+
+    fn write_codex_rollout(home: &Path, session_id: &str, lines: &[serde_json::Value]) {
+        let sessions_dir = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+    }
+
+    const CODEX_CHILD_COMPLETED_ROW: &str =
+        "Task complete: Codex subagent completed: Docs audited; two links fixed.";
+
+    fn codex_subagent_fixture_head(session_id: &str) -> Vec<serde_json::Value> {
+        vec![
+            codex_subagent_session_meta(session_id),
+            codex_event(
+                "2026-05-17T16:49:00Z",
+                serde_json::json!({ "type": "user_message", "message": "Audit the demo docs" }),
+            ),
+            codex_event(
+                "2026-05-17T16:49:20Z",
+                serde_json::json!({ "type": "agent_message",
+                    "message": "Docs audited; two links fixed." }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn codex_subagent_completion_serves_synthetic_terminal_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019e37b2-subagent-completed";
+        let mut lines = codex_subagent_fixture_head(session_id);
+        lines.push(codex_event(
+            "2026-05-17T16:49:21Z",
+            serde_json::json!({ "type": "task_complete",
+                "turn_id": "019e37b2-turn-0000-8000-000000000001",
+                "last_agent_message": "Docs audited; two links fixed." }),
+        ));
+        write_codex_rollout(dir.path(), session_id, &lines);
+
+        let entries = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex child entries");
+        let terminal = entries.last().expect("entries end with the terminal row");
+        assert_eq!(
+            terminal["kind"].as_str(),
+            Some(SUBAGENT_TERMINAL_KIND),
+            "terminal row carries the shared subagent-terminal kind"
+        );
+        assert_eq!(
+            terminal["content"].as_str(),
+            Some(CODEX_CHILD_COMPLETED_ROW)
+        );
+        assert_eq!(terminal["level"].as_str(), Some("info"));
+        assert_eq!(terminal["source"].as_str(), Some("Codex"));
+        assert_eq!(terminal["ts"].as_str(), Some("2026-05-17T16:49:21Z"));
+        assert!(terminal["ts_ms"].as_i64().is_some());
+        // Annotated like every served entry: stable id + delivery.
+        assert!(terminal["event_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        // Exactly one terminal row.
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["kind"].as_str() == Some(SUBAGENT_TERMINAL_KIND))
+                .count(),
+            1
+        );
+
+        // The detail page (the hydration fetch) serves the same row.
+        let body = external_session_detail_from_home_with_page(
+            dir.path(),
+            "codex",
+            session_id,
+            None,
+            None,
+        )
+        .expect("detail body");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let detail_entries = value["entries"].as_array().expect("entries array");
+        assert_eq!(
+            detail_entries.last().and_then(|e| e["content"].as_str()),
+            Some(CODEX_CHILD_COMPLETED_ROW)
+        );
+    }
+
+    #[test]
+    fn codex_subagent_resumed_rows_suppress_stale_completion() {
+        // A follow-up re-tasks the child: rows land AFTER the old
+        // task_complete and no new boundary has settled yet — the stale
+        // completion must not paint the live-again child as done.
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019e37b2-subagent-resumed";
+        let mut lines = codex_subagent_fixture_head(session_id);
+        lines.push(codex_event(
+            "2026-05-17T16:49:21Z",
+            serde_json::json!({ "type": "task_complete",
+                "turn_id": "019e37b2-turn-0000-8000-000000000001",
+                "last_agent_message": "Docs audited; two links fixed." }),
+        ));
+        lines.push(codex_event(
+            "2026-05-17T16:55:00Z",
+            serde_json::json!({ "type": "user_message", "message": "Now audit the guides too" }),
+        ));
+        lines.push(codex_event(
+            "2026-05-17T16:55:10Z",
+            serde_json::json!({ "type": "agent_message", "message": "Working through the guides." }),
+        ));
+        write_codex_rollout(dir.path(), session_id, &lines);
+
+        let entries = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex child entries");
+        assert!(!entries
+            .iter()
+            .any(|entry| entry["kind"].as_str() == Some(SUBAGENT_TERMINAL_KIND)));
+    }
+
+    #[test]
+    fn codex_subagent_turn_abort_retracts_completion_evidence() {
+        // An interrupt lands as `turn_aborted` — even with no rendered
+        // rows after the old completion, the abort retracts it (the live
+        // path emitted Interrupted, not completed).
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019e37b2-subagent-aborted";
+        let mut lines = codex_subagent_fixture_head(session_id);
+        lines.push(codex_event(
+            "2026-05-17T16:49:21Z",
+            serde_json::json!({ "type": "task_complete",
+                "turn_id": "019e37b2-turn-0000-8000-000000000001",
+                "last_agent_message": "Docs audited; two links fixed." }),
+        ));
+        lines.push(codex_event(
+            "2026-05-17T16:56:00Z",
+            serde_json::json!({ "type": "turn_aborted",
+                "turn_id": "019e37b2-turn-0000-8000-000000000002",
+                "reason": "interrupted" }),
+        ));
+        write_codex_rollout(dir.path(), session_id, &lines);
+
+        let entries = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex child entries");
+        assert!(!entries
+            .iter()
+            .any(|entry| entry["kind"].as_str() == Some(SUBAGENT_TERMINAL_KIND)));
+    }
+
+    #[test]
+    fn codex_subagent_last_completion_wins_across_reruns() {
+        // Re-tasked child that settles again: the LAST task_complete is
+        // the terminal, exactly one row, with the newest message.
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019e37b2-subagent-rerun";
+        let mut lines = codex_subagent_fixture_head(session_id);
+        lines.push(codex_event(
+            "2026-05-17T16:49:21Z",
+            serde_json::json!({ "type": "task_complete",
+                "turn_id": "019e37b2-turn-0000-8000-000000000001",
+                "last_agent_message": "Docs audited; two links fixed." }),
+        ));
+        lines.push(codex_event(
+            "2026-05-17T16:55:00Z",
+            serde_json::json!({ "type": "user_message", "message": "Now audit the guides too" }),
+        ));
+        lines.push(codex_event(
+            "2026-05-17T16:58:00Z",
+            serde_json::json!({ "type": "agent_message", "message": "Guides audited as well." }),
+        ));
+        lines.push(codex_event(
+            "2026-05-17T16:58:01Z",
+            serde_json::json!({ "type": "task_complete",
+                "turn_id": "019e37b2-turn-0000-8000-000000000002",
+                "last_agent_message": "Guides audited as well." }),
+        ));
+        write_codex_rollout(dir.path(), session_id, &lines);
+
+        let entries = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex child entries");
+        let terminals: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry["kind"].as_str() == Some(SUBAGENT_TERMINAL_KIND))
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(
+            terminals[0]["content"].as_str(),
+            Some("Task complete: Codex subagent completed: Guides audited as well.")
+        );
+        assert_eq!(terminals[0]["ts"].as_str(), Some("2026-05-17T16:58:01Z"));
+    }
+
+    #[test]
+    fn codex_top_level_rollout_never_synthesizes_terminal() {
+        // Every top-level turn also ends in task_complete — completion of
+        // a turn is not completion of a session, so only rollouts whose
+        // own session_meta marks a subagent thread synthesize.
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019e37b2-toplevel-turns";
+        write_codex_rollout(
+            dir.path(),
+            session_id,
+            &[
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id, "thread_source": "user" }
+                }),
+                codex_event(
+                    "2026-05-17T16:49:00Z",
+                    serde_json::json!({ "type": "user_message", "message": "Audit the demo docs" }),
+                ),
+                codex_event(
+                    "2026-05-17T16:49:20Z",
+                    serde_json::json!({ "type": "agent_message",
+                        "message": "Docs audited; two links fixed." }),
+                ),
+                codex_event(
+                    "2026-05-17T16:49:21Z",
+                    serde_json::json!({ "type": "task_complete",
+                        "turn_id": "019e37b2-turn-0000-8000-000000000001",
+                        "last_agent_message": "Docs audited; two links fixed." }),
+                ),
+            ],
+        );
+
+        let entries = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex entries");
+        assert_eq!(entries.len(), 2, "user + assistant rows only");
+        assert!(!entries
+            .iter()
+            .any(|entry| entry["kind"].as_str() == Some(SUBAGENT_TERMINAL_KIND)));
     }
 
     #[test]

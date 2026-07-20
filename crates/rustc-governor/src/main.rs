@@ -4,10 +4,14 @@
 //! invokes it as `rustc-governor <real-rustc> <args…>` and the chain is:
 //!
 //! ```text
-//! cargo → THIS BINARY (acquires + HOLDS the flock(2) permit, waits) →
-//!   spawn of `wrap_with <real-rustc> <args…>` (the blocking sccache
-//!   client) → sccache server: hits answered from cache, misses
-//!   compiled server-side
+//! cacheable library:
+//!   cargo → THIS BINARY (holds compile permit) →
+//!     `wrap_with <real-rustc> <args…>` (blocking sccache client)
+//!
+//! heavyweight bin/test:
+//!   cargo → THIS BINARY (holds compile permit) → real rustc directly,
+//!     with `-C linker=THIS BINARY` → THIS BINARY in linker mode
+//!       (crash-safe FIFO + link slot) → real linker
 //! ```
 //!
 //! The permit is held by the governor itself, which stays alive as the
@@ -26,7 +30,10 @@
 //! waits. A cache hit occupies its permit only for the client
 //! round-trip (~tens of ms); hits queueing head-of-line behind
 //! miss-saturated permits is an accepted trade (ceiling correctness over
-//! warm-path latency).
+//! warm-path latency). Final bin/test invocations are non-cacheable in
+//! sccache, so they bypass `wrap_with`; this also guarantees that the
+//! invocation-private linker handoff reaches rustc rather than a
+//! long-lived cache server.
 //!
 //! Why wrapper-side: the previous wiring (`[build] rustc = governor`,
 //! `rustc-wrapper = sccache`) made sccache treat the governor as the
@@ -58,19 +65,24 @@
 //!      class). Classification runs over argv[2..]; see `probe.rs`.
 //!   3. **Class detection.** The euid's username, matched against the
 //!      config's `ci_users`, splits invocations into `ci` and `local`.
-//!   4. **The link gate.** A heavyweight final link (bin / `--test` target
-//!      emitting `link` — see `link.rs`) first takes one of the
-//!      machine-global `link_slots` flock slots, BEFORE its ordinary
-//!      permit: a waiter on the link gate holds nothing (no
-//!      ordinary-permit hoarding), and no permit holder ever waits on the
-//!      link slot, so the wait graph is acyclic. Gate failure degrades
-//!      (logged, ordinary governance kept); only the global fail-open
-//!      paths drop governance entirely.
-//!   5. **Permits.** Own-class reservation first, then borrow the other
+//!   4. **Permits.** Own-class reservation first, then borrow the other
 //!      class's spare permits iff that class has no registered waiters,
 //!      else register demand and poll — see `permits.rs` for the demand-gate
 //!      protocol. Nothing is ever killed or signalled; borrowed permits
 //!      return naturally when their holder exits.
+//!   5. **The actual-linker gate.** A heavyweight final artifact (bin /
+//!      `--test` target emitting `link` — see `link.rs`) runs compile and
+//!      codegen under its ordinary permit, then rustc invokes this binary
+//!      as its linker shim. Only that shim enters a bounded crash-safe FIFO
+//!      and takes one of the machine-global `link_slots` flock slots. All
+//!      new processes acquire permit then link, so the wait graph remains
+//!      acyclic; queued linkers can occupy their rustc permits, but only
+//!      for real linker work ahead of them rather than another crate's
+//!      compile/codegen. Missing FIFO assets degrade ordering only; missing
+//!      link-slot assets degrade gating (logged, ordinary governance kept).
+//!      The installer refuses a binary swap while old governors are alive:
+//!      mixing the former link-then-permit generation with this order could
+//!      form a cross-generation cycle.
 //!
 //! Config: `/usr/local/etc/intendant-governor.toml`
 //! (`INTENDANT_GOVERNOR_CONFIG` overrides — how the acceptance tests point
@@ -98,10 +110,20 @@ mod govlog;
 #[cfg_attr(not(unix), allow(dead_code))]
 mod link;
 #[cfg(unix)]
+mod linker;
+#[cfg(unix)]
 mod permits;
 mod probe;
 
 fn main() {
+    // The same executable is also rustc's heavyweight-linker shim. Detect
+    // that private handoff before interpreting argv through cargo's
+    // RUSTC_WRAPPER contract: linker argv[1] is an object/flag, not rustc.
+    #[cfg(unix)]
+    if linker::is_linker_mode() {
+        linker::run();
+    }
+
     let mut argv = std::env::args_os().skip(1);
     // cargo's RUSTC_WRAPPER contract: argv[1] is the real compiler.
     let Some(real) = argv.next().map(PathBuf::from) else {
@@ -215,7 +237,7 @@ fn run_unix(
     config_path: &Path,
     lossy: &[String],
 ) -> ! {
-    match governed_guards(cfg, config_path, lossy) {
+    match acquire_governed(cfg, config_path, lossy) {
         // Fail-open: nothing is held, so there is no fd whose lifetime
         // must outlast the chain — exec(2) keeps the zero-overhead shape
         // (this process image simply BECOMES the chain, and a disabled
@@ -223,7 +245,7 @@ fn run_unix(
         // rustc-wrapper).
         None => exec_wrap_chain(real, args, wrap.as_deref()),
         // Governed: every lock is parent-held — see `run_governed`.
-        Some(guards) => run_governed(real, args, wrap.as_deref(), guards),
+        Some(governed) => run_governed(real, args, wrap.as_deref(), config_path, governed),
     }
 }
 
@@ -265,44 +287,95 @@ fn exec_wrap_chain(real: &Path, args: &[OsString], wrap: Option<&Path>) -> ! {
 /// any-exit-releases story): SIGKILL on the governor releases the
 /// permit in the kernel the instant the process dies (its fds close),
 /// and the child orphans and finishes its current compile momentarily
-/// ungoverned.
+/// outside the compile ceiling. If that child has already become the
+/// linker shim, its independently held link slot remains locked until the
+/// real linker ends — high-RSS link safety is not dropped with the outer
+/// parent.
 #[cfg(unix)]
-fn run_governed(real: &Path, args: &[OsString], wrap: Option<&Path>, guards: Guards) -> ! {
-    let Guards {
+fn run_governed(
+    real: &Path,
+    args: &[OsString],
+    wrap: Option<&Path>,
+    config_path: &Path,
+    governed: Governed,
+) -> ! {
+    let Governed {
         permit,
-        link,
-        link_done,
-    } = guards;
-    let started = std::time::Instant::now();
-    let Some(mut child) = spawn_chain(real, args, wrap) else {
-        // Neither the wrap chain nor the compiler would spawn (messages
-        // already printed by spawn_chain).
-        drop(link);
+        cfg,
+        class,
+        classified,
+    } = governed;
+    govlog::log_compile(
+        &cfg.permit_dir,
+        class.as_str(),
+        classified.crate_name.as_deref(),
+        classified.heavy,
+        &permit.name,
+        permit.wait_ms,
+    );
+
+    if classified.heavy {
+        match linker::prepare_rustc(args) {
+            Ok(prepared) => {
+                let child = linker::spawn_rustc(
+                    real,
+                    &prepared,
+                    linker::CompileContext {
+                        config_path,
+                        class: class.as_str(),
+                        crate_name: classified.crate_name.as_deref(),
+                        permit_name: &permit.name,
+                        permit_wait_ms: permit.wait_ms,
+                    },
+                );
+                let child = match child {
+                    Ok(child) => child,
+                    Err(err) => {
+                        drop(permit);
+                        eprintln!(
+                            "rustc-governor: failed to run {} with the linker shim: {err}",
+                            real.display()
+                        );
+                        std::process::exit(127);
+                    }
+                };
+                let status = wait_for_child(child);
+                drop(permit);
+                match status {
+                    Ok(status) => exit_like_child(status),
+                    Err(err) => {
+                        eprintln!(
+                            "rustc-governor: failed to wait for the governed compiler: {err}"
+                        );
+                        std::process::exit(127);
+                    }
+                }
+            }
+            Err(reason) => {
+                eprintln!(
+                    "rustc-governor: cannot isolate this final link ({reason}); \
+                     serializing the whole rustc invocation"
+                );
+                run_whole_rustc_link(
+                    real,
+                    args,
+                    wrap,
+                    config_path,
+                    permit,
+                    &cfg,
+                    class,
+                    classified.crate_name.as_deref(),
+                );
+            }
+        }
+    }
+
+    let Some(child) = spawn_chain(real, args, wrap) else {
         drop(permit);
         std::process::exit(127);
     };
-    // Between spawn and handler install, TERM/INT/HUP still hits the
-    // default disposition: the governor dies, the kernel releases every
-    // lock, the child orphans — the documented crash semantics, for a
-    // few-instruction window.
-    CHILD_PID.store(child.id() as i32, Ordering::Release);
-    install_signal_forwarders();
-    let status = child.wait();
-    // The child is reaped: its pid is free for reuse, so the forwarders
-    // must stop aiming at it before this process does anything else.
-    CHILD_PID.store(0, Ordering::Release);
-    // Both locks were held for the child's whole run (the fds kept
-    // O_CLOEXEC, so the child never saw them); releasing them now —
-    // before the log write below — is release-on-exit made explicit.
-    drop(link);
+    let status = wait_for_child(child);
     drop(permit);
-    if let Some((permit_dir, crate_name)) = link_done {
-        govlog::log_link_done(
-            &permit_dir,
-            crate_name.as_deref(),
-            started.elapsed().as_millis() as u64,
-        );
-    }
     match status {
         Ok(status) => exit_like_child(status),
         Err(err) => {
@@ -310,6 +383,84 @@ fn run_governed(real: &Path, args: &[OsString], wrap: Option<&Path>, guards: Gua
             std::process::exit(127);
         }
     }
+}
+
+/// Compatibility fallback for an explicit cross target whose implicit
+/// linker rustc knows but the shim cannot safely guess. All new governors
+/// acquire in permit-then-link order, so this remains deadlock-free; the
+/// telemetry's scope marks that its runtime includes compilation/codegen.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_whole_rustc_link(
+    real: &Path,
+    args: &[OsString],
+    wrap: Option<&Path>,
+    config_path: &Path,
+    permit: permits::AcquiredPermit,
+    cfg: &config::Config,
+    class: permits::Class,
+    crate_name: Option<&str>,
+) -> ! {
+    let link_gate = permits::acquire_link_slot(cfg, config_path, crate_name);
+    let disposition = match &link_gate {
+        permits::LinkGate::Held(slot) => govlog::LinkDisposition::Gated {
+            slot: &slot.name,
+            link_wait_ms: slot.wait_ms,
+            queue: slot.queue.as_str(),
+            scope: "whole-rustc",
+        },
+        permits::LinkGate::Off => govlog::LinkDisposition::Off,
+        permits::LinkGate::Degraded => govlog::LinkDisposition::Degraded,
+        permits::LinkGate::FailOpen => {
+            drop(permit);
+            exec_wrap_chain(real, args, wrap);
+        }
+    };
+    govlog::log_link(
+        &cfg.permit_dir,
+        class.as_str(),
+        crate_name,
+        &disposition,
+        &permit.name,
+        permit.wait_ms,
+    );
+    let started = std::time::Instant::now();
+    let Some(child) = spawn_chain(real, args, wrap) else {
+        drop(link_gate);
+        drop(permit);
+        std::process::exit(127);
+    };
+    let status = wait_for_child(child);
+    drop(link_gate);
+    drop(permit);
+    govlog::log_link_done(
+        &cfg.permit_dir,
+        crate_name,
+        started.elapsed().as_millis() as u64,
+        "whole-rustc",
+    );
+    match status {
+        Ok(status) => exit_like_child(status),
+        Err(err) => {
+            eprintln!("rustc-governor: failed to wait for the governed compiler: {err}");
+            std::process::exit(127);
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn wait_for_child(mut child: Child) -> std::io::Result<std::process::ExitStatus> {
+    // Between spawn and handler install, TERM/INT/HUP still hits the
+    // default disposition: the governor dies, the kernel releases every
+    // lock, and the child orphans — the documented crash semantics, for a
+    // few-instruction window.
+    CHILD_PID.store(child.id() as i32, Ordering::Release);
+    install_signal_forwarders();
+    let status = child.wait();
+    // The child is reaped: its pid is free for reuse, so the forwarders
+    // must stop aiming at it before this process does anything else.
+    CHILD_PID.store(0, Ordering::Release);
+    status
 }
 
 /// Spawn `wrap_with <real> <args…>` — the real compiler directly when
@@ -433,35 +584,31 @@ fn exit_like_child(status: std::process::ExitStatus) -> ! {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Everything a governed invocation holds, parent-side, for the chain's
-/// whole run. Every fd keeps std's FD_CLOEXEC and must stay invisible to
-/// every child — a leaked fd in a long-lived child (in production: the
-/// sccache server the client daemonizes on demand) keeps its flock held
-/// long after the compile.
+/// Everything the outer governor retains for a governed rustc invocation.
+/// The compile permit is parent-held for the chain's whole run. A heavy
+/// invocation's linker shim separately holds the link slot only while the
+/// real linker runs.
 #[cfg(unix)]
-struct Guards {
+struct Governed {
     permit: permits::AcquiredPermit,
-    /// The held slot for a GATED heavyweight link; `None` for ordinary
-    /// compiles and for heavyweights running with the gate off/degraded.
-    link: Option<permits::AcquiredLinkSlot>,
-    /// `(permit_dir, crate name)` for every heavyweight link, gated or
-    /// not: drives the `kind=link-done` runtime line the soak data needs.
-    link_done: Option<(PathBuf, Option<String>)>,
+    cfg: config::Config,
+    class: permits::Class,
+    classified: link::Classified,
 }
 
 /// Decide whether this invocation is governed, and if so acquire what it
-/// holds: the machine-global link slot first for heavyweight links (the
-/// no-hoarding order — a link-gate waiter owns nothing), then the ordinary
-/// class permit. `None` always means "run ungoverned" — every fail-open
-/// path funnels here, and the caller execs the same `wrap_with` chain,
-/// lockless: a disabled governor must be indistinguishable from a plain
-/// sccache rustc-wrapper.
+/// holds: its ordinary class permit. Heavy invocations do not touch the
+/// link queue here; rustc reaches it later by invoking the linker shim.
+/// `None` always means "run ungoverned" — every fail-open path funnels
+/// here, and the caller execs the same `wrap_with` chain lockless: a
+/// disabled governor must be indistinguishable from a plain sccache
+/// rustc-wrapper.
 #[cfg(unix)]
-fn governed_guards(
+fn acquire_governed(
     cfg: Option<config::Config>,
     config_path: &Path,
     lossy: &[String],
-) -> Option<Guards> {
+) -> Option<Governed> {
     // Secondary, per-invocation kill switch (the config file is the primary
     // one). Any value other than "off" is ignored.
     if std::env::var_os("INTENDANT_GOVERNOR").is_some_and(|v| v == "off") {
@@ -480,46 +627,13 @@ fn governed_guards(
         return None;
     }
     let classified = link::classify(lossy);
-    let (link_slot, link_disposition) = if classified.heavy {
-        match permits::acquire_link_slot(&cfg, config_path) {
-            permits::LinkGate::Held(slot) => (Some(slot), None),
-            permits::LinkGate::Off => (None, Some(govlog::LinkDisposition::Off)),
-            permits::LinkGate::Degraded => (None, Some(govlog::LinkDisposition::Degraded)),
-            permits::LinkGate::FailOpen => return None,
-        }
-    } else {
-        (None, None)
-    };
     let class = permits::classify(permits::current_username().as_deref(), &cfg);
-    let Some(permit) = permits::acquire(&cfg, class, config_path) else {
-        // Mid-wait kill switch or an unusable ordinary pool: the whole
-        // invocation fails open. The link guard is dropped HERE, before
-        // the caller execs — never carried into a fail-open chain.
-        drop(link_slot);
-        return None;
-    };
-    let disposition = match &link_slot {
-        Some(slot) => Some(govlog::LinkDisposition::Gated {
-            slot: &slot.name,
-            link_wait_ms: slot.wait_ms,
-        }),
-        None => link_disposition,
-    };
-    govlog::log_governed(
-        &cfg.permit_dir,
-        class.as_str(),
-        classified.crate_name.as_deref(),
-        disposition.as_ref(),
-        &permit.name,
-        permit.wait_ms,
-    );
-    let link_done = classified
-        .heavy
-        .then(|| (cfg.permit_dir.clone(), classified.crate_name.clone()));
-    Some(Guards {
+    let permit = permits::acquire(&cfg, class, config_path)?;
+    Some(Governed {
         permit,
-        link: link_slot,
-        link_done,
+        cfg,
+        class,
+        classified,
     })
 }
 

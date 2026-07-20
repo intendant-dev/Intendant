@@ -4,11 +4,14 @@
 // This is intentionally not a CI test: it uses the installed/authenticated
 // Kimi CLI and the K2.7 Coding model. It drives Intendant through its Unix
 // control socket and loopback dashboard API, while isolating Intendant state,
-// Kimi session history, and copied auth material in one disposable root.
+// Kimi session history, and copied auth material in one disposable root. Any
+// OAuth refresh rotation is compare-and-swap published back to the source
+// credential after the supervised process stops, before that root is deleted.
 //
 // Usage:
 //   node driver.cjs [--binary <path>] [--workdir <path>] [--port <n>]
 //                   [--keep] [--quick] [--background-only]
+//                   [--auth-sync-self-test]
 //
 // --quick skips the slow steering/interrupt/background-agent phases. The
 // default is the exhaustive acceptance scenario.
@@ -29,6 +32,20 @@ const HIGHSPEED_MODEL = "kimi-code/kimi-for-coding-highspeed";
 const MODEL_DISPLAY = "K2.7 Coding";
 const SUPPORTED_KIMI_VERSION = /^0\.(?:27|28)\./;
 const args = process.argv.slice(2);
+const USAGE = `Usage:
+  node driver.cjs [--binary <path>] [--workdir <path>] [--port <n>]
+                  [--kimi <path>] [--keep] [--quick] [--background-only]
+                  [--auth-sync-self-test]
+
+The default is the exhaustive authenticated K2.7 Coding acceptance scenario.
+--quick skips slow steer/interrupt/background phases; --background-only runs
+only the native background-agent phase after startup. --auth-sync-self-test
+validates credential rotation copy-back without contacting Kimi.`;
+
+if (args.includes("--help") || args.includes("-h")) {
+  console.log(USAGE);
+  process.exit(0);
+}
 
 function argValue(name, fallback) {
   const i = args.indexOf(name);
@@ -43,6 +60,7 @@ const KIMI_HOME = path.join(ROOT, "kimi-home");
 const KEEP = args.includes("--keep");
 const QUICK = args.includes("--quick");
 const BACKGROUND_ONLY = args.includes("--background-only");
+const AUTH_SYNC_SELF_TEST = args.includes("--auth-sync-self-test");
 const BINARY = path.resolve(
   argValue(
     "--binary",
@@ -63,6 +81,7 @@ const t0 = Date.now();
 const logLines = [];
 const checks = [];
 const skips = [];
+let kimiAuthSnapshot = null;
 
 function ts() {
   return `${((Date.now() - t0) / 1000).toFixed(1).padStart(7)}s`;
@@ -246,16 +265,39 @@ function chmodTreePrivate(root) {
   }
 }
 
+function credentialDigest(bytes) {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
+}
+
+function requirePrivateRegularCredential(credential, label) {
+  const stat = fs.lstatSync(credential);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`${label} must be a regular file`);
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    throw new Error(`${label} must not be readable by group or other users`);
+  }
+}
+
 function copyKimiAuthState() {
-  const source = path.resolve(
+  const requestedSource = path.resolve(
     process.env.KIMI_CODE_HOME || path.join(os.homedir(), ".kimi-code"),
   );
+  const source = fs.realpathSync(requestedSource);
   const credential = path.join(source, "credentials", "kimi-code.json");
   if (!fs.existsSync(credential)) {
     throw new Error(
       `Kimi is not authenticated: expected ${credential}. Run "kimi login" first.`,
     );
   }
+  requirePrivateRegularCredential(credential, "Kimi source credential");
+  const sourceBytes = fs.readFileSync(credential);
+  kimiAuthSnapshot = {
+    credential,
+    initialDigest: credentialDigest(sourceBytes),
+  };
+  sourceBytes.fill(0);
+
   fs.mkdirSync(KIMI_HOME, { recursive: true, mode: 0o700 });
   for (const name of [
     "credentials",
@@ -273,6 +315,138 @@ function copyKimiAuthState() {
     });
   }
   chmodTreePrivate(KIMI_HOME);
+}
+
+// OAuth providers may rotate the refresh grant on a successful model call.
+// The E2E intentionally runs from an isolated KIMI_CODE_HOME, so deleting that
+// home without publishing the rotated credential makes the machine's original
+// login unusable. Adopt the refreshed file only after every supervised Kimi
+// descendant is stopped, and only if the source still matches the snapshot
+// copied at startup. The compare-and-swap refuses to clobber a concurrent
+// `kimi login` or direct CLI refresh.
+function syncKimiAuthState() {
+  if (!kimiAuthSnapshot) return;
+  const isolated = path.join(KIMI_HOME, "credentials", "kimi-code.json");
+  if (!fs.existsSync(isolated)) {
+    throw new Error("isolated Kimi credential disappeared before refresh sync");
+  }
+  requirePrivateRegularCredential(isolated, "Kimi isolated credential");
+  requirePrivateRegularCredential(
+    kimiAuthSnapshot.credential,
+    "Kimi source credential",
+  );
+
+  const isolatedBytes = fs.readFileSync(isolated);
+  const sourceBytes = fs.readFileSync(kimiAuthSnapshot.credential);
+  const isolatedDigest = credentialDigest(isolatedBytes);
+  const sourceDigest = credentialDigest(sourceBytes);
+  try {
+    if (isolatedDigest === kimiAuthSnapshot.initialDigest) {
+      log("auth", "Kimi OAuth credential did not rotate");
+      return;
+    }
+    if (sourceDigest !== kimiAuthSnapshot.initialDigest) {
+      throw new Error(
+        "Kimi source credential changed during E2E; refusing to overwrite a concurrent login or refresh",
+      );
+    }
+
+    const parent = path.dirname(kimiAuthSnapshot.credential);
+    const temporary = path.join(
+      parent,
+      `.intendant-e2e-refresh-${process.pid}-${crypto.randomUUID()}`,
+    );
+    let fd;
+    try {
+      fd = fs.openSync(temporary, "wx", 0o600);
+      fs.writeFileSync(fd, isolatedBytes);
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = undefined;
+      fs.renameSync(temporary, kimiAuthSnapshot.credential);
+      fs.chmodSync(kimiAuthSnapshot.credential, 0o600);
+      const parentFd = fs.openSync(parent, "r");
+      try {
+        fs.fsyncSync(parentFd);
+      } finally {
+        fs.closeSync(parentFd);
+      }
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+      fs.rmSync(temporary, { force: true });
+    }
+    requirePrivateRegularCredential(
+      kimiAuthSnapshot.credential,
+      "refreshed Kimi source credential",
+    );
+    const installed = fs.readFileSync(kimiAuthSnapshot.credential);
+    try {
+      if (credentialDigest(installed) !== isolatedDigest) {
+        throw new Error("Kimi refreshed credential failed post-write verification");
+      }
+    } finally {
+      installed.fill(0);
+    }
+    log("auth", "persisted Kimi OAuth refresh from isolated E2E home");
+  } finally {
+    isolatedBytes.fill(0);
+    sourceBytes.fill(0);
+  }
+}
+
+function runAuthSyncSelfTest() {
+  const sourceHome = path.join(ROOT, "auth-sync-source");
+  const sourceCredential = path.join(
+    sourceHome,
+    "credentials",
+    "kimi-code.json",
+  );
+  const isolatedCredential = path.join(
+    KIMI_HOME,
+    "credentials",
+    "kimi-code.json",
+  );
+  fs.mkdirSync(path.dirname(sourceCredential), {
+    recursive: true,
+    mode: 0o700,
+  });
+  fs.mkdirSync(path.dirname(isolatedCredential), {
+    recursive: true,
+    mode: 0o700,
+  });
+
+  const install = (source, isolated) => {
+    fs.writeFileSync(sourceCredential, source, { mode: 0o600 });
+    fs.chmodSync(sourceCredential, 0o600);
+    fs.writeFileSync(isolatedCredential, isolated, { mode: 0o600 });
+    fs.chmodSync(isolatedCredential, 0o600);
+    kimiAuthSnapshot = {
+      credential: sourceCredential,
+      initialDigest: credentialDigest(Buffer.from(source)),
+    };
+  };
+
+  install("synthetic-initial", "synthetic-rotated");
+  syncKimiAuthState();
+  check(
+    "auth-refresh-copyback",
+    fs.readFileSync(sourceCredential, "utf8") === "synthetic-rotated",
+  );
+
+  install("synthetic-second", "synthetic-second-rotated");
+  fs.writeFileSync(sourceCredential, "synthetic-concurrent", { mode: 0o600 });
+  fs.chmodSync(sourceCredential, 0o600);
+  let refusedConcurrent = false;
+  try {
+    syncKimiAuthState();
+  } catch (error) {
+    refusedConcurrent = /changed during E2E/.test(String(error));
+  }
+  check(
+    "auth-refresh-concurrent-write-refused",
+    refusedConcurrent &&
+      fs.readFileSync(sourceCredential, "utf8") === "synthetic-concurrent",
+  );
 }
 
 function descendantsOf(rootPid) {
@@ -2435,6 +2609,10 @@ async function scenario(run, port, kimiVersion) {
 }
 
 async function main() {
+  if (AUTH_SYNC_SELF_TEST) {
+    runAuthSyncSelfTest();
+    return;
+  }
   log("setup", `Intendant: ${BINARY}`);
   log("setup", `Kimi: ${KIMI_COMMAND}`);
   log("setup", `model: ${MODEL} (${MODEL_DISPLAY})`);
@@ -2458,7 +2636,11 @@ async function main() {
   try {
     await scenario(run, port, version);
   } finally {
-    await run.stop();
+    try {
+      await run.stop();
+    } finally {
+      syncKimiAuthState();
+    }
   }
 }
 

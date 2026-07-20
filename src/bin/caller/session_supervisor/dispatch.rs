@@ -54,7 +54,8 @@ fn fast_control_queue_ids(msg: &event::ControlMsg) -> (Vec<String>, bool) {
         | C::Deny { session_id, .. }
         | C::Skip { session_id, .. }
         | C::ApproveAll { session_id, .. }
-        | C::AnswerQuestion { session_id, .. } => {
+        | C::AnswerQuestion { session_id, .. }
+        | C::HoldQuestion { session_id, .. } => {
             (session_id.iter().cloned().collect(), session_id.is_none())
         }
         C::StopSession { session_id } | C::ReloadCredentials { session_id } => {
@@ -908,6 +909,13 @@ impl SessionSupervisor {
                 session_id,
                 id,
                 answers,
+                // Structured selections/follow-ups/annotations serve the
+                // MCP ask waiter's per-question result; the supervisor's
+                // registry answer channel speaks the joined-answers map
+                // only (external backends have no protocol slot for them).
+                selections: _,
+                followups: _,
+                annotations: _,
             } => {
                 self.resolve_approval(
                     session_id,
@@ -1195,6 +1203,7 @@ pub(crate) fn control_target_session_id(msg: &event::ControlMsg) -> Option<&str>
         | event::ControlMsg::Skip { session_id, .. }
         | event::ControlMsg::ApproveAll { session_id, .. }
         | event::ControlMsg::AnswerQuestion { session_id, .. }
+        | event::ControlMsg::HoldQuestion { session_id, .. }
         | event::ControlMsg::Interrupt { session_id, .. }
         | event::ControlMsg::Steer { session_id, .. }
         | event::ControlMsg::CancelSteer { session_id, .. }

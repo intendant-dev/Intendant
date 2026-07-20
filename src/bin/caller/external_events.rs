@@ -104,6 +104,7 @@ pub(crate) async fn drain_external_agent_events(
     cancelled_follow_ups: &mut HashSet<String>,
     codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
     side_sessions: Option<&mut ExternalSideSessionState<'_>>,
+    primary_turn_revisions: Option<&mut UserTurnRevisionState>,
     managed_context_recovery_kickstart: bool,
     managed_context_density_handoff: bool,
     managed_context_density_handoff_completed: bool,
@@ -122,6 +123,7 @@ pub(crate) async fn drain_external_agent_events(
         codex_thread_action_dedupe,
         &mut prefetched_events,
         side_sessions,
+        primary_turn_revisions,
         managed_context_recovery_kickstart,
         managed_context_density_handoff,
         managed_context_density_handoff_completed,
@@ -211,6 +213,12 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
     codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
     prefetched_events: &mut std::collections::VecDeque<external_agent::AgentEvent>,
     mut side_sessions: Option<&mut ExternalSideSessionState<'_>>,
+    // The primary session's prompt-ordinal state, so an idle-delivered
+    // steer (the no-active-parent-turn fallback below) can emit its user
+    // row under the same ordinal the transcript lane will assign it.
+    // `None` for lanes without primary ordinal tracking (child drains,
+    // run_modes' persistent external thread lane).
+    mut primary_turn_revisions: Option<&mut UserTurnRevisionState>,
     managed_context_recovery_kickstart: bool,
     managed_context_density_handoff: bool,
     managed_context_density_handoff_completed: bool,
@@ -721,7 +729,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                     text: text.clone(),
                                 });
                                 let reason = format!(
-                                    "{} accepted the steer; waiting for the next runtime checkpoint",
+                                    "{} injected the message into the running turn — awaiting the model's next activity",
                                     agent.name()
                                 );
                                 slog(config.session_log, |l| {
@@ -775,6 +783,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                     match start_external_primary_steer_followup_turn(
                                         agent,
                                         config,
+                                        primary_turn_revisions.as_deref_mut(),
                                         primary_session_id.clone(),
                                         text.clone(),
                                         id.clone(),
@@ -1438,6 +1447,14 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     presence: None,
                 });
             }
+            // Rate-limit windows at the report itself → the vitals hub
+            // (rejected turns produce no usage snapshot to ride).
+            external_agent::AgentEvent::RateLimitWindows { windows } => {
+                config.bus.send(AppEvent::SessionRateLimits {
+                    session_id: config.session_id.clone(),
+                    windows,
+                });
+            }
             external_agent::AgentEvent::ActivityUpdate { activity } => {
                 // Wire-fact activity snapshot → the vitals hub (keyed like
                 // usage; the hub's identity aliasing folds it into the
@@ -1660,6 +1677,17 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 tool_name,
                 message_uuid,
             } => {
+                // A model-issued tool call is a fresh API response — the same
+                // checkpoint evidence as streamed text, and often the ONLY
+                // signal for minutes when the model chains tool calls without
+                // emitting text (observed live: a 5-minute "waiting" row on an
+                // already-absorbed steer). The helper's session filter keeps a
+                // child sub-agent's tool calls from confirming parent steers.
+                mark_pending_runtime_steers_delivered_at_model_checkpoint(
+                    config,
+                    pending_runtime_steers,
+                    agent.name(),
+                );
                 if event_is_primary
                     && agent.supports_item_anchor_rewind()
                     && managed_codex_foreground_dashboard_command(&tool_name, &preview)
@@ -2153,6 +2181,10 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         session_id: config.session_id.clone(),
                         id,
                         questions: questions.clone(),
+                        // External backends govern their own wait — no
+                        // daemon-side deadline, so nothing to hold.
+                        expires_at_ms: None,
+                        held: false,
                     });
                     slog(config.session_log, |l| {
                         l.info(&format!("Question for the user: {}", preview))
@@ -3001,6 +3033,7 @@ mod tests {
             &mut cancelled_follow_ups,
             &mut dedupe,
             None,
+            None,
             false,
             false,
             false,
@@ -3117,6 +3150,7 @@ mod tests {
             &mut cancelled_follow_ups,
             &mut dedupe,
             Some(&mut side_sessions),
+            None,
             false,
             false,
             false,
@@ -3215,6 +3249,7 @@ mod tests {
             &mut handled_steer_ids,
             &mut cancelled_follow_ups,
             &mut dedupe,
+            None,
             None,
             false,
             false,
@@ -3319,6 +3354,7 @@ mod tests {
             &mut handled_steer_ids,
             &mut cancelled_follow_ups,
             &mut dedupe,
+            None,
             None,
             false,
             false,
@@ -3443,6 +3479,7 @@ mod tests {
             &mut cancelled_follow_ups,
             &mut dedupe,
             Some(&mut side_sessions),
+            None,
             false,
             false,
             false,
@@ -3557,6 +3594,7 @@ mod tests {
             &mut handled_steer_ids,
             &mut cancelled_follow_ups,
             &mut dedupe,
+            None,
             None,
             false,
             false,
@@ -3952,6 +3990,7 @@ mod tests {
             &mut cancelled_follow_ups,
             &mut dedupe,
             None,
+            None,
             false,
             false,
             false,
@@ -4091,6 +4130,7 @@ mod tests {
             &mut handled_steer_ids,
             &mut cancelled_follow_ups,
             &mut dedupe,
+            None,
             None,
             false,
             false,
@@ -4243,6 +4283,7 @@ mod tests {
             &mut handled_steer_ids,
             &mut cancelled_follow_ups,
             &mut dedupe,
+            None,
             None,
             false,
             false,
@@ -4440,6 +4481,7 @@ mod tests {
             &mut cancelled_follow_ups,
             &mut dedupe,
             None,
+            None,
             false,
             false,
             false,
@@ -4622,6 +4664,7 @@ mod tests {
             &mut cancelled_follow_ups,
             &mut dedupe,
             None,
+            None,
             false,
             false,
             false,
@@ -4764,6 +4807,7 @@ mod tests {
             &mut cancelled_follow_ups,
             &mut dedupe,
             None,
+            None,
             false,
             false,
             true,
@@ -4842,6 +4886,7 @@ mod tests {
             &mut handled_steer_ids,
             &mut cancelled_follow_ups,
             &mut dedupe,
+            None,
             None,
             false,
             false,

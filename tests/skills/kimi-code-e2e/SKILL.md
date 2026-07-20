@@ -44,6 +44,12 @@ Kimi transcripts, server lock/token, MCP bridge configuration, Intendant
 logs, and test project files therefore stay out of the user's normal stores.
 Default cleanup terminates the Intendant process, tracks and reaps only its
 proven descendants, removes its Unix socket, and deletes the disposable root.
+Because Kimi's OAuth provider can rotate its refresh grant during a successful
+call, the stopped harness first compare-and-swap publishes a changed isolated
+credential back to the source file with an atomic 0600 replacement. It refuses
+to overwrite a source changed by a concurrent `kimi login` or direct refresh;
+without that copy-back, deleting the isolated home would strand the only valid
+rotated grant and make the machine login unusable.
 Use `--keep` only when inspecting a failure; that root contains copied Kimi
 credentials and must be deleted securely afterward.
 
@@ -115,6 +121,8 @@ Options:
 --keep            Preserve the disposable root for diagnosis (contains auth)
 --quick           Skip long steer/interrupt/background-agent phases
 --background-only Run only startup plus the background-agent acceptance phase
+--auth-sync-self-test
+                  Hermetically test OAuth rotation copy-back and CAS refusal
 ```
 
 The full run can take several minutes because it intentionally waits on live

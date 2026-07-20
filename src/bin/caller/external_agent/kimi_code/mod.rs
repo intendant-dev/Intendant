@@ -33,6 +33,7 @@ use crate::error::CallerError;
 pub(crate) use self::bridge::sync_managed_bridges_to_primary;
 use self::bridge::{
     choose_mcp_server_name, prepare_bridge_home, sync_bridge_home_to_primary, BridgeMcpConfig,
+    CredentialRefreshMonitor,
 };
 use self::events::{
     child_thread_id, normalize_goal_status, question_answer_body, split_child_thread_id,
@@ -125,6 +126,7 @@ pub struct KimiCodeAgent {
     mcp_auth_token: Option<String>,
     mcp_session_id: Option<String>,
     bridge_home: Option<PathBuf>,
+    credential_refresh: Option<CredentialRefreshMonitor>,
     review_lease: Arc<tokio::sync::Mutex<Option<KimiReviewToolLease>>>,
     review_monitor: Option<tokio::task::JoinHandle<()>>,
 }
@@ -165,6 +167,7 @@ impl KimiCodeAgent {
             mcp_auth_token: None,
             mcp_session_id: None,
             bridge_home: None,
+            credential_refresh: None,
             review_lease: Arc::new(tokio::sync::Mutex::new(None)),
             review_monitor: None,
         }
@@ -1482,10 +1485,14 @@ impl ExternalAgent for KimiCodeAgent {
             }),
             None => None,
         };
-        let bridge_home = tokio::task::spawn_blocking({
+        let (bridge_home, credential_refresh) = tokio::task::spawn_blocking({
             let primary_home = primary_home.clone();
             let identity = identity.clone();
-            move || prepare_bridge_home(&primary_home, &identity, mcp.as_ref())
+            move || {
+                let bridge = prepare_bridge_home(&primary_home, &identity, mcp.as_ref())?;
+                let credential_refresh = CredentialRefreshMonitor::prepare(&primary_home, &bridge)?;
+                Ok::<_, std::io::Error>((bridge, credential_refresh))
+            }
         })
         .await
         .map_err(|error| external(format!("Kimi bridge preparation panicked: {error}")))?
@@ -1636,6 +1643,8 @@ impl ExternalAgent for KimiCodeAgent {
             }
         };
 
+        let credential_refresh = credential_refresh
+            .map(|mirror| CredentialRefreshMonitor::start(mirror, event_tx.clone()));
         self.child = Some(child);
         self.child_pid = child_pid;
         self.api = Some(api);
@@ -1646,6 +1655,7 @@ impl ExternalAgent for KimiCodeAgent {
         self.stdout_handle = Some(stdout_handle);
         self.stderr_handle = Some(stderr_handle);
         self.bridge_home = Some(bridge_home);
+        self.credential_refresh = credential_refresh;
         self.emit(AgentEvent::CwdAnnounced {
             cwd: config.working_dir.to_string_lossy().to_string(),
         });
@@ -2400,6 +2410,14 @@ impl ExternalAgent for KimiCodeAgent {
         if let Some(mut child) = self.child.take() {
             let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
         }
+        let credential_sync = match self.credential_refresh.take() {
+            Some(monitor) => monitor.shutdown().await.map_err(|error| {
+                external(format!(
+                    "failed to persist Kimi copy-fallback OAuth refresh: {error}"
+                ))
+            }),
+            None => Ok(()),
+        };
         if let Some(handle) = self.stdout_handle.take() {
             handle.abort();
         }
@@ -2422,7 +2440,12 @@ impl ExternalAgent for KimiCodeAgent {
         self.api = None;
         self.rpc = None;
         self.event_tx = None;
-        match (review_restore, bridge_sync) {
+        let bridge_persistence = match (credential_sync, bridge_sync) {
+            (Err(credential), Err(history)) => Err(external(format!("{credential}; {history}"))),
+            (Err(credential), Ok(())) => Err(credential),
+            (Ok(()), result) => result,
+        };
+        match (review_restore, bridge_persistence) {
             (Err(review), Err(bridge)) => Err(external(format!(
                 "failed to restore Kimi review confinement: {review}; {bridge}"
             ))),
@@ -2453,6 +2476,9 @@ impl Drop for KimiCodeAgent {
         }
         if let Some(handle) = self.stderr_handle.take() {
             handle.abort();
+        }
+        if let Some(monitor) = self.credential_refresh.take() {
+            monitor.sync_on_drop();
         }
         if let Some(bridge) = self.bridge_home.take() {
             // Drop cannot await, but a synchronous best-effort pass preserves

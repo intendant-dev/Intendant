@@ -1,10 +1,8 @@
-//! `<permit_dir>/governor.log`: one acquisition line per governed
-//! invocation, plus one `kind=link-done` completion line per heavyweight
-//! link (bypasses, probes, and fail-open runs are deliberately silent —
-//! the log answers "who waited how long on which permit", and the probe
-//! fast path must not pay even a log write). The link fields — crate,
-//! classification, both waits, runtime — are the soak telemetry the
-//! link-gate sizing (and any future allowlist/weighting) is justified by.
+//! `<permit_dir>/governor.log`: one compile-permit acquisition line per
+//! governed invocation, plus linker acquisition/completion lines for each
+//! heavyweight final artifact. Bypasses, probes, and fail-open runs are
+//! deliberately silent — the log answers which phase waited, for how long,
+//! and on which resource. The probe fast path must not pay even a log write.
 //!
 //! Best-effort end to end: logging must never fail the build, so every I/O
 //! error here is swallowed. Rotation is truncate-in-place at 1MB keeping
@@ -30,45 +28,77 @@ const KEEP_BYTES: u64 = 256 * 1024;
 /// carry `None` and log `kind=compile`).
 pub(crate) enum LinkDisposition<'a> {
     /// Serialized through a held slot.
-    Gated { slot: &'a str, link_wait_ms: u64 },
+    Gated {
+        slot: &'a str,
+        link_wait_ms: u64,
+        queue: &'a str,
+        scope: &'a str,
+    },
     /// `link_slots = 0`: gated off by configuration.
     Off,
     /// No usable slot file: gating degraded, ordinary governance kept.
     Degraded,
 }
 
-pub(crate) fn log_governed(
+pub(crate) fn log_compile(
     permit_dir: &Path,
     class: &str,
     crate_name: Option<&str>,
-    link: Option<&LinkDisposition>,
+    link_deferred: bool,
     permit_name: &str,
     wait_ms: u64,
 ) {
-    let kind = match link {
-        None => " kind=compile".to_string(),
-        Some(LinkDisposition::Gated { slot, link_wait_ms }) => {
-            format!(" kind=link link_slot={slot} link_wait_ms={link_wait_ms}")
-        }
-        Some(LinkDisposition::Off) => " kind=link-ungated reason=off".to_string(),
-        Some(LinkDisposition::Degraded) => " kind=link-ungated reason=degraded".to_string(),
-    };
+    let deferred = if link_deferred { " link=deferred" } else { "" };
     append_line(
         permit_dir,
         &format!(
-            "class={class} crate={}{kind} permit={permit_name} wait_ms={wait_ms}",
+            "class={class} crate={} kind=compile{deferred} permit={permit_name} wait_ms={wait_ms}",
             printable_crate(crate_name),
         ),
     );
 }
 
-/// Completion line for every heavyweight link (gated or not): the runtime
-/// is the number that sizes the gate post-soak.
-pub(crate) fn log_link_done(permit_dir: &Path, crate_name: Option<&str>, runtime_ms: u64) {
+pub(crate) fn log_link(
+    permit_dir: &Path,
+    class: &str,
+    crate_name: Option<&str>,
+    disposition: &LinkDisposition<'_>,
+    permit_name: &str,
+    permit_wait_ms: u64,
+) {
+    let kind = match disposition {
+        LinkDisposition::Gated {
+            slot,
+            link_wait_ms,
+            queue,
+            scope,
+        } => format!(
+            "kind=link link_slot={slot} link_wait_ms={link_wait_ms} queue={queue} scope={scope}"
+        ),
+        LinkDisposition::Off => "kind=link-ungated reason=off".to_string(),
+        LinkDisposition::Degraded => "kind=link-ungated reason=degraded".to_string(),
+    };
     append_line(
         permit_dir,
         &format!(
-            "crate={} kind=link-done runtime_ms={runtime_ms}",
+            "class={class} crate={} {kind} permit={permit_name} wait_ms={permit_wait_ms}",
+            printable_crate(crate_name),
+        ),
+    );
+}
+
+/// Completion line for every heavyweight link (gated or not). In normal
+/// shim operation this is actual linker wall time, not rustc compile time.
+pub(crate) fn log_link_done(
+    permit_dir: &Path,
+    crate_name: Option<&str>,
+    runtime_ms: u64,
+    scope: &str,
+) {
+    append_line(
+        permit_dir,
+        &format!(
+            "crate={} kind=link-done runtime_ms={runtime_ms} scope={scope}",
             printable_crate(crate_name),
         ),
     );
@@ -180,7 +210,14 @@ mod tests {
     #[test]
     fn log_line_appends_and_parses() {
         let dir = tempfile::tempdir().unwrap();
-        log_governed(dir.path(), "local", Some("serde"), None, "permit-ci-1", 230);
+        log_compile(
+            dir.path(),
+            "local",
+            Some("serde"),
+            false,
+            "permit-ci-1",
+            230,
+        );
         let text = std::fs::read_to_string(dir.path().join(LOG_NAME)).unwrap();
         let line = text.trim_end();
         assert!(
@@ -194,57 +231,72 @@ mod tests {
     #[test]
     fn link_lines_carry_the_soak_fields() {
         let dir = tempfile::tempdir().unwrap();
-        log_governed(
+        log_compile(
             dir.path(),
             "local",
             Some("intendant"),
-            Some(&LinkDisposition::Gated {
-                slot: "link-0",
-                link_wait_ms: 1200,
-            }),
+            true,
             "permit-local-0",
             5,
         );
-        log_governed(
+        log_link(
+            dir.path(),
+            "local",
+            Some("intendant"),
+            &LinkDisposition::Gated {
+                slot: "link-0",
+                link_wait_ms: 1200,
+                queue: "fifo",
+                scope: "linker",
+            },
+            "permit-local-0",
+            5,
+        );
+        log_link(
             dir.path(),
             "ci",
             Some("intendant_connect"),
-            Some(&LinkDisposition::Off),
+            &LinkDisposition::Off,
             "permit-ci-0",
             0,
         );
-        log_governed(
+        log_link(
             dir.path(),
             "ci",
             None,
-            Some(&LinkDisposition::Degraded),
+            &LinkDisposition::Degraded,
             "permit-ci-1",
             0,
         );
-        log_link_done(dir.path(), Some("intendant"), 48_000);
+        log_link_done(dir.path(), Some("intendant"), 48_000, "linker");
         let text = std::fs::read_to_string(dir.path().join(LOG_NAME)).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert!(
-            lines[0].contains(
-                "crate=intendant kind=link link_slot=link-0 link_wait_ms=1200 permit=permit-local-0 wait_ms=5"
-            ),
+            lines[0].contains("crate=intendant kind=compile link=deferred"),
             "{}",
             lines[0]
         );
         assert!(
-            lines[1].contains("kind=link-ungated reason=off permit=permit-ci-0"),
+            lines[1].contains(
+                "crate=intendant kind=link link_slot=link-0 link_wait_ms=1200 queue=fifo scope=linker permit=permit-local-0 wait_ms=5"
+            ),
             "{}",
             lines[1]
         );
         assert!(
-            lines[2].contains("crate=- kind=link-ungated reason=degraded"),
+            lines[2].contains("kind=link-ungated reason=off permit=permit-ci-0"),
             "{}",
             lines[2]
         );
         assert!(
-            lines[3].contains("crate=intendant kind=link-done runtime_ms=48000"),
+            lines[3].contains("crate=- kind=link-ungated reason=degraded"),
             "{}",
             lines[3]
+        );
+        assert!(
+            lines[4].contains("crate=intendant kind=link-done runtime_ms=48000 scope=linker"),
+            "{}",
+            lines[4]
         );
     }
 
@@ -268,7 +320,7 @@ mod tests {
             }
         }
         assert!(std::fs::metadata(&path).unwrap().len() > MAX_LOG_BYTES);
-        log_governed(dir.path(), "ci", None, None, "permit-ci-0", 7);
+        log_compile(dir.path(), "ci", None, false, "permit-ci-0", 7);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             (text.len() as u64) <= KEEP_BYTES + 128,
@@ -288,7 +340,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LOG_NAME);
         std::fs::write(&path, "existing line\n").unwrap();
-        log_governed(dir.path(), "local", None, None, "permit-local-0", 0);
+        log_compile(dir.path(), "local", None, false, "permit-local-0", 0);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("existing line\n"));
         assert_eq!(text.lines().count(), 2);

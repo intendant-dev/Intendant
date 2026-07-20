@@ -681,6 +681,8 @@ mod tests {
             completed_ms: None,
             answer: None,
             effects: Vec::new(),
+            ask: None,
+            dismissed: None,
         }
     }
 

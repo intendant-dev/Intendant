@@ -337,22 +337,20 @@ pub(crate) async fn reader_task(
         }
 
         if method == "account/rateLimits/updated" {
-            let windows = codex_rate_limit_windows(&params);
-            if !windows.is_empty() && windows != notification_state.limit_windows {
-                notification_state.limit_windows = windows;
-                // Refresh the gauges between turns by re-emitting the last
-                // usage snapshot with the new windows — never a bare
-                // zero-usage event, which would stomp the dashboard meter.
-                if let Some(mut latest) = notification_state.latest_usage.clone() {
-                    latest.limits = notification_state.limit_windows.clone();
-                    notification_state.latest_usage = Some(latest.clone());
-                    send_scoped_agent_event(
-                        &event_tx,
-                        thread_id.as_deref(),
-                        turn_id.as_deref(),
-                        AgentEvent::Usage { usage: latest },
-                    );
-                }
+            let windows =
+                codex_rate_limit_windows(&params, crate::session_activity::epoch_seconds());
+            if !windows.is_empty() {
+                notification_state.limit_windows = windows.clone();
+                // Deliver the report itself (dedicated vitals event, never
+                // a bare zero-usage snapshot that would stomp the dashboard
+                // meter): the gauges refresh between turns and before the
+                // first usage snapshot exists at all.
+                send_scoped_agent_event(
+                    &event_tx,
+                    thread_id.as_deref(),
+                    turn_id.as_deref(),
+                    AgentEvent::RateLimitWindows { windows },
+                );
             }
         }
 
@@ -1083,9 +1081,12 @@ pub(crate) struct CodexNotificationState {
 
 /// Parse an `account/rateLimits/updated` payload (app-server v2 shape:
 /// `rateLimits.{primary,secondary}.{usedPercent,windowDurationMins,
-/// resetsAt}`, camelCase with snake_case tolerated) into vitals windows.
+/// resetsAt}`, camelCase with snake_case tolerated) into vitals windows,
+/// stamped with `observed_at_epoch = now_epoch` (the report is fresh at
+/// parse time).
 pub(crate) fn codex_rate_limit_windows(
     params: &serde_json::Value,
+    now_epoch: u64,
 ) -> Vec<crate::types::SessionLimitWindow> {
     let snapshot = params
         .get("rateLimits")
@@ -1116,6 +1117,7 @@ pub(crate) fn codex_rate_limit_windows(
                 .or_else(|| window.get("resets_at"))
                 .and_then(|v| v.as_u64()),
             status: None,
+            observed_at_epoch: Some(now_epoch),
         });
     }
     windows
@@ -3321,26 +3323,28 @@ mod tests {
                 "secondary": {"usedPercent": 12, "windowDurationMins": 10080}
             }
         });
-        let windows = codex_rate_limit_windows(&params);
+        let windows = codex_rate_limit_windows(&params, 1_700_000_000);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].label, "5h");
         assert_eq!(windows[0].used_pct, Some(34));
         assert_eq!(windows[0].resets_at_epoch, Some(1_783_300_000));
+        assert_eq!(windows[0].observed_at_epoch, Some(1_700_000_000));
         assert_eq!(windows[1].label, "7d");
         assert_eq!(windows[1].used_pct, Some(12));
         assert_eq!(windows[1].resets_at_epoch, None);
+        assert_eq!(windows[1].observed_at_epoch, Some(1_700_000_000));
 
         let snake = serde_json::json!({
             "rate_limits": {
                 "primary": {"used_percent": 91.4, "window_minutes": 60}
             }
         });
-        let windows = codex_rate_limit_windows(&snake);
+        let windows = codex_rate_limit_windows(&snake, 1_700_000_000);
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].label, "1h");
         assert_eq!(windows[0].used_pct, Some(91));
 
-        assert!(codex_rate_limit_windows(&serde_json::json!({})).is_empty());
+        assert!(codex_rate_limit_windows(&serde_json::json!({}), 1_700_000_000).is_empty());
         assert_eq!(codex_rate_limit_label(Some(2880), "primary"), "2d");
         assert_eq!(codex_rate_limit_label(Some(45), "primary"), "45m");
         assert_eq!(codex_rate_limit_label(None, "secondary"), "secondary");
@@ -5531,12 +5535,14 @@ error: build failed
                 used_pct: Some(40),
                 resets_at_epoch: Some(2000),
                 status: None,
+                observed_at_epoch: None,
             },
             crate::types::SessionLimitWindow {
                 label: "7d".into(),
                 used_pct: Some(100),
                 resets_at_epoch: Some(9000),
                 status: None,
+                observed_at_epoch: None,
             },
         ];
         let none = serde_json::Value::Null;

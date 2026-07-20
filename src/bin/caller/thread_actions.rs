@@ -3366,6 +3366,8 @@ pub(crate) async fn drain_external_child_turn(
         cancelled_follow_ups,
         codex_thread_action_dedupe,
         None,
+        // Child drains never own the primary session's ordinal state.
+        None,
         false,
         false,
         false,
@@ -3793,6 +3795,10 @@ pub(crate) async fn handle_idle_external_child_interaction(
                 session_id: child_session_id.clone(),
                 id,
                 questions: questions.clone(),
+                // External backends own their wait lifecycle, so the daemon
+                // has no deadline to expose or suspend.
+                expires_at_ms: None,
+                held: false,
             });
             crate::emit_external_turn_status(
                 config.bus,
@@ -4358,6 +4364,12 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 session_id,
                 main: usage.into_model_snapshot(),
                 presence: None,
+            });
+        }
+        external_agent::AgentEvent::RateLimitWindows { windows } => {
+            config.bus.send(AppEvent::SessionRateLimits {
+                session_id,
+                windows,
             });
         }
         external_agent::AgentEvent::ActivityUpdate { activity } => {
@@ -5110,6 +5122,9 @@ mod tests {
                 description: String::new(),
             }],
             multi_select: false,
+            pick_min: None,
+            pick_max: None,
+            free_text: None,
             previews: Vec::new(),
         }];
         let mut question_events = bus.subscribe();
@@ -5119,6 +5134,7 @@ mod tests {
                     session_id,
                     id,
                     questions,
+                    ..
                 } = question_events.recv().await.unwrap()
                 {
                     assert_eq!(session_id.as_deref(), Some(child));

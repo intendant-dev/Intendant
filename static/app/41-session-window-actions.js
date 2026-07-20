@@ -3746,11 +3746,32 @@ function showHumanInput(question) {
 
 // ── Structured user question (external agents' ask-the-user tool) ──
 //
-// pendingQuestion = { id, sessionId, questions: UserQuestion[] } while the
-// panel is up. Selections/free text live in the DOM; sendQuestionAnswer()
-// collects them into {question text → answer} and dispatches
-// {action:'answer_question', id, answers} (session-scoped like approvals).
+// pendingQuestion = { id, sessionId, questions: UserQuestion[],
+// expiresAtMs, held } while the panel is up. Selections/free text live in
+// the DOM; sendQuestionAnswer() collects them into {question text →
+// answer} and dispatches {action:'answer_question', id, answers}
+// (session-scoped like approvals). expiresAtMs is the asking waiter's
+// wall-clock deadline (null = no daemon-side deadline, e.g. external
+// backends, or held open); held mirrors the user's hold_question state.
 let pendingQuestion = null;
+let questionDeadlineTicker = 0;
+
+// Effective selection bounds for a question — mirrors the daemon's
+// UserQuestion::pick_bounds: explicit pick_min/pick_max win, otherwise the
+// legacy rule (exactly one; any-number under multi_select), clamped to the
+// option count.
+function questionPickBounds(q) {
+  const optionCount = (q.options || []).length;
+  const defaultMax = q.multi_select ? Math.max(optionCount, 1) : 1;
+  let max = Math.max(1, q.pick_max ?? defaultMax);
+  if (optionCount > 0) max = Math.min(max, optionCount);
+  const min = Math.min(q.pick_min ?? 1, max);
+  return { min, max };
+}
+
+function questionFreeTextAllowed(q) {
+  return q.free_text !== false;
+}
 
 function questionOptionClicked(qIndex, optIndex) {
   if (!pendingQuestion) return;
@@ -3761,33 +3782,94 @@ function questionOptionClicked(qIndex, optIndex) {
   const buttons = block.querySelectorAll('.question-option');
   const btn = buttons[optIndex];
   if (!btn) return;
-  if (q.multi_select) {
-    btn.classList.toggle('selected');
-  } else {
+  const { max } = questionPickBounds(q);
+  if (max <= 1) {
     buttons.forEach((b) => b.classList.remove('selected'));
     btn.classList.add('selected');
+  } else if (btn.classList.contains('selected')) {
+    btn.classList.remove('selected');
+  } else if (block.querySelectorAll('.question-option.selected').length >= max) {
+    showControlToast('error', `Pick at most ${max} for this question`);
+    return;
+  } else {
+    btn.classList.add('selected');
   }
+  updateQuestionPickCounter(qIndex);
   updateQuestionProgress();
+}
+
+// Keep a multi-pick question's "n/max" counter current (exists only when
+// max > 1).
+function updateQuestionPickCounter(qIndex) {
+  if (!pendingQuestion) return;
+  const q = pendingQuestion.questions[qIndex];
+  const block = document.querySelector(`#question-content .question-block[data-q="${qIndex}"]`);
+  const counter = block?.querySelector('.question-pick-count');
+  if (!q || !counter) return;
+  const { min, max } = questionPickBounds(q);
+  const picked = block.querySelectorAll('.question-option.selected').length;
+  counter.textContent = `${picked}/${max} selected`;
+  counter.classList.toggle('warn', picked < min);
+  counter.title = min === max
+    ? `Pick exactly ${max}`
+    : `Pick ${min}–${max}`;
 }
 
 function collectQuestionAnswers() {
   if (!pendingQuestion) return null;
   const answers = {};
+  const selections = {};
+  const followups = {};
+  const annotations = {};
   for (let i = 0; i < pendingQuestion.questions.length; i++) {
     const q = pendingQuestion.questions[i];
     const block = document.querySelector(`#question-content .question-block[data-q="${i}"]`);
     if (!block) continue;
-    const typed = (block.querySelector('.question-free-text')?.value || '').trim();
+    const { min } = questionPickBounds(q);
+    const typed = questionFreeTextAllowed(q)
+      ? (block.querySelector('.question-free-text')?.value || '').trim()
+      : '';
     const picked = Array.from(block.querySelectorAll('.question-option.selected'))
       .map((b) => b.dataset.label)
       .filter(Boolean);
+    const followup = (block.querySelector('.question-followup-input')?.value || '').trim();
+    const notes = Array.from(block.querySelectorAll('.question-preview-note'))
+      .map((n) => ({ preview: n.dataset.previewLabel || '', note: (n.value || '').trim() }))
+      .filter((n) => n.note);
+    if (followup) followups[q.question] = followup;
+    if (notes.length) annotations[q.question] = notes;
     // Free text wins when both are present (mirrors the CLI's own picker,
     // where typing into "Other" overrides the highlighted option).
     const answer = typed || picked.join(', ');
-    if (!answer) return { missing: q.question };
+    if (!answer) {
+      // Optional, or engaged via follow-up/notes: legal to leave
+      // unanswered — the agent addresses the follow-up and re-asks.
+      if (min === 0 || followup || notes.length) continue;
+      return { missing: q.question };
+    }
+    if (!typed && picked.length < min) {
+      if (followup) continue; // the follow-up stands in for the unmet minimum
+      return {
+        missing: q.question,
+        hint: `Pick at least ${min} option${min === 1 ? '' : 's'} for "${q.header || q.question}"`,
+      };
+    }
     answers[q.question] = answer;
+    // Structured labels ride alongside the joined string, so labels that
+    // contain ", " survive and the agent gets a per-question breakdown.
+    selections[q.question] = typed ? [typed] : picked;
   }
-  return { answers };
+  if (
+    !Object.keys(answers).length
+    && !Object.keys(followups).length
+    && !Object.keys(annotations).length
+  ) {
+    return {
+      missing: pendingQuestion.questions[0]?.question || '',
+      hint: 'Nothing to submit yet — answer, follow up, or Skip',
+    };
+  }
+  return { answers, selections, followups, annotations };
 }
 
 // Scroll a question block to the top of the panel's internal scroll region.
@@ -3815,9 +3897,17 @@ function updateQuestionProgress() {
   const total = pendingQuestion.questions.length;
   let answered = 0;
   for (let i = 0; i < total; i++) {
+    const q = pendingQuestion.questions[i];
     const block = content.querySelector(`.question-block[data-q="${i}"]`);
     const typed = (block?.querySelector('.question-free-text')?.value || '').trim();
-    const done = !!(block && (typed || block.querySelector('.question-option.selected')));
+    const followup = (block?.querySelector('.question-followup-input')?.value || '').trim();
+    const { min } = questionPickBounds(q);
+    const picked = block ? block.querySelectorAll('.question-option.selected').length : 0;
+    // Ticked = ENGAGED (typed, enough picks, or a follow-up standing in).
+    // An untouched optional question stays untucked — a pre-ticked "✓" on
+    // something the user never looked at reads as a lie (min 0 only means
+    // Submit won't block on it).
+    const done = !!(block && (typed || followup || (picked > 0 && picked >= min)));
     if (done) answered++;
     const chip = content.querySelector(`.question-index-chip[data-q="${i}"]`);
     if (chip) {
@@ -3842,12 +3932,28 @@ function updateQuestionProgress() {
 // authentication is ambient (mTLS client cert → IAM principal), so agent
 // markup executing with dashboard-origin authority could drive the daemon
 // API as the operator. Pinned by question_preview_iframe_sandbox_is_pinned.
-function appendQuestionPreviews(block, q) {
+function appendQuestionPreviews(block, q, qIndex) {
   const previews = Array.isArray(q.previews) ? q.previews : [];
   if (!previews.length) return;
   const strip = document.createElement('div');
   strip.className = 'question-previews';
+  strip.dataset.mode = 'grid';
   if (previews.length > 1) strip.classList.add('multi');
+
+  // Focus mode chrome: tabs flip between candidates while one card owns
+  // the whole strip; Grid returns to side-by-side.
+  const tabs = document.createElement('div');
+  tabs.className = 'question-preview-tabs';
+  tabs.hidden = true;
+  strip.appendChild(tabs);
+  const gridBtn = document.createElement('button');
+  gridBtn.type = 'button';
+  gridBtn.className = 'question-preview-tab question-preview-tab-grid';
+  gridBtn.textContent = 'Grid';
+  gridBtn.title = 'Back to the side-by-side grid';
+  gridBtn.addEventListener('click', () => focusQuestionPreview(strip, null));
+  tabs.appendChild(gridBtn);
+
   const missingChip = (p, why) => {
     const chip = document.createElement('span');
     chip.className = 'question-preview-missing';
@@ -3855,34 +3961,86 @@ function appendQuestionPreviews(block, q) {
     chip.title = why || 'preview unavailable (blob deleted from the upload store)';
     return chip;
   };
-  previews.forEach((p) => {
+  previews.forEach((p, pIndex) => {
     const card = document.createElement('figure');
     card.className = 'question-preview-card';
+    card.dataset.p = String(pIndex);
+
+    const tab = document.createElement('button');
+    tab.type = 'button';
+    tab.className = 'question-preview-tab';
+    tab.dataset.p = String(pIndex);
+    tab.textContent = p.label || `#${pIndex + 1}`;
+    tab.addEventListener('click', () => focusQuestionPreview(strip, pIndex));
+    tabs.insertBefore(tab, gridBtn);
+
     const caption = document.createElement('figcaption');
     caption.className = 'question-preview-label';
     const captionText = document.createElement('span');
     captionText.textContent = p.label || '';
     caption.appendChild(captionText);
+    const capActions = document.createElement('span');
+    capActions.className = 'question-preview-cap-actions';
+    // When an option shares this card's label, offer the pick right where
+    // the user is looking (same selection path as the option buttons).
+    const optIndex = (q.options || []).findIndex((o) => o.label === p.label);
+    if (optIndex >= 0) {
+      const choose = document.createElement('button');
+      choose.type = 'button';
+      choose.className = 'question-preview-choose';
+      choose.textContent = `Choose ${p.label}`;
+      choose.addEventListener('click', () => {
+        questionOptionClicked(qIndex, optIndex);
+        const btns = document.querySelectorAll(
+          `#question-content .question-block[data-q="${qIndex}"] .question-option`
+        );
+        choose.classList.toggle('chosen', !!btns[optIndex]?.classList.contains('selected'));
+      });
+      capActions.appendChild(choose);
+    }
+    // Anchored annotation: a note that returns attached to THIS card by
+    // label ("B: rails too faint"), instead of floating in free text.
+    const noteInput = document.createElement('input');
+    noteInput.type = 'text';
+    noteInput.className = 'question-preview-note hidden';
+    noteInput.placeholder = `Note on ${p.label || 'this preview'}…`;
+    noteInput.dataset.previewLabel = p.label || `#${pIndex + 1}`;
+    const noteBtn = document.createElement('button');
+    noteBtn.type = 'button';
+    noteBtn.className = 'question-preview-note-btn';
+    noteBtn.textContent = '✎';
+    noteBtn.title = `Annotate ${p.label || 'this preview'} — the note returns anchored to this card`;
+    noteBtn.addEventListener('click', () => {
+      const hidden = noteInput.classList.toggle('hidden');
+      noteBtn.classList.toggle('open', !hidden);
+      if (!hidden) noteInput.focus();
+    });
+    capActions.appendChild(noteBtn);
+    const focusBtn = document.createElement('button');
+    focusBtn.type = 'button';
+    focusBtn.className = 'question-preview-focus';
+    focusBtn.textContent = '⛶';
+    focusBtn.title = 'Focus this preview (tabs switch candidates)';
+    focusBtn.addEventListener('click', () => {
+      const focused = strip.dataset.mode === 'focus' && card.classList.contains('focused');
+      focusQuestionPreview(strip, focused ? null : pIndex);
+    });
+    capActions.appendChild(focusBtn);
+    caption.appendChild(capActions);
     card.appendChild(caption);
+    card.appendChild(noteInput);
+
     if (p.kind === 'html' && p.url) {
       const frame = document.createElement('iframe');
       frame.className = 'question-preview-frame';
       frame.setAttribute('sandbox', 'allow-scripts');
       frame.setAttribute('referrerpolicy', 'no-referrer');
       frame.title = p.label || 'preview';
-      const grow = document.createElement('button');
-      grow.type = 'button';
-      grow.className = 'question-preview-expand';
-      grow.textContent = 'Expand';
-      grow.addEventListener('click', () => {
-        grow.textContent = card.classList.toggle('expanded') ? 'Collapse' : 'Expand';
-      });
-      caption.appendChild(grow);
       card.appendChild(frame);
       fetch(p.url)
         .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
         .then((html) => { frame.srcdoc = html; })
-        .catch(() => { grow.remove(); frame.replaceWith(missingChip(p)); });
+        .catch(() => { frame.replaceWith(missingChip(p)); });
     } else if (p.kind === 'image' && p.url) {
       const img = document.createElement('img');
       img.className = 'question-preview-image';
@@ -3911,18 +4069,186 @@ function appendQuestionPreviews(block, q) {
   block.appendChild(strip);
 }
 
-function showUserQuestion(id, questions, sessionId) {
+// Focus one preview card (by index) or return to the grid (null). Focus
+// mode gives the card the whole strip at near-pane height; the tab row
+// flips between candidates without a round-trip through the grid.
+function focusQuestionPreview(strip, index) {
+  const focus = index !== null && index !== undefined;
+  strip.dataset.mode = focus ? 'focus' : 'grid';
+  const tabs = strip.querySelector('.question-preview-tabs');
+  if (tabs) tabs.hidden = !focus;
+  strip.querySelectorAll('.question-preview-tab').forEach((t) => {
+    t.classList.toggle('active', focus && t.dataset.p === String(index));
+  });
+  strip.querySelectorAll('.question-preview-card').forEach((c) => {
+    c.classList.toggle('focused', focus && c.dataset.p === String(index));
+  });
+}
+
+// Tuck the pending question away without answering: the panel hides, a
+// floating chip restores it, and the asking agent keeps blocking — the
+// question stays pending on the daemon either way.
+function setQuestionMinimized(min) {
+  const panel = document.getElementById('question-panel');
+  if (!panel) return;
+  panel.classList.toggle('question-minimized', min);
+  let chip = document.getElementById('question-restore-chip');
+  if (min) {
+    if (!chip) {
+      chip = document.createElement('button');
+      chip.id = 'question-restore-chip';
+      chip.type = 'button';
+      chip.title = 'Reopen the pending agent question';
+      chip.addEventListener('click', () => setQuestionMinimized(false));
+      document.body.appendChild(chip);
+    }
+    chip.textContent = questionRestoreChipText();
+    chip.hidden = false;
+  } else if (chip) {
+    chip.hidden = true;
+  }
+}
+
+// Restore-chip label: header (+count) plus the live countdown state, so a
+// tucked-away question still shows how long it has left.
+function questionRestoreChipText() {
+  const first = pendingQuestion?.questions?.[0];
+  const extra =
+    (pendingQuestion?.questions?.length || 1) > 1
+      ? ` +${pendingQuestion.questions.length - 1}`
+      : '';
+  let suffix = ' — pending';
+  if (pendingQuestion?.held) suffix = ' — held open';
+  else if (pendingQuestion?.expiresAtMs != null) {
+    const ms = questionCountdownRemainingMs();
+    suffix = ms <= 0 ? ' — expired' : ` — ${formatQuestionCountdown(ms)}`;
+  }
+  return `❓ ${first?.header || 'Agent question'}${extra}${suffix}`;
+}
+
+function questionCountdownRemainingMs() {
+  return Math.max(0, (pendingQuestion?.expiresAtMs || 0) - Date.now());
+}
+
+function formatQuestionCountdown(ms) {
+  const s = Math.ceil(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+    : `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+// Fold fresh countdown state into pendingQuestion. `held === true` or a
+// numeric deadline is real information; `{null, false}` is ambiguous — a
+// no-deadline ask on first sight, but "no info, keep current" on a
+// re-show (the presence bootstrap lane doesn't know the countdown, and a
+// question that had a deadline never legitimately becomes deadline-less
+// without being held: unhold always re-arms one).
+function applyQuestionDeadline(expiresAtMs, held) {
+  if (!pendingQuestion) return;
+  const hasInfo = held === true || (expiresAtMs !== undefined && expiresAtMs !== null);
+  if (hasInfo) {
+    pendingQuestion.held = held === true;
+    pendingQuestion.expiresAtMs = pendingQuestion.held ? null : Number(expiresAtMs) || null;
+  } else if (pendingQuestion.expiresAtMs === undefined) {
+    pendingQuestion.expiresAtMs = null;
+    pendingQuestion.held = false;
+  }
+  renderQuestionDeadline();
+}
+
+// Paint the countdown chip + hold button (panel title row) and keep the
+// tucked-away restore chip's suffix current.
+function renderQuestionDeadline() {
+  const chipEl = document.getElementById('question-deadline');
+  const holdBtn = document.getElementById('question-hold');
+  const restore = document.getElementById('question-restore-chip');
+  const q = pendingQuestion;
+  if (restore && !restore.hidden) restore.textContent = questionRestoreChipText();
+  if (!chipEl || !holdBtn) return;
+  if (!q || (q.expiresAtMs == null && !q.held)) {
+    // No daemon-side deadline (external backends): nothing to count down
+    // or hold.
+    chipEl.classList.add('hidden');
+    holdBtn.classList.add('hidden');
+    stopQuestionDeadlineTicker();
+    return;
+  }
+  chipEl.classList.remove('hidden');
+  holdBtn.classList.remove('hidden');
+  holdBtn.disabled = false;
+  if (q.held) {
+    chipEl.textContent = 'held open';
+    chipEl.classList.remove('warn');
+    holdBtn.textContent = 'Resume timer';
+    holdBtn.title = 'Re-arm the expiry countdown with the time that remained';
+    stopQuestionDeadlineTicker();
+  } else {
+    holdBtn.textContent = 'Hold open';
+    holdBtn.title = 'Suspend the expiry — the agent keeps waiting until you answer';
+    updateQuestionCountdownText();
+    startQuestionDeadlineTicker();
+  }
+}
+
+function updateQuestionCountdownText() {
+  const chipEl = document.getElementById('question-deadline');
+  if (!chipEl || !pendingQuestion || pendingQuestion.expiresAtMs == null) return;
+  const ms = questionCountdownRemainingMs();
+  chipEl.textContent = ms <= 0
+    ? 'expired — the agent is proceeding'
+    : `expires in ${formatQuestionCountdown(ms)}`;
+  chipEl.classList.toggle('warn', ms > 0 && ms < 60_000);
+  const restore = document.getElementById('question-restore-chip');
+  if (restore && !restore.hidden) restore.textContent = questionRestoreChipText();
+  if (ms <= 0) stopQuestionDeadlineTicker();
+}
+
+function startQuestionDeadlineTicker() {
+  if (!questionDeadlineTicker) {
+    questionDeadlineTicker = setInterval(updateQuestionCountdownText, 1000);
+  }
+}
+
+function stopQuestionDeadlineTicker() {
+  if (questionDeadlineTicker) {
+    clearInterval(questionDeadlineTicker);
+    questionDeadlineTicker = 0;
+  }
+}
+
+function showUserQuestion(id, questions, sessionId, expiresAtMs, held, opts) {
   if (processingLogReplay) return;
   const list = Array.isArray(questions) ? questions : [];
   if (!list.length) return;
+  // Agenda-backed (parked) ask re-shown on boot: nothing waits in any
+  // session — answers match on the ask id alone — so skip session
+  // attribution entirely (the asking session may be long gone, and the
+  // current-session fallback would mark an unrelated window "waiting"
+  // and expose the detached-session submit guard).
+  const agendaBacked = !!(opts && opts.agendaBacked);
+  // Same-id re-delivery — a reconnect's state-line replay, the presence
+  // bootstrap, the agenda boot announce, or the waiter's hold-flip
+  // refresh. The question content is immutable per id: fold in the
+  // countdown state and leave the built panel (including the user's
+  // tuck-away) untouched. Only a genuinely new question id rebuilds and
+  // force-surfaces the panel.
+  if (pendingQuestion?.id === id
+      && document.getElementById('question-panel')?.classList.contains('visible')) {
+    applyQuestionDeadline(expiresAtMs, held);
+    return;
+  }
   hideAllPanels();
   pendingQuestion = {
     id,
-    sessionId:
-      sessionId
-      || approvalSessionIds.get(String(id))
-      || currentSessionFullId
-      || '',
+    sessionId: agendaBacked
+      ? ''
+      : (sessionId
+        || approvalSessionIds.get(String(id))
+        || currentSessionFullId
+        || ''),
     questions: list,
   };
   if (pendingQuestion.sessionId) {
@@ -3934,16 +4260,43 @@ function showUserQuestion(id, questions, sessionId) {
   content.innerHTML = '';
   const multi = list.length > 1;
   const title = document.createElement('div');
-  title.className = 'approval-title';
-  title.textContent = multi
+  title.className = 'approval-title question-title-row';
+  const titleText = document.createElement('span');
+  titleText.textContent = multi
     ? `The agent has ${list.length} questions`
     : 'The agent has a question';
+  title.appendChild(titleText);
+  const deadlineChip = document.createElement('span');
+  deadlineChip.id = 'question-deadline';
+  deadlineChip.className = 'question-deadline hidden';
+  title.appendChild(deadlineChip);
+  const holdBtn = document.createElement('button');
+  holdBtn.type = 'button';
+  holdBtn.id = 'question-hold';
+  holdBtn.className = 'question-hold hidden';
+  holdBtn.addEventListener('click', () => {
+    if (!pendingQuestion) return;
+    // Truth stays with the waiter: disable until its refresh (the same-id
+    // re-emission) lands and renderQuestionDeadline re-enables.
+    holdBtn.disabled = true;
+    sendQuestionHold(!pendingQuestion.held);
+  });
+  title.appendChild(holdBtn);
+  const tuck = document.createElement('button');
+  tuck.type = 'button';
+  tuck.className = 'question-tuck';
+  tuck.textContent = '–';
+  tuck.title = 'Tuck away — the question stays pending; a chip brings it back';
+  tuck.addEventListener('click', () => setQuestionMinimized(true));
+  title.appendChild(tuck);
   content.appendChild(title);
 
-  // Pinned index (2+ questions): one chip per header, kept above the
+  // Pinned index (3+ questions): one chip per header, kept above the
   // scroll region; tapping a chip jumps to its question, and
-  // updateQuestionProgress ticks chips as answers land.
-  if (multi) {
+  // updateQuestionProgress ticks chips as answers land. With only two
+  // questions both are on screen anyway — the chips read as dead
+  // buttons (live finding 2026-07-20), so they don't render.
+  if (list.length > 2) {
     const index = document.createElement('div');
     index.className = 'question-index';
     list.forEach((q, qIndex) => {
@@ -3976,12 +4329,19 @@ function showUserQuestion(id, questions, sessionId) {
       chip.textContent = q.header;
       block.appendChild(chip);
     }
+    const bounds = questionPickBounds(q);
+    if (bounds.min === 0) {
+      const opt = document.createElement('span');
+      opt.className = 'question-optional-chip';
+      opt.textContent = 'optional';
+      block.appendChild(opt);
+    }
     const text = document.createElement('div');
     text.className = 'question-text';
     text.textContent = q.question;
     block.appendChild(text);
 
-    appendQuestionPreviews(block, q);
+    appendQuestionPreviews(block, q, qIndex);
 
     const options = document.createElement('div');
     options.className = 'question-options';
@@ -4005,20 +4365,59 @@ function showUserQuestion(id, questions, sessionId) {
     });
     block.appendChild(options);
 
-    const free = document.createElement('input');
-    free.className = 'question-free-text';
-    free.type = 'text';
-    free.placeholder = (q.options || []).length
-      ? 'Or type your own answer…'
-      : 'Type your answer…';
-    free.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); sendQuestionAnswer(); }
+    // Multi-pick questions carry a live "n/max selected" counter.
+    if (bounds.max > 1) {
+      const counter = document.createElement('span');
+      counter.className = 'question-pick-count';
+      block.appendChild(counter);
+    }
+
+    if (questionFreeTextAllowed(q)) {
+      const free = document.createElement('input');
+      free.className = 'question-free-text';
+      free.type = 'text';
+      free.placeholder = (q.options || []).length
+        ? 'Or type your own answer…'
+        : 'Type your answer…';
+      free.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); sendQuestionAnswer(); }
+      });
+      free.addEventListener('input', () => updateQuestionProgress());
+      block.appendChild(free);
+    }
+
+    // Per-question follow-up: what the user writes returns attached to
+    // THIS question — with an answer, or standing in for one (a question
+    // submitted with only a follow-up waives its pick minimum; the agent
+    // addresses it and re-asks the narrowed part).
+    const followupWrap = document.createElement('div');
+    followupWrap.className = 'question-followup';
+    const followupToggle = document.createElement('button');
+    followupToggle.type = 'button';
+    followupToggle.className = 'question-followup-toggle';
+    followupToggle.textContent = '↩ Follow-up';
+    followupToggle.title =
+      'Ask the agent something about this question, or leave a note — it returns attached to '
+      + 'this question. Submitting with only a follow-up is fine.';
+    const followupInput = document.createElement('textarea');
+    followupInput.className = 'question-followup-input hidden';
+    followupInput.rows = 2;
+    followupInput.placeholder = 'Ask a follow-up or leave a note for the agent…';
+    followupToggle.addEventListener('click', () => {
+      const open = followupInput.classList.toggle('hidden');
+      followupToggle.classList.toggle('open', !open);
+      if (!open) followupInput.focus();
     });
-    free.addEventListener('input', () => updateQuestionProgress());
-    block.appendChild(free);
+    followupInput.addEventListener('input', () => updateQuestionProgress());
+    followupWrap.appendChild(followupToggle);
+    followupWrap.appendChild(followupInput);
+    block.appendChild(followupWrap);
     scroll.appendChild(block);
   });
   content.appendChild(scroll);
+  // Counters resolve via the live DOM — initialize them only once the
+  // scroll region is attached.
+  list.forEach((_, qIndex) => updateQuestionPickCounter(qIndex));
 
   const actions = document.createElement('div');
   actions.className = 'approval-actions';
@@ -4046,15 +4445,31 @@ function showUserQuestion(id, questions, sessionId) {
   stationCurrentHumanQuestion = `${list[0].question}${extra}`;
   stationScheduleUpdate();
   revealActivityLogPanel();
-  document.getElementById('question-panel').classList.add('visible');
+  const panel = document.getElementById('question-panel');
+  // Preview-bearing questions escape the reading-column measure — the
+  // comparison is the content, so the card owns the pane width.
+  panel.classList.toggle(
+    'has-previews',
+    list.some((entry) => Array.isArray(entry.previews) && entry.previews.length)
+  );
+  // A genuinely new question always surfaces, even if an earlier one was
+  // tucked away (same-id re-deliveries return early above and never reach
+  // this).
+  setQuestionMinimized(false);
+  panel.classList.add('visible');
   setApprovalIndicator(true);
+  applyQuestionDeadline(expiresAtMs, held);
 }
 
 function clearPendingQuestion() {
   pendingQuestion = null;
+  stopQuestionDeadlineTicker();
   stationCurrentHumanQuestion = '';
   stationScheduleUpdate();
   setApprovalIndicator(false);
+  // Resolved: drop the tucked-away chip and the wide-panel state.
+  setQuestionMinimized(false);
+  document.getElementById('question-panel')?.classList.remove('has-previews');
 }
 
 function showPanel(id) { hideAllPanels(); document.getElementById(id).classList.add('visible'); }

@@ -676,6 +676,8 @@ mod tests {
             session_id: sid.clone(),
             id: 2,
             questions: Vec::new(),
+            expires_at_ms: None,
+            held: false,
         });
         assert_eq!(state.pending.len(), 2);
 

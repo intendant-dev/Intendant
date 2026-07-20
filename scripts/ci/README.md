@@ -133,17 +133,20 @@ considered and deliberately skipped as disproportionate.
 cargo ──[build] rustc-wrapper=governor──▶ rustc-governor <real rustc> <args…>
                     │  probe (-vV / pure --print):
                     │    exec(2) real rustc directly — no permit, no sccache
-                    ▼  compile: acquire flock(2) permit
+                    ▼  acquire flock(2) compile permit
               governor (HOLDS the permit, waits)
-                    │  spawns; the permit fd keeps FD_CLOEXEC —
-                    ▼  no child ever sees it
-              sccache <real rustc> <args…>   (the blocking sccache CLIENT)
-                    ▼
-              sccache server ── hit: answer from cache (client exits in
-                    │                ~tens of ms, permit released)
-                    ▼  miss / non-cacheable
-              real rustc runs; the client — and so the waiting governor,
-              and so the permit — blocks until it finishes
+                    │
+                    ├─ cacheable library ─▶ sccache <rustc> <args…>
+                    │                         │ hit: answer in ~tens of ms
+                    │                         └ miss: server-side rustc
+                    │
+                    └─ final bin/test ─────▶ real rustc directly
+                                              │ compile + codegen
+                                              ▼
+                                    rustc-governor (linker shim)
+                                              │ FIFO ticket + link slot
+                                              ▼
+                                           real linker
 ```
 
 The governor is cargo's `rustc-wrapper`; sccache is no longer the
@@ -156,6 +159,13 @@ governed but uncached):
   governor, whose spawned sccache *client* blocks until the server
   answers: at most N outstanding clients ⇒ at most N server-side
   compiles, no matter which rustc binary the server resolves and runs.
+- **Final bin/test rustcs bypass sccache.** Those link-producing shapes
+  are non-cacheable (the real-sccache regression tests deliberately use
+  an rlib because a bin would test the wrong path). Running them directly
+  also guarantees that the invocation-private `-C linker=…` handoff
+  reaches rustc rather than a long-lived cache server. Their compile and
+  codegen remain covered by the ordinary permit; only their real linker
+  phase takes the separate link slot.
 - **Probes never wait and never touch sccache** — `-vV` / `--version` /
   pure `--print` queries (cargo fires them at every startup) exec the
   real compiler directly: snappy under a full pool, and cargo startup no
@@ -222,7 +232,7 @@ class has waiters and its reservation is honored. Nothing is ever
 killed or signalled; borrowed permits return naturally when their
 holder exits.
 
-### The link gate: heavyweight final links serialize
+### The linker-phase gate: heavyweight final links serialize
 
 The count ceiling alone proved insufficient the day every slot held a
 LINK (2026-07-15, with the governor verified correct — no bypass, no
@@ -231,7 +241,7 @@ concurrently drove the host compressor to 10–11GB with sustained
 two-way swap; a plain `cargo build` then launched three final links at
 once and pushed swap-out to ~124MiB/s. The causal probe was clean (two
 links = severe churn, one = recovering, zero = idle), so the gate
-matches it: ordinary compiles keep the permit pool, heavyweight links
+matches it: ordinary compiles keep the permit pool, heavyweight linkers
 additionally serialize through `link_slots` machine-GLOBAL flock slots
 (`link-<i>` in the permit dir — classless on purpose: host memory does
 not care whose link it is).
@@ -247,19 +257,41 @@ future allowlist or weighting must earn itself with. Full
 classification contract + pinned argv matrix:
 `crates/rustc-governor/src/link.rs`.
 
-Acquisition order is load-bearing: **link slot first, ordinary permit
-second**. A link-gate waiter holds NOTHING — no ordinary-permit
-hoarding (cargo really does launch three links at once; under the
-reverse order they would pin three permits and starve every ordinary
-compile) — and no permit holder ever waits on the link slot, so the
-wait graph is acyclic. The cost, a held slot idling while its owner
-queues for a permit, delays other links only. There is deliberately no
-FIFO/fairness machinery in the flock+poll design; the soak telemetry
-decides whether any is ever needed. Gate failure DEGRADES instead of
-failing open: if no slot file is usable (config grown past the
-installer-minted files), the link runs ungated but still takes its
-ordinary permit — only the global kill-switch paths drop governance
-entirely. `link_slots = 0` is the per-box opt-out.
+The phase boundary is load-bearing. The first link gate wrapped the
+entire heavyweight rustc invocation: a test rustc held `link-0` through
+compile and codegen for 796 seconds while later release binaries waited
+about 14 minutes without starting. The current governor instead replaces
+rustc's linker with the same binary in a private shim mode. Rustc compiles
+and performs codegen under its ordinary permit; only when it invokes the
+shim does that process queue for `link-<i>`, spawn the real linker, and
+hold the slot until the linker is reaped. An explicit target whose
+implicit linker cannot be recovered safely uses a logged
+`scope=whole-rustc` compatibility fallback rather than guessing a
+target-specific linker.
+
+All current-generation heavyweights acquire **ordinary permit, then link
+slot**, so the wait graph is acyclic: a slot holder needs no further
+governor resource before its linker can finish. A queued linker still
+occupies its rustc's compile permit, but only for actual links ahead of it
+rather than another crate's whole compile/codegen phase. The installer
+refuses to swap binaries while any governor is alive because mixing the
+former link-then-permit generation with this order could create a
+cross-generation cycle.
+
+Link waiters are FIFO. The installer pre-creates
+`link-waiter-<i>` (`link_queue_slots`, default 64) mode 0666. A waiter
+exclusively flocks one ticket, writes its monotonic arrival tuple, and
+holds the flock until it acquires a link slot. The first N active tickets
+may compete for N usable slots. SIGKILL closes the ticket fd, so scanners
+recognize it as free/stale without pid polling or a cleanup daemon. After
+five seconds the waiter emits one concise stderr diagnostic naming the
+crate, elapsed wait, and queue mode.
+
+Degradation is split deliberately: if no waiter file is usable, link
+serialization remains active with `queue=degraded` unordered polling; if
+no link slot itself is usable, the linker runs ungated but ordinary
+governance remains. `link_queue_slots = 0` disables FIFO only;
+`link_slots = 0` disables the link gate.
 
 ### Fail-open doctrine + live kill switch
 
@@ -277,16 +309,18 @@ waiters — link-slot waiters included), so
 `enabled = false` drains the governor within ~100ms, no listener
 restarts. `INTENDANT_GOVERNOR_CONFIG` overrides that path; acceptance tests use
 it to point the wrapper at a tempdir rig, and operators can use it for a
-deliberately isolated diagnostic invocation. Observability: one acquisition
-line per *governed* invocation
-in `<permit_dir>/governor.log` — timestamp, pid, class, crate,
-`kind=compile` / `kind=link link_slot=… link_wait_ms=…` /
-`kind=link-ungated reason=off|degraded`, permit, wait_ms — plus one
-`kind=link-done runtime_ms=…` completion line per heavyweight link
-(gated or not): crate, both waits, and runtime are the soak data that
-size the link gate. Truncate-in-place rotation at 1MB keeping the last
-256K — the hooks-log doctrine, because governed accounts can write the
-pre-created file but not create siblings in the root-owned dir.
+deliberately isolated diagnostic invocation. Observability: one
+compile-permit acquisition line per governed invocation in
+`<permit_dir>/governor.log` — timestamp, pid, class, crate,
+`kind=compile` (plus `link=deferred` for a heavyweight), permit, and
+`wait_ms`. The linker shim adds
+`kind=link link_slot=… link_wait_ms=… queue=… scope=linker` (or
+`kind=link-ungated reason=off|degraded`) and
+`kind=link-done runtime_ms=… scope=linker`. That runtime is actual linker
+wall time, no longer compile+codegen+link. Truncate-in-place rotation at
+1MB keeps the last 256K — the hooks-log doctrine, because governed
+accounts can write the pre-created log/ticket files but cannot create
+siblings in the root-owned dir.
 
 ### Sizing, install, rollout
 
@@ -299,17 +333,19 @@ binary, so a binary upgrade turns the gate on with pre-gate configs)
 sizes the heavyweight-link gate per box: keep 1 on small-memory hosts;
 a big-RAM box can raise it — after the installer re-run that mints the
 extra `link-<i>` files — or set 0 to opt out of link gating alone.
+`link_queue_slots` (default 64) bounds FIFO waiters; set 0 only to retain
+serialization with unordered polling.
 
 ```bash
 cargo build --release -p rustc-governor
 sudo scripts/ci/install-governor-macos.sh   # binary + permit dir + conf
 ```
 
-The installer mints config and lock assets BEFORE swapping the binary
-(old binaries ignore the new key and files; a new binary must never run
-ahead of the root-minted slot files it gates on), and upgrades deploy
-during a quiescent no-link interval — an already-running old governor
-cannot retroactively acquire a gate it never knew about. It never edits
+The installer mints config and lock/ticket assets BEFORE swapping the
+binary (old binaries ignore the new key and files; a new binary must
+never run ahead of its root-minted assets), then refuses the binary swap
+while any `rustc-governor` process is alive. Retry after builds drain;
+this enforces the required quiescent generation transition. It never edits
 account cargo configs; it prints the
 `[build] rustc-wrapper = ".../rustc-governor"` line to set per account
 (replacing sccache as the wrapper — the governor runs sccache itself as

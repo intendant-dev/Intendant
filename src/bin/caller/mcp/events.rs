@@ -253,6 +253,7 @@ pub fn spawn_event_listener(
                     | AppEvent::SessionGoal { .. }
                     | AppEvent::SessionVitals { .. }
                     | AppEvent::SessionActivity { .. }
+                    | AppEvent::SessionRateLimits { .. }
                     | AppEvent::SessionConfigFacts { .. }
                     | AppEvent::SessionRenameResult { .. }
                     | AppEvent::SessionAgentConfigResult { .. }
@@ -652,6 +653,7 @@ pub fn spawn_event_listener(
                         ref session_id,
                         id,
                         ref questions,
+                        ..
                     } => {
                         s.set_phase(Phase::WaitingHuman);
                         s.note_session_phase(

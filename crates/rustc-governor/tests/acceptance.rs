@@ -136,6 +136,33 @@ impl Rig {
         path
     }
 
+    /// A tiny rustc stand-in that honors the `-C linker=...` rewrite. Its
+    /// optional prologue represents compilation/codegen work; afterward it
+    /// execs the linker selected by the governor. The exec preserves the
+    /// child pid, which makes signal/crash assertions deterministic.
+    fn linking_rustc(&self, name: &str, prologue: &str) -> PathBuf {
+        self.script(
+            name,
+            &format!(
+                "{prologue}\n\
+                 linker=\n\
+                 while [ \"$#\" -gt 0 ]; do\n\
+                 \u{20} case \"$1\" in\n\
+                 \u{20}\u{20} -C)\n\
+                 \u{20}\u{20}\u{20} shift\n\
+                 \u{20}\u{20}\u{20} [ \"$#\" -gt 0 ] || break\n\
+                 \u{20}\u{20}\u{20} case \"$1\" in linker=*) linker=${{1#linker=}} ;; esac\n\
+                 \u{20}\u{20}\u{20} ;;\n\
+                 \u{20}\u{20} -Clinker=*) linker=${{1#-Clinker=}} ;;\n\
+                 \u{20} esac\n\
+                 \u{20} shift\n\
+                 done\n\
+                 [ -n \"$linker\" ] || {{ echo 'fake rustc: no linker supplied' >&2; exit 90; }}\n\
+                 exec \"$linker\""
+            ),
+        )
+    }
+
     fn permit(&self, name: &str) -> PathBuf {
         self.permit_dir.join(name)
     }
@@ -165,6 +192,27 @@ fn spawn_governor(config: &Path, real: &Path, args: &[&str], envs: &[(&str, &str
         cmd.env(k, v);
     }
     cmd.spawn().unwrap()
+}
+
+/// Spawn a cargo-shaped heavyweight bin compile with an explicit real
+/// linker. The governor removes this `-C linker=...`, gives rustc its own
+/// shim path, then the fake rustc above invokes the shim.
+fn spawn_heavy(config: &Path, rustc: &Path, real_linker: &Path, envs: &[(&str, &str)]) -> Child {
+    let linker = format!("linker={}", real_linker.display());
+    spawn_governor(
+        config,
+        rustc,
+        &[
+            "--crate-name",
+            "x",
+            "--crate-type",
+            "bin",
+            "--emit=dep-info,link",
+            "-C",
+            &linker,
+        ],
+        envs,
+    )
 }
 
 // ------------------------------------------------------- flock helpers ----
@@ -253,15 +301,14 @@ fn kill_and_reap(mut child: Child) {
     let _ = child.wait();
 }
 
-/// The cargo bin-link argv shape (trimmed): classifies heavyweight, so a
-/// spawn with these args must also hold a link slot.
-const HEAVY_ARGS: &[&str] = &[
-    "--crate-name",
-    "x",
-    "--crate-type",
-    "bin",
-    "--emit=dep-info,link",
-];
+fn locked_queue_tickets(rig: &Rig) -> usize {
+    (0..64)
+        .filter(|index| {
+            let path = rig.permit(&format!("link-waiter-{index}"));
+            path.exists() && is_exclusively_locked(&path)
+        })
+        .count()
+}
 
 // ------------------------------------------------------------- tests ----
 
@@ -565,17 +612,18 @@ fn exit_status_propagates() {
 fn sigterm_forwards_to_child_and_signal_death_propagates() {
     let rig = Rig::new();
     let ticks = rig.root.join("ticks");
-    let script = rig.script(
-        "tick.sh",
+    let linker = rig.script(
+        "linker.sh",
         &format!(
             "i=0\nwhile [ $i -lt 600 ]; do echo tick >> {}; i=$((i+1)); sleep 0.05; done",
             ticks.display()
         ),
     );
+    let rustc = rig.linking_rustc("rustc.sh", "");
     let config = rig.config("gov.toml", 1, 0, false, true);
-    // Heavyweight argv: the signal-death path must release the link slot
-    // exactly like the permit.
-    let mut child = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+    // The fake rustc execs the linker shim, so the signal-death path
+    // exercises both parent-held locks and both forwarding hops.
+    let mut child = spawn_heavy(&config, &rustc, &linker, &[]);
     wait_for(|| ticks.exists(), GENEROUS, "fixture to start ticking");
     assert!(is_exclusively_locked(&rig.permit("link-0")));
     // SAFETY: pid was spawned by this test and not yet reaped; kill(2)
@@ -918,209 +966,331 @@ fn zero_permits_fails_open() {
 
 // ----------------------------------------------------- the link gate ----
 
-/// Serialization: three heavyweight links against link_slots = 1 (the
-/// default — no key in the config) and THREE ordinary permits, so any
-/// serialization observed comes from the link gate alone, never the
-/// permit pool. Concurrency is measured from the fixture's own event
-/// stream, exactly like the global-ceiling test. All three completing is
-/// also the no-deadlock property for slot-then-permit acquisition.
+/// The regression that matters: all three rustcs finish their compile
+/// prologues while the slot is externally held, then their real linker
+/// phases run one-at-a-time in arrival order. The old governor failed the
+/// first half because it held `link-0` around the entire rustc invocation;
+/// its unordered polling also failed the FIFO half under contention.
 #[test]
-fn heavyweight_links_serialize_on_the_link_slot() {
+fn linker_phase_is_serialized_in_fifo_order_after_compilation() {
     let rig = Rig::new();
     let events = rig.root.join("events");
-    let script = rig.script(
-        "link.sh",
+    let rustc = rig.linking_rustc(
+        "rustc.sh",
+        &format!("echo compile-$TEST_ID >> {}", events.display()),
+    );
+    let linker = rig.script(
+        "linker.sh",
         &format!(
-            "echo start >> {ev}\nsleep 0.4\necho end >> {ev}",
-            ev = events.display()
+            "echo link-start-$TEST_ID >> {events}\n\
+             sleep 0.3\n\
+             echo link-end-$TEST_ID >> {events}",
+            events = events.display(),
         ),
     );
     let config = rig.config("gov.toml", 3, 0, false, true);
+    let slot_held = hold_exclusive(&rig.permit("link-0"));
 
-    let mut kids: Vec<Child> = (0..3)
-        .map(|_| spawn_governor(&config, &script, HEAVY_ARGS, &[]))
-        .collect();
-    let overall = Instant::now();
-    for child in &mut kids {
-        let left = Duration::from_secs(45)
-            .checked_sub(overall.elapsed())
-            .unwrap_or_default();
-        let status = wait_deadline(child, left).expect("heavyweight link must finish");
-        assert!(status.success());
+    let mut kids = Vec::new();
+    for id in ["1", "2", "3"] {
+        kids.push(spawn_heavy(&config, &rustc, &linker, &[("TEST_ID", id)]));
+        wait_for(
+            || {
+                std::fs::read_to_string(&events)
+                    .map(|text| text.lines().any(|line| line == format!("compile-{id}")))
+                    .unwrap_or(false)
+            },
+            GENEROUS,
+            "fake rustc to finish its compile phase",
+        );
+        let expected = kids.len();
+        wait_for(
+            || locked_queue_tickets(&rig) == expected,
+            GENEROUS,
+            "linker shim to claim its FIFO ticket",
+        );
     }
-
-    let text = std::fs::read_to_string(&events).unwrap();
-    let (mut current, mut max, mut starts) = (0_i32, 0_i32, 0);
-    for line in text.lines() {
-        match line {
-            "start" => {
-                current += 1;
-                starts += 1;
-                max = max.max(current);
-            }
-            "end" => current -= 1,
-            other => panic!("unexpected event line {other:?}"),
-        }
-    }
-    assert_eq!(starts, 3);
-    assert_eq!(
-        max, 1,
-        "link gate violated: {max} concurrent heavyweight links (link_slots = 1)"
+    assert!(
+        !std::fs::read_to_string(&events)
+            .unwrap()
+            .contains("link-start"),
+        "no real linker may start while link-0 is held"
     );
-    // Every run logged as a gated link, and the completion lines carry
-    // the runtime soak data.
+    drop(slot_held);
+
+    for child in &mut kids {
+        assert!(wait_deadline(child, GENEROUS).unwrap().success());
+    }
+    let text = std::fs::read_to_string(&events).unwrap();
+    let links: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("link-"))
+        .collect();
+    assert_eq!(
+        links,
+        [
+            "link-start-1",
+            "link-end-1",
+            "link-start-2",
+            "link-end-2",
+            "link-start-3",
+            "link-end-3",
+        ],
+        "link phases must be serialized FIFO: {text:?}"
+    );
     let log = rig.log();
     assert_eq!(
         log.matches("kind=link link_slot=link-0").count(),
         3,
-        "all three must serialize through the one slot: {log:?}"
+        "{log:?}"
     );
-    assert_eq!(log.matches("kind=link-done runtime_ms=").count(), 3);
-    // Normal exits released everything.
+    assert_eq!(log.matches("queue=fifo scope=linker").count(), 3, "{log:?}");
+    assert_eq!(
+        log.matches("kind=link-done").count(),
+        3,
+        "actual linker runtimes must be logged: {log:?}"
+    );
+    assert_eq!(locked_queue_tickets(&rig), 0);
     assert!(!is_exclusively_locked(&rig.permit("link-0")));
 }
 
-/// No ordinary-permit hoarding (the acquisition-order invariant): an
-/// invocation queued on the link gate holds ZERO ordinary permits, so
-/// ordinary compiles keep the pool, and a probe that superficially
-/// resembles a bin invocation (cargo's startup probe carries
-/// `--crate-type bin`) still bypasses everything.
+/// Exercise the handoff with the real toolchain, not only the shell
+/// fixtures: rustc must preserve the private environment, invoke this
+/// binary as `-C linker`, and receive the real linker's status/output.
 #[test]
-fn queued_heavyweight_hoards_no_ordinary_permit() {
+fn real_rustc_binary_links_through_the_phase_shim() {
     let rig = Rig::new();
-    let marker = rig.root.join("marker");
-    let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
+    let source = rig.root.join("tiny.rs");
+    let binary = rig.root.join("tiny");
+    std::fs::write(&source, "fn main() { println!(\"shim-ok\"); }\n").unwrap();
+    let config = rig.config("gov.toml", 1, 0, false, true);
+    let linker = "linker=cc";
+    let output = Command::new(GOVERNOR)
+        .arg("rustc")
+        .args([
+            source.to_str().unwrap(),
+            "--crate-name",
+            "tiny",
+            "--crate-type",
+            "bin",
+            "--emit=link",
+            "-o",
+            binary.to_str().unwrap(),
+            "-C",
+            linker,
+        ])
+        .env("INTENDANT_GOVERNOR_CONFIG", &config)
+        .env_remove("INTENDANT_GOVERNOR")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "real rustc through the shim failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ran = Command::new(&binary).output().unwrap();
+    assert!(ran.status.success());
+    assert_eq!(String::from_utf8_lossy(&ran.stdout), "shim-ok\n");
+    let log = rig.log();
+    assert!(
+        log.contains("crate=tiny kind=compile link=deferred"),
+        "{log:?}"
+    );
+    assert!(
+        log.contains("crate=tiny kind=link link_slot=link-0")
+            && log.contains("queue=fifo scope=linker"),
+        "{log:?}"
+    );
+}
+
+/// A link waiter has already consumed its own rustc compile permit, but
+/// does not take any additional capacity. With two compile permits, an
+/// ordinary rustc still proceeds while the first final linker is queued.
+#[test]
+fn queued_linker_holds_only_its_own_compile_permit() {
+    let rig = Rig::new();
+    let compiled = rig.root.join("compiled");
+    let linked = rig.root.join("linked");
+    let ordinary_done = rig.root.join("ordinary");
+    let rustc = rig.linking_rustc(
+        "rustc.sh",
+        &format!("echo compiled >> {}", compiled.display()),
+    );
+    let linker = rig.script("linker.sh", &format!("echo linked >> {}", linked.display()));
+    let ordinary = rig.script(
+        "ordinary.sh",
+        &format!("echo ordinary >> {}", ordinary_done.display()),
+    );
     let config = rig.config("gov.toml", 2, 0, false, true);
 
     let slot_held = hold_exclusive(&rig.permit("link-0"));
-    let mut heavy = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
-    assert_still_running_for(&mut heavy, BLOCKED_OBSERVATION);
-    assert!(!marker.exists(), "heavyweight ran while the slot was held");
+    let mut heavy = spawn_heavy(&config, &rustc, &linker, &[]);
+    wait_for(|| compiled.exists(), GENEROUS, "heavy compile phase");
+    wait_for(
+        || locked_queue_tickets(&rig) == 1,
+        GENEROUS,
+        "heavy linker to queue",
+    );
+    assert!(!linked.exists());
     assert!(
-        !is_exclusively_locked(&rig.permit("permit-local-0"))
-            && !is_exclusively_locked(&rig.permit("permit-local-1")),
-        "a link-gate waiter must hold no ordinary permit"
+        is_exclusively_locked(&rig.permit("permit-local-0"))
+            ^ is_exclusively_locked(&rig.permit("permit-local-1")),
+        "one and only one compile permit belongs to the queued rustc"
     );
 
-    // Ordinary compiles proceed through the un-hoarded pool…
-    let mut ordinary = spawn_governor(&config, &script, &[], &[]);
-    assert!(wait_deadline(&mut ordinary, GENEROUS).unwrap().success());
-    assert_eq!(
-        std::fs::read_to_string(&marker).unwrap().lines().count(),
-        1,
-        "the ordinary compile must complete while the heavyweight queues"
-    );
-    // …and a probe-shaped invocation carrying --crate-type bin execs
-    // directly (probe classification runs BEFORE link classification).
-    let mut probe = spawn_governor(
-        &config,
-        &script,
-        &[
-            "-",
-            "--crate-name",
-            "___",
-            "--print=file-names",
-            "--crate-type",
-            "bin",
-            "--emit=dep-info",
-            "--print=cfg",
-        ],
-        &[],
-    );
-    assert!(wait_deadline(&mut probe, GENEROUS).unwrap().success());
-
+    let mut ordinary_child = spawn_governor(&config, &ordinary, &[], &[]);
+    assert!(wait_deadline(&mut ordinary_child, GENEROUS)
+        .unwrap()
+        .success());
+    assert!(ordinary_done.exists());
     drop(slot_held);
-    let status = wait_deadline(&mut heavy, GENEROUS).expect("heavyweight must acquire the slot");
-    assert!(status.success());
-    let log = rig.log();
-    let heavy_line = log
-        .lines()
-        .find(|l| l.contains("kind=link "))
-        .expect("gated heavyweight must log");
-    assert!(
-        heavy_line.contains("crate=x")
-            && heavy_line.contains("link_slot=link-0")
-            && heavy_line.contains("link_wait_ms="),
-        "link line must carry the soak fields: {heavy_line:?}"
-    );
-    assert!(
-        !is_exclusively_locked(&rig.permit("link-0")),
-        "normal exit must release the slot"
-    );
+    assert!(wait_deadline(&mut heavy, GENEROUS).unwrap().success());
+    assert!(linked.exists());
 }
 
-/// While a heavyweight holds the slot and waits for an ordinary permit,
-/// borrowing still works: the composed gate never deadlocks against the
-/// class machinery. (Local reservation held; the idle CI reservation is
-/// borrowable because no CI demand is registered.)
+/// Cacheable ordinary compiles retain the configured wrap chain. Final
+/// bin/test rustcs bypass it because that sccache shape is non-cacheable
+/// and the linker handoff must remain invocation-local.
 #[test]
-fn slot_holder_borrows_idle_foreign_permit() {
+fn heavyweight_bypasses_wrap_but_ordinary_compile_keeps_it() {
+    let rig = Rig::new();
+    let wrap_marker = rig.root.join("wrap");
+    let compile_marker = rig.root.join("compile");
+    let link_marker = rig.root.join("link");
+    let wrap = rig.script(
+        "wrap.sh",
+        &format!("echo wrap >> {}\nexec \"$@\"", wrap_marker.display()),
+    );
+    let rustc = rig.linking_rustc(
+        "rustc.sh",
+        &format!("echo compile >> {}", compile_marker.display()),
+    );
+    let linker = rig.script(
+        "linker.sh",
+        &format!("echo link >> {}", link_marker.display()),
+    );
+    let config = rig.config_with_wrap("gov.toml", 1, 0, false, true, &wrap);
+
+    let mut heavy = spawn_heavy(&config, &rustc, &linker, &[]);
+    assert!(wait_deadline(&mut heavy, GENEROUS).unwrap().success());
+    assert!(compile_marker.exists() && link_marker.exists());
+    assert!(
+        !wrap_marker.exists(),
+        "non-cacheable final rustc must not pass through wrap_with"
+    );
+
+    let ordinary_marker = rig.root.join("ordinary");
+    let ordinary = rig.script(
+        "ordinary.sh",
+        &format!("echo ordinary >> {}", ordinary_marker.display()),
+    );
+    let mut child = spawn_governor(&config, &ordinary, &[], &[]);
+    assert!(wait_deadline(&mut child, GENEROUS).unwrap().success());
+    assert!(ordinary_marker.exists() && wrap_marker.exists());
+}
+
+/// Permit borrowing happens before the linker phase: with Local's own
+/// reservation held and no CI demand, a heavyweight rustc borrows the idle
+/// CI permit, then its linker acquires the classless global slot.
+#[test]
+fn linker_waiter_borrows_idle_foreign_permit() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
-    let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
+    let rustc = rig.linking_rustc("rustc.sh", "");
+    let linker = rig.script("linker.sh", &format!("echo done >> {}", marker.display()));
     let config = rig.config("gov.toml", 1, 1, false, true);
 
     let _local_held = hold_exclusive(&rig.permit("permit-local-0"));
-    let mut heavy = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
-    let status = wait_deadline(&mut heavy, GENEROUS)
-        .expect("slot holder must borrow the idle CI permit, not deadlock");
-    assert!(status.success());
+    let mut heavy = spawn_heavy(&config, &rustc, &linker, &[]);
+    assert!(wait_deadline(&mut heavy, GENEROUS).unwrap().success());
     let log = rig.log();
-    let line = log.lines().find(|l| l.contains("kind=link ")).unwrap();
+    let compile = log
+        .lines()
+        .find(|line| line.contains("kind=compile link=deferred"))
+        .unwrap();
     assert!(
-        line.contains("permit=permit-ci-0"),
-        "must have borrowed the idle CI permit: {line:?}"
+        compile.contains("permit=permit-ci-0"),
+        "must borrow the idle CI permit before linking: {compile:?}"
     );
 }
 
-/// `link_slots = 0` is the per-box opt-out: heavyweights run ungated
-/// (logged as such) but stay ordinary-governed.
+/// `link_slots = 0` disables only link serialization. The actual linker
+/// still runs through the shim so its disposition/runtime are observable,
+/// and the ordinary compile ceiling remains active.
 #[test]
 fn zero_link_slots_disables_the_gate_only() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
-    let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
+    let rustc = rig.linking_rustc("rustc.sh", "");
+    let linker = rig.script("linker.sh", &format!("echo done >> {}", marker.display()));
     let config = rig.config_with_links("gov.toml", 1, 0, 0);
 
-    let mut heavy = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+    let mut heavy = spawn_heavy(&config, &rustc, &linker, &[]);
     assert!(wait_deadline(&mut heavy, GENEROUS).unwrap().success());
     let log = rig.log();
     let line = log
         .lines()
-        .find(|l| l.contains("kind=link-ungated"))
-        .expect("gate-off heavyweight must log its disposition");
+        .find(|line| line.contains("kind=link-ungated"))
+        .unwrap();
     assert!(
         line.contains("reason=off") && line.contains("permit=permit-local-0"),
         "{line:?}"
     );
-    assert!(
-        log.contains("kind=link-done"),
-        "runtime soak line is wanted even ungated: {log:?}"
-    );
+    assert!(log.contains("kind=link-done"));
 
-    // And the ordinary ceiling still binds: hold the only permit, the
-    // heavyweight queues.
     let _held = hold_exclusive(&rig.permit("permit-local-0"));
-    let mut queued = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+    let mut queued = spawn_heavy(&config, &rustc, &linker, &[]);
     assert_still_running_for(&mut queued, BLOCKED_OBSERVATION);
     kill_and_reap(queued);
 }
 
-/// Degraded link gating: the permit dir denies creating the slot files
-/// (the production shape: root-owned dir, config grown past the
-/// installer-minted files). The link gate degrades — logged — but
-/// ordinary governance is KEPT: reviewer contract, "link-gate failure
-/// must not discard ordinary governance".
+/// Queue ordering and link serialization degrade independently. During an
+/// old-install/new-binary transition, `link-0` may exist before the new
+/// writable waiter files: the link must remain gated, merely unordered.
+#[test]
+fn missing_fifo_assets_preserve_link_serialization() {
+    let rig = Rig::new();
+    let marker = rig.root.join("marker");
+    let rustc = rig.linking_rustc("rustc.sh", "");
+    let linker = rig.script("linker.sh", &format!("echo done >> {}", marker.display()));
+    let config = rig.config("gov.toml", 1, 0, false, true);
+    for name in [
+        "permit-local-0",
+        "demand-local",
+        "demand-ci",
+        "link-0",
+        "governor.log",
+    ] {
+        drop(open_rw(&rig.permit(name)));
+    }
+    let mut ro = std::fs::metadata(&rig.permit_dir).unwrap().permissions();
+    ro.set_mode(0o555);
+    std::fs::set_permissions(&rig.permit_dir, ro).unwrap();
+    let mut heavy = spawn_heavy(&config, &rustc, &linker, &[]);
+    let status = wait_deadline(&mut heavy, GENEROUS);
+    let mut rw = std::fs::metadata(&rig.permit_dir).unwrap().permissions();
+    rw.set_mode(0o755);
+    std::fs::set_permissions(&rig.permit_dir, rw).unwrap();
+
+    assert!(status.unwrap().success());
+    assert!(marker.exists());
+    let log = rig.log();
+    assert!(
+        log.contains("kind=link link_slot=link-0") && log.contains("queue=degraded scope=linker"),
+        "missing FIFO files must not disable the link gate: {log:?}"
+    );
+}
+
+/// Missing root-minted slot files degrade link gating without discarding
+/// the already-acquired ordinary compile permit.
 #[test]
 fn degraded_link_gate_keeps_ordinary_governance() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
-    let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
+    let rustc = rig.linking_rustc("rustc.sh", "");
+    let linker = rig.script("linker.sh", &format!("echo done >> {}", marker.display()));
     let config = rig.config("gov.toml", 1, 0, false, true);
 
-    // Pre-create everything the ordinary path needs (the installer's
-    // job in production), plus the log file — then make the dir
-    // read-only so link-0 cannot be created.
     for name in [
         "permit-local-0",
         "demand-local",
@@ -1132,91 +1302,146 @@ fn degraded_link_gate_keeps_ordinary_governance() {
     let mut ro = std::fs::metadata(&rig.permit_dir).unwrap().permissions();
     ro.set_mode(0o555);
     std::fs::set_permissions(&rig.permit_dir, ro).unwrap();
-
-    let mut heavy = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+    let mut heavy = spawn_heavy(&config, &rustc, &linker, &[]);
     let status = wait_deadline(&mut heavy, GENEROUS);
-
-    // Restore permissions FIRST (tempdir cleanup + rig.log both need the
-    // dir readable-writable), then assert.
     let mut rw = std::fs::metadata(&rig.permit_dir).unwrap().permissions();
     rw.set_mode(0o755);
     std::fs::set_permissions(&rig.permit_dir, rw).unwrap();
 
-    assert!(status.expect("degraded gate must not block").success());
+    assert!(status.unwrap().success());
     assert!(marker.exists());
     let log = rig.log();
     let line = log
         .lines()
-        .find(|l| l.contains("kind=link-ungated"))
-        .expect("degraded heavyweight must log its disposition");
+        .find(|line| line.contains("kind=link-ungated"))
+        .unwrap();
     assert!(
         line.contains("reason=degraded") && line.contains("permit=permit-local-0"),
-        "ordinary governance must be kept through link-gate degradation: {line:?}"
+        "{line:?}"
     );
 }
 
-/// SIGKILL on a slot-holding governor releases BOTH locks through kernel
-/// semantics (the fds close with the process), exactly like the
-/// permit-only crash test above.
+/// Killing a queued linker shim releases its FIFO ticket in the kernel.
+/// The next ticket then advances; no stale pid/timestamp cleanup daemon is
+/// required.
 #[test]
-fn sigkilled_heavy_governor_releases_both_locks() {
+fn sigkilled_queue_waiter_cannot_block_the_fifo() {
     let rig = Rig::new();
-    let ready = rig.root.join("ready");
-    let script = rig.script(
-        "hold.sh",
+    let shim_pids = rig.root.join("shim-pids");
+    let linked = rig.root.join("linked");
+    let rustc = rig.linking_rustc(
+        "rustc.sh",
+        &format!("echo \"$TEST_ID $$\" >> {}", shim_pids.display()),
+    );
+    let linker = rig.script(
+        "linker.sh",
+        &format!("echo \"$TEST_ID\" >> {}", linked.display()),
+    );
+    let config = rig.config("gov.toml", 2, 0, false, true);
+    let slot_held = hold_exclusive(&rig.permit("link-0"));
+
+    let mut first = spawn_heavy(&config, &rustc, &linker, &[("TEST_ID", "1")]);
+    wait_for(
+        || locked_queue_tickets(&rig) == 1,
+        GENEROUS,
+        "first FIFO ticket",
+    );
+    let mut second = spawn_heavy(&config, &rustc, &linker, &[("TEST_ID", "2")]);
+    wait_for(
+        || locked_queue_tickets(&rig) == 2,
+        GENEROUS,
+        "second FIFO ticket",
+    );
+    let first_shim: libc::pid_t = std::fs::read_to_string(&shim_pids)
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            let (id, pid) = line.split_once(' ')?;
+            (id == "1").then(|| pid.parse().unwrap())
+        })
+        .unwrap();
+    // SAFETY: this pid was written by the fake rustc this test spawned and
+    // has exec'd the queued linker shim; it has not been reaped.
+    assert_eq!(unsafe { libc::kill(first_shim, libc::SIGKILL) }, 0);
+    assert!(wait_deadline(&mut first, GENEROUS)
+        .unwrap()
+        .signal()
+        .is_some());
+    wait_for(
+        || locked_queue_tickets(&rig) == 1,
+        GENEROUS,
+        "killed ticket to evaporate",
+    );
+
+    drop(slot_held);
+    assert!(wait_deadline(&mut second, GENEROUS).unwrap().success());
+    assert_eq!(std::fs::read_to_string(&linked).unwrap().trim(), "2");
+}
+
+/// If the outer compile-governor is SIGKILLed after its linker starts, its
+/// ordinary permit is released immediately, but the independently alive
+/// linker shim correctly keeps the high-RSS link slot until the real
+/// linker ends.
+#[test]
+fn sigkilled_outer_releases_compile_permit_but_not_a_live_link_slot() {
+    let rig = Rig::new();
+    let shim_pid = rig.root.join("shim-pid");
+    let linker_pid = rig.root.join("linker-pid");
+    let rustc = rig.linking_rustc("rustc.sh", &format!("echo $$ > {}", shim_pid.display()));
+    let linker = rig.script(
+        "linker.sh",
         &format!(
-            "echo $$ >> {}\nwhile :; do sleep 0.05; done",
-            ready.display()
+            "echo $$ > {}\nwhile :; do sleep 0.05; done",
+            linker_pid.display()
         ),
     );
     let config = rig.config("gov.toml", 1, 0, false, true);
 
-    let mut child = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
-    wait_for(
-        || {
-            std::fs::read_to_string(&ready)
-                .map(|s| s.ends_with('\n'))
-                .unwrap_or(false)
-        },
-        GENEROUS,
-        "holder to start",
-    );
-    assert!(is_exclusively_locked(&rig.permit("link-0")));
+    let mut outer = spawn_heavy(&config, &rustc, &linker, &[]);
+    wait_for(|| linker_pid.exists(), GENEROUS, "real linker to start");
     assert!(is_exclusively_locked(&rig.permit("permit-local-0")));
-    child.kill().unwrap();
-    child.wait().unwrap();
+    assert!(is_exclusively_locked(&rig.permit("link-0")));
+    outer.kill().unwrap();
+    outer.wait().unwrap();
     wait_for(
-        || {
-            !is_exclusively_locked(&rig.permit("link-0"))
-                && !is_exclusively_locked(&rig.permit("permit-local-0"))
-        },
+        || !is_exclusively_locked(&rig.permit("permit-local-0")),
         GENEROUS,
-        "both locks to release after SIGKILL",
+        "compile permit release",
     );
-    let orphan: libc::pid_t = std::fs::read_to_string(&ready)
+    assert!(
+        is_exclusively_locked(&rig.permit("link-0")),
+        "a still-running real linker must remain serialized"
+    );
+
+    let real_linker: libc::pid_t = std::fs::read_to_string(&linker_pid)
         .unwrap()
         .trim()
         .parse()
-        .expect("fixture wrote its pid");
-    // SAFETY: the pid was reported by the fixture this test (transitively)
-    // spawned; kill(2) takes only the pid and signal number.
+        .unwrap();
+    // SAFETY: the pid was reported by the real-linker fixture this test
+    // spawned; kill(2) takes only that pid and signal number.
     unsafe {
-        libc::kill(orphan, libc::SIGKILL);
+        libc::kill(real_linker, libc::SIGKILL);
     }
+    wait_for(
+        || !is_exclusively_locked(&rig.permit("link-0")),
+        GENEROUS,
+        "link slot release after the real linker dies",
+    );
+    // The shim pid file also proves fake rustc exec'd the shim rather than
+    // merely exiting before the link phase.
+    assert!(shim_pid.exists());
 }
 
-/// Neither lock fd is inheritable: a long-lived grandchild the chain
-/// leaves behind (the daemonized-sccache-server shape, minus sccache)
-/// must not keep either flock alive past the governor's exit. This is
-/// the general CLOEXEC + parent-held property; the real-sccache
-/// daemonization variant lives in tests/sccache_chain.rs (heavy bin
-/// shapes are non-cacheable there, so the rlib test carries it).
+/// Neither parent-held lock fd is inheritable by a grandchild the real
+/// linker leaves behind.
 #[test]
 fn long_lived_grandchild_inherits_neither_lock() {
     let rig = Rig::new();
     let marker = rig.root.join("marker");
-    let script = rig.script(
-        "daemonish.sh",
+    let rustc = rig.linking_rustc("rustc.sh", "");
+    let linker = rig.script(
+        "linker.sh",
         &format!(
             "sleep 3 >/dev/null 2>&1 &\necho spawned >> {}",
             marker.display()
@@ -1224,40 +1449,33 @@ fn long_lived_grandchild_inherits_neither_lock() {
     );
     let config = rig.config("gov.toml", 1, 0, false, true);
 
-    let mut child = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
+    let mut child = spawn_heavy(&config, &rustc, &linker, &[]);
     assert!(wait_deadline(&mut child, GENEROUS).unwrap().success());
     assert!(marker.exists());
-    // The governor exited; the backgrounded sleep (reparented, still
-    // alive for ~3s) must hold neither lock.
-    assert!(
-        !is_exclusively_locked(&rig.permit("link-0")),
-        "a grandchild inherited the link-slot fd"
-    );
-    assert!(
-        !is_exclusively_locked(&rig.permit("permit-local-0")),
-        "a grandchild inherited the permit fd"
-    );
+    assert!(!is_exclusively_locked(&rig.permit("link-0")));
+    assert!(!is_exclusively_locked(&rig.permit("permit-local-0")));
 }
 
-/// The live kill switch unwedges LINK-slot waiters exactly like permit
-/// waiters, for every way the config can die: flipped off, deleted, or
-/// replaced with garbage. Fail-open runs are silent in the log, and the
-/// waiter never touched an ordinary permit.
+/// The live kill switch unwedges FIFO link waiters for every way the
+/// config can become unusable. The compile acquisition remains logged;
+/// the fail-open linker itself adds no gated/ungated line.
 #[test]
 fn dying_config_unwedges_link_waiters_fail_open() {
     for way in ["disable", "delete", "garbage"] {
         let rig = Rig::new();
         let marker = rig.root.join("marker");
-        let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
+        let rustc = rig.linking_rustc("rustc.sh", "");
+        let linker = rig.script("linker.sh", &format!("echo done >> {}", marker.display()));
         let config = rig.config("gov.toml", 1, 0, false, true);
 
         let _slot_held = hold_exclusive(&rig.permit("link-0"));
-        let mut heavy = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
-        assert_still_running_for(&mut heavy, Duration::from_millis(600));
-        assert!(
-            !is_exclusively_locked(&rig.permit("permit-local-0")),
-            "[{way}] a link-gate waiter must hold no ordinary permit"
+        let mut heavy = spawn_heavy(&config, &rustc, &linker, &[]);
+        wait_for(
+            || locked_queue_tickets(&rig) == 1,
+            GENEROUS,
+            "linker to queue",
         );
+        assert!(is_exclusively_locked(&rig.permit("permit-local-0")));
 
         match way {
             "disable" => {
@@ -1267,45 +1485,14 @@ fn dying_config_unwedges_link_waiters_fail_open() {
             "garbage" => std::fs::write(&config, "enabled = maybe\n").unwrap(),
             _ => unreachable!(),
         }
-        let status = wait_deadline(&mut heavy, GENEROUS)
-            .unwrap_or_else(|| panic!("[{way}] link waiter must unwedge, fail-open"));
-        assert!(status.success(), "[{way}]");
+        assert!(wait_deadline(&mut heavy, GENEROUS).unwrap().success());
         assert!(marker.exists(), "[{way}]");
-        assert_eq!(rig.log(), "", "[{way}] fail-open must not log");
+        let log = rig.log();
+        assert_eq!(log.matches("kind=compile link=deferred").count(), 1);
+        assert!(!log.contains("kind=link "), "[{way}] {log:?}");
+        assert!(!log.contains("kind=link-ungated"), "[{way}] {log:?}");
+        assert_eq!(locked_queue_tickets(&rig), 0);
     }
-}
-
-/// The config dying while a heavyweight HOLDS the slot but waits for an
-/// ordinary permit: the invocation fails open and the slot is dropped
-/// before the exec — never carried into an ungoverned chain.
-#[test]
-fn dying_config_drops_a_held_slot_before_fail_open() {
-    let rig = Rig::new();
-    let marker = rig.root.join("marker");
-    let script = rig.script("done.sh", &format!("echo done >> {}", marker.display()));
-    let config = rig.config("gov.toml", 1, 0, false, true);
-
-    // The only ordinary permit is held forever; the link slot is free.
-    let _permit_held = hold_exclusive(&rig.permit("permit-local-0"));
-    let mut heavy = spawn_governor(&config, &script, HEAVY_ARGS, &[]);
-    // The heavyweight takes the slot, then queues on the permit.
-    wait_for(
-        || is_exclusively_locked(&rig.permit("link-0")),
-        GENEROUS,
-        "heavyweight to take the link slot",
-    );
-    assert_still_running_for(&mut heavy, Duration::from_millis(600));
-
-    std::fs::remove_file(&config).unwrap();
-    let status =
-        wait_deadline(&mut heavy, GENEROUS).expect("permit waiter must unwedge, fail-open");
-    assert!(status.success());
-    assert!(marker.exists());
-    assert!(
-        !is_exclusively_locked(&rig.permit("link-0")),
-        "the slot must be dropped when its holder fails open"
-    );
-    assert_eq!(rig.log(), "", "fail-open must not log");
 }
 
 // ---------------------------------------------------- wiring guards ----

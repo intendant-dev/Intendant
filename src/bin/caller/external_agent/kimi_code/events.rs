@@ -1336,6 +1336,12 @@ impl EventTranslator {
                         .get("multi_select")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    // Kimi's question contract exposes only the legacy
+                    // multi-select switch; derive bounds and free-text
+                    // behavior from that shared representation.
+                    pick_min: None,
+                    pick_max: None,
+                    free_text: None,
                     previews: Vec::new(),
                 })
             })

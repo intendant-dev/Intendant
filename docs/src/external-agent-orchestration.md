@@ -106,18 +106,18 @@ adapter from `[agent.<backend>]` config, then `run_external_agent_mode()`
 
 | | **Codex** (reference impl) | **Claude Code** | **Kimi Code** |
 |---|---|---|---|
-| Module | `external_agent/codex/` (mod, threads, wire, context_trace, reader) | `external_agent/claude_code.rs` | `external_agent/kimi_code/` (mod, bridge, events, review, websocket, wire, rpc) |
+| Module | `external_agent/codex/` (mod, threads, wire, context_trace, reader) | `external_agent/claude_code.rs` | `external_agent/kimi_code/` (mod, bridge, events, review, rpc, runtime, websocket, wire) |
 | Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --permission-mode <mode>` | Kimi 0.27: `kimi server run --foreground --port 0 --log-level silent`; Kimi 0.28: `kimi web --no-open --port 0 --log-level silent` |
 | Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio | bearer-authenticated loopback REST + reconnecting cursor/snapshot WebSocket (`server-v1`), plus a typed allowlist over authenticated reflected v2 RPCs |
 | MCP injection | Per-process `-c mcp_servers.intendant.{type,url,bearer_token_env_var}` overrides plus scoped env; no workspace config file | Inline `--mcp-config '{…}'` JSON with an environment-expanded Authorization header | Per-session bridge home containing generated `mcp.json`; scoped bearer stays in the child environment |
 | Multi-thread | Yes — many threads per process | No | Yes — the main session plus native `:btw` and swarm agents |
 | Native thread id | Yes | Yes — announced via `AgentEvent::NativeSessionId` on the first turn (placeholder `claude-code-session` until then; `--resume` keeps the id stable so resumed threads are canonical immediately) | Yes — returned at create/resume before the first prompt |
-| Mid-turn steer | Yes (`turn/steer`) | Queued by Intendant because 2.1.2xx discards stdin user messages mid-turn | Yes — Kimi queued prompts plus `prompts::steer`; a completion race becomes an ordinary immediate follow-up without losing text |
+| Mid-turn steer | Yes (`turn/steer`) | Yes — a stdin user message is absorbed into the running turn at the CLI's next checkpoint (verified on 2.1.215; 2.1.207 discarded such lines). No stdout echo, so delivery is inferred at the next model checkpoint; an idle session delivers the steer immediately as its own turn | Yes — Kimi queued prompts plus `prompts::steer`; a completion race becomes an ordinary immediate follow-up without losing text |
 | Mid-turn interrupt | Yes (`turn/interrupt`) | Yes (`control_request` `interrupt`; the process survives for follow-up turns) | Yes — active prompt abort, with a session abort fallback |
 | Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) | Yes — usage events plus typed `agentRPCService.getContext` snapshots: Kimi's current post-compaction model history and measured `tokenCount`, scoped to the exact selected main/composite agent, with the configured model catalog's context window |
 | Reasoning trace | Yes | Yes (`thinking` blocks) | Yes — thinking deltas/messages |
 | Rollback turns | Yes (`thread/rollback`) | No → session reset | Yes — native `undo`, including edit-and-rerun of an active historical user turn |
-| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | `compact`, `fork`, `side`, the full wrapper `goal*` family, and live `model` / `permission-mode` | Native `compact`, head and exact historical real-user-turn-boundary `fork`, `side`/`:btw`, `undo`, archive/restore/rename, goal get/set/pause/resume/complete/clear with enforced token/turn/wall-clock budgets, live model/thinking/permission/plan/swarm switches, official normal↔highspeed model toggling, supervisor-enforced tool-free read-only review turns over bounded controller-collected workspace evidence, background-task list/output/cancel, exact per-agent active-tool control, model catalog, and destructive per-agent context clear. Kimi has no persistent-memory plane equivalent to Codex `memory-reset`, explicit “mark budget-limited” setter, arbitrary item/message/child fork anchor, or child-only undo |
+| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | `compact`, `fork` (respawns via `--resume <id> --fork-session`), `side` (`/btw` — the same respawn carrying a side boundary + question as the child's first prompt; lineage `fork_relationship: "side"`), the full `goal*` family (wrapper goal engine), and live `model` / `permission-mode` — all via universal `thread_actions`. No fast/review/memory-reset — see [Dashboard and Station parity](#dashboard-and-station-parity-codex-vs-claude-code) | Native `compact`, head and exact historical real-user-turn-boundary `fork`, `side`/`:btw`, `undo`, archive/restore/rename, goal get/set/pause/resume/complete/clear with enforced token/turn/wall-clock budgets, live model/thinking/permission/plan/swarm switches, official normal↔highspeed model toggling, supervisor-enforced tool-free read-only review turns over bounded controller-collected workspace evidence, background-task list/output/cancel, exact per-agent active-tool control, model catalog, and destructive per-agent context clear. Kimi has no persistent-memory plane equivalent to Codex `memory-reset`, explicit “mark budget-limited” setter, arbitrary item/message/child fork anchor, or child-only undo |
 | Native sub-agents | Yes — collab tools spawn real attachable threads (`SubAgentToolCall`) | Yes — the in-band `Agent`/`Task` tool; async children stream `parent_tool_use_id`-tagged envelopes, surfaced as ephemeral `task-*` child sessions on the same `SubAgentToolCall`/relationship rail | Yes — native swarm and `:btw` agents retain their own ids, scoped activity, relationships, status, and results |
 
 All three spawn through `crate::platform::spawn_command(&cfg.command)` with the
@@ -619,15 +619,17 @@ through Claude Code 2.1.210):
   `error_during_execution`, mapped to a completed turn rather than a
   backend error when Intendant requested the interrupt); the process stays
   usable for follow-up turns.
-- **Steer**: the CLI **discards** a user message written while a turn runs
-  (probed on 2.1.207; the 2.1.200-era absorb was a CLI bug, since removed,
-  and `system/init.capabilities` advertises no replacement protocol yet).
-  `steer_turn` therefore returns the load-bearing "mid-turn steering not
-  supported" / "no active turn" markers and the drain queues the text onto
-  `context_injection`: it delivers as a `[User]` line when the next turn's
-  message is sent, and an idle session flushes the queue immediately as
-  its own turn. Goal notices queue as next-prompt preludes for the same
-  reason (a mid-turn write would vanish).
+- **Steer**: a user message written while a turn runs is **absorbed into
+  the running turn** at the CLI's next checkpoint (verified live on
+  2.1.215; 2.1.207 was observed discarding such lines, 2.1.200 absorbed
+  them). `steer_turn` writes the stream-json user message and the drain
+  tracks it as a pending runtime steer — the CLI never echoes the injected
+  message on stdout, so delivery is inferred at the next model checkpoint
+  (turn completion at the latest). An idle session keeps the "no active
+  turn" marker and delivers the steer immediately as its own turn. Goal
+  notices still queue as next-prompt preludes: unlike a steer's
+  best-effort injection, a notice must never silently vanish on a
+  discard-era CLI.
 - **Usage**: per-API-call usage from `message_delta` stream events plus the
   turn `result` feed `AgentEvent::Usage`; the context window comes from the
   result's `modelUsage` map (200k default until the first result).
@@ -751,14 +753,26 @@ escapes fail closed before chmod, sync, pruning, or MCP generation. MCP files
 are written through a randomly named, create-new private temporary file and an
 atomic rename, so a guessed PID-based symlink cannot redirect the write.
 
-When symlinks are unavailable, bridge teardown copies back only Kimi's native
-`sessions/` tree and `session_index.jsonl`. Credentials, configuration,
-plugins, caches, MCP declarations, and server state are never copied from a
-bridge into the primary home: a long-lived bridge may hold a stale snapshot,
-so broader copy-back could undo a logout or resurrect removed authority.
-Before each launch, copy-backed mirrors are also reconciled recursively with
-the current primary home, removing credential/config/plugin/cache entries that
-the user deleted while retaining bridge-only session history.
+When symlinks are unavailable, Intendant monitors the one known rotating OAuth
+file, `credentials/kimi-code.json`, in a real copy-fallback bridge. Every
+250 ms and once more after the Kimi child stops, a changed bridge credential is
+published through an owner-private atomic replacement only if the primary
+credential still byte-matches the last value this monitor synchronized. A
+logout, new login, or concurrent refresh changes or removes that primary and
+permanently detaches the monitor; stale bridge authority is never replayed or
+resurrected. This bounds the abrupt-crash window in which Kimi's rotated grant
+exists only in the bridge and keeps repeated Windows sessions authenticated
+without turning general bridge copy-back into an authority restore.
+
+Bridge teardown otherwise copies back only Kimi's native `sessions/` tree and
+`session_index.jsonl`. Configuration, plugins, caches, MCP declarations,
+server state, and every credential other than the live CAS-guarded refresh
+file are never copied from a bridge into the primary home: a long-lived bridge
+may hold a stale snapshot, so broader copy-back could undo a logout or
+resurrect removed authority. Before each launch, copy-backed mirrors are also
+reconciled recursively with the current primary home, removing
+credential/config/plugin/cache entries that the user deleted while retaining
+bridge-only session history.
 Duplicate native session ids across bridge and primary history resolve to the
 copy with the newest filesystem activity. Append-only journals merge only when
 one byte-exact ordered record sequence is a prefix of the other. Divergent
@@ -930,14 +944,14 @@ into them directly rather than adding a parallel `kimi_*` UI architecture.
 |---|---|---|---|
 | Steer / interrupt / stop affordances | `SessionCapabilities.{follow_up,steer,interrupt}`; the UI gates on capabilities, not backend type | emits all three | **Parity** (emits all three) |
 | Usage / context meter | `AgentEvent::Usage` → `UsageSnapshot` / `ContextSnapshot` | `token_count` notifications | **Parity** (`message_delta` + `result` usage) |
-| Goal chip in the agent-window header (`/goal`) | `SessionGoal` type; `AgentEvent::GoalUpdated/GoalCleared`; `session_goal` outbound + log replay; the window chip renderer is backend-neutral; op semantics + wire conventions (statuses, budget shape, objective limit, notice texts) live in the shared `external_agent::GoalEngine`, which the Claude Code adapter and the native presence loop both run | native `thread/goal/*` RPCs | **Live — wrapper goal engine in the adapter.** The full `goal*` op family is advertised and dispatched; goal state lives in `CcShared`, notices always queue as a prelude on the next prompt (2.1.2xx discards mid-turn stdin writes; consecutive notices coalesce in order, and updates never buy a turn), and budget spend is measured in FRESH tokens (uncached input + cache creation + output — cache reads excluded), flipping `active` → `budgetLimited` at exhaustion. Engine state is per-process: after a resume the chip rehydrates from the log but the engine starts empty (re-set the goal) |
+| Goal chip in the agent-window header (`/goal`) | `SessionGoal` type; `AgentEvent::GoalUpdated/GoalCleared`; `session_goal` outbound + log replay; the window chip renderer is backend-neutral; op semantics + wire conventions (statuses, budget shape, objective limit, notice texts) live in the shared `external_agent::GoalEngine`, which the Claude Code adapter and the native presence loop both run | native `thread/goal/*` RPCs | **Live — wrapper goal engine in the adapter.** The full `goal*` op family is advertised and dispatched; goal state lives in `CcShared`, notices always queue as a prelude on the next prompt (mid-turn stdin delivery is unconfirmable and one CLI era discarded it; consecutive notices coalesce in order, and updates never buy a turn), and budget spend is measured in FRESH tokens (uncached input + cache creation + output — cache reads excluded), flipping `active` → `budgetLimited` at exhaustion. Engine state is per-process: after a resume the chip rehydrates from the log but the engine starts empty (re-set the goal) |
 | Per-window action menu (fork / compact / goals / …) | **Universal (landed):** `SessionCapabilities.thread_actions` op vocabulary + the `thread_action` control message (`codex_thread_action` stays a wire alias); the kebab and Station session actions render from the advertised op list, with the codex heuristic as legacy-replay fallback | full op set | **`compact` + `fork` + `side` live.** `compact` sends the native `/compact` user message (status → `compact_boundary` → free result); `fork` respawns via `ForkHandling::RespawnResume` → `ResumeSession { fork: true }` → `--resume <parent> --fork-session` (the child binds its own native id + the `fork` relationship on its first prompt); `side` (`/btw`) is the same respawn with `relationship_kind: "side"` and the boundary + question as the child's first prompt. No Claude analog planned: fast / review / memory-reset |
 | Relationship wiring (parent/sub/fork header chips + SVG wires; Station edges) | `session_relationship` event + lineage ledger + `/api` serving + both renderers — all backend-neutral | side / subagent / fork / fission / rewind emitters | **`fork` + `side` + `subagent` emitted.** Fork/side on the forked child's first identity announcement (persisted `forked_from` + `fork_relationship` lineage); in-band Task sub-agents ride `SubAgentToolCall` → ephemeral `task-*` child sessions with `subagent` relationships (fission observations stay Codex-only by design) |
 | Per-session persisted launch overlay | `SessionAgentConfig` + `ConfigureSessionAgent` / `Restart` (universal `agent_command` + backend fields, bundled as `LaunchOverrides`). The daemon owns this overlay: implicit resumes (`ResumeSession` from auto-attach or a Resume button) carry NO launch overrides — only the explicit configure/restart flows do — and every config funnel drops (or, for the explicit flows, rejects with an error) an `agent_command` whose executable is a *different* backend's CLI than the session's source, so cross-agent contamination can neither launch nor persist | all `codex_*` fields | **Live.** `claude_model` / `claude_permission_mode` / `claude_allowed_tools` / `claude_effort` pins with inherit-vs-pin sentinels ("default" stays a pinnable permission mode; `all` pins explicitly-unrestricted tools), Launch-config modal rows, and LIVE apply of model + permission on save via the `model` / `permission-mode` thread actions (`set_model` / `set_permission_mode` control requests, verified on 2.1.201) |
 | Global runtime config pane | `Set*` ControlMsgs + `*ConfigChanged` broadcast + Settings/Control panes | 12 knobs | **3 knobs** (model / permission mode / allowed tools) — by design; grows only when CC grows equivalent concepts |
 | Station controls-panel runtime block | the controls panel renders per-backend blocks | approval policy / managed-context / fork-binary warning | **Live.** Model pills (default + the CLI's latest-version aliases fable/opus/sonnet/haiku, with a truthful `custom:` row for out-of-alias pins) and permission pills (default/edits/plan/bypass), gated `backend == "claude-code" \|\| launch_agent == "claude-code"` exactly like the Codex block, dispatching `set_claude_model` / `set_claude_permission_mode` (persisted to `intendant.toml` + broadcast, same as the dashboard Control pane) |
 | Plan / todo display | `AgentEvent::PlanUpdate` exists | emits plan updates | **Translation live for both tool families.** `TodoWrite` tool calls translate into `PlanUpdate` (statuses normalized via the shared helper; the raw call and its acknowledgment are suppressed, failures still warn, a sub-agent's TodoWrite scopes to its `task-*` child; malformed inputs fall back to plain-tool rendering). Print-mode Claude Code (verified on 2.1.201) does not enable `TodoWrite` and exposes the incremental Task tools instead, so the adapter also folds `TaskCreate`/`TaskUpdate` into per-scope task-list state and re-renders the full snapshot on every mutation: the CLI only reveals the assigned id in `TaskCreate`'s tool_result, so creates hold a provisional entry until the ack arrives (failed creates retract it), updates upsert by id (unknown ids materialize a placeholder row — creation may predate the supervisor), `status: "deleted"` removes the row, and both acks are suppressed like TodoWrite's. `TaskList`/`TaskGet` stay plain tool calls |
-| Session vitals chip (git / prompt-cache / rate limits — the operator-statusline port) | `SessionVitals{git,cache,limits}` + `session_vitals` outbound/log/replay; a change-detecting hub (`session_vitals.rs`) merges sections from two producers — the fetch-free git prober (branch, dirty, ahead/behind, `merge-tree` parity, unpushed; primary session) and a bus listener over `UsageSnapshot` that computes the latest request's cache-hit receipt + TTL anchor and folds the sticky rate-limit windows the adapters attach (the countdown and once-per-idle-period expiry alert derive client-side; browser notifications only when permission is already granted). Station renders the same vitals as focus-panel rows (git/limits pre-formatted by the feed, the cache countdown live per frame) | `token_count` `last` bucket → hit receipt (no TTL — OpenAI's is undocumented, countdown hidden); `account/rateLimits/updated` `{primary,secondary}` windows → 5h/7d gauges, re-emitted between turns | **Cache + limits sections live** — per-request reads/writes/uncached from the wire usage, TTL flavor from `cache_creation` ephemeral splits (1h beta) with a 5-minute default; `rate_limit_event` utilization/resetsAt updates the gauge per window type (non-allowed statuses still warn). The native loop feeds the same rail through the derived `UsageSnapshot`, with `anthropic-ratelimit-*` per-minute headers as its gauges (header-less egress-relay calls degrade to none) |
+| Session vitals chip (git / prompt-cache / rate limits — the operator-statusline port) | `SessionVitals{git,cache,limits}` + `session_vitals` outbound/log/replay; a change-detecting hub (`session_vitals.rs`) merges sections from two producers — the fetch-free git prober (branch, dirty, ahead/behind, `merge-tree` parity, unpushed; primary session) and a bus listener over `UsageSnapshot` + `SessionRateLimits` that computes the latest request's cache-hit receipt + TTL anchor and folds rate-limit windows. Provider windows are ACCOUNT-scoped: the hub keeps one window store per backend source (freshest report per label, `observedAtEpoch`) and mirrors the merged view into every session of that source — a warning reported through one session elevates them all, and a session starting mid-warning inherits it; native sessions keep per-session header gauges. Reset countdowns are exact and tick client-side from `resetsAtEpoch` (the cache-ttl pattern); a window whose reset epoch passed reads "reset" until the next report; the once-per-escalation toast and once-per-idle-period cache alert also derive client-side (browser notifications only when permission is already granted). Station renders the same vitals as focus-panel rows (git/limits pre-formatted by the feed, the cache countdown live per frame) | `token_count` `last` bucket → hit receipt (no TTL — OpenAI's is undocumented, countdown hidden); `account/rateLimits/updated` `{primary,secondary}` windows → 5h/7d gauges, delivered as `RateLimitWindows` at the report | **Cache + limits sections live** — per-request reads/writes/uncached from the wire usage, TTL flavor from `cache_creation` ephemeral splits (1h beta) with a 5-minute default; every `rate_limit_event` (`five_hour`, and `seven_day` / `seven_day_overage_included` once elevated) updates its window's status/reset and emits `RateLimitWindows` immediately — a rejected turn produces no usage snapshot to ride (2.1.2xx sends no `utilization`, so no percentage is shown or synthesized). The native loop feeds the same rail through the derived `UsageSnapshot`, with `anthropic-ratelimit-*` per-minute headers as its gauges (header-less egress-relay calls degrade to none) |
 | Managed context / fission / rewind family | managed-context tools + ledgers | patched managed fork only | **Out of scope for parity** — Codex-fork-specific by design; Claude Code manages its own context (`/compact`, auto-compaction) |
 
 Kimi's current rail coverage is:
@@ -1060,6 +1074,23 @@ only speak approvals) let the question through with a "proceed on your best
 judgment" note instead of fabricating a choice. Headless runs without any
 frontend answer the same way instead of blocking forever, mirroring the
 external CLI's own away-from-keyboard fallback.
+
+## Skills
+
+Intendant installs every shipped skill machine-wide into the independent
+`~/.agents/skills/` and `~/.claude/skills/` roots at daemon startup, so
+supervised and bare Codex or Claude Code sessions see the shipped catalog
+through their normal personal discovery. Intendant manages only marked
+per-skill directories: the roots themselves and unmarked user-authored
+collisions are always left untouched.
+
+Starting an external session never copies skills into its project. Personal
+global and project-scoped skills remain user-owned under the backend's normal
+global or project path and belong in that project's ignore rules where
+applicable. There is no Intendant-specific legacy skill path and no automatic
+mirroring between Claude Code's `.claude/skills/` and the Agent Skills
+standard `.agents/skills/`. See "Global distribution" in the configuration
+chapter.
 
 ## Configuration
 

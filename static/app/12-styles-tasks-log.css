@@ -702,6 +702,14 @@ body.context-focus-active {
   overflow-wrap: anywhere;
   white-space: normal;
 }
+.steer-elapsed {
+  grid-column: 2;
+  color: var(--overlay1);
+  font-size: 11px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+}
+.steer-elapsed:empty { display: none; }
 .steer-cancel {
   grid-column: 3;
   grid-row: 1 / span 2;
@@ -2869,7 +2877,7 @@ body.context-focus-active {
   margin-bottom: 8px;
 }
 .question-previews.multi {
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
 }
 .question-preview-card {
   margin: 0;
@@ -2890,27 +2898,79 @@ body.context-focus-active {
   color: var(--subtext0);
   border-bottom: 1px solid var(--surface1);
 }
-.question-preview-expand {
-  padding: 1px 8px;
+.question-preview-cap-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.question-preview-focus {
+  padding: 1px 7px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.question-preview-focus:hover { background: var(--surface1); color: var(--text); }
+.question-preview-choose {
+  padding: 1px 10px;
+  border: 1px solid color-mix(in srgb, var(--green) 50%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--green) 14%, transparent);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.question-preview-choose:hover { background: color-mix(in srgb, var(--green) 22%, transparent); }
+.question-preview-choose.chosen {
+  border-color: var(--green);
+  background: color-mix(in srgb, var(--green) 30%, transparent);
+  font-weight: 600;
+}
+.question-preview-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+  grid-column: 1 / -1;
+}
+/* The hidden attribute must beat the display:flex above. */
+.question-preview-tabs[hidden] { display: none; }
+.question-preview-tab {
+  padding: 3px 12px;
   border: 1px solid var(--surface1);
   border-radius: 999px;
   background: var(--surface0);
   color: var(--subtext0);
   font-family: inherit;
-  font-size: 10px;
+  font-size: 11px;
   cursor: pointer;
 }
-.question-preview-expand:hover { background: var(--surface1); color: var(--text); }
+.question-preview-tab:hover { background: var(--surface1); color: var(--text); }
+.question-preview-tab.active {
+  border-color: var(--blue);
+  color: var(--text);
+  background: color-mix(in srgb, var(--blue) 16%, transparent);
+}
 /* Sandboxed agent HTML; the white backdrop matches the light default
-   most prototype documents assume. */
+   most prototype documents assume. Grid frames scale with the viewport;
+   a focused card takes near-pane height. */
 .question-preview-frame {
   display: block;
   width: 100%;
-  height: 280px;
+  height: clamp(280px, 34vh, 520px);
   border: 0;
   background: #fff;
 }
-.question-preview-card.expanded .question-preview-frame { height: 560px; }
+.question-previews[data-mode='focus'] { grid-template-columns: 1fr; }
+.question-previews[data-mode='focus'] .question-preview-card:not(.focused) { display: none; }
+.question-previews[data-mode='focus'] .question-preview-frame { height: min(66vh, 980px); }
+.question-previews[data-mode='focus'] .question-preview-text {
+  max-height: min(66vh, 980px);
+}
 .question-preview-imagelink { display: block; }
 .question-preview-image { display: block; width: 100%; }
 .question-preview-text {
@@ -2932,6 +2992,169 @@ body.context-focus-active {
   color: var(--subtext0);
   font-size: 11px;
 }
+.question-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+/* Title text grows; countdown chip + hold + tuck pack to the right. */
+.question-title-row > span:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.question-deadline {
+  font-family: 'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  padding: 2px 9px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  white-space: nowrap;
+}
+.question-deadline.warn {
+  color: var(--yellow);
+  border-color: color-mix(in srgb, var(--yellow) 40%, transparent);
+  background: color-mix(in srgb, var(--yellow) 10%, transparent);
+}
+.question-deadline.hidden { display: none; }
+.question-pick-count {
+  display: inline-block;
+  margin: 2px 0 0;
+  font-family: 'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--subtext0);
+}
+.question-pick-count.warn { color: var(--yellow); }
+.question-optional-chip {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--subtext0);
+  font-size: 10px;
+}
+.question-followup { margin-top: 6px; }
+.question-followup-toggle {
+  border: 0;
+  background: transparent;
+  color: var(--subtext0);
+  font-family: inherit;
+  font-size: 11px;
+  padding: 2px 0;
+  cursor: pointer;
+}
+.question-followup-toggle:hover,
+.question-followup-toggle.open { color: var(--text); }
+.question-followup-input {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--mantle);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  resize: vertical;
+}
+.question-followup-input.hidden { display: none; }
+.question-preview-note-btn {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+.question-preview-note-btn:hover,
+.question-preview-note-btn.open { color: var(--text); background: var(--surface1); }
+.question-preview-note {
+  display: block;
+  width: calc(100% - 16px);
+  margin: 4px 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--mantle);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+}
+.question-preview-note.hidden { display: none; }
+.question-hold {
+  height: 22px;
+  padding: 0 10px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.question-hold:hover { background: var(--surface1); color: var(--text); }
+.question-hold:disabled { opacity: 0.55; cursor: default; }
+.question-hold.hidden { display: none; }
+.question-tuck {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.question-tuck:hover { background: var(--surface1); color: var(--text); }
+/* !important on purpose (router-hide precedent): the dock geometry rule
+   `#activity-log-pane .bottom-panel.visible { display:flex }` outranks any
+   id+class selector, and a tuck that silently loses the cascade is exactly
+   the "minimize does nothing" bug shipped once already. */
+#question-panel.question-minimized { display: none !important; }
+/* Preview-bearing questions own the WHOLE pane — the comparison is the
+   content, and the tuck chip is the escape hatch. On narrow (mobile)
+   viewports every question panel takes the full pane: the bottom-dock
+   sliver layout is too cramped there. */
+#activity-log-pane #question-panel.has-previews.visible {
+  top: 0;
+  max-height: none;
+}
+@media (max-width: 900px) {
+  #activity-log-pane #question-panel.visible {
+    top: 0;
+    max-height: none;
+  }
+}
+#question-restore-chip {
+  position: fixed;
+  right: 20px;
+  bottom: 96px;
+  z-index: 80;
+  padding: 8px 14px;
+  border: 1px solid color-mix(in srgb, var(--blue) 45%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--blue) 16%, var(--mantle));
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+}
+#question-restore-chip:hover { filter: brightness(1.1); }
+#question-restore-chip[hidden] { display: none; }
 .question-options {
   display: flex;
   flex-direction: column;

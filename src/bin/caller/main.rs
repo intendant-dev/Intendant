@@ -14,6 +14,7 @@ mod background_tasks;
 mod browser_workspace;
 #[path = "../../build_info.rs"]
 mod build_info;
+mod builtin_skills;
 mod claude_auth_ceremony;
 mod codex_auth_ceremony;
 mod computer_use;
@@ -86,6 +87,7 @@ mod session_supervisor;
 mod session_vitals;
 mod setup;
 mod shared_view_lifecycle;
+mod skill_install;
 mod usage_rail;
 pub(crate) use intendant_core::skills;
 mod sub_agent;

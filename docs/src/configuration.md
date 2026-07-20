@@ -1193,11 +1193,8 @@ frontmatter. Discovery checks these locations in order; the first skill with a
 given name wins:
 
 1. `<project-root>/.agents/skills/<name>/SKILL.md` (Agent Skills standard)
-2. `<project-root>/.intendant/skills/<name>/SKILL.md` (legacy project path)
-3. `<project-root>/skills/<name>/SKILL.md` (visible repository path)
-4. `~/.agents/skills/<name>/SKILL.md` (personal standard path)
-5. `<state-root>/skills/<name>/SKILL.md` (legacy personal path; default
-   `~/.intendant/skills`)
+2. `<project-root>/skills/<name>/SKILL.md` (visible repository path)
+3. `~/.agents/skills/<name>/SKILL.md` (personal standard path)
 
 ```yaml
 ---
@@ -1215,11 +1212,41 @@ disable-auto-invocation: true
 ```
 
 Frontmatter fields: `name` (required), `description` (required), `autonomy`
-(override session autonomy when active), `disable-auto-invocation` (only the
-user can trigger it), `disable-model-invocation` (run without LLM calls),
-`sandbox` (override the session sandbox setting), `compatibility` (required
-system tools), `allowed-tools` (restrict the available tool set). Project skills
-take precedence over personal skills of the same name.
+and `sandbox` (parsed, reserved — not yet enforced), `disable-auto-invocation`
+(only the user can trigger it; splits the injected catalog's auto vs manual
+sections), `compatibility` (free-text environment requirements, surfaced
+verbatim in the injected catalog after the description so the model can rule
+a skill out *before* invoking it — descriptions stay purpose-only; other
+harnesses currently drop this field before the model sees it, so a one-line
+guard at the top of the body remains the late gate for them).
+`disable-model-invocation` and `allowed-tools` are accepted for forward
+compatibility but are **not yet interpreted**. Project skills take precedence
+over personal skills of the same name.
+
+### Global distribution
+
+At startup (daemon, headless, and MCP modes), the daemon installs every skill
+shipped inside the Intendant binary independently into `~/.agents/skills/`
+for Codex and Intendant and `~/.claude/skills/` for Claude Code. Intendant
+never aliases, replaces, or otherwise takes ownership of either global root.
+If a root is a symlink, junction, file, or other non-directory object, it is
+left untouched and reported. Inside a normal directory, only per-skill
+directories carrying `.intendant-installed` are refreshed or removed;
+content-identical installs are no-ops, stale marked copies are swept on
+upgrade, and an unmarked user-authored directory with the same name always
+wins.
+
+The shipped sources remain tracked under this repository's `skills/` and are
+embedded in the binary (`builtin_skills.rs`, pinned to that directory by
+test). Starting a supervised Claude Code or Codex session performs no skill
+copying and writes nothing into the project.
+
+Personal global skills are installed manually in the backend's own path
+(`~/.agents/skills/` for Codex and Intendant or `~/.claude/skills/` for
+Claude Code). Personal project-scoped skills likewise stay in the backend's
+project path (`<project>/.agents/skills/` or `<project>/.claude/skills/`) and
+must be covered by that project's ignore rules; this repository ignores both.
+Intendant does not mirror personal skills between backend-specific paths.
 
 ## INTENDANT.md project instructions
 

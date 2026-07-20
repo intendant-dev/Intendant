@@ -12,6 +12,7 @@ __pycache__/
 !.env.example
 docs/book/
 .claude/
+/.agents/skills/
 .mcp.json
 intendant.toml
 .codex

@@ -41,6 +41,15 @@
 const CHAPTER_NAV_MODES = ['user', 'agent'];
 const CHAPTER_NAV_PENDING_TTL_MS = 15000;
 const CHAPTER_NAV_JUMP_PAD_PX = 8;
+// Rows re-rendered ABOVE an off-window jump target. The windowed
+// renderers mount a fixed-width range with no spacers, so a target
+// materialized near the head of its fresh range has almost no mounted
+// content above it: a centered landing would clamp against scrollTop 0
+// (nothing to scroll past) and sit inside the scroll handler's top-load
+// band, which immediately prepends and re-anchors under the highlight.
+// 150 rows of headroom (several viewports even at one line per row)
+// makes the centered landing real and keeps it out of that band.
+const CHAPTER_NAV_JUMP_CONTEXT_ROWS = 150;
 const CHAPTER_NAV_TOOL_SHAPE_HEAD_CHARS = 600;
 let chapterNavMode = 'user';
 let chapterNavPaneCluster = null; // { el, modeBtn, prevBtn, nextBtn, count, host }
@@ -199,16 +208,21 @@ function chapterNavStepMark(marks, idx, dir) {
 
 // The reader's current position: the last jump target while the scroll
 // position is untouched since (deterministic repeat-stepping), otherwise
-// the first row overlapping the viewport top.
+// the first row overlapping the viewport top. Overlap is tested in
+// viewport coordinates (rect deltas) — offsetTop is relative to
+// offsetParent, which for these static-positioned scrollers is a
+// positioned ancestor ABOVE them, so offsetTop comparisons against
+// scrollTop are biased by the chrome height between the two (see
+// chapterNavNodeContentTop).
 function chapterNavAnchorIndex(scroller, ix, indexAttr, fallback) {
   if (ix.cursor && Math.abs(scroller.scrollTop - ix.cursor.scrollTop) <= 2) {
     return { idx: ix.cursor.mark, atCursor: true };
   }
-  const top = scroller.scrollTop + 1;
+  const top = scroller.getBoundingClientRect().top + scroller.clientTop + 1;
   for (const child of scroller.children) {
     const idx = Number(child.dataset?.[indexAttr]);
     if (!Number.isInteger(idx)) continue;
-    if (child.offsetTop + child.offsetHeight > top) return { idx, atCursor: false };
+    if (child.getBoundingClientRect().bottom > top) return { idx, atCursor: false };
   }
   return { idx: fallback, atCursor: false };
 }
@@ -263,12 +277,52 @@ function chapterNavHighlightRow(node, mode) {
 // scroll ancestor containers too, block:'center' buries the head of
 // taller-than-viewport rows, and the cursor bookkeeping needs the
 // resulting scrollTop synchronously.
+
+// A row's top edge in its scroller's scroll-content coordinates, via rect
+// deltas — NEVER offsetTop. Both transcript scrollers are position:
+// static, so a row's offsetParent is a positioned ancestor above the
+// scroller (a pane row's is the .session-window itself) and offsetTop is
+// inflated by the chrome between them: landing math built on it overshot
+// every jump by the header height — absorbed invisibly by the centered
+// branch in tall maximized panes, but in a card-sized grid scroller the
+// taller-than-viewport branch clipped the target's first line under the
+// header. Rect deltas are offsetParent-agnostic; clientTop excludes any
+// scroller border from the visible top edge.
+function chapterNavNodeContentTop(scroller, node) {
+  return node.getBoundingClientRect().top
+    - scroller.getBoundingClientRect().top
+    - scroller.clientTop
+    + scroller.scrollTop;
+}
+
 function chapterNavJumpScrollTop(scroller, node) {
   const lead = Math.max(
     CHAPTER_NAV_JUMP_PAD_PX,
     Math.floor((scroller.clientHeight - node.offsetHeight) / 2)
   );
-  return Math.max(0, node.offsetTop - lead);
+  return Math.max(0, chapterNavNodeContentTop(scroller, node) - lead);
+}
+
+// One-shot post-landing settle: freshly materialized rows can change
+// height a frame after the synchronous scroll write (deferred image
+// galleries, font swaps), shifting where the target actually sits.
+// Re-derive the landing on the next frame and re-assert it — only while
+// the reader still sits exactly on the jump cursor (a user scroll or a
+// windowed re-anchor moves scrollTop off the cursor and wins) and only
+// when the settled geometry really drifted. No observers, no loops: one
+// rAF per jump, riding the same cursor bookkeeping repeat-stepping uses.
+function chapterNavSettleJump(scroller, ix, target, indexAttr) {
+  requestAnimationFrame(() => {
+    const cursor = ix?.cursor;
+    if (!cursor || cursor.mark !== target || !scroller?.isConnected) return;
+    if (Math.abs(scroller.scrollTop - cursor.scrollTop) > 2) return;
+    const node = scroller.querySelector(`[data-${indexAttr}="${target}"]`);
+    if (!node) return;
+    const desired = chapterNavJumpScrollTop(scroller, node);
+    if (Math.abs(desired - scroller.scrollTop) <= 2) return;
+    scroller.scrollTop = desired;
+    cursor.scrollTop = scroller.scrollTop;
+  });
 }
 
 // ── Pane jumps ─────────────────────────────────────────────────────────
@@ -296,7 +350,7 @@ function chapterNavJumpPane(win, mode, dir) {
     return false;
   }
   if (target < win.renderStart || target >= win.renderEnd) {
-    renderSessionWindowRange(win, Math.max(0, target - 3));
+    renderSessionWindowRange(win, Math.max(0, target - CHAPTER_NAV_JUMP_CONTEXT_ROWS));
   }
   const node = win.log.querySelector(`[data-history-index="${target}"]`);
   if (!node) return false;
@@ -307,6 +361,7 @@ function chapterNavJumpPane(win, mode, dir) {
   // scroll event only when the position actually changed, so a jump onto
   // the current position would otherwise leave the button stale.
   updateSessionWindowJumpButton(win);
+  chapterNavSettleJump(win.log, ix, target, 'history-index');
   chapterNavHighlightRow(node, mode);
   const cluster = chapterNavClusterForPane(win);
   chapterNavUpdateCount(cluster, mode, marks, target);
@@ -337,7 +392,7 @@ function chapterNavPaneHistoryLoaded(win) {
     return;
   }
   if (target < win.renderStart || target >= win.renderEnd) {
-    renderSessionWindowRange(win, Math.max(0, target - 3));
+    renderSessionWindowRange(win, Math.max(0, target - CHAPTER_NAV_JUMP_CONTEXT_ROWS));
   }
   const node = win.log.querySelector(`[data-history-index="${target}"]`);
   if (!node) return;
@@ -345,6 +400,7 @@ function chapterNavPaneHistoryLoaded(win) {
   win.log.scrollTop = chapterNavJumpScrollTop(win.log, node);
   ix.cursor = { mark: target, scrollTop: win.log.scrollTop };
   updateSessionWindowJumpButton(win);
+  chapterNavSettleJump(win.log, ix, target, 'history-index');
   chapterNavHighlightRow(node, pending.mode);
   const cluster = chapterNavClusterForPane(win);
   chapterNavUpdateCount(cluster, pending.mode, marks, target);
@@ -383,12 +439,13 @@ function chapterNavJumpDetail(view, mode, dir) {
 
 function chapterNavScrollDetailTo(view, ix, marks, target, mode) {
   if (target < view.renderStart || target >= view.renderEnd) {
-    renderSessionDetailRange(view, Math.max(0, target - 3));
+    renderSessionDetailRange(view, Math.max(0, target - CHAPTER_NAV_JUMP_CONTEXT_ROWS));
   }
   const node = view.scroller.querySelector(`[data-detail-row-index="${target}"]`);
   if (!node) return;
   view.scroller.scrollTop = chapterNavJumpScrollTop(view.scroller, node);
   ix.cursor = { mark: target, scrollTop: view.scroller.scrollTop };
+  chapterNavSettleJump(view.scroller, ix, target, 'detail-row-index');
   chapterNavHighlightRow(node, mode);
   chapterNavUpdateCount(chapterNavDetailCluster, mode, marks, target);
 }

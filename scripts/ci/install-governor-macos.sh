@@ -14,8 +14,11 @@
 # binary must never run ahead of the root-minted files it gates on (a
 # heavyweight link would degrade to ungated on a box that wanted the
 # gate). Upgrades land during a quiescent interval anyway: an
-# already-running old governor cannot retroactively acquire a gate it
-# never knew about.
+# already-running old governor cannot change acquisition order. This
+# installer refuses the final binary swap while any governor is alive:
+# mixing the old link-then-permit generation with the new
+# permit-then-linker-shim generation could form a cross-generation wait
+# cycle even though each generation is deadlock-free by itself.
 #
 # Deliberately does NOT touch any account's ~/.cargo/config.toml: the
 # governor stays inert until an account's cargo points at it (as
@@ -62,12 +65,16 @@ ci_reserved = 2
 # final links are what melt a small box, not ordinary rustc concurrency.
 # 0 disables the link gate; absent, the binary defaults it to 1.
 link_slots = 1
+# Crash-safe FIFO capacity in front of the link slots. These writable
+# ticket files are fixed/root-minted; 0 keeps serialization but disables
+# ordering. Absent, the binary defaults to 64.
+link_queue_slots = 64
 ci_users = ["_intendant-ci", "ci"]
-# Governed invocations spawn `wrap_with <rustc> <args…>` (the sccache
-# client) as a CHILD while the governor itself holds its locks until the
-# child exits — the fds are close-on-exec, so no child (crucially, no
-# daemonized sccache server) can inherit a flock. Unset, empty, or a
-# missing path: the compiler runs directly (correct, just uncached).
+# Cacheable governed invocations spawn `wrap_with <rustc> <args…>` (the
+# sccache client) as a CHILD while the governor holds its compile permit.
+# Final bin/test rustcs are non-cacheable and run directly so the same
+# binary can gate only their real linker phase. Lock fds remain
+# close-on-exec. Unset/empty/missing: rustc runs directly (uncached).
 wrap_with = "/opt/homebrew/bin/sccache"
 CONF_EOF
     chmod 0644 "$CONF"
@@ -89,6 +96,10 @@ WRAP_EOF
         echo "  NOTE: no link_slots key — the binary defaults to 1 (heavyweight final"
         echo "  links serialize machine-wide). Add 'link_slots = N' to resize, 0 to disable."
     fi
+    if ! grep -q '^[[:space:]]*link_queue_slots[[:space:]]*=' "$CONF"; then
+        echo "  NOTE: no link_queue_slots key — the binary defaults to 64 FIFO tickets."
+        echo "  Add 'link_queue_slots = N' to resize, 0 to keep gating without ordering."
+    fi
 fi
 
 # Pre-create the flock files for the *effective* config (an existing conf
@@ -101,16 +112,24 @@ permit_dir=$(sed -n 's/^permit_dir[[:space:]]*=[[:space:]]*"\(.*\)".*$/\1/p' "$C
 local_n=$(sed -n 's/^local_reserved[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*$/\1/p' "$CONF" | tail -n 1)
 ci_n=$(sed -n 's/^ci_reserved[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*$/\1/p' "$CONF" | tail -n 1)
 link_n=$(sed -n 's/^link_slots[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*$/\1/p' "$CONF" | tail -n 1)
+link_queue_n=$(sed -n 's/^link_queue_slots[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*$/\1/p' "$CONF" | tail -n 1)
 permit_dir="${permit_dir:-$PERMIT_DIR_DEFAULT}"
 local_n="${local_n:-1}"
 ci_n="${ci_n:-2}"
 link_n="${link_n:-1}"   # the binary's default when the key is absent
+link_queue_n="${link_queue_n:-64}"   # the binary's default when absent
 
 install -d -m 0755 "$permit_dir"
 create_lock_file() {
     [ -f "$1" ] || : > "$1"
     chown root:wheel "$1"
     chmod 0644 "$1"
+}
+create_queue_file() {
+    [ -f "$1" ] || : > "$1"
+    chown root:wheel "$1"
+    # Every governed account must write its arrival tuple while flocking.
+    chmod 0666 "$1"
 }
 i=0
 while [ "$i" -lt "$local_n" ]; do
@@ -127,15 +146,25 @@ while [ "$i" -lt "$link_n" ]; do
     create_lock_file "$permit_dir/link-$i"
     i=$((i + 1))
 done
+i=0
+while [ "$i" -lt "$link_queue_n" ]; do
+    create_queue_file "$permit_dir/link-waiter-$i"
+    i=$((i + 1))
+done
 create_lock_file "$permit_dir/demand-local"
 create_lock_file "$permit_dir/demand-ci"
 # Every governed account appends to (and rotates) the log: world-writable.
 [ -f "$permit_dir/governor.log" ] || : > "$permit_dir/governor.log"
 chown root:wheel "$permit_dir/governor.log"
 chmod 0666 "$permit_dir/governor.log"
-echo "permit dir ready: $permit_dir (local=$local_n ci=$ci_n link=$link_n)"
+echo "permit dir ready: $permit_dir (local=$local_n ci=$ci_n link=$link_n queue=$link_queue_n)"
 
 # Binary last (see the ordering note up top).
+if pgrep -x rustc-governor >/dev/null 2>&1; then
+    echo "refusing to swap governor generations while rustc-governor processes are active" >&2
+    echo "wait for builds to drain (or use enabled=false to drain waiters), then re-run" >&2
+    exit 1
+fi
 install -m 0755 "$BIN_SRC" "$LIB_BIN_DIR/rustc-governor"
 echo "installed $LIB_BIN_DIR/rustc-governor"
 
@@ -165,8 +194,9 @@ Notes:
   (immediate, machine-wide); a disabled governor still execs the wrap_with
   chain, so caching survives the kill switch. Removing the rustc-wrapper=
   line fully unwires an account. `link_slots = 0` turns off only the
-  heavyweight-link gate.
+  heavyweight-link gate; `link_queue_slots = 0` keeps the gate but turns
+  off FIFO ordering.
 - Watch it: tail -f /usr/local/var/intendant-governor/governor.log
-  (kind=link lines carry link_wait_ms; kind=link-done carries runtime_ms —
-  the link-gate soak data.)
+  (kind=link lines carry link_wait_ms + queue; kind=link-done is actual
+  linker runtime — the link-gate soak data.)
 NEXT_EOF

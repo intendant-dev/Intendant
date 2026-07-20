@@ -570,6 +570,7 @@ impl AppEventUpcaster {
             | AppEvent::DisplayMetrics { .. }
             // Hub-internal: peers see the folded SessionVitals instead.
             | AppEvent::SessionActivity { .. }
+            | AppEvent::SessionRateLimits { .. }
             | AppEvent::SessionConfigFacts { .. }
             | AppEvent::ContextSnapshot { .. }
             | AppEvent::CodexThreadActionRequested { .. }
@@ -1039,6 +1040,7 @@ impl AppEventUpcaster {
                 session_id,
                 id,
                 questions,
+                ..
             } => {
                 let mut out = vec![PeerEvent::ApprovalRequested {
                     request: ApprovalRequest {
@@ -2578,6 +2580,7 @@ impl WireEventUpcaster {
                 session_id,
                 id,
                 questions,
+                ..
             } => {
                 let mut out = vec![PeerEvent::ApprovalRequested {
                     request: ApprovalRequest {

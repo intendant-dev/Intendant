@@ -387,6 +387,7 @@ fn control_target_session_id(msg: &ControlMsg) -> Option<&str> {
         | ControlMsg::Skip { session_id, .. }
         | ControlMsg::ApproveAll { session_id, .. }
         | ControlMsg::AnswerQuestion { session_id, .. }
+        | ControlMsg::HoldQuestion { session_id, .. }
         | ControlMsg::Interrupt { session_id, .. }
         | ControlMsg::Steer { session_id, .. }
         | ControlMsg::CancelSteer { session_id, .. }

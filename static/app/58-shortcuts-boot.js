@@ -84,10 +84,17 @@ window.sendQuestionAnswer = function(opts) {
     const collected = collectQuestionAnswers();
     if (!collected) return;
     if (collected.missing) {
-      showControlToast('error', `Answer "${collected.missing}" first (or Skip)`);
+      showControlToast('error', collected.hint || `Answer "${collected.missing}" first (or Skip)`);
       return;
     }
-    msg = { action: 'answer_question', id, answers: collected.answers };
+    msg = {
+      action: 'answer_question',
+      id,
+      answers: collected.answers,
+      selections: collected.selections,
+      followups: collected.followups,
+      annotations: collected.annotations,
+    };
   }
   if (sessionId) msg.session_id = sessionId;
   dispatchSessionControlMsg(msg);
@@ -95,6 +102,16 @@ window.sendQuestionAnswer = function(opts) {
   clearPendingQuestion();
   hidePanel('question-panel');
   setPhase('running');
+};
+
+// Suspend or resume the pending question's expiry countdown. Truth stays
+// with the asking waiter: it re-emits the question with the new hold state
+// (same id), which refreshes the panel chip and re-enables the button.
+window.sendQuestionHold = function(held) {
+  if (!app || !pendingQuestion) return;
+  const msg = { action: 'hold_question', id: pendingQuestion.id, held: !!held };
+  if (pendingQuestion.sessionId) msg.session_id = pendingQuestion.sessionId;
+  dispatchSessionControlMsg(msg);
 };
 
 // Request interruption of the current agent turn. Disables the button and

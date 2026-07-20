@@ -83,7 +83,81 @@ impl AgendaActor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgendaAnswer {
     /// The reply text — data, never instructions (same doctrine as bodies).
+    /// For rich (ask-backed) questions this is the human-readable joined
+    /// summary, so every text-only surface keeps working; the structured
+    /// breakdown rides [`AgendaAnswer::structured`].
     pub(crate) text: String,
+    pub(crate) at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    /// Structured resolution of a rich ask (selections, follow-ups,
+    /// anchored preview notes). Additive: absent on plain text answers and
+    /// in logs written by older builds, which skip it on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) structured: Option<AgendaAskResolution>,
+}
+
+/// The full Ask v2 payload carried by a parked rich question: the wire
+/// questions exactly as the rail renders them (options, pick bounds,
+/// free-text policy, preview references into the agenda blob store) plus
+/// the approval-space `ask_id` every rail resolves against. Additive on
+/// [`AgendaItem`]: older builds skip the field and treat the item as a
+/// plain question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaAsk {
+    /// Rail id from the process-wide approval allocator
+    /// (`crate::event::next_approval_id`). The store floors the allocator
+    /// above every persisted ask id at fold time so a restarted daemon can
+    /// never re-mint one.
+    pub(crate) ask_id: u64,
+    pub(crate) questions: Vec<crate::types::UserQuestion>,
+}
+
+/// Structured resolution data recorded with an answer — the same shapes
+/// `ControlMsg::AnswerQuestion` carries, keyed by question text. BTreeMaps
+/// keep the durable log lines byte-deterministic.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgendaAskResolution {
+    /// Question text → the joined answer string (the legacy authoritative
+    /// form every consumer understands).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) answers: BTreeMap<String, String>,
+    /// Question text → chosen option labels, unjoined (preserves labels
+    /// containing the ", " join sequence).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) selections: BTreeMap<String, Vec<String>>,
+    /// Question text → the user's follow-up text (may stand in for an
+    /// answer).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) followups: BTreeMap<String, String>,
+    /// Question text → notes anchored to that question's preview cards.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) annotations: BTreeMap<String, Vec<crate::types::QuestionAnnotation>>,
+}
+
+impl AgendaAskResolution {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.answers.is_empty()
+            && self.selections.is_empty()
+            && self.followups.is_empty()
+            && self.annotations.is_empty()
+    }
+}
+
+/// Dismissal marker on an open question (fold view of the latest `dismiss`
+/// op). A dismissal clears the rails NOW but leaves the item OPEN — a
+/// parked question survives dismissal; only an answer resolves it. Cleared
+/// by `answer` and `reopen`; the log keeps every dismissal as history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaDismissal {
+    /// The dismissing verb as the rail spoke it (`skip`, `deny`,
+    /// `approve`, `approve_all`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) action: String,
     pub(crate) at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) principal: Option<String>,
@@ -237,6 +311,14 @@ pub struct AgendaItem {
     /// item; delivery/execution authority never rides item fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) effects: Vec<AgendaEffect>,
+    /// Rich-ask payload (Ask v2), question items parked via the `ask`
+    /// command only. Additive: older builds skip it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ask: Option<AgendaAsk>,
+    /// Latest dismissal of a still-open question (rail skip/deny). Cleared
+    /// by `answer` and `reopen`; never a lifecycle transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dismissed: Option<AgendaDismissal>,
 }
 
 /// Field-level patch of presentation state (umbrella RFC §7.2: `Patch`
@@ -326,9 +408,24 @@ pub enum AgendaCommand {
         id: String,
     },
     /// Reply to an open question (question items only). Resolves it.
+    /// `structured` (optional, additive) carries the rich-ask breakdown —
+    /// selections, follow-ups, anchored preview notes — recorded alongside
+    /// the joined `text` summary.
     Answer {
         id: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured: Option<AgendaAskResolution>,
+    },
+    /// Park a rich multi-question ask (the Ask v2 payload — same
+    /// vocabulary as `ask_user`'s `questions` form: options, pick bounds,
+    /// free-text policy, inline preview sources) as a durable agenda
+    /// question item. Returns immediately: nothing blocks on the answer.
+    /// The daemon validates, commits preview blobs into the agenda blob
+    /// store, and mints both the item id and the rail `ask_id` — commands
+    /// carry no client-minted ids.
+    Ask {
+        questions: Vec<crate::mcp::AskUserQuestionParams>,
     },
     /// Propose (or revise) the item's scheduled-session manifest. Open to
     /// every agenda writer — proposing carries no authority: nothing fires
@@ -374,6 +471,10 @@ pub(crate) enum AgendaOp {
         tags: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         due_ms: Option<u64>,
+        /// Rich-ask payload for `ask`-parked questions (additive: older
+        /// builds skip the field and fold a plain question item).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ask: Option<AgendaAsk>,
     },
     Patch {
         id: String,
@@ -391,6 +492,19 @@ pub(crate) enum AgendaOp {
     Answer {
         id: String,
         text: String,
+        /// Structured rich-ask resolution (additive; older builds skip it
+        /// and fold the text alone).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured: Option<AgendaAskResolution>,
+    },
+    /// Dismissal marker on an open question (rail skip/deny): recorded as
+    /// history, the item stays open. Older builds skip the whole line
+    /// (unknown op vocabulary) — consistent, since dismissal changes no
+    /// lifecycle state.
+    Dismiss {
+        id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        action: String,
     },
     ProposeEffect {
         id: String,
@@ -430,6 +544,7 @@ impl AgendaOp {
             | AgendaOp::Reopen { id }
             | AgendaOp::Retire { id }
             | AgendaOp::Answer { id, .. }
+            | AgendaOp::Dismiss { id, .. }
             | AgendaOp::ProposeEffect { id, .. }
             | AgendaOp::ApproveEffect { id, .. }
             | AgendaOp::RevokeEffect { id, .. }
@@ -481,6 +596,7 @@ pub(crate) fn apply_op(
             body,
             tags,
             due_ms,
+            ask,
         } => {
             if items.contains_key(id) {
                 return Some(format!("duplicate add for {id} ignored"));
@@ -506,6 +622,8 @@ pub(crate) fn apply_op(
                     completed_ms: None,
                     answer: None,
                     effects: Vec::new(),
+                    ask: ask.clone(),
+                    dismissed: None,
                 },
             );
             None
@@ -553,8 +671,9 @@ pub(crate) fn apply_op(
                     item.status = AgendaStatus::Open;
                     item.completed_ms = None;
                     // Re-asking a question awaits a fresh reply; earlier
-                    // replies remain in the log as history.
+                    // replies (and dismissals) remain in the log as history.
                     item.answer = None;
+                    item.dismissed = None;
                     item.updated_ms = at_ms;
                     None
                 }
@@ -668,7 +787,11 @@ pub(crate) fn apply_op(
             item.updated_ms = at_ms;
             None
         }
-        AgendaOp::Answer { id, text } => {
+        AgendaOp::Answer {
+            id,
+            text,
+            structured,
+        } => {
             let Some(item) = items.get_mut(id) else {
                 return Some(format!("answer for unknown {id} ignored"));
             };
@@ -684,8 +807,11 @@ pub(crate) fn apply_op(
                         principal: actor.principal,
                         session_id: actor.session_id,
                         kind: actor.kind,
+                        structured: structured.clone(),
                     });
-                    // A reply resolves the question.
+                    // A reply resolves the question (an earlier dismissal
+                    // is history the answer supersedes).
+                    item.dismissed = None;
                     item.status = AgendaStatus::Done;
                     item.completed_ms = Some(at_ms);
                     item.updated_ms = at_ms;
@@ -693,6 +819,33 @@ pub(crate) fn apply_op(
                 }
                 AgendaStatus::Done | AgendaStatus::Retired => {
                     Some(format!("answer on resolved {id} ignored"))
+                }
+            }
+        }
+        AgendaOp::Dismiss { id, action } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("dismiss for unknown {id} ignored"));
+            };
+            if item.kind != AgendaKind::Question {
+                return Some(format!("dismiss on non-question {id} ignored"));
+            }
+            match item.status {
+                AgendaStatus::Open => {
+                    let actor = rec.actor.clone().unwrap_or_default();
+                    item.dismissed = Some(AgendaDismissal {
+                        action: action.clone(),
+                        at_ms,
+                        principal: actor.principal,
+                        session_id: actor.session_id,
+                        kind: actor.kind,
+                    });
+                    // Deliberately NOT a lifecycle transition: a parked
+                    // question survives dismissal — that's the point.
+                    item.updated_ms = at_ms;
+                    None
+                }
+                AgendaStatus::Done | AgendaStatus::Retired => {
+                    Some(format!("dismiss on resolved {id} ignored"))
                 }
             }
         }
@@ -732,6 +885,7 @@ mod tests {
             body: String::new(),
             tags: Vec::new(),
             due_ms: None,
+            ask: None,
         }
     }
 
@@ -862,6 +1016,7 @@ mod tests {
                 body: String::new(),
                 tags: vec!["later".into()],
                 due_ms: None,
+                ask: None,
             },
         };
         let line = serde_json::to_string(&record).unwrap();
@@ -941,6 +1096,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    ask: None,
                 },
             ),
         );
@@ -949,6 +1105,7 @@ mod tests {
             AgendaOp::Answer {
                 id: "q".into(),
                 text: "sqlite is fine".into(),
+                structured: None,
             },
         );
         answer.actor = Some(AgendaActor {
@@ -972,7 +1129,8 @@ mod tests {
                 3,
                 AgendaOp::Answer {
                     id: "q".into(),
-                    text: "no, postgres".into()
+                    text: "no, postgres".into(),
+                    structured: None,
                 }
             )
         )
@@ -990,6 +1148,7 @@ mod tests {
                 AgendaOp::Answer {
                     id: "q".into(),
                     text: "postgres after all".into(),
+                    structured: None,
                 },
             ),
         );
@@ -1006,7 +1165,8 @@ mod tests {
                 7,
                 AgendaOp::Answer {
                     id: "t".into(),
-                    text: "nope".into()
+                    text: "nope".into(),
+                    structured: None,
                 }
             )
         )
@@ -1029,6 +1189,7 @@ mod tests {
             op: AgendaOp::Answer {
                 id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
                 text: "yes — ship it".into(),
+                structured: None,
             },
         };
         let line = serde_json::to_string(&record).unwrap();
@@ -1072,6 +1233,282 @@ mod tests {
                 done: 1,
                 retired: 1
             }
+        );
+    }
+
+    fn rich_ask() -> AgendaAsk {
+        AgendaAsk {
+            ask_id: 17_592_186_044_423, // (1 << 44) + 7
+            questions: vec![crate::types::UserQuestion {
+                question: "Which grid?".into(),
+                header: "Grid".into(),
+                options: vec![crate::types::UserQuestionOption {
+                    label: "A".into(),
+                    description: String::new(),
+                }],
+                multi_select: false,
+                pick_min: Some(1),
+                pick_max: Some(1),
+                free_text: None,
+                previews: vec![crate::types::QuestionPreview {
+                    label: "A".into(),
+                    source: crate::types::QuestionPreviewSource::Html {
+                        upload_id: "blob-1".into(),
+                        url: "/api/agenda/blobs/01ITEM/blob-1/raw".into(),
+                    },
+                }],
+            }],
+        }
+    }
+
+    fn ask_add(id: &str) -> AgendaOp {
+        AgendaOp::Add {
+            id: id.to_string(),
+            kind: AgendaKind::Question,
+            title: "Which grid?".into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            ask: Some(rich_ask()),
+        }
+    }
+
+    /// Slice 1: an ask-add folds the payload onto the item; a structured
+    /// answer resolves it and records the breakdown; dismissal marks but
+    /// never transitions; reopen clears both views (log keeps history).
+    #[test]
+    fn ask_fold_lifecycle_answer_dismiss_reopen() {
+        let mut items = BTreeMap::new();
+        assert!(apply_op(&mut items, &rec(1, ask_add("q"))).is_none());
+        let item = &items["q"];
+        assert_eq!(item.kind, AgendaKind::Question);
+        assert_eq!(item.ask.as_ref().unwrap().ask_id, rich_ask().ask_id);
+        assert_eq!(item.ask.as_ref().unwrap().questions.len(), 1);
+
+        // Dismissal (rail skip): marker recorded, item stays OPEN.
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                2,
+                AgendaOp::Dismiss {
+                    id: "q".into(),
+                    action: "skip".into()
+                }
+            )
+        )
+        .is_none());
+        assert_eq!(items["q"].status, AgendaStatus::Open);
+        assert_eq!(items["q"].dismissed.as_ref().unwrap().action, "skip");
+        assert_eq!(items["q"].dismissed.as_ref().unwrap().at_ms, 2);
+
+        // A structured answer resolves it and clears the dismissal view.
+        let structured = AgendaAskResolution {
+            answers: BTreeMap::from([("Which grid?".to_string(), "A".to_string())]),
+            selections: BTreeMap::from([("Which grid?".to_string(), vec!["A".to_string()])]),
+            followups: BTreeMap::from([(
+                "Which grid?".to_string(),
+                "can B keep the sidebar?".to_string(),
+            )]),
+            annotations: BTreeMap::from([(
+                "Which grid?".to_string(),
+                vec![crate::types::QuestionAnnotation {
+                    preview: "A".into(),
+                    note: "rails too faint".into(),
+                }],
+            )]),
+        };
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                3,
+                AgendaOp::Answer {
+                    id: "q".into(),
+                    text: "A".into(),
+                    structured: Some(structured.clone()),
+                }
+            )
+        )
+        .is_none());
+        let answered = &items["q"];
+        assert_eq!(answered.status, AgendaStatus::Done);
+        assert!(answered.dismissed.is_none());
+        let reply = answered.answer.as_ref().unwrap();
+        assert_eq!(reply.text, "A");
+        assert_eq!(reply.structured.as_ref().unwrap(), &structured);
+        // The archive keeps the ask payload (previews stay visible).
+        assert!(answered.ask.is_some());
+
+        // Dismiss on a resolved question warns and changes nothing.
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                4,
+                AgendaOp::Dismiss {
+                    id: "q".into(),
+                    action: "deny".into()
+                }
+            )
+        )
+        .is_some());
+
+        // Reopen re-asks: answer + dismissal views clear, ask stays.
+        apply_op(&mut items, &rec(5, AgendaOp::Reopen { id: "q".into() }));
+        let reopened = &items["q"];
+        assert_eq!(reopened.status, AgendaStatus::Open);
+        assert!(reopened.answer.is_none());
+        assert!(reopened.dismissed.is_none());
+        assert!(reopened.ask.is_some());
+
+        // Dismiss never lands on non-questions.
+        apply_op(&mut items, &rec(6, add("t", "task")));
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                7,
+                AgendaOp::Dismiss {
+                    id: "t".into(),
+                    action: "skip".into()
+                }
+            )
+        )
+        .is_some());
+        assert!(items["t"].dismissed.is_none());
+    }
+
+    /// Pins the ask-add durable line (additive to v1) and its round-trip.
+    #[test]
+    fn ask_add_record_line_format_is_pinned() {
+        let record = AgendaOpRecord {
+            v: 1,
+            at_ms: 11,
+            actor: Some(AgendaActor {
+                principal: None,
+                session_id: Some("sess-park".into()),
+                kind: Some("agent_session".into()),
+            }),
+            op: ask_add("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        assert_eq!(
+            line,
+            r#"{"v":1,"at_ms":11,"actor":{"session_id":"sess-park","kind":"agent_session"},"op":{"type":"add","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","kind":"question","title":"Which grid?","ask":{"ask_id":17592186044423,"questions":[{"question":"Which grid?","header":"Grid","options":[{"label":"A"}],"multi_select":false,"pick_min":1,"pick_max":1,"previews":[{"label":"A","kind":"html","upload_id":"blob-1","url":"/api/agenda/blobs/01ITEM/blob-1/raw"}]}]}}}"#
+        );
+        let back: AgendaOpRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, record);
+    }
+
+    /// Pins the dismiss line and the structured-answer line (additive).
+    #[test]
+    fn dismiss_and_structured_answer_line_formats_are_pinned() {
+        let dismiss = AgendaOpRecord {
+            v: 1,
+            at_ms: 12,
+            actor: None,
+            op: AgendaOp::Dismiss {
+                id: "01X".into(),
+                action: "skip".into(),
+            },
+        };
+        let line = serde_json::to_string(&dismiss).unwrap();
+        assert_eq!(
+            line,
+            r#"{"v":1,"at_ms":12,"op":{"type":"dismiss","id":"01X","action":"skip"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgendaOpRecord>(&line).unwrap(),
+            dismiss
+        );
+
+        let answer = AgendaOpRecord {
+            v: 1,
+            at_ms: 13,
+            actor: None,
+            op: AgendaOp::Answer {
+                id: "01X".into(),
+                text: "A".into(),
+                structured: Some(AgendaAskResolution {
+                    answers: BTreeMap::from([("Q?".to_string(), "A".to_string())]),
+                    selections: BTreeMap::from([("Q?".to_string(), vec!["A".to_string()])]),
+                    followups: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                }),
+            },
+        };
+        let line = serde_json::to_string(&answer).unwrap();
+        assert_eq!(
+            line,
+            r#"{"v":1,"at_ms":13,"op":{"type":"answer","id":"01X","text":"A","structured":{"answers":{"Q?":"A"},"selections":{"Q?":["A"]}}}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgendaOpRecord>(&line).unwrap(),
+            answer
+        );
+    }
+
+    /// Forward compatibility both ways: an old add line (no `ask`) folds
+    /// into an ask-less item; an old item JSON (no `ask`/`dismissed`)
+    /// deserializes; and a new item round-trips through JSON intact.
+    #[test]
+    fn ask_fields_are_additive_on_wire_and_log() {
+        // Old log line, current build.
+        let old_line =
+            r#"{"v":1,"at_ms":1,"op":{"type":"add","id":"q","kind":"question","title":"old?"}}"#;
+        let record: AgendaOpRecord = serde_json::from_str(old_line).unwrap();
+        let mut items = BTreeMap::new();
+        assert!(apply_op(&mut items, &record).is_none());
+        assert!(items["q"].ask.is_none());
+        assert!(items["q"].dismissed.is_none());
+
+        // Old item DTO, current build.
+        let old_item = r#"{"id":"q","kind":"question","title":"old?","body":"","tags":[],"provenance":{"created_ms":1},"status":"open","updated_ms":1}"#;
+        let item: AgendaItem = serde_json::from_str(old_item).unwrap();
+        assert!(item.ask.is_none());
+
+        // New item round-trip.
+        apply_op(&mut items, &rec(2, ask_add("rich")));
+        let json = serde_json::to_string(&items["rich"]).unwrap();
+        let back: AgendaItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(&back, &items["rich"]);
+        // Plain (non-ask) items serialize without the new keys at all.
+        let plain = serde_json::to_string(&items["q"]).unwrap();
+        assert!(!plain.contains("\"ask\""));
+        assert!(!plain.contains("\"dismissed\""));
+    }
+
+    /// The park command's wire shape parses, and old daemons' strictness
+    /// story holds: `deny_unknown_fields` still rejects unknown command
+    /// fields while the new optional `structured` on answer is accepted.
+    #[test]
+    fn ask_command_wire_shape_parses() {
+        let cmd: AgendaCommand = serde_json::from_str(
+            r#"{"op":"ask","questions":[{"question":"Which grid?","options":[{"label":"A"},{"label":"B"}],"pick_min":1,"pick_max":1}]}"#,
+        )
+        .unwrap();
+        match cmd {
+            AgendaCommand::Ask { questions } => {
+                assert_eq!(questions.len(), 1);
+                assert_eq!(questions[0].question, "Which grid?");
+                assert_eq!(questions[0].options.len(), 2);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let answer: AgendaCommand = serde_json::from_str(
+            r#"{"op":"answer","id":"01X","text":"A","structured":{"answers":{"Q?":"A"}}}"#,
+        )
+        .unwrap();
+        match answer {
+            AgendaCommand::Answer { structured, .. } => {
+                assert_eq!(
+                    structured.unwrap().answers.get("Q?").map(String::as_str),
+                    Some("A")
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            serde_json::from_str::<AgendaCommand>(r#"{"op":"ask","questions":[],"wait":30}"#)
+                .is_err(),
+            "unknown command fields stay rejected at intake"
         );
     }
 }
