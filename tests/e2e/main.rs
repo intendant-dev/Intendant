@@ -1366,16 +1366,30 @@ async fn ctl_session_note_posts_a_display_only_note_with_image() {
 #[tokio::test]
 async fn native_session_ctl_agenda_add_attributes_to_the_session() {
     let intendant = intendant_bin();
+    // Three steps, portable across sh and cmd (no POSIX-only syntax — the
+    // Windows runtime shells through cmd, where `[`/`{` broke this test in
+    // the merge queue). Step 1 echoes the injected URL: `%VAR%` expands on
+    // cmd while `$VAR` expands on sh, so EITHER platform puts
+    // `/mcp?session_id=` in the transcript iff the injection reached the
+    // runtime env. Step 2's expectation gates the actual ctl write on that
+    // proof (an unmet expectation is a loud provider error), so a broken
+    // injection can never fall back onto some other daemon's default port.
+    // Step 3 gates completion on ctl echoing the minted item back.
     let script = serde_json::json!({
         "profiles": [{
             "steps": [
-                { "content": "Parking the follow-up on the agenda.",
+                { "content": "Probing the injected bootstrap.",
                   "tool_calls": [{ "name": "exec_command",
-                                   "arguments": { "nonce": 1, "command": format!(
-                                       "[ -n \"$INTENDANT_MCP_URL\" ] || {{ echo NO_INJECTED_MCP_URL >&2; exit 1; }}; \
-                                        \"{intendant}\" ctl agenda add parked-from-inside --task"
+                                   "arguments": { "nonce": 1, "command":
+                                       "echo INJECTED %INTENDANT_MCP_URL%$INTENDANT_MCP_URL" } }] },
+                { "expect_transcript_contains": "/mcp?session_id=",
+                  "content": "Parking the follow-up on the agenda.",
+                  "tool_calls": [{ "name": "exec_command",
+                                   "arguments": { "nonce": 2, "command": format!(
+                                       "\"{intendant}\" ctl --json agenda add parked-from-inside --task"
                                    ) } }] },
-                { "content": "Parked.",
+                { "expect_transcript_contains": "parked-from-inside",
+                  "content": "Parked.",
                   "tool_calls": [{ "name": "signal_done",
                                    "arguments": { "message": "agenda write done" } }] }
             ]
