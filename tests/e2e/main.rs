@@ -235,6 +235,31 @@ struct DaemonRig {
 }
 
 impl DaemonRig {
+    /// This daemon's per-boot loopback admission token, read from the
+    /// rig home the way any owner process discovers it — the same file
+    /// `intendant ctl` auto-reads. Raw HTTP/WS tests attach it because
+    /// tokenless loopback stopped binding the trusted-local lane; `ctl`
+    /// tests need nothing (discovery is built in).
+    fn loopback_token(&self) -> String {
+        rig_loopback_token(&self.rig, self.port)
+    }
+
+    /// A reqwest client presenting this daemon's loopback admission
+    /// token on every request (default header) — the raw-HTTP twin of
+    /// the discovery `ctl` performs automatically. Tests shadow their
+    /// boot-probe client with this after `spawn_daemon`.
+    fn authed_client(&self) -> reqwest::Client {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-intendant-loopback-token",
+            self.loopback_token().parse().expect("token header value"),
+        );
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("build token-authed client")
+    }
+
     /// Tail of the daemon's combined stdout/stderr log, for failure context.
     fn log_tail(&self) -> String {
         let path = self.rig.home.path().join("daemon.log");
@@ -413,9 +438,11 @@ async fn spawn_daemon_on_rig(
 /// INTENDANT_MCP_URL / INTENDANT_PORT / INTENDANT_SESSION_ID /
 /// INTENDANT_MANAGED_CONTEXT from the environment — a test run from inside a
 /// supervised session inherits them and would target the wrong daemon — so
-/// scrub them and let `--port` select exactly this daemon (tokenless
-/// loopback /mcp binds the root-capable `local_process` default on a fresh,
-/// grant-less HOME).
+/// scrub them and let `--port` select exactly this daemon. Authentication
+/// is the real discovery path: ctl reads the daemon's per-boot loopback
+/// admission token from the rig HOME the way any owner process would, and
+/// the request binds the root-capable `local_process` default on a fresh,
+/// grant-less HOME.
 async fn ctl(daemon: &DaemonRig, args: &[&str]) -> std::process::Output {
     let mut cmd = daemon.rig.command();
     cmd.env_remove("INTENDANT_MCP_URL")
@@ -427,6 +454,136 @@ async fn ctl(daemon: &DaemonRig, args: &[&str]) -> std::process::Output {
         .arg(daemon.port.to_string())
         .args(args);
     daemon.rig.run(cmd).await
+}
+
+/// The loopback admission token a daemon booted against `rig`'s home
+/// minted for `port` — for tests that spawn the daemon by hand instead
+/// of through [`spawn_daemon`]. Same file every owner process reads.
+fn rig_loopback_token(rig: &TestRig, port: u16) -> String {
+    let path = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("loopback-tokens")
+        .join(format!("{port}.token"));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read loopback token {}: {e}", path.display()))
+        .trim()
+        .to_string()
+}
+
+/// Acceptance for the per-boot loopback admission token: the 2026-07-19
+/// scavenge shape — a permissive-looking `--no-tls` dev/QA daemon on a
+/// home — no longer grants owner posture to whatever can reach its
+/// port. Tokenless raw HTTP and tokenless ctl are refused with the
+/// named, actionable error; discovery-driven ctl and token'd raw HTTP
+/// round-trip an agenda write. The token is default-ON for every
+/// posture: this daemon is exactly the `--no-tls` shape that used to be
+/// wide open.
+#[tokio::test]
+async fn loopback_token_closes_tokenless_drive_by_on_no_tls_daemons() {
+    let client = reqwest::Client::new();
+    let idle_script = serde_json::json!({ "profiles": [] });
+    let daemon = spawn_daemon(&client, &idle_script).await;
+    let port = daemon.port;
+
+    // Raw tokenless loopback HTTP to an owner surface: named refusal.
+    let refused = client
+        .get(format!("http://127.0.0.1:{port}/api/sessions"))
+        .send()
+        .await
+        .expect("tokenless request completes");
+    assert_eq!(refused.status(), 401, "tokenless loopback must be refused");
+    let body = refused.text().await.expect("refusal body");
+    assert!(
+        body.contains("loopback-tokens") && body.contains("INTENDANT_LOOPBACK_TOKEN"),
+        "refusal must name the token file and env override: {body}"
+    );
+
+    // Tokenless /mcp (the ctl lane's endpoint) is refused the same way.
+    let mcp_refused = client
+        .post(format!("http://127.0.0.1:{port}/mcp"))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "get_status", "arguments": {} }
+        }))
+        .send()
+        .await
+        .expect("tokenless mcp request completes");
+    assert_eq!(
+        mcp_refused.status(),
+        401,
+        "tokenless loopback /mcp must be refused"
+    );
+
+    // Tokenless ctl — a foreign home holds no token file, modeling a
+    // caller that can reach the port but cannot read the owner's home.
+    let foreign = TestRig::new();
+    let mut cmd = foreign.command();
+    cmd.env_remove("INTENDANT_MCP_URL")
+        .env_remove("INTENDANT_PORT")
+        .env_remove("INTENDANT_SESSION_ID")
+        .env_remove("INTENDANT_MANAGED_CONTEXT")
+        .env_remove("INTENDANT_LOOPBACK_TOKEN");
+    cmd.arg("ctl")
+        .arg("--port")
+        .arg(port.to_string())
+        .args(["agenda", "add", "scavenged note"]);
+    let output = foreign.run(cmd).await;
+    assert!(
+        !output.status.success(),
+        "tokenless ctl must be refused:\n{}",
+        text_of(&output)
+    );
+    assert!(
+        text_of(&output).contains("loopback"),
+        "ctl refusal must surface the named loopback-token error:\n{}",
+        text_of(&output)
+    );
+
+    // ctl from the daemon's own home: zero-friction file discovery.
+    let added = ctl(&daemon, &["agenda", "add", "token accepted"]).await;
+    assert!(added.status.success(), "{}", text_of(&added));
+    let listed = ctl(&daemon, &["agenda", "list", "--open", "--json"]).await;
+    assert!(listed.status.success(), "{}", text_of(&listed));
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("token accepted"),
+        "agenda write must round-trip:\n{}",
+        text_of(&listed)
+    );
+
+    // Raw HTTP with the discovered token reaches the same surface that
+    // refused above.
+    let authed = daemon.authed_client();
+    let ok = authed
+        .get(format!("http://127.0.0.1:{port}/api/sessions"))
+        .send()
+        .await
+        .expect("token'd request completes");
+    assert!(
+        ok.status().is_success(),
+        "token'd loopback must be admitted: {}",
+        ok.status()
+    );
+
+    // The env override is a first-class discovery rung: a foreign home
+    // WITH the exported token succeeds.
+    let mut cmd = foreign.command();
+    cmd.env_remove("INTENDANT_MCP_URL")
+        .env_remove("INTENDANT_PORT")
+        .env_remove("INTENDANT_SESSION_ID")
+        .env_remove("INTENDANT_MANAGED_CONTEXT")
+        .env("INTENDANT_LOOPBACK_TOKEN", daemon.loopback_token());
+    cmd.arg("ctl")
+        .arg("--port")
+        .arg(port.to_string())
+        .args(["status"]);
+    let output = foreign.run(cmd).await;
+    assert!(
+        output.status.success(),
+        "env-override ctl must succeed:\n{}",
+        text_of(&output)
+    );
 }
 
 /// Parse a ctl run's stdout as the single JSON document the command prints.
@@ -836,7 +993,22 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
         })
         .expect("parse the dashboard port from the startup line");
 
-    let http = reqwest::Client::new();
+    // Owner-posture API calls need the boot's admission token like any
+    // raw-HTTP consumer; the daemon minted it before printing the
+    // Dashboard line this fn just waited for.
+    let http = {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-intendant-loopback-token",
+            rig_loopback_token(&rig, port)
+                .parse()
+                .expect("token header value"),
+        );
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("token-authed client")
+    };
     let base = format!("http://127.0.0.1:{port}");
     let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
     let project_root_body: serde_json::Value = loop {
@@ -893,9 +1065,12 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
     assert!(saved.contains("model = \"gpt-5.6-terra\""), "{saved}");
     assert!(saved.contains("model = \"sonnet\""), "{saved}");
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        rig_loopback_token(&rig, port)
+    ))
+    .await
+    .expect("connect /ws");
 
     // (c) CreateSession WITHOUT a project root: the structured failure,
     // not a dead session and not a cwd-rooted one. The very first control
@@ -1059,10 +1234,13 @@ async fn create_session_with_worktree_runs_inside_the_worktree() {
 
     let client = reqwest::Client::new();
     let mut daemon = spawn_daemon_on_rig(&client, rig, &script, false).await;
-    let (mut ws, _) =
-        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", daemon.port))
-            .await
-            .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{}/ws?token={}",
+        daemon.port,
+        daemon.loopback_token()
+    ))
+    .await
+    .expect("connect /ws");
 
     // The very first control message can race daemon startup on a
     // saturated box (the gateway accepts /ws a beat before the
@@ -1247,15 +1425,19 @@ async fn ctl_session_note_posts_a_display_only_note_with_image() {
         .build()
         .expect("http client");
     let daemon = spawn_daemon(&client, &idle_script).await;
+    let client = daemon.authed_client();
     let port = daemon.port;
 
     let image_path = daemon.rig.project.path().join("note-image.png");
     std::fs::write(&image_path, IMAGE_BYTES).expect("write note image");
 
     // Subscribe before posting so the broadcast cannot race the assert.
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        daemon.loopback_token()
+    ))
+    .await
+    .expect("connect /ws");
 
     let output = ctl(
         &daemon,
@@ -1381,6 +1563,7 @@ async fn transfer_jobs_round_trip_over_direct_http() {
         .build()
         .expect("http client");
     let daemon = spawn_daemon(&client, &idle_script).await;
+    let client = daemon.authed_client();
     let port = daemon.port;
     let base = format!("http://127.0.0.1:{port}");
 
@@ -1592,6 +1775,7 @@ async fn sessions_stream_serves_ndjson_over_direct_http() {
         .build()
         .expect("http client");
     let daemon = spawn_daemon(&client, &idle_script).await;
+    let client = daemon.authed_client();
     let port = daemon.port;
 
     let response = client
@@ -1693,9 +1877,12 @@ async fn display_request_rail_round_trips_over_ws() {
     let port = daemon.port;
 
     // Subscribe before requesting so the broadcast cannot race the assert.
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        daemon.loopback_token()
+    ))
+    .await
+    .expect("connect /ws");
 
     // ── Leg 0: a held grant short-circuits without ringing ──
     let output = ctl(&daemon, &["display", "grant-user"]).await;
@@ -1982,9 +2169,12 @@ async fn cu_actions_broadcast_display_scoped_events_over_ws() {
     let port = daemon.port;
 
     // Subscribe before acting so the broadcast cannot race the assert.
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        daemon.loopback_token()
+    ))
+    .await
+    .expect("connect /ws");
 
     // Synthetic user-display capture session (1280×720 on every platform).
     let output = ctl(&daemon, &["display", "grant-user"]).await;
@@ -2251,9 +2441,12 @@ async fn ctl_ask_blocks_until_the_dashboard_answers() {
     let port = daemon.port;
 
     // Subscribe before asking so the broadcast cannot race the assert.
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        daemon.loopback_token()
+    ))
+    .await
+    .expect("connect /ws");
 
     // Spawn `ctl ask` WITHOUT awaiting: it must stay blocked until the
     // answer lands (same construction as the ctl() helper).
@@ -2379,9 +2572,12 @@ async fn ctl_notify_broadcasts_and_persists() {
     let port = daemon.port;
 
     // Subscribe before notifying so the broadcast cannot race the assert.
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        daemon.loopback_token()
+    ))
+    .await
+    .expect("connect /ws");
 
     let output = ctl(
         &daemon,
@@ -2500,6 +2696,7 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
         .expect("http client");
     let mut a = spawn_daemon(&client, &idle_script).await;
     let mut b = spawn_daemon(&client, &peer_script).await;
+    let client = a.authed_client();
     let (port_a, port_b) = (a.port, b.port);
 
     // Failure forensics shared by every cross-daemon wait below. Always
@@ -2533,12 +2730,17 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
         text_of(&empty)
     );
 
-    // Federate A -> B by B's card URL and wait for the connection to form.
+    // Federate A -> B by B's card URL and wait for the connection to
+    // form. A's dial presents B's loopback admission token as the peer
+    // bearer — plain-ws loopback federation no longer rides the
+    // tokenless trusted-local lane, and a same-box operator wires
+    // exactly this: the target daemon's token as `bearer_token`.
     let response = client
         .post(format!("http://127.0.0.1:{port_a}/api/peers"))
         .json(&serde_json::json!({
             "card_url": format!("http://127.0.0.1:{port_b}/.well-known/agent-card.json"),
             "label": "e2e-peer-b",
+            "bearer_token": b.loopback_token(),
         }))
         .send()
         .await
@@ -3122,9 +3324,12 @@ async fn supervised_session_surfaces_approvals_on_the_dashboard() {
         })
         .expect("parse the dashboard port from the startup line");
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        rig_loopback_token(&rig, port)
+    ))
+    .await
+    .expect("connect /ws");
 
     // The very first control message can race daemon startup (the gateway
     // accepts /ws a beat before the supervisor subscribes) — retry the
@@ -3246,9 +3451,12 @@ async fn supervised_session_ask_human_reaches_the_question_rail() {
         })
         .expect("parse the dashboard port from the startup line");
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        rig_loopback_token(&rig, port)
+    ))
+    .await
+    .expect("connect /ws");
 
     // Same startup race + retry shape as the approvals e2e above.
     let mut question = None;
@@ -3402,9 +3610,12 @@ async fn sandbox_denial_raises_consent_card_and_always_allow_unblocks_retry() {
         })
         .expect("parse the dashboard port from the startup line");
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        rig_loopback_token(&rig, port)
+    ))
+    .await
+    .expect("connect /ws");
 
     // Same startup race + retry shape as the askHuman e2e above, with one
     // extra leg: the out-of-project write first trips the APPROVAL gate
@@ -3755,9 +3966,12 @@ async fn supervised_session_writes_task_ask_human_and_steer_message_rows() {
         })
         .expect("parse the dashboard port from the startup line");
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        rig_loopback_token(&rig, port)
+    ))
+    .await
+    .expect("connect /ws");
 
     // Same startup race + retry shape as the askHuman e2e above.
     let mut question = None;
@@ -3961,9 +4175,12 @@ async fn parked_session_delivers_an_id_less_steer() {
         })
         .expect("parse the dashboard port from the startup line");
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        rig_loopback_token(&rig, port)
+    ))
+    .await
+    .expect("connect /ws");
 
     // Same startup race + retry shape as the sibling tests.
     let mut completed = None;
@@ -4091,9 +4308,12 @@ async fn supervised_session_rolls_back_conversation_to_a_round() {
         })
         .expect("parse the dashboard port from the startup line");
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        rig_loopback_token(&rig, port)
+    ))
+    .await
+    .expect("connect /ws");
 
     // Same startup race + retry shape as the sibling tests.
     let mut completed = None;
@@ -4329,9 +4549,12 @@ async fn headless_rollback_writes_a_conversation_rewound_cut() {
         .trim()
         .to_string();
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        rig_loopback_token(&rig, port)
+    ))
+    .await
+    .expect("connect /ws");
 
     let question = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
         json.get("event").and_then(|v| v.as_str()) == Some("user_question")
@@ -4580,10 +4803,14 @@ async fn native_session_forks_at_a_round_boundary() {
     });
     let client = reqwest::Client::new();
     let mut daemon = spawn_daemon(&client, &script).await;
+    let client = daemon.authed_client();
     let port = daemon.port;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        daemon.loopback_token()
+    ))
+    .await
+    .expect("connect /ws");
 
     // Round one (retry the first send: it can race daemon startup).
     let mut started = None;
@@ -4824,9 +5051,12 @@ async fn fresh_sessions_receive_zero_unrequested_memory() {
     let session_project = tempfile::tempdir().expect("session project");
     std::fs::write(session_project.path().join("intendant.toml"), "")
         .expect("mark session project");
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("connect /ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        daemon.loopback_token()
+    ))
+    .await
+    .expect("connect /ws");
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::json!({
             "action": "create_session",

@@ -27,6 +27,7 @@ import sys
 import time
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 
 WORKTREE = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
@@ -82,11 +83,27 @@ def cleanup():
             p.kill()
 
 
+# Per-daemon loopback admission tokens, keyed by bound port: each boot
+# mints one and owner-posture surfaces refuse tokenless loopback, so the
+# rig reads every daemon's token from its home (the same discovery `ctl`
+# performs) and attaches it to raw HTTP/WS/browser access.
+TOKENS = {}
+
+
+def loopback_token(home, port):
+    path = os.path.join(home, ".intendant", "loopback-tokens", f"{port}.token")
+    with open(path) as f:
+        return f.read().strip()
+
+
 def http(method, url, body=None, timeout=5):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     if data:
         req.add_header("Content-Type", "application/json")
+    port = urllib.parse.urlparse(url).port
+    if port in TOKENS:
+        req.add_header("x-intendant-loopback-token", TOKENS[port])
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode() or "{}")
 
@@ -94,7 +111,8 @@ def http(method, url, body=None, timeout=5):
 def ws_action(port, payload):
     """Send one control frame to a daemon's /ws and close."""
     from websockets.sync.client import connect
-    with connect(f"ws://127.0.0.1:{port}/ws", close_timeout=2) as ws:
+    token = urllib.parse.quote(TOKENS.get(port, ""))
+    with connect(f"ws://127.0.0.1:{port}/ws?token={token}", close_timeout=2) as ws:
         ws.send(json.dumps(payload))
         time.sleep(0.5)
 
@@ -205,6 +223,9 @@ def spawn_daemon(name, home, script, cwd):
     log(f"daemon {name} pid {p.pid} port {port} home {home}")
     wait_for(f"{name} agent card",
              lambda: http("GET", f"http://127.0.0.1:{port}/.well-known/agent-card.json"))
+    # The gateway is wired (agent card serves), so this boot's admission
+    # token is on disk; every later raw HTTP/WS call presents it.
+    TOKENS[port] = loopback_token(home, port)
     return p, port
 
 
@@ -262,9 +283,14 @@ try:
                              os.path.join(SCRATCH, "proj-b"))
     OBSERVER.update(port=b_port, home=os.path.join(SCRATCH, "home-b"))
 
+    # B dials A's /ws with A's loopback admission token as the peer
+    # bearer: plain-ws loopback federation no longer rides the tokenless
+    # trusted-local lane, and the rig reads A's token the same way any
+    # same-box owner process does.
     add = http("POST", f"http://127.0.0.1:{b_port}/api/peers",
                {"card_url": f"http://127.0.0.1:{a_port}/.well-known/agent-card.json",
-                "label": "rig-peer"})
+                "label": "rig-peer",
+                "bearer_token": TOKENS[a_port]})
     log(f"peer add -> {add}")
 
     def connected():
@@ -325,7 +351,10 @@ try:
             return r.stdout.strip()
 
         wait_for("chrome CDP", lambda: cdp("eval", "1+1"))
-        cdp("nav", f"http://127.0.0.1:{b_port}/")
+        # The dashboard opens exactly like an owner would open it: the
+        # tokened URL (the SPA stores the token and strips it from the
+        # visible URL).
+        cdp("nav", f"http://127.0.0.1:{b_port}/?token={urllib.parse.quote(TOKENS[b_port])}")
         wait_for("dashboard booted", lambda: True if cdp(
             "eval", "!!document.querySelector('.tab-btn')") == "true" else None)
         cdp("eval", "(() => { const b = [...document.querySelectorAll('button.tab-btn')]"

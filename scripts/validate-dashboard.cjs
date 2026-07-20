@@ -489,17 +489,55 @@ function normalizeExternalAgentRequirement(raw) {
 }
 
 function resolveDashboardUrl(opts, env) {
-  if (opts.url) {
-    return normalizeDashboardUrl(opts.url);
+  const resolved = (() => {
+    if (opts.url) {
+      return normalizeDashboardUrl(opts.url);
+    }
+    if (opts.port) {
+      return normalizeDashboardUrl(`http://${opts.host}:${opts.port}${normalizePath(opts.path)}`);
+    }
+    const fromMcp = dashboardUrlFromMcpUrl(env.INTENDANT_MCP_URL);
+    if (fromMcp) {
+      return fromMcp;
+    }
+    return undefined;
+  })();
+  return resolved ? withLoopbackToken(resolved, env) : resolved;
+}
+
+// Loopback daemons refuse tokenless owner requests, so the harness
+// opens the tokened URL the way a real owner would. Discovery mirrors
+// `intendant ctl`: INTENDANT_LOOPBACK_TOKEN env override, else the
+// daemon's per-port token file under ~/.intendant (same-user read).
+// Non-loopback URLs, URLs already carrying ?token=, and missing files
+// (an older daemon) pass through unchanged.
+function withLoopbackToken(rawUrl, env) {
+  try {
+    const url = new URL(rawUrl);
+    if (!isLoopbackHost(url.hostname) || url.searchParams.has('token')) {
+      return rawUrl;
+    }
+    let token = (env.INTENDANT_LOOPBACK_TOKEN || '').trim();
+    if (!token) {
+      const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+      const home = env.INTENDANT_HOME
+        ? env.INTENDANT_HOME
+        : path.join(os.homedir(), '.intendant');
+      const tokenFile = path.join(home, 'loopback-tokens', `${port}.token`);
+      try {
+        token = fs.readFileSync(tokenFile, 'utf8').trim();
+      } catch (_) {
+        return rawUrl;
+      }
+    }
+    if (!token) {
+      return rawUrl;
+    }
+    url.searchParams.set('token', token);
+    return url.toString();
+  } catch (_) {
+    return rawUrl;
   }
-  if (opts.port) {
-    return normalizeDashboardUrl(`http://${opts.host}:${opts.port}${normalizePath(opts.path)}`);
-  }
-  const fromMcp = dashboardUrlFromMcpUrl(env.INTENDANT_MCP_URL);
-  if (fromMcp) {
-    return fromMcp;
-  }
-  return undefined;
 }
 
 function validateDashboardLaunchOptions(opts) {
