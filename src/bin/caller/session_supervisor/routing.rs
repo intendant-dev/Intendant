@@ -1091,6 +1091,7 @@ impl SessionSupervisor {
                     text,
                     steer_id,
                     event_session_id,
+                    Some(managed_id.clone()),
                 );
             }
             return;
@@ -1514,6 +1515,7 @@ pub(crate) fn spawn_text_steer_fallback(
     text: String,
     steer_id: String,
     target_session_id: Option<String>,
+    resolved_session_id: Option<String>,
 ) {
     tokio::spawn(async move {
         let timeout = tokio::time::sleep(TEXT_STEER_FALLBACK_TIMEOUT);
@@ -1528,9 +1530,10 @@ pub(crate) fn spawn_text_steer_fallback(
                         | Ok(AppEvent::SteerDelivered { session_id, id, .. })
                         | Ok(AppEvent::SteerCancelled { session_id, id, .. })
                             if id == steer_id
-                                && steer_ack_targets_session(
+                                && steer_ack_targets_session_or_resolved(
                                     &session_id,
                                     &target_session_id,
+                                    &resolved_session_id,
                                 ) =>
                         {
                             return;
@@ -1540,9 +1543,10 @@ pub(crate) fn spawn_text_steer_fallback(
                                 .as_deref()
                                 .map(|id| id == steer_id.as_str())
                                 .unwrap_or(true)
-                                && steer_ack_targets_session(
+                                && steer_ack_targets_session_or_resolved(
                                     &session_id,
                                     &target_session_id,
+                                    &resolved_session_id,
                                 ) =>
                         {
                             return;
@@ -1585,6 +1589,25 @@ pub(crate) fn steer_ack_targets_session(
         (Some(actual), Some(expected)) => actual == expected,
         (None, _) | (_, None) => true,
     }
+}
+
+/// Ack matcher for the text-steer fallback. A steer can be requested under a
+/// session's backend-native alias, but the loop that takes it acks under its
+/// primary id (drains normalize alias targets before matching, and the
+/// resolver returns the primary — see `normalize_native_session_target` and
+/// `resolve_external_steer_target_session`). The fallback must therefore
+/// accept an ack under either name; matching only the requested form parked a
+/// duplicate follow-up for every alias-addressed steer and overwrote the
+/// honest queue status with "not acknowledged".
+pub(crate) fn steer_ack_targets_session_or_resolved(
+    actual: &Option<String>,
+    requested: &Option<String>,
+    resolved: &Option<String>,
+) -> bool {
+    steer_ack_targets_session(actual, requested)
+        || resolved
+            .as_deref()
+            .is_some_and(|resolved| actual.as_deref() == Some(resolved))
 }
 
 #[cfg(test)]
@@ -2335,6 +2358,48 @@ mod tests {
         while let Ok(event) = bus_rx.try_recv() {
             if let AppEvent::SteerQueued { id, .. } = event {
                 assert_ne!(id, "steer-2", "acknowledged steer should not queue");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn text_steer_ack_under_resolved_primary_id_prevents_fallback() {
+        // A steer addressed by a backend-native alias is acked by the owning
+        // loop under its primary id (drains normalize alias targets before
+        // matching). The fallback must treat that ack as this steer's — the
+        // regression was a parked duplicate plus a false "not acknowledged"
+        // status for every alias-addressed steer.
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let (tx, mut rx) = mpsc::channel(1);
+
+        spawn_text_steer_fallback(
+            bus.clone(),
+            bus.subscribe(),
+            tx,
+            "check the usage chips".to_string(),
+            "steer-alias-1".to_string(),
+            Some("backend-native-id".to_string()),
+            Some("wrapper-id".to_string()),
+        );
+
+        bus.send(AppEvent::SteerQueued {
+            session_id: Some("wrapper-id".to_string()),
+            id: "steer-alias-1".to_string(),
+            reason: "claude-code accepted the steer".to_string(),
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "primary-id ack should satisfy an alias-addressed steer's fallback"
+        );
+        while let Ok(event) = bus_rx.try_recv() {
+            if let AppEvent::SteerQueued { id, reason, .. } = event {
+                assert!(
+                    !(id == "steer-alias-1" && reason.contains("not acknowledged")),
+                    "fallback parked despite a primary-id ack: {reason}"
+                );
             }
         }
     }

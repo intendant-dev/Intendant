@@ -117,9 +117,10 @@ table and exits non-zero on any failure; the full event log lands in
 - `native-session-id` timeout → the reader stopped capturing `session_id`
   from stdout messages, or `AgentEvent::NativeSessionId` lost its drain arm
   in `main.rs`.
-- `steer-absorbed-in-turn` failing → steering fell back to the queue path
-  (check `steer_turn` and the load-bearing "not supported" error strings) or
-  the CLI stopped absorbing queued user messages mid-turn.
+- `steer-absorbed-in-turn` failing → `steer_turn`'s stdin write regressed
+  (it must write the stream-json user message while `turn_active`), or the
+  installed CLI is from a discard era (2.1.207 was observed dropping
+  mid-turn stdin lines; 2.1.215 absorbs them at the next checkpoint).
 - `interrupt-aborts-turn` failing → the `control_request`/`interrupt`
   round-trip broke; `process-survives-interrupt` failing → the abort is
   killing the whole CLI process rather than the turn.
