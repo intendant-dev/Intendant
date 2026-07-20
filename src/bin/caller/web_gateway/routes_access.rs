@@ -272,6 +272,101 @@ pub(crate) async fn handle_dashboard_targets(
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
+/// Same-home sibling loopback-token handoff (ratified 2026-07-20).
+/// Enumerates the per-instance loopback admission tokens THIS daemon's
+/// state root holds so an owner surface (the trusted dashboard's
+/// open-sibling action) can hand each sibling its own tokened URL.
+///
+/// Binding guards, per the ruling:
+/// - The route is owner-posture only: gated on `CredentialsManage`
+///   (the credential-custody class no peer profile or scoped default
+///   carries), so the caller is already authenticated to this daemon
+///   at owner level.
+/// - Same-home membership is state-root identity: only files under
+///   this daemon's own `loopback-tokens/` subtree are read — the same
+///   files this process could already read — never across a home
+///   boundary.
+/// - Tokens are read per-request and never persisted into any
+///   server-side store.
+/// - This route relays within one trust class and dies naturally when
+///   the fleet-identity arc supersedes per-home token handoff.
+///
+/// Entries are as-found on disk: a crashed daemon's stale file yields
+/// an entry whose port simply refuses or does not answer.
+pub(crate) fn local_daemon_tokens_response_value(
+    state_root: &std::path::Path,
+    self_port: Option<u16>,
+) -> serde_json::Value {
+    let mut instances = Vec::new();
+    let dir = crate::loopback_token::loopback_token_dir(state_root);
+    let mut ports: Vec<u16> = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| {
+                    entry
+                        .ok()?
+                        .file_name()
+                        .to_str()?
+                        .strip_suffix(".token")?
+                        .parse()
+                        .ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ports.sort_unstable();
+    for port in ports {
+        let Some(token) = crate::loopback_token::discover_client_token(None, state_root, port)
+        else {
+            continue;
+        };
+        let scheme = std::fs::read_to_string(crate::loopback_token::loopback_sidecar_path(
+            state_root, port,
+        ))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|meta| {
+            meta.get("scheme")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "http".to_string());
+        instances.push(serde_json::json!({
+            "port": port,
+            "scheme": scheme,
+            "self": Some(port) == self_port,
+            "dashboard_url": format!("{scheme}://127.0.0.1:{port}/?token={token}"),
+            "token": token,
+        }));
+    }
+    serde_json::json!({ "schema_version": 1, "instances": instances })
+}
+
+pub(crate) async fn handle_local_daemon_tokens(
+    stream: DemuxStream,
+    cors: crate::gateway_routes::CorsPosture,
+) {
+    // Transport edge resolves the real state root and own port; the
+    // value builder stays hermetic (tests inject temp roots).
+    let payload = local_daemon_tokens_response_value(
+        &crate::platform::intendant_home(),
+        crate::sandbox::gateway_loopback_port(),
+    );
+    // Secrets in the body: never cache (`no-store`, not the envelope's
+    // `no-cache`), never decorate with any cross-origin allowance
+    // (`fleet_origin: None` keeps the bare same-origin tail even on
+    // fleet-decorated deployments).
+    let response = ApiResponse::Json {
+        status: 200,
+        body: JsonBody::Value(payload),
+        headers: vec![
+            ("Cache-Control", "no-store".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+    };
+    write_api_response(stream, response, cors, None).await;
+}
+
 /// Run a synchronous authority-store operation off the async reactor.
 /// `authority_store::with_lock` waits for its process/file locks with
 /// blocking `std::thread::sleep` retries (up to its 2s timeout), so a
@@ -4528,6 +4623,56 @@ mod tests {
             crate::dashboard_control::DashboardControlGrant::UserClient { .. }
         ));
         assert!(!unknown.has_any_effective_operation());
+    }
+
+    /// The sibling-token handoff reads only this state root's
+    /// `loopback-tokens/` subtree (same-home membership by state-root
+    /// identity), returns entries as found, marks self, and stores
+    /// nothing. An empty or absent subtree yields an empty list.
+    #[test]
+    fn local_daemon_tokens_enumerate_own_state_root_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let empty = local_daemon_tokens_response_value(tmp.path(), Some(8765));
+        assert_eq!(empty["instances"].as_array().map(Vec::len), Some(0));
+
+        let dir = crate::loopback_token::loopback_token_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("8765.token"), "tok-self\n").unwrap();
+        std::fs::write(dir.join("8765.json"), "{\"v\":1,\"scheme\":\"https\"}\n").unwrap();
+        std::fs::write(dir.join("8799.token"), "tok-sibling\n").unwrap();
+        // No sidecar for 8799: scheme falls back to http.
+        std::fs::write(dir.join("not-a-port.token"), "junk\n").unwrap();
+
+        let payload = local_daemon_tokens_response_value(tmp.path(), Some(8765));
+        let instances = payload["instances"].as_array().unwrap();
+        assert_eq!(instances.len(), 2, "{payload}");
+        let by_port = |port: u64| {
+            instances
+                .iter()
+                .find(|entry| entry["port"] == port)
+                .unwrap_or_else(|| panic!("port {port} missing: {payload}"))
+        };
+        let own = by_port(8765);
+        assert_eq!(own["self"], true);
+        assert_eq!(own["scheme"], "https");
+        assert_eq!(own["token"], "tok-self");
+        assert_eq!(
+            own["dashboard_url"],
+            "https://127.0.0.1:8765/?token=tok-self"
+        );
+        let sibling = by_port(8799);
+        assert_eq!(sibling["self"], false);
+        assert_eq!(sibling["scheme"], "http");
+        assert_eq!(
+            sibling["dashboard_url"],
+            "http://127.0.0.1:8799/?token=tok-sibling"
+        );
+        // Read-only by contract: the subtree is unchanged afterwards.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .collect();
+        assert_eq!(names.len(), 4, "{names:?}");
     }
 
     /// The certless fallback arms are the trusted-local owner lane; both

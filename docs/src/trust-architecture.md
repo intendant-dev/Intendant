@@ -817,6 +817,14 @@ The honest security envelope, per platform:
   the unchanged owner surface: an owner-launched script or unsupervised
   agent on the same account has always been, and remains, the owner.
 
+Multi-daemon homes get a same-home handoff: an owner-posture caller on
+one daemon may ask `GET /api/local-daemons/tokens` for the per-instance
+tokens that daemon's own state root holds (files it could already
+read), so the trusted dashboard opens same-home siblings with their own
+tokened URLs. The route is credential-custody gated, answers
+per-request without persisting anything, never crosses a home boundary,
+and retires naturally when the fleet-identity arc supersedes it.
+
 The same asymmetry applies to the
 state-root secrets: every platform's **default** grant set excludes the trust
 store (`access-certs/`), leased auth, and the custody trail from runtime writes,

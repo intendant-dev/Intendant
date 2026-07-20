@@ -1276,6 +1276,12 @@ mod tests {
             dashboard_http_operation("GET", "/api/dashboard/targets"),
             Some(PeerOperation::AccessInspect)
         );
+        // The sibling-token handoff hands out loopback admission tokens:
+        // credential-custody class, owner-posture only.
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/local-daemons/tokens"),
+            Some(PeerOperation::CredentialsManage)
+        );
         assert_eq!(
             dashboard_http_operation("GET", "/api/session/current/uploads"),
             Some(PeerOperation::SessionManage)
