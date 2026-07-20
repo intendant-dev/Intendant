@@ -221,7 +221,7 @@ impl ResponsesUsage {
 
 pub struct OpenAIProvider {
     client: Client,
-    api_key: String,
+    auth: ProviderAuth,
     model: String,
     context_window: u64,
     max_output_tokens: u64,
@@ -237,7 +237,7 @@ pub struct OpenAIProvider {
 
 impl OpenAIProvider {
     pub fn new(
-        api_key: String,
+        api_key: impl Into<ProviderAuth>,
         model: String,
         context_window: u64,
         max_output_tokens: u64,
@@ -248,7 +248,7 @@ impl OpenAIProvider {
 
         Self {
             client: api_client(),
-            api_key,
+            auth: api_key.into(),
             model,
             context_window,
             max_output_tokens,
@@ -263,14 +263,14 @@ impl OpenAIProvider {
 
     #[allow(dead_code)]
     pub fn new_plain(
-        api_key: String,
+        api_key: impl Into<ProviderAuth>,
         model: String,
         context_window: u64,
         max_output_tokens: u64,
     ) -> Self {
         Self {
             client: api_client(),
-            api_key,
+            auth: api_key.into(),
             model,
             context_window,
             max_output_tokens,
@@ -284,7 +284,7 @@ impl OpenAIProvider {
     }
 
     pub fn new_with_tools(
-        api_key: String,
+        api_key: impl Into<ProviderAuth>,
         model: String,
         context_window: u64,
         max_output_tokens: u64,
@@ -292,7 +292,7 @@ impl OpenAIProvider {
     ) -> Self {
         Self {
             client: api_client(),
-            api_key,
+            auth: api_key.into(),
             model,
             context_window,
             max_output_tokens,
@@ -339,7 +339,7 @@ impl ChatProvider for OpenAIProvider {
         // is applied server-side and reported via usage.prompt_tokens_details.
         let prepared = self.prepare_request(messages, false)?;
         let client = &self.client;
-        let api_key = &self.api_key;
+        let api_key = self.auth.request_key()?;
         let response = send_with_retry(
             client,
             || {
@@ -566,7 +566,7 @@ impl ChatProvider for OpenAIProvider {
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ChatResponse, CallerError> {
         let client = &self.client;
-        let api_key = &self.api_key;
+        let api_key = self.auth.request_key()?;
 
         // Same retry policy as non-streaming: the status is known before any
         // body bytes stream, so a 429/5xx at request-open retries with

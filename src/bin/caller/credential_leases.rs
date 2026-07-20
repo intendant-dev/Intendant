@@ -79,11 +79,12 @@ impl Drop for CredentialLease {
     fn drop(&mut self) {
         // Zeroize the store's own long-lived copy. Copies already served
         // out of the store are NOT reclaimed here: `leased_secret` returns
-        // plain Strings, and the native providers capture the key at
-        // provider construction — a session started under this lease keeps
-        // (and keeps using) its captured copy until that session ends.
-        // Expiry and revocation stop the store from serving new copies;
-        // they cannot claw back served ones.
+        // plain Strings. The native providers re-resolve through the store
+        // at every request boundary (`ProviderAuth::request_key`), so
+        // expiry and revocation take effect at the next request — but a
+        // copy inside an in-flight request, and a materialized
+        // external-CLI auth home until its session exits, remain beyond
+        // the store's reach.
         self.material.fill(0);
     }
 }
@@ -742,14 +743,14 @@ fn sweep_locked(
             continue;
         }
         if defer_home_cleanup {
-            queue_materialization_cleanup(&kind);
+            queue_materialization_cleanup(&kind, "expired: leased session still running");
             continue;
         }
         match reap_materialization(root, &kind) {
             Ok(reaped) => cleanup.push(MaterializationCleanup { kind, reaped }),
             Err(err) => {
                 eprintln!("[credential-leases] expired lease cleanup for {kind} failed: {err}");
-                queue_materialization_cleanup(&kind);
+                queue_materialization_cleanup(&kind, &format!("expired: reap failed: {err}"));
             }
         }
     }
@@ -1506,15 +1507,25 @@ fn run_cleanup_item(
     }
     if let Some(path) = &item.reaped {
         let removed = match symlink_metadata_if_present(path) {
-            Ok(None) => Ok(()),
+            Ok(None) => Ok(false),
             Ok(Some(_)) => {
                 validate_reaped_directory(path, Some(&format!(".reap-{}-", plan.dir_name)))
                     .and_then(|(boundary, canonical)| remove_tree_no_follow(&canonical, &boundary))
+                    .map(|()| true)
             }
             Err(error) => Err(error),
         };
         match removed {
-            Ok(()) => {}
+            Ok(true) => {
+                crate::credential_audit::record(
+                    crate::credential_audit::EVENT_LEASE_HOME_REMOVED,
+                    &item.kind,
+                    plan.dir_name,
+                    "daemon",
+                    "reaped leased auth home deleted".to_string(),
+                );
+            }
+            Ok(false) => {}
             Err(err) => {
                 eprintln!(
                     "[credential-leases] cleanup of {} for {} failed: {err}",
@@ -1555,13 +1566,25 @@ fn run_deferred_cleanup_in(
     }
     for path in parked {
         let cleanup_result = match symlink_metadata_if_present(&path) {
-            Ok(None) => Ok(()),
+            Ok(None) => Ok(false),
             Ok(Some(_)) => validate_reaped_directory(&path, None)
-                .and_then(|(boundary, canonical)| remove_tree_no_follow(&canonical, &boundary)),
+                .and_then(|(boundary, canonical)| remove_tree_no_follow(&canonical, &boundary))
+                .map(|()| true),
             Err(error) => Err(error),
         };
-        let removed = match cleanup_result {
-            Ok(()) => true,
+        let resolved = match cleanup_result {
+            Ok(deleted) => {
+                if deleted {
+                    crate::credential_audit::record(
+                        crate::credential_audit::EVENT_LEASE_HOME_REMOVED,
+                        kind_for_reaped_path(&path).unwrap_or(""),
+                        "",
+                        "daemon",
+                        "parked reaped home deleted on retry".to_string(),
+                    );
+                }
+                true
+            }
             Err(err) => {
                 eprintln!(
                     "[credential-leases] retry cleanup of {} failed: {err}",
@@ -1570,7 +1593,7 @@ fn run_deferred_cleanup_in(
                 false
             }
         };
-        if removed {
+        if resolved {
             pending_reaped_paths()
                 .write()
                 .expect("pending reaped paths poisoned")
@@ -1579,12 +1602,40 @@ fn run_deferred_cleanup_in(
     }
 }
 
-fn queue_materialization_cleanup(kind: &str) {
-    if materialization_plan(kind).is_some() {
-        pending_materialization_cleanup()
-            .write()
-            .expect("pending materialization cleanup poisoned")
-            .insert(kind.to_string());
+/// The lease kind whose reaped-home name (`.reap-<dir>-<nonce>`) this
+/// path carries — audit attribution for retried deletions, where only
+/// the path survives.
+fn kind_for_reaped_path(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?;
+    ["oauth:codex", "oauth:claude-code", "oauth:kimi"]
+        .into_iter()
+        .find(|kind| {
+            materialization_plan(kind)
+                .is_some_and(|plan| name.starts_with(&format!(".reap-{}-", plan.dir_name)))
+        })
+}
+
+/// Park a kind's home deletion for a later sweep, recording WHY in the
+/// custody trail. The event fires only on the transition into the queue —
+/// re-parking an already-parked kind (every later sweep pass that still
+/// finds the blocker) stays silent, so the trail shows decisions, not
+/// polling.
+fn queue_materialization_cleanup(kind: &str, reason: &str) {
+    if materialization_plan(kind).is_none() {
+        return;
+    }
+    let newly_queued = pending_materialization_cleanup()
+        .write()
+        .expect("pending materialization cleanup poisoned")
+        .insert(kind.to_string());
+    if newly_queued {
+        crate::credential_audit::record(
+            crate::credential_audit::EVENT_LEASE_CLEANUP_DEFERRED,
+            kind,
+            "",
+            "daemon",
+            reason.to_string(),
+        );
     }
 }
 
@@ -1741,7 +1792,10 @@ pub fn startup_materialization_sweep() {
                     root.display()
                 );
                 for kind in ["oauth:codex", "oauth:claude-code", "oauth:kimi"] {
-                    queue_materialization_cleanup(kind);
+                    queue_materialization_cleanup(
+                        kind,
+                        "startup sweep refused unsafe materialization root",
+                    );
                 }
                 crate::lease_transcript_staging::gc_staging(&staging.staging, now_unix_ms() as i64);
                 crate::credential_audit::record_reset();
@@ -1751,6 +1805,7 @@ pub fn startup_materialization_sweep() {
         // Crash leftovers can hold transcripts from the previous process's
         // leased sessions — stage them before the sweep deletes the root
         // (works with no indexer running; the drainer picks them up later).
+        let mut swept_kinds: Vec<&str> = Vec::new();
         for kind in ["oauth:codex", "oauth:claude-code", "oauth:kimi"] {
             if let Some(plan) = materialization_plan(kind) {
                 let home = canonical_root.join(plan.dir_name);
@@ -1759,6 +1814,7 @@ pub fn startup_materialization_sweep() {
                     .is_some_and(|canonical| canonical.parent() == Some(canonical_root.as_path()))
                 {
                     stage_before_removal(&plan, &home, &staging);
+                    swept_kinds.push(kind);
                 }
             }
         }
@@ -1783,13 +1839,29 @@ pub fn startup_materialization_sweep() {
                 }
             }
         }
-        if let Err(err) = remove_tree_no_follow(&canonical_root, &canonical_root) {
-            eprintln!(
-                "[credential-leases] startup sweep of {} failed: {err}",
-                canonical_root.display()
-            );
-            for kind in ["oauth:codex", "oauth:claude-code", "oauth:kimi"] {
-                queue_materialization_cleanup(kind);
+        match remove_tree_no_follow(&canonical_root, &canonical_root) {
+            Ok(()) => {
+                for kind in swept_kinds {
+                    crate::credential_audit::record(
+                        crate::credential_audit::EVENT_LEASE_HOME_REMOVED,
+                        kind,
+                        "",
+                        "daemon",
+                        "startup sweep: no lease survives a restart".to_string(),
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "[credential-leases] startup sweep of {} failed: {err}",
+                    canonical_root.display()
+                );
+                for kind in ["oauth:codex", "oauth:claude-code", "oauth:kimi"] {
+                    queue_materialization_cleanup(
+                        kind,
+                        "startup sweep failed to delete materialization root",
+                    );
+                }
             }
         }
     }
@@ -2052,7 +2124,10 @@ pub fn revoke(selector: Option<&str>, actor: &str, via: &str) -> usize {
                 continue;
             }
             if kind_has_provisional_leased_startup(kind) && !final_shutdown {
-                queue_materialization_cleanup(kind);
+                queue_materialization_cleanup(
+                    kind,
+                    "revoked: provisional leased startup still in flight",
+                );
                 continue;
             }
             match reap_materialization(&root, kind) {
@@ -2065,7 +2140,7 @@ pub fn revoke(selector: Option<&str>, actor: &str, via: &str) -> usize {
                 }
                 Err(err) => {
                     eprintln!("[credential-leases] revoked lease cleanup for {kind} failed: {err}");
-                    queue_materialization_cleanup(kind);
+                    queue_materialization_cleanup(kind, &format!("revoked: reap failed: {err}"));
                 }
             }
         }
@@ -2213,6 +2288,148 @@ mod tests {
         *child_dns_credential_scrub_state().write().unwrap() =
             DnsCredentialChildScrubState::default();
         leased_home_sessions().write().unwrap().clear();
+    }
+
+    #[test]
+    fn per_request_auth_follows_lease_lifecycle() {
+        // Env lock first (scrubbing the ambient provider vars this test's
+        // dry-path assertions depend on), then the module store lock — the
+        // one ordering used for both, so no cycle can form.
+        let _env = crate::test_support::TEST_ENV_LOCK.blocking_lock();
+        let saved: Vec<(&str, Option<String>)> = ["ANTHROPIC_API_KEY", "ANTHROPIC"]
+            .into_iter()
+            .map(|name| (name, std::env::var(name).ok()))
+            .collect();
+        for (name, _) in &saved {
+            std::env::remove_var(name);
+        }
+        let _guard = lock();
+        reset();
+        grant(
+            "api_key:anthropic",
+            "vault",
+            "sk-lease-material-1",
+            None,
+            "owner",
+            "test",
+            Some(MIN_TTL_MS),
+            Some(0),
+        )
+        .unwrap();
+        let auth = crate::provider::ProviderAuth::PerRequest {
+            env_name: "ANTHROPIC_API_KEY",
+            project_key: None,
+        };
+        assert_eq!(auth.request_key().unwrap(), "sk-lease-material-1");
+        // A mid-session re-grant serves fresh material at the next request.
+        grant(
+            "api_key:anthropic",
+            "vault",
+            "sk-lease-material-2",
+            None,
+            "owner",
+            "test",
+            Some(MIN_TTL_MS),
+            Some(0),
+        )
+        .unwrap();
+        assert_eq!(auth.request_key().unwrap(), "sk-lease-material-2");
+        // Revocation goes dry at the next request boundary — the running
+        // session keeps no captured copy (the per-request re-validation fix).
+        revoke(Some("api_key:anthropic"), "test", "local");
+        let err = auth.request_key().unwrap_err().to_string();
+        assert!(err.contains("went dry mid-session"), "{err}");
+        // With a project overlay present, the request falls back instead.
+        let overlaid = crate::provider::ProviderAuth::PerRequest {
+            env_name: "ANTHROPIC_API_KEY",
+            project_key: Some("sk-project".to_string()),
+        };
+        assert_eq!(overlaid.request_key().unwrap(), "sk-project");
+        reset();
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_cleanup_and_home_removal_reach_custody_trail() {
+        let _guard = lock();
+        reset();
+        let started = now_unix_ms();
+        let case = tempfile::tempdir().unwrap();
+        let root = case.path().join("leased-auth");
+        let staging = crate::lease_transcript_staging::StagingPaths {
+            staging: case.path().join("staging"),
+            active: case.path().join("active"),
+        };
+        materialize_kind(
+            &root,
+            &staging,
+            "oauth:codex",
+            r#"{"tokens":{"access_token":"at"}}"#,
+        )
+        .unwrap();
+        // An expired lease whose CLI session is still running: register the
+        // session while the lease is live, then backdate it to expiry.
+        grant(
+            "oauth:codex",
+            "Codex",
+            r#"{"tokens":{"access_token":"at"}}"#,
+            Some("access_token"),
+            "owner",
+            "test",
+            Some(MIN_TTL_MS),
+            Some(0),
+        )
+        .unwrap();
+        note_leased_session_running("codex", &["k1-defer-session"]);
+        store()
+            .write()
+            .unwrap()
+            .get_mut("oauth:codex")
+            .unwrap()
+            .renewed_at_unix_ms = 1;
+        sweep_now_in(&root, &staging);
+        assert!(
+            pending_materialization_cleanup()
+                .read()
+                .unwrap()
+                .contains("oauth:codex"),
+            "expired home must be parked while its session runs"
+        );
+        assert!(
+            root.join("codex-home").exists(),
+            "parked home must remain on disk"
+        );
+        let deferred = crate::credential_audit::recent(200)
+            .into_iter()
+            .any(|event| {
+                event.event == crate::credential_audit::EVENT_LEASE_CLEANUP_DEFERRED
+                    && event.kind == "oauth:codex"
+                    && event.at_unix_ms >= started
+                    && event.detail.contains("leased session still running")
+            });
+        assert!(deferred, "deferral must reach the custody trail");
+        // The session ends: the next sweep reaps, deletes, and records it.
+        leased_home_sessions().write().unwrap().clear();
+        sweep_now_in(&root, &staging);
+        assert!(
+            !root.join("codex-home").exists(),
+            "home must be deleted once the session is gone"
+        );
+        let removed = crate::credential_audit::recent(200)
+            .into_iter()
+            .any(|event| {
+                event.event == crate::credential_audit::EVENT_LEASE_HOME_REMOVED
+                    && event.kind == "oauth:codex"
+                    && event.at_unix_ms >= started
+                    && event.detail.contains("reaped leased auth home deleted")
+            });
+        assert!(removed, "deletion must reach the custody trail");
+        reset();
     }
 
     #[test]
@@ -2604,7 +2821,7 @@ mod tests {
         let home = tmp.path().join("codex-home");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join("auth.json"), "LEFTOVER").unwrap();
-        queue_materialization_cleanup("oauth:codex");
+        queue_materialization_cleanup("oauth:codex", "test");
 
         let now = now_unix_ms();
         let mut leases: HashMap<String, CredentialLease> = HashMap::new();
@@ -3450,7 +3667,7 @@ mod tests {
         // active material is removed with no expiry tombstone, and cleanup
         // parks because the provisional process could otherwise recreate it.
         store().write().unwrap().remove("oauth:claude-code");
-        queue_materialization_cleanup("oauth:claude-code");
+        queue_materialization_cleanup("oauth:claude-code", "test");
         assert!(reap_parked_kinds(&HashMap::new(), &root, Some("oauth:claude-code")).is_empty());
 
         let error = startup.promote(&["wrapper", "backend"]).unwrap_err();
@@ -3496,7 +3713,7 @@ mod tests {
         .unwrap()
         .expect("hold");
         store().write().unwrap().remove("oauth:codex");
-        queue_materialization_cleanup("oauth:codex");
+        queue_materialization_cleanup("oauth:codex", "test");
 
         let cleanup =
             reap_parked_kinds_with_policy(&HashMap::new(), &root, Some("oauth:codex"), false);
@@ -3591,7 +3808,7 @@ mod tests {
             .write()
             .unwrap()
             .insert("sess-live".to_string(), "oauth:codex".to_string());
-        queue_materialization_cleanup("oauth:codex");
+        queue_materialization_cleanup("oauth:codex", "test");
 
         // A selector for a different kind leaves the parked home alone.
         let leases: HashMap<String, CredentialLease> = HashMap::new();
@@ -3614,7 +3831,7 @@ mod tests {
         // home belongs to the new lease.
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join("auth.json"), "FRESH").unwrap();
-        queue_materialization_cleanup("oauth:codex");
+        queue_materialization_cleanup("oauth:codex", "test");
         let now = now_unix_ms();
         let mut active: HashMap<String, CredentialLease> = HashMap::new();
         active.insert(
