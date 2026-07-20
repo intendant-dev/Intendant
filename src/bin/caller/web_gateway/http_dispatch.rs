@@ -531,19 +531,26 @@ pub(crate) async fn serve_http_request(
         peer_connection_identity.as_ref(),
     );
     if ((tls_client_cert_required && !tls_client_cert_present) || remote_client_auth_missing)
-        && !is_loopback_cleartext_mcp_request(peer_addr, is_tls, header_text)
+        && !cleartext_loopback_admitted(gateway_ingress, peer_addr, is_tls, header_text)
         && !authority_free_request
         && hosted_verified.is_none()
     {
         use tokio::io::AsyncWriteExt;
-        let body = serde_json::json!({
-            "error": if remote_client_auth_missing {
-                "verified client certificate or authenticated peer identity required for remote dashboard access"
-            } else {
-                "mTLS client certificate required"
-            }
-        })
-        .to_string();
+        // A local caller missing the per-boot token gets the named,
+        // actionable refusal; certificate guidance would misdirect it.
+        let error_message = if direct_loopback_missing_admission_token(
+            gateway_ingress,
+            peer_addr,
+            header_text,
+        ) {
+            crate::loopback_token::refusal_error_message()
+        } else if remote_client_auth_missing {
+            "verified client certificate or authenticated peer identity required for remote dashboard access"
+                .to_string()
+        } else {
+            "mTLS client certificate required".to_string()
+        };
+        let body = serde_json::json!({ "error": error_message }).to_string();
         let response = HttpResponse::with_content("401 Unauthorized", "application/json", body)
             .header("Cache-Control", "no-cache")
             .header("Connection", "close")
@@ -594,6 +601,11 @@ pub(crate) async fn serve_http_request(
             tls_client_cert_fingerprint.as_deref(),
             tls_client_cert_present,
             is_tls,
+            // Trusted-local admission: the per-boot loopback token, or
+            // the token-gated cleartext /mcp carve-out (its own ladder
+            // authorizes past this point).
+            crate::loopback_token::loopback_token_presented(header_text)
+                || is_loopback_cleartext_mcp_request(peer_addr, is_tls, header_text),
         ) {
             Ok(context) => context,
             Err(message) => {
@@ -2009,10 +2021,17 @@ pub(crate) async fn serve_http_request(
             tls_client_cert_fingerprint.as_deref(),
             peer_connection_identity.as_ref(),
         ) {
-            let response = json_error(
-                "401 Unauthorized",
-                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer",
-            );
+            let message = if direct_loopback_missing_admission_token(
+                gateway_ingress,
+                peer_addr,
+                header_text,
+            ) {
+                crate::loopback_token::refusal_error_message()
+            } else {
+                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer"
+                    .to_string()
+            };
+            let response = json_error("401 Unauthorized", message);
             let _ = stream.write_all(response.as_bytes()).await;
             finalize_http_stream(&mut stream).await;
             return;
@@ -2037,6 +2056,7 @@ pub(crate) async fn serve_http_request(
             peer_connection_identity.as_ref(),
             tls_client_cert_fingerprint.as_deref(),
             tls_client_cert_present,
+            crate::loopback_token::loopback_token_presented(header_text),
         ) {
             Ok(grant) => grant,
             Err(message) => {
@@ -2069,10 +2089,17 @@ pub(crate) async fn serve_http_request(
             tls_client_cert_fingerprint.as_deref(),
             peer_connection_identity.as_ref(),
         ) {
-            let response = json_error(
-                "401 Unauthorized",
-                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer",
-            );
+            let message = if direct_loopback_missing_admission_token(
+                gateway_ingress,
+                peer_addr,
+                header_text,
+            ) {
+                crate::loopback_token::refusal_error_message()
+            } else {
+                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer"
+                    .to_string()
+            };
+            let response = json_error("401 Unauthorized", message);
             let _ = stream.write_all(response.as_bytes()).await;
             finalize_http_stream(&mut stream).await;
             return;
@@ -2082,6 +2109,7 @@ pub(crate) async fn serve_http_request(
             peer_connection_identity.as_ref(),
             tls_client_cert_fingerprint.as_deref(),
             tls_client_cert_present,
+            crate::loopback_token::loopback_token_presented(header_text),
         ) {
             Ok(grant) => grant,
             Err(message) => {
@@ -2129,10 +2157,17 @@ pub(crate) async fn serve_http_request(
             tls_client_cert_fingerprint.as_deref(),
             peer_connection_identity.as_ref(),
         ) {
-            let response = json_error(
-                "401 Unauthorized",
-                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer",
-            );
+            let message = if direct_loopback_missing_admission_token(
+                gateway_ingress,
+                peer_addr,
+                header_text,
+            ) {
+                crate::loopback_token::refusal_error_message()
+            } else {
+                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer"
+                    .to_string()
+            };
+            let response = json_error("401 Unauthorized", message);
             let _ = stream.write_all(response.as_bytes()).await;
             finalize_http_stream(&mut stream).await;
             return;
@@ -2142,6 +2177,7 @@ pub(crate) async fn serve_http_request(
             peer_connection_identity.as_ref(),
             tls_client_cert_fingerprint.as_deref(),
             tls_client_cert_present,
+            crate::loopback_token::loopback_token_presented(header_text),
         ) {
             Ok(grant) => grant,
             Err(message) => {

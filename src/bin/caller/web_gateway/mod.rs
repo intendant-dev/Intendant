@@ -1923,6 +1923,44 @@ mod tests {
         request.replacen("\r\n", "\r\nConnection: close\r\n", 1)
     }
 
+    /// Marker header a test adds to send its request deliberately
+    /// WITHOUT the loopback admission token (to pin the tokenless
+    /// refusal itself). Stripped before the bytes hit the socket.
+    pub(crate) const TEST_TOKENLESS_MARKER: &str = "x-intendant-test-tokenless: 1\r\n";
+
+    /// Attach this process's loopback admission token to a test request
+    /// the way every owner client does, unless the test already presents
+    /// one explicitly or opted out via [`TEST_TOKENLESS_MARKER`]. The
+    /// test gateways bind 127.0.0.1, so without this every owner-surface
+    /// request would hit the tokenless-loopback refusal the token change
+    /// introduced — attaching at the funnel keeps the suite exercising
+    /// the same admission path real clients use.
+    fn attach_loopback_token(request: &str) -> String {
+        if let Some(stripped) = strip_tokenless_marker(request) {
+            return stripped;
+        }
+        if request
+            .to_ascii_lowercase()
+            .contains("\r\nx-intendant-loopback-token:")
+        {
+            return request.to_string();
+        }
+        request.replacen(
+            "\r\n",
+            &format!(
+                "\r\nx-intendant-loopback-token: {}\r\n",
+                crate::loopback_token::loopback_admission_token()
+            ),
+            1,
+        )
+    }
+
+    fn strip_tokenless_marker(request: &str) -> Option<String> {
+        request
+            .contains(TEST_TOKENLESS_MARKER)
+            .then(|| request.replace(TEST_TOKENLESS_MARKER, ""))
+    }
+
     /// Fire a raw HTTP request and read the response bytes.
     ///
     /// One-shot contract: the read runs to EOF, so the request is pinned
@@ -1934,7 +1972,7 @@ mod tests {
     /// upgrade shapes send `Connection: Upgrade`) pass through verbatim.
     async fn http_request_bytes(port: u16, request: &str) -> Vec<u8> {
         use tokio::io::AsyncWriteExt;
-        let request = pin_connection_close(request);
+        let request = attach_loopback_token(&pin_connection_close(request));
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
             .unwrap();
@@ -1952,6 +1990,52 @@ mod tests {
     /// because the /api/peers tests all make a handful of these.
     pub(crate) async fn http_request(port: u16, request: &str) -> String {
         String::from_utf8_lossy(&http_request_bytes(port, request).await).into_owned()
+    }
+
+    /// Socket-level pin of the loopback admission gate across the whole
+    /// dispatch path: a tokenless loopback request to an owner surface
+    /// gets the named 401 (file + env guidance), authority-free
+    /// discovery still serves, and the same request with the token
+    /// passes. The suite's other tests ride the funnel's automatic
+    /// token attach; this one uses the explicit tokenless marker.
+    #[tokio::test]
+    async fn test_tokenless_loopback_owner_surface_is_refused_by_name() {
+        let (port, handle) = spawn_test_gateway_with_registry(None).await;
+        let tokenless = format!(
+            "GET /api/dashboard/targets HTTP/1.1\r\nHost: localhost\r\n{TEST_TOKENLESS_MARKER}\r\n"
+        );
+        let resp = http_request(port, &tokenless).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 401"),
+            "tokenless loopback owner surface must refuse: {resp}"
+        );
+        assert!(
+            resp.contains("loopback-tokens") && resp.contains("INTENDANT_LOOPBACK_TOKEN"),
+            "refusal must carry the named guidance: {resp}"
+        );
+
+        let card = http_request(
+            port,
+            &format!(
+                "GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\n{TEST_TOKENLESS_MARKER}\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            card.contains("200 OK"),
+            "authority-free discovery must stay tokenless-serveable: {card}"
+        );
+
+        let tokened = http_request(
+            port,
+            "GET /api/dashboard/targets HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            tokened.starts_with("HTTP/1.1 200 OK"),
+            "the funnel-attached token must admit the same surface: {tokened}"
+        );
+        handle.abort();
     }
 
     #[tokio::test]
@@ -2681,7 +2765,7 @@ mod tests {
         // One-shot contract (same as http_request_bytes): pin the request
         // to `Connection: close` so a keep-alive-eligible response can't
         // park the connection and stall the read-to-EOF below.
-        let request = pin_connection_close(request);
+        let request = attach_loopback_token(&pin_connection_close(request));
         tls.write_all(request.as_bytes()).await.unwrap();
         // Read to EOF under one generous deadline. The old 2s timeout with
         // its result discarded turned this into a load lottery: ~2.8 MB of
@@ -2953,29 +3037,61 @@ mod tests {
     #[tokio::test]
     async fn test_federation_endpoint_rejects_missing_bearer() {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
-        // Request without auth — should 401, NOT pass through to the
-        // 503-no-registry response that would happen otherwise.
-        let resp = http_request(port, "GET /api/peers HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        // A caller with neither the loopback admission token nor the
+        // federation bearer: refused before the federation branch, with
+        // the named loopback guidance (the loopback gate is the outer
+        // gate now; the bearer-specific 401 shapes stay pinned by the
+        // verify_bearer_token unit tests, reachable for authenticated
+        // remote callers).
+        let resp = http_request(
+            port,
+            &format!("GET /api/peers HTTP/1.1\r\nHost: localhost\r\n{TEST_TOKENLESS_MARKER}\r\n"),
+        )
+        .await;
         assert!(resp.contains("401"), "expected 401, got: {resp}");
-        assert!(resp.contains("missing Authorization"));
         assert!(
-            resp.contains("WWW-Authenticate: Bearer"),
-            "WWW-Authenticate header signals the auth scheme"
+            resp.contains("loopback-tokens"),
+            "tokenless callers get the named loopback refusal: {resp}"
+        );
+        // With the owner token and still no bearer, the bearer gate is
+        // satisfied by owner supremacy: dispatch runs (503 = no registry
+        // configured), proving admission rather than a silent bypass.
+        let resp = http_request(port, "GET /api/peers HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(
+            resp.contains("503"),
+            "owner token must satisfy the bearer gate (503 = no registry): {resp}"
         );
         handle.abort();
     }
 
-    /// Wrong bearer token → 401 with "invalid bearer token".
+    /// Wrong bearer: still refused for callers without the owner token;
+    /// the owner token outranks a wrong bearer (owner supremacy — the
+    /// dashboard attaches the loopback token while a stale federation
+    /// bearer may linger in localStorage).
     #[tokio::test]
     async fn test_federation_endpoint_rejects_wrong_bearer() {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         let resp = http_request(
             port,
-            "GET /api/peers HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer wrong\r\n\r\n",
+            &format!(
+                "GET /api/peers HTTP/1.1\r\nHost: localhost\r\n{TEST_TOKENLESS_MARKER}Authorization: Bearer wrong\r\n\r\n"
+            ),
         )
         .await;
         assert!(resp.contains("401"), "expected 401, got: {resp}");
-        assert!(resp.contains("invalid bearer"));
+        assert!(
+            resp.contains("loopback-tokens"),
+            "tokenless caller with a wrong bearer gets the loopback refusal: {resp}"
+        );
+        let resp = http_request(
+            port,
+            "GET /api/peers HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer wrong\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.contains("503"),
+            "owner token outranks a wrong federation bearer: {resp}"
+        );
         handle.abort();
     }
 
@@ -3091,6 +3207,34 @@ mod tests {
     #[tokio::test]
     async fn test_ws_upgrade_rejects_missing_bearer() {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("ws-token".into())).await;
+        // Neither the loopback admission token nor the ws bearer: the
+        // loopback gate refuses first, before the WS handshake, with the
+        // named guidance.
+        let resp = http_request(
+            port,
+            &format!(
+                "GET /ws HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 {TEST_TOKENLESS_MARKER}\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Key: dGVzdA==\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(resp.contains("401"), "expected 401, got: {resp}");
+        assert!(
+            resp.contains("loopback-tokens"),
+            "tokenless /ws gets the named loopback refusal: {resp}"
+        );
+        // Critically, the upgrade did NOT complete.
+        assert!(
+            !resp.contains("101 Switching Protocols"),
+            "must reject before WS handshake completes"
+        );
+        // The owner token satisfies the configured ws bearer too (owner
+        // supremacy): the upgrade completes with no bearer presented.
         let resp = http_request(
             port,
             "GET /ws HTTP/1.1\r\n\
@@ -3101,15 +3245,9 @@ mod tests {
              Sec-WebSocket-Version: 13\r\n\r\n",
         )
         .await;
-        assert!(resp.contains("401"), "expected 401, got: {resp}");
         assert!(
-            resp.contains("WWW-Authenticate: Bearer"),
-            "WWW-Authenticate signals scheme"
-        );
-        // Critically, the upgrade did NOT complete.
-        assert!(
-            !resp.contains("101 Switching Protocols"),
-            "must reject before WS handshake completes"
+            resp.contains("101 Switching Protocols"),
+            "owner token must satisfy the ws bearer gate: {resp}"
         );
         handle.abort();
     }
@@ -3231,12 +3369,15 @@ mod tests {
         let (port, handle) = spawn_test_gateway_tls(Some("ws-token".into())).await;
         let resp = https_request(
             port,
-            "GET /ws HTTP/1.1\r\n\
-             Host: localhost\r\n\
-             Upgrade: websocket\r\n\
-             Connection: Upgrade\r\n\
-             Sec-WebSocket-Key: dGVzdA==\r\n\
-             Sec-WebSocket-Version: 13\r\n\r\n",
+            &format!(
+                "GET /ws HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 {TEST_TOKENLESS_MARKER}\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Key: dGVzdA==\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n"
+            ),
         )
         .await;
         assert!(
@@ -3245,8 +3386,8 @@ mod tests {
         );
         assert!(resp.contains("401"), "expected 401 over TLS, got: {resp}");
         assert!(
-            resp.contains("WWW-Authenticate: Bearer"),
-            "WWW-Authenticate signals scheme"
+            resp.contains("loopback-tokens"),
+            "tokenless /ws over TLS gets the named loopback refusal: {resp}"
         );
         assert!(
             !resp.contains("101 Switching Protocols"),
@@ -3263,7 +3404,13 @@ mod tests {
     #[tokio::test]
     async fn test_strict_tls_rejects_cleartext_http() {
         let (port, handle) = spawn_test_gateway_tls(None).await;
-        let resp = http_request(port, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        // Credential-less cleartext (the tokenless marker keeps the
+        // funnel from attaching this process's admission token).
+        let resp = http_request(
+            port,
+            &format!("GET / HTTP/1.1\r\nHost: localhost\r\n{TEST_TOKENLESS_MARKER}\r\n"),
+        )
+        .await;
         assert!(
             resp.contains("426"),
             "cleartext HTTP to a --tls gateway must get 426, got: {resp}"
@@ -3271,6 +3418,18 @@ mod tests {
         assert!(
             !resp.contains("200 OK"),
             "must not serve the dashboard over cleartext, got: {resp}"
+        );
+        // The ratified carve-out: the same cleartext request bearing the
+        // per-boot loopback admission token is admitted (CLI-class owner
+        // clients; ruling (i) 2026-07-20) — the funnel attaches it.
+        let admitted = http_request(
+            port,
+            "GET /api/dashboard/targets HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            admitted.starts_with("HTTP/1.1 200 OK"),
+            "token'd cleartext loopback must be admitted on a --tls gateway, got: {admitted}"
         );
         handle.abort();
     }
@@ -3283,12 +3442,15 @@ mod tests {
         let (port, handle) = spawn_test_gateway_tls(None).await;
         let resp = http_request(
             port,
-            "GET /ws HTTP/1.1\r\n\
-             Host: localhost\r\n\
-             Upgrade: websocket\r\n\
-             Connection: Upgrade\r\n\
-             Sec-WebSocket-Key: dGVzdA==\r\n\
-             Sec-WebSocket-Version: 13\r\n\r\n",
+            &format!(
+                "GET /ws HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 {TEST_TOKENLESS_MARKER}\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Key: dGVzdA==\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n"
+            ),
         )
         .await;
         assert!(
@@ -3341,14 +3503,19 @@ mod tests {
     #[tokio::test]
     async fn test_strict_tls_rejects_loopback_cleartext_mcp_without_token() {
         let (port, handle) = spawn_test_gateway_tls_with_client_cert_requirement(None, true).await;
+        // No mcp_token AND no loopback admission token (marker): the
+        // credential-less cleartext /mcp shape stays refused.
         let resp = http_request(
             port,
-            "POST /mcp?session_id=child HTTP/1.1\r\n\
-             Host: localhost\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: 2\r\n\
-             \r\n\
-             {}",
+            &format!(
+                "POST /mcp?session_id=child HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 {TEST_TOKENLESS_MARKER}\
+                 Content-Type: application/json\r\n\
+                 Content-Length: 2\r\n\
+                 \r\n\
+                 {{}}"
+            ),
         )
         .await;
         assert!(
@@ -3653,9 +3820,18 @@ mod tests {
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (dash_port, dash_handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
-        // POST A's Agent Card URL to B's /api/peers.
+        // POST A's Agent Card URL to B's /api/peers. The dial presents
+        // A's loopback admission token as the peer bearer (both
+        // gateways share this process's token): plain-ws loopback
+        // federation stopped riding the tokenless trusted-local lane,
+        // and same-box rigs authenticate exactly this way — the target
+        // daemon's token as `bearer_token`.
         let card_url = format!("http://127.0.0.1:{target_port}/.well-known/agent-card.json");
-        let body = serde_json::json!({"card_url": card_url}).to_string();
+        let body = serde_json::json!({
+            "card_url": card_url,
+            "bearer_token": crate::loopback_token::loopback_admission_token(),
+        })
+        .to_string();
         let req = format!(
             "POST /api/peers HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
@@ -3816,9 +3992,18 @@ mod tests {
         let registry_for_wait = registry.clone();
         let (dash_port, dash_handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
-        // POST A's Agent Card URL to B's /api/peers.
+        // POST A's Agent Card URL to B's /api/peers. The dial presents
+        // A's loopback admission token as the peer bearer (both
+        // gateways share this process's token): plain-ws loopback
+        // federation stopped riding the tokenless trusted-local lane,
+        // and same-box rigs authenticate exactly this way — the target
+        // daemon's token as `bearer_token`.
         let card_url = format!("http://127.0.0.1:{target_port}/.well-known/agent-card.json");
-        let body = serde_json::json!({"card_url": card_url}).to_string();
+        let body = serde_json::json!({
+            "card_url": card_url,
+            "bearer_token": crate::loopback_token::loopback_admission_token(),
+        })
+        .to_string();
         let req = format!(
             "POST /api/peers HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),

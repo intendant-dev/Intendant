@@ -758,6 +758,7 @@ pub(crate) fn mcp_http_access_context(
     peer_addr: std::net::SocketAddr,
     header_text: &str,
 ) -> Result<HttpAccessContext, (u16, String)> {
+    let loopback_admitted = crate::loopback_token::loopback_token_presented(header_text);
     let dashboard_equivalent_context = || {
         http_access_context(
             cert_dir,
@@ -765,6 +766,7 @@ pub(crate) fn mcp_http_access_context(
             tls_client_cert_fingerprint,
             tls_client_cert_present,
             is_tls,
+            loopback_admitted,
         )
         .map_err(|message| (500u16, message))
     };
@@ -817,6 +819,14 @@ pub(crate) fn mcp_http_access_context(
                     "mcp_token required: tokenless /mcp is only served to loopback clients"
                         .to_string(),
                 ));
+            }
+            // The mcp_token-less loopback tail mints `local_process` —
+            // owner posture. Like every owner-posture surface, it now
+            // requires the per-boot loopback admission token; transport
+            // reachability alone stopped being a credential when the
+            // token shipped.
+            if !loopback_admitted {
+                return Err((401, crate::loopback_token::refusal_error_message()));
             }
             if let Some(state) = load_state()? {
                 if let Some(principal) =
@@ -903,6 +913,85 @@ pub(crate) fn mcp_agent_session_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mcp_token-less loopback tail of the /mcp ladder mints
+    /// `local_process` — owner posture — so it now requires the per-boot
+    /// loopback admission token like every owner surface. The mcp_token
+    /// rungs (process + session-scoped) are untouched credentials.
+    #[test]
+    fn tokenless_loopback_mcp_requires_the_loopback_admission_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loopback: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        let refused = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n",
+        )
+        .expect_err("tokenless loopback /mcp must refuse");
+        assert_eq!(refused.0, 401);
+        assert!(
+            refused.1.contains("loopback-tokens"),
+            "named token guidance expected: {}",
+            refused.1
+        );
+
+        // Loopback-token'd requests bind the same local_process default
+        // as pre-token tokenless loopback did.
+        let admitted_request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:1\r\nx-intendant-loopback-token: {}\r\n\r\n",
+            crate::loopback_token::loopback_admission_token()
+        );
+        let admitted = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &admitted_request,
+        )
+        .unwrap();
+        assert_eq!(admitted.principal.id, "principal:local-process:loopback");
+
+        // The mcp process-token rung authenticates on its own, no
+        // loopback token required (supervised-backend bootstrap URLs).
+        let process_request = format!(
+            "POST /mcp?mcp_token={} HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n",
+            loopback_mcp_auth_token()
+        );
+        let via_process = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &process_request,
+        )
+        .unwrap();
+        assert_eq!(via_process.principal.id, "principal:mcp-token-holder");
+
+        // Non-loopback tokenless keeps its own refusal (not the token
+        // error — remote callers get mcp_token guidance).
+        let remote: std::net::SocketAddr = "10.0.0.5:9".parse().unwrap();
+        let refused = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            remote,
+            "POST /mcp HTTP/1.1\r\nHost: h\r\n\r\n",
+        )
+        .expect_err("remote tokenless /mcp must refuse");
+        assert_eq!(refused.0, 401);
+        assert!(refused.1.contains("mcp_token"), "{}", refused.1);
+    }
 
     /// The dedicated session-MCP ingress ladder has exactly one rung: a
     /// session-scoped token binds that agent session; the tokenless
@@ -1636,10 +1725,18 @@ mod tests {
         let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 4000);
         let lan = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 9).into(), 4000);
         let plain = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
+        // The mcp_token-less loopback lane requires the per-boot
+        // admission token since the loopback gate shipped; with it the
+        // request binds the same local-process principal as before.
+        let admitted = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\
+             x-intendant-loopback-token: {}\r\n\r\n",
+            crate::loopback_token::loopback_admission_token()
+        );
 
-        // Tokenless loopback keeps working — bound to its own principal.
         let local =
-            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain).unwrap();
+            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, &admitted)
+                .unwrap();
         assert_eq!(local.principal.id, "principal:local-process:loopback");
         assert_eq!(local.principal.kind, "root_session");
         assert!(
@@ -1686,7 +1783,12 @@ mod tests {
             false,
             false,
             loopback,
-            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n",
+            &format!(
+                "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\
+                 Origin: http://localhost:8765\r\n\
+                 x-intendant-loopback-token: {}\r\n\r\n",
+                crate::loopback_token::loopback_admission_token()
+            ),
         )
         .unwrap();
         assert_eq!(dash.principal.id, "principal:root:dashboard");
@@ -1827,7 +1929,11 @@ mod tests {
             false,
             false,
             loopback,
-            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n",
+            &format!(
+                "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\
+                 x-intendant-loopback-token: {}\r\n\r\n",
+                crate::loopback_token::loopback_admission_token()
+            ),
         )
         .unwrap();
         assert_eq!(local.principal.kind, "local_process");
@@ -1867,6 +1973,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 4000);
         let plain = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
+        // The loopback-admitted twin: past the loopback gate, so the
+        // agent-scoping logic under test is what answers.
+        let admitted = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\
+             x-intendant-loopback-token: {}\r\n\r\n",
+            crate::loopback_token::loopback_admission_token()
+        );
         let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "test");
 
         let mut state = crate::access::iam::LocalIamState::default();
@@ -1883,10 +1996,17 @@ mod tests {
         .unwrap();
         crate::access::iam::save_state(tmp.path(), &state).unwrap();
 
-        // A scoped agent shedding its token no longer lands on a
-        // root-compatible default.
+        // Fully tokenless: the loopback admission gate answers first.
         let err = mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain)
             .unwrap_err();
+        assert_eq!(err.0, 401);
+        assert!(err.1.contains("loopback-tokens"), "guidance in: {}", err.1);
+
+        // Loopback-admitted but mcp_token-less while agent sessions are
+        // scoped: the scoping refusal, with its local_process guidance.
+        let err =
+            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, &admitted)
+                .unwrap_err();
         assert_eq!(err.0, 401);
         assert!(err.1.contains("local_process"), "guidance in: {}", err.1);
 
@@ -1918,7 +2038,8 @@ mod tests {
         .unwrap();
         crate::access::iam::save_state(tmp.path(), &state).unwrap();
         let local =
-            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain).unwrap();
+            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, &admitted)
+                .unwrap();
         assert_eq!(local.principal.kind, "local_process");
         assert_eq!(local.principal.role_id, "role:terminal");
     }
@@ -1982,10 +2103,10 @@ mod tests {
         assert!(!decision.allowed);
         assert!(decision.reason.contains("expired"), "{}", decision.reason);
 
-        // The tokenless loopback caller with a revoked local_process grant
-        // binds that principal and is denied per-op — the open default does
-        // not return, and the agent-scoping 401 does not mask the real
-        // reason.
+        // The loopback-admitted, mcp_token-less caller with a revoked
+        // local_process grant binds that principal and is denied per-op —
+        // the open default does not return, and the agent-scoping 401
+        // does not mask the real reason.
         let local = mcp_http_access_context(
             tmp.path(),
             None,
@@ -1993,7 +2114,11 @@ mod tests {
             false,
             false,
             loopback,
-            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n",
+            &format!(
+                "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\
+                 x-intendant-loopback-token: {}\r\n\r\n",
+                crate::loopback_token::loopback_admission_token()
+            ),
         )
         .unwrap();
         assert_eq!(local.principal.id, "principal:local-process:loopback");

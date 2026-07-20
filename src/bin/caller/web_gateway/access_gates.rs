@@ -200,10 +200,14 @@ pub(crate) fn is_connect_dashboard_signaling_path(path: &str) -> bool {
 /// needs a verified client identity.
 /// TLS encryption, a bearer copied from the daemon page, and an
 /// `intendant://` Origin are transport/CSRF properties, not an IAM anchor.
-/// The local/debug exception requires all four facts the daemon can verify:
+/// The local/debug exception requires five facts the daemon can verify:
 /// the public gateway listener accepted the connection directly, its socket
-/// peer is loopback, its Host authority is loopback, and it carries no
-/// reverse-proxy provenance headers. A proxy or reachability-relay dial-back
+/// peer is loopback, its Host authority is loopback, it carries no
+/// reverse-proxy provenance headers, and it presents the daemon's per-boot
+/// loopback admission token (`loopback_token.rs`) — transport facts alone
+/// stopped minting owner posture when the token shipped: TCP loopback is
+/// not uid-scoped, and on Linux/Windows even sandboxed shells can reach
+/// the port. A proxy or reachability-relay dial-back
 /// cannot inherit root merely because its last hop terminates on loopback.
 pub(crate) fn remote_dashboard_client_auth_missing(
     gateway_ingress: GatewayIngress,
@@ -212,11 +216,66 @@ pub(crate) fn remote_dashboard_client_auth_missing(
     tls_client_cert_fingerprint: Option<&str>,
     peer_identity: Option<&PeerConnectionIdentity>,
 ) -> bool {
-    !direct_loopback_dashboard_request(gateway_ingress, peer_addr, header_text)
+    !(direct_loopback_dashboard_request(gateway_ingress, peer_addr, header_text)
+        && crate::loopback_token::loopback_token_presented(header_text))
         && tls_client_cert_fingerprint
             .map(str::trim)
             .is_none_or(str::is_empty)
         && peer_identity.is_none()
+}
+
+/// THE cleartext-loopback admission predicate — deliberately the single
+/// copy of this logic (ratified transport ruling, 2026-07-20), consulted
+/// by BOTH the listener's strict-TLS 426 peek and the HTTP dispatch
+/// mTLS/remote-auth gate. A cleartext connection on a TLS-posture daemon
+/// is admitted only when it is host-local AND credentialed:
+///
+/// - `Direct` ingress admits the `/mcp` token carve-out (supervised
+///   backends' bootstrap URLs, which cannot do custom-CA HTTPS) and —
+///   the ruling's widening — any loopback request presenting the
+///   per-boot loopback admission token: CLI-class owner clients (`ctl`,
+///   rigs) stay cleartext-with-token until the credential-custody
+///   migration gives them TLS client identity, at which point
+///   ctl-over-HTTPS arrives with actual payoff.
+/// - `SessionMcp` ingress stays exactly the `/mcp` carve-out — its own
+///   single-rung session-token ladder governs past transport, and the
+///   owner token must never widen that listener.
+/// - Reachability-relay ingress admits nothing.
+///
+/// Browser-originated requests never qualify (origin markers excluded):
+/// browsers keep the 426 on cleartext and keep the printed https URL.
+pub(crate) fn cleartext_loopback_admitted(
+    gateway_ingress: GatewayIngress,
+    peer_addr: std::net::SocketAddr,
+    is_tls: bool,
+    header_text: &str,
+) -> bool {
+    let mcp_carveout = is_loopback_cleartext_mcp_request(peer_addr, is_tls, header_text);
+    match gateway_ingress {
+        GatewayIngress::Direct => {
+            mcp_carveout
+                || (!is_tls
+                    && client_ip_is_loopback(peer_addr.ip())
+                    && !has_browser_origin_headers(header_text)
+                    && crate::loopback_token::loopback_token_presented(header_text))
+        }
+        GatewayIngress::SessionMcp => mcp_carveout,
+        GatewayIngress::ReachabilityRelay => false,
+    }
+}
+
+/// True when this request sits on the direct-loopback transport lane but
+/// did not present the per-boot admission token: the caller is local, so
+/// the refusal should be the named, actionable token error
+/// ([`crate::loopback_token::refusal_error_message`]) rather than the
+/// generic remote-certificate error.
+pub(crate) fn direct_loopback_missing_admission_token(
+    gateway_ingress: GatewayIngress,
+    peer_addr: std::net::SocketAddr,
+    header_text: &str,
+) -> bool {
+    direct_loopback_dashboard_request(gateway_ingress, peer_addr, header_text)
+        && !crate::loopback_token::loopback_token_presented(header_text)
 }
 
 fn direct_loopback_dashboard_request(
@@ -578,6 +637,14 @@ pub(crate) fn verify_bearer_token(
     let Some(expected) = expected_token else {
         return Ok(());
     };
+    // The box-owner's per-boot loopback admission token satisfies any
+    // bearer-gated lane (here and via `verify_bearer_for_ws`): the
+    // dashboard reuses the shared `Authorization: Bearer` / `?token=`
+    // channels for it, and owner possession is strictly stronger than
+    // the federation bearer it would otherwise shadow.
+    if crate::loopback_token::loopback_token_presented(header_text) {
+        return Ok(());
+    }
     let auth_header = header_text.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
         if name.eq_ignore_ascii_case("authorization") {
@@ -673,6 +740,208 @@ mod tests {
     fn verify_bearer_token_passes_when_no_token_configured() {
         let header = "GET /api/peers HTTP/1.1\r\nHost: x\r\n\r\n";
         assert!(verify_bearer_token(header, None).is_ok());
+    }
+
+    /// The ONE cleartext admission predicate (ratified transport
+    /// ruling): Direct loopback admits the /mcp carve-out or the
+    /// per-boot token; the session-MCP ingress admits only its own
+    /// /mcp lane (the owner token must never widen it); relay admits
+    /// nothing; browser-origin markers and remote peers never qualify.
+    #[test]
+    fn cleartext_admission_is_local_credentialed_and_ingress_scoped() {
+        let loopback: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let token = crate::loopback_token::loopback_admission_token();
+        let tokened = format!(
+            "GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
+             x-intendant-loopback-token: {token}\r\n\r\n"
+        );
+
+        assert!(cleartext_loopback_admitted(
+            GatewayIngress::Direct,
+            loopback,
+            false,
+            &tokened
+        ));
+        // The mcp carve-out still rides on both eligible ingresses.
+        let mcp = format!(
+            "POST /mcp?mcp_token={} HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n",
+            loopback_mcp_auth_token()
+        );
+        assert!(cleartext_loopback_admitted(
+            GatewayIngress::Direct,
+            loopback,
+            false,
+            &mcp
+        ));
+        assert!(cleartext_loopback_admitted(
+            GatewayIngress::SessionMcp,
+            loopback,
+            false,
+            &mcp
+        ));
+
+        // The owner token never widens the session-MCP listener.
+        assert!(!cleartext_loopback_admitted(
+            GatewayIngress::SessionMcp,
+            loopback,
+            false,
+            &tokened
+        ));
+        // Relay ingress admits nothing.
+        assert!(!cleartext_loopback_admitted(
+            GatewayIngress::ReachabilityRelay,
+            loopback,
+            false,
+            &tokened
+        ));
+        // Tokenless, browser-origin, and remote callers never qualify.
+        assert!(!cleartext_loopback_admitted(
+            GatewayIngress::Direct,
+            loopback,
+            false,
+            "GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n"
+        ));
+        let browser = format!(
+            "GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
+             Origin: http://127.0.0.1:8765\r\n\
+             x-intendant-loopback-token: {token}\r\n\r\n"
+        );
+        assert!(!cleartext_loopback_admitted(
+            GatewayIngress::Direct,
+            loopback,
+            false,
+            &browser
+        ));
+        let remote: std::net::SocketAddr = "192.168.1.9:5555".parse().unwrap();
+        assert!(!cleartext_loopback_admitted(
+            GatewayIngress::Direct,
+            remote,
+            false,
+            &tokened
+        ));
+    }
+
+    /// The trusted-local owner lane requires possession of the per-boot
+    /// loopback admission token; the transport facts alone stopped
+    /// sufficing. The token never *overrides* the transport facts —
+    /// relay ingress, proxy provenance, and remote peers stay refused as
+    /// remote (certificate guidance), never as the local token case.
+    #[test]
+    fn loopback_owner_lane_requires_the_admission_token() {
+        let loopback: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let token = crate::loopback_token::loopback_admission_token();
+
+        let tokenless = "GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n";
+        assert!(remote_dashboard_client_auth_missing(
+            GatewayIngress::Direct,
+            loopback,
+            tokenless,
+            None,
+            None
+        ));
+        assert!(direct_loopback_missing_admission_token(
+            GatewayIngress::Direct,
+            loopback,
+            tokenless
+        ));
+
+        let tokened = format!(
+            "GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
+             x-intendant-loopback-token: {token}\r\n\r\n"
+        );
+        assert!(!remote_dashboard_client_auth_missing(
+            GatewayIngress::Direct,
+            loopback,
+            &tokened,
+            None,
+            None
+        ));
+        assert!(!direct_loopback_missing_admission_token(
+            GatewayIngress::Direct,
+            loopback,
+            &tokened
+        ));
+
+        // Wrong token = tokenless, and still the named-token case (a
+        // stale token from a previous boot is the common local error).
+        let stale = "GET / HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
+                     x-intendant-loopback-token: stale\r\n\r\n";
+        assert!(remote_dashboard_client_auth_missing(
+            GatewayIngress::Direct,
+            loopback,
+            stale,
+            None,
+            None
+        ));
+        assert!(direct_loopback_missing_admission_token(
+            GatewayIngress::Direct,
+            loopback,
+            stale
+        ));
+
+        // Relay ingress: refused as remote even with the real token.
+        assert!(remote_dashboard_client_auth_missing(
+            GatewayIngress::ReachabilityRelay,
+            loopback,
+            &tokened,
+            None,
+            None
+        ));
+        assert!(!direct_loopback_missing_admission_token(
+            GatewayIngress::ReachabilityRelay,
+            loopback,
+            &tokened
+        ));
+
+        // Proxy provenance: refused as remote even with the real token.
+        let proxied = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nX-Forwarded-For: 9.9.9.9\r\n\
+             x-intendant-loopback-token: {token}\r\n\r\n"
+        );
+        assert!(remote_dashboard_client_auth_missing(
+            GatewayIngress::Direct,
+            loopback,
+            &proxied,
+            None,
+            None
+        ));
+        assert!(!direct_loopback_missing_admission_token(
+            GatewayIngress::Direct,
+            loopback,
+            &proxied
+        ));
+
+        // Remote socket peer: never the token case.
+        let remote: std::net::SocketAddr = "192.168.1.9:5555".parse().unwrap();
+        assert!(remote_dashboard_client_auth_missing(
+            GatewayIngress::Direct,
+            remote,
+            &tokened,
+            None,
+            None
+        ));
+        assert!(!direct_loopback_missing_admission_token(
+            GatewayIngress::Direct,
+            remote,
+            &tokened
+        ));
+
+        // The token rides the shared bearer/query channels too, and
+        // satisfies a configured federation bearer (owner ≥ federation).
+        let bearer = format!(
+            "GET /api/peers HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
+             Authorization: Bearer {token}\r\n\r\n"
+        );
+        assert!(!remote_dashboard_client_auth_missing(
+            GatewayIngress::Direct,
+            loopback,
+            &bearer,
+            None,
+            None
+        ));
+        assert!(verify_bearer_token(&bearer, Some("configured-federation-token")).is_ok());
+        let query = format!("GET /ws?token={token} HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n");
+        assert!(verify_bearer_for_ws(&query, Some("configured-federation-token")).is_ok());
     }
 
     #[test]
@@ -819,7 +1088,14 @@ mod tests {
     fn remote_certless_dashboard_is_denied_but_loopback_and_verified_peers_survive() {
         let loopback = "127.0.0.1:4444".parse().unwrap();
         let remote = "192.0.2.44:4444".parse().unwrap();
-        let local_headers = "GET /config HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
+        // The surviving loopback lane presents the per-boot admission
+        // token like every owner client.
+        let local_headers = format!(
+            "GET /config HTTP/1.1\r\nHost: localhost:8765\r\n\
+             x-intendant-loopback-token: {}\r\n\r\n",
+            crate::loopback_token::loopback_admission_token()
+        );
+        let local_headers = local_headers.as_str();
         assert!(!remote_dashboard_client_auth_missing(
             GatewayIngress::Direct,
             loopback,
@@ -878,11 +1154,23 @@ mod tests {
             "GET /config HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-Proto: https\r\n\r\n",
             "GET /config HTTP/1.1\r\n\r\n",
         ] {
+            // Even WITH the admission token: proxy provenance and bad
+            // Host authorities never synthesize the trusted-local lane —
+            // the refusal these fixtures pin is transport-shaped, not
+            // token-shaped.
+            let headers = headers.replacen(
+                "\r\n",
+                &format!(
+                    "\r\nx-intendant-loopback-token: {}\r\n",
+                    crate::loopback_token::loopback_admission_token()
+                ),
+                1,
+            );
             assert!(
                 remote_dashboard_client_auth_missing(
                     GatewayIngress::Direct,
                     loopback,
-                    headers,
+                    &headers,
                     None,
                     None,
                 ),
@@ -890,7 +1178,11 @@ mod tests {
             );
         }
         for host in ["127.0.0.1:8765", "[::1]:8765", "LOCALHOST:8765"] {
-            let headers = format!("GET /config HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            let headers = format!(
+                "GET /config HTTP/1.1\r\nHost: {host}\r\n\
+                 x-intendant-loopback-token: {}\r\n\r\n",
+                crate::loopback_token::loopback_admission_token()
+            );
             assert!(!remote_dashboard_client_auth_missing(
                 GatewayIngress::Direct,
                 loopback,
@@ -900,17 +1192,27 @@ mod tests {
             ));
         }
         let mapped_loopback = "[::ffff:127.0.0.1]:4444".parse().unwrap();
+        let mapped_headers = format!(
+            "GET /config HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\
+             x-intendant-loopback-token: {}\r\n\r\n",
+            crate::loopback_token::loopback_admission_token()
+        );
         assert!(!remote_dashboard_client_auth_missing(
             GatewayIngress::Direct,
             mapped_loopback,
-            "GET /config HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n",
+            &mapped_headers,
             None,
             None,
         ));
+        let mapped_host_headers = format!(
+            "GET /config HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:8765\r\n\
+             x-intendant-loopback-token: {}\r\n\r\n",
+            crate::loopback_token::loopback_admission_token()
+        );
         assert!(!remote_dashboard_client_auth_missing(
             GatewayIngress::Direct,
             mapped_loopback,
-            "GET /config HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:8765\r\n\r\n",
+            &mapped_host_headers,
             None,
             None,
         ));

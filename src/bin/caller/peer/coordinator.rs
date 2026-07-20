@@ -286,7 +286,15 @@ mod tests {
             &format!("ws://127.0.0.1:{port}/ws"),
             vec![Capability::ComputerUse],
         );
-        let peer_id = registry.add_peer_with_card(card).await.unwrap();
+        let peer_id = registry
+            .add_peer_with_card_and_auth(
+                card,
+                Vec::new(),
+                Some(crate::loopback_token::loopback_admission_token().to_string()),
+                None,
+            )
+            .await
+            .unwrap();
         let handle = registry.get(&peer_id).unwrap();
         assert!(wait_connected(&handle).await, "peer never connected");
 
@@ -325,7 +333,15 @@ mod tests {
             &format!("ws://127.0.0.1:{dead_port}/ws"),
             vec![Capability::ComputerUse],
         );
-        let peer_id = registry.add_peer_with_card(card).await.unwrap();
+        let peer_id = registry
+            .add_peer_with_card_and_auth(
+                card,
+                Vec::new(),
+                Some(crate::loopback_token::loopback_admission_token().to_string()),
+                None,
+            )
+            .await
+            .unwrap();
         let handle = registry.get(&peer_id).unwrap();
         assert!(
             wait_reconnecting(&handle).await,
@@ -367,7 +383,15 @@ mod tests {
             &format!("ws://127.0.0.1:{port}/ws"),
             vec![Capability::ComputerUse],
         );
-        let peer_id = registry.add_peer_with_card(card).await.unwrap();
+        let peer_id = registry
+            .add_peer_with_card_and_auth(
+                card,
+                Vec::new(),
+                Some(crate::loopback_token::loopback_admission_token().to_string()),
+                None,
+            )
+            .await
+            .unwrap();
         let handle = registry.get(&peer_id).unwrap();
         assert!(wait_connected(&handle).await);
 
@@ -415,8 +439,24 @@ mod tests {
             &format!("ws://127.0.0.1:{port_b}/ws"),
             vec![Capability::ComputerUse],
         );
-        let id_a = registry.add_peer_with_card(card_a).await.unwrap();
-        let id_b = registry.add_peer_with_card(card_b).await.unwrap();
+        let id_a = registry
+            .add_peer_with_card_and_auth(
+                card_a,
+                Vec::new(),
+                Some(crate::loopback_token::loopback_admission_token().to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        let id_b = registry
+            .add_peer_with_card_and_auth(
+                card_b,
+                Vec::new(),
+                Some(crate::loopback_token::loopback_admission_token().to_string()),
+                None,
+            )
+            .await
+            .unwrap();
         let ha = registry.get(&id_a).unwrap();
         let hb = registry.get(&id_b).unwrap();
         assert!(wait_connected(&ha).await, "alpha never connected");
@@ -461,7 +501,15 @@ mod tests {
             &format!("ws://127.0.0.1:{port}/ws"),
             vec![Capability::ComputerUse],
         );
-        let peer_id = registry.add_peer_with_card(card).await.unwrap();
+        let peer_id = registry
+            .add_peer_with_card_and_auth(
+                card,
+                Vec::new(),
+                Some(crate::loopback_token::loopback_admission_token().to_string()),
+                None,
+            )
+            .await
+            .unwrap();
         let handle = registry.get(&peer_id).unwrap();
         assert!(wait_connected(&handle).await);
 

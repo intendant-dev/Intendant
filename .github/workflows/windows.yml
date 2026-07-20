@@ -473,13 +473,24 @@ jobs:
             exit 1
           fi
           echo "port=$port" >> "$GITHUB_OUTPUT"
+          # The per-boot loopback admission token: the daemon persists it
+          # before printing the Dashboard line; owner surfaces refuse
+          # tokenless loopback, so the probe opens the tokened URL the
+          # way a real owner would.
+          token_file="$rig/home/.intendant/loopback-tokens/$port.token"
+          if [ ! -s "$token_file" ]; then
+            echo "::error::loopback token file missing at $token_file"
+            tail -n 40 "$rig/daemon.log"
+            exit 1
+          fi
+          echo "token=$(cat "$token_file")" >> "$GITHUB_OUTPUT"
           echo "daemon pid=$pid port=$port"
 
       - name: dashboard-boot smoke
         if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
         run: >
           node scripts/smoke-dashboard-boot.cjs
-          --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/"
+          --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/?token=${{ steps.daemon.outputs.token }}"
           --artifact-dir "${{ steps.daemon.outputs.rig }}/artifacts"
 
       # Deep-link boots evaluate later-fragment code during script
@@ -493,7 +504,7 @@ jobs:
         run: |
           for hash in stats files; do
             node scripts/smoke-dashboard-boot.cjs \
-              --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/#$hash" \
+              --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/?token=${{ steps.daemon.outputs.token }}#$hash" \
               --artifact-dir "${{ steps.daemon.outputs.rig }}/artifacts"
           done
 

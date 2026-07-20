@@ -739,20 +739,85 @@ The pattern is proven elsewhere; we are assembling, not inventing:
 
 ## Loopback trust vs. the runtime sandbox
 
-Local presence makes bare loopback a root-capable surface — deliberate, and
-documented above. Its sharp edge is that the *sandboxed runtime* is itself a
-local process: a prompt-injected shell running `curl 127.0.0.1:<port>/api/…`
-(or `intendant ctl`) would arrive as the trusted-local principal and escape
-the write sandbox entirely. On macOS the default (sandbox-on) runtime
-profile therefore denies network egress to the daemon's own gateway port —
-everything else stays reachable, and `--no-sandbox` lifts the guard with the
-rest of the confinement. Linux and Windows cannot express a single-port deny
-under their mechanisms (Landlock's network rules are allowlist-only;
-restricted tokens do not filter loopback), so on those platforms the
-loopback surface remains reachable from sandboxed shells — closing it
-properly means authenticating the loopback lane (per-boot secret or
-peer-credential checks) or binding its unauthenticated form to a read-only
-route subset, an open design decision. The same asymmetry applies to the
+Local presence makes loopback a root-capable surface — deliberate, and
+documented above — but since the per-boot admission token shipped,
+*reachability alone is no longer the credential*. Every daemon boot mints
+a random loopback admission token and writes it to
+`<state root>/loopback-tokens/<port>.token` (0600; one file per instance
+port, so concurrent daemons on a home never clobber; rotates every boot;
+removed with the instance's other per-boot state on the next boot of that
+port). Every owner-posture loopback surface — the dashboard HTTP API,
+`/ws`, dashboard-control datachannel signaling, and the `local_process`
+lane of `/mcp` — refuses tokenless loopback with a named error that says
+exactly which file a local owner process reads (or that
+`INTENDANT_LOOPBACK_TOKEN` overrides it). Authority-free bytes (the SPA
+shell, `/.well-known/agent-card.json`) stay serveable; nothing that
+*mints owner authority* is reachable without the token. The gate is
+**default-ON for every daemon posture — dev and QA builds, `--no-tls`
+included — with no opt-out flag**: a shared home's effective security is
+its weakest daemon's posture, and the one live escape observed (a
+session refused by an mTLS front door scavenging a permissive plain-HTTP
+QA daemon on the same home) was exactly a weakest-daemon bypass.
+
+The token turns "can reach 127.0.0.1" into "can read the owner's state
+root". On every platform that ends tokenless drive-by — including
+*cross-uid* drive-by, since TCP loopback is not uid-scoped and the
+trusted-local lane previously admitted any local user — and ends the
+scavenge-a-permissive-daemon bypass. Owner surfaces present the token
+automatically: the boot prints a tokened dashboard URL to the
+controlling terminal only (deliberately never through stdout/stderr,
+which the daemon log tee mirrors into the sandbox-readable `logs/`
+subtree), `intendant ctl` discovers it with zero friction
+(`INTENDANT_LOOPBACK_TOKEN` env override, else the per-port file;
+supervised sessions keep their injected, session-scoped `mcp_token` lane
+instead and never self-escalate by reading the file), `intendant ctl
+dashboard-url` prints the owner URL for service-mode daemons, and the
+dashboard stores the token from its opened URL, strips it from the
+address bar, and attaches it to every same-origin request. The token
+authenticates *admission to the existing loopback posture* — admitted
+callers mint exactly the principals they always did (`local_process`,
+the trusted-local dashboard lane); there is no new principal class and
+no IAM vocabulary change. It is likewise independent of the `/mcp`
+token ladder: `mcp_token` credentials keep working unchanged, and the
+dedicated session-MCP listener's single-rung session-token ladder is
+untouched.
+
+Transport interaction with the TLS posture (ratified 2026-07-20): a
+TLS-enforcing daemon still refuses cleartext with `426 Upgrade
+Required`, through one shared admission predicate whose only exceptions
+are host-local and credentialed — the token-gated loopback `/mcp` lane
+supervised backends bootstrap through, and (the ruling's widening)
+loopback requests presenting the per-boot admission token. That admits
+exactly the CLI-class owner clients (`ctl`, rigs) whose traffic never
+leaves the host and who today hold no TLS client identity; browsers
+never qualify (browser-origin markers are excluded, so they keep the
+426 and the printed https URL), remote surfaces are unchanged, and the
+dedicated session-MCP listener stays exactly its own `/mcp` ladder —
+the owner token never widens it. ctl-over-HTTPS was deliberately not
+built now: it arrives for free with the credential-custody migration,
+when TLS client identity gives the ceremony actual payoff.
+
+The honest security envelope, per platform:
+
+- **macOS — strong.** The default (sandbox-on) runtime profile denies
+  network egress to the daemon's own gateway port (a prompt-injected
+  shell cannot even reach the surface), and the Seatbelt credential
+  clause denies reads of `loopback-tokens/` alongside the trust store —
+  so the token really is scoped to owner processes. `--no-sandbox`
+  lifts both with the rest of the confinement.
+- **Linux and Windows — a real raise, not airtight.** Neither sandbox
+  can express a single-port deny (Landlock's network rules are
+  allowlist-only; restricted tokens do not filter loopback) nor a read
+  deny under a granted tree, so a sandboxed shell that can read the
+  home can read the token. The token still ends tokenless drive-by and
+  the weakest-daemon scavenge on these platforms; airtight same-uid
+  separation arrives with the credential-custody migration and
+  uid-separation work (both tracked separately).
+- **Same-uid unsandboxed processes read the token by design.** That is
+  the unchanged owner surface: an owner-launched script or unsupervised
+  agent on the same account has always been, and remains, the owner.
+
+The same asymmetry applies to the
 state-root secrets: every platform's **default** grant set excludes the trust
 store (`access-certs/`), leased auth, and the custody trail from runtime writes,
 but a project root or operator-supplied `extra_write_paths` that overlaps those
