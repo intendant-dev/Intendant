@@ -441,12 +441,62 @@ function agendaThreadBlock(item) {
   return parts.length ? `<div class="agenda-item-thread">${parts.join('')}</div>` : '';
 }
 
+// F3 follow-up affordance: the live, composer-targetable session window
+// carrying the item's recorded conversation, if one exists RIGHT NOW.
+// Purely a navigation affordance — sessions die, so items must stand
+// alone; this appears only when following up happens to be possible.
+function agendaFollowUpSid(item) {
+  const recorded = item.provenance && item.provenance.session_id;
+  if (!recorded) return null;
+  if (typeof sessionWindows === 'undefined'
+    || typeof isPromptTargetSessionUsable !== 'function') return null;
+  const s = agendaSessionInfo(recorded);
+  const conversationId = (s && s.conversation_id) || recorded;
+  for (const sid of sessionWindows.keys()) {
+    if (!isPromptTargetSessionUsable(sid)) continue;
+    if (sid === recorded || sid === conversationId) return sid;
+    const meta = (typeof sessionMetadataById !== 'undefined'
+      && sessionMetadataById.get(sid)) || {};
+    const backend = String(meta.backend_session_id || meta.backendSessionId || '').trim();
+    if (backend && backend === conversationId) return sid;
+  }
+  return null;
+}
+
+// Open the composer targeted at the recorder's conversation with the item
+// quoted as data. No daemon write happens here.
+function agendaFollowUpWithRecorder(item, sid) {
+  routeTo('activity');
+  if (typeof focusSessionWindow === 'function') focusSessionWindow(sid);
+  const input = document.getElementById('activity-task-input');
+  if (input) {
+    const body = item.body ? `\n> ${String(item.body).split('\n').join('\n> ')}` : '';
+    input.value =
+      `Following up on agenda item ${item.id} (quoted):\n> ${item.title}${body}\n\n`;
+    input.focus();
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.setSelectionRange(input.value.length, input.value.length);
+  }
+}
+
 function agendaActionButtons(item) {
   const actions = [];
   if (item.status === 'open') actions.push(['complete', 'Complete'], ['retire', 'Retire']);
   else if (item.status === 'done') actions.push(['reopen', 'Reopen'], ['retire', 'Retire']);
   else actions.push(['reopen', 'Reopen']);
-  const buttons = actions
+  let extra = '';
+  if (item.status === 'open') {
+    // Owner start-now: ONE gesture — the daemon mints the manifest from
+    // this item, the gesture is the approval (digest bound server-side
+    // under the same lock), and it fires through the ordinary scheduled
+    // lane. Owner surface = this dashboard; agents get NotPermitted.
+    extra += `<button type="button" class="agenda-btn agenda-start-now" data-id="${escapeHtml(item.id)}" title="Mint + approve a session from this item and start it now (runs through the standard scheduled lane)">Start now</button>`;
+    const sid = agendaFollowUpSid(item);
+    if (sid) {
+      extra += `<button type="button" class="agenda-btn agenda-follow-up" data-id="${escapeHtml(item.id)}" data-sid="${escapeHtml(sid)}" title="The recording conversation is live — open the composer targeted at it with this item quoted">Follow up</button>`;
+    }
+  }
+  const buttons = extra + actions
     .map(([op, label]) =>
       `<button type="button" class="agenda-btn" data-op="${op}" data-id="${escapeHtml(item.id)}">${label}</button>`)
     .join('');
@@ -653,6 +703,17 @@ function agendaRenderTab() {
   list.querySelectorAll('select.agenda-bell').forEach((sel) => {
     sel.addEventListener('change', () =>
       agendaSetItemUrgency(sel.dataset.id, sel.value, sel));
+  });
+  // F3 act-on-item wiring.
+  list.querySelectorAll('button.agenda-start-now').forEach((btn) => {
+    btn.addEventListener('click', () =>
+      agendaSendOp({ op: 'start_now', id: btn.dataset.id }, btn));
+  });
+  list.querySelectorAll('button.agenda-follow-up').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const item = agendaFindItem(btn.dataset.id);
+      if (item) agendaFollowUpWithRecorder(item, btn.dataset.sid);
+    });
   });
   // F2 thread + gates wiring.
   list.querySelectorAll('button.agenda-thread-more').forEach((btn) => {
@@ -861,6 +922,22 @@ function agendaPositionCard() {
     }
     agendaBuildCard();
     agendaRefresh();
+    // Follow-up affordance liveness: the button is derived at render time
+    // from session-window state the agenda has no event lane for, so a
+    // visible tab re-renders when (and only when) the eligibility
+    // signature changes — the target-switch poll idiom, write-guarded.
+    let followUpSig = '';
+    setInterval(() => {
+      if (!agendaTabVisible() || !Array.isArray(agendaItems)) return;
+      const sig = agendaItems
+        .filter((item) => item.status === 'open')
+        .map((item) => `${item.id}:${agendaFollowUpSid(item) || ''}`)
+        .join('|');
+      if (sig !== followUpSig) {
+        followUpSig = sig;
+        agendaRenderTab();
+      }
+    }, 2000);
     // Pane-gated: the card lives in #activity-log-pane, so with the
     // Activity tab parked (another tab, or document.hidden) the reposition
     // tick used to write data-rail-hidden into a display:none subtree once

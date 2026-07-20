@@ -27,6 +27,7 @@ mod custom_domain;
 mod cutover_absence;
 mod kimi_auth_ceremony;
 pub(crate) use intendant_core::conversation;
+mod cli_descriptor;
 mod credential_audit;
 mod credential_egress;
 mod credential_leases;
@@ -3542,6 +3543,19 @@ async fn main() -> Result<(), CallerError> {
     };
     // Only expose the web port to external agents when the web gateway is actually running.
     let web_port_for_agent: Option<u16> = if use_web { Some(web_port) } else { None };
+
+    // Daemon boot = a gateway-serving controller start: record where this
+    // controller binary lives so UNSUPERVISED agents can resolve a CLI
+    // (F1.5 discovery descriptor). Transient invocations (ctl, --no-web
+    // one-shots) never write it; failure only degrades discovery.
+    if use_web {
+        if let Err(err) = cli_descriptor::write_boot_descriptor(
+            &intendant_core::state_paths::intendant_home(),
+            web_port,
+        ) {
+            eprintln!("[cli-descriptor] not written: {err}");
+        }
+    }
 
     // Build the dashboard's TLS acceptor once (cheap to clone into each
     // gateway spawn site). Defaults to mTLS; `--no-tls` is the explicit

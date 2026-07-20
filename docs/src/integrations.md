@@ -257,6 +257,27 @@ scripted-provider E2E suite, and `cargo clippy --workspace -- -D warnings`.
 The TLS stack is pure-Rust `ring` / `rustls` / `rcgen` (no OpenSSL), which is
 why the Windows CI job installs NASM (for `ring`'s assembly) but no `libssl`.
 
+## CLI discovery descriptor
+
+A gateway-serving daemon records at boot where its controller binary lives,
+so unsupervised local agents (cron jobs, plain shells, agents outside
+Intendant supervision) can resolve a CLI even when `intendant` is not on
+PATH (app installs name the bundled controller `intendant-bin` and install
+no PATH shim). Under the state root (`$INTENDANT_HOME` or `~/.intendant`):
+
+- `cli-path` — one line, the absolute controller path; readable from a
+  shell one-liner, no jq;
+- `cli-path.meta.json` — debug context only (controller, port, pid,
+  version, write time). **Never secrets.**
+
+Written atomically on daemon boot only — `ctl` and transient invocations
+never touch it; on multi-daemon homes the last-booted daemon wins, which is
+fine because any controller binary can `ctl` any daemon at the standard
+endpoints (the sidecar identifies the writer for debugging). Every repo
+skill that shells to the CLI resolves it through the canonical preamble —
+`$INTENDANT` → PATH → this descriptor → bare `intendant` — and a repo test
+pins that preamble so future skills cannot regress.
+
 ## Control socket
 
 When `--control-socket` is enabled, a Unix domain socket is created at

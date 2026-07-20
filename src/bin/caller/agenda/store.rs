@@ -239,6 +239,11 @@ impl AgendaStore {
         if let AgendaCommand::Ask { questions } = cmd {
             return self.apply_ask(questions, actor, now_ms);
         }
+        // Owner start-now (F3): two ops appended under this same lock —
+        // its own arm because one command maps to a propose+approve pair.
+        if let AgendaCommand::StartNow { id } = cmd {
+            return self.start_now(&id, actor, now_ms);
+        }
         let deletes_blobs = matches!(&cmd, AgendaCommand::Retire { .. });
         let op = self.command_to_op(cmd, now_ms)?;
         let item = self.append_op(op, actor, source, now_ms)?;
@@ -251,6 +256,87 @@ impl AgendaStore {
             }
         }
         Ok(item)
+    }
+
+    /// The owner "start session now" gesture (F3): mint a manifest from
+    /// the item — goal = title + body quoted as data, with the item id so
+    /// the spawned session's own (attributed) `ctl` can act on it — and
+    /// append the propose + approve ops atomically under the caller's
+    /// lock, the approve binding the digest of exactly the manifest minted
+    /// here. `fire_at_ms = now` makes the ordinary scheduler pass (nudged
+    /// right after this apply) journal the occurrence and dispatch through
+    /// the standard StartTask lane — start-now IS scheduled firing with a
+    /// zero-length wait, never a bypass. Revising semantics are the
+    /// standing ones: an existing effect keeps its lineage, gets a fresh
+    /// digest, and any prior approval is void.
+    ///
+    /// The caller (`AgendaHandle::apply`) has already enforced the
+    /// owner-surface gate — this command embeds an approval.
+    fn start_now(
+        &mut self,
+        id: &str,
+        actor: Option<AgendaActor>,
+        now_ms: u64,
+    ) -> Result<AgendaItem, AgendaError> {
+        let item = self.require(id)?;
+        if item.status != AgendaStatus::Open {
+            return Err(AgendaError::Transition(format!(
+                "{id} is not open — reopen it before starting work on it"
+            )));
+        }
+        let mut goal = format!("Agenda follow-through for item {id}: {}", item.title);
+        if !item.body.trim().is_empty() {
+            goal.push_str("\n\nItem body (quoted):\n");
+            goal.push_str(&item.body);
+        }
+        goal.push_str(
+            "\n\nWork the item, then state the outcome plainly — it is written back to \
+             the agenda item, and `intendant ctl agenda` from this session records \
+             attributed progress (annotate/complete) on it.",
+        );
+        // The item body is already capped, but the wrapper text must never
+        // push the goal past the manifest bound the scheduled lane
+        // enforces at propose time.
+        if goal.len() > MAX_BODY_BYTES {
+            let mut cut = MAX_BODY_BYTES;
+            while !goal.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            goal.truncate(cut);
+        }
+        let effect_id = item
+            .effects
+            .first()
+            .map(|effect| effect.effect_id.clone())
+            .unwrap_or_else(|| {
+                format!("ef-{}", &super::reminders::occurrence_id(id, now_ms)[..12])
+            });
+        let manifest = super::types::SessionManifest {
+            goal,
+            fire_at_ms: now_ms,
+            orchestrate: false,
+        };
+        let digest = super::types::manifest_digest(id, &effect_id, &manifest);
+        self.append_op(
+            AgendaOp::ProposeEffect {
+                id: id.to_string(),
+                effect_id: effect_id.clone(),
+                manifest,
+            },
+            actor.clone(),
+            None,
+            now_ms,
+        )?;
+        self.append_op(
+            AgendaOp::ApproveEffect {
+                id: id.to_string(),
+                effect_id,
+                digest,
+            },
+            actor,
+            None,
+            now_ms,
+        )
     }
 
     /// Park one validated rich ask: build the questions through the same
@@ -478,10 +564,14 @@ impl AgendaStore {
                 due_ms,
                 ask: None,
             }),
-            // Handled by `apply_command`'s dedicated arm (blob commits +
-            // rollback); reaching here is a daemon bug, not a caller error.
+            // Handled by `apply_command`'s dedicated arms (ask: blob
+            // commits + rollback; start_now: an atomic two-op append);
+            // reaching here is a daemon bug, not a caller error.
             AgendaCommand::Ask { .. } => Err(AgendaError::Invalid(
                 "internal: ask must route through apply_command".into(),
+            )),
+            AgendaCommand::StartNow { .. } => Err(AgendaError::Invalid(
+                "internal: start_now must route through apply_command".into(),
             )),
             AgendaCommand::Patch {
                 id,
