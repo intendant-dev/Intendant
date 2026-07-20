@@ -1,4 +1,4 @@
-//! Authenticated helpers for Kimi 0.27's reflected `/api/v2` agent RPCs.
+//! Authenticated helpers for Kimi 0.27-0.28's reflected `/api/v2` agent RPCs.
 //!
 //! Kimi's v1 REST facade intentionally exposes a conservative subset of the
 //! underlying agent services. The bearer-authenticated v2 dispatcher exposes
@@ -22,8 +22,8 @@ const AGENT_RPC_SERVICE: &str = "agentRPCService";
 const MODEL_CATALOG_SERVICE: &str = "modelCatalogService";
 const KIMI_RPC_RESPONSE_LIMIT: usize = 32 * 1024 * 1024;
 
-/// Native Kimi goal limits. Kimi 0.27 enforces all three in the goal service;
-/// omitted fields leave the corresponding existing limit unchanged.
+/// Native Kimi goal limits. Kimi 0.27-0.28 enforce all three in the goal
+/// service; omitted fields leave the corresponding existing limit unchanged.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct KimiGoalBudgetLimits {
@@ -134,8 +134,8 @@ impl KimiRpcApi {
         })
     }
 
-    /// Fail closed when the reflected service surface is not the 0.27 shape
-    /// this adapter was built against.
+    /// Fail closed when the reflected service surface is not the 0.27-0.28
+    /// shape this adapter was built against.
     pub(crate) async fn validate_required_methods(&self) -> Result<(), CallerError> {
         let channels = self
             .request_path(Method::GET, "/api/v2/channels", None, "channels")

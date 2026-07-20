@@ -1,10 +1,11 @@
 //! Kimi Code external-agent adapter.
 //!
-//! The adapter supervises `kimi server run` rather than the narrower ACP
-//! facade. Kimi's authenticated REST/WS surface exposes native fork/undo/
-//! compaction, true queued-prompt steering, goals, side agents, background
-//! tasks, structured approvals/questions, multimodal files, live profile
-//! switches, and full sub-agent telemetry.
+//! The adapter supervises Kimi's local web server rather than the narrower ACP
+//! facade. Kimi 0.27 exposes it as `kimi server run`; 0.28 replaced that
+//! entrypoint with foreground `kimi web --no-open`. The authenticated REST/WS
+//! surface exposes native fork/undo/compaction, true queued-prompt steering,
+//! goals, side agents, background tasks, structured approvals/questions,
+//! multimodal files, live profile switches, and full sub-agent telemetry.
 
 mod bridge;
 mod events;
@@ -49,6 +50,7 @@ use super::{
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(25);
 const KIMI_MAIN_AGENT_ID: &str = "main";
+const KIMI_MCP_TOOL_WILDCARD: &str = "mcp__*";
 const REVIEW_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 const KIMI_REVIEW_CONTRACT: &str = "\
@@ -58,6 +60,29 @@ file and line references, ordered by severity. Do not modify files, run \
 commands, invoke skills, select additional tools, launch tasks or agents, \
 change goals, schedules, or configuration, or call MCP tools. If no concrete \
 finding remains, say so explicitly.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KimiServerEntrypoint {
+    ServerRun,
+    Web,
+}
+
+impl KimiServerEntrypoint {
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::ServerRun => &[
+                "server",
+                "run",
+                "--foreground",
+                "--port",
+                "0",
+                "--log-level",
+                "silent",
+            ],
+            Self::Web => &["web", "--no-open", "--port", "0", "--log-level", "silent"],
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KimiLaunchConfig {
@@ -209,8 +234,9 @@ impl KimiCodeAgent {
             ));
         }
 
-        // Kimi 0.27's fork response is returned only after the child session
-        // and its agents have been materialized from copied wire history.
+        // Kimi 0.27-0.28's fork response is returned only after the child
+        // session and its agents have been materialized from copied wire
+        // history.
         // `:undo` prechecks the entire count before mutating that history, so
         // this one request is atomic and leaves the parent untouched. This
         // helper runs before shared-state publication and WS subscription: no
@@ -458,9 +484,9 @@ impl KimiCodeAgent {
         if let Some(prompt_id) = self.shared.prompt_id(&session_id, &agent_id) {
             return Ok(Some(prompt_id));
         }
-        // Kimi 0.27's prompt-list route exposes only the main agent. Falling
-        // back to it while a child thread is selected could make a child
-        // interrupt/steer target the parent's prompt.
+        // Kimi 0.27-0.28's prompt-list route exposes only the main agent.
+        // Falling back to it while a child thread is selected could make a
+        // child interrupt/steer target the parent's prompt.
         if agent_id != KIMI_MAIN_AGENT_ID {
             return Ok(None);
         }
@@ -635,16 +661,53 @@ impl KimiCodeAgent {
         echoed: bool,
     ) -> Result<(), CallerError> {
         let profile = self.rpc()?.profile(session_id, KIMI_MAIN_AGENT_ID).await?;
+        let inventory = self.rpc()?.tools(session_id, KIMI_MAIN_AGENT_ID).await?;
         self.launch.model = profile.model_alias;
         self.launch.thinking = profile.thinking_level;
-        self.launch.allowed_tools = match profile.active_tool_names {
-            Some(names) => Some(sorted_unique_tool_names(names)),
-            None => Some(active_tool_names(
-                &self.rpc()?.tools(session_id, KIMI_MAIN_AGENT_ID).await?,
-            )),
-        };
+        self.launch.allowed_tools = Some(concrete_profile_tool_names(
+            profile.active_tool_names,
+            &inventory,
+        ));
         self.emit_config_facts(echoed);
         Ok(())
+    }
+
+    async fn resolve_launch_tool_names(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        requested: &[String],
+    ) -> Result<Vec<String>, CallerError> {
+        const MCP_CATALOG_WAIT: Duration = Duration::from_secs(10);
+        const MCP_CATALOG_POLL: Duration = Duration::from_millis(100);
+
+        let deadline = tokio::time::Instant::now() + MCP_CATALOG_WAIT;
+        loop {
+            let inventory = self.rpc()?.tools(session_id, agent_id).await?;
+            match resolve_requested_tool_names(&inventory, requested)? {
+                RequestedToolNameResolution::Ready(names) => return Ok(names),
+                RequestedToolNameResolution::PendingMcp { resolved, pending } => {
+                    // A bare native wildcard is valid even when this launch
+                    // has no Intendant MCP endpoint to wait for: it simply
+                    // matches the currently empty MCP catalog. Exact missing
+                    // MCP names remain errors because silently dropping them
+                    // would corrupt an exact persisted tool profile.
+                    if self.web_port.is_none()
+                        && pending.iter().all(|name| name == KIMI_MCP_TOOL_WILDCARD)
+                    {
+                        return Ok(resolved);
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(external(format!(
+                            "Kimi MCP tool catalog did not register requested selection within {}s: {}",
+                            MCP_CATALOG_WAIT.as_secs(),
+                            pending.join(", ")
+                        )));
+                    }
+                    tokio::time::sleep(MCP_CATALOG_POLL).await;
+                }
+            }
+        }
     }
 
     async fn tools_report(&self, session_id: &str, agent_id: &str) -> Result<String, CallerError> {
@@ -1034,10 +1097,11 @@ impl KimiCodeAgent {
             .await?;
         self.launch.model = Some(result.model.clone());
         self.launch.thinking = profile.thinking_level;
-        self.launch.allowed_tools = Some(match profile.active_tool_names {
-            Some(names) => sorted_unique_tool_names(names),
-            None => active_tool_names(&self.rpc()?.tools(&session_id, KIMI_MAIN_AGENT_ID).await?),
-        });
+        let inventory = self.rpc()?.tools(&session_id, KIMI_MAIN_AGENT_ID).await?;
+        self.launch.allowed_tools = Some(concrete_profile_tool_names(
+            profile.active_tool_names,
+            &inventory,
+        ));
         self.emit_config_facts(true);
         Ok(format!(
             "Kimi fast mode {} via {}",
@@ -1051,14 +1115,32 @@ impl KimiCodeAgent {
     }
 
     async fn set_thinking(&mut self, params: &Value) -> Result<String, CallerError> {
-        let thinking = string_param(params, &["thinking", "effort", "value"], "thinking")?;
-        self.update_profile(serde_json::json!({ "thinking": thinking }))
+        let requested = string_param(params, &["thinking", "effort", "value"], "thinking")?;
+        let session_id = self.current_session_id()?;
+        self.update_profile(serde_json::json!({ "thinking": requested }))
             .await?;
-        self.launch.thinking = Some(thinking.clone());
+        // Kimi's model catalog may expose either named effort levels or a
+        // boolean thinking switch. Kimi 0.28 therefore normalizes a request
+        // such as `high` to the effective profile value `on`. Read the
+        // backend's authoritative echo before publishing session facts so
+        // the dashboard, persisted fork profile, and action result never
+        // claim an effort Kimi did not apply.
+        let effective = self
+            .rpc()?
+            .profile(&session_id, KIMI_MAIN_AGENT_ID)
+            .await?
+            .thinking_level
+            .unwrap_or_else(|| requested.clone());
+        self.launch.thinking = Some(effective.clone());
         self.emit_config_facts(true);
-        Ok(format!(
-            "thinking effort switched to {thinking} for the running Kimi session"
-        ))
+        Ok(if effective == requested {
+            format!("thinking effort switched to {effective} for the running Kimi session")
+        } else {
+            format!(
+                "thinking effort {requested} requested; Kimi applied {effective} \
+                 for the running Kimi session"
+            )
+        })
     }
 
     async fn set_permission(&mut self, params: &Value) -> Result<String, CallerError> {
@@ -1407,68 +1489,85 @@ impl ExternalAgent for KimiCodeAgent {
         .map_err(|error| external(format!("Kimi bridge preparation panicked: {error}")))?
         .map_err(|error| external(format!("failed to prepare Kimi bridge home: {error}")))?;
 
-        let mut command = crate::platform::spawn_command(&self.command);
-        command
-            .args([
-                "server",
-                "run",
-                "--foreground",
-                "--port",
-                "0",
-                "--log-level",
-                "silent",
-            ])
-            .current_dir(&config.working_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        super::apply_external_child_env_policy(&mut command);
-        command.env("KIMI_CODE_HOME", &bridge_home);
-        if let Some(port) = self.web_port {
-            super::add_intendant_bootstrap_env(
+        let bootstrap_url = self.web_port.map(|port| self.intendant_mcp_url(port, true));
+        let mut entrypoint = KimiServerEntrypoint::ServerRun;
+        let (mut child, child_pid, origin, stdout_reader, stderr) = loop {
+            let mut command = crate::platform::spawn_command(&self.command);
+            command
+                .args(entrypoint.args())
+                .current_dir(&config.working_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            super::apply_external_child_env_policy(&mut command);
+            command.env("KIMI_CODE_HOME", &bridge_home);
+            if let Some(url) = bootstrap_url.as_deref() {
+                super::add_intendant_bootstrap_env(
+                    &mut command,
+                    url,
+                    self.mcp_session_id.as_deref(),
+                    self.mcp_auth_token.as_deref(),
+                );
+            }
+            crate::platform::die_with_parent(&mut command);
+            #[cfg(target_os = "linux")]
+            crate::linux_display_env::apply_to_tokio_command(&mut command);
+            let mut child = crate::credential_leases::spawn_with_dns_credential_scrub(
                 &mut command,
-                &self.intendant_mcp_url(port, true),
-                self.mcp_session_id.as_deref(),
-                self.mcp_auth_token.as_deref(),
-            );
-        }
-        crate::platform::die_with_parent(&mut command);
-        #[cfg(target_os = "linux")]
-        crate::linux_display_env::apply_to_tokio_command(&mut command);
-        let mut child = crate::credential_leases::spawn_with_dns_credential_scrub(
-            &mut command,
-            config.dns_credential_env.as_deref(),
-            config.dns_credential_store.as_deref(),
-        )
-        .map_err(|error| {
-            external(format!(
-                "failed to spawn Kimi command '{}': {error}",
-                self.command
-            ))
-        })?;
-        let child_pid = child.id();
-        if let Some(pid) = child_pid {
-            super::register_child_process(pid);
-        }
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                terminate_spawned_child(child_pid, &mut child, &bridge_home).await;
-                return Err(external("failed to capture Kimi server stdout"));
+                config.dns_credential_env.as_deref(),
+                config.dns_credential_store.as_deref(),
+            )
+            .map_err(|error| {
+                external(format!(
+                    "failed to spawn Kimi command '{}': {error}",
+                    self.command
+                ))
+            })?;
+            let child_pid = child.id();
+            if let Some(pid) = child_pid {
+                super::register_child_process(pid);
             }
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => {
-                terminate_spawned_child(child_pid, &mut child, &bridge_home).await;
-                return Err(external("failed to capture Kimi server stderr"));
-            }
-        };
-        let (origin, stdout_reader) = match wait_for_server_origin(stdout).await {
-            Ok(ready) => ready,
-            Err(error) => {
-                terminate_spawned_child(child_pid, &mut child, &bridge_home).await;
-                return Err(error);
+            let stdout = match child.stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    terminate_spawned_child(child_pid, &mut child, &bridge_home).await;
+                    return Err(external("failed to capture Kimi server stdout"));
+                }
+            };
+            let stderr = match child.stderr.take() {
+                Some(stderr) => stderr,
+                None => {
+                    terminate_spawned_child(child_pid, &mut child, &bridge_home).await;
+                    return Err(external("failed to capture Kimi server stderr"));
+                }
+            };
+            match wait_for_server_origin(stdout).await {
+                Ok((origin, stdout_reader)) => {
+                    break (child, child_pid, origin, stdout_reader, stderr);
+                }
+                Err(error) => {
+                    // Kimi 0.28 closes the deprecated entrypoint's stdout a
+                    // few scheduler ticks before its process becomes
+                    // reapable. An immediate `try_wait` therefore made the
+                    // `kimi web` compatibility fallback intermittent.
+                    let exited = match child.try_wait() {
+                        Ok(Some(_)) => true,
+                        Ok(None) => matches!(
+                            tokio::time::timeout(Duration::from_secs(1), child.wait()).await,
+                            Ok(Ok(_))
+                        ),
+                        Err(_) => false,
+                    };
+                    let retry_with_web = entrypoint == KimiServerEntrypoint::ServerRun
+                        && exited
+                        && legacy_server_entrypoint_removed(stderr).await;
+                    terminate_spawned_child(child_pid, &mut child, &bridge_home).await;
+                    if retry_with_web {
+                        entrypoint = KimiServerEntrypoint::Web;
+                        continue;
+                    }
+                    return Err(error);
+                }
             }
         };
         let token = match wait_for_server_token(&bridge_home.join("server.token")).await {
@@ -1585,19 +1684,19 @@ impl ExternalAgent for KimiCodeAgent {
                 ));
             }
         }
-        // Kimi 0.27 validates `agent_config` on session creation but its
+        // Kimi 0.27-0.28 validate `agent_config` on session creation but their
         // create route does not apply the field. The profile route is the
-        // authoritative live mutation path, so apply launch pins here for
-        // new, resumed, and forked sessions before publication/subscription.
+        // authoritative live mutation path, so apply launch pins here for new,
+        // resumed, and forked sessions before publication/subscription.
         let configured: Result<Value, CallerError> = async {
             let session = self
                 .api()?
                 .update_profile(&session_id, self.session_agent_config())
                 .await?;
             if let Some(names) = self.launch.allowed_tools.clone() {
-                let names = sorted_unique_tool_names(names);
-                let inventory = self.rpc()?.tools(&session_id, KIMI_MAIN_AGENT_ID).await?;
-                validate_requested_tool_names(&inventory, &names)?;
+                let names = self
+                    .resolve_launch_tool_names(&session_id, KIMI_MAIN_AGENT_ID, &names)
+                    .await?;
                 self.rpc()?
                     .set_active_tools(&session_id, KIMI_MAIN_AGENT_ID, &names)
                     .await?;
@@ -1917,7 +2016,7 @@ impl ExternalAgent for KimiCodeAgent {
             )
         {
             return Err(external(format!(
-                "Kimi 0.27 cannot apply /{op} to one :btw agent; target the parent session"
+                "Kimi 0.27-0.28 cannot apply /{op} to one :btw agent; target the parent session"
             )));
         }
         match op {
@@ -2075,7 +2174,7 @@ impl ExternalAgent for KimiCodeAgent {
     ) -> Result<AgentThread, CallerError> {
         if split_child_thread_id(thread_id).is_some() {
             return Err(external(
-                "Kimi 0.27 cannot fork one composite :btw conversation",
+                "Kimi 0.27-0.28 cannot fork one composite :btw conversation",
             ));
         }
         if let Some(cwd) = cwd {
@@ -2110,8 +2209,9 @@ impl ExternalAgent for KimiCodeAgent {
                         .update_profile(&id, self.session_agent_config())
                         .await?;
                     if let Some(names) = self.launch.allowed_tools.clone() {
-                        let inventory = self.rpc()?.tools(&id, KIMI_MAIN_AGENT_ID).await?;
-                        validate_requested_tool_names(&inventory, &names)?;
+                        let names = self
+                            .resolve_launch_tool_names(&id, KIMI_MAIN_AGENT_ID, &names)
+                            .await?;
                         self.rpc()?
                             .set_active_tools(&id, KIMI_MAIN_AGENT_ID, &names)
                             .await?;
@@ -2167,11 +2267,11 @@ impl ExternalAgent for KimiCodeAgent {
             return Err(external("Kimi fission charter must not be empty"));
         }
         self.api()?.get_session(thread_id).await?;
-        // Kimi 0.27 has no public developer-role append. A fission branch is
-        // supposed to begin work immediately, so submit Intendant's delimited
-        // charter as its first user-origin prompt. The branch's resumed
-        // supervisor attaches to that live turn and does not enqueue a second
-        // kickoff prompt.
+        // Kimi 0.27-0.28 have no public developer-role append. A fission
+        // branch is supposed to begin work immediately, so submit Intendant's
+        // delimited charter as its first user-origin prompt. The branch's
+        // resumed supervisor attaches to that live turn and does not enqueue a
+        // second kickoff prompt.
         let submitted = self
             .api()?
             .submit_prompt(
@@ -2216,7 +2316,9 @@ impl ExternalAgent for KimiCodeAgent {
         turns_to_drop: u32,
     ) -> Result<(), CallerError> {
         if split_child_thread_id(thread_id).is_some() {
-            return Err(external("Kimi 0.27 cannot target undo at one :btw agent"));
+            return Err(external(
+                "Kimi 0.27-0.28 cannot target undo at one :btw agent",
+            ));
         }
         self.api()?
             .session_action(
@@ -2385,6 +2487,28 @@ async fn wait_for_server_origin(
         .await
         .map_err(|_| external("timed out waiting for Kimi server readiness"))??;
     Ok((origin, reader))
+}
+
+/// Kimi 0.28 removed the 0.27 `server run` entrypoint. Detect only its bounded,
+/// post-exit diagnostic and retry the same configured executable with the new
+/// foreground `web --no-open` entrypoint. The captured stderr is never logged:
+/// future Kimi builds may include sensitive startup material there.
+async fn legacy_server_entrypoint_removed(stderr: tokio::process::ChildStderr) -> bool {
+    const LIMIT: u64 = 8 * 1024;
+    let mut bytes = Vec::new();
+    let mut bounded = stderr.take(LIMIT + 1);
+    let read = tokio::time::timeout(Duration::from_secs(1), bounded.read_to_end(&mut bytes)).await;
+    if !matches!(read, Ok(Ok(_))) || bytes.len() as u64 > LIMIT {
+        return false;
+    }
+    legacy_server_entrypoint_removed_text(&String::from_utf8_lossy(&bytes))
+}
+
+fn legacy_server_entrypoint_removed_text(message: &str) -> bool {
+    let message = super::strip_ansi_escapes(message).to_ascii_lowercase();
+    (message.contains("`kimi server` has been deprecated")
+        && message.contains("use `kimi web` instead"))
+        || message.contains("unknown command 'server'")
 }
 
 fn extract_loopback_origin(line: &str) -> Option<String> {
@@ -2856,6 +2980,83 @@ fn active_tool_names(inventory: &[KimiRpcTool]) -> Vec<String> {
     )
 }
 
+fn concrete_profile_tool_names(
+    profile_names: Option<Vec<String>>,
+    inventory: &[KimiRpcTool],
+) -> Vec<String> {
+    match profile_names {
+        Some(names) if names.iter().all(|name| !name.contains('*')) => {
+            sorted_unique_tool_names(names)
+        }
+        // Kimi profiles express dynamic MCP selection as `mcp__*`, while
+        // AgentRPC.setActiveTools accepts concrete registered names only.
+        // Persist the effective inventory rather than a pattern that cannot
+        // be replayed directly into a new server.
+        Some(_) | None => active_tool_names(inventory),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RequestedToolNameResolution {
+    Ready(Vec<String>),
+    PendingMcp {
+        resolved: Vec<String>,
+        pending: Vec<String>,
+    },
+}
+
+fn resolve_requested_tool_names(
+    inventory: &[KimiRpcTool],
+    requested: &[String],
+) -> Result<RequestedToolNameResolution, CallerError> {
+    let registered = inventory
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut resolved = Vec::new();
+    let mut pending_mcp = Vec::new();
+    let mut unknown = Vec::new();
+
+    for name in sorted_unique_tool_names(requested.to_vec()) {
+        if name == KIMI_MCP_TOOL_WILDCARD {
+            let before = resolved.len();
+            resolved.extend(
+                inventory
+                    .iter()
+                    .filter(|tool| tool.name.starts_with("mcp__"))
+                    .map(|tool| tool.name.clone()),
+            );
+            if resolved.len() == before {
+                pending_mcp.push(name);
+            }
+        } else if registered.contains(name.as_str()) {
+            resolved.push(name);
+        } else if name.starts_with("mcp__") {
+            // MCP tool registration is asynchronous with server/session
+            // startup. The caller polls this retryable class within a bound.
+            pending_mcp.push(name);
+        } else {
+            unknown.push(name);
+        }
+    }
+
+    if !unknown.is_empty() {
+        return Err(external(format!(
+            "unknown Kimi tool name(s): {}",
+            unknown.join(", ")
+        )));
+    }
+    let resolved = sorted_unique_tool_names(resolved);
+    if pending_mcp.is_empty() {
+        Ok(RequestedToolNameResolution::Ready(resolved))
+    } else {
+        Ok(RequestedToolNameResolution::PendingMcp {
+            resolved,
+            pending: sorted_unique_tool_names(pending_mcp),
+        })
+    }
+}
+
 fn validate_requested_tool_names(
     inventory: &[KimiRpcTool],
     names: &[String],
@@ -3156,6 +3357,69 @@ mod tests {
         }
     }
 
+    fn rpc_tool(name: &str, active: bool, source: &str) -> KimiRpcTool {
+        KimiRpcTool {
+            name: name.to_string(),
+            description: format!("{name} description"),
+            active,
+            source: source.to_string(),
+        }
+    }
+
+    #[test]
+    fn native_mcp_wildcard_resolves_to_concrete_registered_tools() {
+        let inventory = vec![
+            rpc_tool("Read", true, "builtin"),
+            rpc_tool("Write", false, "builtin"),
+            rpc_tool("mcp__managed__list_displays", true, "mcp"),
+            rpc_tool("mcp__managed__read_screen", false, "mcp"),
+        ];
+        let requested = vec!["Read".to_string(), KIMI_MCP_TOOL_WILDCARD.to_string()];
+
+        assert_eq!(
+            resolve_requested_tool_names(&inventory, &requested).unwrap(),
+            RequestedToolNameResolution::Ready(vec![
+                "Read".to_string(),
+                "mcp__managed__list_displays".to_string(),
+                "mcp__managed__read_screen".to_string(),
+            ])
+        );
+        assert_eq!(
+            concrete_profile_tool_names(
+                Some(vec!["Read".to_string(), KIMI_MCP_TOOL_WILDCARD.to_string(),]),
+                &inventory,
+            ),
+            vec![
+                "Read".to_string(),
+                "mcp__managed__list_displays".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn native_mcp_selection_waits_for_async_catalog_registration() {
+        let inventory = vec![rpc_tool("Read", true, "builtin")];
+        let requested = vec![
+            "Read".to_string(),
+            KIMI_MCP_TOOL_WILDCARD.to_string(),
+            "mcp__managed__read_screen".to_string(),
+        ];
+
+        assert_eq!(
+            resolve_requested_tool_names(&inventory, &requested).unwrap(),
+            RequestedToolNameResolution::PendingMcp {
+                resolved: vec!["Read".to_string()],
+                pending: vec![
+                    KIMI_MCP_TOOL_WILDCARD.to_string(),
+                    "mcp__managed__read_screen".to_string(),
+                ],
+            }
+        );
+        let error =
+            resolve_requested_tool_names(&inventory, &["NotATool".to_string()]).unwrap_err();
+        assert!(error.to_string().contains("unknown Kimi tool name"));
+    }
+
     #[tokio::test]
     async fn captured_server_token_is_removed_after_handshake() {
         let dir = tempfile::tempdir().unwrap();
@@ -3206,6 +3470,66 @@ mod tests {
         assert_eq!(
             clear_line,
             "POST /api/v2/session/session-parent/agent/agent-0/agentRPCService/clearContext HTTP/1.1"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn thinking_action_reports_the_effective_backend_echo() {
+        let (origin, requests, server) = sequential_mock_server(vec![
+            serde_json::json!({
+                "code": 0,
+                "data": {
+                    "id": "session-parent",
+                    "agent_config": {"thinking": "on"}
+                }
+            }),
+            serde_json::json!({
+                "code": 0,
+                "data": {
+                    "modelAlias": "kimi-code/kimi-for-coding",
+                    "thinkingLevel": "on",
+                    "activeToolNames": ["Read"]
+                }
+            }),
+        ])
+        .await;
+        let mut agent = KimiCodeAgent::new("kimi".into(), launch(), None);
+        agent.api = Some(KimiApi::new(origin.clone(), "test-token".into()).unwrap());
+        agent.rpc = Some(KimiRpcApi::new(origin, "test-token".into()).unwrap());
+        agent
+            .shared
+            .set_session_id(Some("session-parent".to_string()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        agent.event_tx = Some(event_tx);
+
+        let message = agent
+            .thread_action("thinking", &serde_json::json!({"thinking": "high"}))
+            .await
+            .unwrap();
+
+        assert_eq!(agent.launch.thinking.as_deref(), Some("on"));
+        assert!(message.contains("high requested; Kimi applied on"));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(AgentEvent::ConfigFacts { facts })
+                if facts.effort.as_deref() == Some("on") && facts.permission_echoed
+        ));
+
+        let requests = requests.await.unwrap();
+        let (profile_line, profile_body) = request_line_and_body(&requests[0]);
+        assert_eq!(
+            profile_line,
+            "POST /api/v1/sessions/session-parent/profile HTTP/1.1"
+        );
+        assert_eq!(
+            profile_body,
+            serde_json::json!({"agent_config": {"thinking": "high"}})
+        );
+        let (rpc_line, _) = request_line_and_body(&requests[1]);
+        assert_eq!(
+            rpc_line,
+            "POST /api/v2/session/session-parent/agent/main/agentProfileService/data HTTP/1.1"
         );
         server.await.unwrap();
     }
@@ -3460,6 +3784,36 @@ mod tests {
         let origin = extract_loopback_origin(line).unwrap();
         assert_eq!(origin, "http://127.0.0.1:51035");
         assert!(!origin.contains("secret"));
+    }
+
+    #[test]
+    fn server_entrypoint_upgrade_is_exact_and_keeps_the_server_foreground() {
+        assert_eq!(
+            KimiServerEntrypoint::ServerRun.args(),
+            &[
+                "server",
+                "run",
+                "--foreground",
+                "--port",
+                "0",
+                "--log-level",
+                "silent",
+            ]
+        );
+        assert_eq!(
+            KimiServerEntrypoint::Web.args(),
+            &["web", "--no-open", "--port", "0", "--log-level", "silent"]
+        );
+        assert!(legacy_server_entrypoint_removed_text(
+            "`kimi server` has been deprecated and no longer works.\n\
+             Use `kimi web` instead — it runs the local server in the foreground."
+        ));
+        assert!(legacy_server_entrypoint_removed_text(
+            "error: unknown command 'server'"
+        ));
+        assert!(!legacy_server_entrypoint_removed_text(
+            "provider rejected the request; use kimi web for documentation"
+        ));
     }
 
     #[test]
@@ -3860,6 +4214,15 @@ mod tests {
                         "thinkingLevel": "high",
                         "activeToolNames": []
                     }
+                }),
+                serde_json::json!({
+                    "code": 0,
+                    "data": [{
+                        "name": "Read",
+                        "description": "read files",
+                        "active": false,
+                        "source": "builtin"
+                    }]
                 }),
                 serde_json::json!({"code": 0, "data": {"warnings": []}}),
             ],

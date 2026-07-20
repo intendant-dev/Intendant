@@ -2,14 +2,15 @@
 name: kimi-code-e2e
 description: >
   Reproducible live end-to-end acceptance test for Intendant's Kimi Code
-  external-agent backend. Exercises the real authenticated Kimi 0.27
+  external-agent backend. Exercises the real authenticated Kimi 0.27-0.28
   server-v1/v2 adapter with K2.7 Coding, including approvals/questions,
   attachments, streaming/usage/tools/diffs, native lifecycle and goal
   actions, exact historical fork/undo, side and background agents, search,
   interrupt/steer, and resume. Not for CI.
 compatibility: >
-  Requires an authenticated Kimi Code 0.27.x installation and a release
-  intendant build from this checkout. Makes real K2.7 Coding model calls.
+  Requires an authenticated Kimi Code 0.27.x or 0.28.x installation and a
+  release intendant build from this checkout. Makes real K2.7 Coding model
+  calls.
 allowed-tools: Bash Read
 disable-model-invocation: false
 ---
@@ -17,7 +18,8 @@ disable-model-invocation: false
 # Kimi Code External-Agent E2E
 
 This acceptance scenario catches protocol and orchestration drift that mock
-tests cannot: Intendant starts a private `kimi server run`, uses its real
+tests cannot: Intendant starts a private foreground Kimi server (`kimi server
+run` on 0.27, or `kimi web --no-open` on 0.28), uses its real
 bearer-authenticated REST/WebSocket server-v1 surface plus its allowlisted
 server-v2 agent RPCs, and drives it through the same control socket and
 dashboard HTTP routes used by frontends.
@@ -53,12 +55,14 @@ credentials and must be deleted securely afterward.
 - Kimi's distinct structured `AskUserQuestion` request/answer rail, including
   a one-choice answer that must remain typed as multi-select.
 - The generated bearer-authenticated Intendant MCP bridge, through a real
-  read-only `list_displays` call and correlated tool output while a project
-  MCP declaration deliberately occupies the default server name.
+  read-only `list_displays` call, Kimi 0.28's native MCP approval request, and
+  correlated tool output while a project MCP declaration deliberately
+  occupies the default server name.
 - Dashboard-staged ordinary-file and image attachments delivered through
   Kimi's native file/base64 APIs.
-- Manual approval allow and deny, Write execution, tool activity/output,
-  file diff, incremental text, thinking, and non-zero K2.7 usage.
+- Manual approval allow (MCP) and deny (destructive Bash), safe workspace
+  Write execution, tool activity/output, file diff, incremental text,
+  thinking, and non-zero K2.7 usage.
 - Exact historical real-user-turn-boundary fork, parent-preserving lineage,
   native undo, an attached/independently usable native head fork with exact
   inherited profile, compact, rename, archive, and restore.
@@ -80,14 +84,17 @@ credentials and must be deleted securely afterward.
 - Native `:btw` Kimi child identity, ephemeral side relationship, scoped
   response/terminal boundary, per-agent exact tool mutation/context clear,
   exact close event, and restored parent routing.
-- A real background `Agent` task: scoped child relationship, native
-  parent-idle structured question and Bash approval routing, native
-  list/output/cancel actions, and the shared HTTP task inspector/output peek
-  with actual streamed task bytes.
+- Real background `Agent` tasks: scoped child relationships, a completed
+  child's native output through list/output actions and the shared HTTP task
+  inspector/output peek, plus a distinct long-running child observed and
+  cancelled through Kimi's task API. Active-child control scoping is covered
+  separately by the `:btw` phase.
 - Kimi session catalog/detail replay, deep search, indexed message search,
   explicit stop/resume by native id, and post-resume context recall.
 - Destructive native context clear only after every context-sensitive check,
   at the end of the disposable harness session.
+- A clean passive-protocol report for the exact Kimi executable/version after
+  both initial supervision and native-session resume.
 
 ## Run
 
@@ -107,6 +114,7 @@ Options:
 --port <n>        Loopback dashboard port (default: choose a free port)
 --keep            Preserve the disposable root for diagnosis (contains auth)
 --quick           Skip long steer/interrupt/background-agent phases
+--background-only Run only startup plus the background-agent acceptance phase
 ```
 
 The full run can take several minutes because it intentionally waits on live
@@ -128,7 +136,7 @@ pass/fail table and exits non-zero on any failed assertion. With `--keep`,
   pre-publication atomic undo staging regressed.
 - Undo removes KEEP or retains DROP: active real-user turn counting no longer
   matches Kimi's native `:undo` horizon.
-- Steer file appears only after another follow-up: `prompts::steer` fell back
+- Steer file appears only after another follow-up: `prompts:steer` fell back
   to ordinary queued delivery.
 - Interrupt takes close to 90 seconds or the next reply fails: prompt abort /
   session abort routing killed too little or too much.

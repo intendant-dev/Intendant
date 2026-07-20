@@ -295,6 +295,12 @@ pub(crate) async fn run_headless_mode(
         });
     }
 
+    let session_id = log_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let mut foreground_dispatcher_handle = None;
     if use_web {
         // Backend task dispatcher: listens on the bus for
         // ControlCommand(StartTask | FollowUp) from the dashboard and
@@ -309,13 +315,15 @@ pub(crate) async fn run_headless_mode(
         // (and silently ate task/follow-up fallbacks) for messages nothing
         // would ever deliver. With `None`, those fallbacks reach the
         // explicit warn+drop instead.
-        task_dispatch::Dispatcher {
-            presence_tx: presence_tx_for_dispatch,
-            task_tx: task_tx.clone(),
-            follow_up_tx: (!use_presence).then(|| follow_up_tx.clone()),
-            primary_session_id: session_log_id(&session_log),
-        }
-        .spawn(bus.clone());
+        foreground_dispatcher_handle = Some(
+            task_dispatch::Dispatcher {
+                presence_tx: presence_tx_for_dispatch,
+                task_tx: task_tx.clone(),
+                follow_up_tx: (!use_presence).then(|| follow_up_tx.clone()),
+                primary_session_id: Some(session_id.clone()),
+            }
+            .spawn(bus.clone()),
+        );
 
         // askHuman replies from the dashboard: write the human_response
         // file the agent polls for (the TUI used to do this on
@@ -444,20 +452,10 @@ pub(crate) async fn run_headless_mode(
         None
     };
 
-    let session_id = log_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-
     bus.send(AppEvent::SessionStarted {
         session_id: session_id.clone(),
         task: Some(task.clone()),
     });
-
-    // Save for daemon loop (project and autonomy are moved into the agent loop)
-    let project_root = project.root.clone();
-    let autonomy_for_daemon = autonomy.clone();
 
     // External agent backend resolved at startup; the shared runtime handle
     // above is kept in sync by ControlPlane SetExternalAgent messages.
@@ -508,7 +506,7 @@ pub(crate) async fn run_headless_mode(
     // Dashboard-driven CreateSession / ResumeSession while the foreground
     // session runs: parallel sessions are owned by the session supervisor
     // (the dispatcher deliberately ignores them).
-    let _resume_listener_handle = if use_web {
+    let foreground_supervisor_handle = if use_web {
         Some(
             session_supervisor::SessionSupervisor::new(
                 session_supervisor::SessionSupervisorConfig {
@@ -532,7 +530,7 @@ pub(crate) async fn run_headless_mode(
                     launch_gate_for_tests: None,
                 },
             )
-            .spawn_resume_listener(),
+            .spawn_foreground_listener(session_id.clone()),
         )
     } else {
         None
@@ -707,6 +705,14 @@ pub(crate) async fn run_headless_mode(
             .and_then(|e| e.session_end_kind())
             .map(str::to_string),
     });
+    // `SessionEnded` is the ordered handoff marker on both lossless intent
+    // subscriptions. The foreground dispatcher drains every earlier control
+    // and exits at the marker; the already-running supervisor filters every
+    // earlier primary control and promotes itself immediately after the same
+    // marker. Controls on either side therefore have exactly one owner.
+    if let Some(handle) = foreground_dispatcher_handle.take() {
+        let _ = handle.await;
+    }
 
     if use_web {
         // Daemon mode: keep web gateway alive, listen for new tasks from web UI.
@@ -724,23 +730,10 @@ pub(crate) async fn run_headless_mode(
             reason, web_port
         );
 
-        run_daemon_loop(DaemonConfig {
-            bus: bus.clone(),
-            project_root: Some(project_root.clone()),
-            autonomy: autonomy_for_daemon.clone(),
-            shared_external_agent: shared_external_agent.clone(),
-            shared_codex_config: shared_codex_config.clone(),
-            shared_claude_config: shared_claude_config.clone(),
-            shared_kimi_config: shared_kimi_config.clone(),
-            frame_registry: frame_registry.clone(),
-            session_registry: Some(session_registry.clone()),
-            peer_registry: headless_peer_registry.clone(),
-            web_port: web_port_for_agent,
-            flags_direct: flags.direct,
-            shared_session: headless_shared_session.clone(),
-            git_vitals_targets: vitals_git_targets.clone(),
-        })
-        .await;
+        foreground_supervisor_handle
+            .expect("web foreground supervisor exists")
+            .wait()
+            .await;
     } else {
         result?;
     }

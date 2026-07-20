@@ -314,15 +314,19 @@ const CODEX_ITEM_TYPES: &[&str] = &[
     "function_call_output",
 ];
 
-// Kimi Code 0.27.0's server-v1 WebSocket event vocabulary. The adapter
-// consumes a subset, but the watch distinguishes known ignorable additions
-// from genuinely novel wire shapes.
+// Kimi Code 0.27.0-0.28.0's server-v1 WebSocket event vocabulary. The server
+// projects both its public session events and the underlying agent event bus.
+// The adapter consumes a subset, but the watch distinguishes known ignorable
+// internal notifications from genuinely novel wire shapes.
 const KIMI_SERVER_EVENT_TYPES: &[&str] = &[
     "error",
     "warning",
+    "agent.activity.updated",
     "agent.status.updated",
     "session.meta.updated",
+    "session.resume_hint",
     "event.session.created",
+    "event.session.archived",
     "event.workspace.created",
     "event.workspace.updated",
     "event.workspace.deleted",
@@ -336,6 +340,7 @@ const KIMI_SERVER_EVENT_TYPES: &[&str] = &[
     "event.approval.resolved",
     "event.approval.expired",
     "event.question.requested",
+    "event.question.resolved",
     "event.question.answered",
     "event.question.dismissed",
     "event.config.changed",
@@ -356,18 +361,58 @@ const KIMI_SERVER_EVENT_TYPES: &[&str] = &[
     "event.task.created",
     "event.task.progress",
     "event.task.completed",
+    "config.update",
+    "content.part",
+    "context.append_loop_event",
+    "context.append_message",
+    "context.apply_compaction",
+    "context.clear",
+    "context.spliced",
+    "context.undo",
+    "context.update_token_count",
+    "full_compaction.begin",
+    "full_compaction.cancel",
+    "full_compaction.complete",
+    "goal.clear",
+    "goal.create",
+    "goal.summary",
+    "goal.update",
     "goal.updated",
+    "llm.request",
+    "llm.tools_snapshot",
+    "mcp.tools_discovered",
+    "micro_compaction.apply",
+    "permission.approval.requested",
+    "permission.approval.resolved",
+    "permission.record_approval_result",
+    "permission.set_mode",
+    "plan_mode.cancel",
+    "plan_mode.enter",
+    "plan_mode.exit",
     "skill.activated",
     "plugin_command.activated",
+    "step.begin",
+    "step.end",
+    "step.retrying",
+    "swarm_mode.enter",
+    "swarm_mode.exit",
+    "system.version",
+    "task.notified",
     "turn.started",
+    "turn.cancel",
     "turn.ended",
+    "turn.interrupted",
+    "turn.prompt",
+    "turn.steer",
     "turn.step.started",
     "turn.step.completed",
     "turn.step.retrying",
     "turn.step.interrupted",
     "assistant.delta",
+    "text.delta",
     "hook.result",
     "thinking.delta",
+    "tool.call",
     "tool.call.delta",
     "tool.call.started",
     "tool.progress",
@@ -394,6 +439,11 @@ const KIMI_SERVER_EVENT_TYPES: &[&str] = &[
     "prompt.completed",
     "prompt.aborted",
     "prompt.steered",
+    "tools.register_user_tool",
+    "tools.set_active_tools",
+    "tools.unregister_user_tool",
+    "tools.update_store",
+    "usage.record",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2077,6 +2127,18 @@ mod tests {
             "payload": { "text": "SENTINEL_KIMI_CONTENT" },
         }))
         .is_empty());
+        for event_type in ["context.spliced", "permission.approval.requested"] {
+            assert!(
+                kimi_findings(&serde_json::json!({
+                    "type": event_type,
+                    "seq": 8,
+                    "timestamp": "2026-07-20T12:00:00Z",
+                    "payload": {},
+                }))
+                .is_empty(),
+                "{event_type}"
+            );
+        }
 
         let findings = kimi_findings(&serde_json::json!({
             "type": "future.private.event",

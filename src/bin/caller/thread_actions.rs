@@ -2353,16 +2353,19 @@ pub(crate) async fn handle_external_thread_action(
 
     if success && matches!(op.as_str(), "side-close" | "side_close") {
         if let Some(child_thread_id) = side_child_thread_id_from_params(&params) {
-            config.bus.send(AppEvent::SessionEnded {
-                session_id: child_thread_id.clone(),
-                reason: "side conversation closed".to_string(),
-                error_kind: None,
-            });
             return ExternalThreadActionEffect::SideTurnClosed { child_thread_id };
         }
     }
 
     ExternalThreadActionEffect::None
+}
+
+pub(crate) fn emit_side_session_closed(bus: &EventBus, child_thread_id: String) {
+    bus.send(AppEvent::SessionEnded {
+        session_id: child_thread_id,
+        reason: "side conversation closed".to_string(),
+        error_kind: None,
+    });
 }
 
 pub(crate) fn codex_thread_action_log_message(op: &str, message: &str) -> String {
@@ -5348,6 +5351,16 @@ mod tests {
                 );
             }
             other => panic!("expected child completion LogEntry, got {:?}", other),
+        }
+        match rx.try_recv().expect("child done boundary") {
+            AppEvent::DoneSignal {
+                session_id,
+                message,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("child-thread"));
+                assert_eq!(message.as_deref(), Some("child final answer"));
+            }
+            other => panic!("expected child DoneSignal, got {:?}", other),
         }
     }
 

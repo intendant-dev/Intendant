@@ -1023,6 +1023,11 @@ impl SessionSupervisor {
             event::ControlMsg::SpawnSubAgent { .. } => true,
             event::ControlMsg::ResumeSession { .. } => true,
             event::ControlMsg::RestartSession { .. } => true,
+            // The foreground/headless resume listener does not register the
+            // startup session in its own supervisor state. Anchor forks are
+            // nevertheless self-resolving from persisted backend history and
+            // activate a fresh managed child, just like ResumeSession.
+            event::ControlMsg::ForkSessionAtAnchor { .. } => true,
             event::ControlMsg::StopSession { .. } => true,
             event::ControlMsg::RenameSession { .. } => true,
             event::ControlMsg::ConfigureSessionAgent { .. } => true,
@@ -1890,6 +1895,32 @@ mod tests {
             attachments: Vec::new(),
         };
         assert!(control_msg_can_attach_unmanaged_session(&msg));
+    }
+
+    #[tokio::test]
+    async fn anchor_fork_is_claimed_before_foreground_session_attach() {
+        let bus = EventBus::new();
+        let project_dir = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor(project_dir.path().to_path_buf(), bus);
+        let msg = event::ControlMsg::ForkSessionAtAnchor {
+            source: "kimi".to_string(),
+            session_id: "session_parent".to_string(),
+            resume_id: Some("session_parent".to_string()),
+            anchor: crate::session_fork::ForkAnchorSpec {
+                kind: "turn-boundary".to_string(),
+                turn: Some(2),
+                item_id: None,
+                position: None,
+                seq: None,
+                message_uuid: None,
+            },
+            name: None,
+            task: None,
+            project_root: Some(project_dir.path().to_string_lossy().into_owned()),
+            request_id: Some("fork-foreground".to_string()),
+        };
+
+        assert!(supervisor.should_handle_session_control(&msg).await);
     }
 
     fn delegated_start_task(delegation_id: &str) -> event::ControlMsg {

@@ -1,4 +1,4 @@
-//! Authenticated REST helpers for Kimi server 0.27's `/api/v1` contract.
+//! Authenticated REST helpers for Kimi server 0.27-0.28's `/api/v1` contract.
 
 use std::collections::HashSet;
 use std::io;
@@ -218,15 +218,16 @@ impl KimiApi {
             .await
     }
 
-    /// Promote queued prompts into the active turn. Kimi 0.27's collection
-    /// action is deliberately spelled `prompts::steer` (double colon).
+    /// Promote queued prompts into the active turn. Kimi's route declaration
+    /// spells this `prompts::steer` because Fastify doubles a literal colon,
+    /// but clients send the collection action as `prompts:steer`.
     pub(crate) async fn steer_prompts(
         &self,
         session_id: &str,
         prompt_ids: &[String],
     ) -> Result<Value, CallerError> {
         self.post(
-            &format!("/sessions/{}/prompts::steer", component(session_id)),
+            &format!("/sessions/{}/prompts:steer", component(session_id)),
             &serde_json::json!({ "prompt_ids": prompt_ids }),
         )
         .await
@@ -808,7 +809,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn steer_uses_double_colon_collection_action_and_bearer_auth() {
+    async fn steer_uses_literal_colon_collection_action_and_bearer_auth() {
         let (origin, request, server) = mock_server(
             "200 OK",
             serde_json::json!({"code": 0, "data": {"steered": 2}}),
@@ -824,7 +825,7 @@ mod tests {
         let (line, headers, body) = request_parts(&request);
         assert_eq!(
             line,
-            "POST /api/v1/sessions/session%2Fa/prompts::steer HTTP/1.1"
+            "POST /api/v1/sessions/session%2Fa/prompts:steer HTTP/1.1"
         );
         assert!(headers.contains("\r\nauthorization: bearer test-wire-token\r\n"));
         assert_eq!(body, serde_json::json!({"prompt_ids": ["p1", "p2"]}));

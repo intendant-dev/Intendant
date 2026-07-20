@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 
 const BRIDGE_PARENT: &str = "intendant-bridges";
 const SYNC_LOCK_NAME: &str = ".intendant-bridge-sync.lock";
+const SESSION_INDEX_NAME: &str = "session_index.jsonl";
 const PRIVATE_NAMES: &[&str] = &["mcp.json", "server.token", "server", SYNC_LOCK_NAME];
-const HISTORY_NAMES: &[&str] = &["sessions", "session_index.jsonl"];
+const HISTORY_NAMES: &[&str] = &["sessions", SESSION_INDEX_NAME];
 const SYNC_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
@@ -33,7 +34,7 @@ pub(crate) struct BridgeMcpConfig {
 /// MCP file already owns it. Kimi merges user, project-root, then project-local
 /// declarations, so blindly writing only the user-level bridge entry would let
 /// a checkout silently replace Intendant's scoped control plane.
-pub(crate) fn choose_mcp_server_name(cwd: &Path, identity: &str) -> io::Result<String> {
+pub(crate) fn choose_mcp_server_name(cwd: &Path, _identity: &str) -> io::Result<String> {
     let mut names = std::collections::HashSet::new();
     for path in project_mcp_paths(cwd) {
         let text = match fs::read_to_string(&path) {
@@ -73,7 +74,13 @@ pub(crate) fn choose_mcp_server_name(cwd: &Path, identity: &str) -> io::Result<S
     if !names.contains("intendant") {
         return Ok("intendant".into());
     }
-    let suffix = bridge_key(identity)
+    // Kimi persists the active tool names in session state. A suffix derived
+    // from the Intendant wrapper id changes across resume/fork bridges and
+    // turns every previously selected managed MCP tool into an unknown name.
+    // Scope the collision fallback to the project instead: bridge homes remain
+    // isolated, so all wrappers for one project can safely use the same name.
+    let project_scope = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let suffix = bridge_key(&project_scope.to_string_lossy())
         .strip_prefix("session-")
         .unwrap_or("managed")
         .chars()
@@ -122,19 +129,43 @@ pub(crate) fn prepare_bridge_home(
     ensure_private_managed_directory(&bridge)?;
     validate_managed_bridge_path(&bridge)?;
 
-    // Recover writes from a prior process that exited through Drop/crash
-    // before refreshing copy fallbacks from the primary home. Symlinked
-    // entries are already primary-backed and are ignored by this pass.
-    sync_bridge_home_to_primary(&bridge)?;
+    // Publish history from every existing bridge before this bridge mirrors
+    // the primary home. The first supervised Kimi process can start before
+    // `sessions/` exists in the primary home, so that process necessarily
+    // creates a real copy-fallback directory in its bridge even on Unix. A
+    // concurrent resume/fork bridge must see that live parent history; waiting
+    // for the parent's Drop-time sync makes native fork-at-head unverifiable.
+    // The sweep is history-only and serialized. Session transcripts retain
+    // strict append-only ordering, while Kimi's session index is merged by its
+    // actual per-session map semantics. Both ignore incomplete source tails,
+    // so copying a live bridge neither exposes private server/auth state nor
+    // publishes a partial journal record.
+    sync_managed_bridges_to_primary(primary_home)?;
     prune_stale_bridge_snapshots(primary_home, &bridge)?;
 
     for entry in fs::read_dir(primary_home)? {
         let entry = entry?;
         let name = entry.file_name();
-        if name == OsStr::new(BRIDGE_PARENT) || private_name(&name) {
+        if name == OsStr::new(BRIDGE_PARENT)
+            || name == OsStr::new(SESSION_INDEX_NAME)
+            || private_name(&name)
+        {
             continue;
         }
         mirror_entry(&entry.path(), &bridge.join(&name))?;
+    }
+    let primary_index = primary_home.join(SESSION_INDEX_NAME);
+    if fs::symlink_metadata(&primary_index).is_ok() {
+        let bridge_index = bridge.join(SESSION_INDEX_NAME);
+        if fs::symlink_metadata(&bridge_index)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            // Older Intendant builds mirrored the index as a symlink. Kimi's
+            // index entries contain absolute session paths, so each bridge
+            // needs a materialized, path-rebased copy instead.
+            remove_entry_no_follow(&bridge_index)?;
+        }
+        merge_session_index(&primary_index, &bridge_index, &bridge)?;
     }
 
     write_merged_mcp(primary_home, &bridge, mcp)?;
@@ -170,13 +201,29 @@ pub(crate) fn sync_bridge_home_to_primary(bridge: &Path) -> io::Result<()> {
     })?;
     let _lock = BridgeSyncLock::acquire(primary_home)?;
 
-    for entry in fs::read_dir(bridge)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if !history_name(&name) {
-            continue;
+    let sessions = bridge.join("sessions");
+    if fs::symlink_metadata(&sessions).is_ok() {
+        sync_copy_back(&sessions, &primary_home.join("sessions"))?;
+    }
+    let session_index = bridge.join(SESSION_INDEX_NAME);
+    if let Ok(metadata) = fs::symlink_metadata(&session_index) {
+        if !metadata.file_type().is_symlink() {
+            let primary_index = primary_home.join(SESSION_INDEX_NAME);
+            match fs::symlink_metadata(&primary_index) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    // Never write through an authority-controlled primary-home
+                    // link. This matches the copy-back policy for all other
+                    // history entries.
+                }
+                Ok(_) => {
+                    merge_session_index(&session_index, &primary_index, primary_home)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    merge_session_index(&session_index, &primary_index, primary_home)?;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        sync_copy_back(&entry.path(), &primary_home.join(name))?;
     }
     Ok(())
 }
@@ -612,6 +659,299 @@ fn sync_copy_back(source: &Path, destination: &Path) -> io::Result<()> {
         fs::copy(source, destination)?;
     }
     Ok(())
+}
+
+struct SessionIndexRecord {
+    session_id: String,
+    value: Value,
+}
+
+struct SessionIndexJournal {
+    snapshot: JournalPrefixSnapshot,
+    records: Vec<SessionIndexRecord>,
+}
+
+/// Merge Kimi's session index according to the reader Kimi actually ships.
+///
+/// `session_index.jsonl` is not a globally ordered replay journal. Kimi reduces
+/// it into a map keyed by `sessionId`; later records for one id replace or
+/// delete only that id. Concurrent bridges therefore legitimately produce
+/// `[parent, child-a]` and `[parent, child-b]`. Treating those as an ordinary
+/// append-only journal rejects the second branch, while concatenating arbitrary
+/// transcript journals would be unsafe.
+///
+/// Compare each session's own record sequence and append only per-session
+/// suffixes. Distinct ids commute. A conflicting sequence for the same id still
+/// fails closed because there is no timestamp with which to order it. Active
+/// entries are rebased to the destination bridge's `sessions/` path; Kimi
+/// validates that absolute path lexically when it reads the index, so sharing a
+/// symlinked index between bridge homes makes otherwise valid sessions vanish.
+fn merge_session_index(
+    source: &Path,
+    destination: &Path,
+    destination_home: &Path,
+) -> io::Result<()> {
+    if same_canonical_path(source, destination) {
+        return Ok(());
+    }
+    if crate::platform::path_leaf_is_symlink_or_reparse(source)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Kimi session index {} is a link", source.display()),
+        ));
+    }
+    if !destination_home.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Kimi session-index destination home must be absolute",
+        ));
+    }
+    let source_journal = read_session_index_journal(source, destination_home, true)?;
+    let destination_journal = match fs::symlink_metadata(destination) {
+        Ok(metadata) => {
+            reject_non_symlink_reparse(destination, &metadata, "Kimi session index")?;
+            if metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Kimi session index {} is a link", destination.display()),
+                ));
+            }
+            Some(read_session_index_journal(
+                destination,
+                destination_home,
+                false,
+            )?)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+
+    let mut source_by_id = std::collections::HashMap::<&str, Vec<&Value>>::new();
+    for record in &source_journal.records {
+        source_by_id
+            .entry(record.session_id.as_str())
+            .or_default()
+            .push(&record.value);
+    }
+    let mut destination_by_id = std::collections::HashMap::<&str, Vec<&Value>>::new();
+    if let Some(journal) = destination_journal.as_ref() {
+        for record in &journal.records {
+            destination_by_id
+                .entry(record.session_id.as_str())
+                .or_default()
+                .push(&record.value);
+        }
+    }
+
+    let mut destination_counts = std::collections::HashMap::<&str, usize>::new();
+    for (session_id, source_records) in &source_by_id {
+        let destination_records = destination_by_id
+            .get(session_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let common = source_records.len().min(destination_records.len());
+        if source_records[..common] != destination_records[..common] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("refusing to merge divergent Kimi session-index history for {session_id}"),
+            ));
+        }
+        destination_counts.insert(session_id, destination_records.len());
+    }
+
+    let mut seen = std::collections::HashMap::<&str, usize>::new();
+    let mut append = Vec::new();
+    for record in &source_journal.records {
+        let occurrence = seen.entry(record.session_id.as_str()).or_default();
+        let destination_count = destination_counts
+            .get(record.session_id.as_str())
+            .copied()
+            .unwrap_or_default();
+        if *occurrence >= destination_count {
+            serde_json::to_writer(&mut append, &record.value).map_err(io::Error::other)?;
+            append.push(b'\n');
+        }
+        *occurrence = occurrence.saturating_add(1);
+    }
+    if append.is_empty() {
+        return Ok(());
+    }
+
+    // Revalidate the exact source prefix that produced `append`, then validate
+    // the destination immediately before opening it for append. Source growth
+    // is safe and will be picked up by the next sweep; replacement, truncation,
+    // or an in-place rewrite is not.
+    let _validated_source =
+        open_validated_journal_prefix(source, &source_journal.snapshot, true, false)?;
+    let destination_snapshot = destination_journal
+        .as_ref()
+        .map(|journal| &journal.snapshot);
+    let mut output = open_validated_journal_destination(destination, destination_snapshot)?;
+    if destination_snapshot.is_none() {
+        set_private_file_permissions(destination)?;
+    }
+    output.write_all(&append)?;
+    output.sync_data()
+}
+
+fn read_session_index_journal(
+    path: &Path,
+    destination_home: &Path,
+    allow_incomplete_tail: bool,
+) -> io::Result<SessionIndexJournal> {
+    let file = fs::File::open(path)?;
+    let identity = reliable_file_identity(&file, path)?;
+    let mut reader = BufReader::new(file);
+    let mut digest = Sha256::new();
+    let mut complete_len = 0u64;
+    let mut records = Vec::new();
+    while let Some(encoded) = read_complete_journal_record(&mut reader)? {
+        if !encoded.ends_with(b"\n") {
+            if allow_incomplete_tail {
+                break;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "refusing to append Kimi session index {} after an incomplete record",
+                    path.display()
+                ),
+            ));
+        }
+        complete_len = checked_journal_len(complete_len, encoded.len())?;
+        digest.update(&encoded);
+        records.push(normalize_session_index_record(
+            &encoded,
+            path,
+            destination_home,
+        )?);
+    }
+    if !allow_incomplete_tail && reader.get_ref().metadata()?.len() != complete_len {
+        return Err(journal_changed_error(path, "while it was compared"));
+    }
+    Ok(SessionIndexJournal {
+        snapshot: JournalPrefixSnapshot {
+            identity,
+            len: complete_len,
+            digest: digest.finalize().into(),
+        },
+        records,
+    })
+}
+
+fn normalize_session_index_record(
+    encoded: &[u8],
+    source: &Path,
+    destination_home: &Path,
+) -> io::Result<SessionIndexRecord> {
+    let mut value = serde_json::from_slice::<Value>(encoded).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid Kimi session index {}: {error}", source.display()),
+        )
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Kimi session index {} contains a non-object record",
+                source.display()
+            ),
+        )
+    })?;
+    let session_id = object
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|session_id| {
+            !session_id.is_empty()
+                && *session_id != "."
+                && *session_id != ".."
+                && !session_id.contains('/')
+                && !session_id.contains('\\')
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Kimi session index {} contains an invalid sessionId",
+                    source.display()
+                ),
+            )
+        })?
+        .to_string();
+    if object.get("deleted").and_then(Value::as_bool) != Some(true) {
+        if object.get("workDir").and_then(Value::as_str).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Kimi session index {} contains an active record without workDir",
+                    source.display()
+                ),
+            ));
+        }
+        let session_dir = object
+            .get("sessionDir")
+            .and_then(Value::as_str)
+            .map(Path::new)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Kimi session index {} contains an invalid sessionDir",
+                        source.display()
+                    ),
+                )
+            })?;
+        if session_dir.file_name() != Some(OsStr::new(&session_id)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Kimi session index {} sessionDir does not match sessionId",
+                    source.display()
+                ),
+            ));
+        }
+        let workspace = session_dir
+            .parent()
+            .and_then(Path::file_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Kimi session index {} sessionDir has no workspace",
+                        source.display()
+                    ),
+                )
+            })?
+            .to_os_string();
+        if session_dir
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            != Some(OsStr::new("sessions"))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Kimi session index {} sessionDir is outside a sessions directory",
+                    source.display()
+                ),
+            ));
+        }
+        let rebased = destination_home
+            .join("sessions")
+            .join(workspace)
+            .join(&session_id);
+        let rebased = rebased.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Kimi session-index destination is not valid Unicode",
+            )
+        })?;
+        object.insert("sessionDir".into(), Value::String(rebased.to_string()));
+    }
+    Ok(SessionIndexRecord { session_id, value })
 }
 
 /// Ordinary symlinks are handled explicitly by the caller: primary-backed
@@ -1150,6 +1490,34 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
 
+    fn session_index_entry(
+        home: &Path,
+        workspace: &str,
+        session_id: &str,
+        work_dir: &Path,
+    ) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "sessionId": session_id,
+                "sessionDir": home
+                    .join("sessions")
+                    .join(workspace)
+                    .join(session_id)
+                    .to_string_lossy(),
+                "workDir": work_dir.to_string_lossy(),
+            })
+        )
+    }
+
+    fn read_session_index(path: &Path) -> Vec<Value> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
     #[test]
     fn bridge_key_is_stable_and_path_safe() {
         let a = bridge_key("session/with spaces");
@@ -1236,6 +1604,163 @@ mod tests {
     }
 
     #[test]
+    fn new_bridge_sees_history_written_by_a_live_copy_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("kimi");
+        let parent = prepare_bridge_home(&primary, "parent-wrapper", None).unwrap();
+        let parent_session = parent.join("sessions/wd/session_parent");
+        fs::create_dir_all(&parent_session).unwrap();
+        fs::write(
+            parent_session.join("wire.jsonl"),
+            "{\"type\":\"turn.ended\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            parent.join("session_index.jsonl"),
+            session_index_entry(&parent, "wd", "session_parent", temp.path()),
+        )
+        .unwrap();
+
+        let child = prepare_bridge_home(&primary, "child-wrapper", None).unwrap();
+
+        assert_ne!(child, parent);
+        assert_eq!(
+            fs::read_to_string(child.join("sessions/wd/session_parent/wire.jsonl")).unwrap(),
+            "{\"type\":\"turn.ended\"}\n"
+        );
+        let index = read_session_index(&child.join("session_index.jsonl"));
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0]["sessionId"], "session_parent");
+        assert_eq!(
+            index[0]["sessionDir"],
+            child
+                .join("sessions/wd/session_parent")
+                .to_string_lossy()
+                .as_ref()
+        );
+    }
+
+    #[test]
+    fn new_bridge_merges_distinct_children_from_divergent_live_indexes() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("kimi");
+        let parent = prepare_bridge_home(&primary, "parent-wrapper", None).unwrap();
+        fs::create_dir_all(parent.join("sessions/wd/session_parent")).unwrap();
+        fs::write(
+            parent.join("sessions/wd/session_parent/wire.jsonl"),
+            "{\"type\":\"parent\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            parent.join(SESSION_INDEX_NAME),
+            session_index_entry(&parent, "wd", "session_parent", temp.path()),
+        )
+        .unwrap();
+
+        let child_a = prepare_bridge_home(&primary, "child-a-wrapper", None).unwrap();
+        fs::create_dir_all(child_a.join("sessions/wd/session_child_a")).unwrap();
+        fs::write(
+            child_a.join("sessions/wd/session_child_a/wire.jsonl"),
+            "{\"type\":\"child-a\"}\n",
+        )
+        .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(child_a.join(SESSION_INDEX_NAME))
+            .unwrap()
+            .write_all(
+                session_index_entry(&child_a, "wd", "session_child_a", temp.path()).as_bytes(),
+            )
+            .unwrap();
+
+        fs::create_dir_all(parent.join("sessions/wd/session_child_b")).unwrap();
+        fs::write(
+            parent.join("sessions/wd/session_child_b/wire.jsonl"),
+            "{\"type\":\"child-b\"}\n",
+        )
+        .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(parent.join(SESSION_INDEX_NAME))
+            .unwrap()
+            .write_all(
+                session_index_entry(&parent, "wd", "session_child_b", temp.path()).as_bytes(),
+            )
+            .unwrap();
+
+        let consumer = prepare_bridge_home(&primary, "consumer-wrapper", None).unwrap();
+        let index = read_session_index(&consumer.join(SESSION_INDEX_NAME));
+        let ids = index
+            .iter()
+            .map(|record| record["sessionId"].as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from([
+                "session_parent",
+                "session_child_a",
+                "session_child_b",
+            ])
+        );
+        assert!(index.iter().all(|record| record["sessionDir"]
+            .as_str()
+            .unwrap()
+            .starts_with(consumer.join("sessions").to_string_lossy().as_ref())));
+        assert_eq!(
+            fs::read_to_string(consumer.join("sessions/wd/session_child_a/wire.jsonl")).unwrap(),
+            "{\"type\":\"child-a\"}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(consumer.join("sessions/wd/session_child_b/wire.jsonl")).unwrap(),
+            "{\"type\":\"child-b\"}\n"
+        );
+    }
+
+    #[test]
+    fn session_index_merge_preserves_per_session_order_and_rejects_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_home = temp.path().join("source-home");
+        let destination_home = temp.path().join("destination-home");
+        fs::create_dir_all(&source_home).unwrap();
+        fs::create_dir_all(&destination_home).unwrap();
+        let source = source_home.join(SESSION_INDEX_NAME);
+        let destination = destination_home.join(SESSION_INDEX_NAME);
+        let active = session_index_entry(&source_home, "wd", "session-a", temp.path());
+        fs::write(
+            &destination,
+            session_index_entry(&destination_home, "wd", "session-a", temp.path()),
+        )
+        .unwrap();
+        fs::write(
+            &source,
+            format!(
+                "{active}{}\n",
+                serde_json::json!({"sessionId": "session-a", "deleted": true})
+            ),
+        )
+        .unwrap();
+
+        merge_session_index(&source, &destination, &destination_home).unwrap();
+        let records = read_session_index(&destination);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["deleted"], true);
+
+        fs::write(
+            &source,
+            session_index_entry(
+                &source_home,
+                "wd",
+                "session-a",
+                &temp.path().join("different-workdir"),
+            ),
+        )
+        .unwrap();
+        let error = merge_session_index(&source, &destination, &destination_home).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(read_session_index(&destination), records);
+    }
+
+    #[test]
     fn malformed_primary_mcp_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
         let primary = temp.path().join("kimi");
@@ -1255,7 +1780,7 @@ mod tests {
         )
         .unwrap();
         let first = choose_mcp_server_name(temp.path(), "session-a").unwrap();
-        let second = choose_mcp_server_name(temp.path(), "session-a").unwrap();
+        let second = choose_mcp_server_name(temp.path(), "session-b").unwrap();
         assert_eq!(first, second);
         assert_ne!(first, "intendant");
         assert!(first.starts_with("intendant_managed_"));
@@ -1272,7 +1797,11 @@ mod tests {
             "{\"type\":\"turn.ended\"}\n",
         )
         .unwrap();
-        fs::write(bridge.join("session_index.jsonl"), "{\"id\":\"child\"}\n").unwrap();
+        fs::write(
+            bridge.join("session_index.jsonl"),
+            session_index_entry(&bridge, "workspace", "session", temp.path()),
+        )
+        .unwrap();
         fs::write(bridge.join("server.token"), "bridge-secret").unwrap();
         fs::create_dir_all(bridge.join("server")).unwrap();
         fs::write(bridge.join("server/lock"), "private").unwrap();
@@ -1292,9 +1821,15 @@ mod tests {
             fs::read_to_string(primary.join("sessions/workspace/session/wire.jsonl")).unwrap(),
             "{\"type\":\"turn.ended\"}\n"
         );
+        let index = read_session_index(&primary.join("session_index.jsonl"));
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0]["sessionId"], "session");
         assert_eq!(
-            fs::read_to_string(primary.join("session_index.jsonl")).unwrap(),
-            "{\"id\":\"child\"}\n"
+            index[0]["sessionDir"],
+            primary
+                .join("sessions/workspace/session")
+                .to_string_lossy()
+                .as_ref()
         );
         assert!(!primary.join("server.token").exists());
         assert!(!primary.join("server").exists());
@@ -1486,15 +2021,12 @@ mod tests {
         for (bridge, suffix) in [(&bridge_a, "a"), (&bridge_b, "b")] {
             let session = bridge.join("sessions/workspace/session");
             fs::create_dir_all(&session).unwrap();
-            fs::write(
-                bridge.join("session_index.jsonl"),
-                if suffix == "a" {
-                    "{\"id\":\"base\"}\n{\"id\":\"a\"}\n".to_string()
-                } else {
-                    "{\"id\":\"base\"}\n{\"id\":\"a\"}\n{\"id\":\"b\"}\n".to_string()
-                },
-            )
-            .unwrap();
+            let mut index = session_index_entry(bridge, "workspace", "base", temp.path());
+            index.push_str(&session_index_entry(bridge, "workspace", "a", temp.path()));
+            if suffix == "b" {
+                index.push_str(&session_index_entry(bridge, "workspace", "b", temp.path()));
+            }
+            fs::write(bridge.join("session_index.jsonl"), index).unwrap();
             fs::write(
                 session.join("wire.jsonl"),
                 if suffix == "a" {
@@ -1531,8 +2063,18 @@ mod tests {
             handle.join().unwrap().unwrap();
         }
 
-        let index = fs::read_to_string(primary.join("session_index.jsonl")).unwrap();
-        assert_eq!(index, "{\"id\":\"base\"}\n{\"id\":\"a\"}\n{\"id\":\"b\"}\n");
+        let index = read_session_index(&primary.join("session_index.jsonl"));
+        assert_eq!(
+            index
+                .iter()
+                .map(|record| record["sessionId"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["base", "a", "b"]
+        );
+        assert!(index.iter().all(|record| record["sessionDir"]
+            .as_str()
+            .unwrap()
+            .starts_with(primary.join("sessions").to_string_lossy().as_ref())));
         let session = primary.join("sessions/workspace/session");
         let wire = fs::read_to_string(session.join("wire.jsonl")).unwrap();
         assert_eq!(

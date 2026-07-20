@@ -31,6 +31,25 @@ fn warn_undeliverable_images(
     }
 }
 
+/// Translate an idle backend cwd announcement without opening an observed
+/// turn. Kept as one shared predicate for the persistent-presence and
+/// standalone external loops: an unscoped announcement belongs to the primary
+/// conversation, while a scoped side/sub-agent announcement must not retarget
+/// the primary session's git locus.
+pub(crate) fn idle_external_cwd_event(
+    event_thread_id: &Option<String>,
+    session_id: &Option<String>,
+    alias_session_id: &Option<String>,
+    cwd: String,
+) -> Option<AppEvent> {
+    (!cwd.trim().is_empty()
+        && scoped_event_targets_config(event_thread_id, session_id, alias_session_id))
+    .then(|| AppEvent::SessionCwdAnnounced {
+        session_id: session_id.clone(),
+        cwd,
+    })
+}
+
 /// In-place backend respawn for reload-credentials (the dashboard's
 /// "Reload credentials" chip after a Claude sign-in): cancel a live
 /// rate-limit park PRESERVING its pending re-send (unlike an interrupt,
@@ -216,6 +235,12 @@ pub(crate) async fn run_external_agent_mode(
     // the backend starts are buffered here and consumed at the first
     // idle/drain poll.
     let mut external_control_rx = bus.subscribe();
+    // Stop additionally rides the lossless intent lane. The shared broadcast
+    // receiver also carries high-volume model/context traffic and can lag
+    // exactly when a foreground session is asked to stop; the originating
+    // ControlCommand remains ordered and lossless here.
+    let mut external_intent_rx = bus.subscribe_intents();
+    let mut external_intent_open = true;
     let (mut agent, thread, mut event_rx) = match create_external_agent(
         &backend,
         &project,
@@ -522,6 +547,28 @@ pub(crate) async fn run_external_agent_mode(
                     break FollowUpMessage::text(String::new());
                 }
                 tokio::select! {
+                    maybe_intent = external_intent_rx.recv(), if external_intent_open => {
+                        match maybe_intent {
+                            Some(event) => {
+                                if let Some(reason) = external_stop_reason_from_control_intent(
+                                    &event,
+                                    &live_session_id,
+                                    &drain_config.alias_session_id,
+                                    stats.announced_native_session_id.as_deref(),
+                                ) {
+                                    slog(&session_log, |l| {
+                                        l.info(&format!(
+                                            "Stop requested on lossless intent lane while idle: {reason}"
+                                        ))
+                                    });
+                                    stats.terminal_outcome = Some(reason);
+                                    break 'outer;
+                                }
+                            }
+                            None => external_intent_open = false,
+                        }
+                        continue;
+                    }
                     maybe_followup = follow_up_rx.recv() => {
                         match maybe_followup {
                             Some(followup) => {
@@ -754,6 +801,26 @@ pub(crate) async fn run_external_agent_mode(
                                             session_id: drain_config.session_id.clone(),
                                             facts,
                                         });
+                                    }
+                                    external_agent::AgentEvent::CwdAnnounced { cwd } => {
+                                        // Working-directory announcements are
+                                        // ambient session metadata, not proof
+                                        // that a backend turn started. Kimi
+                                        // emits one while an empty-task
+                                        // resumed/forked wrapper attaches; if
+                                        // it falls into the observe drain
+                                        // below, that drain waits forever for
+                                        // a turn completion that can never
+                                        // arrive and the wrapper stops
+                                        // accepting follow-ups.
+                                        if let Some(event) = idle_external_cwd_event(
+                                            &event_thread_id,
+                                            &live_session_id,
+                                            &drain_config.alias_session_id,
+                                            cwd,
+                                        ) {
+                                            bus.send(event);
+                                        }
                                     }
                                     external_agent::AgentEvent::BackendError {
                                         message,
@@ -1390,6 +1457,7 @@ pub(crate) async fn run_external_agent_mode(
                                     open_side_threads.remove(&child_thread_id);
                                     side_rounds.remove(&child_thread_id);
                                     side_turn_revisions.remove(&child_thread_id);
+                                    emit_side_session_closed(&bus, child_thread_id);
                                 }
                             }
                             Ok(AppEvent::InterruptRequested { session_id })
@@ -3500,4 +3568,46 @@ pub(crate) async fn run_external_agent_mode(
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_cwd_announcement_is_housekeeping_for_the_primary_session() {
+        let session_id = Some("session-main".to_string());
+        let alias_session_id = Some("wrapper-main".to_string());
+
+        assert!(matches!(
+            idle_external_cwd_event(
+                &None,
+                &session_id,
+                &alias_session_id,
+                "/repo".to_string(),
+            ),
+            Some(AppEvent::SessionCwdAnnounced {
+                session_id: Some(id),
+                cwd,
+            }) if id == "session-main" && cwd == "/repo"
+        ));
+        assert!(idle_external_cwd_event(
+            &Some("wrapper-main".to_string()),
+            &session_id,
+            &alias_session_id,
+            "/repo".to_string(),
+        )
+        .is_some());
+        assert!(idle_external_cwd_event(
+            &Some("side-thread".to_string()),
+            &session_id,
+            &alias_session_id,
+            "/other".to_string(),
+        )
+        .is_none());
+        assert!(
+            idle_external_cwd_event(&None, &session_id, &alias_session_id, "  ".to_string(),)
+                .is_none()
+        );
+    }
 }

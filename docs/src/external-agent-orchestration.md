@@ -107,7 +107,7 @@ adapter from `[agent.<backend>]` config, then `run_external_agent_mode()`
 | | **Codex** (reference impl) | **Claude Code** | **Kimi Code** |
 |---|---|---|---|
 | Module | `external_agent/codex/` (mod, threads, wire, context_trace, reader) | `external_agent/claude_code.rs` | `external_agent/kimi_code/` (mod, bridge, events, review, websocket, wire, rpc) |
-| Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --permission-mode <mode>` | `kimi server run --foreground --port 0 --log-level silent` |
+| Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --permission-mode <mode>` | Kimi 0.27: `kimi server run --foreground --port 0 --log-level silent`; Kimi 0.28: `kimi web --no-open --port 0 --log-level silent` |
 | Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio | bearer-authenticated loopback REST + reconnecting cursor/snapshot WebSocket (`server-v1`), plus a typed allowlist over authenticated reflected v2 RPCs |
 | MCP injection | Per-process `-c mcp_servers.intendant.{type,url,bearer_token_env_var}` overrides plus scoped env; no workspace config file | Inline `--mcp-config '{…}'` JSON with an environment-expanded Authorization header | Per-session bridge home containing generated `mcp.json`; scoped bearer stays in the child environment |
 | Multi-thread | Yes — many threads per process | No | Yes — the main session plus native `:btw` and swarm agents |
@@ -129,6 +129,12 @@ contract, and immediately unlinks the on-disk token while retaining it only in
 the supervisor's HTTP clients. It then drains both streams; REST or WebSocket
 failures are normalized as backend errors for every frontend.
 
+Kimi's exact native tool-call ids also keep tool starts, streaming output, and
+completion correlated in persistent daemon sessions. The legacy Codex/Claude
+presence lane coalesces those `AgentStarted` rows with model activity; Kimi
+leaves them unsuppressed because its server stream provides a stable,
+deduplicated lifecycle boundary.
+
 ### Passive protocol compatibility watch
 
 Every supervised Codex, Claude Code, or Kimi Code process carries a passive
@@ -148,8 +154,9 @@ four most recently observed fingerprints, so upgrade residue does not
 accumulate.
 
 The initial vocabulary baseline is Claude Code 2.1.210, Codex app-server
-0.144.1, and Kimi Code server-v1 0.27.0. Known-but-intentionally-ignored
-notifications are included so the
+0.144.1, and the complete projected Kimi Code server-v1/agent-event-bus
+vocabulary in 0.27.0/0.28.0. Known-but-intentionally-ignored notifications are
+included so the
 watch reports new protocol surface, not ordinary traffic the adapter already
 chose to ignore. Structural-check changes bump a separate contract revision,
 which is folded into the manifest digest.
@@ -710,11 +717,14 @@ warning on divergence (once per distinct echoed value).
 ### Kimi Code
 
 Kimi uses the local `server-v1` interface rather than ACP. ACP is convenient
-for editor interoperability, but Kimi Code 0.27's ACP facade does not expose
-the native goal, undo, fork, side-agent, structured-interaction, background
-task, usage, and live-profile surfaces needed for Intendant parity. The
-adapter therefore starts one private `kimi server run` process per supervised
-session and speaks its bearer-authenticated loopback REST and WebSocket APIs.
+for editor interoperability, but Kimi Code 0.27-0.28's ACP facade does not
+expose the native goal, undo, fork, side-agent, structured-interaction,
+background-task, usage, and live-profile surfaces needed for Intendant parity.
+The adapter therefore starts one private foreground server process per
+supervised session and speaks its bearer-authenticated loopback REST and
+WebSocket APIs. It starts 0.27's `kimi server run` entrypoint and retries with
+0.28's `kimi web --no-open` only when the first process exits with Kimi's exact
+entrypoint-removal diagnostic; other startup failures remain failures.
 The server binds port `0`; its chosen origin is read from stdout, and its bearer
 is read from `server.token`. Neither value is put on argv or emitted as an
 Intendant event. Once health, metadata, and the typed v2 method catalog have
@@ -838,7 +848,7 @@ adapters:
   files are uploaded to Kimi's file API before the prompt, preserving their
   name, media type, and size.
 
-The capability list intentionally omits operations Kimi 0.27 cannot perform
+The capability list intentionally omits operations Kimi 0.27-0.28 cannot perform
 honestly: arbitrary item/message/child fork anchors, item-anchor rewind, an
 explicit “mark budget-limited” transition, persistent-memory reset, and
 independent undo of one child agent. Historical forks are exact only at active
@@ -948,7 +958,7 @@ The intentional non-parity cells are upstream capability boundaries, not
 missing UI: no arbitrary item/message/child fork point, item-anchor rewind,
 explicit budget-limited setter or individual budget clear, Codex
 managed-context/fission or persistent-memory reset, or independent undo of one
-Kimi child agent in Kimi Code 0.27.
+Kimi child agent in Kimi Code 0.27-0.28.
 
 Catch-up order (each step unlocks UI in both surfaces at once):
 

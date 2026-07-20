@@ -526,6 +526,17 @@ impl EventTranslator {
                         usage: self.usage_from_tokens(usage, None, &state_id),
                     });
                 }
+                // Kimi 0.28 writes a terminal step.end for side agents but
+                // does not always follow it with the turn.ended alias that
+                // main-agent sessions receive. A terminal model finish is
+                // authoritative once every child tool has settled. Reuse the
+                // normal closer so a later compatibility alias deduplicates.
+                if agent_id != "main"
+                    && terminal_model_finish(payload)
+                    && !self.open_tools.iter().any(|(owner, _)| owner == &state_id)
+                {
+                    events.extend(self.turn_ended(session_id, agent_id, &state_id, payload));
+                }
                 events
             }
             "turn.step.retrying" => {
@@ -590,7 +601,7 @@ impl EventTranslator {
                 self.observe(&state_id, ActivityObservation::ReasoningDelta)
             }
             "tool.call.delta" => self.observe(&state_id, ActivityObservation::ResponseDelta),
-            "tool.call.started" => {
+            "tool.call" | "tool.call.started" => {
                 self.ensure_turn(&state_id, value_id(payload.get("turnId")).as_deref(), None);
                 self.tool_started(&state_id, payload)
             }
@@ -1120,10 +1131,10 @@ impl EventTranslator {
             .to_string();
         self.synthetically_closed_tools
             .remove(&(agent_id.to_string(), item_id.clone()));
-        if !self
+        let inserted = self
             .open_tools
-            .insert((agent_id.to_string(), item_id.clone()))
-        {
+            .insert((agent_id.to_string(), item_id.clone()));
+        if !inserted {
             return events;
         }
         let name = payload
@@ -1132,7 +1143,12 @@ impl EventTranslator {
             .unwrap_or("tool")
             .to_string();
         let display = payload.get("display");
-        if let Some(entries) = display.and_then(todo_entries) {
+        let todo_entries = display.and_then(todo_entries).or_else(|| {
+            matches!(name.as_str(), "TodoList" | "TodoWrite")
+                .then(|| payload.get("args").and_then(todo_argument_entries))
+                .flatten()
+        });
+        if let Some(entries) = todo_entries {
             events.push(AgentEvent::PlanUpdate { entries });
         }
         if let Some(path) = write_path(display) {
@@ -2280,6 +2296,40 @@ fn todo_entries(value: &Value) -> Option<Vec<(String, String, String)>> {
     )
 }
 
+fn todo_argument_entries(value: &Value) -> Option<Vec<(String, String, String)>> {
+    Some(
+        value
+            .get("todos")?
+            .as_array()?
+            .iter()
+            .filter_map(|item| {
+                Some((
+                    item.get("title")?.as_str()?.to_string(),
+                    "medium".to_string(),
+                    super::super::normalize_plan_status(
+                        item.get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("pending"),
+                    ),
+                ))
+            })
+            .collect(),
+    )
+}
+
+fn terminal_model_finish(payload: &Value) -> bool {
+    [
+        payload.get("finishReason"),
+        payload.get("providerFinishReason"),
+        payload.get("rawFinishReason"),
+        payload.get("finish_reason"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .any(|reason| matches!(reason, "end_turn" | "completed" | "stop"))
+}
+
 fn content_text(content: Option<&Value>) -> String {
     content
         .and_then(Value::as_array)
@@ -2465,6 +2515,80 @@ mod tests {
             1,
             "normal terminal must not repeat the final message in the child log lane"
         );
+    }
+
+    #[test]
+    fn terminal_child_step_closes_once_when_kimi_omits_turn_ended() {
+        let mut translator = translator();
+        let child = "worker-1";
+        translator.translate_envelope(&agent_envelope(
+            "turn.started",
+            child,
+            serde_json::json!({"turnId": 12}),
+        ));
+        translator.translate_envelope(&agent_envelope(
+            "assistant.delta",
+            child,
+            serde_json::json!({"turnId": 12, "delta": "child final"}),
+        ));
+
+        let completed = translator
+            .translate_envelope(&agent_envelope(
+                "turn.step.completed",
+                child,
+                serde_json::json!({
+                    "turnId": 12,
+                    "finishReason": "end_turn",
+                    "providerFinishReason": "completed",
+                    "rawFinishReason": "stop"
+                }),
+            ))
+            .into_iter()
+            .map(unscoped)
+            .collect::<Vec<_>>();
+        assert!(completed
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Message { text } if text == "child final")));
+        assert_eq!(
+            completed
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::TurnCompleted { .. }))
+                .count(),
+            1
+        );
+
+        let compatibility_alias = translator.translate_envelope(&agent_envelope(
+            "turn.ended",
+            child,
+            serde_json::json!({"turnId": 12, "reason": "completed"}),
+        ));
+        assert!(
+            compatibility_alias.is_empty(),
+            "the eventual turn.ended alias must not close the child twice"
+        );
+    }
+
+    #[test]
+    fn child_tool_step_and_main_terminal_step_wait_for_turn_ended() {
+        let mut translator = translator();
+        let child = translator.translate_envelope(&agent_envelope(
+            "turn.step.completed",
+            "worker-1",
+            serde_json::json!({"turnId": 12, "finishReason": "tool_calls"}),
+        ));
+        assert!(!child
+            .into_iter()
+            .map(unscoped)
+            .any(|event| matches!(event, AgentEvent::TurnCompleted { .. })));
+
+        let main = translator.translate_envelope(&envelope(
+            "turn.step.completed",
+            serde_json::json!({"turnId": 13, "finishReason": "end_turn"}),
+        ));
+        assert!(!main
+            .into_iter()
+            .map(unscoped)
+            .any(|event| matches!(event, AgentEvent::TurnCompleted { .. })));
     }
 
     #[test]
@@ -2662,7 +2786,7 @@ mod tests {
     fn todo_display_becomes_plan_and_write_path() {
         let mut translator = translator();
         let events = translator.translate_envelope(&envelope(
-            "tool.call.started",
+            "tool.call",
             serde_json::json!({
                 "turnId": 1,
                 "toolCallId": "t1",
@@ -2679,6 +2803,44 @@ mod tests {
         ));
         assert!(events.into_iter().map(unscoped).any(|event| {
             matches!(event, AgentEvent::PlanUpdate { entries } if entries.len() == 2)
+        }));
+        let compatibility_alias = translator.translate_envelope(&envelope(
+            "tool.call.started",
+            serde_json::json!({
+                "turnId": 1,
+                "toolCallId": "t1",
+                "name": "TodoWrite",
+                "args": {}
+            }),
+        ));
+        assert!(!compatibility_alias
+            .into_iter()
+            .map(unscoped)
+            .any(|event| matches!(event, AgentEvent::ToolStarted { .. })));
+
+        let events = translator.translate_envelope(&envelope(
+            "tool.call",
+            serde_json::json!({
+                "turnId": 1,
+                "toolCallId": "t-list",
+                "name": "TodoList",
+                "args": {
+                    "todos": [
+                        {"title": "Inspect", "status": "in_progress"},
+                        {"title": "Verify", "status": "pending"}
+                    ]
+                }
+            }),
+        ));
+        assert!(events.into_iter().map(unscoped).any(|event| {
+            matches!(
+                event,
+                AgentEvent::PlanUpdate { entries }
+                    if entries == vec![
+                        ("Inspect".into(), "medium".into(), "inprogress".into()),
+                        ("Verify".into(), "medium".into(), "pending".into()),
+                    ]
+            )
         }));
 
         let events = translator.translate_envelope(&envelope(

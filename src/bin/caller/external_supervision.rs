@@ -694,6 +694,15 @@ pub(crate) fn codex_context_trace_dir(
     }
 }
 
+fn clear_consumed_kimi_fork_staging(config: &mut crate::session_config::SessionAgentConfig) {
+    // These fields authorize one exact head-check + rollback while creating
+    // an anchor child. They are not durable session profile: once start_thread
+    // succeeds, retaining them in either the child wrapper or the parent
+    // overlay makes an ordinary later resume try to fork again.
+    config.kimi_fork_rollback_turns = None;
+    config.kimi_fork_expected_horizon = None;
+}
+
 /// Construct, initialize, and start a thread for an external agent backend.
 ///
 /// Returns the agent, thread handle, and event receiver. The caller owns the
@@ -1013,17 +1022,19 @@ pub(crate) async fn create_external_agent(
                 launch.merge_missing_from(existing);
             }
             crate::session_config::write_log_dir_config(&log_dir, &launch)?;
-            if let Some(resume) = resume_session
-                .as_deref()
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-            {
-                crate::session_config::write_external_overlay(
-                    &crate::platform::home_dir(),
-                    "kimi",
-                    resume,
-                    &launch,
-                )?;
+            if !fork_resume {
+                if let Some(resume) = resume_session
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                {
+                    crate::session_config::write_external_overlay(
+                        &crate::platform::home_dir(),
+                        "kimi",
+                        resume,
+                        &launch,
+                    )?;
+                }
             }
             Ok::<(), String>(())
         })();
@@ -1036,6 +1047,29 @@ pub(crate) async fn create_external_agent(
     }
 
     let thread = agent.start_thread().await?;
+    if *backend == AgentBackend::Kimi {
+        let persistence = (|| {
+            let mut launch = agent.launch_config_snapshot().ok_or_else(|| {
+                "Kimi adapter did not expose its consumed launch config".to_string()
+            })?;
+            let log_dir = session_log
+                .lock()
+                .map_err(|_| "session log lock poisoned".to_string())?
+                .dir()
+                .to_path_buf();
+            if let Some(existing) = crate::session_config::read_log_dir_config(&log_dir) {
+                launch.merge_missing_from(existing);
+            }
+            clear_consumed_kimi_fork_staging(&mut launch);
+            crate::session_config::write_log_dir_config(&log_dir, &launch)
+        })();
+        if let Err(error) = persistence {
+            let _ = agent.shutdown().await;
+            return Err(CallerError::ExternalAgent(format!(
+                "persist consumed Kimi launch config: {error}"
+            )));
+        }
+    }
     if let Some(mut startup) = leased_home_startup {
         let canonical_backend_id = if backend.thread_id_is_canonical(&thread.thread_id) {
             thread.thread_id.as_str()
@@ -1089,8 +1123,10 @@ pub(crate) struct DrainConfig<'a> {
     pub(crate) web_port: Option<u16>,
     pub(crate) agent_source: Option<String>,
     /// When true, `ToolStarted` just increments the turn counter without
-    /// emitting `AgentStarted`. The presence path sets this to avoid
-    /// duplicating the model reasoning that's already shown via ModelResponse.
+    /// emitting `AgentStarted`. Legacy presence paths set this to avoid
+    /// duplicating model activity already shown via `ModelResponse`. Kimi's
+    /// precise server-v1 tool ids make its daemon lane safe to leave
+    /// unsuppressed, preserving correlated tool start/output telemetry.
     pub(crate) suppress_agent_started: bool,
     /// When set (supervised sessions with their own session log), the drain
     /// persists model responses and reasoning inline into the owning
@@ -1388,6 +1424,26 @@ pub(crate) fn shared_codex_config_from_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumed_kimi_anchor_staging_is_not_a_durable_resume_pin() {
+        let mut config = crate::session_config::SessionAgentConfig {
+            forked_from: Some("session_parent".to_string()),
+            fork_relationship: Some("anchor-fork".to_string()),
+            fork_anchor: Some("{\"kind\":\"turn-boundary\",\"turn\":4}".to_string()),
+            kimi_fork_rollback_turns: Some(2),
+            kimi_fork_expected_horizon: Some("{\"active_turns\":6}".to_string()),
+            ..Default::default()
+        };
+
+        clear_consumed_kimi_fork_staging(&mut config);
+
+        assert_eq!(config.forked_from.as_deref(), Some("session_parent"));
+        assert_eq!(config.fork_relationship.as_deref(), Some("anchor-fork"));
+        assert!(config.fork_anchor.is_some());
+        assert_eq!(config.kimi_fork_rollback_turns, None);
+        assert_eq!(config.kimi_fork_expected_horizon, None);
+    }
 
     #[test]
     fn buffered_idle_agent_event_preempts_and_disables_on_disconnect() {

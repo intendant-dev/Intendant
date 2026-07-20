@@ -8,10 +8,12 @@
 //
 // Usage:
 //   node driver.cjs [--binary <path>] [--workdir <path>] [--port <n>]
-//                   [--keep] [--quick]
+//                   [--keep] [--quick] [--background-only]
 //
 // --quick skips the slow steering/interrupt/background-agent phases. The
 // default is the exhaustive acceptance scenario.
+// --background-only runs the native background-agent phase after startup,
+// which is useful for focused compatibility diagnosis.
 
 "use strict";
 
@@ -25,6 +27,7 @@ const path = require("path");
 const MODEL = "kimi-code/kimi-for-coding";
 const HIGHSPEED_MODEL = "kimi-code/kimi-for-coding-highspeed";
 const MODEL_DISPLAY = "K2.7 Coding";
+const SUPPORTED_KIMI_VERSION = /^0\.(?:27|28)\./;
 const args = process.argv.slice(2);
 
 function argValue(name, fallback) {
@@ -39,6 +42,7 @@ const STATE_HOME = path.join(ROOT, "intendant-state");
 const KIMI_HOME = path.join(ROOT, "kimi-home");
 const KEEP = args.includes("--keep");
 const QUICK = args.includes("--quick");
+const BACKGROUND_ONLY = args.includes("--background-only");
 const BINARY = path.resolve(
   argValue(
     "--binary",
@@ -55,9 +59,6 @@ const QUESTION = "Which acceptance lane should this Kimi E2E use?";
 const QUESTION_ANSWER = "Blue";
 const MULTI_QUESTION = "Which acceptance flags should this Kimi E2E record?";
 const MULTI_ANSWER = "Protocol";
-const BACKGROUND_QUESTION = "May the background Kimi E2E child continue?";
-const BACKGROUND_ANSWER = "Continue";
-
 const t0 = Date.now();
 const logLines = [];
 const checks = [];
@@ -114,7 +115,11 @@ function eventTargets(event, ...ids) {
 }
 
 function isTurnEnd(event) {
-  return event.event === "task_complete" || event.event === "round_complete";
+  return (
+    event.event === "done_signal" ||
+    event.event === "task_complete" ||
+    event.event === "round_complete"
+  );
 }
 
 function resultEvent(event, op) {
@@ -168,6 +173,34 @@ function sessionRowForId(body, id) {
       row?.intendant_session_id,
     ].includes(id),
   );
+}
+
+function kimiProfileRowsForId(body, id) {
+  if (!id) return [];
+  return sessionRows(body)
+    .filter((row) =>
+      [
+        row?.session_id,
+        row?.resume_id,
+        row?.backend_session_id,
+        row?.intendant_session_id,
+      ].includes(id),
+    )
+    .map((row) => ({
+      session_id: row?.session_id,
+      resume_id: row?.resume_id,
+      backend_session_id: row?.backend_session_id,
+      intendant_session_id: row?.intendant_session_id,
+      source: row?.source,
+      backend_source: row?.backend_source,
+      configured_source: row?.configured_source,
+      kimi_model: row?.kimi_model,
+      kimi_thinking: row?.kimi_thinking,
+      kimi_permission_mode: row?.kimi_permission_mode,
+      kimi_allowed_tools: row?.kimi_allowed_tools,
+      kimi_plan_mode: row?.kimi_plan_mode,
+      kimi_swarm_mode: row?.kimi_swarm_mode,
+    }));
 }
 
 function worktreeSnapshot(root) {
@@ -557,7 +590,13 @@ async function httpJson(port, pathname, options = {}, timeoutMs = 30_000) {
   throw new Error(`HTTP ${pathname} failed: ${lastError}`);
 }
 
-async function pollJson(port, pathname, predicate, timeoutMs = 45_000) {
+async function pollJson(
+  port,
+  pathname,
+  predicate,
+  timeoutMs = 45_000,
+  describeLast,
+) {
   const deadline = Date.now() + timeoutMs;
   let lastBody;
   let lastError;
@@ -570,8 +609,11 @@ async function pollJson(port, pathname, predicate, timeoutMs = 45_000) {
     }
     await sleep(750);
   }
+  const lastDescription = describeLast
+    ? describeLast(lastBody)
+    : JSON.stringify(lastBody).slice(0, 500);
   throw new Error(
-    `poll ${pathname} timed out; last=${JSON.stringify(lastBody).slice(0, 500)} ` +
+    `poll ${pathname} timed out; last=${lastDescription} ` +
       `error=${lastError || "none"}`,
   );
 }
@@ -648,6 +690,227 @@ async function pollActiveTools(
   );
 }
 
+async function exerciseBackgroundTask(run, port, wrapperId, sessionId) {
+  // Use one short child to prove output persistence and a second long child
+  // to prove live inspection and cancellation. Kimi 0.28 can stall a coder
+  // subagent's model stream before a manual-mode tool call is emitted, so
+  // child approval routing stays covered by hermetic event tests while this
+  // authenticated phase exercises the native background surface in yolo
+  // mode. Main-agent native approvals are exercised above.
+  await expectAction(run, sessionId, "permission-mode", { mode: "yolo" });
+  const completedMark = run.mark();
+  run.send({
+    action: "follow_up",
+    session_id: sessionId,
+    direct: true,
+    text:
+      'Call the Agent tool exactly once with description "kimi e2e output", ' +
+      'subagent_type "coder", run_in_background true, and prompt: ' +
+      "`Reply with exactly BACKGROUND_CHILD_OUTPUT_OK and do not use tools.` " +
+      "After launching it, do not poll or wait; reply exactly " +
+      "BACKGROUND_OUTPUT_LAUNCHED.",
+  });
+  const completedRelationship = await run.waitFor(
+    "background output subagent relationship",
+    (event) =>
+      event.event === "session_relationship" &&
+      event.relationship === "subagent" &&
+      event.parent_session_id === sessionId,
+    180_000,
+    completedMark,
+  );
+  await run.waitFor(
+    "background output launch response",
+    (event) =>
+      event.event === "model_response" &&
+      responseText(event).includes("BACKGROUND_OUTPUT_LAUNCHED"),
+    180_000,
+    completedMark,
+  );
+  await run.waitFor(
+    "parent idle after background output launch",
+    (event) => isTurnEnd(event) && eventTargets(event, wrapperId, sessionId),
+    180_000,
+    completedMark,
+  );
+  check(
+    "background-subagent-scoped",
+    /^session_.+:.+/.test(completedRelationship.child_session_id || ""),
+    completedRelationship.child_session_id || "",
+  );
+  let taskList;
+  let taskLine;
+  const completedTaskDeadline = Date.now() + 120_000;
+  while (Date.now() < completedTaskDeadline) {
+    taskList = await threadAction(run, sessionId, "tasks");
+    taskLine = (taskList.message || "")
+      .split("\n")
+      .find(
+        (line) => /completed/i.test(line) && /kimi e2e output/i.test(line),
+      );
+    if (taskLine) break;
+    await sleep(500);
+  }
+  const outputTaskId = taskLine?.split("\t")[0]?.trim();
+  check(
+    "background-task-listed",
+    Boolean(outputTaskId),
+    taskList?.message || "",
+  );
+  if (!outputTaskId) {
+    throw new Error("could not recover completed Kimi background task id");
+  }
+  let taskOutput;
+  const taskOutputDeadline = Date.now() + 45_000;
+  while (Date.now() < taskOutputDeadline) {
+    taskOutput = await threadAction(run, sessionId, "task-output", {
+      task_id: outputTaskId,
+      output_bytes: 65_536,
+    });
+    if (
+      taskOutput.success !== true ||
+      /BACKGROUND_CHILD_OUTPUT_OK/.test(taskOutput.message || "")
+    ) {
+      break;
+    }
+    await sleep(750);
+  }
+  check(
+    "task-output-dispatches",
+    taskOutput?.success === true,
+    taskOutput?.message || "",
+  );
+  check(
+    "background-task-native-output",
+    /BACKGROUND_CHILD_OUTPUT_OK/.test(taskOutput?.message || ""),
+    (taskOutput?.message || "").slice(0, 500),
+  );
+  const inspector = await pollJson(
+    port,
+    `/api/session/${encodeURIComponent(sessionId)}/background-tasks`,
+    (body) =>
+      body.supported === true &&
+      body.source === "kimi" &&
+      body.tasks?.some(
+        (task) => task.taskId === outputTaskId && task.hasOutput === true,
+      ),
+    45_000,
+  );
+  const inspectorTask = inspector.tasks?.find(
+    (task) => task.taskId === outputTaskId,
+  );
+  check(
+    "background-task-http-inspector",
+    inspector.supported === true &&
+      inspector.source === "kimi" &&
+      inspectorTask?.status === "completed" &&
+      inspectorTask?.running !== true,
+    JSON.stringify(inspector).slice(0, 600),
+  );
+  const output = await httpJson(
+    port,
+    `/api/session/${encodeURIComponent(sessionId)}/background-tasks/` +
+      `${encodeURIComponent(outputTaskId)}/output?tail_kb=64`,
+  );
+  check(
+    "background-task-http-output",
+    output.taskId === outputTaskId &&
+      typeof output.content === "string" &&
+      /BACKGROUND_CHILD_OUTPUT_OK/.test(output.content),
+    JSON.stringify(output).slice(0, 500),
+  );
+
+  const cancelMark = run.mark();
+  run.send({
+    action: "follow_up",
+    session_id: sessionId,
+    direct: true,
+    text:
+      'Call the Agent tool exactly once with description "kimi e2e cancel", ' +
+      'subagent_type "coder", run_in_background true, and prompt: ' +
+      "`Call Bash exactly once with command for i in $(seq 1 120); do echo " +
+      "BG_CANCEL_TICK_$i; sleep 1; done, timeout 180, and " +
+      "run_in_background false (or omitted). Do not speak before the tool " +
+      "call. After Bash finishes, reply BG_CANCEL_FINISHED.` After launching " +
+      "it, do not poll or wait; reply exactly BACKGROUND_CANCEL_LAUNCHED.",
+  });
+  const cancelRelationship = await run.waitFor(
+    "background cancellable subagent relationship",
+    (event) =>
+      event.event === "session_relationship" &&
+      event.relationship === "subagent" &&
+      event.parent_session_id === sessionId &&
+      event.child_session_id !== completedRelationship.child_session_id,
+    180_000,
+    cancelMark,
+  );
+  await run.waitFor(
+    "background cancel launch response",
+    (event) =>
+      event.event === "model_response" &&
+      responseText(event).includes("BACKGROUND_CANCEL_LAUNCHED"),
+    180_000,
+    cancelMark,
+  );
+  await run.waitFor(
+    "cancellable child Bash starts",
+    (event) =>
+      event.event === "agent_started" &&
+      event.session_id === cancelRelationship.child_session_id &&
+      /BG_CANCEL_TICK_|seq 1 120/i.test(event.commands_preview || ""),
+    180_000,
+    cancelMark,
+  );
+  let cancelTaskLine;
+  let cancelTaskList;
+  const runningTaskDeadline = Date.now() + 45_000;
+  while (Date.now() < runningTaskDeadline) {
+    cancelTaskList = await threadAction(run, sessionId, "tasks");
+    cancelTaskLine = (cancelTaskList.message || "")
+      .split("\n")
+      .find(
+        (line) => /running/i.test(line) && /kimi e2e cancel/i.test(line),
+      );
+    if (cancelTaskLine) break;
+    await sleep(500);
+  }
+  const cancelTaskId = cancelTaskLine?.split("\t")[0]?.trim();
+  check(
+    "background-running-task-listed",
+    Boolean(cancelTaskId),
+    cancelTaskList?.message || "",
+  );
+  if (!cancelTaskId) {
+    throw new Error("could not recover running Kimi background task id");
+  }
+  const runningInspector = await pollJson(
+    port,
+    `/api/session/${encodeURIComponent(sessionId)}/background-tasks`,
+    (body) =>
+      body.supported === true &&
+      body.source === "kimi" &&
+      body.tasks?.some(
+        (task) => task.taskId === cancelTaskId && task.running === true,
+      ),
+    45_000,
+  );
+  check(
+    "background-running-task-http-inspector",
+    runningInspector.tasks?.some(
+      (task) => task.taskId === cancelTaskId && task.running === true,
+    ),
+    JSON.stringify(runningInspector).slice(0, 600),
+  );
+  const cancel = await expectAction(run, sessionId, "task-cancel", {
+    task_id: cancelTaskId,
+  });
+  check(
+    "background-task-cancelled",
+    /cancelled|already/i.test(cancel.message || ""),
+    cancel.message || "",
+  );
+}
+
 function setupProject() {
   if (WORKDIR_ARG && fs.existsSync(WORKDIR)) {
     const entries = fs.readdirSync(WORKDIR);
@@ -705,7 +968,7 @@ function setupProject() {
   );
 }
 
-async function scenario(run, port) {
+async function scenario(run, port, kimiVersion) {
   await run.connect();
 
   const identity = await run.waitFor(
@@ -816,6 +1079,10 @@ async function scenario(run, port) {
     120_000,
     questionMark,
   );
+  if (BACKGROUND_ONLY) {
+    await exerciseBackgroundTask(run, port, wrapperId, sessionId);
+    return;
+  }
 
   // A one-item answer to a multi-select question must stay wire-typed as
   // `multi`; Kimi distinguishes it from a single-select response even though
@@ -882,6 +1149,17 @@ async function scenario(run, port) {
   // intentionally a read-only deterministic tool, but it proves Kimi loaded
   // the scoped server declaration and can reach Intendant through it.
   const mcpMark = run.mark();
+  let mcpApproval = null;
+  run.approvalResponder = (event) => {
+    if (
+      /intendant.*list_displays|list_displays.*intendant/i.test(
+        event.command || "",
+      )
+    ) {
+      mcpApproval = event;
+      run.approve(event);
+    }
+  };
   run.send({
     action: "follow_up",
     session_id: sessionId,
@@ -927,6 +1205,12 @@ async function scenario(run, port) {
     120_000,
     mcpMark,
   );
+  run.approvalResponder = null;
+  check(
+    "injected-intendant-mcp-approval-routing",
+    !/^0\.28\./.test(kimiVersion) || Boolean(mcpApproval),
+    mcpApproval?.command || `Kimi ${kimiVersion} required no approval`,
+  );
   check(
     "injected-intendant-mcp-round-trip",
     Boolean(mcpToolStart.item_id) &&
@@ -957,6 +1241,13 @@ async function scenario(run, port) {
   );
 
   const attachmentMark = run.mark();
+  let writeApproval = null;
+  run.approvalResponder = (event) => {
+    if (/probe\.txt|write/i.test(event.command || "")) {
+      writeApproval = event;
+      run.approve(event);
+    }
+  };
   run.send({
     action: "start_task",
     session_id: sessionId,
@@ -969,17 +1260,6 @@ async function scenario(run, port) {
     direct: true,
     attachments: [`upload:${textUpload.id}`, `upload:${imageUpload.id}`],
   });
-  const approval = await run.waitFor(
-    "file-write approval",
-    (event) =>
-      event.event === "approval_required" &&
-      /probe\.txt|write/i.test(event.command || ""),
-    120_000,
-    attachmentMark,
-  );
-  check("approval-surfaced", true, approval.command || "");
-  run.approvalResponder = (event) => run.approve(event);
-  run.approve(approval);
   const attachmentResponse = await run.waitFor(
     "attachment response",
     (event) =>
@@ -998,7 +1278,7 @@ async function scenario(run, port) {
   );
   const probePath = path.join(WORKDIR, "probe.txt");
   check(
-    "approved-write-ran",
+    "workspace-write-ran",
     fs.existsSync(probePath) &&
       fs.readFileSync(probePath, "utf8").trim() === ATTACHMENT_TOKEN,
     fs.existsSync(probePath)
@@ -1024,8 +1304,19 @@ async function scenario(run, port) {
           event.event === "log_entry" &&
           event.source === "Diff" &&
           /probe\.txt|ATTACHMENT_/.test(event.content || ""),
-      ) || /--- before|\+\+\+ after|ATTACHMENT_/.test(approval.command || ""),
-    approval.command || "",
+      ) ||
+      run.events
+        .slice(attachmentMark)
+        .some(
+          (event) =>
+            event.event === "file_changed" &&
+            event.path === "probe.txt" &&
+            event.lines_added > 0,
+        ) ||
+      /--- before|\+\+\+ after|ATTACHMENT_/.test(
+        writeApproval?.command || "",
+      ),
+    writeApproval?.command || "safe workspace write",
   );
 
   const usage = run.events.find(
@@ -1034,14 +1325,20 @@ async function scenario(run, port) {
   const nonzeroMainUsage = run.events.filter(
     (event) => event.event === "usage_update" && event.main?.tokens_used > 0,
   );
+  const allowedUsageModels = new Set(
+    [MODEL, MODEL.split("/").at(-1), MODEL_DISPLAY].map((model) =>
+      model.toLowerCase(),
+    ),
+  );
+  const canonicalUsage = nonzeroMainUsage.find((event) =>
+    allowedUsageModels.has(String(event.main?.model || "").toLowerCase()),
+  );
+  const forbiddenUsage = nonzeroMainUsage.filter((event) =>
+    /highspeed|k3/i.test(event.main?.model || ""),
+  );
   check(
     "usage-reported",
-    Boolean(usage) &&
-      nonzeroMainUsage.every(
-        (event) =>
-          [MODEL, MODEL_DISPLAY].includes(event.main?.model) &&
-          !/highspeed|k3/i.test(event.main?.model || ""),
-      ),
+    Boolean(usage) && Boolean(canonicalUsage) && forbiddenUsage.length === 0,
     usage
       ? `${usage.main.model} ${usage.main.tokens_used}/${usage.main.context_window}`
       : "none",
@@ -1145,15 +1442,25 @@ async function scenario(run, port) {
     !forkResult.error && forkResult.relationship === "anchor-fork",
     JSON.stringify(forkResult),
   );
-  const childIdentity = await run.waitFor(
-    "historical child identity",
+  const childStartup = await run.waitFor(
+    "historical child identity or startup failure",
     (event) =>
-      event.event === "session_identity" &&
-      event.source === "kimi" &&
-      event.backend_session_id !== sessionId,
+      (event.event === "session_identity" &&
+        event.source === "kimi" &&
+        event.backend_session_id !== sessionId) ||
+      (event.event === "session_ended" &&
+        event.source === "kimi" &&
+        event.session_id !== wrapperId &&
+        Boolean(event.error)),
     120_000,
     historicalMark,
   );
+  if (childStartup.event === "session_ended") {
+    throw new Error(
+      `historical child failed before identity: ${childStartup.error}`,
+    );
+  }
+  const childIdentity = childStartup;
   const historicalChild = childIdentity.backend_session_id;
   const relationship = await run.waitFor(
     "historical fork relationship",
@@ -1500,6 +1807,31 @@ async function scenario(run, port) {
 
   // A native head fork is attached as its own managed Kimi wrapper, preserving
   // the exact live profile and tool set before accepting independent work.
+  const parentProfileSessions = await pollJson(
+    port,
+    "/api/sessions",
+    (body) => {
+      const row = sessionRowForId(body, sessionId);
+      return Boolean(
+        row?.kimi_model &&
+          row?.kimi_thinking &&
+          row?.kimi_permission_mode &&
+          Array.isArray(row?.kimi_allowed_tools),
+      );
+    },
+    60_000,
+  );
+  const parentProfileRow = sessionRowForId(parentProfileSessions, sessionId);
+  const parentConfiguredTools = [
+    ...(parentProfileRow?.kimi_allowed_tools || []),
+  ]
+    .filter((value) => typeof value === "string")
+    .sort();
+  check(
+    "effective-thinking-is-backend-echoed",
+    ["high", "on"].includes(parentProfileRow?.kimi_thinking),
+    JSON.stringify(parentProfileRow).slice(0, 1_200),
+  );
   const headForkMark = run.mark();
   const headFork = await expectAction(run, sessionId, "fork", {
     name: "Kimi head E2E fork",
@@ -1553,8 +1885,22 @@ async function scenario(run, port) {
   const headForkSessions = await pollJson(
     port,
     "/api/sessions",
-    (body) => Boolean(sessionRowForId(body, headForkId)),
+    (body) => {
+      const row = sessionRowForId(body, headForkId);
+      const tools = [...(row?.kimi_allowed_tools || [])]
+        .filter((value) => typeof value === "string")
+        .sort();
+      return (
+        row?.kimi_model === parentProfileRow?.kimi_model &&
+        row?.kimi_thinking === parentProfileRow?.kimi_thinking &&
+        row?.kimi_permission_mode === parentProfileRow?.kimi_permission_mode &&
+        row?.kimi_plan_mode === parentProfileRow?.kimi_plan_mode &&
+        row?.kimi_swarm_mode === parentProfileRow?.kimi_swarm_mode &&
+        sameStrings(tools, parentConfiguredTools)
+      );
+    },
     60_000,
+    (body) => JSON.stringify(kimiProfileRowsForId(body, headForkId)),
   );
   const headForkRow = sessionRowForId(headForkSessions, headForkId);
   const headForkConfiguredTools = [...(headForkRow?.kimi_allowed_tools || [])]
@@ -1562,11 +1908,13 @@ async function scenario(run, port) {
     .sort();
   check(
     "head-fork-persists-exact-live-profile",
-    headForkRow?.kimi_model === MODEL &&
-      headForkRow?.kimi_thinking === "high" &&
-      headForkRow?.kimi_permission_mode === "yolo" &&
-      headForkRow?.kimi_plan_mode === false &&
-      headForkRow?.kimi_swarm_mode === false &&
+    headForkRow?.kimi_model === parentProfileRow?.kimi_model &&
+      headForkRow?.kimi_thinking === parentProfileRow?.kimi_thinking &&
+      headForkRow?.kimi_permission_mode ===
+        parentProfileRow?.kimi_permission_mode &&
+      headForkRow?.kimi_plan_mode === parentProfileRow?.kimi_plan_mode &&
+      headForkRow?.kimi_swarm_mode === parentProfileRow?.kimi_swarm_mode &&
+      sameStrings(headForkConfiguredTools, parentConfiguredTools) &&
       sameStrings(headForkConfiguredTools, restoredTools),
     JSON.stringify(headForkRow).slice(0, 1_200),
   );
@@ -1621,16 +1969,17 @@ async function scenario(run, port) {
     headForkStopMark,
   );
 
-  // Compact in place, then force one TodoWrite plan event and recall evidence
+  // Compact in place, then force one native todo plan event and recall evidence
   // from before compaction.
   await expectAction(run, sessionId, "compact", {}, 180_000);
   const compactMark = run.mark();
+  const todoTool = restoredTools.includes("TodoList") ? "TodoList" : "TodoWrite";
   run.send({
     action: "follow_up",
     session_id: sessionId,
     direct: true,
     text:
-      'Call TodoWrite exactly once with two items: "verify compact recall" ' +
+      `Call ${todoTool} exactly once with two items: "verify compact recall" ` +
       '(in_progress) and "finish E2E" (pending). Then reply with exactly ' +
       `COMPACT_RECALL=${ATTACHMENT_TOKEN}.`,
   });
@@ -1683,6 +2032,7 @@ async function scenario(run, port) {
       120_000,
       steerMark,
     );
+    const activeSteerMark = run.mark();
     const steerSentAt = Date.now();
     run.send({
       action: "steer",
@@ -1693,7 +2043,13 @@ async function scenario(run, port) {
         "containing exactly STEERED_IN_TURN.",
       attachments: [],
     });
-    await run.waitFor("steered turn end", isTurnEnd, 180_000, steerMark);
+    await run.waitFor(
+      "steered parent turn end",
+      (event) =>
+        isTurnEnd(event) && eventTargets(event, wrapperId, sessionId),
+      180_000,
+      activeSteerMark,
+    );
     check(
       "native-mid-turn-steer",
       fs.existsSync(steerPath) &&
@@ -1703,7 +2059,7 @@ async function scenario(run, port) {
     check(
       "steer-delivery-ack",
       run.events
-        .slice(steerMark)
+        .slice(activeSteerMark)
         .some(
           (event) =>
             event.event === "steer_delivered" && event.mid_turn === true,
@@ -1913,184 +2269,7 @@ async function scenario(run, port) {
   if (QUICK) {
     skip("background-task-output-cancel", "--quick selected");
   } else {
-    // Background Agent task: after the parent is idle, resolve the child's
-    // structured question and Bash approval through the child-scoped UI rail,
-    // then inspect output and cancel it.
-    await expectAction(run, sessionId, "permission-mode", { mode: "manual" });
-    const backgroundMark = run.mark();
-    run.send({
-      action: "follow_up",
-      session_id: sessionId,
-      direct: true,
-      text:
-        'Call the Agent tool exactly once with description "kimi e2e sleeper", ' +
-        'subagent_type "coder", run_in_background true, and prompt: ' +
-        "`First call AskUserQuestion exactly once. Ask " +
-        `${BACKGROUND_QUESTION} with header Background and the single-select ` +
-        `option ${BACKGROUND_ANSWER} (description Proceed). After the answer, ` +
-        "use Bash to run for i in $(seq 1 120); do echo BG_TICK_$i; " +
-        "sleep 1; done; then reply BG_FINISHED.` After launching it, do not " +
-        "poll or wait; reply exactly BACKGROUND_KIMI_LAUNCHED.",
-    });
-    const bgRelationship = await run.waitFor(
-      "background subagent relationship",
-      (event) =>
-        event.event === "session_relationship" &&
-        event.relationship === "subagent" &&
-        event.parent_session_id === sessionId,
-      180_000,
-      backgroundMark,
-    );
-    await run.waitFor(
-      "background launch response",
-      (event) =>
-        event.event === "model_response" &&
-        responseText(event).includes("BACKGROUND_KIMI_LAUNCHED"),
-      180_000,
-      backgroundMark,
-    );
-    const backgroundParentEnd = await run.waitFor(
-      "parent idle after background launch",
-      (event) =>
-        isTurnEnd(event) && eventTargets(event, wrapperId, sessionId),
-      180_000,
-      backgroundMark,
-    );
-    check(
-      "background-subagent-scoped",
-      /^session_.+:.+/.test(bgRelationship.child_session_id || ""),
-      bgRelationship.child_session_id || "",
-    );
-    const backgroundQuestion = await run.waitFor(
-      "idle background child question",
-      (event) =>
-        event.event === "user_question" &&
-        event.session_id === bgRelationship.child_session_id &&
-        event.questions?.some(
-          (question) => question.question === BACKGROUND_QUESTION,
-        ),
-      180_000,
-      backgroundMark,
-    );
-    check(
-      "idle-child-question-arrives-after-parent-end",
-      run.events.indexOf(backgroundQuestion) >
-        run.events.indexOf(backgroundParentEnd),
-      `parent=${run.events.indexOf(backgroundParentEnd)} child=${run.events.indexOf(backgroundQuestion)}`,
-    );
-    let idleChildApproval;
-    run.approvalResponder = (event) => {
-      idleChildApproval = event;
-      run.approve(event);
-    };
-    run.send({
-      action: "answer_question",
-      session_id: backgroundQuestion.session_id,
-      id: backgroundQuestion.id,
-      answers: { [BACKGROUND_QUESTION]: BACKGROUND_ANSWER },
-    });
-    await run.waitFor(
-      "idle background child Bash approval",
-      (event) =>
-        event.event === "approval_required" &&
-        event.session_id === bgRelationship.child_session_id &&
-        /BG_TICK_|seq 1 120/i.test(event.command || ""),
-      180_000,
-      backgroundMark,
-    );
-    check(
-      "idle-child-approval-is-child-scoped",
-      idleChildApproval?.session_id === bgRelationship.child_session_id,
-      JSON.stringify(idleChildApproval || {}),
-    );
-    const backgroundChildTools = await expectAction(
-      run,
-      bgRelationship.child_session_id,
-      "tools",
-    );
-    check(
-      "idle-subagent-public-control-rail",
-      registeredToolNames(backgroundChildTools.message).length > 2,
-      (backgroundChildTools.message || "").slice(0, 600),
-    );
-    const taskList = await expectAction(run, sessionId, "tasks");
-    const taskLine = (taskList.message || "")
-      .split("\n")
-      .find(
-        (line) => /running/i.test(line) && /kimi e2e sleeper|agent/i.test(line),
-      );
-    const taskId = taskLine?.split("\t")[0]?.trim();
-    check("background-task-listed", Boolean(taskId), taskList.message || "");
-    if (!taskId) throw new Error("could not recover running Kimi task id");
-
-    let taskOutput;
-    const taskOutputDeadline = Date.now() + 45_000;
-    while (Date.now() < taskOutputDeadline) {
-      taskOutput = await threadAction(run, sessionId, "task-output", {
-        task_id: taskId,
-        output_bytes: 65_536,
-      });
-      if (
-        taskOutput.success !== true ||
-        /BG_TICK_\d+/.test(taskOutput.message || "")
-      ) {
-        break;
-      }
-      await sleep(750);
-    }
-    check(
-      "task-output-dispatches",
-      taskOutput?.success === true,
-      taskOutput?.message || "",
-    );
-    check(
-      "background-task-native-output",
-      /BG_TICK_\d+/.test(taskOutput?.message || ""),
-      (taskOutput?.message || "").slice(0, 500),
-    );
-    const inspector = await pollJson(
-      port,
-      `/api/session/${encodeURIComponent(sessionId)}/background-tasks`,
-      (body) =>
-        body.supported === true &&
-        body.source === "kimi" &&
-        body.tasks?.some(
-          (task) => task.taskId === taskId && task.hasOutput === true,
-        ),
-      45_000,
-    );
-    const inspectorTask = inspector.tasks?.find(
-      (task) => task.taskId === taskId,
-    );
-    check(
-      "background-task-http-inspector",
-      inspector.supported === true &&
-        inspector.source === "kimi" &&
-        Boolean(inspectorTask?.running),
-      JSON.stringify(inspector).slice(0, 600),
-    );
-    const output = await httpJson(
-      port,
-      `/api/session/${encodeURIComponent(sessionId)}/background-tasks/` +
-        `${encodeURIComponent(taskId)}/output?tail_kb=64`,
-    );
-    check(
-      "background-task-http-output",
-      output.taskId === taskId &&
-        typeof output.content === "string" &&
-        /BG_TICK_\d+/.test(output.content),
-      JSON.stringify(output).slice(0, 500),
-    );
-    const cancel = await expectAction(run, sessionId, "task-cancel", {
-      task_id: taskId,
-    });
-    check(
-      "background-task-cancelled",
-      /cancelled|already/i.test(cancel.message || ""),
-      cancel.message || "",
-    );
-    run.approvalResponder = null;
-    await expectAction(run, sessionId, "permission-mode", { mode: "yolo" });
+    await exerciseBackgroundTask(run, port, wrapperId, sessionId);
   }
 
   // Native session lifecycle controls.
@@ -2238,6 +2417,20 @@ async function scenario(run, port) {
     responseText(clearedContextResponse).slice(0, 400),
   );
 
+  const availability = await httpJson(port, "/api/external-agents");
+  const kimiAvailability = availability.external_agents?.find(
+    (entry) => entry.id === "kimi",
+  );
+  const compatibility = kimiAvailability?.compatibility;
+  check(
+    "passive-protocol-watch-is-clean",
+    compatibility?.state === "no_drift_observed" &&
+      compatibility?.reported_version === kimiVersion &&
+      compatibility?.finding_counts?.warning === 0 &&
+      compatibility?.finding_counts?.error === 0,
+    JSON.stringify(compatibility || {}).slice(0, 600),
+  );
+
   return { sessionId, wrapperId, resumedWrapperId: resumedIdentity.session_id };
 }
 
@@ -2256,14 +2449,14 @@ async function main() {
   const version = execFileSync(KIMI_COMMAND, ["--version"], {
     encoding: "utf8",
   }).trim();
-  check("kimi-installed", /^0\.27\./.test(version), version);
+  check("kimi-installed", SUPPORTED_KIMI_VERSION.test(version), version);
   copyKimiAuthState();
   setupProject();
 
   const port = REQUESTED_PORT || (await freePort());
   const run = new IntendantRun(port);
   try {
-    await scenario(run, port);
+    await scenario(run, port, version);
   } finally {
     await run.stop();
   }

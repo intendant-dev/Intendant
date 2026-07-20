@@ -95,6 +95,23 @@ pub struct SessionSupervisor {
     exec: Arc<exec::IntakeExecutor>,
 }
 
+/// The foreground web shape needs session supervision before its primary
+/// task ends (for parallel create/resume/fork requests), but must leave
+/// untargeted primary-session controls to the foreground dispatcher. Once
+/// both ordered intent streams reach the primary session's `SessionEnded`
+/// marker, the dispatcher exits and this same receiver promotes in place to
+/// the daemon's full supervisor. Reusing one lossless intent subscription
+/// avoids both a handoff gap and duplicate launches.
+pub(crate) struct ForegroundSupervisorHandle {
+    handle: JoinHandle<()>,
+}
+
+impl ForegroundSupervisorHandle {
+    pub(crate) async fn wait(self) {
+        let _ = self.handle.await;
+    }
+}
+
 const EXTERNAL_ATTACH_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SESSION_STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const SESSION_RESTART_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
@@ -543,8 +560,8 @@ impl SessionSupervisor {
     }
 
     /// Act on one intent-lane event. Split from the receive loops so the
-    /// primary supervisor and the resume listener share exactly one
-    /// action path; `filter_session_control` is the resume listener's
+    /// primary supervisor and the foreground listener share exactly one
+    /// action path; `filter_session_control` is the foreground listener's
     /// `should_handle_session_control` gate.
     async fn handle_intent_lane_event(&self, event: AppEvent, filter_session_control: bool) {
         match event {
@@ -578,7 +595,7 @@ impl SessionSupervisor {
     }
 
     /// The supervisor's receive loop, shared by [`Self::spawn`] and
-    /// [`Self::spawn_resume_listener`].
+    /// [`Self::spawn_foreground_listener`].
     ///
     /// Two lanes, one loop:
     /// - the lossless intent lane ([`EventBus::subscribe_intents`]) carries
@@ -615,15 +632,28 @@ impl SessionSupervisor {
         self,
         mut intent_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
         mut rx: tokio::sync::broadcast::Receiver<AppEvent>,
-        filter_session_control: bool,
+        foreground_primary_session_id: Option<String>,
     ) {
+        let mut full_session_control = foreground_primary_session_id.is_none();
         loop {
             tokio::select! {
                 biased;
                 intent = intent_rx.recv() => match intent {
                     Some(event) => {
-                        self.handle_intent_lane_event(event, filter_session_control)
+                        let promote_after_event = foreground_primary_session_id
+                            .as_ref()
+                            .is_some_and(|primary| {
+                                matches!(
+                                    &event,
+                                    AppEvent::SessionEnded { session_id, .. }
+                                        if session_id == primary
+                                )
+                            });
+                        self.handle_intent_lane_event(event, !full_session_control)
                             .await;
+                        if promote_after_event {
+                            full_session_control = true;
+                        }
                     }
                     None => break,
                 },
@@ -639,18 +669,17 @@ impl SessionSupervisor {
     pub fn spawn(self) -> JoinHandle<()> {
         let intent_rx = self.config.bus.subscribe_intents();
         let rx = self.config.bus.subscribe();
-        tokio::spawn(self.run_event_loop(intent_rx, rx, false))
+        tokio::spawn(self.run_event_loop(intent_rx, rx, None))
     }
 
-    pub fn spawn_resume_listener(self) -> JoinHandle<()> {
+    pub(crate) fn spawn_foreground_listener(
+        self,
+        primary_session_id: String,
+    ) -> ForegroundSupervisorHandle {
         let intent_rx = self.config.bus.subscribe_intents();
         let rx = self.config.bus.subscribe();
-        tokio::spawn(self.run_event_loop(intent_rx, rx, true))
-    }
-
-    pub async fn run(self) {
-        let handle = self.spawn();
-        let _ = handle.await;
+        let handle = tokio::spawn(self.run_event_loop(intent_rx, rx, Some(primary_session_id)));
+        ForegroundSupervisorHandle { handle }
     }
 
     fn attachment_store_scopes(&self, primary: &Path) -> Vec<crate::global_store::StoreScope> {

@@ -9,6 +9,10 @@
 // god-file split design).
 use crate::*;
 
+fn suppress_persistent_tool_starts(backend: Option<&external_agent::AgentBackend>) -> bool {
+    !matches!(backend, Some(external_agent::AgentBackend::Kimi))
+}
+
 pub(crate) fn get_task_from_flags_or_env(flags: &CliFlags) -> Result<String, CallerError> {
     if let Some(ref task) = flags.task {
         return Ok(task.clone());
@@ -351,6 +355,14 @@ pub(crate) async fn run_with_presence(
         emit_native_session_capabilities(&bus, local_session_id.as_deref());
     }
     let mut outer_bus_rx = bus.subscribe();
+    // Foreground startup sessions are not owned by SessionSupervisor. Keep a
+    // lossless control-intent receiver for their lifetime so Stop cannot be
+    // dropped behind high-volume model/context traffic while this loop is
+    // idle. Active external drains subscribe independently; fan-out leaves
+    // the same Stop queued here so a drain-local termination also tears down
+    // the outer presence session instead of silently returning to idle.
+    let mut outer_intent_rx = bus.subscribe_intents();
+    let mut outer_intent_open = true;
     // Turn controls (steer / interrupt) need to be subscribed before the
     // turn-start RPC. Otherwise an immediate follow-up can land during the
     // handoff and miss the running-turn drain entirely.
@@ -382,10 +394,11 @@ pub(crate) async fn run_with_presence(
         /// or the backend starting a spontaneous turn (e.g. Claude Code's
         /// task-notification round after an async Agent-tool child ends).
         IdleAgentEvent(Box<external_agent::AgentEvent>),
+        Stop(String),
         Done,
     }
 
-    loop {
+    'presence_tasks: loop {
         // Queued steers with no turn to ride (the backend finished before
         // the queue drained, or a steer arrived while idle): synthesize an
         // empty task — the send path prepends queued steers as `[User]`
@@ -441,6 +454,29 @@ pub(crate) async fn run_with_presence(
         } else {
             tokio::select! {
                 biased;
+                maybe_intent = outer_intent_rx.recv(), if outer_intent_open => {
+                    match maybe_intent {
+                        Some(event) => {
+                            let alias_session_id = persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.clone());
+                            if let Some(reason) = external_stop_reason_from_control_intent(
+                                &event,
+                                &local_session_id,
+                                &alias_session_id,
+                                None,
+                            ) {
+                                OuterSignal::Stop(reason)
+                            } else {
+                                continue;
+                            }
+                        }
+                        None => {
+                            outer_intent_open = false;
+                            continue;
+                        }
+                    }
+                },
                 env = task_rx.recv() => match env {
                     Some(e) => OuterSignal::Task(e),
                     None => OuterSignal::Done,
@@ -684,6 +720,17 @@ pub(crate) async fn run_with_presence(
                         );
                         continue;
                     }
+                    Ok(AppEvent::SessionStopRequested { session_id, reason })
+                        if event_targets_session_or_alias(
+                            &session_id,
+                            &local_session_id,
+                            &persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.clone()),
+                        ) =>
+                    {
+                        OuterSignal::Stop(reason)
+                    }
                     // Any other bus event: skip, keep selecting. Lagged /
                     // Closed also fall through — task_rx close is the
                     // authoritative "we're done" signal.
@@ -713,6 +760,10 @@ pub(crate) async fn run_with_presence(
         let envelope = match signal {
             OuterSignal::Task(e) => e,
             OuterSignal::Done => break,
+            OuterSignal::Stop(reason) => {
+                cumulative_stats.terminal_outcome = Some(reason);
+                break;
+            }
             OuterSignal::ThreadAction {
                 session_id,
                 op,
@@ -970,6 +1021,11 @@ pub(crate) async fn run_with_presence(
                                             Ok(Some(DrainOutcome::Terminated {
                                                 reason, ..
                                             })) => {
+                                                if reason == "stopped by user" {
+                                                    cumulative_stats.terminal_outcome =
+                                                        Some(reason);
+                                                    break 'presence_tasks;
+                                                }
                                                 bus.send(AppEvent::PresenceLog {
                                                     message: format!(
                                                         "External agent terminated: {}",
@@ -1077,6 +1133,10 @@ pub(crate) async fn run_with_presence(
                                         });
                                     }
                                     Ok(DrainOutcome::Terminated { reason, .. }) => {
+                                        if reason == "stopped by user" {
+                                            cumulative_stats.terminal_outcome = Some(reason);
+                                            break 'presence_tasks;
+                                        }
                                         bus.send(AppEvent::PresenceLog {
                                             message: format!(
                                                 "External agent terminated: {}",
@@ -1661,7 +1721,9 @@ pub(crate) async fn run_with_presence(
                             .map(|backend| backend.to_string())
                             .unwrap_or_else(|| "Codex".to_string()),
                     ),
-                    suppress_agent_started: true,
+                    suppress_agent_started: suppress_persistent_tool_starts(
+                        persistent_agent_backend.as_ref(),
+                    ),
                     persist_model_responses_inline: false,
                     headless: false,
                     context_injection: &context_injection,
@@ -1736,6 +1798,20 @@ pub(crate) async fn run_with_presence(
                             session_id: session_log_id(&session_log),
                             facts,
                         });
+                    }
+                    external_agent::AgentEvent::CwdAnnounced { cwd } => {
+                        // First-hand cwd metadata is ambient. In particular,
+                        // Kimi publishes it during an empty-task resume/fork
+                        // attach, when no turn exists for the spontaneous
+                        // observe drain to complete.
+                        if let Some(event) = idle_external_cwd_event(
+                            &event_thread_id,
+                            &local_session_id,
+                            &persistent_thread_id,
+                            cwd,
+                        ) {
+                            bus.send(event);
+                        }
                     }
                     external_agent::AgentEvent::BackendError {
                         message,
@@ -1961,6 +2037,10 @@ pub(crate) async fn run_with_presence(
                                     });
                                 }
                                 DrainOutcome::Terminated { reason, .. } => {
+                                    if reason == "stopped by user" {
+                                        cumulative_stats.terminal_outcome = Some(reason);
+                                        break 'presence_tasks;
+                                    }
                                     slog(&session_log, |l| {
                                         l.warn(&format!(
                                             "External agent terminated during spontaneous round: {reason}"
@@ -2534,7 +2614,7 @@ pub(crate) async fn run_with_presence(
                     approval_registry: &approval_registry,
                     json_approval: None,
                     agent_source: Some(backend.to_string()),
-                    suppress_agent_started: true,
+                    suppress_agent_started: suppress_persistent_tool_starts(Some(backend)),
                     persist_model_responses_inline: false,
                     headless: false,
                     context_injection: &context_injection,
@@ -3268,6 +3348,10 @@ pub(crate) async fn run_with_presence(
                         cumulative_stats.rounds += 1;
                     }
                     DrainOutcome::Terminated { reason, .. } => {
+                        if reason == "stopped by user" {
+                            cumulative_stats.terminal_outcome = Some(reason);
+                            break 'presence_tasks;
+                        }
                         bus.send(AppEvent::PresenceLog {
                             message: format!("External agent terminated: {}", reason),
                             level: Some(types::LogLevel::Error),
@@ -3503,6 +3587,14 @@ pub(crate) async fn run_with_presence(
                     });
                 }
             }
+        }
+    }
+
+    if let Some(mut agent) = persistent_agent.take() {
+        if let Err(e) = agent.shutdown().await {
+            slog(&session_log, |l| {
+                l.warn(&format!("Agent shutdown error: {}", e))
+            });
         }
     }
 
@@ -3777,4 +3869,23 @@ pub(crate) async fn run_direct_mode(
         native.orchestration.as_ref(),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_kimi_preserves_exact_native_tool_starts() {
+        assert!(!suppress_persistent_tool_starts(Some(
+            &external_agent::AgentBackend::Kimi
+        )));
+        assert!(suppress_persistent_tool_starts(Some(
+            &external_agent::AgentBackend::Codex
+        )));
+        assert!(suppress_persistent_tool_starts(Some(
+            &external_agent::AgentBackend::ClaudeCode
+        )));
+        assert!(suppress_persistent_tool_starts(None));
+    }
 }
