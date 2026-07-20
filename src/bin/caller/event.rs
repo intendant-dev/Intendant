@@ -279,8 +279,9 @@ pub enum AppEvent {
     SteerAccepted {
         session_id: Option<String>,
         id: String,
-        /// Short human-readable detail for UI display, e.g. "Codex accepted
-        /// the steer; waiting for the next runtime checkpoint".
+        /// Short human-readable detail for UI display, e.g. "Codex injected
+        /// the message into the running turn — awaiting the model's next
+        /// activity".
         reason: String,
     },
     /// Mid-turn steering could not be delivered natively by the current
