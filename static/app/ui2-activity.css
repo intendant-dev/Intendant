@@ -1636,6 +1636,37 @@ html.ui-v2 #question-panel .question-optional-chip {
   border: 1px solid var(--line);
   background: transparent;
 }
+html.ui-v2 #question-panel .question-followup-toggle {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+}
+html.ui-v2 #question-panel .question-followup-toggle:hover,
+html.ui-v2 #question-panel .question-followup-toggle.open { color: var(--iris-2); }
+html.ui-v2 #question-panel .question-followup-input,
+html.ui-v2 #question-panel .question-preview-note {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg-1);
+  color: var(--text);
+}
+html.ui-v2 #question-panel .question-followup-input:focus,
+html.ui-v2 #question-panel .question-preview-note:focus {
+  border-color: rgba(var(--iris-rgb), .45);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+  outline: none;
+}
+html.ui-v2 #question-panel .question-preview-note-btn {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+}
+html.ui-v2 #question-panel .question-preview-note-btn:hover,
+html.ui-v2 #question-panel .question-preview-note-btn.open {
+  background: var(--surface-2);
+  color: var(--text);
+}
 html.ui-v2 #question-panel .question-header-chip {
   font-family: var(--mono);
   font-size: 9px;

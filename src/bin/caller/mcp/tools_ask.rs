@@ -567,13 +567,53 @@ fn ask_result(
     result
 }
 
+/// The answered-path result: `ask_result` plus per-question `followup`
+/// and `annotations` — and a nudge in `guidance` when any follow-up
+/// arrived, so agents reliably address them (in chat or with a narrowed
+/// re-ask) instead of skimming past.
+#[allow(clippy::too_many_arguments)]
+fn ask_result_with_followups(
+    status: &str,
+    id: u64,
+    session_id: &str,
+    questions: &[crate::types::UserQuestion],
+    answers: std::collections::HashMap<String, String>,
+    selections: Option<&std::collections::HashMap<String, Vec<String>>>,
+    followups: &std::collections::HashMap<String, String>,
+    annotations: &std::collections::HashMap<String, Vec<crate::types::QuestionAnnotation>>,
+) -> serde_json::Value {
+    let mut result = ask_result(status, id, session_id, questions, answers, selections, None);
+    if let Some(entries) = result["questions"].as_array_mut() {
+        for entry in entries {
+            let Some(question) = entry["question"].as_str().map(str::to_string) else {
+                continue;
+            };
+            if let Some(followup) = followups.get(&question) {
+                entry["followup"] = serde_json::Value::String(followup.clone());
+            }
+            if let Some(notes) = annotations.get(&question) {
+                if !notes.is_empty() {
+                    entry["annotations"] = serde_json::json!(notes);
+                }
+            }
+        }
+    }
+    if !followups.is_empty() {
+        result["guidance"] = serde_json::Value::String(
+            "The user wrote follow-up question(s)/notes on specific questions (see              questions[].followup and questions[].annotations). Address them — reply in the              conversation or raise a narrowed re-ask — before treating the unanswered parts              as settled."
+                .to_string(),
+        );
+    }
+    result
+}
+
 fn guidance_answers(question: &str, guidance: &str) -> std::collections::HashMap<String, String> {
     std::collections::HashMap::from([(question.to_string(), guidance.to_string())])
 }
 
 impl IntendantServer {
     #[tool(
-        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total per ask. Or ask up to 4 questions on ONE panel via questions: [{question, header?, options?, pick_min?, pick_max?, free_text?, previews?}] — pick_min/pick_max bound how many options may be selected (minimum 0 = optional question; default exactly one), free_text: false disables typed answers, and every answer returns together. Returns {status, answer, answers, questions: [{question, header, answer, selected?}]}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900; the dashboard shows the expiry as a live countdown, and the user may hold the question open — a held ask blocks past the wait until answered or dismissed. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
+        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total per ask. Or ask up to 4 questions on ONE panel via questions: [{question, header?, options?, pick_min?, pick_max?, free_text?, previews?}] — pick_min/pick_max bound how many options may be selected (minimum 0 = optional question; default exactly one), free_text: false disables typed answers, and every answer returns together. The user can also attach a follow-up per question and anchored preview notes; a follow-up may STAND IN for an answer — address it (reply in conversation or raise a narrowed re-ask) before treating that part as settled. Returns {status, answer, answers, questions: [{question, header, answer, selected?, followup?, annotations?: [{preview, note}]}]}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900; the dashboard shows the expiry as a live countdown, and the user may hold the question open — a held ask blocks past the wait until answered or dismissed. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
     )]
     pub(crate) async fn ask_user(&self, Parameters(params): Parameters<AskUserParams>) -> String {
         match self.ask_user_inner(params).await {
@@ -816,17 +856,20 @@ impl IntendantServer {
                     id: answer_id,
                     answers,
                     selections,
+                    followups,
+                    annotations,
                     ..
                 } if answer_id == id => {
                     guard.resolve("answer");
-                    return Ok(ask_result(
+                    return Ok(ask_result_with_followups(
                         "answered",
                         id,
                         &session_id,
                         &questions,
                         answers,
                         Some(&selections),
-                        None,
+                        &followups,
+                        &annotations,
                     ));
                 }
                 // A bare approve comes from callers that only speak the
@@ -1170,6 +1213,67 @@ mod tests {
         let err = build_ask_user_questions(&params).unwrap_err();
         assert!(err.starts_with("questions[1]: "), "{err}");
         assert!(err.contains("total preview payload"), "{err}");
+    }
+
+    #[test]
+    fn ask_result_followups_and_annotations_ride_their_questions() {
+        let questions = vec![
+            crate::types::UserQuestion {
+                question: "Which lineage?".into(),
+                header: "Lineage".into(),
+                options: vec![],
+                multi_select: false,
+                pick_min: None,
+                pick_max: None,
+                free_text: None,
+                previews: Vec::new(),
+            },
+            crate::types::UserQuestion {
+                question: "Which headers?".into(),
+                header: "Headers".into(),
+                options: vec![],
+                multi_select: false,
+                pick_min: None,
+                pick_max: None,
+                free_text: None,
+                previews: Vec::new(),
+            },
+        ];
+        // Q1 answered with an anchored note; Q2 unanswered, follow-up only.
+        let answers =
+            std::collections::HashMap::from([("Which lineage?".to_string(), "B".to_string())]);
+        let followups = std::collections::HashMap::from([(
+            "Which headers?".to_string(),
+            "What does 'monoline' mean here?".to_string(),
+        )]);
+        let annotations = std::collections::HashMap::from([(
+            "Which lineage?".to_string(),
+            vec![crate::types::QuestionAnnotation {
+                preview: "B · Lineage lanes".to_string(),
+                note: "rails too faint".to_string(),
+            }],
+        )]);
+        let result = ask_result_with_followups(
+            "answered",
+            4,
+            "sess",
+            &questions,
+            answers,
+            None,
+            &followups,
+            &annotations,
+        );
+        let per = result["questions"].as_array().unwrap();
+        assert_eq!(per[0]["answer"], "B");
+        assert_eq!(per[0]["annotations"][0]["preview"], "B · Lineage lanes");
+        assert!(per[0].get("followup").is_none());
+        assert_eq!(per[1]["answer"], "");
+        assert_eq!(per[1]["followup"], "What does 'monoline' mean here?");
+        // The guidance nudge exists exactly because a follow-up arrived.
+        assert!(result["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("follow-up question(s)"));
     }
 
     #[test]
@@ -1585,6 +1689,8 @@ mod tests {
                 "blue, or cerulean if available".to_string(),
             )]),
             selections: Default::default(),
+            followups: Default::default(),
+            annotations: Default::default(),
         }));
 
         let result = ask.await.expect("join").expect("ask_user result");
@@ -1712,6 +1818,8 @@ mod tests {
                 "A".to_string(),
             )]),
             selections: Default::default(),
+            followups: Default::default(),
+            annotations: Default::default(),
         }));
         let result = ask.await.expect("join").expect("ask_user result");
         assert_eq!(result["status"], "answered", "{result}");
@@ -1851,6 +1959,8 @@ mod tests {
             id: 1,
             answers: std::collections::HashMap::from([("Mine?".into(), "wrong".into())]),
             selections: Default::default(),
+            followups: Default::default(),
+            annotations: Default::default(),
         }));
         bus.send(AppEvent::ControlCommand(ControlMsg::Approve {
             session_id: None,
@@ -1862,6 +1972,8 @@ mod tests {
             id,
             answers: std::collections::HashMap::from([("Mine?".into(), "yes".into())]),
             selections: Default::default(),
+            followups: Default::default(),
+            annotations: Default::default(),
         }));
         let result = ask.await.expect("join").expect("result");
         assert_eq!(result["status"], "answered");
@@ -2025,6 +2137,8 @@ mod tests {
             id,
             answers: std::collections::HashMap::from([("Dispatch ok?".into(), "yes".into())]),
             selections: Default::default(),
+            followups: Default::default(),
+            annotations: Default::default(),
         }));
         let result = ask.await.expect("join").expect("dispatch result");
         assert_ne!(result.is_error, Some(true));

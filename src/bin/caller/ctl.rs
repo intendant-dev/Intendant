@@ -1384,6 +1384,36 @@ async fn run_ask(client: &reqwest::Client, config: &Config, raw: &[String]) -> R
                 .unwrap_or_default();
             println!("{answer}");
         }
+        // Follow-ups and anchored preview notes print AFTER the answers,
+        // clearly prefixed — line 1 stays the plain answer for existing
+        // consumers, and a follow-up is the user's cue to respond before
+        // treating unanswered parts as settled.
+        if let Some(questions) = outcome.get("questions").and_then(Value::as_array) {
+            for q in questions {
+                let name = q
+                    .get("header")
+                    .and_then(Value::as_str)
+                    .filter(|h| !h.is_empty())
+                    .or_else(|| q.get("question").and_then(Value::as_str))
+                    .unwrap_or_default();
+                if let Some(followup) = q.get("followup").and_then(Value::as_str) {
+                    println!("follow-up ({name}): {followup}");
+                }
+                for note in q
+                    .get("annotations")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let preview = note
+                        .get("preview")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let text = note.get("note").and_then(Value::as_str).unwrap_or_default();
+                    println!("note on {preview} ({name}): {text}");
+                }
+            }
+        }
     }
     match outcome.get("status").and_then(Value::as_str) {
         Some("timeout") => Err("timed out waiting for an answer".to_string()),
@@ -3558,7 +3588,9 @@ makes the question optional). --schema takes the multi-question JSON form —\n\
 {{\"questions\":[{{question, header?, options?:[{{label,description?}}],\n\
 pick?:{{min,max}}, free_text?, previews?:[{{label, html|image: FILE | text}}]}}]}}\n\
 (up to 4 questions on one panel; every answer returns together, per-question\n\
-lines on stdout, full structure under --json).\n\
+lines on stdout, full structure under --json). Users may attach a follow-up\n\
+per question and anchored preview notes — printed as suffixed lines, and a\n\
+follow-up may stand in for an answer (address it, then re-ask).\n\
 \n\
 Raises the question on the dashboard question rail and BLOCKS until the user\n\
 answers, then prints the answer to stdout. A question requests input, never\n\

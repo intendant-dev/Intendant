@@ -151,6 +151,17 @@ pub struct SharedViewRegion {
     pub height: f64,
 }
 
+/// One user note anchored to a preview card of a [`UserQuestion`] —
+/// "B: the rails are too faint" lands attached to candidate B instead of
+/// floating in prose. Rides `answer_question` alongside the answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionAnnotation {
+    /// The preview card's label, exactly as rendered.
+    pub preview: String,
+    /// The user's note about that card.
+    pub note: String,
+}
+
 /// One selectable option of a [`UserQuestion`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserQuestionOption {

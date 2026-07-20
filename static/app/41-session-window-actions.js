@@ -3816,6 +3816,8 @@ function collectQuestionAnswers() {
   if (!pendingQuestion) return null;
   const answers = {};
   const selections = {};
+  const followups = {};
+  const annotations = {};
   for (let i = 0; i < pendingQuestion.questions.length; i++) {
     const q = pendingQuestion.questions[i];
     const block = document.querySelector(`#question-content .question-block[data-q="${i}"]`);
@@ -3827,14 +3829,23 @@ function collectQuestionAnswers() {
     const picked = Array.from(block.querySelectorAll('.question-option.selected'))
       .map((b) => b.dataset.label)
       .filter(Boolean);
+    const followup = (block.querySelector('.question-followup-input')?.value || '').trim();
+    const notes = Array.from(block.querySelectorAll('.question-preview-note'))
+      .map((n) => ({ preview: n.dataset.previewLabel || '', note: (n.value || '').trim() }))
+      .filter((n) => n.note);
+    if (followup) followups[q.question] = followup;
+    if (notes.length) annotations[q.question] = notes;
     // Free text wins when both are present (mirrors the CLI's own picker,
     // where typing into "Other" overrides the highlighted option).
     const answer = typed || picked.join(', ');
     if (!answer) {
-      if (min === 0) continue; // optional question, deliberately unanswered
+      // Optional, or engaged via follow-up/notes: legal to leave
+      // unanswered — the agent addresses the follow-up and re-asks.
+      if (min === 0 || followup || notes.length) continue;
       return { missing: q.question };
     }
     if (!typed && picked.length < min) {
+      if (followup) continue; // the follow-up stands in for the unmet minimum
       return {
         missing: q.question,
         hint: `Pick at least ${min} option${min === 1 ? '' : 's'} for "${q.header || q.question}"`,
@@ -3845,7 +3856,17 @@ function collectQuestionAnswers() {
     // contain ", " survive and the agent gets a per-question breakdown.
     selections[q.question] = typed ? [typed] : picked;
   }
-  return { answers, selections };
+  if (
+    !Object.keys(answers).length
+    && !Object.keys(followups).length
+    && !Object.keys(annotations).length
+  ) {
+    return {
+      missing: pendingQuestion.questions[0]?.question || '',
+      hint: 'Nothing to submit yet — answer, follow up, or Skip',
+    };
+  }
+  return { answers, selections, followups, annotations };
 }
 
 // Scroll a question block to the top of the panel's internal scroll region.
@@ -3876,10 +3897,12 @@ function updateQuestionProgress() {
     const q = pendingQuestion.questions[i];
     const block = content.querySelector(`.question-block[data-q="${i}"]`);
     const typed = (block?.querySelector('.question-free-text')?.value || '').trim();
+    const followup = (block?.querySelector('.question-followup-input')?.value || '').trim();
     const { min } = questionPickBounds(q);
     const picked = block ? block.querySelectorAll('.question-option.selected').length : 0;
-    // Satisfied = typed free text, enough picks, or nothing required.
-    const done = !!(block && (typed || picked >= Math.max(min, 1) || min === 0));
+    // Satisfied = typed free text, enough picks, a follow-up standing in,
+    // or nothing required.
+    const done = !!(block && (typed || followup || picked >= Math.max(min, 1) || min === 0));
     if (done) answered++;
     const chip = content.querySelector(`.question-index-chip[data-q="${i}"]`);
     if (chip) {
@@ -3970,6 +3993,24 @@ function appendQuestionPreviews(block, q, qIndex) {
       });
       capActions.appendChild(choose);
     }
+    // Anchored annotation: a note that returns attached to THIS card by
+    // label ("B: rails too faint"), instead of floating in free text.
+    const noteInput = document.createElement('input');
+    noteInput.type = 'text';
+    noteInput.className = 'question-preview-note hidden';
+    noteInput.placeholder = `Note on ${p.label || 'this preview'}…`;
+    noteInput.dataset.previewLabel = p.label || `#${pIndex + 1}`;
+    const noteBtn = document.createElement('button');
+    noteBtn.type = 'button';
+    noteBtn.className = 'question-preview-note-btn';
+    noteBtn.textContent = '✎';
+    noteBtn.title = `Annotate ${p.label || 'this preview'} — the note returns anchored to this card`;
+    noteBtn.addEventListener('click', () => {
+      const hidden = noteInput.classList.toggle('hidden');
+      noteBtn.classList.toggle('open', !hidden);
+      if (!hidden) noteInput.focus();
+    });
+    capActions.appendChild(noteBtn);
     const focusBtn = document.createElement('button');
     focusBtn.type = 'button';
     focusBtn.className = 'question-preview-focus';
@@ -3982,6 +4023,7 @@ function appendQuestionPreviews(block, q, qIndex) {
     capActions.appendChild(focusBtn);
     caption.appendChild(capActions);
     card.appendChild(caption);
+    card.appendChild(noteInput);
 
     if (p.kind === 'html' && p.url) {
       const frame = document.createElement('iframe');
@@ -4328,6 +4370,33 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held) {
       free.addEventListener('input', () => updateQuestionProgress());
       block.appendChild(free);
     }
+
+    // Per-question follow-up: what the user writes returns attached to
+    // THIS question — with an answer, or standing in for one (a question
+    // submitted with only a follow-up waives its pick minimum; the agent
+    // addresses it and re-asks the narrowed part).
+    const followupWrap = document.createElement('div');
+    followupWrap.className = 'question-followup';
+    const followupToggle = document.createElement('button');
+    followupToggle.type = 'button';
+    followupToggle.className = 'question-followup-toggle';
+    followupToggle.textContent = '↩ Follow-up';
+    followupToggle.title =
+      'Ask the agent something about this question, or leave a note — it returns attached to '
+      + 'this question. Submitting with only a follow-up is fine.';
+    const followupInput = document.createElement('textarea');
+    followupInput.className = 'question-followup-input hidden';
+    followupInput.rows = 2;
+    followupInput.placeholder = 'Ask a follow-up or leave a note for the agent…';
+    followupToggle.addEventListener('click', () => {
+      const open = followupInput.classList.toggle('hidden');
+      followupToggle.classList.toggle('open', !open);
+      if (!open) followupInput.focus();
+    });
+    followupInput.addEventListener('input', () => updateQuestionProgress());
+    followupWrap.appendChild(followupToggle);
+    followupWrap.appendChild(followupInput);
+    block.appendChild(followupWrap);
     scroll.appendChild(block);
   });
   content.appendChild(scroll);
