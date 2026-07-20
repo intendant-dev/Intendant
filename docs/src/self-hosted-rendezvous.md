@@ -550,14 +550,17 @@ instance renders it (`/`, `/connect`, `/access`, `/trust`, the
 origin-injected `/install.sh` and `/install.ps1`, `/logo.svg`,
 `/favicon.png`, the embedded `/sw.js` push worker, and the landing
 screenshots) — and appends an
-`artifact_manifest` entry when the result differs from the latest logged
-one. The entry carries `artifacts` (a path-sorted list of
+`artifact_manifest` entry when the result or its canonical serving origin
+differs from the latest logged one. The entry carries `artifact_origin`
+(the configured public origin serving those bytes), `artifacts` (a path-sorted list of
 `{path, sha256}` with lowercase-hex hashes, comparable to `sha256sum`
 output), `bundle_version` (the crate version), `git_sha` (the build's
 commit, `-dirty` suffixed for uncommitted trees), and `manifest_hash` —
 sha256 over the canonical byte string
 `intendant-artifact-manifest-v1\n` then `{path}\t{sha256}\n` per
-artifact. `GET /api/log/artifact-manifest` returns the current entry
+artifact. The v1 hash intentionally remains bytes-only for rolling-upgrade
+compatibility; inclusion of the whole leaf in the signed tree authenticates
+`artifact_origin` too. `GET /api/log/artifact-manifest` returns the current entry
 with its log index, an inclusion proof, and the signed tree head, all
 computed coherently.
 
@@ -577,9 +580,13 @@ and the highest verified artifact-manifest index pinned beside it
 (`~/.intendant/hosted-verify/<host>.artifact-manifest.json`). A lower
 manifest index, or different manifest hash at the pinned index, is a loud
 verification failure even though that older leaf remains included in the
-append-only tree. The verifier then downloads every listed artifact exactly
-as a browser would and compares hashes — nonzero exit and a per-artifact diff
-on divergence.
+append-only tree. Once observed, the signed artifact origin is pinned there
+too; a later origin change or omission is a loud failure. Leaves written
+before `artifact_origin` existed retain the old behavior of fetching below
+the rendezvous URL, and the first new leaf upgrades the companion pin. The
+verifier then downloads every listed artifact from the signed canonical
+origin exactly as a browser would and compares hashes — nonzero exit and a
+per-artifact diff on divergence.
 Metadata bodies, proof arrays, artifact lists, and their strings are all
 bounded before verification work. Manifests must have unique, strictly sorted
 paths and cover the stable Connect pages, installers, service worker, and brand
@@ -588,9 +595,16 @@ pass. Each artifact is capped at 64 MiB; one manifest run is additionally
 capped at 256 MiB and five minutes, with bytes consumed by an over-limit stream
 charged to that aggregate budget and with bounded response-header and
 between-chunk idle waits.
-Verification fetches do not follow HTTP redirects, so a served log response
-cannot turn the monitor into a request to another origin, loopback, link-local,
-or LAN service.
+Verification fetches never follow HTTP redirects. A declared split artifact
+origin must keep the rendezvous scheme and use either the same host or its
+single-label apex/subdomain counterpart (for example,
+`connect.intendant.dev` → `intendant.dev`). Before fetching a split origin,
+the verifier resolves it directly without ambient proxies, rejects local,
+loopback, link-local, private, metadata, documentation, benchmark, multicast,
+reserved, or mixed public/private answers, and pins the request client to the
+validated addresses to close DNS rebinding. Thus the signed field supports the
+production metadata/site split without giving the service an arbitrary network
+fetch primitive.
 Every daemon with Connect enabled also runs this check on boot and then
 daily as an advisory tripwire (the CT tripwire's sibling): a divergence flips
 `hosted_bundle_state` to `alert` on the Connect status payload and
