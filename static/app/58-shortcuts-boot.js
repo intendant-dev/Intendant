@@ -97,6 +97,16 @@ window.sendQuestionAnswer = function(opts) {
   setPhase('running');
 };
 
+// Suspend or resume the pending question's expiry countdown. Truth stays
+// with the asking waiter: it re-emits the question with the new hold state
+// (same id), which refreshes the panel chip and re-enables the button.
+window.sendQuestionHold = function(held) {
+  if (!app || !pendingQuestion) return;
+  const msg = { action: 'hold_question', id: pendingQuestion.id, held: !!held };
+  if (pendingQuestion.sessionId) msg.session_id = pendingQuestion.sessionId;
+  dispatchSessionControlMsg(msg);
+};
+
 // Request interruption of the current agent turn. Disables the button and
 // flips the label to "Interrupting..." until the phase leaves `interrupting`
 // — updateStopButtonVisibility resets the label when it hides/re-enables.

@@ -492,11 +492,21 @@ pub enum AppEvent {
     /// id space and registry, but is a request for *input*, not permission:
     /// autonomy policy never auto-resolves it. Resolved by
     /// `ControlMsg::AnswerQuestion` (or deny/skip to dismiss), reported back
-    /// as `ApprovalResolved`.
+    /// as `ApprovalResolved`. Re-emitted with the same `id` when the hold
+    /// state flips (`ControlMsg::HoldQuestion`) — same-id re-emissions are
+    /// refreshes, not new questions (frontends update in place, the
+    /// attention nudge dedups by id).
     UserQuestionRequired {
         session_id: Option<String>,
         id: u64,
         questions: Vec<crate::types::UserQuestion>,
+        /// Wall-clock instant the asking waiter gives up (unix ms). `None`
+        /// when no daemon-side deadline exists (external backends wait on
+        /// their own) or while the question is held open.
+        expires_at_ms: Option<u64>,
+        /// User held the question open: the waiter's deadline is suspended
+        /// until a `HoldQuestion { held: false }` resumes it.
+        held: bool,
     },
     ApprovalResolved {
         session_id: Option<String>,
@@ -1289,6 +1299,18 @@ pub enum ControlMsg {
         id: u64,
         #[serde(default)]
         answers: std::collections::HashMap<String, String>,
+    },
+    /// Hold a pending `user_question` open (suspend its expiry) or resume
+    /// its countdown. Strictly weaker than `AnswerQuestion` — it changes
+    /// when a question may time out, never what it answers — and rides the
+    /// same authority class. The asking waiter re-emits the question with
+    /// the updated hold state.
+    HoldQuestion {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: u64,
+        #[serde(default)]
+        held: bool,
     },
     Input {
         text: String,
@@ -2664,10 +2686,14 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id,
             id,
             questions,
+            expires_at_ms,
+            held,
         } => Some(OutboundEvent::UserQuestion {
             session_id: session_id.clone(),
             id: *id,
             questions: questions.clone(),
+            expires_at_ms: *expires_at_ms,
+            held: *held,
         }),
         AppEvent::UserNotification {
             session_id,
@@ -4515,16 +4541,23 @@ mod tests {
                 multi_select: false,
                 previews: Vec::new(),
             }],
+            expires_at_ms: Some(1_784_500_000_000),
+            held: true,
         };
         match app_event_to_outbound(&event).unwrap() {
             crate::types::OutboundEvent::UserQuestion {
                 session_id,
                 id,
                 questions,
+                expires_at_ms,
+                held,
             } => {
                 assert_eq!(session_id.as_deref(), Some("sess-1"));
                 assert_eq!(id, 5);
                 assert_eq!(questions.len(), 1);
+                // Countdown state rides through untouched.
+                assert_eq!(expires_at_ms, Some(1_784_500_000_000));
+                assert!(held);
                 // Wire shape the dashboard renders from.
                 let json = serde_json::to_value(&questions[0]).unwrap();
                 assert_eq!(json["question"], "Which DB?");
@@ -4533,6 +4566,29 @@ mod tests {
             }
             other => panic!("expected UserQuestion, got {:?}", other),
         }
+    }
+
+    /// The hold verb parses from the dashboard's wire shape, and an absent
+    /// `held` fails closed to `false` (resume) rather than erroring.
+    #[test]
+    fn control_msg_hold_question_deserialize() {
+        let json = r#"{"action":"hold_question","id":7,"session_id":"sess-1","held":true}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::HoldQuestion {
+                session_id,
+                id,
+                held,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(id, 7);
+                assert!(held);
+            }
+            _ => panic!("expected HoldQuestion"),
+        }
+        let bare: ControlMsg =
+            serde_json::from_str(r#"{"action":"hold_question","id":7}"#).unwrap();
+        assert!(matches!(bare, ControlMsg::HoldQuestion { held: false, .. }));
     }
 
     #[test]

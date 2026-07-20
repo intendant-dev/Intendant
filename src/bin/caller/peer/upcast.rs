@@ -1040,6 +1040,7 @@ impl AppEventUpcaster {
                 session_id,
                 id,
                 questions,
+                ..
             } => {
                 let mut out = vec![PeerEvent::ApprovalRequested {
                     request: ApprovalRequest {
@@ -2528,6 +2529,7 @@ impl WireEventUpcaster {
                 session_id,
                 id,
                 questions,
+                ..
             } => {
                 let mut out = vec![PeerEvent::ApprovalRequested {
                     request: ApprovalRequest {

@@ -2325,6 +2325,10 @@ pub(crate) async fn run_agent_loop(
                         multi_select: false,
                         previews: Vec::new(),
                     }],
+                    // The native waiter blocks on its oneshot without a
+                    // deadline — no expiry to show or hold.
+                    expires_at_ms: None,
+                    held: false,
                 });
                 let answer = match rx.await {
                     Ok(event::ApprovalResponse::Answer { answers }) => answers
@@ -2929,6 +2933,10 @@ Proceed with explicit assumptions and continue without additional questions."
                         multi_select: false,
                         previews: Vec::new(),
                     }],
+                    // The native waiter blocks on its oneshot without a
+                    // deadline — no expiry to show or hold.
+                    expires_at_ms: None,
+                    held: false,
                 });
                 let answer = match rx.await {
                     Ok(event::ApprovalResponse::Answer { answers }) => answers
@@ -4075,6 +4083,8 @@ fn raise_sandbox_consent_cards(
                 multi_select: false,
                 previews: Vec::new(),
             }],
+            expires_at_ms: None,
+            held: false,
         });
         let bus = bus.clone();
         let session_id = session_id.clone();

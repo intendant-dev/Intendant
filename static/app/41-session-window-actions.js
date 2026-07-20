@@ -3743,11 +3743,15 @@ function showHumanInput(question) {
 
 // ── Structured user question (external agents' ask-the-user tool) ──
 //
-// pendingQuestion = { id, sessionId, questions: UserQuestion[] } while the
-// panel is up. Selections/free text live in the DOM; sendQuestionAnswer()
-// collects them into {question text → answer} and dispatches
-// {action:'answer_question', id, answers} (session-scoped like approvals).
+// pendingQuestion = { id, sessionId, questions: UserQuestion[],
+// expiresAtMs, held } while the panel is up. Selections/free text live in
+// the DOM; sendQuestionAnswer() collects them into {question text →
+// answer} and dispatches {action:'answer_question', id, answers}
+// (session-scoped like approvals). expiresAtMs is the asking waiter's
+// wall-clock deadline (null = no daemon-side deadline, e.g. external
+// backends, or held open); held mirrors the user's hold_question state.
 let pendingQuestion = null;
+let questionDeadlineTicker = 0;
 
 function questionOptionClicked(qIndex, optIndex) {
   if (!pendingQuestion) return;
@@ -3990,22 +3994,137 @@ function setQuestionMinimized(min) {
       chip.addEventListener('click', () => setQuestionMinimized(false));
       document.body.appendChild(chip);
     }
-    const first = pendingQuestion?.questions?.[0];
-    const extra =
-      (pendingQuestion?.questions?.length || 1) > 1
-        ? ` +${pendingQuestion.questions.length - 1}`
-        : '';
-    chip.textContent = `❓ ${first?.header || 'Agent question'}${extra} — pending`;
+    chip.textContent = questionRestoreChipText();
     chip.hidden = false;
   } else if (chip) {
     chip.hidden = true;
   }
 }
 
-function showUserQuestion(id, questions, sessionId) {
+// Restore-chip label: header (+count) plus the live countdown state, so a
+// tucked-away question still shows how long it has left.
+function questionRestoreChipText() {
+  const first = pendingQuestion?.questions?.[0];
+  const extra =
+    (pendingQuestion?.questions?.length || 1) > 1
+      ? ` +${pendingQuestion.questions.length - 1}`
+      : '';
+  let suffix = ' — pending';
+  if (pendingQuestion?.held) suffix = ' — held open';
+  else if (pendingQuestion?.expiresAtMs != null) {
+    const ms = questionCountdownRemainingMs();
+    suffix = ms <= 0 ? ' — expired' : ` — ${formatQuestionCountdown(ms)}`;
+  }
+  return `❓ ${first?.header || 'Agent question'}${extra}${suffix}`;
+}
+
+function questionCountdownRemainingMs() {
+  return Math.max(0, (pendingQuestion?.expiresAtMs || 0) - Date.now());
+}
+
+function formatQuestionCountdown(ms) {
+  const s = Math.ceil(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+    : `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+// Fold fresh countdown state into pendingQuestion. `held === true` or a
+// numeric deadline is real information; `{null, false}` is ambiguous — a
+// no-deadline ask on first sight, but "no info, keep current" on a
+// re-show (the presence bootstrap lane doesn't know the countdown, and a
+// question that had a deadline never legitimately becomes deadline-less
+// without being held: unhold always re-arms one).
+function applyQuestionDeadline(expiresAtMs, held) {
+  if (!pendingQuestion) return;
+  const hasInfo = held === true || (expiresAtMs !== undefined && expiresAtMs !== null);
+  if (hasInfo) {
+    pendingQuestion.held = held === true;
+    pendingQuestion.expiresAtMs = pendingQuestion.held ? null : Number(expiresAtMs) || null;
+  } else if (pendingQuestion.expiresAtMs === undefined) {
+    pendingQuestion.expiresAtMs = null;
+    pendingQuestion.held = false;
+  }
+  renderQuestionDeadline();
+}
+
+// Paint the countdown chip + hold button (panel title row) and keep the
+// tucked-away restore chip's suffix current.
+function renderQuestionDeadline() {
+  const chipEl = document.getElementById('question-deadline');
+  const holdBtn = document.getElementById('question-hold');
+  const restore = document.getElementById('question-restore-chip');
+  const q = pendingQuestion;
+  if (restore && !restore.hidden) restore.textContent = questionRestoreChipText();
+  if (!chipEl || !holdBtn) return;
+  if (!q || (q.expiresAtMs == null && !q.held)) {
+    // No daemon-side deadline (external backends): nothing to count down
+    // or hold.
+    chipEl.classList.add('hidden');
+    holdBtn.classList.add('hidden');
+    stopQuestionDeadlineTicker();
+    return;
+  }
+  chipEl.classList.remove('hidden');
+  holdBtn.classList.remove('hidden');
+  holdBtn.disabled = false;
+  if (q.held) {
+    chipEl.textContent = 'held open';
+    chipEl.classList.remove('warn');
+    holdBtn.textContent = 'Resume timer';
+    holdBtn.title = 'Re-arm the expiry countdown with the time that remained';
+    stopQuestionDeadlineTicker();
+  } else {
+    holdBtn.textContent = 'Hold open';
+    holdBtn.title = 'Suspend the expiry — the agent keeps waiting until you answer';
+    updateQuestionCountdownText();
+    startQuestionDeadlineTicker();
+  }
+}
+
+function updateQuestionCountdownText() {
+  const chipEl = document.getElementById('question-deadline');
+  if (!chipEl || !pendingQuestion || pendingQuestion.expiresAtMs == null) return;
+  const ms = questionCountdownRemainingMs();
+  chipEl.textContent = ms <= 0
+    ? 'expired — the agent is proceeding'
+    : `expires in ${formatQuestionCountdown(ms)}`;
+  chipEl.classList.toggle('warn', ms > 0 && ms < 60_000);
+  const restore = document.getElementById('question-restore-chip');
+  if (restore && !restore.hidden) restore.textContent = questionRestoreChipText();
+  if (ms <= 0) stopQuestionDeadlineTicker();
+}
+
+function startQuestionDeadlineTicker() {
+  if (!questionDeadlineTicker) {
+    questionDeadlineTicker = setInterval(updateQuestionCountdownText, 1000);
+  }
+}
+
+function stopQuestionDeadlineTicker() {
+  if (questionDeadlineTicker) {
+    clearInterval(questionDeadlineTicker);
+    questionDeadlineTicker = 0;
+  }
+}
+
+function showUserQuestion(id, questions, sessionId, expiresAtMs, held) {
   if (processingLogReplay) return;
   const list = Array.isArray(questions) ? questions : [];
   if (!list.length) return;
+  // Same-id re-delivery — a reconnect's state-line replay, the presence
+  // bootstrap, or the waiter's hold-flip refresh. The question content is
+  // immutable per id: fold in the countdown state and leave the built
+  // panel (including the user's tuck-away) untouched. Only a genuinely
+  // new question id rebuilds and force-surfaces the panel.
+  if (pendingQuestion?.id === id
+      && document.getElementById('question-panel')?.classList.contains('visible')) {
+    applyQuestionDeadline(expiresAtMs, held);
+    return;
+  }
   hideAllPanels();
   pendingQuestion = {
     id,
@@ -4031,6 +4150,22 @@ function showUserQuestion(id, questions, sessionId) {
     ? `The agent has ${list.length} questions`
     : 'The agent has a question';
   title.appendChild(titleText);
+  const deadlineChip = document.createElement('span');
+  deadlineChip.id = 'question-deadline';
+  deadlineChip.className = 'question-deadline hidden';
+  title.appendChild(deadlineChip);
+  const holdBtn = document.createElement('button');
+  holdBtn.type = 'button';
+  holdBtn.id = 'question-hold';
+  holdBtn.className = 'question-hold hidden';
+  holdBtn.addEventListener('click', () => {
+    if (!pendingQuestion) return;
+    // Truth stays with the waiter: disable until its refresh (the same-id
+    // re-emission) lands and renderQuestionDeadline re-enables.
+    holdBtn.disabled = true;
+    sendQuestionHold(!pendingQuestion.held);
+  });
+  title.appendChild(holdBtn);
   const tuck = document.createElement('button');
   tuck.type = 'button';
   tuck.className = 'question-tuck';
@@ -4153,15 +4288,18 @@ function showUserQuestion(id, questions, sessionId) {
     'has-previews',
     list.some((entry) => Array.isArray(entry.previews) && entry.previews.length)
   );
-  // A new (or re-shown) question always surfaces, even if an earlier one
-  // was tucked away.
+  // A genuinely new question always surfaces, even if an earlier one was
+  // tucked away (same-id re-deliveries return early above and never reach
+  // this).
   setQuestionMinimized(false);
   panel.classList.add('visible');
   setApprovalIndicator(true);
+  applyQuestionDeadline(expiresAtMs, held);
 }
 
 function clearPendingQuestion() {
   pendingQuestion = null;
+  stopQuestionDeadlineTicker();
   stationCurrentHumanQuestion = '';
   stationScheduleUpdate();
   setApprovalIndicator(false);

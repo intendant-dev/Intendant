@@ -3352,7 +3352,10 @@ permission — it is never auto-approved. Up to 4 options; with none (or with\n\
 --free-text) the user types an answer — free text is always accepted on top\n\
 of options. --multi allows selecting several options (joined with \", \").\n\
 Default --wait 300 seconds, max 900; on timeout prints best-judgment guidance\n\
-and exits nonzero. --json prints {{status, answer, answers}} instead.\n\
+and exits nonzero. The dashboard shows the expiry as a live countdown, and\n\
+the user can HOLD the question open (suspending the countdown) — a held ask\n\
+blocks past --wait until answered or dismissed. --json prints\n\
+{{status, answer, answers}} instead.\n\
 \n\
 Preview cards render above the options — show, then ask (prototype variants,\n\
 before/after states). --preview-html embeds a self-contained HTML file in a\n\

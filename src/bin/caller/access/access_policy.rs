@@ -941,7 +941,8 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::Deny { .. }
         | ControlMsg::Skip { .. }
         | ControlMsg::ApproveAll { .. }
-        | ControlMsg::AnswerQuestion { .. } => PeerOperation::Approval,
+        | ControlMsg::AnswerQuestion { .. }
+        | ControlMsg::HoldQuestion { .. } => PeerOperation::Approval,
         // Executable repointing is credential-adjacent, not Settings: the
         // command path decides WHICH binary external-agent sessions run
         // with the owner's credentials and workspace, so it takes the same

@@ -2985,6 +2985,44 @@ body.context-focus-active {
   justify-content: space-between;
   gap: 8px;
 }
+/* Title text grows; countdown chip + hold + tuck pack to the right. */
+.question-title-row > span:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.question-deadline {
+  font-family: 'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  padding: 2px 9px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  white-space: nowrap;
+}
+.question-deadline.warn {
+  color: var(--yellow);
+  border-color: color-mix(in srgb, var(--yellow) 40%, transparent);
+  background: color-mix(in srgb, var(--yellow) 10%, transparent);
+}
+.question-deadline.hidden { display: none; }
+.question-hold {
+  height: 22px;
+  padding: 0 10px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.question-hold:hover { background: var(--surface1); color: var(--text); }
+.question-hold:disabled { opacity: 0.55; cursor: default; }
+.question-hold.hidden { display: none; }
 .question-tuck {
   width: 22px;
   height: 22px;

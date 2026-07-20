@@ -2022,6 +2022,10 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         session_id: config.session_id.clone(),
                         id,
                         questions: questions.clone(),
+                        // External backends govern their own wait — no
+                        // daemon-side deadline, so nothing to hold.
+                        expires_at_ms: None,
+                        held: false,
                     });
                     slog(config.session_log, |l| {
                         l.info(&format!("Question for the user: {}", preview))
