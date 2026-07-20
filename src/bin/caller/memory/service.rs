@@ -1198,7 +1198,9 @@ mod tests {
         // The recovered chain keeps judging: retire the replacement
         // and the old claim REVIVES (replacement loss, §11.2 rule 2 —
         // revival is automatic and surfaced).
-        let retired = svc.judge(judge_args("retire", &new_back.id), &owner).unwrap();
+        let retired = svc
+            .judge(judge_args("retire", &new_back.id), &owner)
+            .unwrap();
         assert_eq!(retired.status, "retired");
         assert_eq!(
             svc.read(&old_back.id[..12]).unwrap().status,
@@ -1373,7 +1375,9 @@ mod tests {
     fn local_process_judgments_seal_human_and_count() {
         let mut svc = MemoryService::new().unwrap();
         let shell = ActorBinding::local_process(Some("principal:loopback:test".into()));
-        let claim = svc.propose(propose_args("judged from ctl"), &shell).unwrap();
+        let claim = svc
+            .propose(propose_args("judged from ctl"), &shell)
+            .unwrap();
         let view = svc.judge(judge_args("accept", &claim.id), &shell).unwrap();
         assert_eq!(view.status, "accepted", "ctl judgment moves status");
         assert_eq!(
@@ -1439,7 +1443,9 @@ mod tests {
         let owner = ActorBinding::dashboard(None);
         let claim = svc.propose(propose_args("target"), &owner).unwrap();
         for verdict in ["retract", "raise_class", "declassify", "erase", "approve"] {
-            let err = svc.judge(judge_args(verdict, &claim.id), &owner).unwrap_err();
+            let err = svc
+                .judge(judge_args(verdict, &claim.id), &owner)
+                .unwrap_err();
             match err {
                 MemoryError::Vocabulary { what, got, allowed } => {
                     assert_eq!(what, "verdict");
@@ -1495,7 +1501,9 @@ mod tests {
         let a = svc.propose(propose_args("claim a"), &owner).unwrap();
         let b = svc.propose(propose_args("claim b"), &owner).unwrap();
 
-        let err = svc.judge(judge_args("supersede", &a.id), &owner).unwrap_err();
+        let err = svc
+            .judge(judge_args("supersede", &a.id), &owner)
+            .unwrap_err();
         assert!(matches!(&err, MemoryError::InvalidArg(m) if m.contains("replacement")));
 
         let err = svc
