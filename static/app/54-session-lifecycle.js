@@ -987,6 +987,50 @@ function cancelSteerRow(id) {
   removeSteerRowSoon(key, 700);
 }
 
+// Waiting steer rows show how long they have been waiting (a mid-turn steer
+// can honestly sit minutes before the model's next checkpoint confirms it —
+// without a clock the row reads as stuck). One shared 1s ticker, started only
+// while a waiting row exists and self-stopping when none remain.
+const STEER_WAITING_STATUSES = ['pending', 'accepted', 'queued'];
+let steerElapsedTimer = null;
+
+function steerElapsedLabel(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ' + (s % 60) + 's';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m % 60) + 'm';
+}
+
+function steerElapsedTick() {
+  const now = Date.now();
+  let waitingRows = 0;
+  steerRows.forEach((entry) => {
+    const el = entry.el;
+    if (!el || !el.isConnected) return;
+    const node = el.querySelector('.steer-elapsed');
+    if (!node) return;
+    const waiting = STEER_WAITING_STATUSES.some((cls) => el.classList.contains(cls));
+    if (!waiting || !entry.waitingSince) {
+      if (node.textContent) node.textContent = '';
+      return;
+    }
+    waitingRows++;
+    const label = '· ' + steerElapsedLabel(now - entry.waitingSince);
+    if (node.textContent !== label) node.textContent = label;
+  });
+  if (waitingRows === 0 && steerElapsedTimer) {
+    clearInterval(steerElapsedTimer);
+    steerElapsedTimer = null;
+  }
+}
+
+function ensureSteerElapsedTicker() {
+  if (!steerElapsedTimer) steerElapsedTimer = setInterval(steerElapsedTick, 1000);
+  steerElapsedTick();
+}
+
 function onSteerStatusUpdate(id, text, status, reason, options = {}) {
   const key = String(id || '').trim();
   if (!key) return;
@@ -1002,9 +1046,10 @@ function onSteerStatusUpdate(id, text, status, reason, options = {}) {
       '<span class="steer-icon"></span>'
       + '<span class="steer-text"></span>'
       + '<span class="steer-reason"></span>'
+      + '<span class="steer-elapsed"></span>'
       + '<button type="button" class="steer-cancel" title="Clear queued steer" aria-label="Clear queued steer">&#10005;</button>';
     strip.appendChild(el);
-    entry = { el, timeout: null, text: '', sessionId: '' };
+    entry = { el, timeout: null, text: '', sessionId: '', waitingSince: Date.now() };
     steerRows.set(key, entry);
     el.querySelector('.steer-cancel')?.addEventListener('click', () => cancelSteerRow(key));
   }
@@ -1031,6 +1076,13 @@ function onSteerStatusUpdate(id, text, status, reason, options = {}) {
   el.title = [entry.text || text, reason].filter(Boolean).join('\n\n');
   strip.classList.remove('empty');
   stationScheduleUpdate();
+
+  if (STEER_WAITING_STATUSES.includes(status)) {
+    ensureSteerElapsedTicker();
+  } else {
+    const elapsedNode = el.querySelector('.steer-elapsed');
+    if (elapsedNode) elapsedNode.textContent = '';
+  }
 
   // Clear any in-flight fade timer — a fresh status update preempts it.
   if (entry.timeout) { clearTimeout(entry.timeout); entry.timeout = null; }

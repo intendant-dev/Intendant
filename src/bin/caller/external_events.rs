@@ -632,7 +632,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                     text: text.clone(),
                                 });
                                 let reason = format!(
-                                    "{} accepted the steer; waiting for the next runtime checkpoint",
+                                    "{} injected the message into the running turn — awaiting the model's next activity",
                                     agent.name()
                                 );
                                 slog(config.session_log, |l| {
@@ -1529,6 +1529,17 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 tool_name,
                 message_uuid,
             } => {
+                // A model-issued tool call is a fresh API response — the same
+                // checkpoint evidence as streamed text, and often the ONLY
+                // signal for minutes when the model chains tool calls without
+                // emitting text (observed live: a 5-minute "waiting" row on an
+                // already-absorbed steer). The helper's session filter keeps a
+                // child sub-agent's tool calls from confirming parent steers.
+                mark_pending_runtime_steers_delivered_at_model_checkpoint(
+                    config,
+                    pending_runtime_steers,
+                    agent.name(),
+                );
                 if event_is_primary
                     && agent.supports_item_anchor_rewind()
                     && managed_codex_foreground_dashboard_command(&tool_name, &preview)
