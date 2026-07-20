@@ -92,6 +92,8 @@ window.sendQuestionAnswer = function(opts) {
       id,
       answers: collected.answers,
       selections: collected.selections,
+      followups: collected.followups,
+      annotations: collected.annotations,
     };
   }
   if (sessionId) msg.session_id = sessionId;

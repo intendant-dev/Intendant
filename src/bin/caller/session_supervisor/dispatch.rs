@@ -861,10 +861,13 @@ impl SessionSupervisor {
                 session_id,
                 id,
                 answers,
-                // Structured selections serve the MCP ask waiter's
-                // per-question result; the supervisor's registry answer
-                // channel speaks the joined-answers map only.
+                // Structured selections/follow-ups/annotations serve the
+                // MCP ask waiter's per-question result; the supervisor's
+                // registry answer channel speaks the joined-answers map
+                // only (external backends have no protocol slot for them).
                 selections: _,
+                followups: _,
+                annotations: _,
             } => {
                 self.resolve_approval(
                     session_id,

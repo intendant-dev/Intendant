@@ -1305,6 +1305,17 @@ pub enum ControlMsg {
         /// the ", " join sequence and feeds the per-question result.
         #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
         selections: std::collections::HashMap<String, Vec<String>>,
+        /// Per-question follow-up text (question text → what the user
+        /// wrote back). A follow-up may accompany an answer or stand in
+        /// for one — a question submitted with only a follow-up waives
+        /// its pick minimum, and the agent addresses it in chat or with a
+        /// narrowed re-ask.
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        followups: std::collections::HashMap<String, String>,
+        /// Per-question preview annotations (question text → notes
+        /// anchored to that question's preview cards by label).
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        annotations: std::collections::HashMap<String, Vec<crate::types::QuestionAnnotation>>,
     },
     /// Hold a pending `user_question` open (suspend its expiry) or resume
     /// its countdown. Strictly weaker than `AnswerQuestion` — it changes
@@ -4524,12 +4535,16 @@ mod tests {
                 id,
                 answers,
                 selections,
+                followups,
+                annotations,
             } => {
                 assert_eq!(session_id.as_deref(), Some("sess-1"));
                 assert_eq!(id, 3);
                 assert_eq!(answers["Which DB?"], "PostgreSQL");
                 // Absent on the legacy wire — defaults empty.
                 assert!(selections.is_empty());
+                assert!(followups.is_empty());
+                assert!(annotations.is_empty());
             }
             _ => panic!("expected AnswerQuestion"),
         }
