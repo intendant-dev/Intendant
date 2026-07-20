@@ -71,6 +71,33 @@ pub(crate) async fn memory_propose_api_response(
     }
 }
 
+/// Transport-neutral core of `POST /api/memory/judge` (tunnel twin
+/// `api_memory_judge`): the body is one [`crate::memory::JudgeArgs`]
+/// JSON object; success returns the target's refreshed view (derived
+/// status just re-folded, judgment history attached). `actor` is the
+/// gate-resolved binding from the authenticated edge — the service's
+/// judgment choke makes the owner-surface decision from it (ruling
+/// R1) and denies ring-2 with the named outcome, here HTTP 403.
+pub(crate) async fn memory_judge_api_response(
+    body_text: &str,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+    actor: &crate::access::actor::ActorBinding,
+) -> ApiResponse {
+    let Some(memory) = memory_handle(mcp_server).await else {
+        return ApiResponse::json_error(503, "memory service unavailable on this daemon");
+    };
+    let args: crate::memory::JudgeArgs = match serde_json::from_str(body_text) {
+        Ok(args) => args,
+        Err(err) => {
+            return ApiResponse::json_error(400, format!("invalid memory judgment: {err}"));
+        }
+    };
+    match memory.judge(args, actor) {
+        Ok(claim) => ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "claim": claim }))),
+        Err(err) => ApiResponse::json_error(memory_error_status(&err), err.to_string()),
+    }
+}
+
 async fn memory_handle(
     mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
 ) -> Option<Arc<crate::memory::MemoryHandle>> {
@@ -138,5 +165,17 @@ pub(crate) async fn handle_memory_propose(
     fleet_origin: Option<&str>,
 ) {
     let response = memory_propose_api_response(&body_text, mcp_server.as_ref(), &actor).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+pub(crate) async fn handle_memory_judge(
+    stream: DemuxStream,
+    body_text: String,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    actor: crate::access::actor::ActorBinding,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = memory_judge_api_response(&body_text, mcp_server.as_ref(), &actor).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }

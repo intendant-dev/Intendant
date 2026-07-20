@@ -255,6 +255,7 @@ pub(crate) async fn control_request_frame(
         "api_memory_search" => api_memory_search_response(id, params.as_ref(), &runtime).await,
         "api_memory_claim" => api_memory_claim_response(id, params.as_ref(), &runtime).await,
         "api_memory_propose" => api_memory_propose_response(id, params.as_ref(), &runtime).await,
+        "api_memory_judge" => api_memory_judge_response(id, params.as_ref(), &runtime).await,
         "api_session_current_uploads" => api_session_current_uploads_response(id, &runtime).await,
         "api_session_current_upload_delete" => {
             api_session_current_upload_delete_response(id, params.as_ref(), &runtime).await
@@ -1384,6 +1385,30 @@ pub(crate) async fn api_memory_propose_response(
         )
         .await,
         "memory propose",
+    )
+}
+
+/// Tunnel twin of `POST /api/memory/judge` — the judgment rides
+/// `params` (the same JSON shape as the HTTP body); attribution comes
+/// from the authenticated dashboard-control grant, and the service's
+/// judgment choke (ruling R1) makes the owner-surface decision.
+pub(crate) async fn api_memory_judge_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    let actor =
+        crate::access::actor::ActorBinding::from_principal(&runtime.grant.access_principal(), None);
+    frame_api_response(
+        id,
+        crate::web_gateway::memory_judge_api_response(
+            &body_text,
+            runtime.mcp_server.as_ref(),
+            &actor,
+        )
+        .await,
+        "memory judge",
     )
 }
 

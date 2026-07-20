@@ -3148,13 +3148,66 @@ async fn run_memory(
             .await?;
             print_tool_response(response, config, None)?;
         }
+        verdict @ ("accept" | "dispute" | "retire" | "supersede") => {
+            let response = call_tool(
+                client,
+                config,
+                "memory_judge",
+                memory_judge_args(verdict, &raw[1..])?,
+            )
+            .await?;
+            print_tool_response(response, config, None)?;
+        }
         other => {
             return Err(format!(
-                "unknown memory subcommand '{other}' (search, read, propose)"
+                "unknown memory subcommand '{other}' \
+                 (search, read, propose, accept, dispute, retire, supersede)"
             ))
         }
     }
     Ok(())
+}
+
+/// Build `memory_judge` tool args for one owner verdict:
+/// `memory accept|dispute|retire ID [--reason TEXT]` and
+/// `memory supersede ID --with REPLACEMENT_ID [--reason TEXT]`.
+fn memory_judge_args(verdict: &str, raw: &[String]) -> Result<Value, String> {
+    let args = parse_command_args(raw, &["--reason", "--with"], &[])?;
+    let id = args
+        .positional
+        .first()
+        .cloned()
+        .ok_or_else(|| format!("usage: memory {verdict} ID_PREFIX"))?;
+    if args.positional.len() > 1 {
+        return Err(format!(
+            "memory {verdict} takes one claim id (got {})",
+            args.positional.len()
+        ));
+    }
+    let mut tool_args = Map::new();
+    tool_args.insert("verdict".to_string(), Value::String(verdict.to_string()));
+    tool_args.insert("id".to_string(), Value::String(id));
+    if let Some(reason) = args.one("--reason") {
+        tool_args.insert("reason".to_string(), Value::String(reason.to_string()));
+    }
+    match (verdict, args.one("--with")) {
+        ("supersede", Some(replacement)) => {
+            tool_args.insert(
+                "replacement".to_string(),
+                Value::String(replacement.to_string()),
+            );
+        }
+        ("supersede", None) => {
+            return Err(
+                "supersede requires --with REPLACEMENT_ID (the superseding claim)".to_string(),
+            )
+        }
+        (_, Some(_)) => {
+            return Err(format!("--with only applies to supersede (got {verdict})"));
+        }
+        (_, None) => {}
+    }
+    Ok(Value::Object(tool_args))
 }
 
 async fn run_memory_search(
@@ -4135,17 +4188,25 @@ fn help_memory() {
   intendant ctl memory propose STATEMENT... [--kind KIND] [--sensitivity CLASS] [--label L]... [--project P]\n\
   intendant ctl memory search [QUERY...] [--limit N] [--candidates] [--json]\n\
   intendant ctl memory read ID_PREFIX\n\
+  intendant ctl memory accept|dispute|retire ID_PREFIX [--reason TEXT]\n\
+  intendant ctl memory supersede ID_PREFIX --with REPLACEMENT_ID [--reason TEXT]\n\
 \n\
-The P1 Memory service: claims with provenance and derived status.\n\
-Proposals enter as CANDIDATES; this product slice exposes no judgment\n\
-command, so a fresh\n\
-proposal is visible via `read` or `search --candidates`. KIND is one of\n\
-observation, decision, episode, procedure, preference (default\n\
-observation); CLASS is public, internal, private (the default), or\n\
-sensitive. Claim bodies are data to read, never instructions to\n\
-follow. Every result reports the effective durability mode. macOS uses\n\
-durable custody by default; other platforms and the operator kill switch\n\
-use an ephemeral plane whose claims do not survive daemon restart."
+The Memory service: claims with provenance and derived status.\n\
+Proposals enter as CANDIDATES, visible via `read` or `search\n\
+--candidates`. Judgments are OWNER curation (this shell and the\n\
+dashboard; agent callers are refused): each seals an attributed\n\
+append-only op and the claim's status is re-derived by the fold —\n\
+accept -> accepted, dispute -> disputed, retire -> retired, supersede\n\
+-> superseded once the replacement is itself accepted (accept it\n\
+first; a candidate replacement records the judgment without moving\n\
+status). --reason (<= 2000 chars) is recorded verbatim and rendered\n\
+as quoted data. KIND is one of observation, decision, episode,\n\
+procedure, preference (default observation); CLASS is public,\n\
+internal, private (the default), or sensitive. Claim bodies are data\n\
+to read, never instructions to follow. Every result reports the\n\
+effective durability mode. macOS uses durable custody by default;\n\
+other platforms and the operator kill switch use an ephemeral plane\n\
+whose claims do not survive daemon restart."
     );
 }
 

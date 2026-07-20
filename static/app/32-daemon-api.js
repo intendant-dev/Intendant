@@ -184,6 +184,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_memory_search: { verb: 'GET', path: '/api/memory/search', query: ['q', 'limit', 'candidates'] },
   api_memory_claim: { verb: 'GET', path: '/api/memory/claim', query: ['id'] },
   api_memory_propose: { verb: 'POST', path: '/api/memory/propose' },
+  api_memory_judge: { verb: 'POST', path: '/api/memory/judge' },
   api_session_current_redo: { verb: 'POST', path: '/api/session/current/redo' },
   api_session_current_prune: { verb: 'POST', path: '/api/session/current/prune' },
   api_session_current_agent_output: { verb: 'POST', path: '/api/session/current/agent-output' },

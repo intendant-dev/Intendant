@@ -34,6 +34,36 @@ fn default_sensitivity() -> String {
     "private".into()
 }
 
+/// Judgment `reason` intake cap (ruling R3, 2026-07-20 — the F2
+/// annotation-cap idiom): the kernel's `? reason: text` is unbounded;
+/// this DTO-edge bound rejects loudly, never truncates.
+pub(crate) const MAX_REASON_CHARS: usize = 2000;
+
+/// Arguments for a judgment (`judge` — the owner curation lane).
+/// `verdict` is the v1-minted subset of the kernel's closed §11.1
+/// vocabulary: `accept`, `dispute`, `retire`, `supersede` (retract is
+/// author/agent-lane machinery surfaced read-only in v1;
+/// `raise_class`/`declassify` are fail-closed classification arms;
+/// pins are fail-closed at the stamped kernel boundary). Unknown or
+/// unminted words reject with the allowed set — never coerced.
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JudgeArgs {
+    /// One of: accept, dispute, retire, supersede.
+    pub verdict: String,
+    /// Target claim id prefix (≥ 8 hex chars of the claim op hash).
+    pub id: String,
+    /// Optional rationale, recorded verbatim in the sealed op
+    /// (≤ 2000 chars). Rendered as quoted data, never instructions.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// `supersede` only: the replacement claim's id prefix. The fold
+    /// holds supersession only while the replacement's derived status
+    /// is `accepted` (§11.2 rule 2) — accept it first.
+    #[serde(default)]
+    pub replacement: Option<String>,
+}
+
 /// Bounded search arguments (§6.5: bounded retrieval, candidates
 /// excluded by default and results always status-labeled).
 #[derive(Debug, Clone)]
@@ -97,6 +127,38 @@ impl ClaimProvenance {
     }
 }
 
+/// One judgment as history surfaces render it: who judged what, when
+/// — the provenance is the product. Judgments are quoted DATA (the
+/// `reason` included), never instructions. Every §11.2-recorded
+/// judgment surfaces here, counting or not — the derived `status` on
+/// the claim is the truth about what counted.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct JudgmentView {
+    /// The judgment id: hex of the accepted `m.judge` op hash.
+    pub id: String,
+    /// accept / dispute / retire / supersede (plus, on recovered
+    /// planes, any kernel-legal verdict another writer sealed —
+    /// rendered verbatim, e.g. `retract`).
+    pub verdict: String,
+    /// The judged claim's id (hex op hash).
+    pub target: String,
+    /// `supersede` only: the replacement claim's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub at_ms: u64,
+    /// Who judged, in the DURABLE identity vocabulary (ruling R2,
+    /// 2026-07-20): actor is `owner` / `session` / `peer` /
+    /// `unattributed` — never a dashboard-vs-ctl surface distinction,
+    /// which the closed `mjudge` CDDL cannot carry across a restart.
+    /// (Claim `proposed_by` keeps its own richer live vocabulary.)
+    pub judged_by: ClaimProvenance,
+    /// The status policy the judgment cited (stamped server-side from
+    /// the target space's binding — never caller input).
+    pub policy: String,
+}
+
 /// A provenance-labeled claim view. This is DATA for surfaces to
 /// render as quoted content — never instructions (§6.5).
 /// (`Deserialize`: event-lane plumbing only, as on [`ClaimProvenance`].)
@@ -125,6 +187,11 @@ pub struct ClaimView {
     pub proposed_by: ClaimProvenance,
     /// Effective storage mode: `"durable"` or `"ephemeral"`.
     pub durability: String,
+    /// Judgment history, oldest first. Populated on single-claim
+    /// views (read, judge returns, the change event); search results
+    /// stay lean (empty) — bounded retrieval per §6.5.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judgments: Vec<JudgmentView>,
 }
 
 /// Service errors. Kernel verdicts surface their named

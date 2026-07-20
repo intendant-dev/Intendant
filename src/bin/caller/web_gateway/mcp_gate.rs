@@ -1718,6 +1718,129 @@ mod tests {
         );
     }
 
+    /// Track J exit criterion (rulings R1/R2, full MCP lane): an
+    /// owner-surface judgment moves derived status and records the
+    /// durable `owner` identity; a supervised agent session on the
+    /// SAME lane takes the named `actor-not-permitted` denial and the
+    /// claim does not move — the judgment choke, exercised through
+    /// the real gate.
+    #[tokio::test]
+    async fn memory_judgments_are_owner_lane_only_end_to_end() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bus = crate::event::EventBus::new();
+        let mut state = crate::mcp::McpAppState::new(
+            "test".into(),
+            "test".into(),
+            crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
+            tmp.path().join("logs"),
+        );
+        state.memory = Some(std::sync::Arc::new(
+            crate::memory::MemoryHandle::bootstrap(
+                bus.clone(),
+                crate::memory::MemoryStorage::Ephemeral,
+            )
+            .expect("ephemeral plane bootstraps"),
+        ));
+        let server = crate::mcp::IntendantServer::new(
+            std::sync::Arc::new(tokio::sync::RwLock::new(state)),
+            bus.clone(),
+        );
+        let dashboard_access = HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https"),
+            iam_state: None,
+        };
+        let session_access = HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+                "sess-e2e", "http", true,
+            ),
+            iam_state: None,
+        };
+        let rpc = |name: &str, arguments: serde_json::Value| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments },
+            })
+            .to_string()
+        };
+
+        let outcome = handle_mcp_http_request(
+            &rpc(
+                "memory_propose",
+                serde_json::json!({ "kind": "observation", "statement": "judged over the wire" }),
+            ),
+            &server,
+            None,
+            None,
+            None,
+            &dashboard_access,
+            None,
+            &bus,
+        )
+        .await;
+        let claim = memory_claim_from_outcome(outcome);
+        let claim_id = claim["id"].as_str().expect("claim id").to_string();
+
+        // The supervised session is refused with the NAMED outcome —
+        // and refused means refused: the claim stays candidate.
+        let outcome = handle_mcp_http_request(
+            &rpc(
+                "memory_judge",
+                serde_json::json!({ "verdict": "accept", "id": claim_id }),
+            ),
+            &server,
+            Some("sess-e2e"),
+            None,
+            None,
+            &session_access,
+            Some("sess-e2e".to_string()),
+            &bus,
+        )
+        .await;
+        let McpHttpOutcome::Response(resp) = outcome else {
+            panic!("expected a response outcome");
+        };
+        let result = resp.result.expect("tool result");
+        assert_eq!(
+            result.get("isError").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "agent-session judgment must be refused: {result}"
+        );
+        let text = result["content"][0]["text"].as_str().expect("error text");
+        assert!(
+            text.contains("actor-not-permitted"),
+            "the denial is the NAMED tenant-edge outcome, got: {text}"
+        );
+
+        // The owner surface judges the same claim: status moves, and
+        // the judgment history records the durable owner identity.
+        let outcome = handle_mcp_http_request(
+            &rpc(
+                "memory_judge",
+                serde_json::json!({
+                    "verdict": "accept", "id": claim_id,
+                    "reason": "verified over the wire",
+                }),
+            ),
+            &server,
+            None,
+            None,
+            None,
+            &dashboard_access,
+            None,
+            &bus,
+        )
+        .await;
+        let judged = memory_claim_from_outcome(outcome);
+        assert_eq!(judged["status"], "accepted", "owner judgment counts");
+        assert_eq!(judged["judgments"][0]["judged_by"]["actor"], "owner");
+        assert_eq!(
+            judged["judgments"][0]["judged_by"].get("principal"),
+            None,
+            "durable identity only (R2) — no principal survives the envelope"
+        );
+        assert_eq!(judged["judgments"][0]["reason"], "verified over the wire");
+    }
+
     #[test]
     fn mcp_http_access_context_binds_token_origin_and_loopback_paths() {
         use std::net::{Ipv4Addr, SocketAddr};

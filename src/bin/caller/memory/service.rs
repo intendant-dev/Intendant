@@ -7,13 +7,16 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use owner_plane_core::cbor;
 use owner_plane_core::shapes::envelope::ActorKind;
-use owner_plane_core::shapes::memory::Mclaim;
+use owner_plane_core::shapes::memory::{BasicVerdict, Mclaim, Mjudge};
 use owner_plane_core::shapes::{Class, Kind, ToValue, Verb};
 
 use crate::access::actor::{ActorBinding, ActorKind as GateActorKind};
 
 use super::plane::EphemeralPlane;
-use super::types::{hex32, ClaimProvenance, ClaimView, MemoryError, ProposeArgs, SearchArgs};
+use super::types::{
+    hex32, ClaimProvenance, ClaimView, JudgeArgs, JudgmentView, MemoryError, ProposeArgs,
+    SearchArgs, MAX_REASON_CHARS,
+};
 
 /// Search results are hard-capped regardless of the caller's ask
 /// (§6.5: bounded retrieval — no whole-store reads through this API).
@@ -72,9 +75,29 @@ fn hex_prefix_matches(key: &[u8; 32], p: &str) -> bool {
     })
 }
 
+/// What the service records about a judgment it minted or recovered,
+/// keyed alongside claims by the accepted op hash. Whether a judgment
+/// COUNTS is never stored — the claim's derived status is the fold's
+/// answer; the record exists so history renders every §11.2-recorded
+/// judgment ("recorded and surfaced", counting or not).
+struct JudgmentRecord {
+    id: [u8; 32],
+    verdict: String,
+    target: [u8; 32],
+    replacement: Option<[u8; 32]>,
+    reason: Option<String>,
+    at_ms: u64,
+    judged_by: ClaimProvenance,
+    policy: String,
+}
+
 pub(crate) struct MemoryService {
     plane: EphemeralPlane,
     claims: BTreeMap<[u8; 32], ClaimRecord>,
+    /// Judgment history in append order (the plane's item order —
+    /// rebuilt in the same order on reopen, so live and recovered
+    /// views agree; ruling R2).
+    judgments: Vec<JudgmentRecord>,
     /// P1.8: the durable custody store, when this daemon runs the
     /// durable plane (macOS — multi-platform custody stays full Gate
     /// B, so other OSes run ephemeral and say so). `None` = ephemeral.
@@ -87,6 +110,7 @@ impl MemoryService {
         Ok(MemoryService {
             plane: EphemeralPlane::bootstrap()?,
             claims: BTreeMap::new(),
+            judgments: Vec::new(),
             store: None,
         })
     }
@@ -106,9 +130,11 @@ impl MemoryService {
             } = DurableStore::open(dir)?;
             let plane = EphemeralPlane::resume(&resume, items)?;
             let claims = Self::rebuild_claims(&plane)?;
+            let judgments = Self::rebuild_judgments(&plane);
             Ok(MemoryService {
                 plane,
                 claims,
+                judgments,
                 store: Some(store),
             })
         } else {
@@ -117,6 +143,7 @@ impl MemoryService {
             Ok(MemoryService {
                 plane,
                 claims: BTreeMap::new(),
+                judgments: Vec::new(),
                 store: Some(store),
             })
         }
@@ -222,6 +249,73 @@ impl MemoryService {
         Ok(claims)
     }
 
+    /// Rebuild the judgment history from recovered ops, in the log's
+    /// append order. Provenance is envelope truth in the DURABLE
+    /// identity vocabulary (ruling R2): `human` → `owner` (the O4
+    /// shape the judgment seal mints — a dashboard-vs-ctl surface
+    /// distinction cannot survive restart, so the live path records
+    /// the same collapse), attested/`agent-session` → `session`,
+    /// `peer` → `peer`, anything else (a bare non-human writer, whose
+    /// judgments are D-201-inert but §11.2 "recorded and surfaced")
+    /// → `unattributed`.
+    fn rebuild_judgments(plane: &EphemeralPlane) -> Vec<JudgmentRecord> {
+        use owner_plane_reducer::envelope::parse_op;
+        let mut judgments = Vec::new();
+        for raw in plane.held_items().values() {
+            let Ok(op) = parse_op(raw) else { continue };
+            if op.header.operation_type != Mjudge::OP_TYPE {
+                continue;
+            }
+            let body = op.body.clone();
+            let text = |k: &str| body.get(k).and_then(|v| v.as_text().map(|t| t.to_string()));
+            let bytes32 = |k: &str| body.get(k).and_then(|v| v.bytes_n::<32>());
+            let Some(target) = bytes32("target") else {
+                continue;
+            };
+            let judged_by = match op.header.actor_kind {
+                "human" => ClaimProvenance {
+                    v: 1,
+                    actor: "owner".into(),
+                    principal: None,
+                    session: None,
+                },
+                "agent-session" => ClaimProvenance {
+                    v: 1,
+                    actor: "session".into(),
+                    principal: Some(op.header.actor_id.to_string()),
+                    session: None,
+                },
+                "peer" => ClaimProvenance {
+                    v: 1,
+                    actor: "peer".into(),
+                    principal: Some(op.header.actor_id.to_string()),
+                    session: None,
+                },
+                _ => ClaimProvenance {
+                    v: 1,
+                    actor: "unattributed".into(),
+                    principal: None,
+                    session: None,
+                },
+            };
+            judgments.push(JudgmentRecord {
+                id: op.op_hash(),
+                verdict: text("verdict").unwrap_or_default(),
+                target,
+                replacement: bytes32("replacement"),
+                reason: text("reason"),
+                at_ms: op.header.created_ms,
+                judged_by,
+                policy: body
+                    .get("policy")
+                    .and_then(|p| p.get("id"))
+                    .and_then(|v| v.as_text().map(|t| t.to_string()))
+                    .unwrap_or_default(),
+            });
+        }
+        judgments
+    }
+
     /// The plane id (hex) — logged at wiring so an operator can tell
     /// one plane incarnation from the next (especially in ephemeral
     /// mode, where a restart mints a new plane).
@@ -300,6 +394,53 @@ impl MemoryService {
         self.plane.tenant_op(actor_kind, actor_id, op_type, body)
     }
 
+    /// The judgment-class choke (ruling R1, 2026-07-20) — the ONLY
+    /// path that seals an `m.judge` op, and the ONLY place the HUMAN
+    /// envelope actor is minted. Structure IS the enforcement
+    /// (condition 1): the ring check runs first, so a ring-2 caller
+    /// takes the named `actor-not-permitted` denial and can never
+    /// reach the human seal below (condition 2's test pins it); the
+    /// verb is fixed at `judge.full` here, never caller input. An
+    /// owner-surface invocation — dashboard or the owner's local
+    /// shell — IS the owner-at-the-box posture D-47 names, so the op
+    /// carries O4 human evidence: `kind: "human"`, id = the writer
+    /// device (O8, filled by `tenant_op`), `attested_by` ABSENT.
+    /// Authoring ops keep [`Self::envelope_actor`]'s mapping — the
+    /// narrowness is the point (judgments express authority the edge
+    /// verified; proposals carry diary provenance and need none).
+    /// Even bypassed, the kernel's D-201 keeps a bare-daemon
+    /// judgment fold-inert — belt and suspenders.
+    fn seal_judgment(
+        &mut self,
+        actor: &ActorBinding,
+        body: &Mjudge,
+    ) -> Result<[u8; 32], MemoryError> {
+        Self::authorize_write(actor, Verb::JudgeFull)?;
+        self.plane
+            .tenant_op(ActorKind::Human, None, Mjudge::OP_TYPE, body.to_value())
+    }
+
+    /// P1.8 durability lockstep (§6.2 L1) shared by every sealing
+    /// path: the write ACKs only after its sealed item is flushed; on
+    /// a store failure the in-memory admission is RETRACTED (nothing
+    /// unpersisted is ever exposed) and the named outcome surfaces.
+    fn persist_admitted(&mut self, op_hash: &[u8; 32]) -> Result<(), MemoryError> {
+        if let Some(store) = &mut self.store {
+            let op_bytes = self
+                .plane
+                .held_items()
+                .values()
+                .last()
+                .expect("the op just admitted is held")
+                .clone();
+            if let Err(e) = store.append_sealed_op(&op_bytes) {
+                self.plane.retract_unpersisted(op_hash)?;
+                return Err(MemoryError::InvalidArg(e.to_string()));
+            }
+        }
+        Ok(())
+    }
+
     /// Author a claim (`propose` — the candidate lane; `assert` is a
     /// separate verb this build does not expose). The claim enters as
     /// a `candidate` and only judgments move its derived status.
@@ -343,23 +484,7 @@ impl MemoryService {
             },
         };
         let op_hash = self.seal_write(actor, Verb::Propose, Mclaim::OP_TYPE, body.to_value())?;
-        // P1.8 durability: §6.2 L1 — the claim ACKs only after its
-        // sealed item is flushed. On a store failure the in-memory
-        // admission is RETRACTED (nothing unpersisted is ever exposed)
-        // and the named outcome surfaces verbatim.
-        if let Some(store) = &mut self.store {
-            let op_bytes = self
-                .plane
-                .held_items()
-                .values()
-                .last()
-                .expect("the op just admitted is held")
-                .clone();
-            if let Err(e) = store.append_sealed_op(&op_bytes) {
-                self.plane.retract_unpersisted(&op_hash)?;
-                return Err(MemoryError::InvalidArg(e.to_string()));
-            }
-        }
+        self.persist_admitted(&op_hash)?;
         self.claims.insert(
             op_hash,
             ClaimRecord {
@@ -411,22 +536,149 @@ impl MemoryService {
 
     /// Read one claim by id prefix (≥ 8 hex chars of the op hash).
     pub(crate) fn read(&self, id_prefix: &str) -> Result<ClaimView, MemoryError> {
+        let op_hash = self.resolve(id_prefix)?;
+        Ok(self.view(&op_hash, &self.claims[&op_hash]))
+    }
+
+    /// Resolve a claim id prefix (≥ 8 hex chars) to its op hash —
+    /// shared by read and every judgment target/replacement lookup.
+    fn resolve(&self, id_prefix: &str) -> Result<[u8; 32], MemoryError> {
         let p = id_prefix.to_lowercase();
         if p.len() < 8 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(MemoryError::InvalidArg(
                 "id prefix must be at least 8 hex characters".into(),
             ));
         }
-        let matches: Vec<(&[u8; 32], &ClaimRecord)> = self
+        let matches: Vec<&[u8; 32]> = self
             .claims
-            .iter()
-            .filter(|(hash, _)| hex_prefix_matches(hash, &p))
+            .keys()
+            .filter(|hash| hex_prefix_matches(hash, &p))
             .collect();
         match matches.len() {
             0 => Err(MemoryError::NotFound(id_prefix.into())),
-            1 => Ok(self.view(matches[0].0, matches[0].1)),
+            1 => Ok(*matches[0]),
             n => Err(MemoryError::Ambiguous(id_prefix.into(), n)),
         }
+    }
+
+    /// Judge a claim (owner curation): seal one attributed `m.judge`
+    /// op through the R1 choke and return the target's refreshed view
+    /// — derived status visibly moved iff the fold counted it. The
+    /// polref is stamped from the target space's binding, never
+    /// caller input (§11.3; a mismatch would pend `policy-missing`).
+    pub(crate) fn judge(
+        &mut self,
+        args: JudgeArgs,
+        actor: &ActorBinding,
+    ) -> Result<ClaimView, MemoryError> {
+        if let Some(reason) = &args.reason {
+            let n = reason.chars().count();
+            if n > MAX_REASON_CHARS {
+                return Err(MemoryError::InvalidArg(format!(
+                    "reason is {n} chars (cap {MAX_REASON_CHARS}) — shorten it; \
+                     the full rationale can live in a claim or evidence"
+                )));
+            }
+        }
+        let target = self.resolve(&args.id)?;
+        let policy = self.plane.home_status_policy();
+        let policy_id = policy.id.clone();
+        let body = match args.verdict.as_str() {
+            v @ ("accept" | "dispute" | "retire") => {
+                if args.replacement.is_some() {
+                    return Err(MemoryError::InvalidArg(format!(
+                        "replacement only applies to supersede (verdict: {v})"
+                    )));
+                }
+                let verdict = match v {
+                    "accept" => BasicVerdict::Accept,
+                    "dispute" => BasicVerdict::Dispute,
+                    _ => BasicVerdict::Retire,
+                };
+                Mjudge::Basic {
+                    verdict,
+                    target,
+                    policy,
+                    reason: args.reason.clone(),
+                    evidence: None,
+                }
+            }
+            "supersede" => {
+                let Some(replacement_prefix) = args.replacement.as_deref() else {
+                    return Err(MemoryError::InvalidArg(
+                        "supersede requires replacement (the superseding claim's id)".into(),
+                    ));
+                };
+                let replacement = self.resolve(replacement_prefix)?;
+                if replacement == target {
+                    return Err(MemoryError::InvalidArg(
+                        "a claim cannot supersede itself".into(),
+                    ));
+                }
+                Mjudge::Supersede {
+                    target,
+                    replacement,
+                    policy,
+                    reason: args.reason.clone(),
+                }
+            }
+            // The kernel vocabulary this build deliberately does not
+            // mint: retract (author/agent-lane machinery, surfaced
+            // read-only in v1), raise_class / declassify (fail-closed
+            // classification arms, §C.2). Named rejection, never a
+            // coerced or silently dropped verdict.
+            other => {
+                return Err(MemoryError::Vocabulary {
+                    what: "verdict",
+                    got: other.to_string(),
+                    allowed: "accept, dispute, retire, supersede".into(),
+                })
+            }
+        };
+        let op_hash = self.seal_judgment(actor, &body)?;
+        self.persist_admitted(&op_hash)?;
+        self.judgments.push(JudgmentRecord {
+            id: op_hash,
+            verdict: args.verdict.clone(),
+            target,
+            replacement: match &body {
+                Mjudge::Supersede { replacement, .. } => Some(*replacement),
+                _ => None,
+            },
+            reason: args.reason,
+            // The sealed op's own HLC millisecond — exactly what a
+            // restart recovers from the header (ruling R2: live and
+            // rebuilt views agree).
+            at_ms: self.plane.last_hlc_ms(),
+            // The durable identity the envelope carries: the owner
+            // (R2 — rebuild maps `human` → `owner` identically).
+            judged_by: ClaimProvenance {
+                v: 1,
+                actor: "owner".into(),
+                principal: None,
+                session: None,
+            },
+            policy: policy_id,
+        });
+        Ok(self.view(&target, &self.claims[&target]))
+    }
+
+    /// Judgment history for one claim, oldest first (append order).
+    fn judgments_for(&self, claim: &[u8; 32]) -> Vec<JudgmentView> {
+        self.judgments
+            .iter()
+            .filter(|j| j.target == *claim)
+            .map(|j| JudgmentView {
+                id: hex32(&j.id),
+                verdict: j.verdict.clone(),
+                target: hex32(&j.target),
+                replacement: j.replacement.as_ref().map(hex32),
+                reason: j.reason.clone(),
+                at_ms: j.at_ms,
+                judged_by: j.judged_by.clone(),
+                policy: j.policy.clone(),
+            })
+            .collect()
     }
 
     /// The reducer-derived status a view carries ("pending" until the
@@ -436,7 +688,9 @@ impl MemoryService {
     }
 
     fn view(&self, op_hash: &[u8; 32], rec: &ClaimRecord) -> ClaimView {
-        self.view_with_status(op_hash, rec, self.claim_status_of(op_hash))
+        let mut view = self.view_with_status(op_hash, rec, self.claim_status_of(op_hash));
+        view.judgments = self.judgments_for(op_hash);
+        view
     }
 
     fn view_with_status(
@@ -458,6 +712,9 @@ impl MemoryService {
             created_ms: rec.created_ms,
             proposed_by: rec.proposed_by.clone(),
             durability: self.durability_label().into(),
+            // Lean by construction (search results); [`Self::view`]
+            // attaches history for single-claim views.
+            judgments: Vec::new(),
         }
     }
 
@@ -893,6 +1150,65 @@ mod tests {
             .expect("the recovered chain keeps accepting");
     }
 
+    /// Ruling R2 binding test: judge live, reopen the plane — the
+    /// views are IDENTICAL. Derived status re-folds to the same
+    /// answer, and the judgment history (verdict, target,
+    /// replacement, reason, timestamp, durable-identity provenance,
+    /// policy) rebuilds byte-equal from the recovered envelopes; a
+    /// post-restart judgment keeps counting on the recovered chain.
+    #[test]
+    fn durable_judgments_survive_restart_with_identical_views() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("plane");
+        let owner = ActorBinding::dashboard(Some("principal:root:dashboard".into()));
+        let (old_live, new_live);
+        {
+            let mut svc = MemoryService::new_durable(&dir).unwrap();
+            let old = svc.propose(propose_args("the old fact"), &owner).unwrap();
+            let new = svc.propose(propose_args("the new fact"), &owner).unwrap();
+            svc.judge(judge_args("accept", &new.id), &owner).unwrap();
+            old_live = svc
+                .judge(
+                    JudgeArgs {
+                        replacement: Some(new.id.clone()),
+                        reason: Some("superseded by the corrected fact".into()),
+                        ..judge_args("supersede", &old.id)
+                    },
+                    &owner,
+                )
+                .unwrap();
+            assert_eq!(old_live.status, "superseded");
+            new_live = svc.read(&new.id[..12]).unwrap();
+        }
+        let mut svc = MemoryService::new_durable(&dir).unwrap();
+        let old_back = svc.read(&old_live.id[..12]).unwrap();
+        let new_back = svc.read(&new_live.id[..12]).unwrap();
+        assert_eq!(old_back.status, "superseded", "status re-folds identically");
+        assert_eq!(
+            old_back.judgments, old_live.judgments,
+            "judgment history is identical across the restart (R2)"
+        );
+        assert_eq!(new_back.judgments, new_live.judgments);
+        assert_eq!(old_back.judgments.len(), 1);
+        assert_eq!(old_back.judgments[0].judged_by.actor, "owner");
+        assert_eq!(
+            old_back.judgments[0].reason.as_deref(),
+            Some("superseded by the corrected fact")
+        );
+        // The recovered chain keeps judging: retire the replacement
+        // and the old claim REVIVES (replacement loss, §11.2 rule 2 —
+        // revival is automatic and surfaced).
+        let retired = svc
+            .judge(judge_args("retire", &new_back.id), &owner)
+            .unwrap();
+        assert_eq!(retired.status, "retired");
+        assert_eq!(
+            svc.read(&old_back.id[..12]).unwrap().status,
+            "candidate",
+            "supersession released by the replacement's retirement (D-21 revival)"
+        );
+    }
+
     /// P1.8 exit battery — zone/space denial: an op aimed at a space
     /// the writer grant does not cover rejects with the kernel's named
     /// scope outcome. (The service only ever writes the home space;
@@ -964,6 +1280,291 @@ mod tests {
             options("memory-add-sensitivity"),
             kernel(&Class::ALL.iter().map(|c| c.as_str()).collect::<Vec<_>>()),
             "memory-add-sensitivity options drifted from Class::ALL"
+        );
+    }
+
+    fn judge_args(verdict: &str, id: &str) -> JudgeArgs {
+        JudgeArgs {
+            verdict: verdict.into(),
+            id: id.into(),
+            reason: None,
+            replacement: None,
+        }
+    }
+
+    /// Owner judgments visibly move derived status for every minted
+    /// verdict — accept, dispute, retire — and the judgment history
+    /// rides the returned view (who judged what, when).
+    #[test]
+    fn owner_judgments_move_status_per_verdict() {
+        let mut svc = MemoryService::new().unwrap();
+        let owner = ActorBinding::dashboard(Some("principal:browser-cert:test".into()));
+
+        let a = svc.propose(propose_args("accepted claim"), &owner).unwrap();
+        let view = svc.judge(judge_args("accept", &a.id), &owner).unwrap();
+        assert_eq!(view.status, "accepted", "accept counts (owner class)");
+        assert_eq!(view.judgments.len(), 1);
+        assert_eq!(view.judgments[0].verdict, "accept");
+        assert_eq!(view.judgments[0].policy, "workflow-v1");
+
+        let d = svc.propose(propose_args("disputed claim"), &owner).unwrap();
+        let view = svc
+            .judge(
+                JudgeArgs {
+                    reason: Some("disputed: authorship-in-fact, content unverified".into()),
+                    ..judge_args("dispute", &d.id)
+                },
+                &owner,
+            )
+            .unwrap();
+        assert_eq!(view.status, "disputed");
+        assert_eq!(
+            view.judgments[0].reason.as_deref(),
+            Some("disputed: authorship-in-fact, content unverified"),
+            "the rationale rides the sealed op and the view"
+        );
+
+        let r = svc.propose(propose_args("retired claim"), &owner).unwrap();
+        let view = svc.judge(judge_args("retire", &r.id), &owner).unwrap();
+        assert_eq!(view.status, "retired");
+    }
+
+    /// §11.2 rule 2 honesty (ruling R4): supersession holds only
+    /// while the replacement's derived status is `accepted` — a
+    /// candidate replacement leaves the target unmoved (the judgment
+    /// is recorded, never fake atomicity), and accepting the
+    /// replacement later flips the target to `superseded` with no
+    /// further op.
+    #[test]
+    fn supersede_holds_only_while_replacement_accepted() {
+        let mut svc = MemoryService::new().unwrap();
+        let owner = ActorBinding::dashboard(None);
+        let old = svc.propose(propose_args("the old fact"), &owner).unwrap();
+        let new = svc.propose(propose_args("the new fact"), &owner).unwrap();
+
+        let view = svc
+            .judge(
+                JudgeArgs {
+                    replacement: Some(new.id.clone()),
+                    ..judge_args("supersede", &old.id)
+                },
+                &owner,
+            )
+            .unwrap();
+        assert_eq!(
+            view.status, "candidate",
+            "candidate replacement holds no supersession (recorded, surfaced, honest)"
+        );
+        assert_eq!(view.judgments.len(), 1, "the judgment IS recorded");
+        assert_eq!(view.judgments[0].replacement.as_deref(), Some(&new.id[..]));
+
+        svc.judge(judge_args("accept", &new.id), &owner).unwrap();
+        let after = svc.read(&old.id[..12]).unwrap();
+        assert_eq!(
+            after.status, "superseded",
+            "accepting the replacement completes the supersession via the fold alone"
+        );
+    }
+
+    /// Ruling R1: the owner's LOCAL SHELL is an owner surface — a
+    /// `local_process` judgment seals the O4 human shape (kind
+    /// `human`, attested_by absent) and COUNTS, exactly like the
+    /// dashboard. This is the mapping J0 found missing (bare-daemon
+    /// ctl judgments would have been recorded-but-inert).
+    #[test]
+    fn local_process_judgments_seal_human_and_count() {
+        let mut svc = MemoryService::new().unwrap();
+        let shell = ActorBinding::local_process(Some("principal:loopback:test".into()));
+        let claim = svc
+            .propose(propose_args("judged from ctl"), &shell)
+            .unwrap();
+        let view = svc.judge(judge_args("accept", &claim.id), &shell).unwrap();
+        assert_eq!(view.status, "accepted", "ctl judgment moves status");
+        assert_eq!(
+            svc.plane.tail_op_actor(),
+            Some(("human".into(), false)),
+            "the sealed envelope carries O4 human evidence: kind human, UNATTESTED"
+        );
+        assert_eq!(view.judgments[0].judged_by.actor, "owner", "R2 identity");
+        assert_eq!(view.judgments[0].judged_by.principal, None);
+    }
+
+    /// Ruling R1 condition 2: ring-2 actors take the named
+    /// `actor-not-permitted` denial BEFORE any seal — they can never
+    /// obtain the human envelope actor (and the kernel's D-201 keeps
+    /// even a hypothetical bypass fold-inert). Nothing is sealed,
+    /// nothing recorded.
+    #[test]
+    fn ring2_judgments_denied_before_any_seal() {
+        let mut svc = MemoryService::new().unwrap();
+        let owner = ActorBinding::dashboard(None);
+        let claim = svc.propose(propose_args("target"), &owner).unwrap();
+        let held_before = svc.plane.held_ops();
+
+        for ring2 in [
+            ActorBinding::agent_session(
+                Some("principal:agent-session:sess-9".into()),
+                "sess-9".into(),
+            ),
+            ActorBinding::peer(Some("principal:peer:remote".into())),
+            ActorBinding::unattributed(),
+        ] {
+            let err = svc
+                .judge(judge_args("accept", &claim.id), &ring2)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    MemoryError::NotPermitted {
+                        verb: "judge.full",
+                        ..
+                    }
+                ),
+                "named tenant-edge denial, got {err:?}"
+            );
+        }
+        assert_eq!(
+            svc.plane.held_ops(),
+            held_before,
+            "denied judgments seal NOTHING — the human seal is unreachable for ring-2"
+        );
+        assert!(
+            svc.judgments.is_empty(),
+            "no judgment record exists after denials"
+        );
+    }
+
+    /// Unminted kernel vocabulary rejects with the allowed set:
+    /// retract (author-lane machinery, read-only surfaced in v1),
+    /// the fail-closed classification arms, and unknown words alike.
+    #[test]
+    fn unminted_verdicts_reject_with_the_allowed_set() {
+        let mut svc = MemoryService::new().unwrap();
+        let owner = ActorBinding::dashboard(None);
+        let claim = svc.propose(propose_args("target"), &owner).unwrap();
+        for verdict in ["retract", "raise_class", "declassify", "erase", "approve"] {
+            let err = svc
+                .judge(judge_args(verdict, &claim.id), &owner)
+                .unwrap_err();
+            match err {
+                MemoryError::Vocabulary { what, got, allowed } => {
+                    assert_eq!(what, "verdict");
+                    assert_eq!(got, verdict);
+                    assert_eq!(allowed, "accept, dispute, retire, supersede");
+                }
+                other => panic!("expected vocabulary rejection for {verdict}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Ruling R3: the 2000-char `reason` intake cap rejects loudly —
+    /// never truncates — and names the cap.
+    #[test]
+    fn reason_cap_rejects_loudly() {
+        let mut svc = MemoryService::new().unwrap();
+        let owner = ActorBinding::dashboard(None);
+        let claim = svc.propose(propose_args("target"), &owner).unwrap();
+        let err = svc
+            .judge(
+                JudgeArgs {
+                    reason: Some("x".repeat(MAX_REASON_CHARS + 1)),
+                    ..judge_args("accept", &claim.id)
+                },
+                &owner,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, MemoryError::InvalidArg(m) if m.contains("2000")),
+            "cap named in the rejection, got {err:?}"
+        );
+        let ok = svc
+            .judge(
+                JudgeArgs {
+                    reason: Some("y".repeat(MAX_REASON_CHARS)),
+                    ..judge_args("accept", &claim.id)
+                },
+                &owner,
+            )
+            .unwrap();
+        assert_eq!(ok.status, "accepted", "at-cap reason seals fine");
+    }
+
+    /// Supersede argument shape: replacement is required for
+    /// supersede, refused elsewhere, and self-supersession is refused
+    /// at construction (the kernel would derive `disputed` from the
+    /// cycle — refusing is the honest §C.2 construction-side named
+    /// outcome).
+    #[test]
+    fn supersede_argument_shapes_are_enforced() {
+        let mut svc = MemoryService::new().unwrap();
+        let owner = ActorBinding::dashboard(None);
+        let a = svc.propose(propose_args("claim a"), &owner).unwrap();
+        let b = svc.propose(propose_args("claim b"), &owner).unwrap();
+
+        let err = svc
+            .judge(judge_args("supersede", &a.id), &owner)
+            .unwrap_err();
+        assert!(matches!(&err, MemoryError::InvalidArg(m) if m.contains("replacement")));
+
+        let err = svc
+            .judge(
+                JudgeArgs {
+                    replacement: Some(b.id.clone()),
+                    ..judge_args("accept", &a.id)
+                },
+                &owner,
+            )
+            .unwrap_err();
+        assert!(matches!(&err, MemoryError::InvalidArg(m) if m.contains("supersede")));
+
+        let err = svc
+            .judge(
+                JudgeArgs {
+                    replacement: Some(a.id.clone()),
+                    ..judge_args("supersede", &a.id)
+                },
+                &owner,
+            )
+            .unwrap_err();
+        assert!(matches!(&err, MemoryError::InvalidArg(m) if m.contains("itself")));
+    }
+
+    /// POST-RULING FINDING #1 boundary proof: the stamped reducer
+    /// fail-closes `m.pin` (registry-known, mechanism undispatched) —
+    /// the named kernel boundary surfaces verbatim and nothing is
+    /// admitted. When a future kernel slice lifts the row, this test
+    /// fails loudly and the pin surface becomes buildable.
+    #[test]
+    fn pin_ops_are_fail_closed_at_the_stamped_kernel_boundary() {
+        use owner_plane_core::shapes::memory::Mpin;
+        let mut svc = MemoryService::new().unwrap();
+        let owner = ActorBinding::dashboard(None);
+        let claim = svc.propose(propose_args("pin target"), &owner).unwrap();
+        svc.judge(judge_args("accept", &claim.id), &owner).unwrap();
+        let target: [u8; 32] = {
+            let mut b = [0u8; 32];
+            for (i, chunk) in claim.id.as_bytes().chunks(2).enumerate().take(32) {
+                b[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
+            }
+            b
+        };
+        let accept_judgment = svc.judgments.last().map(|j| j.id).unwrap();
+        let pin = Mpin {
+            target,
+            dest_space: [0u8; 16],
+            dest_role: "context".into(),
+            expiry_ms: None,
+            token_budget: None,
+            provenance_floor: None,
+            accepted_under_judgment: accept_judgment,
+            accepted_under_policy: super::super::plane::workflow_polref(),
+        };
+        let err = svc
+            .tenant_op_for_test(Mpin::OP_TYPE, pin.to_value())
+            .unwrap_err();
+        assert!(
+            matches!(&err, MemoryError::Unimplemented(m) if m.contains("m.pin")),
+            "the stamped kernel names the fail-closed boundary, got {err:?}"
         );
     }
 }
