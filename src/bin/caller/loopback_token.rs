@@ -138,13 +138,15 @@ fn write_private_atomic(dir: &Path, dest: &Path, contents: &[u8]) -> io::Result<
     crate::file_watcher::persist_staged(&staged_path, dest)
 }
 
-/// Constant-time equality against the daemon's admission token.
+/// Timing-safe equality against the daemon's admission token:
+/// hash-then-compare, so the byte comparison runs over SHA-256 digests
+/// and its early-exit timing reveals at most a digest prefix — useless
+/// without a preimage. (ring's `verify_slices_are_equal` is deprecated
+/// with no side-channel promises.)
 fn matches_admission_token(candidate: &str) -> bool {
-    ring::constant_time::verify_slices_are_equal(
-        candidate.trim().as_bytes(),
-        loopback_admission_token().as_bytes(),
-    )
-    .is_ok()
+    let digest_of = |bytes: &[u8]| ring::digest::digest(&ring::digest::SHA256, bytes);
+    digest_of(candidate.trim().as_bytes()).as_ref()
+        == digest_of(loopback_admission_token().as_bytes()).as_ref()
 }
 
 /// Whether this request presents the loopback admission token on any
@@ -259,6 +261,21 @@ pub(crate) fn tokened_dashboard_url(scheme: &str, port: u16) -> String {
         "{scheme}://127.0.0.1:{port}/?token={}",
         loopback_admission_token()
     )
+}
+
+/// Test-only: peer-transport credentials that present this process's
+/// admission token as the bearer — in-process test gateways enforce the
+/// loopback gate like every daemon, and same-box federation dials
+/// authenticate with the target daemon's token (here: the shared
+/// process token). Central so every peer test module builds dials the
+/// same way.
+#[cfg(test)]
+pub(crate) fn test_transport_credentials() -> crate::peer::transport::intendant::TransportCredentials
+{
+    crate::peer::transport::intendant::TransportCredentials {
+        bearer_token: Some(loopback_admission_token().to_string()),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

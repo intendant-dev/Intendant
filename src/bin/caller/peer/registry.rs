@@ -894,7 +894,14 @@ mod tests {
         let reg = PeerRegistry::new(log_tx);
 
         let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
-        let peer_id = reg.add_peer(&card_url).await.expect("add_peer succeeds");
+        let peer_id = reg
+            .add_peer_with_via_and_auth(
+                &card_url,
+                Vec::new(),
+                Some(crate::loopback_token::loopback_admission_token().to_string()),
+            )
+            .await
+            .expect("add_peer succeeds");
         assert_eq!(peer_id.kind(), Some(PeerKind::Intendant));
         assert_eq!(reg.len(), 1);
 
@@ -1132,7 +1139,15 @@ mod tests {
 
         let ws_url = format!("ws://127.0.0.1:{port}/ws");
         let card = fake_card("forward-test", &ws_url);
-        let id = reg.add_peer_with_card(card).await.unwrap();
+        let id = reg
+            .add_peer_with_card_and_auth(
+                card,
+                Vec::new(),
+                Some(crate::loopback_token::loopback_admission_token().to_string()),
+                None,
+            )
+            .await
+            .unwrap();
 
         // Drain everything until we see a PeerEventForwarded with a
         // matching peer id, or time out. The target gateway is idle
@@ -1280,7 +1295,11 @@ mod tests {
         let via_url = format!("ws://127.0.0.1:{port}/ws");
         let via_urls = vec![via_url.clone()];
         let peer_id = reg
-            .add_peer_with_via(&card_url, via_urls)
+            .add_peer_with_via_and_auth(
+                &card_url,
+                via_urls,
+                Some(crate::loopback_token::loopback_admission_token().to_string()),
+            )
             .await
             .expect("add_peer_with_via succeeds");
         let handle = reg.get(&peer_id).expect("peer is in registry");

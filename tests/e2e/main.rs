@@ -4382,6 +4382,7 @@ async fn supervised_session_rolls_back_conversation_to_a_round() {
         .post(format!(
             "http://127.0.0.1:{port}/api/session/current/rollback"
         ))
+        .header("x-intendant-loopback-token", rig_loopback_token(&rig, port))
         .json(&serde_json::json!({
             "session_id": session_id,
             "round_id": 1,
@@ -4642,8 +4643,22 @@ async fn headless_rollback_writes_a_conversation_rewound_cut() {
     // Conversation-only revert to the first recorded round, through the
     // dashboard's route (the production `conversation_rewound` path).
     // Idle-state and history-visibility race the round_complete event, so
-    // poll both.
-    let client = reqwest::Client::new();
+    // poll both. Owner-surface polls present the boot's admission token
+    // as a default header (the daemon printed its Dashboard line above,
+    // so the token file exists).
+    let client = {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-intendant-loopback-token",
+            rig_loopback_token(&rig, port)
+                .parse()
+                .expect("token header value"),
+        );
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("token-authed client")
+    };
     let stderr_ctx = stderr_buf.clone();
     let first_round_id = poll_until(
         "the session history to list its first round",
@@ -4673,11 +4688,13 @@ async fn headless_rollback_writes_a_conversation_rewound_cut() {
         Duration::from_secs(30),
         || {
             let client = client.clone();
+            let loopback_token = rig_loopback_token(&rig, port);
             async move {
                 let response = client
                     .post(format!(
                         "http://127.0.0.1:{port}/api/session/current/rollback"
                     ))
+                    .header("x-intendant-loopback-token", loopback_token)
                     .json(&serde_json::json!({
                         "round_id": first_round_id,
                         "revert_conversation": true,

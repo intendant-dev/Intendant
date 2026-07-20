@@ -4164,7 +4164,12 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(with_test_loopback_token("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
+            .write_all(
+                with_test_loopback_token(
+                    "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .as_bytes(),
+            )
             .await
             .unwrap();
 
@@ -4224,7 +4229,12 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
+            .write_all(
+                with_test_loopback_token(
+                    "GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .as_bytes(),
+            )
             .await
             .unwrap();
 
@@ -4278,7 +4288,12 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
+            .write_all(
+                with_test_loopback_token(
+                    "GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .as_bytes(),
+            )
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -5766,7 +5781,10 @@ mod tests {
         // Request 1: HTTP/1.1 defaults to keep-alive; the framed JSON
         // response advertises it and the connection stays open.
         stream
-            .write_all(with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .write_all(
+                with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .as_bytes(),
+            )
             .await
             .unwrap();
         let resp1 = read_one_http_response(&mut stream).await;
@@ -5781,7 +5799,12 @@ mod tests {
         // funnel (write_api_response): the rewritten header tail must
         // advertise keep-alive there too.
         stream
-            .write_all(with_test_loopback_token("GET /api/project-root HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .write_all(
+                with_test_loopback_token(
+                    "GET /api/project-root HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .as_bytes(),
+            )
             .await
             .unwrap();
         let resp2 = read_one_http_response(&mut stream).await;
@@ -5791,7 +5814,12 @@ mod tests {
 
         // Request 3: a static-asset chain arm, same connection still.
         stream
-            .write_all(with_test_loopback_token("GET /audio-processor.js HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .write_all(
+                with_test_loopback_token(
+                    "GET /audio-processor.js HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .as_bytes(),
+            )
             .await
             .unwrap();
         let resp3 = read_one_http_response(&mut stream).await;
@@ -5801,7 +5829,12 @@ mod tests {
         // Request 4 says close: the server honors it and the connection
         // ends cleanly right after the response.
         stream
-            .write_all(with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
+            .write_all(
+                with_test_loopback_token(
+                    "GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .as_bytes(),
+            )
             .await
             .unwrap();
         let resp4 = read_one_http_response(&mut stream).await;
@@ -5829,7 +5862,10 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(with_test_loopback_token("GET /config HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes())
+            .write_all(
+                with_test_loopback_token("GET /config HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                    .as_bytes(),
+            )
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -5857,7 +5893,10 @@ mod tests {
 
         // Plain request first; the connection parks for reuse.
         stream
-            .write_all(with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .write_all(
+                with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .as_bytes(),
+            )
             .await
             .unwrap();
         let resp = read_one_http_response(&mut stream).await;
@@ -5893,7 +5932,10 @@ mod tests {
             .unwrap();
         for i in 1..=KEEP_ALIVE_MAX_REQUESTS {
             stream
-                .write_all(with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+                .write_all(
+                    with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        .as_bytes(),
+                )
                 .await
                 .unwrap();
             let resp = read_one_http_response(&mut stream).await;

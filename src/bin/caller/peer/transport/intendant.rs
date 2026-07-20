@@ -730,6 +730,8 @@ impl PeerTransport for IntendantWsTransport {
 
 #[cfg(test)]
 mod tests {
+    use crate::loopback_token::test_transport_credentials as test_loopback_credentials;
+
     use super::*;
     use crate::event::{AppEvent, EventBus};
     use crate::peer::event::{MessageContent, MessageRole, PeerMessage};
@@ -836,7 +838,8 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<PeerEvent>(64);
         let url = format!("ws://127.0.0.1:{port}/ws");
-        let mut transport = IntendantWsTransport::new(url, tx);
+        let mut transport =
+            IntendantWsTransport::with_credentials(url, tx, test_loopback_credentials());
         let _card = transport.connect().await.expect("connect succeeds");
         // Give the gateway's per-connection outbound loop a beat to
         // subscribe before broadcasting, so the events aren't dropped
@@ -932,7 +935,8 @@ mod tests {
         let (port, gateway) = spawn_test_peer().await;
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
         let url = format!("ws://127.0.0.1:{port}/ws");
-        let mut transport = IntendantWsTransport::new(url, tx);
+        let mut transport =
+            IntendantWsTransport::with_credentials(url, tx, test_loopback_credentials());
 
         let card = transport.connect().await.expect("connect succeeds");
         assert_eq!(
@@ -955,7 +959,8 @@ mod tests {
         let (port, gateway) = spawn_test_peer().await;
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
         let url = format!("ws://127.0.0.1:{port}/ws");
-        let mut transport = IntendantWsTransport::new(url, tx);
+        let mut transport =
+            IntendantWsTransport::with_credentials(url, tx, test_loopback_credentials());
 
         let _card1 = transport.connect().await.expect("first connect");
         assert!(transport.is_connected());
@@ -980,7 +985,11 @@ mod tests {
     #[test]
     fn features_advertise_three_outbound_verbs() {
         let (tx, _rx) = mpsc::channel::<PeerEvent>(1);
-        let transport = IntendantWsTransport::new("ws://127.0.0.1:0/ws".to_string(), tx);
+        let transport = IntendantWsTransport::with_credentials(
+            "ws://127.0.0.1:0/ws".to_string(),
+            tx,
+            test_loopback_credentials(),
+        );
         let features = transport.features();
         assert!(features.bidirectional);
         assert!(features.streaming_events);
@@ -1001,7 +1010,8 @@ mod tests {
         let (port, gateway, mut bus_rx) = spawn_test_peer_with_bus().await;
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
         let url = format!("ws://127.0.0.1:{port}/ws");
-        let mut transport = IntendantWsTransport::new(url, tx);
+        let mut transport =
+            IntendantWsTransport::with_credentials(url, tx, test_loopback_credentials());
         let _ = transport.connect().await.unwrap();
         let report = crate::access::hosted_control::HostedCertificateWitnessReport {
             protocol: crate::access::hosted_control::CERTIFICATE_WITNESS_PROTOCOL.to_string(),
@@ -1046,7 +1056,8 @@ mod tests {
         let (port, gateway, mut bus_rx) = spawn_test_peer_with_bus().await;
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
         let url = format!("ws://127.0.0.1:{port}/ws");
-        let mut transport = IntendantWsTransport::new(url, tx);
+        let mut transport =
+            IntendantWsTransport::with_credentials(url, tx, test_loopback_credentials());
         let _ = transport.connect().await.unwrap();
 
         let ack = transport
@@ -1090,7 +1101,8 @@ mod tests {
         let (port, gateway, mut bus_rx) = spawn_test_peer_with_bus().await;
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
         let url = format!("ws://127.0.0.1:{port}/ws");
-        let mut transport = IntendantWsTransport::new(url, tx);
+        let mut transport =
+            IntendantWsTransport::with_credentials(url, tx, test_loopback_credentials());
         let _ = transport.connect().await.unwrap();
 
         let ack = transport
@@ -1130,7 +1142,8 @@ mod tests {
         let (port, gateway, mut bus_rx) = spawn_test_peer_with_bus().await;
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
         let url = format!("ws://127.0.0.1:{port}/ws");
-        let mut transport = IntendantWsTransport::new(url, tx);
+        let mut transport =
+            IntendantWsTransport::with_credentials(url, tx, test_loopback_credentials());
         let _ = transport.connect().await.unwrap();
 
         let ack = transport
@@ -1174,7 +1187,8 @@ mod tests {
         let (port, gateway, mut bus_rx) = spawn_test_peer_with_bus().await;
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
         let url = format!("ws://127.0.0.1:{port}/ws");
-        let mut transport = IntendantWsTransport::new(url, tx);
+        let mut transport =
+            IntendantWsTransport::with_credentials(url, tx, test_loopback_credentials());
         let _ = transport.connect().await.unwrap();
 
         // Accept → Approve { id }
@@ -1250,7 +1264,8 @@ mod tests {
         let (port, gateway) = spawn_test_peer().await;
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
         let url = format!("ws://127.0.0.1:{port}/ws");
-        let mut transport = IntendantWsTransport::new(url, tx);
+        let mut transport =
+            IntendantWsTransport::with_credentials(url, tx, test_loopback_credentials());
         let _ = transport.connect().await.unwrap();
 
         let result = transport
@@ -1286,7 +1301,8 @@ mod tests {
         let (port, gateway) = spawn_test_peer().await;
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
         let url = format!("ws://127.0.0.1:{port}/ws");
-        let mut transport = IntendantWsTransport::new(url, tx);
+        let mut transport =
+            IntendantWsTransport::with_credentials(url, tx, test_loopback_credentials());
         let _ = transport.connect().await.unwrap();
 
         let result = transport
@@ -1312,7 +1328,11 @@ mod tests {
     #[tokio::test]
     async fn send_before_connect_returns_not_connected() {
         let (tx, _rx) = mpsc::channel::<PeerEvent>(1);
-        let mut transport = IntendantWsTransport::new("ws://127.0.0.1:1/ws".to_string(), tx);
+        let mut transport = IntendantWsTransport::with_credentials(
+            "ws://127.0.0.1:1/ws".to_string(),
+            tx,
+            test_loopback_credentials(),
+        );
 
         let result = transport
             .send(PeerOp::SendMessage {
