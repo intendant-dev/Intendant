@@ -159,16 +159,27 @@ pub struct ChatResponse {
     pub raw_output: Option<Vec<serde_json::Value>>,
 }
 
-/// How a provider instance authenticates its requests: a real key
-/// (lease or environment) attached daemon-side, or the client-egress
-/// marker — a registered browser relay holds the credential, the daemon
-/// ships auth-less requests to it, and the browser attaches the key
+/// How a provider instance authenticates its requests: a fixed key
+/// captured at construction, the per-request marker that re-resolves the
+/// lease/env chain on every request, or the client-egress marker — a
+/// registered browser relay holds the credential, the daemon ships
+/// auth-less requests to it, and the browser attaches the key
 /// (credential custody, rollout step 5). `From<String>` keeps every
 /// existing key-shaped construction site source-compatible.
 #[derive(Debug, Clone)]
 pub enum ProviderAuth {
     Key(String),
-    ClientEgress { kind: &'static str },
+    /// Re-resolved through `credential_leases::provider_api_key` at every
+    /// request boundary, with the session project's `.env` overlay as the
+    /// last layer — so lease revocation, expiry, re-grant, and dashboard
+    /// key saves take effect at the next request instead of session end.
+    PerRequest {
+        env_name: &'static str,
+        project_key: Option<String>,
+    },
+    ClientEgress {
+        kind: &'static str,
+    },
 }
 
 impl From<String> for ProviderAuth {
@@ -177,16 +188,80 @@ impl From<String> for ProviderAuth {
     }
 }
 
-/// The credential a selector binds for a provider: a real key first
-/// (lease shadows env, as everywhere), else the egress marker when a
-/// browser relay is attached for the kind.
-fn provider_auth_for(env_name: &str, egress_kind: &'static str) -> Option<ProviderAuth> {
-    crate::credential_leases::provider_api_key(env_name)
-        .map(ProviderAuth::Key)
-        .or_else(|| {
-            crate::credential_egress::available(egress_kind)
-                .then_some(ProviderAuth::ClientEgress { kind: egress_kind })
-        })
+impl ProviderAuth {
+    /// The credential for the request being built *now*. `Key` is a fixed
+    /// capture; `PerRequest` re-resolves so a revoked or expired lease
+    /// stops fueling at the next request boundary, failing closed with a
+    /// named error when nothing replaces it. The egress marker carries no
+    /// daemon-side key by design — callers route it before asking.
+    pub(crate) fn request_key(&self) -> Result<std::borrow::Cow<'_, str>, CallerError> {
+        match self {
+            ProviderAuth::Key(key) => Ok(std::borrow::Cow::Borrowed(key.as_str())),
+            ProviderAuth::PerRequest {
+                env_name,
+                project_key,
+            } => {
+                if let Some(key) = crate::credential_leases::provider_api_key(env_name) {
+                    return Ok(std::borrow::Cow::Owned(key));
+                }
+                if let Some(key) = project_key {
+                    return Ok(std::borrow::Cow::Borrowed(key.as_str()));
+                }
+                let note = crate::credential_leases::expired_lease_note()
+                    .map(|note| format!(" — {note}"))
+                    .unwrap_or_default();
+                Err(CallerError::Config(format!(
+                    "{env_name} went dry mid-session: no credential lease, environment \
+                     key, or project key currently serves it{note}"
+                )))
+            }
+            ProviderAuth::ClientEgress { kind } => Err(CallerError::Config(format!(
+                "client-egress auth for {kind} carries no daemon-side key; \
+                 this request path requires a direct credential"
+            ))),
+        }
+    }
+}
+
+/// The credential a selector binds for a provider: available iff the
+/// lease/env chain (or the project overlay) serves a key right now, but
+/// bound as `PerRequest` so every request re-resolves. Precedence matches
+/// the pre-per-request selectors: key sources first (lease shadows env,
+/// as everywhere), else the egress marker when a browser relay is
+/// attached, else the project overlay alone.
+fn provider_auth_with_project(
+    env_name: &'static str,
+    egress_kind: Option<&'static str>,
+    project_keys: &ProjectEnvKeys,
+) -> Option<ProviderAuth> {
+    let project_key = project_keys.get(env_name);
+    if crate::credential_leases::provider_api_key(env_name).is_some() {
+        return Some(ProviderAuth::PerRequest {
+            env_name,
+            project_key,
+        });
+    }
+    if let Some(kind) = egress_kind {
+        if crate::credential_egress::available(kind) {
+            return Some(ProviderAuth::ClientEgress { kind });
+        }
+    }
+    project_key.map(|key| ProviderAuth::PerRequest {
+        env_name,
+        project_key: Some(key),
+    })
+}
+
+/// [`provider_auth_with_project`] for the selectors that carry no session
+/// project overlay.
+fn provider_auth_for(env_name: &'static str, egress_kind: &'static str) -> Option<ProviderAuth> {
+    provider_auth_with_project(env_name, Some(egress_kind), &ProjectEnvKeys::none())
+}
+
+/// Per-request OpenAI auth for the selectors that carry no session
+/// project overlay (OpenAI has no egress lane today).
+fn openai_auth() -> Option<ProviderAuth> {
+    provider_auth_with_project("OPENAI_API_KEY", None, &ProjectEnvKeys::none())
 }
 
 /// The provider API-key environment variables — the single authoritative
@@ -664,15 +739,17 @@ pub fn select_provider_for_project(
 fn select_provider_with_project_keys(
     project_keys: &ProjectEnvKeys,
 ) -> Result<Box<dyn ChatProvider>, CallerError> {
-    let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY")
-        .or_else(|| project_keys.get("OPENAI_API_KEY"));
-    let anthropic_key = provider_auth_for(
+    let openai_key = provider_auth_with_project("OPENAI_API_KEY", None, project_keys);
+    let anthropic_key = provider_auth_with_project(
         "ANTHROPIC_API_KEY",
-        crate::credential_egress::KIND_ANTHROPIC,
-    )
-    .or_else(|| project_keys.get("ANTHROPIC_API_KEY").map(ProviderAuth::Key));
-    let gemini_key = provider_auth_for("GEMINI_API_KEY", crate::credential_egress::KIND_GEMINI)
-        .or_else(|| project_keys.get("GEMINI_API_KEY").map(ProviderAuth::Key));
+        Some(crate::credential_egress::KIND_ANTHROPIC),
+        project_keys,
+    );
+    let gemini_key = provider_auth_with_project(
+        "GEMINI_API_KEY",
+        Some(crate::credential_egress::KIND_GEMINI),
+        project_keys,
+    );
 
     let preferred = env::var("PROVIDER").ok();
 
@@ -816,7 +893,7 @@ pub fn select_provider_with_overrides(
         .map(|s| s.to_string())
         .or_else(|| env::var("PRESENCE_MODEL").ok());
 
-    let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
+    let openai_key = openai_auth();
     let anthropic_key = provider_auth_for(
         "ANTHROPIC_API_KEY",
         crate::credential_egress::KIND_ANTHROPIC,
@@ -893,7 +970,7 @@ pub fn select_cu_provider(
         .map(String::from)
         .or_else(|| env::var("CU_MODEL").ok());
 
-    let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
+    let openai_key = openai_auth();
     let anthropic_key = provider_auth_for(
         "ANTHROPIC_API_KEY",
         crate::credential_egress::KIND_ANTHROPIC,
@@ -1013,7 +1090,7 @@ pub fn select_presence_provider(
         .map(|s| s.to_string())
         .or_else(|| env::var("PRESENCE_MODEL").ok());
 
-    let openai_key = crate::credential_leases::provider_api_key("OPENAI_API_KEY");
+    let openai_key = openai_auth();
     let anthropic_key = provider_auth_for(
         "ANTHROPIC_API_KEY",
         crate::credential_egress::KIND_ANTHROPIC,
@@ -1262,6 +1339,45 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_key_static_and_egress_shapes() {
+        let auth = ProviderAuth::Key("sk-static".to_string());
+        assert_eq!(auth.request_key().unwrap(), "sk-static");
+        let egress = ProviderAuth::ClientEgress {
+            kind: crate::credential_egress::KIND_ANTHROPIC,
+        };
+        let err = egress.request_key().unwrap_err().to_string();
+        assert!(err.contains("client-egress"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn per_request_auth_re_resolves_every_request() {
+        let _env = crate::test_support::TEST_ENV_LOCK.lock().await;
+        const NAME: &str = "INTENDANT_TEST_PER_REQUEST_KEY";
+        std::env::remove_var(NAME);
+        let auth = ProviderAuth::PerRequest {
+            env_name: NAME,
+            project_key: Some("sk-project".to_string()),
+        };
+        // No env key: the project overlay is the last layer.
+        assert_eq!(auth.request_key().unwrap(), "sk-project");
+        // A key appearing mid-session is served at the next request…
+        std::env::set_var(NAME, "sk-env-1");
+        assert_eq!(auth.request_key().unwrap(), "sk-env-1");
+        // …and so is a replacement: nothing is captured at construction.
+        std::env::set_var(NAME, "sk-env-2");
+        assert_eq!(auth.request_key().unwrap(), "sk-env-2");
+        std::env::remove_var(NAME);
+        // Fully dry: fail closed with a named error.
+        let dry = ProviderAuth::PerRequest {
+            env_name: NAME,
+            project_key: None,
+        };
+        let err = dry.request_key().unwrap_err().to_string();
+        assert!(err.contains("went dry mid-session"), "{err}");
+        assert!(err.contains(NAME), "{err}");
+    }
 
     #[test]
     fn project_env_keys_whitelists_provider_keys_only() {

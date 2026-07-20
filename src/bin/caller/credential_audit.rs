@@ -30,6 +30,14 @@ pub const EVENT_CUSTODY_RESET: &str = "custody_reset";
 /// CredentialsManage-gated save surface (`POST /api/api-keys` or its
 /// tunnel twin). The label carries key *names* only.
 pub const EVENT_PROVIDER_KEYS_WRITTEN: &str = "provider_keys_written";
+/// A dead lease's materialized auth home could not be deleted yet — a
+/// leased CLI session still runs against it, a provisional startup holds
+/// it, or the reap itself failed. Cleanup is queued;
+/// [`EVENT_LEASE_HOME_REMOVED`] records the eventual deletion.
+pub const EVENT_LEASE_CLEANUP_DEFERRED: &str = "lease_cleanup_deferred";
+/// A materialized leased auth home was deleted from disk (sweep, session
+/// end, revocation, or the startup sweep).
+pub const EVENT_LEASE_HOME_REMOVED: &str = "lease_home_removed";
 
 /// How many events the in-memory tail keeps (and the file is trimmed
 /// to on rewrite).
