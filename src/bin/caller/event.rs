@@ -1299,6 +1299,12 @@ pub enum ControlMsg {
         id: u64,
         #[serde(default)]
         answers: std::collections::HashMap<String, String>,
+        /// Structured per-question selections (question text → chosen
+        /// option labels, unjoined). Additive: `answers` remains the
+        /// authoritative legacy form; this preserves labels that contain
+        /// the ", " join sequence and feeds the per-question result.
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        selections: std::collections::HashMap<String, Vec<String>>,
     },
     /// Hold a pending `user_question` open (suspend its expiry) or resume
     /// its countdown. Strictly weaker than `AnswerQuestion` — it changes
@@ -4517,10 +4523,13 @@ mod tests {
                 session_id,
                 id,
                 answers,
+                selections,
             } => {
                 assert_eq!(session_id.as_deref(), Some("sess-1"));
                 assert_eq!(id, 3);
                 assert_eq!(answers["Which DB?"], "PostgreSQL");
+                // Absent on the legacy wire — defaults empty.
+                assert!(selections.is_empty());
             }
             _ => panic!("expected AnswerQuestion"),
         }
@@ -4539,6 +4548,9 @@ mod tests {
                     description: "Relational".into(),
                 }],
                 multi_select: false,
+                pick_min: None,
+                pick_max: None,
+                free_text: None,
                 previews: Vec::new(),
             }],
             expires_at_ms: Some(1_784_500_000_000),

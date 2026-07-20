@@ -3753,6 +3753,23 @@ function showHumanInput(question) {
 let pendingQuestion = null;
 let questionDeadlineTicker = 0;
 
+// Effective selection bounds for a question — mirrors the daemon's
+// UserQuestion::pick_bounds: explicit pick_min/pick_max win, otherwise the
+// legacy rule (exactly one; any-number under multi_select), clamped to the
+// option count.
+function questionPickBounds(q) {
+  const optionCount = (q.options || []).length;
+  const defaultMax = q.multi_select ? Math.max(optionCount, 1) : 1;
+  let max = Math.max(1, q.pick_max ?? defaultMax);
+  if (optionCount > 0) max = Math.min(max, optionCount);
+  const min = Math.min(q.pick_min ?? 1, max);
+  return { min, max };
+}
+
+function questionFreeTextAllowed(q) {
+  return q.free_text !== false;
+}
+
 function questionOptionClicked(qIndex, optIndex) {
   if (!pendingQuestion) return;
   const q = pendingQuestion.questions[qIndex];
@@ -3762,33 +3779,73 @@ function questionOptionClicked(qIndex, optIndex) {
   const buttons = block.querySelectorAll('.question-option');
   const btn = buttons[optIndex];
   if (!btn) return;
-  if (q.multi_select) {
-    btn.classList.toggle('selected');
-  } else {
+  const { max } = questionPickBounds(q);
+  if (max <= 1) {
     buttons.forEach((b) => b.classList.remove('selected'));
     btn.classList.add('selected');
+  } else if (btn.classList.contains('selected')) {
+    btn.classList.remove('selected');
+  } else if (block.querySelectorAll('.question-option.selected').length >= max) {
+    showControlToast('error', `Pick at most ${max} for this question`);
+    return;
+  } else {
+    btn.classList.add('selected');
   }
+  updateQuestionPickCounter(qIndex);
   updateQuestionProgress();
+}
+
+// Keep a multi-pick question's "n/max" counter current (exists only when
+// max > 1).
+function updateQuestionPickCounter(qIndex) {
+  if (!pendingQuestion) return;
+  const q = pendingQuestion.questions[qIndex];
+  const block = document.querySelector(`#question-content .question-block[data-q="${qIndex}"]`);
+  const counter = block?.querySelector('.question-pick-count');
+  if (!q || !counter) return;
+  const { min, max } = questionPickBounds(q);
+  const picked = block.querySelectorAll('.question-option.selected').length;
+  counter.textContent = `${picked}/${max} selected`;
+  counter.classList.toggle('warn', picked < min);
+  counter.title = min === max
+    ? `Pick exactly ${max}`
+    : `Pick ${min}–${max}`;
 }
 
 function collectQuestionAnswers() {
   if (!pendingQuestion) return null;
   const answers = {};
+  const selections = {};
   for (let i = 0; i < pendingQuestion.questions.length; i++) {
     const q = pendingQuestion.questions[i];
     const block = document.querySelector(`#question-content .question-block[data-q="${i}"]`);
     if (!block) continue;
-    const typed = (block.querySelector('.question-free-text')?.value || '').trim();
+    const { min } = questionPickBounds(q);
+    const typed = questionFreeTextAllowed(q)
+      ? (block.querySelector('.question-free-text')?.value || '').trim()
+      : '';
     const picked = Array.from(block.querySelectorAll('.question-option.selected'))
       .map((b) => b.dataset.label)
       .filter(Boolean);
     // Free text wins when both are present (mirrors the CLI's own picker,
     // where typing into "Other" overrides the highlighted option).
     const answer = typed || picked.join(', ');
-    if (!answer) return { missing: q.question };
+    if (!answer) {
+      if (min === 0) continue; // optional question, deliberately unanswered
+      return { missing: q.question };
+    }
+    if (!typed && picked.length < min) {
+      return {
+        missing: q.question,
+        hint: `Pick at least ${min} option${min === 1 ? '' : 's'} for "${q.header || q.question}"`,
+      };
+    }
     answers[q.question] = answer;
+    // Structured labels ride alongside the joined string, so labels that
+    // contain ", " survive and the agent gets a per-question breakdown.
+    selections[q.question] = typed ? [typed] : picked;
   }
-  return { answers };
+  return { answers, selections };
 }
 
 // Scroll a question block to the top of the panel's internal scroll region.
@@ -3816,9 +3873,13 @@ function updateQuestionProgress() {
   const total = pendingQuestion.questions.length;
   let answered = 0;
   for (let i = 0; i < total; i++) {
+    const q = pendingQuestion.questions[i];
     const block = content.querySelector(`.question-block[data-q="${i}"]`);
     const typed = (block?.querySelector('.question-free-text')?.value || '').trim();
-    const done = !!(block && (typed || block.querySelector('.question-option.selected')));
+    const { min } = questionPickBounds(q);
+    const picked = block ? block.querySelectorAll('.question-option.selected').length : 0;
+    // Satisfied = typed free text, enough picks, or nothing required.
+    const done = !!(block && (typed || picked >= Math.max(min, 1) || min === 0));
     if (done) answered++;
     const chip = content.querySelector(`.question-index-chip[data-q="${i}"]`);
     if (chip) {
@@ -4211,6 +4272,13 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held) {
       chip.textContent = q.header;
       block.appendChild(chip);
     }
+    const bounds = questionPickBounds(q);
+    if (bounds.min === 0) {
+      const opt = document.createElement('span');
+      opt.className = 'question-optional-chip';
+      opt.textContent = 'optional';
+      block.appendChild(opt);
+    }
     const text = document.createElement('div');
     text.className = 'question-text';
     text.textContent = q.question;
@@ -4240,20 +4308,32 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held) {
     });
     block.appendChild(options);
 
-    const free = document.createElement('input');
-    free.className = 'question-free-text';
-    free.type = 'text';
-    free.placeholder = (q.options || []).length
-      ? 'Or type your own answer…'
-      : 'Type your answer…';
-    free.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); sendQuestionAnswer(); }
-    });
-    free.addEventListener('input', () => updateQuestionProgress());
-    block.appendChild(free);
+    // Multi-pick questions carry a live "n/max selected" counter.
+    if (bounds.max > 1) {
+      const counter = document.createElement('span');
+      counter.className = 'question-pick-count';
+      block.appendChild(counter);
+    }
+
+    if (questionFreeTextAllowed(q)) {
+      const free = document.createElement('input');
+      free.className = 'question-free-text';
+      free.type = 'text';
+      free.placeholder = (q.options || []).length
+        ? 'Or type your own answer…'
+        : 'Type your answer…';
+      free.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); sendQuestionAnswer(); }
+      });
+      free.addEventListener('input', () => updateQuestionProgress());
+      block.appendChild(free);
+    }
     scroll.appendChild(block);
   });
   content.appendChild(scroll);
+  // Counters resolve via the live DOM — initialize them only once the
+  // scroll region is attached.
+  list.forEach((_, qIndex) => updateQuestionPickCounter(qIndex));
 
   const actions = document.createElement('div');
   actions.className = 'approval-actions';

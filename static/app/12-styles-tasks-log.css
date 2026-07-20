@@ -3007,6 +3007,25 @@ body.context-focus-active {
   background: color-mix(in srgb, var(--yellow) 10%, transparent);
 }
 .question-deadline.hidden { display: none; }
+.question-pick-count {
+  display: inline-block;
+  margin: 2px 0 0;
+  font-family: 'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--subtext0);
+}
+.question-pick-count.warn { color: var(--yellow); }
+.question-optional-chip {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--subtext0);
+  font-size: 10px;
+}
 .question-hold {
   height: 22px;
   padding: 0 10px;

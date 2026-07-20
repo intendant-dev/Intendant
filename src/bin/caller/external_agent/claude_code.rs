@@ -516,6 +516,11 @@ fn parse_user_questions(input: &serde_json::Value) -> Option<Vec<crate::types::U
                     .get("multiSelect")
                     .and_then(|m| m.as_bool())
                     .unwrap_or(false),
+                // CC's AskUserQuestion speaks multiSelect only — the
+                // legacy bounds derivation applies.
+                pick_min: None,
+                pick_max: None,
+                free_text: None,
                 previews,
             })
         })

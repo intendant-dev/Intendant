@@ -84,10 +84,15 @@ window.sendQuestionAnswer = function(opts) {
     const collected = collectQuestionAnswers();
     if (!collected) return;
     if (collected.missing) {
-      showControlToast('error', `Answer "${collected.missing}" first (or Skip)`);
+      showControlToast('error', collected.hint || `Answer "${collected.missing}" first (or Skip)`);
       return;
     }
-    msg = { action: 'answer_question', id, answers: collected.answers };
+    msg = {
+      action: 'answer_question',
+      id,
+      answers: collected.answers,
+      selections: collected.selections,
+    };
   }
   if (sessionId) msg.session_id = sessionId;
   dispatchSessionControlMsg(msg);
