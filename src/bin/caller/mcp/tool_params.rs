@@ -124,7 +124,9 @@ pub struct PostSessionNoteParams {
     pub images: Vec<SessionNoteImageParams>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+// Clone/Eq/Serialize: the agenda park command (`AgendaCommand::Ask`)
+// embeds this wire type verbatim — derive, don't mirror.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AskUserOptionParams {
     /// Short option label the user clicks (also the answer value returned).
     pub label: String,
@@ -133,7 +135,9 @@ pub struct AskUserOptionParams {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+// Clone/Eq/Serialize: the agenda park command (`AgendaCommand::Ask`)
+// embeds this wire type verbatim — derive, don't mirror.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AskUserPreviewParams {
     /// Short card caption shown above the preview (e.g. "A", "Before", "After",
     /// or a matching option label).
@@ -212,7 +216,9 @@ pub struct AskUserParams {
 
 /// One question of the multi-question `ask_user` form. Same vocabulary as
 /// the flat form, minus call-level fields (wait, session).
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+// Clone/Eq/Serialize: the agenda park command (`AgendaCommand::Ask`)
+// embeds this wire type verbatim — derive, don't mirror.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AskUserQuestionParams {
     /// The question text.
     pub question: String,

@@ -1228,6 +1228,21 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::AgendaBlobRaw => {
+                // The row's `{item_id}`/`{blob_id}` captures, in order.
+                let mut segments = route_captures.iter().map(|s| s.to_string());
+                let item_id = segments.next().unwrap_or_default();
+                let blob_id = segments.next().unwrap_or_default();
+                return handle_agenda_blob_raw(
+                    stream,
+                    item_id,
+                    blob_id,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::AgendaReminderPolicy => {
                 return handle_agenda_reminder_policy(
                     stream,

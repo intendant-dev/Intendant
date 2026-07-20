@@ -307,3 +307,65 @@ pub(crate) async fn handle_agenda_op(
     let response = agenda_op_api_response(&body_text, mcp_server.as_ref(), actor).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
+
+/// `GET /api/agenda/blobs/{item_id}/{blob_id}/raw` — raw bytes of one
+/// parked-ask preview blob. Same serving posture as the session-upload
+/// raw route: attachment `Content-Disposition` + `nosniff`, so blobs can
+/// never render by direct navigation — the dashboard consumes via
+/// authenticated fetch (html → sandboxed `srcdoc`, images → `<img>`).
+pub(crate) async fn agenda_blob_raw_api_response(
+    item_id: &str,
+    blob_id: &str,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+) -> ApiResponse {
+    let Some(agenda) = agenda_handle(mcp_server).await else {
+        return ApiResponse::json_error(503, "agenda unavailable on this daemon");
+    };
+    let Some((descriptor, path)) = crate::agenda::find_blob(agenda.dir(), item_id, blob_id) else {
+        // Malformed ids and retired items' deleted blobs both land here.
+        return ApiResponse::json_error(404, "agenda blob not found");
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return ApiResponse::json_error(500, format!("read agenda blob: {err}"));
+        }
+    };
+    let meta = serde_json::json!({
+        "ok": true,
+        "id": descriptor.id,
+        "name": descriptor.name,
+        "mime": descriptor.mime,
+        "size": bytes.len() as u64,
+    });
+    ApiResponse::Bytes {
+        status: 200,
+        content_type: descriptor.mime.clone(),
+        headers: vec![
+            (
+                "Content-Disposition",
+                format!(
+                    "attachment; filename=\"{}\"",
+                    descriptor.name.replace('"', "")
+                ),
+            ),
+            ("X-Content-Type-Options", "nosniff".to_string()),
+            ("Cache-Control", "no-cache".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+        bytes: BytesPayload::InMemory(bytes),
+        meta,
+    }
+}
+
+pub(crate) async fn handle_agenda_blob_raw(
+    stream: DemuxStream,
+    item_id: String,
+    blob_id: String,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = agenda_blob_raw_api_response(&item_id, &blob_id, mcp_server.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}

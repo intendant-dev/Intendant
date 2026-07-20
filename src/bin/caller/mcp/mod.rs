@@ -60,16 +60,17 @@ pub(crate) use tool_params::*;
 // probe the session supervisor's approval routing consults.
 mod tools_ask;
 pub(crate) use tools_ask::{
-    ask_user_question_pending, ASK_USER_DEFAULT_WAIT_SECS, ASK_USER_MAX_HTML_BYTES,
-    ASK_USER_MAX_OPTIONS, ASK_USER_MAX_PREVIEWS, ASK_USER_MAX_QUESTIONS,
-    ASK_USER_MAX_TEXT_PREVIEW_BYTES, ASK_USER_MAX_WAIT_SECS, NOTIFY_USER_MAX_TEXT_BYTES,
+    ask_user_question_pending, build_ask_user_questions, DecodedPreviewSource,
+    ASK_USER_DEFAULT_WAIT_SECS, ASK_USER_MAX_HTML_BYTES, ASK_USER_MAX_OPTIONS,
+    ASK_USER_MAX_PREVIEWS, ASK_USER_MAX_QUESTIONS, ASK_USER_MAX_TEXT_PREVIEW_BYTES,
+    ASK_USER_MAX_WAIT_SECS, NOTIFY_USER_MAX_TEXT_BYTES,
 };
 mod tools_display;
 mod tools_managed;
 mod tools_notes;
 pub(crate) use tools_notes::{
-    SESSION_NOTE_MAX_IMAGES, SESSION_NOTE_MAX_IMAGE_BYTES, SESSION_NOTE_MAX_TEXT_BYTES,
-    SESSION_NOTE_MAX_TOTAL_IMAGE_BYTES,
+    note_image_extension, SESSION_NOTE_MAX_IMAGES, SESSION_NOTE_MAX_IMAGE_BYTES,
+    SESSION_NOTE_MAX_TEXT_BYTES, SESSION_NOTE_MAX_TOTAL_IMAGE_BYTES,
 };
 mod tools_peer;
 

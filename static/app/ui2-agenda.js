@@ -37,6 +37,7 @@ async function agendaRefresh() {
         agendaSessionLookupsAttempted = new Set(
           agendaItems.flatMap(agendaItemSessionIds));
         agendaLoadError = '';
+        agendaAnnounceParkedAsks();
       } else {
         agendaLoadError = (resp.body && resp.body.error) || `agenda unavailable (${resp.status})`;
       }
@@ -48,6 +49,39 @@ async function agendaRefresh() {
     agendaRenderAll();
   })();
   return agendaFetchInFlight;
+}
+
+// Parked rich asks (ask↔agenda unification, slice 1) re-surface on the
+// question rail after a FRESH load — a daemon restart wipes the
+// state-line replay cache, and a parked question must not evaporate with
+// it. Dispatch the exact show_user_question path live asks ride; the
+// same-id re-show dedupe makes double delivery (state-line replay racing
+// this) harmless. Once per page load per ask id: an in-session dismissal
+// (the daemon's ApprovalResolved cleared the rail) stays dismissed until
+// the next load, while the item itself stays open on the agenda.
+const agendaAnnouncedAsks = new Set();
+function agendaAnnounceParkedAsks() {
+  if (!Array.isArray(agendaItems)) return;
+  if (typeof showUserQuestion !== 'function') return;
+  if (typeof processingLogReplay !== 'undefined' && processingLogReplay) {
+    // Replay is momentary (session selection); retry shortly rather than
+    // losing the announce until the next full fetch.
+    setTimeout(agendaAnnounceParkedAsks, 500);
+    return;
+  }
+  const open = agendaItems
+    .filter((item) => item.status === 'open'
+      && item.ask && item.ask.ask_id && Array.isArray(item.ask.questions)
+      && item.ask.questions.length)
+    // Oldest first, so with several parked asks the panel lands on the
+    // newest — the same "latest ask surfaces" behavior live asks have.
+    .sort((a, b) => (a.id < b.id ? -1 : 1));
+  for (const item of open) {
+    const askId = item.ask.ask_id;
+    if (agendaAnnouncedAsks.has(askId)) continue;
+    agendaAnnouncedAsks.add(askId);
+    showUserQuestion(askId, item.ask.questions, '', undefined, false, { agendaBacked: true });
+  }
 }
 
 // Live update from the event lane: merge the changed item, adopt counts.
