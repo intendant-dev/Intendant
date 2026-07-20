@@ -11,6 +11,13 @@ pub(crate) const MAX_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_TAGS: usize = 32;
 pub(crate) const MAX_TAG_CHARS: usize = 100;
 pub(crate) const MAX_SOURCE_CHARS: usize = 100;
+/// F2 caps (steward-ruled 2026-07-20): annotations got an explicit intake
+/// cap — the one otherwise-unbounded DTO surface (weekly housekeeping ≈
+/// 52/item/year; 500 is a pathology rail, not a budget).
+pub(crate) const MAX_ANNOTATIONS_PER_ITEM: usize = 500;
+pub(crate) const MAX_UNCLEARED_BLOCKERS_PER_ITEM: usize = 32;
+pub(crate) const MAX_RELIES_ON_PER_ITEM: usize = 32;
+pub(crate) const MAX_CRITERION_CHARS: usize = 1000;
 
 /// What an agenda entry is. Kinds and effects are orthogonal: no kind
 /// implies any delivery or execution behavior. `Question` (slice A4) is a
@@ -326,6 +333,100 @@ pub struct AgendaItem {
     /// by `answer` and `reopen`; never a lifecycle transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) dismissed: Option<AgendaDismissal>,
+    /// Attributed note thread (F2 `annotate`), full history in fold order —
+    /// render caps with an expander. Notes are data, never instructions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) annotations: Vec<AgendaAnnotation>,
+    /// Blockers (F2): human-stated criteria, never evaluated by machinery.
+    /// Cleared entries STAY as the evidence trail — clears are ops.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) blockers: Vec<AgendaBlocker>,
+    /// Live dependency edges (F2 `relies_on`). Removal drops the edge from
+    /// this view; the log keeps the full add/remove history. Satisfaction
+    /// and the blocked chip are derived at RENDER time, never stored or
+    /// wired.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) relies_on: Vec<AgendaDependency>,
+}
+
+/// One attributed note on an item (F2 `annotate` fold view). Attribution
+/// mirrors [`AgendaActor`] + the envelope's self-described `source` label
+/// (which supplements, never replaces, gate attribution — steward ruling
+/// Q2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaAnnotation {
+    /// The note — data, never instructions (bodies doctrine).
+    pub(crate) text: String,
+    pub(crate) at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
+}
+
+/// One blocker (F2 fold view): criterion text stated by whoever set it,
+/// with set/cleared attribution. NO evaluation machinery exists — the
+/// owner clears from the card; agents clear only under an explicit
+/// mandate (conduct doctrine, not an IAM gate — steward ruling Q3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaBlocker {
+    /// Intake-minted stable id (`bk-…`), recorded in the op — replay never
+    /// mints.
+    pub(crate) blocker_id: String,
+    /// The blocking criterion — data describing the world, never a
+    /// condition any component evaluates.
+    pub(crate) criterion: String,
+    pub(crate) set_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
+    /// Set by `clear_blocker` — the cleared entry remains rendered
+    /// history (clears are ops, never deletions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cleared: Option<AgendaBlockerClear>,
+}
+
+/// The clearing act's attribution (F2 `clear_blocker` fold view).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaBlockerClear {
+    pub(crate) at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
+}
+
+/// One live dependency edge (F2 `relies_on` fold view). Satisfaction is
+/// derived at render time from the target's status — a completed target
+/// satisfies; a retired target does NOT silently satisfy (renders a
+/// "prerequisite retired — review" marker); cycles simply render every
+/// member blocked. Nothing evaluates, nothing fires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaDependency {
+    /// The prerequisite item's id.
+    pub(crate) target_id: String,
+    pub(crate) added_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
 }
 
 /// Field-level patch of presentation state (umbrella RFC §7.2: `Patch`
@@ -461,6 +562,50 @@ pub enum AgendaCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
+    /// Append an attributed, timestamped note to any item, any status —
+    /// the thread under it (A4's answer op generalized). Notes are data,
+    /// never instructions; history is the full log, render caps with an
+    /// expander.
+    Annotate {
+        id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    /// State a blocking criterion on an open item. Plain text about the
+    /// world — NO watcher, poller, or condition language ever evaluates
+    /// it. The daemon mints the blocker id at intake.
+    SetBlocker {
+        id: String,
+        criterion: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    /// Clear one blocker — an op, never a deletion: the entry stays as
+    /// history with the clearing actor. Plain `agenda.write` (the owner
+    /// decision governs agent CONDUCT via mandate text, not capability).
+    ClearBlocker {
+        id: String,
+        blocker_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    /// Add a dependency edge: this item relies on `target_id`.
+    /// Satisfaction is derived at render time from the target's status —
+    /// nothing evaluates, nothing fires.
+    AddReliesOn {
+        id: String,
+        target_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    /// Remove a live dependency edge (an op; the log keeps history).
+    RemoveReliesOn {
+        id: String,
+        target_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
     /// Approve the current manifest revision by its digest. **An
     /// owner-surface act** — the tenant edge refuses agent-session, peer,
     /// and unattributed actors with a named denial.
@@ -502,7 +647,12 @@ impl AgendaCommand {
             | AgendaCommand::Reopen { source, .. }
             | AgendaCommand::Retire { source, .. }
             | AgendaCommand::Answer { source, .. }
-            | AgendaCommand::ProposeEffect { source, .. } => source.take(),
+            | AgendaCommand::ProposeEffect { source, .. }
+            | AgendaCommand::Annotate { source, .. }
+            | AgendaCommand::SetBlocker { source, .. }
+            | AgendaCommand::ClearBlocker { source, .. }
+            | AgendaCommand::AddReliesOn { source, .. }
+            | AgendaCommand::RemoveReliesOn { source, .. } => source.take(),
             AgendaCommand::Ask { .. }
             | AgendaCommand::ApproveEffect { .. }
             | AgendaCommand::RevokeEffect { .. } => None,
@@ -566,6 +716,33 @@ pub(crate) enum AgendaOp {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         action: String,
     },
+    /// Attributed note (F2). Attribution + `source` ride the envelope.
+    Annotate {
+        id: String,
+        text: String,
+    },
+    /// Blocker set (F2): `blocker_id` was minted at intake and is recorded
+    /// here — replay never mints.
+    SetBlocker {
+        id: String,
+        blocker_id: String,
+        criterion: String,
+    },
+    /// Blocker cleared (F2): an op, never a deletion.
+    ClearBlocker {
+        id: String,
+        blocker_id: String,
+    },
+    /// Dependency edge added (F2).
+    AddReliesOn {
+        id: String,
+        target_id: String,
+    },
+    /// Dependency edge removed (F2): drops the view edge; history stays.
+    RemoveReliesOn {
+        id: String,
+        target_id: String,
+    },
     ProposeEffect {
         id: String,
         effect_id: String,
@@ -605,6 +782,11 @@ impl AgendaOp {
             | AgendaOp::Retire { id }
             | AgendaOp::Answer { id, .. }
             | AgendaOp::Dismiss { id, .. }
+            | AgendaOp::Annotate { id, .. }
+            | AgendaOp::SetBlocker { id, .. }
+            | AgendaOp::ClearBlocker { id, .. }
+            | AgendaOp::AddReliesOn { id, .. }
+            | AgendaOp::RemoveReliesOn { id, .. }
             | AgendaOp::ProposeEffect { id, .. }
             | AgendaOp::ApproveEffect { id, .. }
             | AgendaOp::RevokeEffect { id, .. }
@@ -691,8 +873,117 @@ pub(crate) fn apply_op(
                     effects: Vec::new(),
                     ask: ask.clone(),
                     dismissed: None,
+                    annotations: Vec::new(),
+                    blockers: Vec::new(),
+                    relies_on: Vec::new(),
                 },
             );
+            None
+        }
+        AgendaOp::Annotate { id, text } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("annotate for unknown {id} ignored"));
+            };
+            let actor = rec.actor.clone().unwrap_or_default();
+            item.annotations.push(AgendaAnnotation {
+                text: text.clone(),
+                at_ms,
+                principal: actor.principal,
+                session_id: actor.session_id,
+                kind: actor.kind,
+                source: rec.source.clone(),
+            });
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::SetBlocker {
+            id,
+            blocker_id,
+            criterion,
+        } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("set_blocker for unknown {id} ignored"));
+            };
+            if item.blockers.iter().any(|b| b.blocker_id == *blocker_id) {
+                return Some(format!("duplicate blocker {blocker_id} on {id} ignored"));
+            }
+            let actor = rec.actor.clone().unwrap_or_default();
+            item.blockers.push(AgendaBlocker {
+                blocker_id: blocker_id.clone(),
+                criterion: criterion.clone(),
+                set_ms: at_ms,
+                principal: actor.principal,
+                session_id: actor.session_id,
+                kind: actor.kind,
+                source: rec.source.clone(),
+                cleared: None,
+            });
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::ClearBlocker { id, blocker_id } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("clear_blocker for unknown {id} ignored"));
+            };
+            let Some(blocker) = item
+                .blockers
+                .iter_mut()
+                .find(|b| b.blocker_id == *blocker_id)
+            else {
+                return Some(format!(
+                    "clear_blocker for unknown {blocker_id} on {id} ignored"
+                ));
+            };
+            if blocker.cleared.is_some() {
+                return Some(format!("blocker {blocker_id} on {id} already cleared"));
+            }
+            let actor = rec.actor.clone().unwrap_or_default();
+            blocker.cleared = Some(AgendaBlockerClear {
+                at_ms,
+                principal: actor.principal,
+                session_id: actor.session_id,
+                kind: actor.kind,
+                source: rec.source.clone(),
+            });
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::AddReliesOn { id, target_id } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("add_relies_on for unknown {id} ignored"));
+            };
+            if target_id == id {
+                return Some(format!("self-edge on {id} ignored"));
+            }
+            if item.relies_on.iter().any(|e| e.target_id == *target_id) {
+                return Some(format!("duplicate edge {id}→{target_id} ignored"));
+            }
+            // A target missing from this fold (partial/foreign replay) is
+            // tolerated — the render marks the edge "prerequisite missing".
+            let actor = rec.actor.clone().unwrap_or_default();
+            item.relies_on.push(AgendaDependency {
+                target_id: target_id.clone(),
+                added_ms: at_ms,
+                principal: actor.principal,
+                session_id: actor.session_id,
+                kind: actor.kind,
+                source: rec.source.clone(),
+            });
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::RemoveReliesOn { id, target_id } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("remove_relies_on for unknown {id} ignored"));
+            };
+            let before = item.relies_on.len();
+            item.relies_on.retain(|e| e.target_id != *target_id);
+            if item.relies_on.len() == before {
+                return Some(format!(
+                    "remove_relies_on for absent edge {id}→{target_id} ignored"
+                ));
+            }
+            item.updated_ms = at_ms;
             None
         }
         AgendaOp::Patch { id, patch } => {
@@ -917,6 +1208,47 @@ pub(crate) fn apply_op(
             }
         }
     }
+}
+
+/// Render-time judgment of one dependency edge: `(satisfied, review)`.
+/// A completed target satisfies; a retired target does NOT silently
+/// satisfy (review `"target_retired"`); a target absent from the fold —
+/// foreign/partial replay — is review `"target_missing"`. Direct status
+/// lookup only: cycles need no machinery (every member of a cycle has a
+/// non-Done target and simply derives blocked), nothing walks, nothing
+/// evaluates, nothing fires.
+///
+/// This is presentation, deliberately NOT a stored or wire field (the DTO
+/// stays the pure fold product — the D0-Agenda-Data migration replays the
+/// log verbatim). The dashboard and ctl derive the same judgment from the
+/// serialized items like the overdue chip; this typed twin exists to PIN
+/// the semantics in unit tests (the retire-review and cycle rules).
+#[cfg(test)]
+pub(crate) fn dependency_state(
+    items: &BTreeMap<String, AgendaItem>,
+    edge: &AgendaDependency,
+) -> (bool, Option<&'static str>) {
+    match items.get(&edge.target_id) {
+        None => (false, Some("target_missing")),
+        Some(target) => match target.status {
+            AgendaStatus::Done => (true, None),
+            AgendaStatus::Retired => (false, Some("target_retired")),
+            AgendaStatus::Open => (false, None),
+        },
+    }
+}
+
+/// Render-time blocked judgment: an open item with any uncleared blocker
+/// or any unsatisfied live dependency. Never stored, never on the wire,
+/// never notifies — A3's time lane remains the only thing that fires.
+#[cfg(test)]
+pub(crate) fn is_blocked(items: &BTreeMap<String, AgendaItem>, item: &AgendaItem) -> bool {
+    item.status == AgendaStatus::Open
+        && (item.blockers.iter().any(|b| b.cleared.is_none())
+            || item
+                .relies_on
+                .iter()
+                .any(|edge| !dependency_state(items, edge).0))
 }
 
 pub(crate) fn counts(items: &BTreeMap<String, AgendaItem>) -> AgendaCounts {
@@ -1326,6 +1658,433 @@ mod tests {
         let answer: AgendaCommand =
             serde_json::from_str(r#"{"op":"answer","id":"01X","text":"yes"}"#).unwrap();
         assert!(matches!(answer, AgendaCommand::Answer { .. }));
+    }
+
+    /// F2 fold: annotations thread (any status), blockers with
+    /// clear-is-an-op history, edges with add/remove, and full tolerance
+    /// for out-of-order or foreign lines.
+    #[test]
+    fn f2_fold_annotations_blockers_edges() {
+        let mut items = BTreeMap::new();
+        apply_op(&mut items, &rec(1, add("a", "dependent")));
+        apply_op(&mut items, &rec(2, add("b", "prerequisite")));
+
+        // Annotations: attributed thread, allowed on done items too.
+        let mut note = rec(
+            3,
+            AgendaOp::Annotate {
+                id: "a".into(),
+                text: "evidence: still waiting on the API".into(),
+            },
+        );
+        note.actor = Some(AgendaActor {
+            principal: None,
+            session_id: Some("sess-1".into()),
+            kind: Some("agent_session".into()),
+        });
+        note.source = Some("housekeeper".into());
+        assert!(apply_op(&mut items, &note).is_none());
+        apply_op(&mut items, &rec(4, AgendaOp::Complete { id: "b".into() }));
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                5,
+                AgendaOp::Annotate {
+                    id: "b".into(),
+                    text: "post-completion note".into()
+                }
+            )
+        )
+        .is_none());
+        let a = &items["a"];
+        assert_eq!(a.annotations.len(), 1);
+        assert_eq!(a.annotations[0].session_id.as_deref(), Some("sess-1"));
+        assert_eq!(a.annotations[0].source.as_deref(), Some("housekeeper"));
+        assert_eq!(items["b"].annotations.len(), 1);
+        // Unknown item: warn, keep going.
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                6,
+                AgendaOp::Annotate {
+                    id: "nope".into(),
+                    text: "x".into()
+                }
+            )
+        )
+        .is_some());
+
+        // Blockers: set, duplicate-id warn, clear-is-an-op (entry stays),
+        // double-clear warn.
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                7,
+                AgendaOp::SetBlocker {
+                    id: "a".into(),
+                    blocker_id: "bk-000000000001".into(),
+                    criterion: "gpt-live-1 available on the API".into(),
+                }
+            )
+        )
+        .is_none());
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                8,
+                AgendaOp::SetBlocker {
+                    id: "a".into(),
+                    blocker_id: "bk-000000000001".into(),
+                    criterion: "duplicate".into(),
+                }
+            )
+        )
+        .is_some());
+        let mut clear = rec(
+            9,
+            AgendaOp::ClearBlocker {
+                id: "a".into(),
+                blocker_id: "bk-000000000001".into(),
+            },
+        );
+        clear.actor = Some(AgendaActor {
+            principal: Some("principal:root:dashboard".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        assert!(apply_op(&mut items, &clear).is_none());
+        let blocker = &items["a"].blockers[0];
+        assert_eq!(blocker.criterion, "gpt-live-1 available on the API");
+        let cleared = blocker.cleared.as_ref().expect("clear recorded");
+        assert_eq!(cleared.kind.as_deref(), Some("dashboard"));
+        assert!(apply_op(&mut items, &clear).is_some(), "double clear warns");
+        assert_eq!(items["a"].blockers.len(), 1, "history is never deleted");
+
+        // Edges: add, self-edge warn, duplicate warn, remove drops the
+        // view (log history is the caller's record).
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                10,
+                AgendaOp::AddReliesOn {
+                    id: "a".into(),
+                    target_id: "b".into()
+                }
+            )
+        )
+        .is_none());
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                11,
+                AgendaOp::AddReliesOn {
+                    id: "a".into(),
+                    target_id: "a".into()
+                }
+            )
+        )
+        .is_some());
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                12,
+                AgendaOp::AddReliesOn {
+                    id: "a".into(),
+                    target_id: "b".into()
+                }
+            )
+        )
+        .is_some());
+        assert_eq!(items["a"].relies_on.len(), 1);
+        // Dangling target tolerated (foreign/partial log).
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                13,
+                AgendaOp::AddReliesOn {
+                    id: "a".into(),
+                    target_id: "01GONE".into()
+                }
+            )
+        )
+        .is_none());
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                14,
+                AgendaOp::RemoveReliesOn {
+                    id: "a".into(),
+                    target_id: "01GONE".into()
+                }
+            )
+        )
+        .is_none());
+        assert!(
+            apply_op(
+                &mut items,
+                &rec(
+                    15,
+                    AgendaOp::RemoveReliesOn {
+                        id: "a".into(),
+                        target_id: "01GONE".into()
+                    }
+                )
+            )
+            .is_some(),
+            "removing an absent edge warns"
+        );
+        assert_eq!(items["a"].relies_on.len(), 1);
+        assert_eq!(items["a"].relies_on[0].target_id, "b");
+    }
+
+    /// Pins the five F2 durable line formats (additive to v1) and their
+    /// round-trips — the migration story is "these exact bytes replay".
+    #[test]
+    fn f2_op_line_formats_are_pinned() {
+        let annotate = AgendaOpRecord {
+            v: 1,
+            at_ms: 20,
+            actor: Some(AgendaActor {
+                principal: None,
+                session_id: Some("sess-9".into()),
+                kind: Some("agent_session".into()),
+            }),
+            source: None,
+            op: AgendaOp::Annotate {
+                id: "01X".into(),
+                text: "note".into(),
+            },
+        };
+        let line = serde_json::to_string(&annotate).unwrap();
+        assert_eq!(
+            line,
+            r#"{"v":1,"at_ms":20,"actor":{"session_id":"sess-9","kind":"agent_session"},"op":{"type":"annotate","id":"01X","text":"note"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgendaOpRecord>(&line).unwrap(),
+            annotate
+        );
+
+        for (record, expected) in [
+            (
+                AgendaOpRecord {
+                    v: 1,
+                    at_ms: 21,
+                    actor: None,
+                    source: Some("deploy-hook".into()),
+                    op: AgendaOp::SetBlocker {
+                        id: "01X".into(),
+                        blocker_id: "bk-0a1b2c3d4e5f".into(),
+                        criterion: "api access granted".into(),
+                    },
+                },
+                r#"{"v":1,"at_ms":21,"source":"deploy-hook","op":{"type":"set_blocker","id":"01X","blocker_id":"bk-0a1b2c3d4e5f","criterion":"api access granted"}}"#,
+            ),
+            (
+                AgendaOpRecord {
+                    v: 1,
+                    at_ms: 22,
+                    actor: None,
+                    source: None,
+                    op: AgendaOp::ClearBlocker {
+                        id: "01X".into(),
+                        blocker_id: "bk-0a1b2c3d4e5f".into(),
+                    },
+                },
+                r#"{"v":1,"at_ms":22,"op":{"type":"clear_blocker","id":"01X","blocker_id":"bk-0a1b2c3d4e5f"}}"#,
+            ),
+            (
+                AgendaOpRecord {
+                    v: 1,
+                    at_ms: 23,
+                    actor: None,
+                    source: None,
+                    op: AgendaOp::AddReliesOn {
+                        id: "01X".into(),
+                        target_id: "01Y".into(),
+                    },
+                },
+                r#"{"v":1,"at_ms":23,"op":{"type":"add_relies_on","id":"01X","target_id":"01Y"}}"#,
+            ),
+            (
+                AgendaOpRecord {
+                    v: 1,
+                    at_ms: 24,
+                    actor: None,
+                    source: None,
+                    op: AgendaOp::RemoveReliesOn {
+                        id: "01X".into(),
+                        target_id: "01Y".into(),
+                    },
+                },
+                r#"{"v":1,"at_ms":24,"op":{"type":"remove_relies_on","id":"01X","target_id":"01Y"}}"#,
+            ),
+        ] {
+            let line = serde_json::to_string(&record).unwrap();
+            assert_eq!(line, expected);
+            assert_eq!(
+                serde_json::from_str::<AgendaOpRecord>(&line).unwrap(),
+                record
+            );
+        }
+    }
+
+    #[test]
+    fn f2_command_wire_shapes_parse() {
+        for (json, ok) in [
+            (r#"{"op":"annotate","id":"01X","text":"n"}"#, true),
+            (
+                r#"{"op":"annotate","id":"01X","text":"n","source":"hook"}"#,
+                true,
+            ),
+            (r#"{"op":"set_blocker","id":"01X","criterion":"c"}"#, true),
+            (
+                r#"{"op":"clear_blocker","id":"01X","blocker_id":"bk-1"}"#,
+                true,
+            ),
+            (
+                r#"{"op":"add_relies_on","id":"01X","target_id":"01Y"}"#,
+                true,
+            ),
+            (
+                r#"{"op":"remove_relies_on","id":"01X","target_id":"01Y"}"#,
+                true,
+            ),
+            // Clients never mint blocker ids on set.
+            (
+                r#"{"op":"set_blocker","id":"01X","criterion":"c","blocker_id":"bk-forged"}"#,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<AgendaCommand>(json).is_ok(),
+                ok,
+                "{json}"
+            );
+        }
+    }
+
+    /// The ruled derivation semantics: done satisfies; RETIRED does not
+    /// silently satisfy (review marker); missing target marks for review;
+    /// cycles derive blocked on every member without any walk; clearing
+    /// the last blocker unblocks; everything is pure recomputation.
+    #[test]
+    fn derived_blocked_retire_review_and_cycle_tolerance() {
+        let mut items = BTreeMap::new();
+        apply_op(&mut items, &rec(1, add("a", "dependent")));
+        apply_op(&mut items, &rec(2, add("b", "prerequisite")));
+        apply_op(
+            &mut items,
+            &rec(
+                3,
+                AgendaOp::AddReliesOn {
+                    id: "a".into(),
+                    target_id: "b".into(),
+                },
+            ),
+        );
+        assert!(is_blocked(&items, &items["a"]), "open target blocks");
+        assert!(!is_blocked(&items, &items["b"]));
+
+        // Completion satisfies by pure recomputation — no event fired.
+        apply_op(&mut items, &rec(4, AgendaOp::Complete { id: "b".into() }));
+        assert_eq!(
+            dependency_state(&items, &items["a"].relies_on[0]),
+            (true, None)
+        );
+        assert!(!is_blocked(&items, &items["a"]));
+
+        // Retire does NOT silently satisfy: review marker + blocked again.
+        apply_op(&mut items, &rec(5, AgendaOp::Reopen { id: "b".into() }));
+        apply_op(&mut items, &rec(6, AgendaOp::Retire { id: "b".into() }));
+        assert_eq!(
+            dependency_state(&items, &items["a"].relies_on[0]),
+            (false, Some("target_retired"))
+        );
+        assert!(is_blocked(&items, &items["a"]));
+
+        // Dangling edge (foreign/partial log): review, blocked, no error.
+        apply_op(
+            &mut items,
+            &rec(
+                7,
+                AgendaOp::AddReliesOn {
+                    id: "b".into(),
+                    target_id: "01GONE".into(),
+                },
+            ),
+        );
+        apply_op(&mut items, &rec(8, AgendaOp::Reopen { id: "b".into() }));
+        assert_eq!(
+            dependency_state(&items, &items["b"].relies_on[0]),
+            (false, Some("target_missing"))
+        );
+
+        // Cycle: c→d, d→c — both derive blocked, nothing recurses.
+        apply_op(&mut items, &rec(9, add("c", "one")));
+        apply_op(&mut items, &rec(10, add("d", "other")));
+        apply_op(
+            &mut items,
+            &rec(
+                11,
+                AgendaOp::AddReliesOn {
+                    id: "c".into(),
+                    target_id: "d".into(),
+                },
+            ),
+        );
+        apply_op(
+            &mut items,
+            &rec(
+                12,
+                AgendaOp::AddReliesOn {
+                    id: "d".into(),
+                    target_id: "c".into(),
+                },
+            ),
+        );
+        assert!(is_blocked(&items, &items["c"]));
+        assert!(is_blocked(&items, &items["d"]));
+
+        // Blockers: uncleared blocks, clearing the last one unblocks.
+        apply_op(&mut items, &rec(13, add("e", "solo")));
+        apply_op(
+            &mut items,
+            &rec(
+                14,
+                AgendaOp::SetBlocker {
+                    id: "e".into(),
+                    blocker_id: "bk-1".into(),
+                    criterion: "wait".into(),
+                },
+            ),
+        );
+        assert!(is_blocked(&items, &items["e"]));
+        apply_op(
+            &mut items,
+            &rec(
+                15,
+                AgendaOp::ClearBlocker {
+                    id: "e".into(),
+                    blocker_id: "bk-1".into(),
+                },
+            ),
+        );
+        assert!(!is_blocked(&items, &items["e"]));
+        // A done item is never "blocked" regardless of blockers.
+        apply_op(
+            &mut items,
+            &rec(
+                16,
+                AgendaOp::SetBlocker {
+                    id: "e".into(),
+                    blocker_id: "bk-2".into(),
+                    criterion: "wait more".into(),
+                },
+            ),
+        );
+        apply_op(&mut items, &rec(17, AgendaOp::Complete { id: "e".into() }));
+        assert!(!is_blocked(&items, &items["e"]));
     }
 
     #[test]

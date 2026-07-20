@@ -22,6 +22,8 @@ let agendaReminderPolicy = null; // owner delivery policy (Settings-gated)
 // id never causes refetch loops on the event lane.
 let agendaSessions = {};
 let agendaSessionLookupsAttempted = new Set();
+// Items whose full annotation thread is expanded (render caps at 3).
+const agendaExpandedThreads = new Set();
 
 async function agendaRefresh() {
   if (agendaFetchInFlight) return agendaFetchInFlight;
@@ -183,6 +185,30 @@ function agendaSessionInfo(id) {
   return (id && agendaSessions && agendaSessions[id]) || null;
 }
 
+// ---- F2 derived presentation (client twin of the daemon's is_blocked /
+// dependency_state — like the overdue chip, derived at render time from
+// facts the tab already holds; never stored, never on the wire).
+
+function agendaFindItem(id) {
+  return (agendaItems || []).find((item) => item.id === id) || null;
+}
+
+// One edge's render judgment: { satisfied, review } where review is
+// '' | 'target_retired' | 'target_missing'.
+function agendaEdgeState(edge) {
+  const target = agendaFindItem(edge.target_id);
+  if (!target) return { satisfied: false, review: 'target_missing' };
+  if (target.status === 'done') return { satisfied: true, review: '' };
+  if (target.status === 'retired') return { satisfied: false, review: 'target_retired' };
+  return { satisfied: false, review: '' };
+}
+
+function agendaItemIsBlocked(item) {
+  if (item.status !== 'open') return false;
+  if ((item.blockers || []).some((b) => !b.cleared)) return true;
+  return (item.relies_on || []).some((edge) => !agendaEdgeState(edge).satisfied);
+}
+
 function agendaActorLabel(p) {
   // Gate-attributed actor (A2), rendered for humans. Session ids resolve
   // through the join map to the conversation's human name; unresolved ids
@@ -337,6 +363,84 @@ function agendaEffectBlock(item) {
   </div>`;
 }
 
+// The item's thread + gates (F2): annotations (capped with an expander),
+// blockers with their clear affordance and cleared history, dependency
+// chips with satisfied/review markers, and the note/block composer.
+// Everything is data rendered escaped; nothing here executes or obeys.
+function agendaThreadBlock(item) {
+  const parts = [];
+  const notes = item.annotations || [];
+  if (notes.length) {
+    const cap = 3;
+    const shown = agendaExpandedThreads.has(item.id) ? notes : notes.slice(-cap);
+    const rows = shown.map((note) => {
+      const when = note.at_ms
+        ? new Date(note.at_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+        : '';
+      const who = agendaActorHtml(note);
+      const meta = [who, escapeHtml(when)].filter(Boolean).join(' · ');
+      return `<div class="agenda-note">↳ ${escapeHtml(note.text)}
+        <span class="agenda-item-meta">— ${meta}</span></div>`;
+    });
+    const more = notes.length > shown.length
+      ? `<button type="button" class="agenda-thread-more" data-id="${escapeHtml(item.id)}">show all ${notes.length} notes</button>`
+      : '';
+    parts.push(`<div class="agenda-thread">${rows.join('')}${more}</div>`);
+  }
+  const blockers = item.blockers || [];
+  if (blockers.length) {
+    const rows = blockers.map((blocker) => {
+      const who = agendaActorHtml(blocker);
+      if (blocker.cleared) {
+        const clearedBy = agendaActorHtml(blocker.cleared);
+        return `<div class="agenda-blocker cleared">✓ <s>${escapeHtml(blocker.criterion)}</s>
+          <span class="agenda-item-meta">— cleared${clearedBy ? ` by ${clearedBy}` : ''}</span></div>`;
+      }
+      const clear = item.status === 'open'
+        ? `<button type="button" class="agenda-btn agenda-clear-blocker" data-id="${escapeHtml(item.id)}" data-blocker="${escapeHtml(blocker.blocker_id)}">Clear</button>`
+        : '';
+      return `<div class="agenda-blocker">
+        <span class="agenda-blocker-text" title="${escapeHtml(blocker.blocker_id)}">⛔ ${escapeHtml(blocker.criterion)}</span>
+        <span class="agenda-item-meta">${who ? `— set by ${who}` : ''}</span>${clear}
+      </div>`;
+    });
+    parts.push(`<div class="agenda-blockers">${rows.join('')}</div>`);
+  }
+  const edges = item.relies_on || [];
+  if (edges.length) {
+    const chips = edges.map((edge) => {
+      const state = agendaEdgeState(edge);
+      const target = agendaFindItem(edge.target_id);
+      const label = target ? target.title : edge.target_id.slice(0, 10);
+      const marker = state.review === 'target_retired'
+        ? ' · prerequisite retired — review'
+        : state.review === 'target_missing'
+          ? ' · prerequisite missing'
+          : '';
+      const cls = state.satisfied ? 'satisfied' : state.review ? 'review' : 'waiting';
+      const remove = item.status === 'open'
+        ? `<button type="button" class="agenda-edge-remove" data-id="${escapeHtml(item.id)}" data-target="${escapeHtml(edge.target_id)}" aria-label="Remove dependency" title="Remove dependency">×</button>`
+        : '';
+      return `<span class="agenda-edge ${cls}" title="${escapeHtml(edge.target_id)}">
+        ${state.satisfied ? '✓' : '…'} needs ${escapeHtml(label)}${escapeHtml(marker)}${remove}</span>`;
+    });
+    parts.push(`<div class="agenda-edges">${chips.join('')}</div>`);
+  }
+  // Composer: annotate any non-retired item; block only open ones.
+  if (item.status !== 'retired') {
+    const blockBtn = item.status === 'open'
+      ? `<button type="button" class="agenda-btn agenda-thread-block" data-id="${escapeHtml(item.id)}">Block</button>`
+      : '';
+    parts.push(`<div class="agenda-thread-add">
+      <input type="text" class="agenda-thread-input" maxlength="4000"
+             placeholder="Add a note — or state a blocker…" aria-label="Note or blocker" data-id="${escapeHtml(item.id)}" />
+      <button type="button" class="agenda-btn agenda-thread-note" data-id="${escapeHtml(item.id)}">Note</button>
+      ${blockBtn}
+    </div>`);
+  }
+  return parts.length ? `<div class="agenda-item-thread">${parts.join('')}</div>` : '';
+}
+
 function agendaActionButtons(item) {
   const actions = [];
   if (item.status === 'open') actions.push(['complete', 'Complete'], ['retire', 'Retire']);
@@ -479,7 +583,9 @@ function agendaRenderTab() {
     return;
   }
   const filtered = agendaItems.filter((item) =>
-    agendaFilter === 'all' ? true : item.status === agendaFilter);
+    agendaFilter === 'all' ? true
+      : agendaFilter === 'blocked' ? agendaItemIsBlocked(item)
+        : item.status === agendaFilter);
   if (!filtered.length) {
     const what = agendaFilter === 'all' ? '' : `${agendaFilter} `;
     list.innerHTML =
@@ -512,14 +618,17 @@ function agendaRenderTab() {
         <span class="agenda-item-meta">— ${escapeHtml([who && `by ${who}`, when].filter(Boolean).join(' · '))}</span>
       </div>`;
     }
+    const blockedChip = agendaItemIsBlocked(item)
+      ? '<span class="agenda-chip blocked">blocked</span>'
+      : '';
     return `<div class="agenda-item" data-status="${escapeHtml(item.status)}">
       <div class="agenda-item-head">
         ${agendaGlyph(item.status, item.kind)}
         <span class="agenda-item-kind">${escapeHtml(item.kind)}</span>
         <span class="agenda-item-title">${escapeHtml(item.title)}</span>
-        ${agendaDueChip(item)}${tags}
+        ${blockedChip}${agendaDueChip(item)}${tags}
       </div>
-      ${body}${answerBlock}${agendaEffectBlock(item)}
+      ${body}${answerBlock}${agendaThreadBlock(item)}${agendaEffectBlock(item)}
       <div class="agenda-item-foot">
         <span class="agenda-item-meta">${agendaProvenanceLine(item)}</span>
         <span class="agenda-item-actions">${agendaActionButtons(item)}</span>
@@ -544,6 +653,48 @@ function agendaRenderTab() {
   list.querySelectorAll('select.agenda-bell').forEach((sel) => {
     sel.addEventListener('change', () =>
       agendaSetItemUrgency(sel.dataset.id, sel.value, sel));
+  });
+  // F2 thread + gates wiring.
+  list.querySelectorAll('button.agenda-thread-more').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      agendaExpandedThreads.add(btn.dataset.id);
+      agendaRenderTab();
+    });
+  });
+  list.querySelectorAll('button.agenda-clear-blocker').forEach((btn) => {
+    btn.addEventListener('click', () =>
+      agendaSendOp({ op: 'clear_blocker', id: btn.dataset.id, blocker_id: btn.dataset.blocker }, btn));
+  });
+  list.querySelectorAll('button.agenda-edge-remove').forEach((btn) => {
+    btn.addEventListener('click', () =>
+      agendaSendOp({ op: 'remove_relies_on', id: btn.dataset.id, target_id: btn.dataset.target }, btn));
+  });
+  const submitThread = async (id, input, op, control) => {
+    const text = (input.value || '').trim();
+    if (!text) return;
+    input.disabled = true;
+    const params = op === 'set_blocker'
+      ? { op, id, criterion: text }
+      : { op, id, text };
+    const ok = await agendaSendOp(params, control);
+    input.disabled = false;
+    if (!ok) input.focus();
+  };
+  list.querySelectorAll('button.agenda-thread-note').forEach((btn) => {
+    const input = list.querySelector(`input.agenda-thread-input[data-id="${btn.dataset.id}"]`);
+    if (!input) return;
+    btn.addEventListener('click', () => submitThread(btn.dataset.id, input, 'annotate', btn));
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submitThread(btn.dataset.id, input, 'annotate', btn);
+      }
+    });
+  });
+  list.querySelectorAll('button.agenda-thread-block').forEach((btn) => {
+    const input = list.querySelector(`input.agenda-thread-input[data-id="${btn.dataset.id}"]`);
+    if (!input) return;
+    btn.addEventListener('click', () => submitThread(btn.dataset.id, input, 'set_blocker', btn));
   });
   const submitAnswer = async (id, input, control) => {
     const text = (input.value || '').trim();

@@ -684,6 +684,9 @@ mod tests {
             effects: Vec::new(),
             ask: None,
             dismissed: None,
+            annotations: Vec::new(),
+            blockers: Vec::new(),
+            relies_on: Vec::new(),
         }
     }
 

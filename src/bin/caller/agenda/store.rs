@@ -5,8 +5,9 @@
 
 use super::types::{
     apply_op, counts, AgendaActor, AgendaCommand, AgendaCounts, AgendaItem, AgendaOp,
-    AgendaOpRecord, AgendaPatch, AgendaStatus, AGENDA_LOG_VERSION, MAX_BODY_BYTES,
-    MAX_SOURCE_CHARS, MAX_TAGS, MAX_TAG_CHARS, MAX_TITLE_CHARS,
+    AgendaOpRecord, AgendaPatch, AgendaStatus, AGENDA_LOG_VERSION, MAX_ANNOTATIONS_PER_ITEM,
+    MAX_BODY_BYTES, MAX_CRITERION_CHARS, MAX_RELIES_ON_PER_ITEM, MAX_SOURCE_CHARS, MAX_TAGS,
+    MAX_TAG_CHARS, MAX_TITLE_CHARS, MAX_UNCLEARED_BLOCKERS_PER_ITEM,
 };
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -38,7 +39,7 @@ pub(crate) enum AgendaError {
 /// preserved on disk but skipped at load (forward compatibility: a newer
 /// build's vocabulary — effects, journal curation — must not brick an older
 /// daemon's ledger).
-const KNOWN_OPS: [&str; 11] = [
+const KNOWN_OPS: [&str; 16] = [
     "add",
     "patch",
     "complete",
@@ -46,6 +47,11 @@ const KNOWN_OPS: [&str; 11] = [
     "retire",
     "answer",
     "dismiss",
+    "annotate",
+    "set_blocker",
+    "clear_blocker",
+    "add_relies_on",
+    "remove_relies_on",
     "propose_effect",
     "approve_effect",
     "revoke_effect",
@@ -234,7 +240,7 @@ impl AgendaStore {
             return self.apply_ask(questions, actor, now_ms);
         }
         let deletes_blobs = matches!(&cmd, AgendaCommand::Retire { .. });
-        let op = self.command_to_op(cmd)?;
+        let op = self.command_to_op(cmd, now_ms)?;
         let item = self.append_op(op, actor, source, now_ms)?;
         // Retention is tied to the item lifecycle: preview blobs die with
         // RETIREMENT — not completion, because answered questions remain
@@ -452,7 +458,7 @@ impl AgendaStore {
             .ok_or_else(|| AgendaError::Invalid("internal: item missing after fold".into()))
     }
 
-    fn command_to_op(&mut self, cmd: AgendaCommand) -> Result<AgendaOp, AgendaError> {
+    fn command_to_op(&mut self, cmd: AgendaCommand, now_ms: u64) -> Result<AgendaOp, AgendaError> {
         // `source` is detached (and validated) in `apply_command` before the
         // translation — the remaining fields are the op's.
         match cmd {
@@ -592,6 +598,153 @@ impl AgendaStore {
                         orchestrate,
                     },
                 })
+            }
+            AgendaCommand::Annotate {
+                id,
+                text,
+                source: _,
+            } => {
+                let item = self.require(&id)?;
+                let text = text.trim();
+                if text.is_empty() {
+                    return Err(AgendaError::Invalid("annotation must not be empty".into()));
+                }
+                if text.len() > MAX_BODY_BYTES {
+                    return Err(AgendaError::Invalid(format!(
+                        "annotation exceeds {MAX_BODY_BYTES} bytes"
+                    )));
+                }
+                // The steward-ruled pathology rail — not a budget (weekly
+                // housekeeping ≈ 52/item/year).
+                if item.annotations.len() >= MAX_ANNOTATIONS_PER_ITEM {
+                    return Err(AgendaError::Invalid(format!(
+                        "item has {MAX_ANNOTATIONS_PER_ITEM} annotations — retire it or start \
+                         a successor item"
+                    )));
+                }
+                Ok(AgendaOp::Annotate {
+                    id,
+                    text: text.to_string(),
+                })
+            }
+            AgendaCommand::SetBlocker {
+                id,
+                criterion,
+                source: _,
+            } => {
+                let item = self.require(&id)?;
+                if item.status != AgendaStatus::Open {
+                    return Err(AgendaError::Transition(format!(
+                        "{id} is not open — blockers describe open work"
+                    )));
+                }
+                let criterion = criterion.trim();
+                if criterion.is_empty() {
+                    return Err(AgendaError::Invalid("criterion must not be empty".into()));
+                }
+                if criterion.chars().count() > MAX_CRITERION_CHARS {
+                    return Err(AgendaError::Invalid(format!(
+                        "criterion exceeds {MAX_CRITERION_CHARS} characters"
+                    )));
+                }
+                let uncleared = item.blockers.iter().filter(|b| b.cleared.is_none());
+                if uncleared.clone().any(|b| b.criterion == criterion) {
+                    return Err(AgendaError::Transition(format!(
+                        "{id} is already blocked on exactly this criterion"
+                    )));
+                }
+                if uncleared.count() >= MAX_UNCLEARED_BLOCKERS_PER_ITEM {
+                    return Err(AgendaError::Invalid(format!(
+                        "more than {MAX_UNCLEARED_BLOCKERS_PER_ITEM} uncleared blockers"
+                    )));
+                }
+                // Intake-minted, recorded in the op — replay never mints
+                // (§7 purity). The at_ms preimage makes same-criterion
+                // re-blocks (after a clear) distinct; a same-millisecond
+                // duplicate is refused above as an identical criterion.
+                let blocker_id = mint_blocker_id(&id, criterion, now_ms);
+                if item.blockers.iter().any(|b| b.blocker_id == blocker_id) {
+                    return Err(AgendaError::Invalid(
+                        "blocker id collision — retry the command".into(),
+                    ));
+                }
+                Ok(AgendaOp::SetBlocker {
+                    id,
+                    blocker_id,
+                    criterion: criterion.to_string(),
+                })
+            }
+            AgendaCommand::ClearBlocker {
+                id,
+                blocker_id,
+                source: _,
+            } => {
+                let item = self.require(&id)?;
+                // Any item status: clearing history on a done item is a
+                // legitimate bookkeeping act.
+                let needle = blocker_id.trim();
+                let mut matches = item
+                    .blockers
+                    .iter()
+                    .filter(|b| b.cleared.is_none() && b.blocker_id.starts_with(needle));
+                let Some(blocker) = matches.next() else {
+                    return Err(AgendaError::NotFound(format!(
+                        "no uncleared blocker matching {needle:?} on {id}"
+                    )));
+                };
+                if matches.next().is_some() {
+                    return Err(AgendaError::Invalid(format!(
+                        "blocker prefix {needle:?} is ambiguous on {id}"
+                    )));
+                }
+                Ok(AgendaOp::ClearBlocker {
+                    id: id.clone(),
+                    blocker_id: blocker.blocker_id.clone(),
+                })
+            }
+            AgendaCommand::AddReliesOn {
+                id,
+                target_id,
+                source: _,
+            } => {
+                let item = self.require(&id)?;
+                if item.status != AgendaStatus::Open {
+                    return Err(AgendaError::Transition(format!(
+                        "{id} is not open — dependencies describe open work"
+                    )));
+                }
+                let target_id = target_id.trim().to_string();
+                if target_id == id {
+                    return Err(AgendaError::Invalid("an item cannot rely on itself".into()));
+                }
+                // The target must exist NOW (intake strictness); the fold
+                // stays tolerant of dangling edges in foreign logs.
+                self.require(&target_id)?;
+                if item.relies_on.iter().any(|e| e.target_id == target_id) {
+                    return Err(AgendaError::Transition(format!(
+                        "{id} already relies on {target_id}"
+                    )));
+                }
+                if item.relies_on.len() >= MAX_RELIES_ON_PER_ITEM {
+                    return Err(AgendaError::Invalid(format!(
+                        "more than {MAX_RELIES_ON_PER_ITEM} dependencies"
+                    )));
+                }
+                Ok(AgendaOp::AddReliesOn { id, target_id })
+            }
+            AgendaCommand::RemoveReliesOn {
+                id,
+                target_id,
+                source: _,
+            } => {
+                let item = self.require(&id)?;
+                let target_id = target_id.trim().to_string();
+                if !item.relies_on.iter().any(|e| e.target_id == target_id) {
+                    return Err(AgendaError::NotFound(format!(
+                        "{id} has no live dependency on {target_id}"
+                    )));
+                }
+                Ok(AgendaOp::RemoveReliesOn { id, target_id })
             }
             AgendaCommand::ApproveEffect { id, digest } => {
                 let item = self.require(&id)?;
@@ -753,6 +906,29 @@ fn parse_record(line: &str) -> Result<AgendaOpRecord, String> {
         return Err(format!("unknown op type {op_type:?}"));
     }
     serde_json::from_value(value).map_err(|err| format!("malformed {op_type} op: {err}"))
+}
+
+/// The ruled blocker-id shape (F2 vocabulary):
+/// `"bk-" + first 12 hex of sha256("agenda-blocker\0" item "\0" criterion
+/// "\0" at_ms)`. Minted once at intake and recorded in the op — replay
+/// never mints (§7 purity, same discipline as `effect_id`).
+fn mint_blocker_id(item_id: &str, criterion: &str, at_ms: u64) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"agenda-blocker\0");
+    hasher.update(item_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(criterion.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(at_ms.to_string().as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(15);
+    hex.push_str("bk-");
+    for byte in digest.iter().take(6) {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// The self-described `--source` label: trimmed, bounded, present-or-absent
@@ -1370,6 +1546,258 @@ mod tests {
         assert_eq!(store.snapshot().len(), 1);
         assert_eq!(store.ops(), 1);
         assert_eq!(store.skipped_lines(), 3);
+        // The skipped lines are preserved on disk verbatim, not repaired
+        // away — a newer build folds them later.
+        let raw = std::fs::read_to_string(store.log_path()).unwrap();
+        assert!(raw.contains(r#""type":"propose_effect""#));
+    }
+
+    /// F2 intake strictness + persistence: the five thread/gate verbs
+    /// validate at intake (empty/oversized text, non-open items for
+    /// set_blocker/add_relies_on, duplicates, self-edges, missing targets,
+    /// caps), mint blocker ids server-side, and the folded state survives
+    /// a store reopen. The forward-compat property (older builds
+    /// skip-and-preserve unknown vocabulary) keeps holding for whatever
+    /// comes after F2.
+    #[test]
+    fn f2_verbs_are_strict_at_intake_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let a = store.apply_command(add_cmd("dependent"), None, 1).unwrap();
+        let b = store
+            .apply_command(add_cmd("prerequisite"), None, 2)
+            .unwrap();
+
+        // Annotate: empty and unknown-item rejected; a real one lands with
+        // the envelope source.
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::Annotate {
+                    id: a.id.clone(),
+                    text: "   ".into(),
+                    source: None,
+                },
+                None,
+                3,
+            ),
+            Err(AgendaError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::Annotate {
+                    id: "01UNKNOWN".into(),
+                    text: "x".into(),
+                    source: None,
+                },
+                None,
+                3,
+            ),
+            Err(AgendaError::NotFound(_))
+        ));
+        let annotated = store
+            .apply_command(
+                AgendaCommand::Annotate {
+                    id: a.id.clone(),
+                    text: "waiting on the API rollout".into(),
+                    source: Some("deploy-hook".into()),
+                },
+                None,
+                4,
+            )
+            .unwrap();
+        assert_eq!(annotated.annotations.len(), 1);
+        assert_eq!(
+            annotated.annotations[0].source.as_deref(),
+            Some("deploy-hook")
+        );
+
+        // SetBlocker: open-only, bounded criterion, duplicate criterion
+        // refused, id minted server-side (bk- prefix).
+        let blocked = store
+            .apply_command(
+                AgendaCommand::SetBlocker {
+                    id: a.id.clone(),
+                    criterion: "gpt-live-1 available on the API".into(),
+                    source: None,
+                },
+                None,
+                5,
+            )
+            .unwrap();
+        let blocker_id = blocked.blockers[0].blocker_id.clone();
+        assert!(blocker_id.starts_with("bk-") && blocker_id.len() == 15);
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::SetBlocker {
+                    id: a.id.clone(),
+                    criterion: "gpt-live-1 available on the API".into(),
+                    source: None,
+                },
+                None,
+                6,
+            ),
+            Err(AgendaError::Transition(_))
+        ));
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::SetBlocker {
+                    id: a.id.clone(),
+                    criterion: "c".repeat(MAX_CRITERION_CHARS + 1),
+                    source: None,
+                },
+                None,
+                6,
+            ),
+            Err(AgendaError::Invalid(_))
+        ));
+
+        // AddReliesOn: self-edge, missing target, duplicate all refused.
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::AddReliesOn {
+                    id: a.id.clone(),
+                    target_id: a.id.clone(),
+                    source: None,
+                },
+                None,
+                7,
+            ),
+            Err(AgendaError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::AddReliesOn {
+                    id: a.id.clone(),
+                    target_id: "01UNKNOWN".into(),
+                    source: None,
+                },
+                None,
+                7,
+            ),
+            Err(AgendaError::NotFound(_))
+        ));
+        store
+            .apply_command(
+                AgendaCommand::AddReliesOn {
+                    id: a.id.clone(),
+                    target_id: b.id.clone(),
+                    source: None,
+                },
+                None,
+                8,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::AddReliesOn {
+                    id: a.id.clone(),
+                    target_id: b.id.clone(),
+                    source: None,
+                },
+                None,
+                9,
+            ),
+            Err(AgendaError::Transition(_))
+        ));
+
+        // ClearBlocker resolves a unique prefix to the full id at intake
+        // (the durable op carries the exact id); RemoveReliesOn needs a
+        // live edge.
+        let cleared = store
+            .apply_command(
+                AgendaCommand::ClearBlocker {
+                    id: a.id.clone(),
+                    blocker_id: blocker_id[..6].to_string(),
+                    source: None,
+                },
+                None,
+                10,
+            )
+            .unwrap();
+        assert!(cleared.blockers[0].cleared.is_some());
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::ClearBlocker {
+                    id: a.id.clone(),
+                    blocker_id,
+                    source: None,
+                },
+                None,
+                11,
+            ),
+            Err(AgendaError::NotFound(_)),
+        ));
+        store
+            .apply_command(
+                AgendaCommand::RemoveReliesOn {
+                    id: a.id.clone(),
+                    target_id: b.id.clone(),
+                    source: None,
+                },
+                None,
+                12,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::RemoveReliesOn {
+                    id: a.id.clone(),
+                    target_id: b.id.clone(),
+                    source: None,
+                },
+                None,
+                13,
+            ),
+            Err(AgendaError::NotFound(_))
+        ));
+
+        // Blocking a completed item is a transition error.
+        store
+            .apply_command(
+                AgendaCommand::Complete {
+                    id: b.id.clone(),
+                    source: None,
+                },
+                None,
+                14,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::SetBlocker {
+                    id: b.id.clone(),
+                    criterion: "too late".into(),
+                    source: None,
+                },
+                None,
+                15,
+            ),
+            Err(AgendaError::Transition(_))
+        ));
+        // …but annotating it is fine (housekeeping annotates without
+        // disposing).
+        store
+            .apply_command(
+                AgendaCommand::Annotate {
+                    id: b.id.clone(),
+                    text: "post-completion evidence".into(),
+                    source: None,
+                },
+                None,
+                16,
+            )
+            .unwrap();
+
+        // Reopen the store: thread, blocker history (cleared entry kept),
+        // and the removed edge all replay exactly.
+        drop(store);
+        let store = AgendaStore::open(dir.path()).unwrap();
+        let a_re = store.get(&a.id).unwrap();
+        assert_eq!(a_re.annotations.len(), 1);
+        assert_eq!(a_re.blockers.len(), 1);
+        assert!(a_re.blockers[0].cleared.is_some());
+        assert!(a_re.relies_on.is_empty());
+        assert_eq!(store.get(&b.id).unwrap().annotations.len(), 1);
     }
 
     fn ask_question(text: &str) -> crate::mcp::AskUserQuestionParams {
