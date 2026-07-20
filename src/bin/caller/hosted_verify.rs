@@ -33,6 +33,7 @@
 
 use sha2::{Digest as _, Sha256};
 use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -47,6 +48,7 @@ const GITHUB_ASSET_CAP: usize = 4096;
 const ARTIFACT_PATH_BYTE_CAP: usize = 2048;
 const ARTIFACT_NAME_BYTE_CAP: usize = 512;
 const METADATA_STRING_BYTE_CAP: usize = 512;
+const ARTIFACT_ORIGIN_DNS_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Status registry (the tripwire's verdict; fleet_cert.rs pattern) ──
 
@@ -411,6 +413,9 @@ struct ManifestLeaf {
     bundle_version: String,
     git_sha: String,
     manifest_hash: String,
+    /// Canonical origin serving the logged bytes. Older leaves omit it and
+    /// retain the legacy same-origin behavior.
+    artifact_origin: Option<String>,
     artifacts: Vec<ManifestArtifact>,
 }
 
@@ -497,6 +502,18 @@ fn parse_manifest_leaf(leaf_json: &str) -> Result<ManifestLeaf, String> {
             METADATA_STRING_BYTE_CAP,
         )?,
         manifest_hash,
+        artifact_origin: leaf
+            .get("artifact_origin")
+            .map(|value| {
+                bounded_string(
+                    value
+                        .as_str()
+                        .ok_or("manifest artifact_origin is not a string")?,
+                    "artifact origin",
+                    METADATA_STRING_BYTE_CAP,
+                )
+            })
+            .transpose()?,
         artifacts,
     })
 }
@@ -520,6 +537,10 @@ struct SthPin {
 struct ArtifactManifestPin {
     index: u64,
     manifest_hash: String,
+    /// Absent in pins written before artifact origins were logged. Once
+    /// observed, an origin cannot disappear or change at a later index.
+    #[serde(default)]
+    artifact_origin: Option<String>,
     pinned_unix_ms: u64,
 }
 
@@ -576,6 +597,7 @@ fn check_artifact_manifest_high_water(
     pin: Option<&ArtifactManifestPin>,
     index: u64,
     manifest_hash: &str,
+    artifact_origin: Option<&str>,
 ) -> Result<(), String> {
     let Some(pin) = pin else {
         return Ok(());
@@ -592,6 +614,14 @@ fn check_artifact_manifest_high_water(
             pin.index
         ));
     }
+    if pin.artifact_origin.as_deref().is_some() && pin.artifact_origin.as_deref() != artifact_origin
+    {
+        return Err(format!(
+            "artifact origin changed from pinned {} to {}",
+            pin.artifact_origin.as_deref().unwrap_or_default(),
+            artifact_origin.unwrap_or("<missing>")
+        ));
+    }
     Ok(())
 }
 
@@ -599,21 +629,24 @@ fn commit_artifact_manifest_pin(
     path: &Path,
     index: u64,
     manifest_hash: &str,
+    artifact_origin: Option<&str>,
 ) -> Result<(), String> {
     let lock_dir = pin_lock_dir(path)?;
     crate::access::authority_store::with_lock(&lock_dir, || {
         let current = load_artifact_manifest_pin(path).map_err(crate::access::AccessError)?;
-        check_artifact_manifest_high_water(current.as_ref(), index, manifest_hash)
+        check_artifact_manifest_high_water(current.as_ref(), index, manifest_hash, artifact_origin)
             .map_err(crate::access::AccessError)?;
-        if current
-            .as_ref()
-            .is_some_and(|pin| pin.index == index && pin.manifest_hash == manifest_hash)
-        {
+        if current.as_ref().is_some_and(|pin| {
+            pin.index == index
+                && pin.manifest_hash == manifest_hash
+                && pin.artifact_origin.as_deref() == artifact_origin
+        }) {
             return Ok(());
         }
         let pin = ArtifactManifestPin {
             index,
             manifest_hash: manifest_hash.to_string(),
+            artifact_origin: artifact_origin.map(str::to_string),
             pinned_unix_ms: current
                 .as_ref()
                 .map(|pin| pin.pinned_unix_ms)
@@ -793,9 +826,237 @@ pub(crate) struct VerifyReport {
     pub bundle_version: String,
     pub git_sha: String,
     pub manifest_hash: String,
+    pub artifact_origin: String,
     pub artifact_count: usize,
     /// `None` = first contact (this run created the pin).
     pub pinned_from_size: Option<u64>,
+}
+
+fn same_network_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left
+            .host_str()
+            .zip(right.host_str())
+            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn one_label_below(child: &str, parent: &str) -> bool {
+    parent.contains('.')
+        && child
+            .strip_suffix(&format!(".{parent}"))
+            .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+}
+
+fn related_artifact_hosts(rendezvous: &str, artifact: &str) -> bool {
+    rendezvous.eq_ignore_ascii_case(artifact)
+        || one_label_below(rendezvous, artifact)
+        || one_label_below(artifact, rendezvous)
+}
+
+fn parse_artifact_origin(raw: &str) -> Result<Url, String> {
+    let mut origin =
+        Url::parse(raw).map_err(|error| format!("invalid manifest artifact_origin: {error}"))?;
+    if !matches!(origin.scheme(), "http" | "https") {
+        return Err("manifest artifact_origin must use http or https".to_string());
+    }
+    if origin.host_str().is_none() {
+        return Err("manifest artifact_origin has no host".to_string());
+    }
+    if !origin.username().is_empty() || origin.password().is_some() {
+        return Err("manifest artifact_origin must not contain credentials".to_string());
+    }
+    if origin.query().is_some() || origin.fragment().is_some() {
+        return Err("manifest artifact_origin must not contain a query or fragment".to_string());
+    }
+    if origin.path() != "/" {
+        return Err("manifest artifact_origin must be an origin without a path".to_string());
+    }
+    let default_port = match origin.scheme() {
+        "http" => 80,
+        "https" => 443,
+        _ => unreachable!("scheme checked above"),
+    };
+    if origin.port() == Some(default_port) {
+        origin
+            .set_port(None)
+            .map_err(|_| "manifest artifact_origin has an invalid port".to_string())?;
+    }
+    Ok(origin)
+}
+
+/// Select the origin whose bytes the signed leaf commits to. The field is
+/// optional for rolling compatibility: old leaves preserve the former
+/// rendezvous-relative behavior. A split origin is deliberately narrow — the
+/// same scheme and either the same host or its single-label apex/subdomain
+/// counterpart — so a compromised service cannot turn the verifier into a
+/// general network fetcher.
+fn select_artifact_origin(
+    rendezvous: &Url,
+    declared: Option<&str>,
+) -> Result<(Url, Option<String>), String> {
+    let Some(declared) = declared else {
+        return Ok((rendezvous.clone(), None));
+    };
+    let origin = parse_artifact_origin(declared)?;
+    if origin.scheme() != rendezvous.scheme() {
+        return Err(format!(
+            "manifest artifact_origin scheme {} differs from rendezvous scheme {}",
+            origin.scheme(),
+            rendezvous.scheme()
+        ));
+    }
+    let rendezvous_host = rendezvous.host_str().ok_or("rendezvous URL has no host")?;
+    let artifact_host = origin
+        .host_str()
+        .ok_or("manifest artifact_origin has no host")?;
+    if !related_artifact_hosts(rendezvous_host, artifact_host) {
+        return Err(format!(
+            "manifest artifact_origin host {artifact_host} is not the rendezvous host or its one-label apex/subdomain counterpart"
+        ));
+    }
+    let normalized = origin.as_str().trim_end_matches('/').to_string();
+    Ok((origin, Some(normalized)))
+}
+
+/// REPLICATED from the runtime browse egress guard. This is intentionally an
+/// allow-public policy, including IPv4-mapped IPv6 handling, because a signed
+/// split origin still must not make this verifier a loopback/LAN/metadata
+/// fetch primitive.
+fn artifact_origin_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _d] = v4.octets();
+            a == 0
+                || a == 10
+                || a == 127
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 192 && b == 168)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+                || a >= 224
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return artifact_origin_blocked_ip(IpAddr::V4(mapped));
+            }
+            let segments = v6.segments();
+            (segments[0] & 0xe000) != 0x2000
+                || (segments[0] == 0x2001 && segments[1] <= 0x01ff)
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || segments[0] == 0x2002
+                || (segments[0] == 0x3fff && (segments[1] & 0xf000) == 0)
+        }
+    }
+}
+
+fn artifact_origin_blocked_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host.is_empty()
+        || !host.contains('.')
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".localdomain")
+        || host.ends_with(".lan")
+        || host == "home.arpa"
+        || host.ends_with(".home.arpa")
+        || host.ends_with(".internal")
+        || host == "metadata.google.internal"
+        || host == "metadata.goog"
+        || host.ends_with(".metadata.goog")
+}
+
+async fn split_artifact_http_client(origin: &Url) -> Result<reqwest::Client, VerifyFailure> {
+    use VerifyFailure::{Unavailable, Verification};
+    let verification = |summary: String| Verification {
+        summary,
+        mismatches: Vec::new(),
+    };
+    let port = origin
+        .port_or_known_default()
+        .ok_or_else(|| verification("manifest artifact_origin has no usable port".to_string()))?;
+    let mut pinned = Vec::<SocketAddr>::new();
+    match origin.host() {
+        None => {
+            return Err(verification(
+                "manifest artifact_origin has no host".to_string(),
+            ));
+        }
+        Some(url::Host::Ipv4(ip)) => {
+            if artifact_origin_blocked_ip(ip.into()) {
+                return Err(verification(format!(
+                    "manifest artifact_origin uses non-public address {ip}"
+                )));
+            }
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            if artifact_origin_blocked_ip(ip.into()) {
+                return Err(verification(format!(
+                    "manifest artifact_origin uses non-public address {ip}"
+                )));
+            }
+        }
+        Some(url::Host::Domain(host)) => {
+            if artifact_origin_blocked_host(host) {
+                return Err(verification(format!(
+                    "manifest artifact_origin uses local/private host {host}"
+                )));
+            }
+            pinned = tokio::time::timeout(
+                ARTIFACT_ORIGIN_DNS_TIMEOUT,
+                tokio::net::lookup_host((host, port)),
+            )
+            .await
+            .map_err(|_| {
+                Unavailable(format!(
+                    "DNS lookup timed out for manifest artifact origin {host}"
+                ))
+            })?
+            .map_err(|error| {
+                Unavailable(format!(
+                    "DNS lookup failed for manifest artifact origin {host}: {error}"
+                ))
+            })?
+            .collect();
+            if pinned.is_empty() {
+                return Err(Unavailable(format!(
+                    "DNS lookup returned no addresses for manifest artifact origin {host}"
+                )));
+            }
+            if let Some(blocked) = pinned
+                .iter()
+                .find(|address| artifact_origin_blocked_ip(address.ip()))
+            {
+                return Err(verification(format!(
+                    "manifest artifact_origin host {host} resolves to non-public address {}",
+                    blocked.ip()
+                )));
+            }
+        }
+    }
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        // Ambient proxies could bypass the addresses validated above.
+        .no_proxy()
+        .user_agent("intendant-hosted-verify");
+    if !pinned.is_empty() {
+        let host = origin
+            .host_str()
+            .expect("origin host checked before DNS resolution");
+        builder = builder.resolve_to_addrs(host, &pinned);
+    }
+    builder
+        .build()
+        .map_err(|error| Unavailable(error.to_string()))
 }
 
 fn http_client() -> Result<reqwest::Client, String> {
@@ -1317,12 +1578,30 @@ pub(crate) async fn verify_hosted_bundle(
 
     // The manifest self-verifies, then the live bytes match it.
     let leaf = parse_manifest_leaf(&entry.leaf_json).map_err(verification)?;
+    let (artifact_base, artifact_origin_pin) =
+        select_artifact_origin(base, leaf.artifact_origin.as_deref()).map_err(verification)?;
     let manifest_pin_file = artifact_manifest_pin_path(state_root, base);
     let manifest_pin = load_artifact_manifest_pin(&manifest_pin_file).map_err(verification)?;
-    check_artifact_manifest_high_water(manifest_pin.as_ref(), entry.index, &leaf.manifest_hash)
-        .map_err(verification)?;
-    let mismatches =
-        compare_live_artifacts(&client, base, &leaf.artifacts, BUNDLE_FETCH_LIMITS).await?;
+    check_artifact_manifest_high_water(
+        manifest_pin.as_ref(),
+        entry.index,
+        &leaf.manifest_hash,
+        artifact_origin_pin.as_deref(),
+    )
+    .map_err(verification)?;
+    let split_client = if same_network_origin(base, &artifact_base) {
+        None
+    } else {
+        Some(split_artifact_http_client(&artifact_base).await?)
+    };
+    let artifact_client = split_client.as_ref().unwrap_or(&client);
+    let mismatches = compare_live_artifacts(
+        artifact_client,
+        &artifact_base,
+        &leaf.artifacts,
+        BUNDLE_FETCH_LIMITS,
+    )
+    .await?;
     if !mismatches.is_empty() {
         return Err(Verification {
             summary: format!(
@@ -1337,8 +1616,13 @@ pub(crate) async fn verify_hosted_bundle(
     // Everything held. Advance the selected-manifest high-water mark before
     // the tree head: a crash between the writes may cause an extra
     // consistency check, but can never reopen an older bundle observation.
-    commit_artifact_manifest_pin(&manifest_pin_file, entry.index, &leaf.manifest_hash)
-        .map_err(verification)?;
+    commit_artifact_manifest_pin(
+        &manifest_pin_file,
+        entry.index,
+        &leaf.manifest_hash,
+        artifact_origin_pin.as_deref(),
+    )
+    .map_err(verification)?;
     commit_verified_pin(&client, base, &entry).await?;
 
     Ok(VerifyReport {
@@ -1348,6 +1632,7 @@ pub(crate) async fn verify_hosted_bundle(
         bundle_version: leaf.bundle_version,
         git_sha: leaf.git_sha,
         manifest_hash: leaf.manifest_hash,
+        artifact_origin: artifact_base.as_str().trim_end_matches('/').to_string(),
         artifact_count: leaf.artifacts.len(),
         pinned_from_size: entry.pinned_from_size,
     })
@@ -2072,7 +2357,8 @@ pub(crate) async fn run_cli(args: Vec<String>) -> i32 {
                 "artifacts: {}/{} match the log",
                 report.artifact_count, report.artifact_count
             );
-            println!("PASS — what this origin serves is what its transparency log commits to");
+            println!("artifact origin: {}", report.artifact_origin);
+            println!("PASS — what the signed artifact origin serves matches the transparency log");
             0
         }
         Err(failure) => print_failure(
@@ -2559,6 +2845,17 @@ mod tests {
         assert_eq!(leaf.bundle_version, "0.1.0");
         assert_eq!(leaf.git_sha, "abc1234");
         assert_eq!(leaf.unix_ms, 42);
+        assert_eq!(leaf.artifact_origin, None);
+
+        let mut with_origin: serde_json::Value = serde_json::from_str(&good).unwrap();
+        with_origin["artifact_origin"] = serde_json::json!("https://intendant.dev");
+        assert_eq!(
+            parse_manifest_leaf(&with_origin.to_string())
+                .unwrap()
+                .artifact_origin
+                .as_deref(),
+            Some("https://intendant.dev")
+        );
 
         // A tampered list no longer matches its own manifest_hash.
         let tampered = good.replace(&sha256_hex(b"bundle"), &sha256_hex(b"evil"));
@@ -2589,6 +2886,66 @@ mod tests {
         assert!(parse_manifest_leaf(&manifest_leaf_json(&duplicate))
             .unwrap_err()
             .contains("not unique"));
+    }
+
+    #[test]
+    fn artifact_origin_contract_accepts_the_production_split_only() {
+        let connect = Url::parse("https://connect.intendant.dev").unwrap();
+        let (artifact, pin) =
+            select_artifact_origin(&connect, Some("https://intendant.dev/")).unwrap();
+        assert_eq!(artifact.as_str(), "https://intendant.dev/");
+        assert_eq!(pin.as_deref(), Some("https://intendant.dev"));
+        assert!(!same_network_origin(&connect, &artifact));
+
+        let (same, same_pin) =
+            select_artifact_origin(&connect, Some("https://connect.intendant.dev:443")).unwrap();
+        assert!(same_network_origin(&connect, &same));
+        assert_eq!(same_pin.as_deref(), Some("https://connect.intendant.dev"));
+
+        let apex = Url::parse("https://intendant.dev").unwrap();
+        assert!(select_artifact_origin(&apex, Some("https://connect.intendant.dev")).is_ok());
+
+        for rejected in [
+            "http://intendant.dev",
+            "https://assets.intendant.dev",
+            "https://example.com",
+            "https://intendant.dev/client",
+            "https://user@intendant.dev",
+            "https://intendant.dev?target=connect",
+        ] {
+            assert!(
+                select_artifact_origin(&connect, Some(rejected)).is_err(),
+                "{rejected} must not become an artifact origin"
+            );
+        }
+
+        let (legacy, legacy_pin) = select_artifact_origin(&connect, None).unwrap();
+        assert_eq!(legacy, connect);
+        assert_eq!(legacy_pin, None);
+    }
+
+    #[test]
+    fn split_artifact_origins_reject_non_public_networks() {
+        for blocked in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "192.168.1.2",
+            "198.18.0.1",
+            "203.0.113.1",
+            "::1",
+            "fc00::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                artifact_origin_blocked_ip(blocked.parse().unwrap()),
+                "{blocked} must be blocked"
+            );
+        }
+        assert!(!artifact_origin_blocked_ip("8.8.8.8".parse().unwrap()));
+        assert!(!artifact_origin_blocked_ip(
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
     }
 
     /// The golden mismatch case: a fabricated manifest against fabricated
@@ -3423,21 +3780,69 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = Url::parse("https://connect.example.test").unwrap();
         let path = artifact_manifest_pin_path(dir.path(), &base);
-        commit_artifact_manifest_pin(&path, 7, "newer-hash").unwrap();
-        commit_artifact_manifest_pin(&path, 7, "newer-hash").unwrap();
+        let origin = Some("https://example.test");
+        commit_artifact_manifest_pin(&path, 7, "newer-hash", origin).unwrap();
+        commit_artifact_manifest_pin(&path, 7, "newer-hash", origin).unwrap();
 
-        let rollback = commit_artifact_manifest_pin(&path, 3, "older-hash").unwrap_err();
+        let rollback = commit_artifact_manifest_pin(&path, 3, "older-hash", origin).unwrap_err();
         assert!(rollback.contains("regressed"), "error was {rollback}");
-        let replacement = commit_artifact_manifest_pin(&path, 7, "different-hash").unwrap_err();
+        let replacement =
+            commit_artifact_manifest_pin(&path, 7, "different-hash", origin).unwrap_err();
         assert!(
             replacement.contains("changed at pinned index"),
             "error was {replacement}"
         );
+        let origin_change = commit_artifact_manifest_pin(
+            &path,
+            9,
+            "latest-hash",
+            Some("https://other.example.test"),
+        )
+        .unwrap_err();
+        assert!(
+            origin_change.contains("artifact origin changed"),
+            "error was {origin_change}"
+        );
+        let origin_removed =
+            commit_artifact_manifest_pin(&path, 9, "latest-hash", None).unwrap_err();
+        assert!(
+            origin_removed.contains("artifact origin changed"),
+            "error was {origin_removed}"
+        );
 
-        commit_artifact_manifest_pin(&path, 9, "latest-hash").unwrap();
+        commit_artifact_manifest_pin(&path, 9, "latest-hash", origin).unwrap();
         let pin = load_artifact_manifest_pin(&path).unwrap().unwrap();
         assert_eq!(pin.index, 9);
         assert_eq!(pin.manifest_hash, "latest-hash");
+        assert_eq!(pin.artifact_origin.as_deref(), origin);
+    }
+
+    #[test]
+    fn legacy_artifact_pin_learns_the_first_signed_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = Url::parse("https://connect.example.test").unwrap();
+        let path = artifact_manifest_pin_path(dir.path(), &base);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "index": 7,
+                "manifest_hash": "same-hash",
+                "pinned_unix_ms": 11,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let legacy = load_artifact_manifest_pin(&path).unwrap().unwrap();
+        assert_eq!(legacy.artifact_origin, None);
+        commit_artifact_manifest_pin(&path, 7, "same-hash", Some("https://example.test")).unwrap();
+        let upgraded = load_artifact_manifest_pin(&path).unwrap().unwrap();
+        assert_eq!(
+            upgraded.artifact_origin.as_deref(),
+            Some("https://example.test")
+        );
+        assert_eq!(upgraded.pinned_unix_ms, 11);
     }
 
     #[test]
