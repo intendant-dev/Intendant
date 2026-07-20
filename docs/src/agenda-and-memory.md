@@ -133,6 +133,43 @@ in-process; under extreme event pressure an occurrence can remain
 `awaiting_receipt` or `running` until daemon restart resolves it fail-closed
 (normally to `unknown`).
 
+### Attribution, provenance display, and `--source`
+
+Every operation records the actor **as the daemon's gates resolved it**
+(principal, session id, actor class), mapped from the shared `ActorBinding`
+seam at the authenticated edge — never parsed from the request. Coverage:
+
+- **Supervised sessions — external and native — attribute automatically.**
+  The daemon injects a session-scoped `INTENDANT_MCP_URL` (a loopback
+  capability token derived per session; never a provider key) into external
+  backends' env and, since the follow-through slice, into the native
+  runtime's command env at spawn (`agent_runner`), so `intendant ctl agenda …`
+  run by any shell command inside a supervised session — sub-agents included —
+  records `agent_session` with that session's id. The native URL targets a
+  dedicated session-MCP loopback listener that serves only `/mcp` and only
+  session-scoped tokens: the runtime sandbox's gateway-port guard keeps
+  denying the main port (tokenless loopback there is root-equivalent), while
+  this door can only ever mint the calling session's own authority.
+- **Dashboard writes** attribute as the owner surface; **bare local ctl**
+  outside any session records `local_process`.
+- **`--source LABEL`** (on `add` and the other non-owner verbs) is a
+  self-described, explicitly **unverified** label for unsupervised callers —
+  cron jobs, git hooks. It is stored beside the actor on the operation
+  envelope (and folded into `provenance.source` for `add`), rendered visibly
+  as "self-described", and never becomes a principal, session attribution, or
+  trust input. Owner-surface verbs (`approve_effect`, `revoke_effect`) accept
+  no label.
+
+For display, the ledger snapshot response carries a `sessions` join map
+beside the items (never fields on them — the item DTO stays the pure fold
+product): each recorded session id resolves through the external wrapper
+index to its backend **conversation** (superseded wrapper incarnations
+included) or to the native session's log dir, with the session's human name
+and the Sessions-tab row key. The dashboard renders the resolved name as a
+jump link to that conversation row, keeps raw ids/principal/kind in the
+tooltip, and degrades to the raw truncated id whenever nothing resolves
+(index pruned, log dir gone) — a dangling recorded id is never an error.
+
 ### Surfaces and permissions
 
 Agenda is available in the dashboard, through `intendant ctl agenda`, through
@@ -141,7 +178,7 @@ routes:
 
 | Route | Permission | Purpose |
 |---|---|---|
-| `GET /api/agenda` | `agenda.read` | Items, status counts, and skipped-line count |
+| `GET /api/agenda` | `agenda.read` | Items, status counts, skipped-line count, and the session-resolution join map |
 | `POST /api/agenda/op` | `agenda.write` | Apply one validated Agenda command |
 | `POST /api/agenda/reminders/policy` | `settings.manage` | Change owner reminder policy |
 

@@ -10,6 +10,7 @@ pub(crate) const MAX_TITLE_CHARS: usize = 500;
 pub(crate) const MAX_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_TAGS: usize = 32;
 pub(crate) const MAX_TAG_CHARS: usize = 100;
+pub(crate) const MAX_SOURCE_CHARS: usize = 100;
 
 /// What an agenda entry is. Kinds and effects are orthogonal: no kind
 /// implies any delivery or execution behavior. `Question` (slice A4) is a
@@ -272,6 +273,12 @@ pub struct AgendaProvenance {
     /// Actor class of the parking write (see [`AgendaActor::kind`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kind: Option<String>,
+    /// Self-described caller label (`--source`), copied from the add op's
+    /// envelope. UNVERIFIED by doctrine: data beside the attribution, never
+    /// a principal, never session attribution — every surface renders it
+    /// visibly labeled as self-described.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
     pub(crate) created_ms: u64,
 }
 
@@ -393,19 +400,32 @@ pub enum AgendaCommand {
         /// policy-controlled notification but never authorizes work.
         #[serde(default)]
         due_ms: Option<u64>,
+        /// Self-described caller label for unsupervised writers
+        /// (`--source`). Explicitly UNVERIFIED: stored beside the
+        /// gate-resolved actor, never as attribution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     Patch {
         id: String,
         patch: AgendaPatch,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     Complete {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     Reopen {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     Retire {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     /// Reply to an open question (question items only). Resolves it.
     /// `structured` (optional, additive) carries the rich-ask breakdown —
@@ -416,6 +436,8 @@ pub enum AgendaCommand {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         structured: Option<AgendaAskResolution>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     /// Park a rich multi-question ask (the Ask v2 payload — same
     /// vocabulary as `ask_user`'s `questions` form: options, pick bounds,
@@ -436,18 +458,56 @@ pub enum AgendaCommand {
         fire_at_ms: u64,
         #[serde(default)]
         orchestrate: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     /// Approve the current manifest revision by its digest. **An
     /// owner-surface act** — the tenant edge refuses agent-session, peer,
     /// and unattributed actors with a named denial.
-    ApproveEffect {
-        id: String,
-        digest: String,
-    },
+    ApproveEffect { id: String, digest: String },
     /// Withdraw the approval (owner-surface, like granting it).
-    RevokeEffect {
-        id: String,
-    },
+    RevokeEffect { id: String },
+}
+
+impl AgendaItem {
+    /// Every session id this item's attribution views reference (birth
+    /// provenance, answer, effect proposals and runs) — the set a display
+    /// surface resolves to conversations and names. Deduplication is the
+    /// caller's concern.
+    pub(crate) fn referenced_session_ids(&self) -> impl Iterator<Item = &str> {
+        self.provenance
+            .session_id
+            .as_deref()
+            .into_iter()
+            .chain(self.answer.as_ref().and_then(|a| a.session_id.as_deref()))
+            .chain(self.effects.iter().flat_map(|effect| {
+                effect.proposed_session_id.as_deref().into_iter().chain(
+                    effect
+                        .last_run
+                        .as_ref()
+                        .and_then(|run| run.session_id.as_deref()),
+                )
+            }))
+    }
+}
+
+impl AgendaCommand {
+    /// Detach the self-described `--source` label for envelope recording.
+    /// The owner-surface verbs (approve/revoke) carry none by design.
+    pub(crate) fn take_source(&mut self) -> Option<String> {
+        match self {
+            AgendaCommand::Add { source, .. }
+            | AgendaCommand::Patch { source, .. }
+            | AgendaCommand::Complete { source, .. }
+            | AgendaCommand::Reopen { source, .. }
+            | AgendaCommand::Retire { source, .. }
+            | AgendaCommand::Answer { source, .. }
+            | AgendaCommand::ProposeEffect { source, .. } => source.take(),
+            AgendaCommand::Ask { .. }
+            | AgendaCommand::ApproveEffect { .. }
+            | AgendaCommand::RevokeEffect { .. } => None,
+        }
+    }
 }
 
 /// A durable op — the payload of one log line. Compatible with the
@@ -561,6 +621,12 @@ pub(crate) struct AgendaOpRecord {
     pub(crate) at_ms: u64,
     #[serde(default, skip_serializing_if = "actor_is_empty")]
     pub(crate) actor: Option<AgendaActor>,
+    /// Self-described caller label (`--source`), recorded verbatim beside —
+    /// never inside — the gate-resolved actor. UNVERIFIED by doctrine; the
+    /// owner-surface verbs (approve/revoke) accept none. Older builds
+    /// tolerate the field (serde ignores unknown envelope fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
     pub(crate) op: AgendaOp,
 }
 
@@ -615,6 +681,7 @@ pub(crate) fn apply_op(
                         principal: actor.principal,
                         session_id: actor.session_id,
                         kind: actor.kind,
+                        source: rec.source.clone(),
                         created_ms: at_ms,
                     },
                     status: AgendaStatus::Open,
@@ -873,6 +940,7 @@ mod tests {
             v: AGENDA_LOG_VERSION,
             at_ms,
             actor: None,
+            source: None,
             op,
         }
     }
@@ -1009,6 +1077,7 @@ mod tests {
                 session_id: None,
                 kind: None,
             }),
+            source: None,
             op: AgendaOp::Add {
                 id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
                 kind: AgendaKind::Note,
@@ -1186,6 +1255,7 @@ mod tests {
                 session_id: None,
                 kind: Some("dashboard".into()),
             }),
+            source: None,
             op: AgendaOp::Answer {
                 id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
                 text: "yes — ship it".into(),
@@ -1199,6 +1269,46 @@ mod tests {
         );
         let back: AgendaOpRecord = serde_json::from_str(&line).unwrap();
         assert_eq!(back, record);
+    }
+
+    /// Pins the `--source` envelope field (additive to v1): recorded
+    /// verbatim beside the actor, folded into add provenance, absent from
+    /// the wire when unset (the existing pin tests prove that half).
+    #[test]
+    fn source_label_line_format_is_pinned_and_folds_into_provenance() {
+        let record = AgendaOpRecord {
+            v: 1,
+            at_ms: 42,
+            actor: None,
+            source: Some("deploy-hook".into()),
+            op: AgendaOp::Add {
+                id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                kind: AgendaKind::Task,
+                title: "rotate certs".into(),
+                body: String::new(),
+                tags: Vec::new(),
+                due_ms: None,
+                ask: None,
+            },
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        assert_eq!(
+            line,
+            r#"{"v":1,"at_ms":42,"source":"deploy-hook","op":{"type":"add","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","kind":"task","title":"rotate certs"}}"#
+        );
+        let back: AgendaOpRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, record);
+
+        let mut items = BTreeMap::new();
+        assert!(apply_op(&mut items, &record).is_none());
+        let provenance = &items["01ARZ3NDEKTSV4RRFFQ69G5FAV"].provenance;
+        assert_eq!(provenance.source.as_deref(), Some("deploy-hook"));
+        // The label is data beside the attribution, never attribution:
+        // principal/session/kind stay exactly what the gate resolved (here,
+        // nothing).
+        assert_eq!(provenance.principal, None);
+        assert_eq!(provenance.session_id, None);
+        assert_eq!(provenance.kind, None);
     }
 
     #[test]
@@ -1386,6 +1496,7 @@ mod tests {
                 session_id: Some("sess-park".into()),
                 kind: Some("agent_session".into()),
             }),
+            source: None,
             op: ask_add("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
         };
         let line = serde_json::to_string(&record).unwrap();
@@ -1404,6 +1515,7 @@ mod tests {
             v: 1,
             at_ms: 12,
             actor: None,
+            source: None,
             op: AgendaOp::Dismiss {
                 id: "01X".into(),
                 action: "skip".into(),
@@ -1423,6 +1535,7 @@ mod tests {
             v: 1,
             at_ms: 13,
             actor: None,
+            source: None,
             op: AgendaOp::Answer {
                 id: "01X".into(),
                 text: "A".into(),

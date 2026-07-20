@@ -117,8 +117,24 @@ pub(super) fn intendant_mcp_bearer_token(
 /// session id is present the token is *session-scoped* (derived from the
 /// per-process token and the session id), so the backend authenticates as
 /// exactly that supervised agent session to the daemon's IAM layer and cannot
-/// present another session's identity.
-pub(super) fn intendant_bootstrap_mcp_url(
+/// present another session's identity. `pub(crate)`: the supervised NATIVE
+/// launch arm reuses the same builder for the runtime child's bootstrap
+/// ([`crate::agent_runner::RuntimeMcpEnv`]) so both lanes stay one shape.
+pub(crate) fn intendant_bootstrap_mcp_url(
+    port: u16,
+    session_id: Option<&str>,
+    managed_context: Option<&str>,
+    mcp_token: Option<&str>,
+) -> String {
+    intendant_bootstrap_mcp_url_at("localhost", port, session_id, managed_context, mcp_token)
+}
+
+/// [`intendant_bootstrap_mcp_url`] with an explicit host. The native
+/// runtime bootstrap names `127.0.0.1` (its dedicated session-MCP
+/// listener binds IPv4 loopback, and the sandboxed client must not depend
+/// on `localhost` resolution order); external backends keep `localhost`.
+pub(crate) fn intendant_bootstrap_mcp_url_at(
+    host: &str,
     port: u16,
     session_id: Option<&str>,
     managed_context: Option<&str>,
@@ -141,7 +157,7 @@ pub(super) fn intendant_bootstrap_mcp_url(
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join("&");
-    format!("http://localhost:{port}/mcp?{query}")
+    format!("http://{host}:{port}/mcp?{query}")
 }
 
 /// Inject the `intendant ctl` bootstrap environment into a supervised child:

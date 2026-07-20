@@ -423,3 +423,29 @@ html.ui-v2 .agenda-card-add input:focus {
   outline: none;
   border-color: var(--iris);
 }
+
+/* F1 provenance: resolved session names link to the conversation row on
+   the Sessions tab; self-described labels are visibly labeled data. */
+html.ui-v2 .agenda-session-link {
+  color: var(--iris);
+  text-decoration: none;
+  border-bottom: 1px dotted color-mix(in srgb, var(--iris) 55%, transparent);
+  cursor: pointer;
+}
+html.ui-v2 .agenda-session-link:hover {
+  color: var(--text);
+  border-bottom-color: var(--text);
+}
+html.ui-v2 .agenda-self-described {
+  color: var(--text-3);
+  font-style: italic;
+}
+/* Flash highlight on the Sessions-tab card an agenda jump lands on.
+   Defined here because the agenda owns the jump gesture. */
+.agenda-jump-flash {
+  animation: agenda-jump-flash-pulse 0.8s ease-in-out 3;
+}
+@keyframes agenda-jump-flash-pulse {
+  0%, 100% { outline: 2px solid transparent; outline-offset: 2px; }
+  50% { outline: 2px solid var(--iris, #7c7cf0); outline-offset: 2px; }
+}

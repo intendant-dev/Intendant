@@ -674,6 +674,7 @@ mod tests {
                 principal: None,
                 session_id: None,
                 kind: None,
+                source: None,
                 created_ms: 1,
             },
             status,

@@ -15,6 +15,13 @@ let agendaFilter = 'open';
 let agendaFetchInFlight = null;
 let agendaLoadError = '';
 let agendaReminderPolicy = null; // owner delivery policy (Settings-gated)
+// Session-resolution join from the list response: recorded session id →
+// { source, conversation_id, key, name } for the Sessions-tab row. Ids the
+// daemon could not resolve have no entry — surfaces fall back to the raw
+// id. `attempted` remembers ids a fetch already tried, so an unresolvable
+// id never causes refetch loops on the event lane.
+let agendaSessions = {};
+let agendaSessionLookupsAttempted = new Set();
 
 async function agendaRefresh() {
   if (agendaFetchInFlight) return agendaFetchInFlight;
@@ -26,6 +33,9 @@ async function agendaRefresh() {
         agendaCounts = resp.body.counts || agendaCounts;
         agendaSkippedLines = resp.body.skipped_lines || 0;
         agendaReminderPolicy = resp.body.reminder_policy || agendaReminderPolicy;
+        agendaSessions = resp.body.sessions || {};
+        agendaSessionLookupsAttempted = new Set(
+          agendaItems.flatMap(agendaItemSessionIds));
         agendaLoadError = '';
         agendaAnnounceParkedAsks();
       } else {
@@ -86,7 +96,27 @@ function agendaObserveServerMessage(d) {
   if (at >= 0) agendaItems[at] = d.item;
   else agendaItems.push(d.item);
   if (d.counts) agendaCounts = d.counts;
+  // A session id this tab has never tried to resolve (a fresh session
+  // parked something): refetch once to pick up the join entry. Ids that
+  // already failed resolution stay raw — no loops.
+  const unresolved = agendaItemSessionIds(d.item).some(
+    (id) => !(id in agendaSessions) && !agendaSessionLookupsAttempted.has(id));
+  if (unresolved) agendaRefresh();
   agendaRenderAll();
+}
+
+// Every session id an item's attribution views reference (provenance,
+// answer, effect proposals and runs) — the daemon-side twin drives the
+// join map in the list response.
+function agendaItemSessionIds(item) {
+  const ids = [];
+  if (item.provenance && item.provenance.session_id) ids.push(item.provenance.session_id);
+  if (item.answer && item.answer.session_id) ids.push(item.answer.session_id);
+  (item.effects || []).forEach((effect) => {
+    if (effect.proposed_session_id) ids.push(effect.proposed_session_id);
+    if (effect.last_run && effect.last_run.session_id) ids.push(effect.last_run.session_id);
+  });
+  return ids;
 }
 
 function agendaTabVisible() {
@@ -149,10 +179,23 @@ function agendaDueChip(item) {
   return `<span class="agenda-chip due${overdue ? ' overdue' : ''}">due ${escapeHtml(label)}</span>`;
 }
 
+function agendaSessionInfo(id) {
+  return (id && agendaSessions && agendaSessions[id]) || null;
+}
+
 function agendaActorLabel(p) {
-  // Gate-attributed actor (A2): kind + session/principal, rendered for
-  // humans. Data only — never markup.
-  if (p.session_id) return `session ${p.session_id.slice(0, 12)}`;
+  // Gate-attributed actor (A2), rendered for humans. Session ids resolve
+  // through the join map to the conversation's human name; unresolved ids
+  // degrade to the raw truncated id. Plain TEXT only — callers escape.
+  if (p.session_id) {
+    const s = agendaSessionInfo(p.session_id);
+    if (s && s.name) return `session “${s.name}”`;
+    if (s) {
+      const prefix = s.source && s.source !== 'intendant' ? `${s.source} ` : '';
+      return `${prefix}session ${String(s.conversation_id || p.session_id).slice(0, 8)}`;
+    }
+    return `session ${p.session_id.slice(0, 12)}`;
+  }
   if (p.kind === 'dashboard') return 'you';
   if (p.kind === 'local_process') return 'local ctl';
   if (p.kind === 'peer') return 'a peer daemon';
@@ -160,16 +203,74 @@ function agendaActorLabel(p) {
   return p.principal || '';
 }
 
+// Full attribution HTML: the resolved session name as a jump link to its
+// Sessions-tab conversation row, raw ids + principal + kind in the tooltip
+// (no more suppression — they moved, not vanished), and self-described
+// `--source` labels rendered visibly AS self-described. Everything is
+// data: each fragment is escaped, none of it is ever executed.
+function agendaActorHtml(p) {
+  const bits = [];
+  if (p.session_id) {
+    const s = agendaSessionInfo(p.session_id);
+    const label = agendaActorLabel(p);
+    const tip = [
+      `session id: ${p.session_id}`,
+      s && s.conversation_id && s.conversation_id !== p.session_id
+        ? `conversation: ${s.conversation_id}` : '',
+      p.principal ? `principal: ${p.principal}` : '',
+      p.kind ? `kind: ${p.kind}` : '',
+    ].filter(Boolean).join('\n');
+    if (s && s.key) {
+      bits.push(`<a href="#sessions" class="agenda-session-link" data-session-key="${escapeHtml(s.key)}" title="${escapeHtml(tip)}">${escapeHtml(label)}</a>`);
+    } else {
+      bits.push(`<span title="${escapeHtml(tip)}">${escapeHtml(label)}</span>`);
+    }
+  } else {
+    const label = agendaActorLabel(p);
+    if (label) {
+      bits.push(p.principal && label !== p.principal
+        ? `<span title="${escapeHtml(`principal: ${p.principal}`)}">${escapeHtml(label)}</span>`
+        : escapeHtml(label));
+    }
+  }
+  if (p.source) {
+    bits.push(`<span class="agenda-self-described" title="self-described label — UNVERIFIED, never attribution">— self-described: ${escapeHtml(p.source)}</span>`);
+  }
+  return bits.join(' ');
+}
+
 function agendaProvenanceLine(item) {
   const p = item.provenance || {};
   const created = p.created_ms
     ? new Date(p.created_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
     : '';
-  const who = agendaActorLabel(p);
+  const who = agendaActorHtml(p);
   const parts = [];
-  if (created) parts.push(`parked ${created}`);
+  if (created) parts.push(escapeHtml(`parked ${created}`));
   if (who) parts.push(`by ${who}`);
-  return escapeHtml(parts.join(' · '));
+  return parts.join(' · ');
+}
+
+// Jump to the conversation's row on the Sessions tab: switch tabs, then
+// focus/flash the card once the list renders it (rows are keyed by
+// sessionListRowKey = source<conversation id>). If the row is not in
+// the loaded window the jump degrades to just opening the tab.
+function agendaJumpToSession(key) {
+  if (!key) return;
+  routeTo('sessions');
+  const deadline = Date.now() + 4000;
+  const selector = `[data-session-key="${window.CSS && CSS.escape ? CSS.escape(key) : key}"]`;
+  const seek = () => {
+    const card = document.querySelector(selector);
+    if (card) {
+      card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      card.classList.add('agenda-jump-flash');
+      setTimeout(() => card.classList.remove('agenda-jump-flash'), 2400);
+      return;
+    }
+    if (Date.now() < deadline) setTimeout(seek, 200);
+  };
+  seek();
 }
 
 // Scheduled-session effect (A5): render the manifest under review, its
@@ -203,7 +304,7 @@ function agendaEffectBlock(item) {
     const glyphs = { completed: '✓', failed: '✗', missed: '⊘', unknown: '?', started: '▶' };
     const classes = { completed: 'completed', failed: 'failed', started: 'armed' };
     const bits = [`${glyphs[run.state] || '·'} ${run.state}`];
-    if (run.session_id) bits.push(`session ${run.session_id.slice(0, 12)}`);
+    if (run.session_id) bits.push(agendaActorLabel({ session_id: run.session_id }));
     stateHtml = `<span class="agenda-effect-state ${classes[run.state] || 'attention'}">${escapeHtml(bits.join(' · '))}</span>`;
     if (run.note) {
       // Session summaries / failure reasons are quoted data, like bodies.
@@ -426,6 +527,12 @@ function agendaRenderTab() {
     </div>`;
   });
   list.innerHTML = rows.join('');
+  list.querySelectorAll('a.agenda-session-link').forEach((link) => {
+    link.addEventListener('click', (e) => {
+      e.preventDefault();
+      agendaJumpToSession(link.dataset.sessionKey);
+    });
+  });
   list.querySelectorAll('button[data-op]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const params = { op: btn.dataset.op, id: btn.dataset.id };
@@ -515,10 +622,14 @@ function agendaRenderCard() {
   // Oldest first: long-parked intent stays visible instead of scrolling away.
   const rows = open.slice(0, 5).map((item) => {
     const p = item.provenance || {};
-    // Agent-parked items carry their session provenance right on the card.
+    // Agent-parked items carry their session provenance right on the card,
+    // by resolved name when the join map has one (raw id in the tooltip).
+    const s = agendaSessionInfo(p.session_id);
     const who = p.session_id
-      ? `<span class="agenda-card-row-who">· sess ${escapeHtml(p.session_id.slice(0, 8))}</span>`
-      : '';
+      ? `<span class="agenda-card-row-who" title="${escapeHtml(p.session_id)}">· ${escapeHtml(s && s.name ? s.name : `sess ${p.session_id.slice(0, 8)}`)}</span>`
+      : (p.source
+        ? `<span class="agenda-card-row-who" title="self-described label — unverified">· ${escapeHtml(p.source)}</span>`
+        : '');
     const q = item.kind === 'question'
       ? '<span class="agenda-card-q" aria-label="question">?</span>'
       : '';

@@ -43,6 +43,8 @@ pub(crate) use handle::AgendaHandle;
 pub(crate) use reminders::ReminderPolicyPatch;
 pub(crate) use scheduler::spawn_reminder_scheduler;
 pub(crate) use store::{AgendaError, AgendaStore};
+#[cfg(test)]
+pub(crate) use types::AgendaKind;
 pub(crate) use types::{AgendaActor, AgendaCommand, AgendaCounts, AgendaItem, AgendaStatus};
 
 use std::path::{Path, PathBuf};

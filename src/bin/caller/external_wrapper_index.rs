@@ -748,6 +748,32 @@ pub fn wrappers_for(
     records
 }
 
+/// Resolve an arbitrary wrapper session id — active OR superseded — to its
+/// backend conversation `(source, backend_session_id)`. Deliberately does
+/// NOT require the wrapper's log dir to still exist (unlike
+/// [`wrappers_for`]): a conversation outlives any one wrapper incarnation,
+/// and provenance recorded at park time (agenda items, diary lines) must
+/// keep resolving to the conversation after the parking wrapper's dir is
+/// pruned. Callers wanting the conversation's *live* row state re-resolve
+/// through [`wrappers_for`] with the returned pair.
+pub fn conversation_for_wrapper(home: &Path, wrapper_session_id: &str) -> Option<(String, String)> {
+    let wrapper_session_id = wrapper_session_id.trim();
+    if wrapper_session_id.is_empty() {
+        return None;
+    }
+    let _guard = INDEX_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    with_index_unlocked(home, |index| {
+        index
+            .wrappers
+            .iter()
+            .find(|record| record.intendant_session_id == wrapper_session_id)
+            .map(|record| (record.source.clone(), record.backend_session_id.clone()))
+    })
+}
+
 pub fn wrappers_for_source(home: &Path, source: &str) -> Vec<ExternalWrapperRecord> {
     let source = crate::session_names::normalize_source(source);
     if source.is_empty() {

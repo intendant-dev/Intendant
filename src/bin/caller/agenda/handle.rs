@@ -248,6 +248,7 @@ impl AgendaHandle {
                 id: item.id.clone(),
                 text,
                 structured: Some(resolution),
+                source: None,
             },
             None,
         )
@@ -362,6 +363,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    source: None,
                 },
                 Some(AgendaActor {
                     principal: Some("owner".into()),
@@ -386,7 +388,8 @@ mod tests {
         assert!(handle
             .apply(
                 AgendaCommand::Complete {
-                    id: "01UNKNOWN".into()
+                    id: "01UNKNOWN".into(),
+                    source: None,
                 },
                 None,
             )
@@ -419,6 +422,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    source: None,
                 },
                 actor("agent_session", Some("sess-a5")),
             )
@@ -432,6 +436,7 @@ mod tests {
                     goal: "run the cert sweep and report".into(),
                     fire_at_ms: 4_000_000_000_000,
                     orchestrate: false,
+                    source: None,
                 },
                 actor("agent_session", Some("sess-a5")),
             )
@@ -633,6 +638,7 @@ mod tests {
             .apply(
                 AgendaCommand::Reopen {
                     id: parked.id.clone(),
+                    source: None,
                 },
                 None,
             )
@@ -648,6 +654,7 @@ mod tests {
             .apply(
                 AgendaCommand::Complete {
                     id: parked.id.clone(),
+                    source: None,
                 },
                 None,
             )
@@ -761,6 +768,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    source: None,
                 },
                 None,
             )
@@ -772,6 +780,7 @@ mod tests {
                     goal: "summarize the week".into(),
                     fire_at_ms: 4_000_000_000_000,
                     orchestrate: false,
+                    source: None,
                 },
                 None,
             )
@@ -808,6 +817,7 @@ mod tests {
                     goal: "summarize the week AND email it".into(),
                     fire_at_ms: 4_000_000_000_000,
                     orchestrate: false,
+                    source: None,
                 },
                 None,
             )
