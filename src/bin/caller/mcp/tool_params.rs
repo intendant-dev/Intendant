@@ -159,26 +159,47 @@ pub struct AskUserPreviewParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AskUserParams {
-    /// The question to ask the user. Keep it self-contained — it renders on
-    /// the dashboard question rail without surrounding context.
+    /// The question to ask the user (single-question form). Keep it
+    /// self-contained — it renders on the dashboard question rail without
+    /// surrounding context. Leave empty when using `questions`.
+    #[serde(default)]
     pub question: String,
     /// Optional very short topic chip (e.g. "Auth method").
     #[serde(default)]
     pub header: Option<String>,
     /// Structured choices (0..=4). With zero options the rail shows a
-    /// free-text field only; free-text answers are always allowed on top.
+    /// free-text field only; free-text answers are always allowed on top
+    /// unless `free_text` is false.
     #[serde(default)]
     pub options: Vec<AskUserOptionParams>,
     /// Optional preview cards rendered above the options — show, then ask
     /// (prototype variants to pick between, before/after states to judge).
-    /// Each card carries exactly one of html / image / text. Caps: 4 cards,
-    /// 2 MB per html document, 4 MB per image (decoded), 4 KB per text
-    /// snippet, 8 MB total.
+    /// Each card carries exactly one of html / image / text. Caps: 4 cards
+    /// per question, 2 MB per html document, 4 MB per image (decoded),
+    /// 4 KB per text snippet, 8 MB total per ask.
     #[serde(default)]
     pub previews: Vec<AskUserPreviewParams>,
     /// Allow selecting multiple options (answers join with ", ").
+    /// Legacy sugar for `pick_min`/`pick_max`.
     #[serde(default)]
     pub multi_select: Option<bool>,
+    /// Minimum selections required to submit (0 = optional question).
+    /// Default 1: an answer is required (free text satisfies it).
+    #[serde(default)]
+    pub pick_min: Option<u8>,
+    /// Maximum selections allowed. Default 1, or unbounded under
+    /// `multi_select`.
+    #[serde(default)]
+    pub pick_max: Option<u8>,
+    /// Whether a typed free-text answer is accepted (default true).
+    #[serde(default)]
+    pub free_text: Option<bool>,
+    /// Multi-question form: up to 4 questions in one ask, each with its
+    /// own options, previews, and pick bounds — the user answers them on
+    /// one panel and every answer returns together. Mutually exclusive
+    /// with `question`.
+    #[serde(default)]
+    pub questions: Vec<AskUserQuestionParams>,
     /// How long to block waiting for the answer, in seconds
     /// (default 300, max 900). On timeout the call returns a structured
     /// timeout result telling the agent to proceed on its best judgment.
@@ -187,6 +208,33 @@ pub struct AskUserParams {
     /// Optional target session id. Omit to ask as the calling session.
     #[serde(default, alias = "sessionId")]
     pub session_id: Option<String>,
+}
+
+/// One question of the multi-question `ask_user` form. Same vocabulary as
+/// the flat form, minus call-level fields (wait, session).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AskUserQuestionParams {
+    /// The question text.
+    pub question: String,
+    /// Optional very short topic chip (e.g. "Lineage").
+    #[serde(default)]
+    pub header: Option<String>,
+    /// Structured choices (0..=4).
+    #[serde(default)]
+    pub options: Vec<AskUserOptionParams>,
+    /// Preview cards for THIS question (≤4; the 8 MB byte cap spans the
+    /// whole ask).
+    #[serde(default)]
+    pub previews: Vec<AskUserPreviewParams>,
+    /// Minimum selections required to submit (0 = optional question).
+    #[serde(default)]
+    pub pick_min: Option<u8>,
+    /// Maximum selections allowed (default 1 — radio semantics).
+    #[serde(default)]
+    pub pick_max: Option<u8>,
+    /// Whether a typed free-text answer is accepted (default true).
+    #[serde(default)]
+    pub free_text: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

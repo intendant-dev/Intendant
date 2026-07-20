@@ -27,6 +27,8 @@ use super::*;
 pub(crate) const ASK_USER_MAX_QUESTION_BYTES: usize = 2048;
 /// Maximum number of structured options per question.
 pub(crate) const ASK_USER_MAX_OPTIONS: usize = 4;
+/// Maximum questions per ask (multi-question form).
+pub(crate) const ASK_USER_MAX_QUESTIONS: usize = 4;
 /// Maximum option-label size (the label is also the returned answer value).
 pub(crate) const ASK_USER_MAX_OPTION_LABEL_BYTES: usize = 120;
 /// Default blocking wait for an answer.
@@ -213,17 +215,20 @@ pub(crate) enum DecodedPreviewSource {
 /// Decode and validate the preview cards of an `ask_user` call: exactly
 /// one source per card, the session-note MIME allowlist for images, and
 /// the per-kind plus total size caps.
+/// `total_bytes` is the per-ASK running preview budget: the multi-question
+/// form decodes each question's cards against one shared cap.
 pub(crate) fn decode_ask_previews(
     previews: &[AskUserPreviewParams],
+    total_bytes: &mut usize,
 ) -> Result<Vec<DecodedPreview>, String> {
     if previews.len() > ASK_USER_MAX_PREVIEWS {
         return Err(format!(
-            "too many previews: {} (max {ASK_USER_MAX_PREVIEWS})",
+            "too many previews: {} (max {ASK_USER_MAX_PREVIEWS} per question)",
             previews.len()
         ));
     }
     let mut decoded = Vec::with_capacity(previews.len());
-    let mut total_bytes = 0usize;
+    let total_bytes = &mut *total_bytes;
     for (index, preview) in previews.iter().enumerate() {
         let label = preview.label.trim();
         if label.is_empty() {
@@ -250,7 +255,7 @@ pub(crate) fn decode_ask_previews(
                     ASK_USER_MAX_HTML_BYTES / (1024 * 1024)
                 ));
             }
-            total_bytes = total_bytes.saturating_add(html.len());
+            *total_bytes = total_bytes.saturating_add(html.len());
             DecodedPreviewSource::Html(html.to_string())
         } else if let Some(image) = preview.image.as_deref() {
             let media_type = preview
@@ -270,7 +275,7 @@ pub(crate) fn decode_ask_previews(
                     super::tools_notes::SESSION_NOTE_MAX_IMAGE_BYTES / (1024 * 1024)
                 ));
             }
-            total_bytes = total_bytes.saturating_add(bytes.len());
+            *total_bytes = total_bytes.saturating_add(bytes.len());
             DecodedPreviewSource::Image { mime, bytes }
         } else {
             let text = preview.text.as_deref().unwrap_or_default().trim();
@@ -285,10 +290,10 @@ pub(crate) fn decode_ask_previews(
                     ASK_USER_MAX_TEXT_PREVIEW_BYTES / 1024
                 ));
             }
-            total_bytes = total_bytes.saturating_add(text.len());
+            *total_bytes = total_bytes.saturating_add(text.len());
             DecodedPreviewSource::Text(text.to_string())
         };
-        if total_bytes > ASK_USER_MAX_TOTAL_PREVIEW_BYTES {
+        if *total_bytes > ASK_USER_MAX_TOTAL_PREVIEW_BYTES {
             return Err(format!(
                 "total preview payload exceeds the {} MB per-ask cap",
                 ASK_USER_MAX_TOTAL_PREVIEW_BYTES / (1024 * 1024)
@@ -337,35 +342,55 @@ fn preview_raw_url(upload_id: &str) -> String {
 /// Validate `ask_user` parameters into the `UserQuestion` the rail renders.
 /// Returns the question (previews still empty), the decoded-but-uncommitted
 /// preview cards, and the effective wait.
-pub(crate) fn build_ask_user_question(
-    params: &AskUserParams,
-) -> Result<(crate::types::UserQuestion, Vec<DecodedPreview>, u64), String> {
-    let question = params.question.trim();
+/// One validated ask question paired with its decoded-but-uncommitted
+/// preview cards.
+pub(crate) type BuiltAskQuestion = (crate::types::UserQuestion, Vec<DecodedPreview>);
+
+/// Validate one question of an ask — flat or multi form — into the
+/// `UserQuestion` the rail renders plus its decoded-but-uncommitted preview
+/// cards. `at` prefixes error messages ("" for the flat form,
+/// "questions[N]: " for the multi form); `preview_budget` is the per-ask
+/// running byte total shared across questions.
+#[allow(clippy::too_many_arguments)]
+fn build_one_ask_question(
+    at: &str,
+    question_text: &str,
+    header: Option<&str>,
+    option_params: &[AskUserOptionParams],
+    preview_params: &[AskUserPreviewParams],
+    multi_select: bool,
+    pick_min: Option<u8>,
+    pick_max: Option<u8>,
+    free_text: Option<bool>,
+    preview_budget: &mut usize,
+) -> Result<BuiltAskQuestion, String> {
+    let question = question_text.trim();
     if question.is_empty() {
-        return Err("question must not be empty".to_string());
+        return Err(format!("{at}question must not be empty"));
     }
     if question.len() > ASK_USER_MAX_QUESTION_BYTES {
         return Err(format!(
-            "question is {} bytes; max {} KB",
+            "{at}question is {} bytes; max {} KB",
             question.len(),
             ASK_USER_MAX_QUESTION_BYTES / 1024
         ));
     }
-    if params.options.len() > ASK_USER_MAX_OPTIONS {
+    if option_params.len() > ASK_USER_MAX_OPTIONS {
         return Err(format!(
-            "too many options: {} (max {ASK_USER_MAX_OPTIONS}; zero options means free-text only)",
-            params.options.len()
+            "{at}too many options: {} (max {ASK_USER_MAX_OPTIONS}; zero options means free-text \
+             only)",
+            option_params.len()
         ));
     }
-    let mut options = Vec::with_capacity(params.options.len());
-    for (index, option) in params.options.iter().enumerate() {
+    let mut options = Vec::with_capacity(option_params.len());
+    for (index, option) in option_params.iter().enumerate() {
         let label = option.label.trim();
         if label.is_empty() {
-            return Err(format!("options[{index}]: label must not be empty"));
+            return Err(format!("{at}options[{index}]: label must not be empty"));
         }
         if label.len() > ASK_USER_MAX_OPTION_LABEL_BYTES {
             return Err(format!(
-                "options[{index}]: label is {} bytes; max {ASK_USER_MAX_OPTION_LABEL_BYTES} \
+                "{at}options[{index}]: label is {} bytes; max {ASK_USER_MAX_OPTION_LABEL_BYTES} \
                  (the label is the answer value — keep it short)",
                 label.len()
             ));
@@ -382,53 +407,159 @@ pub(crate) fn build_ask_user_question(
             description,
         });
     }
-    let header = params
-        .header
-        .as_deref()
+    // Pick-bound sanity: bounds describe selections of the offered
+    // options, so they need options to select; a question that forbids
+    // free text must leave something answerable.
+    if options.is_empty() {
+        if pick_max.is_some() {
+            return Err(format!("{at}pick_max needs options to pick from"));
+        }
+        if pick_min.is_some_and(|m| m > 1) {
+            return Err(format!("{at}pick_min above 1 needs options to pick from"));
+        }
+        if free_text == Some(false) {
+            return Err(format!(
+                "{at}free_text: false with no options leaves nothing to answer"
+            ));
+        }
+    } else {
+        let max = pick_max.unwrap_or(if multi_select { options.len() as u8 } else { 1 });
+        if max == 0 {
+            return Err(format!("{at}pick_max must be at least 1"));
+        }
+        if (max as usize) > options.len() {
+            return Err(format!(
+                "{at}pick_max {max} exceeds the {} offered options",
+                options.len()
+            ));
+        }
+        if pick_min.is_some_and(|min| min > max) {
+            return Err(format!(
+                "{at}pick_min {} exceeds pick_max {max}",
+                pick_min.unwrap_or_default()
+            ));
+        }
+    }
+    let header = header
         .map(str::trim)
         .filter(|h| !h.is_empty())
         .map(|h| crate::types::truncate_str(h, 64).to_string())
         .unwrap_or_default();
-    let wait_seconds = params
-        .wait_seconds
-        .unwrap_or(ASK_USER_DEFAULT_WAIT_SECS)
-        .clamp(1, ASK_USER_MAX_WAIT_SECS);
-    let previews = decode_ask_previews(&params.previews)?;
+    let previews =
+        decode_ask_previews(preview_params, preview_budget).map_err(|e| format!("{at}{e}"))?;
     Ok((
         crate::types::UserQuestion {
             question: question.to_string(),
             header,
             options,
-            multi_select: params.multi_select.unwrap_or(false),
+            multi_select,
+            pick_min,
+            pick_max,
+            free_text,
             previews: Vec::new(),
         },
         previews,
-        wait_seconds,
     ))
 }
 
+/// Validate `ask_user` parameters into the question list the rail renders:
+/// the flat single-question form or the `questions` multi form (up to
+/// [`ASK_USER_MAX_QUESTIONS`]), never both. Returns per-question
+/// (question, decoded-uncommitted previews) pairs and the effective wait.
+pub(crate) fn build_ask_user_questions(
+    params: &AskUserParams,
+) -> Result<(Vec<BuiltAskQuestion>, u64), String> {
+    let wait_seconds = params
+        .wait_seconds
+        .unwrap_or(ASK_USER_DEFAULT_WAIT_SECS)
+        .clamp(1, ASK_USER_MAX_WAIT_SECS);
+    let flat = !params.question.trim().is_empty();
+    if flat && !params.questions.is_empty() {
+        return Err("provide either question or questions, not both".to_string());
+    }
+    let mut preview_budget = 0usize;
+    if params.questions.is_empty() {
+        let built = build_one_ask_question(
+            "",
+            &params.question,
+            params.header.as_deref(),
+            &params.options,
+            &params.previews,
+            params.multi_select.unwrap_or(false),
+            params.pick_min,
+            params.pick_max,
+            params.free_text,
+            &mut preview_budget,
+        )?;
+        return Ok((vec![built], wait_seconds));
+    }
+    if params.questions.len() > ASK_USER_MAX_QUESTIONS {
+        return Err(format!(
+            "too many questions: {} (max {ASK_USER_MAX_QUESTIONS})",
+            params.questions.len()
+        ));
+    }
+    let mut built = Vec::with_capacity(params.questions.len());
+    for (index, q) in params.questions.iter().enumerate() {
+        let at = format!("questions[{index}]: ");
+        built.push(build_one_ask_question(
+            &at,
+            &q.question,
+            q.header.as_deref(),
+            &q.options,
+            &q.previews,
+            false,
+            q.pick_min,
+            q.pick_max,
+            q.free_text,
+            &mut preview_budget,
+        )?);
+    }
+    Ok((built, wait_seconds))
+}
+
 /// One `ask_user` outcome, shaped for both the returning tool result and
-/// the guidance-filled answers map agents read.
+/// the guidance-filled answers map agents read. The legacy top-level
+/// `question`/`answer` name the FIRST question; `questions` carries the
+/// per-question breakdown (answer + structured `selected` labels when the
+/// frontend reported them).
 fn ask_result(
     status: &str,
     id: u64,
     session_id: &str,
-    question: &str,
+    questions: &[crate::types::UserQuestion],
     answers: std::collections::HashMap<String, String>,
+    selections: Option<&std::collections::HashMap<String, Vec<String>>>,
     guidance: Option<&str>,
 ) -> serde_json::Value {
+    let first_question = questions.first().map(|q| q.question.as_str()).unwrap_or("");
     let answer = answers
-        .get(question)
+        .get(first_question)
         .cloned()
         .or_else(|| answers.values().next().cloned())
         .unwrap_or_default();
+    let per_question: Vec<serde_json::Value> = questions
+        .iter()
+        .map(|q| {
+            let mut entry = serde_json::json!({
+                "question": q.question,
+                "header": q.header,
+                "answer": answers.get(&q.question).cloned().unwrap_or_default(),
+            });
+            if let Some(selected) = selections.and_then(|s| s.get(&q.question)) {
+                entry["selected"] = serde_json::json!(selected);
+            }
+            entry
+        })
+        .collect();
     let mut result = serde_json::json!({
         "status": status,
         "id": id,
         "session_id": session_id,
-        "question": question,
+        "question": first_question,
         "answer": answer,
         "answers": answers,
+        "questions": per_question,
     });
     if let Some(guidance) = guidance {
         result["guidance"] = serde_json::Value::String(guidance.to_string());
@@ -442,7 +573,7 @@ fn guidance_answers(question: &str, guidance: &str) -> std::collections::HashMap
 
 impl IntendantServer {
     #[tool(
-        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total. Returns {status, answer, answers}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900; the dashboard shows the expiry as a live countdown, and the user may hold the question open — a held ask blocks past the wait until answered or dismissed. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
+        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total per ask. Or ask up to 4 questions on ONE panel via questions: [{question, header?, options?, pick_min?, pick_max?, free_text?, previews?}] — pick_min/pick_max bound how many options may be selected (minimum 0 = optional question; default exactly one), free_text: false disables typed answers, and every answer returns together. Returns {status, answer, answers, questions: [{question, header, answer, selected?}]}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900; the dashboard shows the expiry as a live countdown, and the user may hold the question open — a held ask blocks past the wait until answered or dismissed. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
     )]
     pub(crate) async fn ask_user(&self, Parameters(params): Parameters<AskUserParams>) -> String {
         match self.ask_user_inner(params).await {
@@ -457,8 +588,11 @@ impl IntendantServer {
         &self,
         params: AskUserParams,
     ) -> Result<serde_json::Value, String> {
-        let (mut question, decoded_previews, wait_seconds) = build_ask_user_question(&params)?;
-        let question_text = question.question.clone();
+        let (built, wait_seconds) = build_ask_user_questions(&params)?;
+        let question_text = built
+            .first()
+            .map(|(q, _)| q.question.clone())
+            .unwrap_or_default();
 
         // Same session resolution as post_session_note: the HTTP dispatch
         // injects the URL-bound session id (`with_default_mcp_session_id`),
@@ -508,12 +642,15 @@ impl IntendantServer {
                 content,
                 turn: None,
             });
+            let questions: Vec<crate::types::UserQuestion> =
+                built.into_iter().map(|(q, _)| q).collect();
             return Ok(ask_result(
                 "auto_answered",
                 id,
                 &session_id,
-                &question_text,
+                &questions,
                 guidance_answers(&question_text, NO_ANSWER_GUIDANCE),
+                None,
                 Some(NO_ANSWER_GUIDANCE),
             ));
         }
@@ -521,9 +658,14 @@ impl IntendantServer {
         // Commit blob previews into the calling session's upload store —
         // references only from here on (mirrors post_session_note): the
         // broadcast, the reconnect state-line cache, and the session log
-        // stay small, and browsers fetch the bytes lazily via /raw.
-        if !decoded_previews.is_empty() {
-            let scope = crate::global_store::StoreScope::resolve(project_root.as_deref());
+        // stay small, and browsers fetch the bytes lazily via /raw. A
+        // failure rolls back every blob committed for this ask — across
+        // all its questions — so a refused ask strands nothing.
+        let scope = crate::global_store::StoreScope::resolve(project_root.as_deref());
+        let mut questions: Vec<crate::types::UserQuestion> = Vec::with_capacity(built.len());
+        let mut committed_ids: Vec<String> = Vec::new();
+        let mut commit_error: Option<String> = None;
+        'questions: for (mut question, decoded_previews) in built {
             let mut committed: Vec<crate::types::QuestionPreview> = Vec::new();
             for preview in decoded_previews {
                 let source =
@@ -560,35 +702,37 @@ impl IntendantServer {
                         }),
                     };
                 match source {
-                    Ok(source) => committed.push(crate::types::QuestionPreview {
-                        label: preview.label,
-                        source,
-                    }),
-                    Err(message) => {
-                        // Roll back blobs committed earlier in this call so
-                        // a refused ask doesn't strand half its previews.
-                        for preview in &committed {
-                            let upload_id = match &preview.source {
-                                crate::types::QuestionPreviewSource::Html { upload_id, .. }
-                                | crate::types::QuestionPreviewSource::Image {
-                                    upload_id, ..
-                                } => upload_id,
-                                crate::types::QuestionPreviewSource::Text { .. } => continue,
-                            };
-                            let _ = crate::upload_store::delete_upload(upload_id, &log_dir, &scope);
+                    Ok(source) => {
+                        if let crate::types::QuestionPreviewSource::Html { upload_id, .. }
+                        | crate::types::QuestionPreviewSource::Image { upload_id, .. } = &source
+                        {
+                            committed_ids.push(upload_id.clone());
                         }
-                        return Err(message);
+                        committed.push(crate::types::QuestionPreview {
+                            label: preview.label,
+                            source,
+                        });
+                    }
+                    Err(message) => {
+                        commit_error = Some(message);
+                        break 'questions;
                     }
                 }
             }
             question.previews = committed;
+            questions.push(question);
+        }
+        if let Some(message) = commit_error {
+            for upload_id in &committed_ids {
+                let _ = crate::upload_store::delete_upload(upload_id, &log_dir, &scope);
+            }
+            return Err(message);
         }
 
         // Subscribe BEFORE announcing the question (same race as approvals:
         // an instant answer must find the waiter listening).
         let mut events = self.bus.subscribe();
         let mut guard = PendingAskGuard::register(id, Some(session_id.clone()), self.bus.clone());
-        let questions = vec![question];
         let mut ask_deadline = AskDeadline::new(
             tokio::time::Instant::now(),
             std::time::Duration::from_secs(wait_seconds),
@@ -619,8 +763,9 @@ impl IntendantServer {
                         "timeout",
                         id,
                         &session_id,
-                        &question_text,
+                        &questions,
                         guidance_answers(&question_text, &guidance),
+                        None,
                         Some(&guidance),
                     ));
                 }
@@ -631,8 +776,9 @@ impl IntendantServer {
                         "dismissed",
                         id,
                         &session_id,
-                        &question_text,
+                        &questions,
                         guidance_answers(&question_text, DISMISSED_GUIDANCE),
+                        None,
                         Some(DISMISSED_GUIDANCE),
                     ));
                 }
@@ -669,6 +815,7 @@ impl IntendantServer {
                 ControlMsg::AnswerQuestion {
                     id: answer_id,
                     answers,
+                    selections,
                     ..
                 } if answer_id == id => {
                     guard.resolve("answer");
@@ -676,8 +823,9 @@ impl IntendantServer {
                         "answered",
                         id,
                         &session_id,
-                        &question_text,
+                        &questions,
                         answers,
+                        Some(&selections),
                         None,
                     ));
                 }
@@ -695,8 +843,9 @@ impl IntendantServer {
                         "pass",
                         id,
                         &session_id,
-                        &question_text,
+                        &questions,
                         guidance_answers(&question_text, PASS_GUIDANCE),
+                        None,
                         Some(PASS_GUIDANCE),
                     ));
                 }
@@ -706,8 +855,9 @@ impl IntendantServer {
                         "dismissed",
                         id,
                         &session_id,
-                        &question_text,
+                        &questions,
                         guidance_answers(&question_text, DISMISSED_GUIDANCE),
+                        None,
                         Some(DISMISSED_GUIDANCE),
                     ));
                 }
@@ -717,8 +867,9 @@ impl IntendantServer {
                         "dismissed",
                         id,
                         &session_id,
-                        &question_text,
+                        &questions,
                         guidance_answers(&question_text, DISMISSED_GUIDANCE),
+                        None,
                         Some(DISMISSED_GUIDANCE),
                     ));
                 }
@@ -864,6 +1015,214 @@ mod tests {
         assert_eq!(d.wake_at(late), late);
     }
 
+    fn question_param(question: &str) -> crate::mcp::tool_params::AskUserQuestionParams {
+        crate::mcp::tool_params::AskUserQuestionParams {
+            question: question.to_string(),
+            header: None,
+            options: vec![],
+            previews: vec![],
+            pick_min: None,
+            pick_max: None,
+            free_text: None,
+        }
+    }
+
+    fn labeled_options(labels: &[&str]) -> Vec<AskUserOptionParams> {
+        labels
+            .iter()
+            .map(|l| AskUserOptionParams {
+                label: l.to_string(),
+                description: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn multi_question_form_builds_and_prefixes_errors() {
+        let mut params = ask_params("");
+        params.questions = vec![question_param("Which lineage?"), question_param("Headers?")];
+        params.questions[0].header = Some("Lineage".into());
+        params.questions[0].options = labeled_options(&["A", "B", "C"]);
+        params.questions[0].pick_min = Some(1);
+        params.questions[0].pick_max = Some(2);
+        params.questions[1].pick_min = Some(0);
+        let (built, _) = build_ask_user_questions(&params).unwrap();
+        assert_eq!(built.len(), 2);
+        assert_eq!(built[0].0.header, "Lineage");
+        assert_eq!(built[0].0.pick_bounds(), (1, 2));
+        // Optional second question (min 0, free text only).
+        assert_eq!(built[1].0.pick_bounds(), (0, 1));
+
+        // Errors carry the questions[N] prefix.
+        let mut params = ask_params("");
+        params.questions = vec![question_param("ok"), question_param("  ")];
+        let err = build_ask_user_questions(&params).unwrap_err();
+        assert!(err.starts_with("questions[1]: "), "{err}");
+    }
+
+    #[test]
+    fn multi_question_form_validates_shape() {
+        // Both forms at once refuse.
+        let mut params = ask_params("flat question");
+        params.questions = vec![question_param("also this")];
+        let err = build_ask_user_questions(&params).unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+
+        // Too many questions refuse.
+        let mut params = ask_params("");
+        params.questions = (0..ASK_USER_MAX_QUESTIONS + 1)
+            .map(|i| question_param(&format!("q{i}")))
+            .collect();
+        let err = build_ask_user_questions(&params).unwrap_err();
+        assert!(err.contains("too many questions"), "{err}");
+    }
+
+    #[test]
+    fn pick_bound_validation_refuses_impossible_schemas() {
+        // pick_max above the option count.
+        let mut params = ask_params("");
+        params.questions = vec![question_param("q")];
+        params.questions[0].options = labeled_options(&["A", "B"]);
+        params.questions[0].pick_max = Some(3);
+        let err = build_ask_user_questions(&params).unwrap_err();
+        assert!(err.contains("pick_max 3 exceeds"), "{err}");
+
+        // min above max.
+        let mut params = ask_params("");
+        params.questions = vec![question_param("q")];
+        params.questions[0].options = labeled_options(&["A", "B", "C"]);
+        params.questions[0].pick_min = Some(3);
+        params.questions[0].pick_max = Some(2);
+        let err = build_ask_user_questions(&params).unwrap_err();
+        assert!(err.contains("pick_min 3 exceeds pick_max 2"), "{err}");
+
+        // Bounds without options.
+        let mut params = ask_params("");
+        params.questions = vec![question_param("q")];
+        params.questions[0].pick_max = Some(2);
+        let err = build_ask_user_questions(&params).unwrap_err();
+        assert!(err.contains("needs options"), "{err}");
+
+        // free_text: false with nothing to pick.
+        let mut params = ask_params("");
+        params.questions = vec![question_param("q")];
+        params.questions[0].free_text = Some(false);
+        let err = build_ask_user_questions(&params).unwrap_err();
+        assert!(err.contains("leaves nothing to answer"), "{err}");
+    }
+
+    #[test]
+    fn user_question_pick_bounds_derivation() {
+        // Legacy default: exactly one.
+        let mut q = crate::types::UserQuestion {
+            question: "q".into(),
+            header: String::new(),
+            options: vec![],
+            multi_select: false,
+            pick_min: None,
+            pick_max: None,
+            free_text: None,
+            previews: Vec::new(),
+        };
+        assert_eq!(q.pick_bounds(), (1, 1));
+        assert!(q.free_text_allowed());
+        // Legacy multi_select: any number, at least one.
+        q.options = vec![
+            crate::types::UserQuestionOption {
+                label: "A".into(),
+                description: String::new(),
+            },
+            crate::types::UserQuestionOption {
+                label: "B".into(),
+                description: String::new(),
+            },
+            crate::types::UserQuestionOption {
+                label: "C".into(),
+                description: String::new(),
+            },
+        ];
+        q.multi_select = true;
+        assert_eq!(q.pick_bounds(), (1, 3));
+        // Explicit bounds win; clamped to the option count.
+        q.pick_min = Some(0);
+        q.pick_max = Some(9);
+        assert_eq!(q.pick_bounds(), (0, 3));
+        q.free_text = Some(false);
+        assert!(!q.free_text_allowed());
+    }
+
+    #[test]
+    fn preview_budget_spans_the_whole_ask() {
+        // Each html stays under the 2 MB per-document cap, but the 8 MB
+        // per-ASK budget crosses on the fifth card — in the SECOND
+        // question, proving the budget is shared, not per-question.
+        let big = "x".repeat(1_900_000);
+        let mut params = ask_params("");
+        let mut q1 = question_param("first");
+        q1.previews = vec![html_preview("p1", &big), html_preview("p2", &big)];
+        let mut q2 = question_param("second");
+        q2.previews = vec![
+            html_preview("p3", &big),
+            html_preview("p4", &big),
+            html_preview("p5", &big),
+        ];
+        params.questions = vec![q1, q2];
+        let err = build_ask_user_questions(&params).unwrap_err();
+        assert!(err.starts_with("questions[1]: "), "{err}");
+        assert!(err.contains("total preview payload"), "{err}");
+    }
+
+    #[test]
+    fn ask_result_carries_per_question_breakdown() {
+        let questions = vec![
+            crate::types::UserQuestion {
+                question: "Which lineage?".into(),
+                header: "Lineage".into(),
+                options: vec![],
+                multi_select: false,
+                pick_min: None,
+                pick_max: None,
+                free_text: None,
+                previews: Vec::new(),
+            },
+            crate::types::UserQuestion {
+                question: "Which headers?".into(),
+                header: "Headers".into(),
+                options: vec![],
+                multi_select: false,
+                pick_min: Some(0),
+                pick_max: None,
+                free_text: None,
+                previews: Vec::new(),
+            },
+        ];
+        let answers = std::collections::HashMap::from([
+            ("Which lineage?".to_string(), "B".to_string()),
+            ("Which headers?".to_string(), "icons, one-pill".to_string()),
+        ]);
+        let selections = std::collections::HashMap::from([(
+            "Which headers?".to_string(),
+            vec!["icons".to_string(), "one-pill".to_string()],
+        )]);
+        let result = ask_result(
+            "answered",
+            9,
+            "sess",
+            &questions,
+            answers,
+            Some(&selections),
+            None,
+        );
+        assert_eq!(result["question"], "Which lineage?");
+        assert_eq!(result["answer"], "B");
+        let per = result["questions"].as_array().unwrap();
+        assert_eq!(per.len(), 2);
+        assert_eq!(per[0]["header"], "Lineage");
+        assert_eq!(per[0]["answer"], "B");
+        assert!(per[0].get("selected").is_none());
+        assert_eq!(per[1]["selected"][1], "one-pill");
+    }
+
     fn test_server(session_id: &str, interactive: bool) -> (IntendantServer, EventBus) {
         let bus = EventBus::new();
         let mut state = McpAppState::new(
@@ -885,9 +1244,24 @@ mod tests {
             options: vec![],
             previews: vec![],
             multi_select: None,
+            pick_min: None,
+            pick_max: None,
+            free_text: None,
+            questions: vec![],
             wait_seconds: None,
             session_id: None,
         }
+    }
+
+    /// Flat-form shim over the multi-form builder for the legacy tests:
+    /// same tuple shape the old single-question builder returned.
+    fn build_flat(
+        params: &AskUserParams,
+    ) -> Result<(crate::types::UserQuestion, Vec<DecodedPreview>, u64), String> {
+        let (mut built, wait) = build_ask_user_questions(params)?;
+        assert_eq!(built.len(), 1, "flat form builds one question");
+        let (question, previews) = built.remove(0);
+        Ok((question, previews, wait))
     }
 
     fn preview_params(label: &str) -> AskUserPreviewParams {
@@ -944,7 +1318,7 @@ mod tests {
     #[test]
     fn build_ask_user_question_validates_and_normalizes() {
         // Empty question / too many options / empty label all refuse.
-        let err = build_ask_user_question(&ask_params("  ")).unwrap_err();
+        let err = build_flat(&ask_params("  ")).unwrap_err();
         assert!(err.contains("must not be empty"), "{err}");
 
         let mut params = ask_params("Pick one");
@@ -954,7 +1328,7 @@ mod tests {
                 description: None,
             })
             .collect();
-        let err = build_ask_user_question(&params).unwrap_err();
+        let err = build_flat(&params).unwrap_err();
         assert!(err.contains("too many options"), "{err}");
 
         let mut params = ask_params("Pick one");
@@ -962,7 +1336,7 @@ mod tests {
             label: "  ".into(),
             description: None,
         }];
-        let err = build_ask_user_question(&params).unwrap_err();
+        let err = build_flat(&params).unwrap_err();
         assert!(err.contains("label must not be empty"), "{err}");
 
         // Happy path: trims, defaults, clamps.
@@ -980,7 +1354,7 @@ mod tests {
         ];
         params.multi_select = Some(true);
         params.wait_seconds = Some(10_000);
-        let (question, previews, wait) = build_ask_user_question(&params).unwrap();
+        let (question, previews, wait) = build_flat(&params).unwrap();
         assert_eq!(question.question, "Deploy now?");
         assert_eq!(question.header, "Release");
         assert_eq!(question.options.len(), 2);
@@ -995,7 +1369,7 @@ mod tests {
 
         let mut params = ask_params("Quick?");
         params.wait_seconds = Some(0);
-        let (_, _, wait) = build_ask_user_question(&params).unwrap();
+        let (_, _, wait) = build_flat(&params).unwrap();
         assert_eq!(wait, 1);
     }
 
@@ -1005,57 +1379,71 @@ mod tests {
         let too_many: Vec<AskUserPreviewParams> = (0..ASK_USER_MAX_PREVIEWS + 1)
             .map(|i| text_preview(&format!("p{i}"), "snippet"))
             .collect();
-        let err = decode_ask_previews(&too_many).unwrap_err();
+        let err = decode_ask_previews(&too_many, &mut 0).unwrap_err();
         assert!(err.contains("too many previews"), "{err}");
 
         // Label required; exactly one source required.
-        let err = decode_ask_previews(&[text_preview("  ", "snippet")]).unwrap_err();
+        let err = decode_ask_previews(&[text_preview("  ", "snippet")], &mut 0).unwrap_err();
         assert!(err.contains("label must not be empty"), "{err}");
-        let err = decode_ask_previews(&[preview_params("A")]).unwrap_err();
+        let err = decode_ask_previews(&[preview_params("A")], &mut 0).unwrap_err();
         assert!(err.contains("exactly one of html, image, or text"), "{err}");
         let both = AskUserPreviewParams {
             text: Some("t".into()),
             ..html_preview("A", "<html></html>")
         };
-        let err = decode_ask_previews(&[both]).unwrap_err();
+        let err = decode_ask_previews(&[both], &mut 0).unwrap_err();
         assert!(err.contains("exactly one of html, image, or text"), "{err}");
 
         // Per-kind caps and validation.
-        let err = decode_ask_previews(&[html_preview("A", "   ")]).unwrap_err();
+        let err = decode_ask_previews(&[html_preview("A", "   ")], &mut 0).unwrap_err();
         assert!(err.contains("html must not be empty"), "{err}");
-        let err =
-            decode_ask_previews(&[html_preview("A", &"x".repeat(ASK_USER_MAX_HTML_BYTES + 1))])
-                .unwrap_err();
+        let err = decode_ask_previews(
+            &[html_preview("A", &"x".repeat(ASK_USER_MAX_HTML_BYTES + 1))],
+            &mut 0,
+        )
+        .unwrap_err();
         assert!(err.contains("max 2 MB"), "{err}");
-        let err = decode_ask_previews(&[image_preview("A", None, b"png")]).unwrap_err();
+        let err = decode_ask_previews(&[image_preview("A", None, b"png")], &mut 0).unwrap_err();
         assert!(err.contains("media_type is required"), "{err}");
-        let err = decode_ask_previews(&[image_preview("A", Some("image/svg+xml"), b"<svg/>")])
-            .unwrap_err();
+        let err = decode_ask_previews(
+            &[image_preview("A", Some("image/svg+xml"), b"<svg/>")],
+            &mut 0,
+        )
+        .unwrap_err();
         assert!(err.contains("unsupported media_type"), "{err}");
-        let err = decode_ask_previews(&[text_preview(
-            "A",
-            &"x".repeat(ASK_USER_MAX_TEXT_PREVIEW_BYTES + 1),
-        )])
+        let err = decode_ask_previews(
+            &[text_preview(
+                "A",
+                &"x".repeat(ASK_USER_MAX_TEXT_PREVIEW_BYTES + 1),
+            )],
+            &mut 0,
+        )
         .unwrap_err();
         assert!(err.contains("max 4 KB"), "{err}");
 
         // Total cap: individually legal cards that exceed the ask budget
         // together (2 × 4 MB images + one html crosses 8 MB).
         let big_image = vec![0u8; super::super::tools_notes::SESSION_NOTE_MAX_IMAGE_BYTES];
-        let err = decode_ask_previews(&[
-            image_preview("A", Some("image/png"), &big_image),
-            image_preview("B", Some("image/png"), &big_image),
-            html_preview("C", "<html><body>c</body></html>"),
-        ])
+        let err = decode_ask_previews(
+            &[
+                image_preview("A", Some("image/png"), &big_image),
+                image_preview("B", Some("image/png"), &big_image),
+                html_preview("C", "<html><body>c</body></html>"),
+            ],
+            &mut 0,
+        )
         .unwrap_err();
         assert!(err.contains("total preview payload"), "{err}");
 
         // Happy path: one of each kind; labels trim and truncate.
-        let decoded = decode_ask_previews(&[
-            html_preview("  A — dense layout  ", "<html><body>a</body></html>"),
-            image_preview("B", Some("image/jpg"), b"\xff\xd8jpeg"),
-            text_preview(&"L".repeat(200), "diff --git a b"),
-        ])
+        let decoded = decode_ask_previews(
+            &[
+                html_preview("  A — dense layout  ", "<html><body>a</body></html>"),
+                image_preview("B", Some("image/jpg"), b"\xff\xd8jpeg"),
+                text_preview(&"L".repeat(200), "diff --git a b"),
+            ],
+            &mut 0,
+        )
         .unwrap();
         assert_eq!(decoded.len(), 3);
         assert_eq!(decoded[0].label, "A — dense layout");
@@ -1099,6 +1487,9 @@ mod tests {
             header: String::new(),
             options: Vec::new(),
             multi_select: false,
+            pick_min: None,
+            pick_max: None,
+            free_text: None,
             previews: vec![
                 crate::types::QuestionPreview {
                     label: "A".into(),
@@ -1193,6 +1584,7 @@ mod tests {
                 "Which color?".to_string(),
                 "blue, or cerulean if available".to_string(),
             )]),
+            selections: Default::default(),
         }));
 
         let result = ask.await.expect("join").expect("ask_user result");
@@ -1319,6 +1711,7 @@ mod tests {
                 "Which prototype?".to_string(),
                 "A".to_string(),
             )]),
+            selections: Default::default(),
         }));
         let result = ask.await.expect("join").expect("ask_user result");
         assert_eq!(result["status"], "answered", "{result}");
@@ -1457,6 +1850,7 @@ mod tests {
             session_id: None,
             id: 1,
             answers: std::collections::HashMap::from([("Mine?".into(), "wrong".into())]),
+            selections: Default::default(),
         }));
         bus.send(AppEvent::ControlCommand(ControlMsg::Approve {
             session_id: None,
@@ -1467,6 +1861,7 @@ mod tests {
             session_id: Some("sess-other".into()),
             id,
             answers: std::collections::HashMap::from([("Mine?".into(), "yes".into())]),
+            selections: Default::default(),
         }));
         let result = ask.await.expect("join").expect("result");
         assert_eq!(result["status"], "answered");
@@ -1629,6 +2024,7 @@ mod tests {
             session_id: Some("url-sess".into()),
             id,
             answers: std::collections::HashMap::from([("Dispatch ok?".into(), "yes".into())]),
+            selections: Default::default(),
         }));
         let result = ask.await.expect("join").expect("dispatch result");
         assert_ne!(result.is_error, Some(true));

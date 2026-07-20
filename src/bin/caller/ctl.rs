@@ -1357,13 +1357,33 @@ async fn run_ask(client: &reqwest::Client, config: &Config, raw: &[String]) -> R
     if config.json {
         print_json(&outcome)?;
     } else {
-        // `answer` carries the user's choice(s) when answered, and the
-        // best-judgment guidance on pass/dismissed/auto_answered.
-        let answer = outcome
-            .get("answer")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        println!("{answer}");
+        let per_question = outcome
+            .get("questions")
+            .and_then(Value::as_array)
+            .filter(|qs| qs.len() > 1);
+        if let Some(questions) = per_question {
+            // Multi-question ask: one line per question, prefixed by its
+            // header (or the question text) so scripts and eyes both can
+            // attribute the answers.
+            for q in questions {
+                let name = q
+                    .get("header")
+                    .and_then(Value::as_str)
+                    .filter(|h| !h.is_empty())
+                    .or_else(|| q.get("question").and_then(Value::as_str))
+                    .unwrap_or_default();
+                let answer = q.get("answer").and_then(Value::as_str).unwrap_or_default();
+                println!("{name}: {answer}");
+            }
+        } else {
+            // `answer` carries the user's choice(s) when answered, and the
+            // best-judgment guidance on pass/dismissed/auto_answered.
+            let answer = outcome
+                .get("answer")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            println!("{answer}");
+        }
     }
     match outcome.get("status").and_then(Value::as_str) {
         Some("timeout") => Err("timed out waiting for an answer".to_string()),
@@ -1477,14 +1497,55 @@ fn ask_args(raw: &[String]) -> Result<Value, String> {
             "--header",
             "--wait",
             "--session",
+            "--schema",
+            "--pick",
             "--preview-html",
             "--preview-image",
             "--preview-text",
         ],
         &["--multi", "--free-text"],
     )?;
+    if let Some(schema) = args.one("--schema") {
+        // Full multi-question form from JSON — the single-question sugar
+        // flags would be ambiguous next to it, so they are refused.
+        if !args.positional.is_empty() {
+            return Err("--schema replaces the question text — provide one or the other".into());
+        }
+        for flag in ["--option", "--header", "--pick"] {
+            if args.all(flag).next().is_some() {
+                return Err(format!("{flag} cannot be combined with --schema"));
+            }
+        }
+        if args.has("--multi")
+            || args.all("--preview-html").next().is_some()
+            || args.all("--preview-image").next().is_some()
+            || args.all("--preview-text").next().is_some()
+        {
+            return Err(
+                "--multi/--preview-* cannot be combined with --schema (declare previews per \
+                 question inside the schema)"
+                    .into(),
+            );
+        }
+        let mut map = ask_schema_args(schema)?;
+        insert_string(&mut map, "session_id", args.one("--session"));
+        if let Some(wait) = args.one("--wait") {
+            let seconds: u64 = wait
+                .parse()
+                .map_err(|_| format!("--wait requires a number of seconds, got '{wait}'"))?;
+            if seconds == 0 || seconds > crate::mcp::ASK_USER_MAX_WAIT_SECS {
+                return Err(format!(
+                    "--wait must be 1..={} seconds (default {})",
+                    crate::mcp::ASK_USER_MAX_WAIT_SECS,
+                    crate::mcp::ASK_USER_DEFAULT_WAIT_SECS
+                ));
+            }
+            map.insert("wait_seconds".to_string(), Value::from(seconds));
+        }
+        return Ok(Value::Object(map));
+    }
     if args.positional.is_empty() {
-        return Err("ask requires question text".to_string());
+        return Err("ask requires question text (or --schema FILE)".to_string());
     }
     let question = args.positional.join(" ");
     let options: Vec<&str> = args.all("--option").collect();
@@ -1502,6 +1563,14 @@ fn ask_args(raw: &[String]) -> Result<Value, String> {
     map.insert("question".to_string(), Value::String(question));
     insert_string(&mut map, "header", args.one("--header"));
     insert_string(&mut map, "session_id", args.one("--session"));
+    if let Some(pick) = args.one("--pick") {
+        if args.has("--multi") {
+            return Err("--pick replaces --multi — provide one or the other".into());
+        }
+        let (min, max) = parse_pick_spec(pick)?;
+        map.insert("pick_min".to_string(), Value::from(min));
+        map.insert("pick_max".to_string(), Value::from(max));
+    }
     if args.has("--multi") {
         map.insert("multi_select".to_string(), Value::Bool(true));
     }
@@ -1544,6 +1613,143 @@ fn ask_args(raw: &[String]) -> Result<Value, String> {
         map.insert("previews".to_string(), Value::Array(previews));
     }
     Ok(Value::Object(map))
+}
+
+/// Parse `--pick MIN[-MAX]` (e.g. "1", "0-3", "2-2" — MIN alone means
+/// exactly MIN).
+fn parse_pick_spec(spec: &str) -> Result<(u8, u8), String> {
+    let (min_s, max_s) = match spec.split_once('-') {
+        Some((min, max)) => (min.trim(), max.trim()),
+        None => (spec.trim(), spec.trim()),
+    };
+    let parse = |s: &str| -> Result<u8, String> {
+        s.parse()
+            .map_err(|_| format!("--pick expects MIN[-MAX] numbers, got '{spec}'"))
+    };
+    let (min, max) = (parse(min_s)?, parse(max_s)?);
+    if max == 0 {
+        return Err("--pick MAX must be at least 1".into());
+    }
+    if min > max {
+        return Err(format!("--pick MIN {min} exceeds MAX {max}"));
+    }
+    Ok((min, max))
+}
+
+/// Read the `--schema` multi-question JSON (a file path, or `-` for
+/// stdin): `{"questions": [...], "wait_seconds"?}` or a bare array. Each
+/// question takes {question, header?, options?, pick?:{min,max} (or flat
+/// pick_min/pick_max), free_text?, previews?}. Per-question previews name
+/// FILES for html/image — read here, in the ctl process, under the
+/// caller's own privileges, exactly like the --preview-* flags — while
+/// text previews stay inline.
+fn ask_schema_args(path: &str) -> Result<Map<String, Value>, String> {
+    use base64::Engine as _;
+    let raw = if path == "-" {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("--schema: failed to read stdin: {e}"))?;
+        buf
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("--schema: failed to read {path}: {e}"))?
+    };
+    let parsed: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("--schema: invalid JSON: {e}"))?;
+    let (questions, wait) = match parsed {
+        Value::Array(questions) => (questions, None),
+        Value::Object(mut obj) => {
+            let questions = match obj.remove("questions") {
+                Some(Value::Array(questions)) => questions,
+                _ => return Err("--schema: expected a questions array".into()),
+            };
+            (
+                questions,
+                obj.remove("wait_seconds").or_else(|| obj.remove("wait")),
+            )
+        }
+        _ => return Err("--schema: expected an object with questions or a bare array".into()),
+    };
+    if questions.is_empty() {
+        return Err("--schema: questions must not be empty".into());
+    }
+    if questions.len() > crate::mcp::ASK_USER_MAX_QUESTIONS {
+        return Err(format!(
+            "--schema: too many questions: {} (max {})",
+            questions.len(),
+            crate::mcp::ASK_USER_MAX_QUESTIONS
+        ));
+    }
+    let mut out_questions = Vec::with_capacity(questions.len());
+    for (index, question) in questions.into_iter().enumerate() {
+        let Value::Object(mut question) = question else {
+            return Err(format!("--schema: questions[{index}] must be an object"));
+        };
+        // Nested {"pick": {"min","max"}} sugar next to the flat fields.
+        if let Some(Value::Object(pick)) = question.remove("pick") {
+            if let Some(min) = pick.get("min").cloned() {
+                question.insert("pick_min".into(), min);
+            }
+            if let Some(max) = pick.get("max").cloned() {
+                question.insert("pick_max".into(), max);
+            }
+        }
+        if let Some(previews) = question.remove("previews") {
+            let Value::Array(previews) = previews else {
+                return Err(format!(
+                    "--schema: questions[{index}].previews must be an array"
+                ));
+            };
+            let mut out_previews = Vec::with_capacity(previews.len());
+            for (preview_index, preview) in previews.into_iter().enumerate() {
+                let at = format!("--schema: questions[{index}].previews[{preview_index}]");
+                let Value::Object(preview) = preview else {
+                    return Err(format!("{at} must be an object"));
+                };
+                let label = preview
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if label.is_empty() {
+                    return Err(format!("{at}: label is required"));
+                }
+                let mut entry = Map::new();
+                entry.insert("label".into(), Value::String(label.to_string()));
+                if let Some(file) = preview.get("html").and_then(Value::as_str) {
+                    let html = std::fs::read_to_string(file)
+                        .map_err(|e| format!("{at}: failed to read {file}: {e}"))?;
+                    entry.insert("html".into(), Value::String(html));
+                } else if let Some(file) = preview.get("image").and_then(Value::as_str) {
+                    let mime = preview_image_mime(file).map_err(|e| format!("{at}: {e}"))?;
+                    let bytes = std::fs::read(file)
+                        .map_err(|e| format!("{at}: failed to read {file}: {e}"))?;
+                    entry.insert(
+                        "image".into(),
+                        Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+                    );
+                    entry.insert("media_type".into(), Value::String(mime.to_string()));
+                } else if let Some(text) = preview.get("text").and_then(Value::as_str) {
+                    entry.insert("text".into(), Value::String(text.to_string()));
+                } else {
+                    return Err(format!(
+                        "{at}: provide one of html (file), image (file), or text (inline)"
+                    ));
+                }
+                out_previews.push(Value::Object(entry));
+            }
+            question.insert("previews".into(), Value::Array(out_previews));
+        }
+        out_questions.push(Value::Object(question));
+    }
+    let mut map = Map::new();
+    map.insert("questions".into(), Value::Array(out_questions));
+    if let Some(wait) = wait {
+        map.insert("wait_seconds".into(), wait);
+    }
+    Ok(map)
 }
 
 /// `intendant ctl notify` — fire-and-forget notification to the user.
@@ -3341,10 +3547,18 @@ Examples:\n\
 
 fn help_ask() {
     println!(
-        "Usage: intendant ctl ask \"QUESTION\" [--option \"Label[:desc]\"]... [--multi] \\\n\
+        "Usage: intendant ctl ask \"QUESTION\" [--option \"Label[:desc]\"]... [--multi | --pick MIN[-MAX]] \\\n\
 \x20                          [--header TEXT] [--free-text] [--wait SECONDS] [--json] \\\n\
 \x20                          [--preview-html LABEL=FILE]... [--preview-image LABEL=FILE]... \\\n\
 \x20                          [--preview-text LABEL=TEXT]...\n\
+\x20      intendant ctl ask --schema FILE|- [--wait SECONDS] [--json]\n\
+\n\
+--pick constrains selections (\"1\" exactly one, \"0-3\" up to three; 0 minimum\n\
+makes the question optional). --schema takes the multi-question JSON form —\n\
+{{\"questions\":[{{question, header?, options?:[{{label,description?}}],\n\
+pick?:{{min,max}}, free_text?, previews?:[{{label, html|image: FILE | text}}]}}]}}\n\
+(up to 4 questions on one panel; every answer returns together, per-question\n\
+lines on stdout, full structure under --json).\n\
 \n\
 Raises the question on the dashboard question rail and BLOCKS until the user\n\
 answers, then prints the answer to stdout. A question requests input, never\n\
@@ -3506,6 +3720,85 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn pick_spec_parses_exact_and_range_forms() {
+        assert_eq!(parse_pick_spec("1").unwrap(), (1, 1));
+        assert_eq!(parse_pick_spec("0-3").unwrap(), (0, 3));
+        assert_eq!(parse_pick_spec("2-2").unwrap(), (2, 2));
+        assert!(parse_pick_spec("3-1").unwrap_err().contains("exceeds"));
+        assert!(parse_pick_spec("0").unwrap_err().contains("at least 1"));
+        assert!(parse_pick_spec("x").unwrap_err().contains("MIN[-MAX]"));
+    }
+
+    #[test]
+    fn ask_pick_flag_maps_to_bounds_and_refuses_multi() {
+        let arguments = ask_args(&args(&[
+            "Which?", "--option", "A", "--option", "B", "--option", "C", "--pick", "0-2",
+        ]))
+        .unwrap();
+        assert_eq!(arguments["pick_min"], 0);
+        assert_eq!(arguments["pick_max"], 2);
+        let err = ask_args(&args(&[
+            "Which?", "--option", "A", "--pick", "1", "--multi",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--pick replaces --multi"), "{err}");
+    }
+
+    #[test]
+    fn ask_schema_reads_questions_previews_and_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let proto = dir.path().join("proto.html");
+        std::fs::write(&proto, "<!doctype html><p>hi</p>").unwrap();
+        let schema = dir.path().join("ask.json");
+        std::fs::write(
+            &schema,
+            serde_json::json!({
+                "questions": [
+                    {
+                        "question": "Which lineage?",
+                        "header": "Lineage",
+                        "options": [{"label": "A"}, {"label": "B", "description": "lanes"}],
+                        "pick": {"min": 1, "max": 1},
+                        "previews": [{"label": "A", "html": proto.to_str().unwrap()}]
+                    },
+                    {"question": "Anything else?", "pick_min": 0}
+                ],
+                "wait_seconds": 240
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let arguments = ask_args(&args(&["--schema", schema.to_str().unwrap()])).unwrap();
+        assert_eq!(arguments["wait_seconds"], 240);
+        let questions = arguments["questions"].as_array().unwrap();
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0]["pick_min"], 1);
+        assert_eq!(questions[0]["pick_max"], 1);
+        assert_eq!(
+            questions[0]["previews"][0]["html"],
+            "<!doctype html><p>hi</p>"
+        );
+        assert_eq!(questions[1]["pick_min"], 0);
+
+        // Sugar flags conflict with --schema.
+        let err = ask_args(&args(&[
+            "--schema",
+            schema.to_str().unwrap(),
+            "--option",
+            "A",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("cannot be combined with --schema"), "{err}");
+        let err = ask_args(&args(&[
+            "question text",
+            "--schema",
+            schema.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("provide one or the other"), "{err}");
     }
 
     // Minted ids (session, request, workspace, …) ride ctl argv as flag

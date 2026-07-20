@@ -958,6 +958,9 @@ mod tests {
                     },
                 ],
                 multi_select: false,
+                pick_min: None,
+                pick_max: None,
+                free_text: None,
                 previews: Vec::new(),
             },
             crate::types::UserQuestion {
@@ -965,6 +968,9 @@ mod tests {
                 header: String::new(),
                 options: Vec::new(),
                 multi_select: false,
+                pick_min: None,
+                pick_max: None,
+                free_text: None,
                 previews: Vec::new(),
             },
         ];
@@ -984,6 +990,9 @@ mod tests {
                 header: String::new(),
                 options: Vec::new(),
                 multi_select: false,
+                pick_min: None,
+                pick_max: None,
+                free_text: None,
                 previews: Vec::new(),
             },
             crate::types::UserQuestion {
@@ -991,6 +1000,9 @@ mod tests {
                 header: String::new(),
                 options: Vec::new(),
                 multi_select: true,
+                pick_min: None,
+                pick_max: None,
+                free_text: None,
                 previews: Vec::new(),
             },
         ];

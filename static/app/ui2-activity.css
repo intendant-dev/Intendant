@@ -1620,6 +1620,22 @@ html.ui-v2 #question-panel .question-hold {
 }
 html.ui-v2 #question-panel .question-hold:hover { background: var(--surface-2); color: var(--text); }
 html.ui-v2 #question-panel .question-hold:disabled { opacity: .55; }
+html.ui-v2 #question-panel .question-pick-count {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+}
+html.ui-v2 #question-panel .question-pick-count.warn { color: var(--amber); }
+html.ui-v2 #question-panel .question-optional-chip {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  background: transparent;
+}
 html.ui-v2 #question-panel .question-header-chip {
   font-family: var(--mono);
   font-size: 9px;
