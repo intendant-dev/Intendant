@@ -498,6 +498,7 @@ pub fn hosted_control_msg_allowed(
         | ControlMsg::Skip { .. }
         | ControlMsg::ApproveAll { .. }
         | ControlMsg::AnswerQuestion { .. }
+        | ControlMsg::HoldQuestion { .. }
         | ControlMsg::Input { .. }
         | ControlMsg::SetAutonomy { .. }
         | ControlMsg::SetApprovalRule { .. }

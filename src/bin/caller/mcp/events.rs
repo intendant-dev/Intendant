@@ -652,6 +652,7 @@ pub fn spawn_event_listener(
                         ref session_id,
                         id,
                         ref questions,
+                        ..
                     } => {
                         s.set_phase(Phase::WaitingHuman);
                         s.note_session_phase(

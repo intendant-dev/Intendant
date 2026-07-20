@@ -138,6 +138,62 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Deadline bookkeeping for one blocked ask: a countdown the user can
+/// suspend (`hold_question`) and later resume with exactly the time that
+/// remained. Pure math over injected instants so the hold semantics are
+/// unit-testable without a waiter.
+pub(crate) struct AskDeadline {
+    /// Armed deadline while counting down; `None` while held.
+    deadline: Option<tokio::time::Instant>,
+    /// Time left, captured at the moment of the last hold; meaningful
+    /// (and kept current) only while held.
+    remaining: std::time::Duration,
+}
+
+impl AskDeadline {
+    pub(crate) fn new(now: tokio::time::Instant, wait: std::time::Duration) -> Self {
+        Self {
+            deadline: Some(now + wait),
+            remaining: wait,
+        }
+    }
+
+    pub(crate) fn held(&self) -> bool {
+        self.deadline.is_none()
+    }
+
+    /// Apply a hold flip. Returns `true` when the state actually changed
+    /// (the waiter re-announces the question only then).
+    pub(crate) fn set_held(&mut self, held: bool, now: tokio::time::Instant) -> bool {
+        match (held, self.deadline) {
+            (true, Some(deadline)) => {
+                self.remaining = deadline.saturating_duration_since(now);
+                self.deadline = None;
+                true
+            }
+            (false, None) => {
+                self.deadline = Some(now + self.remaining);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The instant the waiter's `timeout_at` should fire. While held there
+    /// is no deadline — park far enough out that it never fires (re-armed
+    /// every loop iteration anyway).
+    pub(crate) fn wake_at(&self, now: tokio::time::Instant) -> tokio::time::Instant {
+        self.deadline
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 86_400))
+    }
+
+    /// Wall-clock expiry for the wire (`expires_at_ms`); `None` while held.
+    pub(crate) fn expires_at_unix_ms(&self, now: tokio::time::Instant, now_ms: u64) -> Option<u64> {
+        self.deadline
+            .map(|d| now_ms + d.saturating_duration_since(now).as_millis() as u64)
+    }
+}
+
 /// One validated `ask_user` preview card, decoded but not yet committed —
 /// blob kinds still carry their bytes; `ask_user_inner` commits them into
 /// the calling session's upload store once the session is resolved.
@@ -386,7 +442,7 @@ fn guidance_answers(question: &str, guidance: &str) -> std::collections::HashMap
 
 impl IntendantServer {
     #[tool(
-        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total. Returns {status, answer, answers}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
+        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total. Returns {status, answer, answers}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900; the dashboard shows the expiry as a live countdown, and the user may hold the question open — a held ask blocks past the wait until answered or dismissed. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
     )]
     pub(crate) async fn ask_user(&self, Parameters(params): Parameters<AskUserParams>) -> String {
         match self.ask_user_inner(params).await {
@@ -532,17 +588,27 @@ impl IntendantServer {
         // an instant answer must find the waiter listening).
         let mut events = self.bus.subscribe();
         let mut guard = PendingAskGuard::register(id, Some(session_id.clone()), self.bus.clone());
+        let questions = vec![question];
+        let mut ask_deadline = AskDeadline::new(
+            tokio::time::Instant::now(),
+            std::time::Duration::from_secs(wait_seconds),
+        );
         self.bus.send(AppEvent::UserQuestionRequired {
             session_id: Some(session_id.clone()),
             id,
-            questions: vec![question],
+            questions: questions.clone(),
+            expires_at_ms: ask_deadline
+                .expires_at_unix_ms(tokio::time::Instant::now(), now_unix_ms()),
+            held: false,
         });
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_seconds);
         loop {
-            let event = match tokio::time::timeout_at(deadline, events.recv()).await {
+            let wake_at = ask_deadline.wake_at(tokio::time::Instant::now());
+            let event = match tokio::time::timeout_at(wake_at, events.recv()).await {
                 Err(_) => {
                     // Timed out: clear the rail and hand back guidance.
+                    // Unreachable while held — `wake_at` parks a year out
+                    // and is re-armed every iteration.
                     guard.resolve("timeout");
                     let guidance = format!(
                         "No answer arrived within {wait_seconds}s. Proceed using your best \
@@ -581,6 +647,25 @@ impl IntendantServer {
                 continue;
             };
             match msg {
+                // Hold flip: suspend or resume the countdown, then
+                // re-announce the question with the same id so every
+                // frontend (and the reconnect state-line cache) carries the
+                // current hold state. A same-state repeat is a no-op.
+                ControlMsg::HoldQuestion {
+                    id: verb_id, held, ..
+                } if verb_id == id => {
+                    let now = tokio::time::Instant::now();
+                    if ask_deadline.set_held(held, now) {
+                        self.bus.send(AppEvent::UserQuestionRequired {
+                            session_id: Some(session_id.clone()),
+                            id,
+                            questions: questions.clone(),
+                            expires_at_ms: ask_deadline.expires_at_unix_ms(now, now_unix_ms()),
+                            held: ask_deadline.held(),
+                        });
+                    }
+                    continue;
+                }
                 ControlMsg::AnswerQuestion {
                     id: answer_id,
                     answers,
@@ -728,6 +813,56 @@ impl IntendantServer {
 mod tests {
     use super::*;
     use crate::types::NotificationUrgency;
+
+    /// Hold suspends the deadline; resume re-arms it with exactly the time
+    /// that remained at the moment of the hold — however long the hold
+    /// lasted in wall time.
+    #[tokio::test]
+    async fn ask_deadline_hold_preserves_remaining() {
+        let t0 = tokio::time::Instant::now();
+        let wait = std::time::Duration::from_secs(300);
+        let mut d = AskDeadline::new(t0, wait);
+        assert!(!d.held());
+        assert_eq!(d.wake_at(t0), t0 + wait);
+        assert_eq!(
+            d.expires_at_unix_ms(t0, 1_000_000),
+            Some(1_000_000 + 300_000)
+        );
+
+        // Hold with 100s elapsed → 200s remain.
+        let t1 = t0 + std::time::Duration::from_secs(100);
+        assert!(d.set_held(true, t1));
+        assert!(d.held());
+        assert_eq!(d.expires_at_unix_ms(t1, 2_000_000), None);
+        // While held the wake instant is parked far out (≥ a day).
+        assert!(d.wake_at(t1) >= t1 + std::time::Duration::from_secs(86_400));
+        // Same-state repeat is a no-op (waiter must not re-announce).
+        assert!(!d.set_held(true, t1));
+
+        // Resume much later: countdown re-arms with the 200s that remained.
+        let t2 = t1 + std::time::Duration::from_secs(9_999);
+        assert!(d.set_held(false, t2));
+        assert!(!d.held());
+        assert_eq!(d.wake_at(t2), t2 + std::time::Duration::from_secs(200));
+        assert_eq!(
+            d.expires_at_unix_ms(t2, 3_000_000),
+            Some(3_000_000 + 200_000)
+        );
+        assert!(!d.set_held(false, t2));
+    }
+
+    /// Holding after the deadline already passed resumes with zero
+    /// remaining (saturating) — the next un-held wake fires immediately
+    /// instead of underflowing.
+    #[tokio::test]
+    async fn ask_deadline_hold_after_expiry_saturates() {
+        let t0 = tokio::time::Instant::now();
+        let mut d = AskDeadline::new(t0, std::time::Duration::from_secs(10));
+        let late = t0 + std::time::Duration::from_secs(60);
+        assert!(d.set_held(true, late));
+        assert!(d.set_held(false, late));
+        assert_eq!(d.wake_at(late), late);
+    }
 
     fn test_server(session_id: &str, interactive: bool) -> (IntendantServer, EventBus) {
         let bus = EventBus::new();
@@ -1024,14 +1159,22 @@ mod tests {
         }];
         let ask = tokio::spawn(async move { ask_server.ask_user_inner(params).await });
 
-        // The rail event announces the question with the armed id.
+        // The rail event announces the question with the armed id, a real
+        // wall-clock expiry, and no hold.
         let (id, questions) = match next_event(&mut rx, "UserQuestionRequired").await {
             AppEvent::UserQuestionRequired {
                 session_id,
                 id,
                 questions,
+                expires_at_ms,
+                held,
             } => {
                 assert_eq!(session_id.as_deref(), Some("sess-ask"));
+                assert!(
+                    expires_at_ms.is_some(),
+                    "ask_user always arms a daemon-side deadline"
+                );
+                assert!(!held);
                 (id, questions)
             }
             other => panic!("expected UserQuestionRequired, got {other:?}"),

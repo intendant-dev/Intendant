@@ -385,12 +385,22 @@ pub enum OutboundEvent {
     },
     /// The agent asks the human structured question(s) and blocks until
     /// answered via `{"action":"answer_question","id":…,"answers":{…}}`
-    /// (or dismissed via deny/skip on the same id).
+    /// (or dismissed via deny/skip on the same id). The user may suspend
+    /// the expiry via `{"action":"hold_question","id":…,"held":true}`;
+    /// hold flips re-emit this event with the same `id` (a refresh, not a
+    /// new question).
     UserQuestion {
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         id: u64,
         questions: Vec<UserQuestion>,
+        /// Unix-ms deadline of the asking waiter; absent when no
+        /// daemon-side deadline exists or while held.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_ms: Option<u64>,
+        /// The user held this question open (countdown suspended).
+        #[serde(default)]
+        held: bool,
     },
     AskHuman {
         question: String,
