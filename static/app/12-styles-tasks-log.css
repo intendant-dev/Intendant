@@ -702,6 +702,14 @@ body.context-focus-active {
   overflow-wrap: anywhere;
   white-space: normal;
 }
+.steer-elapsed {
+  grid-column: 2;
+  color: var(--overlay1);
+  font-size: 11px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+}
+.steer-elapsed:empty { display: none; }
 .steer-cancel {
   grid-column: 3;
   grid-row: 1 / span 2;
