@@ -314,10 +314,12 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         "agenda_list" => PeerOperation::AgendaRead,
         "agenda_op" => PeerOperation::AgendaWrite,
         // Memory: search/read are bounded retrieval; propose is the
-        // candidate-lane write class — the same operations the
-        // /api/memory rows carry.
+        // candidate-lane write class; judge is owner curation riding
+        // the same write class (the tenant edge denies ring-2 with
+        // the named outcome) — the same operations the /api/memory
+        // rows carry.
         "memory_search" | "memory_read" => PeerOperation::MemoryRead,
-        "memory_propose" => PeerOperation::MemoryWrite,
+        "memory_propose" | "memory_judge" => PeerOperation::MemoryWrite,
         _ => PeerOperation::RuntimeControl,
     }
 }
@@ -467,8 +469,16 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "memory_propose",
         manual_http_tool_definition!(
             "memory_propose",
-            "Propose one Memory claim (kind: observation|decision|episode|procedure|preference; statement; sensitivity: public|internal|private|sensitive, default private; optional project, labels). Proposals enter as CANDIDATES; this product slice exposes no judgment command. Your session id rides the claim's provenance, and the returned view reports the plane's effective durability (durable or ephemeral).",
+            "Propose one Memory claim (kind: observation|decision|episode|procedure|preference; statement; sensitivity: public|internal|private|sensitive, default private; optional project, labels). Proposals enter as CANDIDATES; judging them is the OWNER'S act (memory_judge is refused to agent callers) — if you disagree with an existing claim, propose a countering or corrected claim instead. Your session id rides the claim's provenance, and the returned view reports the plane's effective durability (durable or ephemeral).",
             crate::memory::ProposeArgs
+        ),
+    );
+    push(
+        "memory_judge",
+        manual_http_tool_definition!(
+            "memory_judge",
+            "Judge one Memory claim — OWNER curation (dashboard / owner-shell surfaces only; agent and peer callers are refused with actor-not-permitted, so never call this as an agent: propose a countering claim and let the owner judge). verdict: accept|dispute|retire|supersede; id: the target claim's hex id prefix (≥ 8 chars); optional reason (≤ 2000 chars, recorded verbatim in the sealed op); supersede additionally takes replacement (the superseding claim's id — supersession holds only while the replacement's derived status is accepted). Every judgment is an attributed append-only plane op; status is re-derived by the fold, never edited. Returns the target's refreshed view with its judgment history.",
+            crate::memory::JudgeArgs
         ),
     );
     push(

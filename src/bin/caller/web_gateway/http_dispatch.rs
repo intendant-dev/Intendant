@@ -1240,6 +1240,21 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::MemoryJudge => {
+                let actor = crate::access::actor::ActorBinding::from_principal(
+                    &http_access_context.principal,
+                    None,
+                );
+                return handle_memory_judge(
+                    stream,
+                    route_body,
+                    mcp_server,
+                    actor,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::AgendaBlobRaw => {
                 // The row's `{item_id}`/`{blob_id}` captures, in order.
                 let mut segments = route_captures.iter().map(|s| s.to_string());

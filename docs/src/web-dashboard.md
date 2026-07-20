@@ -1843,6 +1843,7 @@ response omits the header.
 | GET | `/api/memory/search` | MemoryRead | own origin | none | Bounded Memory claim search (q, limit, candidates); results carry derived status |
 | GET | `/api/memory/claim` | MemoryRead | own origin | none | Read one Memory claim by id prefix (id); status derived at read time |
 | POST | `/api/memory/propose` | MemoryWrite | own origin | bounded | Propose one Memory claim (candidate lane; response reports effective durability) |
+| POST | `/api/memory/judge` | MemoryWrite | own origin | bounded | Judge one Memory claim (owner curation: accept/dispute/retire/supersede + reason; ring-2 callers get the named actor-not-permitted denial) |
 | POST | `/api/session/current/redo` | SessionManage | own origin | bounded | Redo the last rolled-back round |
 | POST | `/api/session/current/prune` | SessionManage | own origin | bounded | Prune rollback state for the current session |
 | POST | `/api/session/current/agent-output` | SessionManage | own origin | bounded | Fetch the current session's persisted agent output by id (POST-shaped read) |

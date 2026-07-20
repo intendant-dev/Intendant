@@ -378,6 +378,7 @@ pub(crate) enum RouteHandlerId {
     MemoryClaim,
     /// Propose one Memory claim (the candidate lane).
     MemoryPropose,
+    MemoryJudge,
     /// The whole /api/peers registry + pairing sub-router, moved
     /// verbatim (its internal shapes stay as they were; leaf-shape
     /// declarations are a deliberate follow-up, not part of the
@@ -977,6 +978,16 @@ pub(crate) static ROUTES: &[Route] = &[
         "Propose one Memory claim (candidate lane; response reports effective durability)",
     )
     .with_tunnel(tunnel_method("api_memory_propose")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/memory/judge"),
+        PeerOperation::MemoryWrite,
+        BodyPolicy::Default,
+        RouteHandlerId::MemoryJudge,
+        "Judge one Memory claim (owner curation: accept/dispute/retire/supersede + reason; \
+         ring-2 callers get the named actor-not-permitted denial)",
+    )
+    .with_tunnel(tunnel_method("api_memory_judge")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/session/current/redo"),
