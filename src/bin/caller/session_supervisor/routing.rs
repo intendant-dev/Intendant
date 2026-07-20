@@ -1195,6 +1195,12 @@ impl SessionSupervisor {
         if crate::mcp::ask_user_question_pending(approval_id) {
             return;
         }
+        // An agenda-backed (parked) ask has no waiter at all: the daemon's
+        // ask resolver observes the same ControlCommand, records the
+        // answer/dismissal on the item, and emits ApprovalResolved.
+        if crate::agenda::agenda_ask_pending(approval_id) {
+            return;
+        }
         // A live-audio consent prompt is likewise armed by its own gate
         // waiter (crate::live_audio), which observes the same ControlCommand
         // on the bus, resolves, and emits ApprovalResolved — a native-path

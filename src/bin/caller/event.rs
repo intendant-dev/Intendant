@@ -39,6 +39,20 @@ pub(crate) fn next_approval_id() -> u64 {
     id
 }
 
+/// Raise the allocator's floor above `persisted`, so ids minted after this
+/// call sort strictly above it. Stores that persist approval-space ids
+/// across restarts (the agenda's parked asks) call this at fold time — a
+/// fresh process's counter restarts at the base and could otherwise
+/// re-mint a persisted rail id for an unrelated approval. Values at or
+/// beyond the JavaScript-safe ceiling are ignored (a tampered log must
+/// not brick the allocator).
+pub(crate) fn ensure_approval_id_floor(persisted: u64) {
+    if persisted >= MAX_SAFE_WIRE_ID {
+        return;
+    }
+    NEXT_APPROVAL_ID.fetch_max(persisted + 1, Ordering::Relaxed);
+}
+
 /// Source of a context injection item.
 ///
 /// Used by the agent loop to decide which queued injections to discard between
