@@ -30,7 +30,10 @@ use tokio::sync::mpsc;
 
 use crate::error::CallerError;
 
-pub(crate) use self::bridge::sync_managed_bridges_to_primary;
+pub(crate) use self::bridge::{
+    capture_kimi_credential_baseline, install_kimi_credential_if_unchanged,
+    sync_managed_bridges_to_primary, KimiCredentialBaseline, KimiCredentialInstall,
+};
 use self::bridge::{
     choose_mcp_server_name, prepare_bridge_home, sync_bridge_home_to_primary, BridgeMcpConfig,
     CredentialRefreshMonitor,

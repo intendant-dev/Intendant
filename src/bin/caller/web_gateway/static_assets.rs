@@ -1267,6 +1267,18 @@ mod tests {
     }
 
     #[test]
+    fn kimi_device_signin_copy_and_countdown_are_provider_aware() {
+        assert!(APP_HTML.contains("startLabel: 'Start Kimi sign-in'"));
+        assert!(APP_HTML.contains("openLabel: 'Open Kimi sign-in'"));
+        assert!(APP_HTML.contains("devicePageName: 'Kimi'"));
+        assert!(APP_HTML.contains("spec.devicePageName || spec.label"));
+        assert!(
+            APP_HTML.contains(".some(provider => agentSigninPhase(provider) === 'awaiting_user')")
+        );
+        assert!(APP_HTML.contains("paneIsVisible('vault')"));
+    }
+
+    #[test]
     fn app_html_override_rereads_per_request_and_revalidates() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.html");

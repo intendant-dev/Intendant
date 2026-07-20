@@ -12,7 +12,7 @@
 //!   The single global [`manager`] slot is the mechanism.
 //! - The private-PTY transport and its reaping (cancel, timeout, late
 //!   exits), with per-ceremony timeouts (each provider's flow carries
-//!   its own deadline — the device code's expiry for Codex).
+//!   its own deadline — the device code's expiry for Codex and Kimi).
 //! - Custody hygiene: ceremony I/O is never logged, PTY bytes stay in
 //!   bounded in-memory scan buffers, and every string that can reach a
 //!   log or error body passes [`redact_oauth_params`].
@@ -76,9 +76,9 @@ pub(crate) enum CeremonyPhase {
     AwaitingBrowser,
     /// Claude: the CLI's paste prompt was seen; ready for the code.
     AwaitingCode,
-    /// Codex: verification URL and one-time code are captured and
-    /// shown; waiting for the owner to complete the browser step (the
-    /// CLI polls its server on its own — nothing is typed back).
+    /// Codex/Kimi: verification URL and one-time code are captured and
+    /// shown; waiting for the owner to complete the browser step (the CLI
+    /// polls its server on its own — nothing is typed back).
     AwaitingUser,
     /// Waiting for the CLI's verdict (Claude: code written; Codex/Kimi:
     /// the CLI exited and the status probe is deciding).
@@ -144,7 +144,7 @@ struct CeremonyState {
     /// the status payload carries it whole — validation is the
     /// sanitization.
     url: Option<String>,
-    /// Codex: the one-time code the owner types into the provider's
+    /// Codex/Kimi: the one-time code the owner types into the provider's
     /// device page. User-facing by design — it appears in status
     /// payloads (the owner must read it) but never in daemon logs.
     user_code: Option<String>,
@@ -334,7 +334,7 @@ impl CeremonyManager {
         }
     }
 
-    /// Codex: both device-flow artifacts (validated verification URL +
+    /// Codex/Kimi: both device-flow artifacts (validated verification URL +
     /// one-time code) were captured — show them and wait for the owner.
     pub(crate) fn device_artifacts_captured(&self, id: u64, url: String, user_code: String) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -349,7 +349,7 @@ impl CeremonyManager {
         state.phase = CeremonyPhase::AwaitingUser;
     }
 
-    /// Codex: the CLI exited while the ceremony was still deciding; the
+    /// Codex/Kimi: the CLI exited while the ceremony was still deciding; the
     /// status probe delivers the verdict next ([`Self::child_exited`]).
     pub(crate) fn verification_started(&self, id: u64) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -361,7 +361,7 @@ impl CeremonyManager {
         }
     }
 
-    /// Codex: the status poll (or a probe) confirmed the login while the
+    /// Codex/Kimi: the status poll (or a probe) confirmed the login while the
     /// ceremony was live — success without waiting for the CLI to notice.
     /// The child is reaped (its work is durable: the credential store is
     /// already written, which is exactly what the probe proved).
@@ -389,9 +389,9 @@ impl CeremonyManager {
         Self::cleanup_runtime(inner);
     }
 
-    /// Claude: write the pasted authorization code to the CLI. Codex
-    /// ceremonies never enter a code-accepting phase, so the phase guard
-    /// refuses them naturally.
+    /// Claude: write the pasted authorization code to the CLI. Codex and
+    /// Kimi ceremonies never enter a code-accepting phase, so the phase
+    /// guard refuses them naturally.
     pub(crate) fn submit_code(&self, code: &str) -> Result<CeremonyPhase, CodeRefusal> {
         let code = code.trim();
         if code.is_empty() {
@@ -442,7 +442,7 @@ impl CeremonyManager {
     }
 
     /// Explicit cancel: Ctrl-C to the PTY, then kill. Verified
-    /// non-destructive against both real CLIs (credential stores
+    /// non-destructive against all three real CLIs (credential stores
     /// untouched).
     pub(crate) fn cancel(&self) -> Result<(), String> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());

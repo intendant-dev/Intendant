@@ -795,8 +795,8 @@ html.ui-v2 #agent-signin-section .agent-signin-code:focus-visible {
   outline: 2px solid var(--iris);
   outline-offset: 1px;
 }
-/* The Codex one-time code: BIG, mono, select-all — the owner reads or
-   copies it into OpenAI's page, so legibility is the whole point. */
+/* Device-flow one-time codes: BIG, mono, select-all — the owner reads or
+   copies one into the provider's page, so legibility is the whole point. */
 html.ui-v2 #agent-signin-section .agent-signin-device-row {
   align-items: center;
   gap: 12px;

@@ -462,6 +462,23 @@ device code's own expiry. V1 is the ChatGPT subscription lane only (the
 `--with-api-key` / `--with-access-token` stdin lanes are a different
 custody class and stay follow-ups).
 
+**Kimi Code** (`kimi_auth_ceremony.rs`, `kimi login`) uses the same
+owner-facing device pattern as Codex. The dashboard shows the CLI's
+validated verification URL and one-time code, the owner enters that code on
+Kimi's page, and the official CLI performs the exchange and writes its native
+credential store. The validator accepts both Kimi Code 0.28's exact
+`https://www.kimi.com/code/authorize_device` path (plus the equivalent apex
+host) and the older `auth.kimi.com` flow; unrelated paths and lookalike hosts
+fail closed. Success is confirmed from the native Kimi credential store
+without exposing its token material to the dashboard. The ceremony has the
+same 15-minute device-flow ceiling as Codex. Because `kimi login` otherwise
+returns immediately when an account is already active, Intendant runs the
+ceremony in a daemon-private empty Kimi home. The existing credential stays
+live until the new device flow succeeds; then a private atomic
+compare-and-swap installs it only if no concurrent login, logout, or refresh
+changed the primary. Cancel, failure, and timeout delete the isolated home and
+leave the previous account untouched.
+
 Ten `credentials.manage`-gated routes carry the three ceremonies
 (`/api/claude-auth/{start,status,code,cancel}` +
 `/api/codex-auth/{start,status,cancel}` — the device flow deliberately
@@ -482,7 +499,7 @@ with per-session **Reload credentials** chips: a graceful in-place
 respawn, resume-attached to the same backend session (Codex via its
 thread-resume machinery), that re-reads the fresh store (a mid-turn
 session is interrupted first; a rate-limit park is cancelled with its
-pending re-send preserved). Both ceremonies are local-daemon only.
+pending re-send preserved). All three ceremonies are local-daemon only.
 
 ## Egress: whose network path
 

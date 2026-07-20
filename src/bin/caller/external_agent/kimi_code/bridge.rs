@@ -40,6 +40,19 @@ enum CredentialRefreshSync {
     SourceChanged,
 }
 
+/// Snapshot used to install a credential produced by an isolated Kimi login
+/// ceremony without overwriting a concurrent login, logout, or refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KimiCredentialBaseline {
+    digest: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KimiCredentialInstall {
+    Installed,
+    SourceChanged,
+}
+
 /// Compare-and-swap state for one refreshable credential mirrored by copy.
 ///
 /// A normal Unix bridge symlinks `credentials/` and needs no monitor. Windows
@@ -339,6 +352,125 @@ fn read_regular_credential(path: &Path, label: &str) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+fn optional_credential_digest(home: &Path, label: &str) -> io::Result<Option<[u8; 32]>> {
+    let path = home.join(KIMI_CREDENTIAL_PATH);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("Kimi credential has no parent"))?;
+    require_real_directory(parent, label)?;
+    let mut bytes = read_regular_credential(&path, label)?;
+    let digest = credential_digest(&bytes);
+    bytes.fill(0);
+    Ok(Some(digest))
+}
+
+/// Capture the primary credential state before an isolated sign-in starts.
+///
+/// The caller holds only the digest/absence fact, never a second long-lived
+/// copy of the credential bytes.
+pub(crate) fn capture_kimi_credential_baseline(
+    primary_home: &Path,
+) -> io::Result<KimiCredentialBaseline> {
+    fs::create_dir_all(primary_home)?;
+    require_real_directory(primary_home, "Kimi primary home")?;
+    set_private_dir_permissions(primary_home)?;
+    Ok(KimiCredentialBaseline {
+        digest: optional_credential_digest(primary_home, "Kimi primary credential directory")?,
+    })
+}
+
+/// Promote a credential produced in an isolated home only when the primary
+/// still matches the state captured before login began.
+///
+/// Existing credentials use the bridge's private atomic replacement path. A
+/// first login publishes with a same-directory hard link from a fully written,
+/// fsynced staging file, which is atomic and refuses to clobber a credential
+/// created concurrently.
+pub(crate) fn install_kimi_credential_if_unchanged(
+    primary_home: &Path,
+    candidate_home: &Path,
+    baseline: KimiCredentialBaseline,
+) -> io::Result<KimiCredentialInstall> {
+    require_real_directory(primary_home, "Kimi primary home")?;
+    require_real_directory(candidate_home, "Kimi ceremony home")?;
+    let candidate_path = candidate_home.join(KIMI_CREDENTIAL_PATH);
+    let candidate_parent = candidate_path
+        .parent()
+        .ok_or_else(|| io::Error::other("Kimi ceremony credential has no parent"))?;
+    require_real_directory(candidate_parent, "Kimi ceremony credential directory")?;
+    let mut candidate = read_regular_credential(&candidate_path, "Kimi ceremony credential")?;
+    let candidate_digest = credential_digest(&candidate);
+
+    let result = (|| {
+        let _lock = BridgeSyncLock::acquire(primary_home)?;
+        if optional_credential_digest(primary_home, "Kimi primary credential directory")?
+            != baseline.digest
+        {
+            return Ok(KimiCredentialInstall::SourceChanged);
+        }
+
+        let primary_path = primary_home.join(KIMI_CREDENTIAL_PATH);
+        let primary_parent = primary_path
+            .parent()
+            .ok_or_else(|| io::Error::other("Kimi primary credential has no parent"))?;
+        match fs::symlink_metadata(primary_parent) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(primary_parent)?;
+            }
+            Err(error) => return Err(error),
+        }
+        require_real_directory(primary_parent, "Kimi primary credential directory")?;
+        set_private_dir_permissions(primary_parent)?;
+
+        if baseline.digest.is_some() {
+            replace_private_credential(&primary_path, &candidate)?;
+        } else {
+            let (mut file, staged) = crate::file_watcher::stage_in(primary_parent)?;
+            let staged_write = file
+                .write_all(&candidate)
+                .and_then(|()| file.sync_all())
+                .and_then(|()| set_private_file_permissions(&staged));
+            drop(file);
+            if let Err(error) = staged_write {
+                let _ = fs::remove_file(&staged);
+                return Err(error);
+            }
+            match fs::hard_link(&staged, &primary_path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&staged);
+                    set_private_file_permissions(&primary_path)?;
+                    sync_parent_directory(primary_parent)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let _ = fs::remove_file(&staged);
+                    return Ok(KimiCredentialInstall::SourceChanged);
+                }
+                Err(error) => {
+                    let _ = fs::remove_file(&staged);
+                    return Err(error);
+                }
+            }
+        }
+
+        if optional_credential_digest(primary_home, "installed Kimi credential directory")?
+            != Some(candidate_digest)
+        {
+            return Err(io::Error::other(
+                "Kimi sign-in credential failed post-write verification",
+            ));
+        }
+        Ok(KimiCredentialInstall::Installed)
+    })();
+    candidate.fill(0);
+    result
 }
 
 fn credential_digest(bytes: &[u8]) -> [u8; 32] {
@@ -2154,6 +2286,85 @@ mod tests {
         fs::write(primary.join(KIMI_CREDENTIAL_PATH), b"synthetic-initial").unwrap();
         fs::write(bridge.join(KIMI_CREDENTIAL_PATH), b"synthetic-initial").unwrap();
         (primary, bridge)
+    }
+
+    fn ceremony_candidate(temp: &tempfile::TempDir, content: &[u8]) -> PathBuf {
+        let candidate = temp.path().join("ceremony");
+        fs::create_dir_all(candidate.join("credentials")).unwrap();
+        fs::write(candidate.join(KIMI_CREDENTIAL_PATH), content).unwrap();
+        candidate
+    }
+
+    #[test]
+    fn isolated_login_installs_first_credential_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("kimi");
+        let baseline = capture_kimi_credential_baseline(&primary).unwrap();
+        let candidate = ceremony_candidate(&temp, b"synthetic-first-login");
+
+        assert_eq!(
+            install_kimi_credential_if_unchanged(&primary, &candidate, baseline).unwrap(),
+            KimiCredentialInstall::Installed
+        );
+        assert_eq!(
+            fs::read(primary.join(KIMI_CREDENTIAL_PATH)).unwrap(),
+            b"synthetic-first-login"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(primary.join(KIMI_CREDENTIAL_PATH))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_relogin_replaces_only_the_captured_credential() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("kimi");
+        fs::create_dir_all(primary.join("credentials")).unwrap();
+        fs::write(primary.join(KIMI_CREDENTIAL_PATH), b"synthetic-old-login").unwrap();
+        let baseline = capture_kimi_credential_baseline(&primary).unwrap();
+        let candidate = ceremony_candidate(&temp, b"synthetic-new-login");
+
+        assert_eq!(
+            install_kimi_credential_if_unchanged(&primary, &candidate, baseline).unwrap(),
+            KimiCredentialInstall::Installed
+        );
+        assert_eq!(
+            fs::read(primary.join(KIMI_CREDENTIAL_PATH)).unwrap(),
+            b"synthetic-new-login"
+        );
+    }
+
+    #[test]
+    fn isolated_relogin_preserves_a_concurrent_credential_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("kimi");
+        fs::create_dir_all(primary.join("credentials")).unwrap();
+        fs::write(primary.join(KIMI_CREDENTIAL_PATH), b"synthetic-old-login").unwrap();
+        let baseline = capture_kimi_credential_baseline(&primary).unwrap();
+        let candidate = ceremony_candidate(&temp, b"synthetic-new-login");
+        fs::write(
+            primary.join(KIMI_CREDENTIAL_PATH),
+            b"synthetic-concurrent-login",
+        )
+        .unwrap();
+
+        assert_eq!(
+            install_kimi_credential_if_unchanged(&primary, &candidate, baseline).unwrap(),
+            KimiCredentialInstall::SourceChanged
+        );
+        assert_eq!(
+            fs::read(primary.join(KIMI_CREDENTIAL_PATH)).unwrap(),
+            b"synthetic-concurrent-login"
+        );
     }
 
     #[test]

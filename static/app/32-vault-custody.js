@@ -1567,11 +1567,11 @@ function renderAccessCustodySection() {
    /api/kimi-auth/*):
    the daemon runs each CLI's own login ceremony on a private PTY; a
    card walks the owner through it. Claude: open the sign-in URL in
-   THIS browser, paste the code Anthropic shows back here. Codex: open
-   the verification URL, type the one-time code the card shows into
-   OpenAI's page — nothing comes back to the daemon. Token exchanges
+   THIS browser, paste the code Anthropic shows back here. Codex/Kimi:
+   open the verification URL and type the one-time code the card shows
+   into the provider's page — nothing comes back to the daemon. Token exchanges
    stay inside the CLIs on the daemon; this page only ever sees the
-   sign-in URL (and, for Codex, the one-time code the owner must read).
+   sign-in URL (and, for Codex/Kimi, the one-time code the owner must read).
    Custody-gated on the daemon (credentials.manage + hosted-provenance
    + lease/egress tier refusals) — the cards render whatever refusal
    the daemon states. One credential ceremony runs at a time across
@@ -1618,6 +1618,7 @@ const AGENT_SIGNIN_PROVIDERS = {
     startLabel: 'Start Codex sign-in',
     openLabel: 'Open OpenAI sign-in',
     checkNote: 'Check that your browser shows auth.openai.com before signing in.',
+    devicePageName: 'OpenAI',
     unsupportedNote:
       'This daemon predates the Codex sign-in ceremony — upgrade it to sign in from here.',
     backendMatch: backend => backend.includes('codex'),
@@ -1648,7 +1649,9 @@ const AGENT_SIGNIN_PROVIDERS = {
       'this machine uses it. Running sessions keep the old account until reloaded.',
     startLabel: 'Start Kimi sign-in',
     openLabel: 'Open Kimi sign-in',
-    checkNote: 'Check that your browser shows auth.kimi.com before signing in.',
+    checkNote:
+      'Check that your browser shows kimi.com (current CLI) or auth.kimi.com (older CLI) before signing in.',
+    devicePageName: 'Kimi',
     unsupportedNote:
       'This daemon predates the Kimi sign-in ceremony — upgrade it to sign in from here.',
     backendMatch: backend => backend.includes('kimi'),
@@ -1755,7 +1758,7 @@ function agentSigninEnsurePoll(provider) {
   }
 }
 
-/* 1s countdown ticker for the codex one-time code's expiry: updates the
+/* 1s countdown ticker for device-flow one-time-code expiry: updates the
    countdown text in place (never a full re-render per tick). */
 let agentSigninTickTimer = null;
 function agentSigninCountdownText(deadlineMs) {
@@ -1772,19 +1775,17 @@ function agentSigninRenderCountdowns() {
   }
 }
 function agentSigninEnsureTicker() {
-  const needsTick = agentSigninPhase('codex') === 'awaiting_user';
+  const needsTick = Object.keys(AGENT_SIGNIN_PROVIDERS)
+    .some(provider => agentSigninPhase(provider) === 'awaiting_user');
   if (needsTick && !agentSigninTickTimer) {
     agentSigninTickTimer = window.setInterval(() => {
-      // Pane gate: the countdown lives in the Access pane
-      // (#agent-signin-section), so with that tab parked (or the page
-      // backgrounded) the per-second textContent write hit a display:none
-      // subtree — and still ran style invalidation. While parked, defer
-      // ONE repaint; flushPaneRenders runs it on pane re-entry, so the
-      // countdown is correct the instant the pane shows.
-      if (!paneIsVisible('access')) {
-        renderOrDefer('access', 'agent-signin-countdown', agentSigninRenderCountdowns);
-        return;
-      }
+      // ui-v2 reparents #agent-signin-section into Vault; the legacy
+      // location is Access → Advanced. Avoid writes while both are hidden.
+      const watching =
+        typeof paneIsVisible !== 'function' ||
+        paneIsVisible('vault') ||
+        paneIsVisible('access');
+      if (!watching) return;
       agentSigninRenderCountdowns();
     }, 1000);
   } else if (!needsTick && agentSigninTickTimer) {
@@ -2131,13 +2132,14 @@ function agentSigninProviderCard(provider) {
     card.appendChild(stepOne);
 
     if (phase === 'awaiting_user') {
-      // Codex device step: the owner reads the one-time code off this
-      // card and types it into OpenAI's page.
+      // Device-flow step (Codex/Kimi): the owner reads the one-time code
+      // off this card and types it into the provider's page.
       const stepTwo = document.createElement('div');
       stepTwo.className = 'agent-signin-step';
       const stepTwoLabel = document.createElement('div');
       stepTwoLabel.className = 'vault-note';
-      stepTwoLabel.textContent = '2. Enter this one-time code on the OpenAI page';
+      stepTwoLabel.textContent =
+        `2. Enter this one-time code on the ${spec.devicePageName || spec.label} page`;
       stepTwo.appendChild(stepTwoLabel);
       const userCode = String(status?.user_code || '');
       if (userCode) {

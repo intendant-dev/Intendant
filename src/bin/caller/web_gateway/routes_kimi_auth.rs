@@ -2,7 +2,8 @@
 //!
 //! These mirror the Codex device-flow routes: the dashboard receives only a
 //! validated verification URL, a short user code, and state transitions.
-//! The official Kimi CLI owns the token exchange and credential file.
+//! The official Kimi CLI owns the token exchange in an isolated private home;
+//! Intendant promotes the resulting credential atomically only after success.
 
 use super::*;
 use crate::auth_ceremony::{self, Provider, StartRefusal};

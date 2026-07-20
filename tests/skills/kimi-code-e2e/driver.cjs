@@ -56,6 +56,7 @@ const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-intendant-e2e-"));
 const WORKDIR_ARG = argValue("--workdir", "");
 const WORKDIR = path.resolve(WORKDIR_ARG || path.join(ROOT, "project"));
 const STATE_HOME = path.join(ROOT, "intendant-state");
+const VAULT_STATE_HOME = path.join(ROOT, "vault-intendant-state");
 const KIMI_HOME = path.join(ROOT, "kimi-home");
 const KEEP = args.includes("--keep");
 const QUICK = args.includes("--quick");
@@ -494,6 +495,28 @@ async function freePort() {
   });
 }
 
+function intendantEnv(stateHome) {
+  const env = {
+    ...process.env,
+    INTENDANT_HOME: stateHome,
+    KIMI_CODE_HOME: KIMI_HOME,
+    NO_COLOR: "1",
+  };
+  for (const key of [
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "MODEL_NAME",
+    "PRESENCE_PROVIDER",
+    "PRESENCE_MODEL",
+    "CU_PROVIDER",
+    "CU_MODEL",
+  ]) {
+    delete env[key];
+  }
+  return env;
+}
+
 class IntendantRun {
   constructor(port) {
     this.events = [];
@@ -520,29 +543,10 @@ class IntendantRun {
         '(description "Alternate acceptance lane"). After the answer, reply ' +
         "with exactly QUESTION_ANSWER=<chosen label> and do nothing else.",
     ];
-    const env = {
-      ...process.env,
-      INTENDANT_HOME: STATE_HOME,
-      KIMI_CODE_HOME: KIMI_HOME,
-      NO_COLOR: "1",
-    };
-    for (const key of [
-      "OPENAI_API_KEY",
-      "ANTHROPIC_API_KEY",
-      "GEMINI_API_KEY",
-      "MODEL_NAME",
-      "PRESENCE_PROVIDER",
-      "PRESENCE_MODEL",
-      "CU_PROVIDER",
-      "CU_MODEL",
-    ]) {
-      delete env[key];
-    }
-
     log("spawn", `${BINARY} ${cliArgs.map(shellDisplay).join(" ")}`);
     this.child = spawn(BINARY, cliArgs, {
       cwd: WORKDIR,
-      env,
+      env: intendantEnv(STATE_HOME),
       stdio: ["ignore", "pipe", "pipe"],
     });
     this.socketPath = `/tmp/intendant-${this.child.pid}.sock`;
@@ -1142,6 +1146,148 @@ function setupProject() {
   );
 }
 
+async function exerciseVaultSigninCeremony(port, stateHome) {
+  const credential = path.join(KIMI_HOME, "credentials", "kimi-code.json");
+  const before = fs.readFileSync(credential);
+  let ceremonyActive = false;
+  let cancelled = false;
+  try {
+    const started = await httpJson(port, "/api/kimi-auth/start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "kimi-code" }),
+    });
+    ceremonyActive = started?.ok === true;
+    check(
+      "vault-kimi-auth-starts-isolated-device-flow",
+      ceremonyActive && started?.status?.provider === "kimi",
+    );
+
+    const status = await pollJson(
+      port,
+      "/api/kimi-auth/status",
+      (body) =>
+        body?.phase === "awaiting_user" ||
+        body?.phase === "failed" ||
+        body?.phase === "timed_out",
+      45_000,
+      (body) => JSON.stringify({ phase: body?.phase, error: body?.error }),
+    );
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(String(status.url || ""));
+    } catch {
+      parsedUrl = null;
+    }
+    const currentUrl =
+      parsedUrl?.protocol === "https:" &&
+      ["kimi.com", "www.kimi.com"].includes(parsedUrl.hostname) &&
+      parsedUrl.pathname.replace(/\/+$/, "") === "/code/authorize_device";
+    const legacyUrl =
+      parsedUrl?.protocol === "https:" &&
+      (parsedUrl.hostname === "auth.kimi.com" ||
+        parsedUrl.hostname.endsWith(".auth.kimi.com"));
+    check(
+      "vault-kimi-auth-publishes-provider-url",
+      status.phase === "awaiting_user" && (currentUrl || legacyUrl),
+      parsedUrl ? `${parsedUrl.hostname}${parsedUrl.pathname}` : status.phase,
+    );
+    check(
+      "vault-kimi-auth-publishes-code-and-deadline",
+      /^[A-Za-z0-9-]{4,64}$/.test(String(status.user_code || "")) &&
+        Number(status.deadline_unix_ms) > Date.now(),
+    );
+
+    const cancel = await httpJson(port, "/api/kimi-auth/cancel", {
+      method: "POST",
+    });
+    cancelled = cancel?.ok === true && cancel?.phase === "cancelled";
+    ceremonyActive = false;
+    check("vault-kimi-auth-cancels-cleanly", cancelled);
+
+    const cleanupDeadline = Date.now() + 5_000;
+    const ceremonyRoot = path.join(stateHome, "kimi-auth");
+    while (fs.existsSync(ceremonyRoot) && Date.now() < cleanupDeadline) {
+      await sleep(50);
+    }
+    const after = fs.readFileSync(credential);
+    const credentialUnchanged = before.equals(after);
+    after.fill(0);
+    const privateMode =
+      process.platform === "win32" ||
+      (fs.statSync(credential).mode & 0o077) === 0;
+    check(
+      "vault-kimi-auth-cancel-preserves-primary",
+      credentialUnchanged && privateMode,
+    );
+    check(
+      "vault-kimi-auth-cleans-isolated-home",
+      !fs.existsSync(ceremonyRoot),
+    );
+  } finally {
+    before.fill(0);
+    if (ceremonyActive && !cancelled) {
+      await httpJson(
+        port,
+        "/api/kimi-auth/cancel",
+        { method: "POST" },
+        5_000,
+      ).catch(() => {});
+    }
+  }
+}
+
+async function exerciseVaultSigninCeremonyOnIdleDaemon() {
+  fs.mkdirSync(VAULT_STATE_HOME, { recursive: true, mode: 0o700 });
+  const port = await freePort();
+  const cliArgs = [
+    "--no-tui",
+    "--web",
+    String(port),
+    "--bind",
+    "127.0.0.1",
+    "--no-tls",
+  ];
+  log("vault-spawn", `${BINARY} ${cliArgs.map(shellDisplay).join(" ")}`);
+  const child = spawn(BINARY, cliArgs, {
+    cwd: WORKDIR,
+    env: intendantEnv(VAULT_STATE_HOME),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout.on("data", (data) => {
+    for (const line of data.toString().split("\n")) {
+      if (line.trim()) log("vault-out", line.trim().slice(0, 500));
+    }
+  });
+  child.stderr.on("data", (data) => {
+    for (const line of data.toString().split("\n")) {
+      if (line.trim()) log("vault-err", line.trim().slice(0, 500));
+    }
+  });
+  let exited = false;
+  const exitPromise = new Promise((resolve) => {
+    child.on("exit", (code, signal) => {
+      exited = true;
+      log("vault-daemon", `exited code=${code} signal=${signal}`);
+      resolve({ code, signal });
+    });
+  });
+  try {
+    await exerciseVaultSigninCeremony(port, VAULT_STATE_HOME);
+  } finally {
+    if (!exited) child.kill("SIGTERM");
+    let result = await Promise.race([
+      exitPromise,
+      sleep(15_000).then(() => null),
+    ]);
+    if (!result) {
+      log("vault-cleanup", "idle daemon ignored SIGTERM; sending SIGKILL");
+      child.kill("SIGKILL");
+      result = await exitPromise;
+    }
+  }
+}
+
 async function scenario(run, port, kimiVersion) {
   await run.connect();
 
@@ -1211,7 +1357,6 @@ async function scenario(run, port, kimiVersion) {
     !advertised.includes("memory-reset"),
     JSON.stringify(advertised),
   );
-
   // Initial prompt deliberately blocks on Kimi's native structured question,
   // which gives the socket time to observe identity and capability startup.
   const question = await run.waitFor(
@@ -2630,6 +2775,7 @@ async function main() {
   check("kimi-installed", SUPPORTED_KIMI_VERSION.test(version), version);
   copyKimiAuthState();
   setupProject();
+  await exerciseVaultSigninCeremonyOnIdleDaemon();
 
   const port = REQUESTED_PORT || (await freePort());
   const run = new IntendantRun(port);

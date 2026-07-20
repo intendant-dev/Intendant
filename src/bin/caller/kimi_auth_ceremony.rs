@@ -1,24 +1,90 @@
 //! Dashboard-guided Kimi Code account sign-in (`kimi login`).
 //!
-//! Kimi's official CLI runs a device-code flow: it prints an
-//! `auth.kimi.com` URL and a short user code, opens the browser, then polls
-//! until the account authorizes the device. Intendant runs that unmodified
-//! CLI flow on the same private PTY and single-flight state machine used by
-//! the Codex and Claude Code ceremonies. The browser opener is suppressed;
-//! the owner opens the validated URL from the dashboard and enters the code
-//! there. Token material never crosses the dashboard API.
+//! Kimi's official CLI runs a device-code flow: 0.28 prints a
+//! `www.kimi.com/code/authorize_device` URL, older releases used
+//! `auth.kimi.com`, and both print a short user code before polling until the
+//! account authorizes the device. Intendant runs that unmodified CLI flow on
+//! the same private PTY and single-flight state machine used by the Codex and
+//! Claude Code ceremonies. The browser opener is suppressed; the owner opens
+//! the validated URL from the dashboard and enters the code there. Token
+//! material never crosses the dashboard API.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::auth_ceremony::{
     self, find_url_where, manager, pty_program_invocation, strip_ansi, url_from_shim_log,
     AuthProbe, CeremonyAccount, CeremonyPhase, Provider, StartRefusal,
 };
+use crate::external_agent::kimi_code::{
+    capture_kimi_credential_baseline, install_kimi_credential_if_unchanged, KimiCredentialBaseline,
+    KimiCredentialInstall,
+};
 
 pub(crate) const SUPPORTED_MODE: &str = "kimi-code";
 const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const CODE_ANCHOR: &str = "enter code:";
+
+#[derive(Clone)]
+struct CredentialPromotion {
+    inner: Arc<Mutex<CredentialPromotionState>>,
+}
+
+struct CredentialPromotionState {
+    primary_home: PathBuf,
+    ceremony_home: PathBuf,
+    baseline: KimiCredentialBaseline,
+    completed: Option<Result<AuthProbe, String>>,
+}
+
+impl CredentialPromotion {
+    fn new(primary_home: PathBuf, ceremony_home: PathBuf) -> Result<Self, String> {
+        let baseline = capture_kimi_credential_baseline(&primary_home)
+            .map_err(|error| format!("could not snapshot the existing Kimi login: {error}"))?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(CredentialPromotionState {
+                primary_home,
+                ceremony_home,
+                baseline,
+                completed: None,
+            })),
+        })
+    }
+
+    /// Promote the isolated login exactly once. `Ok(None)` means the CLI has
+    /// not finished writing a valid credential yet, so the poller should retry.
+    fn probe_and_promote(&self) -> Result<Option<AuthProbe>, String> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "Kimi sign-in credential lock was poisoned".to_string())?;
+        if let Some(completed) = state.completed.as_ref() {
+            return completed.clone().map(Some);
+        }
+        let Some(probe) = probe_credentials(&state.ceremony_home).filter(|probe| probe.logged_in)
+        else {
+            return Ok(None);
+        };
+        let completed = match install_kimi_credential_if_unchanged(
+            &state.primary_home,
+            &state.ceremony_home,
+            state.baseline,
+        ) {
+            Ok(KimiCredentialInstall::Installed) => Ok(probe),
+            Ok(KimiCredentialInstall::SourceChanged) => Err(
+                "Kimi credentials changed in another login, logout, or refresh while this \
+                 ceremony was running; the concurrent credential was preserved"
+                    .to_string(),
+            ),
+            Err(error) => Err(format!(
+                "could not install the newly authorized Kimi credential: {error}"
+            )),
+        };
+        state.completed = Some(completed.clone());
+        completed.map(Some)
+    }
+}
 
 pub(crate) fn custody_refusal_for(kimi_lease_active: bool) -> Option<String> {
     kimi_lease_active.then(|| {
@@ -34,7 +100,7 @@ pub(crate) fn custody_refusal() -> Option<String> {
     custody_refusal_for(crate::credential_leases::kind_is_active("oauth:kimi"))
 }
 
-fn kimi_auth_host_allowed(host: &str) -> bool {
+fn legacy_kimi_auth_host_allowed(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     host == "auth.kimi.com" || host.ends_with(".auth.kimi.com")
 }
@@ -45,7 +111,19 @@ pub(crate) fn validated_device_url(candidate: &str) -> Option<String> {
         .trim_start_matches(['<', '(', '['])
         .trim_end_matches(['>', ')', ']', '.', ',']);
     let url = url::Url::parse(candidate).ok()?;
-    if url.scheme() != "https" || !url.host_str().is_some_and(kimi_auth_host_allowed) {
+    if url.scheme() != "https"
+        || url.port_or_known_default() != Some(443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    let path = url.path().trim_end_matches('/');
+    let legacy = legacy_kimi_auth_host_allowed(&host);
+    let current =
+        matches!(host.as_str(), "kimi.com" | "www.kimi.com") && path == "/code/authorize_device";
+    if !legacy && !current {
         return None;
     }
     Some(candidate.to_string())
@@ -204,19 +282,24 @@ pub(crate) fn start_ceremony(command: &str, mode: &str) -> Result<(), StartRefus
         Ok(()) => Ok(()),
         Err(error) => {
             manager().spawn_failed(id, error.clone());
+            let _ = std::fs::remove_dir_all(crate::platform::intendant_home().join("kimi-auth"));
             Err(StartRefusal::Spawn(error))
         }
     }
 }
 
-fn spawn_ceremony_process(id: u64, command: &str, kimi_home: PathBuf) -> Result<(), String> {
+fn spawn_ceremony_process(id: u64, command: &str, primary_home: PathBuf) -> Result<(), String> {
     let shim_parent = crate::platform::intendant_home().join("kimi-auth");
     let _ = std::fs::remove_dir_all(&shim_parent);
+    ensure_private_ceremony_directory(&shim_parent)?;
     let shim = if cfg!(unix) {
         auth_ceremony::write_browser_shim(&shim_parent).ok()
     } else {
         None
     };
+    let ceremony_home = shim_parent.join("kimi-home");
+    ensure_private_ceremony_directory(&ceremony_home)?;
+    let promotion = CredentialPromotion::new(primary_home, ceremony_home.clone())?;
 
     let pair = portable_pty::native_pty_system()
         .openpty(portable_pty::PtySize {
@@ -232,7 +315,7 @@ fn spawn_ceremony_process(id: u64, command: &str, kimi_home: PathBuf) -> Result<
     cmd.args(&args);
     crate::external_agent::apply_external_child_env_policy_pty(&mut cmd);
     cmd.env("TERM", "xterm-256color");
-    cmd.env("KIMI_CODE_HOME", kimi_home.as_os_str());
+    cmd.env("KIMI_CODE_HOME", ceremony_home.as_os_str());
     if let Some((shim_dir, _)) = shim.as_ref() {
         cmd.env(
             "PATH",
@@ -253,10 +336,7 @@ fn spawn_ceremony_process(id: u64, command: &str, kimi_home: PathBuf) -> Result<
         .take_writer()
         .map_err(|error| format!("take PTY writer: {error}"))?;
     let killer = child.clone_killer();
-    let (shim_dir, shim_log) = match shim {
-        Some((dir, log)) => (Some(dir), Some(log)),
-        None => (None, None),
-    };
+    let shim_log = shim.map(|(_, log)| log);
     manager().install_transport(
         id,
         Box::new(auth_ceremony::PtyTransport {
@@ -264,17 +344,17 @@ fn spawn_ceremony_process(id: u64, command: &str, kimi_home: PathBuf) -> Result<
             killer,
             _master: pair.master,
         }),
-        shim_dir,
+        Some(shim_parent),
     );
 
-    let poll_home = kimi_home.clone();
+    let reader_promotion = promotion.clone();
     std::thread::Builder::new()
         .name("kimi-auth-reader".to_string())
-        .spawn(move || reader_thread(id, reader, child, shim_log, kimi_home))
+        .spawn(move || reader_thread(id, reader, child, shim_log, reader_promotion))
         .map_err(|error| format!("spawn reader thread: {error}"))?;
     std::thread::Builder::new()
         .name("kimi-auth-poll".to_string())
-        .spawn(move || poller_thread(id, poll_home))
+        .spawn(move || poller_thread(id, promotion))
         .map_err(|error| format!("spawn status-poll thread: {error}"))?;
     std::thread::Builder::new()
         .name("kimi-auth-timeout".to_string())
@@ -286,12 +366,38 @@ fn spawn_ceremony_process(id: u64, command: &str, kimi_home: PathBuf) -> Result<
     Ok(())
 }
 
+fn ensure_private_ceremony_directory(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|error| format!("create Kimi sign-in directory: {error}"))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect Kimi sign-in directory: {error}"))?;
+    if crate::platform::path_leaf_is_symlink_or_reparse(path)
+        .map_err(|error| format!("inspect Kimi sign-in directory: {error}"))?
+        || !metadata.is_dir()
+    {
+        return Err(format!(
+            "Kimi sign-in directory {} is not a real directory",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("secure Kimi sign-in directory: {error}"))?;
+    }
+    #[cfg(windows)]
+    crate::platform::set_owner_private_permissions(path)
+        .map_err(|error| format!("secure Kimi sign-in directory: {error}"))?;
+    Ok(())
+}
+
 fn reader_thread(
     id: u64,
     mut reader: Box<dyn std::io::Read + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     shim_log: Option<PathBuf>,
-    kimi_home: PathBuf,
+    promotion: CredentialPromotion,
 ) {
     let mut scanner = DeviceScanner::default();
     let mut reported = false;
@@ -314,9 +420,26 @@ fn reader_thread(
     if exit_ok && deciding {
         manager().verification_started(id);
     }
-    let probe = (exit_ok && deciding)
-        .then(|| probe_credentials(&kimi_home))
-        .flatten();
+    let probe = if exit_ok && deciding {
+        match promotion.probe_and_promote() {
+            Ok(Some(probe)) => Some(probe),
+            Ok(None) => {
+                manager().spawn_failed(
+                    id,
+                    "Kimi login exited without producing an authenticated credential; the \
+                     previous login was preserved"
+                        .to_string(),
+                );
+                return;
+            }
+            Err(error) => {
+                manager().spawn_failed(id, error);
+                return;
+            }
+        }
+    } else {
+        None
+    };
     manager().child_exited(id, exit_ok, probe);
 }
 
@@ -340,10 +463,7 @@ fn report_artifacts(
     manager().device_artifacts_captured(id, url, code);
 }
 
-fn poller_thread(id: u64, kimi_home: PathBuf) {
-    if probe_credentials(&kimi_home).is_some_and(|probe| probe.logged_in) {
-        return;
-    }
+fn poller_thread(id: u64, promotion: CredentialPromotion) {
     loop {
         std::thread::sleep(STATUS_POLL_INTERVAL);
         match manager().phase_of(id) {
@@ -351,9 +471,16 @@ fn poller_thread(id: u64, kimi_home: PathBuf) {
             Some(phase) if !phase.is_terminal() => continue,
             _ => return,
         }
-        if let Some(probe) = probe_credentials(&kimi_home).filter(|probe| probe.logged_in) {
-            manager().login_confirmed(id, probe);
-            return;
+        match promotion.probe_and_promote() {
+            Ok(Some(probe)) => {
+                manager().login_confirmed(id, probe);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                manager().spawn_failed(id, error);
+                return;
+            }
         }
     }
 }
@@ -369,7 +496,8 @@ pub(crate) fn configured_kimi_command(project_root: Option<&Path>) -> String {
 mod tests {
     use super::*;
 
-    const FIXTURE_URL: &str =
+    const FIXTURE_URL: &str = "https://www.kimi.com/code/authorize_device?user_code=ABCD-EFGH";
+    const LEGACY_FIXTURE_URL: &str =
         "https://auth.kimi.com/oauth/device?user_code=ABCD-EFGH&client_id=test";
     const FIXTURE_CODE: &str = "ABCD-EFGH";
 
@@ -382,14 +510,28 @@ mod tests {
     }
 
     #[test]
-    fn validates_only_kimi_auth_https_hosts() {
+    fn validates_current_and_legacy_kimi_device_urls_only() {
         assert_eq!(
             validated_device_url(FIXTURE_URL).as_deref(),
             Some(FIXTURE_URL)
         );
+        assert_eq!(
+            validated_device_url(LEGACY_FIXTURE_URL).as_deref(),
+            Some(LEGACY_FIXTURE_URL)
+        );
         assert!(validated_device_url("https://sub.auth.kimi.com/device").is_some());
+        assert!(
+            validated_device_url("https://kimi.com/code/authorize_device?user_code=ABCD-EFGH")
+                .is_some()
+        );
         assert!(validated_device_url("http://auth.kimi.com/device").is_none());
         assert!(validated_device_url("https://auth.kimi.com.evil.test/device").is_none());
+        assert!(
+            validated_device_url("https://www.kimi.com.evil.test/code/authorize_device").is_none()
+        );
+        assert!(validated_device_url("https://www.kimi.com/code/not-authorize").is_none());
+        assert!(validated_device_url("https://user@www.kimi.com/code/authorize_device").is_none());
+        assert!(validated_device_url("https://www.kimi.com:444/code/authorize_device").is_none());
         assert!(validated_device_url("https://kimi.com/device").is_none());
     }
 
@@ -453,5 +595,34 @@ mod tests {
     fn custody_refusal_tracks_kimi_lease() {
         assert!(custody_refusal_for(true).is_some());
         assert!(custody_refusal_for(false).is_none());
+    }
+
+    #[test]
+    fn isolated_promotion_preserves_primary_until_a_valid_login_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let ceremony = temp.path().join("ceremony");
+        std::fs::create_dir_all(primary.join("credentials")).unwrap();
+        std::fs::create_dir_all(ceremony.join("credentials")).unwrap();
+        let old = serde_json::to_vec(&serde_json::json!({
+            "refresh_token": "synthetic-old"
+        }))
+        .unwrap();
+        let new = serde_json::to_vec(&serde_json::json!({
+            "refresh_token": "synthetic-new"
+        }))
+        .unwrap();
+        std::fs::write(credentials_path(&primary), &old).unwrap();
+        let promotion = CredentialPromotion::new(primary.clone(), ceremony.clone()).unwrap();
+
+        assert_eq!(promotion.probe_and_promote().unwrap(), None);
+        assert_eq!(std::fs::read(credentials_path(&primary)).unwrap(), old);
+
+        std::fs::write(credentials_path(&ceremony), &new).unwrap();
+        assert!(promotion
+            .probe_and_promote()
+            .unwrap()
+            .is_some_and(|probe| probe.logged_in));
+        assert_eq!(std::fs::read(credentials_path(&primary)).unwrap(), new);
     }
 }
