@@ -89,6 +89,9 @@ impl AgendaHandle {
         let verb = match cmd {
             AgendaCommand::ApproveEffect { .. } => "approve_effect",
             AgendaCommand::RevokeEffect { .. } => "revoke_effect",
+            // The combined mint+approve gesture embeds an approval, so it
+            // is owner-surface exactly like the approval alone.
+            AgendaCommand::StartNow { .. } => "start_now",
             _ => return Ok(()),
         };
         let owner_surface = matches!(
@@ -751,6 +754,95 @@ mod tests {
         // stays (still open).
         assert!(!super::super::ask::agenda_ask_pending(answered_ask));
         assert!(super::super::ask::agenda_ask_pending(skipped_ask));
+    }
+
+    /// F3's combined mint+approve gesture is owner-surface only, exactly
+    /// like the approval it embeds: agent sessions (their own items
+    /// included), peers, and unattributed callers get the named denial;
+    /// an owner surface gets an immediately-approved effect whose digest
+    /// binds the manifest minted in the same act, fire_at_ms = now.
+    #[test]
+    fn start_now_is_owner_surface_and_binds_its_own_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Task,
+                    title: "fix the flaky probe".into(),
+                    body: "details in the runbook".into(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                actor("agent_session", Some("sess-f3")),
+            )
+            .unwrap();
+
+        for (kind, session) in [
+            ("agent_session", Some("sess-f3")),
+            ("peer", None),
+            ("unattributed", None),
+        ] {
+            match handle.apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                },
+                actor(kind, session),
+            ) {
+                Err(AgendaError::NotPermitted { verb, actor }) => {
+                    assert_eq!(verb, "start_now");
+                    assert_eq!(actor, kind);
+                }
+                other => panic!("expected NotPermitted for {kind}, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            handle.apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                },
+                None,
+            ),
+            Err(AgendaError::NotPermitted { .. })
+        ));
+
+        let before_ms = now_ms();
+        let started = handle
+            .apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                },
+                actor("dashboard", None),
+            )
+            .unwrap();
+        let effect = &started.effects[0];
+        let approval = effect
+            .approval
+            .as_ref()
+            .expect("the gesture approves in the same act");
+        assert_eq!(approval.digest, effect.digest);
+        assert_eq!(approval.kind.as_deref(), Some("dashboard"));
+        assert!(effect.manifest.fire_at_ms >= before_ms);
+        assert!(effect.manifest.goal.contains(&item.id));
+        assert!(effect.manifest.goal.contains("fix the flaky probe"));
+        assert!(effect.manifest.goal.contains("details in the runbook"));
+
+        // Start-now on an already-scheduled item revises the same lineage
+        // (standing re-propose semantics) rather than growing a second
+        // effect.
+        let again = handle
+            .apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                },
+                actor("local_process", None),
+            )
+            .unwrap();
+        assert_eq!(again.effects.len(), 1);
+        assert_eq!(again.effects[0].effect_id, effect.effect_id);
+        assert!(again.effects[0].approval.is_some());
     }
 
     /// Approval binds the digest: an edit (re-propose) voids it, and a
