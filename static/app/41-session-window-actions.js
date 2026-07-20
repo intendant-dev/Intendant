@@ -3900,9 +3900,11 @@ function updateQuestionProgress() {
     const followup = (block?.querySelector('.question-followup-input')?.value || '').trim();
     const { min } = questionPickBounds(q);
     const picked = block ? block.querySelectorAll('.question-option.selected').length : 0;
-    // Satisfied = typed free text, enough picks, a follow-up standing in,
-    // or nothing required.
-    const done = !!(block && (typed || followup || picked >= Math.max(min, 1) || min === 0));
+    // Ticked = ENGAGED (typed, enough picks, or a follow-up standing in).
+    // An untouched optional question stays untucked — a pre-ticked "✓" on
+    // something the user never looked at reads as a lie (min 0 only means
+    // Submit won't block on it).
+    const done = !!(block && (typed || followup || (picked > 0 && picked >= min)));
     if (done) answered++;
     const chip = content.querySelector(`.question-index-chip[data-q="${i}"]`);
     if (chip) {
@@ -4278,10 +4280,12 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held) {
   title.appendChild(tuck);
   content.appendChild(title);
 
-  // Pinned index (2+ questions): one chip per header, kept above the
+  // Pinned index (3+ questions): one chip per header, kept above the
   // scroll region; tapping a chip jumps to its question, and
-  // updateQuestionProgress ticks chips as answers land.
-  if (multi) {
+  // updateQuestionProgress ticks chips as answers land. With only two
+  // questions both are on screen anyway — the chips read as dead
+  // buttons (live finding 2026-07-20), so they don't render.
+  if (list.length > 2) {
     const index = document.createElement('div');
     index.className = 'question-index';
     list.forEach((q, qIndex) => {
