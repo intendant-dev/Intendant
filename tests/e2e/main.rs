@@ -1388,18 +1388,49 @@ async fn native_session_ctl_agenda_add_attributes_to_the_session() {
     let daemon = spawn_daemon(&client, &script).await;
     let port = daemon.port;
 
-    let started = ctl(
-        &daemon,
-        &[
-            "task",
-            "start",
-            "--direct",
-            "--task",
-            "park an agenda follow-up",
-        ],
-    )
-    .await;
-    assert!(started.status.success(), "{}", text_of(&started));
+    // A SUPERVISED session (the dashboard's create_session lane — the
+    // supervisor launch arm that computes the bootstrap), not the daemon's
+    // resident head session. First control message can race startup on a
+    // saturated box; retry until session_started.
+    use futures_util::SinkExt;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+    let mut started = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "park an agenda follow-up",
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send create_session");
+        started = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("session_started")
+                && json
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|task| task.contains("agenda follow-up"))
+        })
+        .await;
+        if started.is_some() {
+            break;
+        }
+    }
+    let started = started.unwrap_or_else(|| {
+        panic!(
+            "create_session never started; daemon log:\n{}",
+            daemon.log_tail()
+        )
+    });
+    let session_id = started["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session_started must carry the id: {started}"))
+        .to_string();
 
     // The durable proof: the item exists with session-grade attribution.
     let item = poll_until(
@@ -1417,8 +1448,10 @@ async fn native_session_ctl_agenda_add_attributes_to_the_session() {
         },
         || {
             format!(
-                "--- session logs ---\n{}\n--- daemon log tail ---\n{}",
-                tail(&daemon.rig.session_logs(), 2000),
+                "--- turn artifacts (runtime stdout/stderr) ---\n{}\n\
+                 --- session logs ---\n{}\n--- daemon log tail ---\n{}",
+                tail(&daemon.rig.turn_artifacts(), 4000),
+                tail(&daemon.rig.session_logs(), 3000),
                 daemon.log_tail()
             )
         },
@@ -1433,20 +1466,10 @@ async fn native_session_ctl_agenda_add_attributes_to_the_session() {
     let recorded_sid = provenance["session_id"]
         .as_str()
         .unwrap_or_else(|| panic!("provenance must carry the session id: {item}"));
-
-    // And it is THIS daemon's real session, not an echoed or foreign id.
-    let sessions = http_get_json(&client, &format!("http://127.0.0.1:{port}/api/sessions"))
-        .await
-        .expect("GET /api/sessions");
-    let listed: Vec<String> = sessions["sessions"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|s| s["session_id"].as_str().map(str::to_string))
-        .collect();
-    assert!(
-        listed.iter().any(|sid| sid == recorded_sid),
-        "recorded session id {recorded_sid} not among the daemon's sessions {listed:?}"
+    assert_eq!(
+        recorded_sid, session_id,
+        "the durable actor must be exactly the supervised session that ran \
+         the command: {item}"
     );
 
     // `--source` from an UNSUPERVISED caller (the ctl helper scrubs the

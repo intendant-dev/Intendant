@@ -145,7 +145,11 @@ seam at the authenticated edge — never parsed from the request. Coverage:
   backends' env and, since the follow-through slice, into the native
   runtime's command env at spawn (`agent_runner`), so `intendant ctl agenda …`
   run by any shell command inside a supervised session — sub-agents included —
-  records `agent_session` with that session's id.
+  records `agent_session` with that session's id. The native URL targets a
+  dedicated session-MCP loopback listener that serves only `/mcp` and only
+  session-scoped tokens: the runtime sandbox's gateway-port guard keeps
+  denying the main port (tokenless loopback there is root-equivalent), while
+  this door can only ever mint the calling session's own authority.
 - **Dashboard writes** attribute as the owner surface; **bare local ctl**
   outside any session records `local_process`.
 - **`--source LABEL`** (on `add` and the other non-owner verbs) is a

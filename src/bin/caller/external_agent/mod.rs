@@ -126,6 +126,20 @@ pub(crate) fn intendant_bootstrap_mcp_url(
     managed_context: Option<&str>,
     mcp_token: Option<&str>,
 ) -> String {
+    intendant_bootstrap_mcp_url_at("localhost", port, session_id, managed_context, mcp_token)
+}
+
+/// [`intendant_bootstrap_mcp_url`] with an explicit host. The native
+/// runtime bootstrap names `127.0.0.1` (its dedicated session-MCP
+/// listener binds IPv4 loopback, and the sandboxed client must not depend
+/// on `localhost` resolution order); external backends keep `localhost`.
+pub(crate) fn intendant_bootstrap_mcp_url_at(
+    host: &str,
+    port: u16,
+    session_id: Option<&str>,
+    managed_context: Option<&str>,
+    mcp_token: Option<&str>,
+) -> String {
     let mut params: Vec<(&str, String)> = Vec::new();
     let session_id = session_id.map(str::trim).filter(|s| !s.is_empty());
     if let Some(session_id) = session_id {
@@ -143,7 +157,7 @@ pub(crate) fn intendant_bootstrap_mcp_url(
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join("&");
-    format!("http://localhost:{port}/mcp?{query}")
+    format!("http://{host}:{port}/mcp?{query}")
 }
 
 /// Inject the `intendant ctl` bootstrap environment into a supervised child:

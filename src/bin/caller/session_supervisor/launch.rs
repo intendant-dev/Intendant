@@ -1270,15 +1270,22 @@ impl SessionSupervisor {
                     // (a daemon-loopback capability token — never a provider
                     // key), so `ctl` writes attribute to this session instead
                     // of `local_process`. Sub-agents pass through here too,
-                    // each under its own minted id.
-                    runtime_mcp_env: web_port.map(|port| crate::agent_runner::RuntimeMcpEnv {
-                        url: crate::external_agent::intendant_bootstrap_mcp_url(
-                            port,
-                            Some(&session_id),
-                            None,
-                            Some(crate::web_gateway::loopback_mcp_auth_token()),
-                        ),
-                        session_id: session_id.clone(),
+                    // each under its own minted id. The URL targets the
+                    // dedicated session-MCP listener — the one loopback door
+                    // the runtime sandbox's gateway-port guard does not (and
+                    // need not) cover, because it only ever mints the calling
+                    // session's own authority.
+                    runtime_mcp_env: crate::web_gateway::session_mcp_port().map(|port| {
+                        crate::agent_runner::RuntimeMcpEnv {
+                            url: crate::external_agent::intendant_bootstrap_mcp_url_at(
+                                "127.0.0.1",
+                                port,
+                                Some(&session_id),
+                                None,
+                                Some(crate::web_gateway::loopback_mcp_auth_token()),
+                            ),
+                            session_id: session_id.clone(),
+                        }
                     }),
                 };
                 run_direct_mode(
