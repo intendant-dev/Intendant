@@ -1524,6 +1524,74 @@ async fn native_session_ctl_agenda_add_attributes_to_the_session() {
     );
 }
 
+/// F1.5 CLI discovery, hermetic: with `$INTENDANT` unset and a PATH that
+/// cannot resolve `intendant`, the skills' canonical resolver preamble
+/// finds the controller through the boot-written discovery descriptor
+/// (`<state root>/cli-path`, no jq needed) and a real `ctl agenda list`
+/// round-trips against the booted daemon. Unix-gated: the preamble is the
+/// skills' POSIX one-liner.
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_descriptor_resolves_the_cli_for_unsupervised_shells() {
+    let script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let daemon = spawn_daemon(&client, &script).await;
+    let port = daemon.port;
+
+    // The daemon's boot wrote the descriptor into the rig's state root.
+    let cli_path_file = daemon.rig.home.path().join(".intendant").join("cli-path");
+    let recorded = std::fs::read_to_string(&cli_path_file)
+        .unwrap_or_else(|e| panic!("boot must write {}: {e}", cli_path_file.display()));
+    assert_eq!(
+        recorded.trim(),
+        intendant_bin(),
+        "descriptor names this build"
+    );
+
+    // The exact canonical preamble every CLI-invoking skill carries
+    // (pinned against skills/ by the repo grep test).
+    let preamble = r#"INTENDANT="${INTENDANT:-$(command -v intendant || cat "${INTENDANT_HOME:-$HOME/.intendant}/cli-path" 2>/dev/null || echo intendant)}""#;
+    let shell = format!(
+        "{preamble}\necho RESOLVED=$INTENDANT\nexec \"$INTENDANT\" ctl --url http://127.0.0.1:{port}/mcp agenda list"
+    );
+    let output = tokio::process::Command::new("/bin/bash")
+        .arg("-c")
+        .arg(&shell)
+        .env_clear()
+        // A PATH with shell basics but no cargo bins: `command -v
+        // intendant` must fail so the descriptor is the resolving rung.
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", daemon.rig.home.path())
+        .output()
+        .await
+        .expect("run the resolver shell");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "resolver round-trip failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("RESOLVED={}", intendant_bin())),
+        "the descriptor rung must resolve this build's controller:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("open ·"),
+        "ctl agenda list must answer through the resolved CLI:\n{stdout}"
+    );
+}
+
 /// F3 owner start-now, end to end against the real binaries: one owner
 /// gesture (`ctl agenda start` — local_process is an owner surface) mints
 /// and approves a manifest from the item and fires it through the SAME
