@@ -1,10 +1,10 @@
 //! Skills shipped inside the Intendant binary.
 //!
-//! The daemon installs this complete manifest machine-wide under
-//! `~/.agents/skills/`, so packaged installs do not need a repository checkout.
-//! The parity test pins every embedded byte to `skills/` on disk: adding,
-//! removing, or renaming a support file without updating this table fails the
-//! suite instead of shipping a partial skill.
+//! The daemon installs this complete manifest machine-wide under the independent
+//! `~/.agents/skills/` and `~/.claude/skills/` roots, so packaged installs do
+//! not need a repository checkout. The parity test pins every embedded byte to
+//! `skills/` on disk: adding, removing, or renaming a support file without
+//! updating this table fails the suite instead of shipping a partial skill.
 
 /// One skill embedded in the binary.
 pub(crate) struct BuiltinSkill {
