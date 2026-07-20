@@ -113,6 +113,15 @@ pub(crate) fn stable_external_transcript_event_id(
         return id.to_string();
     }
     let prefix = format!("external:{source}:{session_id}");
+    if let Some(record_id) = entry
+        .get("record_id")
+        .or_else(|| entry.get("recordId"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        return format!("{prefix}:record:{record_id}");
+    }
     if let Some(item_id) = entry
         .get("item_id")
         .or_else(|| entry.get("itemId"))
@@ -1295,6 +1304,9 @@ pub(crate) fn external_session_entries_from_home_arc(
     session_id: &str,
 ) -> Option<std::sync::Arc<Vec<serde_json::Value>>> {
     let source = crate::session_names::normalize_source(source);
+    if source == kimi_history::KIMI_SOURCE {
+        return kimi_session_entries_arc(home, session_id);
+    }
     let path = match source.as_str() {
         "codex" => find_codex_session_file(home, session_id),
         // Task-tool sub-threads have no transcript keyed by their
@@ -1316,6 +1328,30 @@ pub(crate) fn external_session_entries_from_home_arc(
     }?;
 
     external_session_entries_from_file_arc(home, &source, session_id, &path)
+}
+
+fn kimi_session_entries_arc(
+    home: &Path,
+    requested_id: &str,
+) -> Option<std::sync::Arc<Vec<serde_json::Value>>> {
+    let location = kimi_history::find_kimi_session_from_home(home, requested_id)?;
+    let selected = location.selected_agent(requested_id)?;
+    // Kimi's relationship metadata lives in state.json while the actual
+    // transcript lives in the selected wire. Include both in the cache
+    // namespace so either append/state rewrite invalidates hydration.
+    let dependency =
+        files_dependency_fingerprint([location.state_path.as_path(), selected.wire_path.as_path()]);
+    let cache_source = format!("kimi:{dependency}");
+    let key = external_transcript_cache_key(&cache_source, requested_id, &selected.wire_path)?;
+    if let Some(entries) = cached_external_transcript_entries(&key) {
+        return Some(entries);
+    }
+    let parsed = kimi_history::parse_kimi_session(location);
+    let mut entries = parsed.selected_agent(requested_id)?.entries.clone();
+    annotate_external_transcript_entries(kimi_history::KIMI_SOURCE, requested_id, &mut entries);
+    let entries = std::sync::Arc::new(entries);
+    store_external_transcript_entries(key, &entries);
+    Some(entries)
 }
 
 /// Task-child serving: the subagent transcript's rows plus — once the

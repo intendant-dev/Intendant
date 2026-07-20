@@ -3,15 +3,16 @@
 //! background-task inspector (tunnel twins `api_session_background_tasks`
 //! / `api_session_background_task_output`).
 //!
-//! Read-only peek at what a supervised Claude Code session's background
-//! commands are doing, served from the adapter-fed registry
+//! Read-only peek at what a supervised external session's background
+//! tasks are doing, served from the adapter-fed registry
 //! (`crate::background_tasks`). `{id}` resolves like fork-points: an
 //! Intendant wrapper session resolves to its persisted backend identity
 //! first, then the id is tried as a backend session id directly.
 //!
 //! Security invariants (unit-tested below):
-//! - Output is served ONLY from the registry's stored path — the client
-//!   names a task id, never a path, and an unknown task is a 404.
+//! - Output is served ONLY from the registry's stored file or inline
+//!   backend preview — the client names a task id, never a path or server
+//!   endpoint, and an unknown task is a 404.
 //! - Reads are tail-capped: `tail_kb` defaults to
 //!   [`DEFAULT_TAIL_KB`] and clamps to [`MAX_TAIL_KB`].
 //! - The stored path is opened directly and must be a regular file both
@@ -59,7 +60,7 @@ enum SessionResolution {
     /// through a persisted wrapper identity (which vouches the session
     /// exists even when the registry has no records for it yet), or the
     /// id itself when the registry already knows it.
-    ClaudeCode { key: String },
+    Supported { key: String, source: String },
     /// A wrapper session of a backend without a background-task wire.
     Unsupported { source: String },
     /// Nothing known under this id anywhere.
@@ -72,15 +73,20 @@ fn resolve_session(session_id: &str, home: &Path) -> SessionResolution {
     if let Some((source, backend_id)) =
         crate::session_supervisor::persisted_external_identity_for_session_in_home(home, session_id)
     {
-        return if source == "claude-code" {
-            SessionResolution::ClaudeCode { key: backend_id }
+        return if matches!(source.as_str(), "claude-code" | "kimi") {
+            SessionResolution::Supported {
+                key: backend_id,
+                source,
+            }
         } else {
             SessionResolution::Unsupported { source }
         };
     }
     if crate::background_tasks::session_known(session_id) {
-        return SessionResolution::ClaudeCode {
+        return SessionResolution::Supported {
             key: session_id.to_string(),
+            source: crate::background_tasks::session_source(session_id)
+                .unwrap_or_else(|| "external".to_string()),
         };
     }
     SessionResolution::Unknown
@@ -92,10 +98,11 @@ fn task_json(record: &BackgroundTaskRecord) -> serde_json::Value {
         "description": record.description,
         "status": record.status.as_str(),
         "startedAtEpoch": record.started_at_epoch,
-        // The peek affordance: true only when the wire announced a path
-        // (the path itself is deliberately NOT serialized — clients name
-        // tasks, the daemon resolves paths).
-        "hasOutput": record.output_file.is_some(),
+        // The peek affordance: true only when the backend announced a file
+        // or returned an inline preview. Neither storage location nor server
+        // credential is serialized — clients name tasks.
+        "hasOutput": record.output_file.is_some() || record.inline_output.is_some(),
+        "cancellable": record.source == "kimi" && record.status == BackgroundTaskStatus::Running,
     });
     if let Some(ended) = record.ended_at_epoch {
         task["endedAtEpoch"] = serde_json::json!(ended);
@@ -111,7 +118,7 @@ pub(crate) fn session_background_tasks_response(request_line: &str, home: &Path)
         return ApiResponse::json_error(400, "session id missing in background-tasks path");
     };
     match resolve_session(&session_id, home) {
-        SessionResolution::ClaudeCode { key } => {
+        SessionResolution::Supported { key, source } => {
             let tasks: Vec<serde_json::Value> = crate::background_tasks::tasks_for_session(&key)
                 .iter()
                 .map(task_json)
@@ -120,7 +127,7 @@ pub(crate) fn session_background_tasks_response(request_line: &str, home: &Path)
                 200,
                 JsonBody::Value(serde_json::json!({
                     "session": session_id,
-                    "source": "claude-code",
+                    "source": source,
                     "supported": true,
                     "tasks": tasks,
                 })),
@@ -143,8 +150,7 @@ pub(crate) fn session_background_tasks_response(request_line: &str, home: &Path)
     }
 }
 
-/// Honest per-backend absence wording (scope: supervised Claude Code on
-/// this daemon only — see the PR that introduced the inspector).
+/// Honest per-backend absence wording.
 fn background_tasks_unsupported_reason(source: &str) -> String {
     match source {
         "codex" => "codex has no non-blocking shell on today's wire".to_string(),
@@ -166,7 +172,7 @@ pub(crate) fn session_background_task_output_response(
         return ApiResponse::json_error(400, "session or task id missing in output path");
     };
     let key = match resolve_session(&session_id, home) {
-        SessionResolution::ClaudeCode { key } => key,
+        SessionResolution::Supported { key, .. } => key,
         SessionResolution::Unsupported { source } => {
             return ApiResponse::json_error(
                 404,
@@ -180,20 +186,28 @@ pub(crate) fn session_background_task_output_response(
             );
         }
     };
-    // THE path authority: the registry's stored record. A task id the
-    // registry doesn't know — whatever path shenanigans the caller
-    // imagines — is simply a 404.
+    // THE output authority: the registry's stored record. A task id the
+    // registry doesn't know — whatever path shenanigans the caller imagines
+    // — is simply a 404.
     let Some(record) = crate::background_tasks::find_task(&key, &task_id) else {
         return ApiResponse::json_error(404, format!("unknown background task {task_id}"));
     };
-    let Some(path) = record.output_file.as_deref() else {
+    let tail_bytes = tail_bytes_from_request(request_line);
+    let tail = if let Some(output) = record.inline_output.as_deref() {
+        Ok(inline_output_tail(
+            output,
+            record.output_size_bytes,
+            tail_bytes,
+        ))
+    } else if let Some(path) = record.output_file.as_deref() {
+        read_output_tail(path, tail_bytes)
+    } else {
         return ApiResponse::json_error(
             404,
-            format!("no output file was announced for background task {task_id}"),
+            format!("no output was announced for background task {task_id}"),
         );
     };
-    let tail_bytes = tail_bytes_from_request(request_line);
-    match read_output_tail(path, tail_bytes) {
+    match tail {
         Ok(tail) => ApiResponse::json(
             200,
             JsonBody::Value(serde_json::json!({
@@ -232,6 +246,25 @@ struct OutputTail {
     size_bytes: u64,
     offset: u64,
     content: String,
+}
+
+/// Tail a bounded backend preview while preserving its authoritative total
+/// size. Kimi's preview is already the end of the task stream, so an
+/// additional smaller request remains an exact suffix of the full output.
+fn inline_output_tail(
+    output: &[u8],
+    output_size_bytes: Option<u64>,
+    tail_bytes: u64,
+) -> OutputTail {
+    let retained = output.len() as u64;
+    let take = retained.min(tail_bytes) as usize;
+    let start = output.len().saturating_sub(take);
+    let size_bytes = output_size_bytes.unwrap_or(retained).max(retained);
+    OutputTail {
+        size_bytes,
+        offset: size_bytes.saturating_sub(take as u64),
+        content: String::from_utf8_lossy(&output[start..]).into_owned(),
+    }
 }
 
 enum TailError {
@@ -368,6 +401,19 @@ mod tests {
         );
     }
 
+    fn seed_kimi_session(sid: &str, output: &[u8], total_bytes: u64) {
+        crate::background_tasks::clear_session(sid);
+        crate::background_tasks::record_started_for_source(
+            sid,
+            "kimi",
+            "task-kimi",
+            "task-kimi",
+            "Kimi native task",
+            101,
+        );
+        crate::background_tasks::record_inline_output(sid, "task-kimi", output, Some(total_bytes));
+    }
+
     #[test]
     fn list_serves_registry_records_without_paths() {
         let home = tempfile::tempdir().expect("home");
@@ -419,6 +465,52 @@ mod tests {
         ));
         assert_eq!(status, 404);
         assert!(body["error"].as_str().is_some());
+    }
+
+    #[test]
+    fn kimi_wrapper_lists_and_tails_native_inline_output() {
+        let home = tempfile::tempdir().expect("home");
+        let wrapper_id = "b2e3ee5a-81ca-47db-947d-cee82e3b0f21";
+        let backend_id = "session_bgroute_kimi";
+        let wrapper_dir = crate::platform::intendant_home_in(home.path())
+            .join("logs")
+            .join(wrapper_id);
+        {
+            let mut log =
+                crate::session_log::SessionLog::open(wrapper_dir).expect("wrapper session log");
+            log.session_identity(wrapper_id, "kimi", backend_id);
+        }
+
+        let mut output = vec![b'k'; 80 * 1024];
+        let marker = b"KIMI-NATIVE-TAIL";
+        let at = output.len() - marker.len();
+        output[at..].copy_from_slice(marker);
+        seed_kimi_session(backend_id, &output, 100 * 1024);
+
+        let (status, body) = response_json(session_background_tasks_response(
+            &list_line(wrapper_id),
+            home.path(),
+        ));
+        assert_eq!(status, 200);
+        assert_eq!(body["source"], "kimi");
+        assert_eq!(body["supported"], true);
+        assert_eq!(body["tasks"][0]["taskId"], "task-kimi");
+        assert_eq!(body["tasks"][0]["hasOutput"], true);
+        assert_eq!(body["tasks"][0]["cancellable"], true);
+
+        let (status, body) = response_json(session_background_task_output_response(
+            &output_line(wrapper_id, "task-kimi", ""),
+            home.path(),
+        ));
+        assert_eq!(status, 200);
+        assert_eq!(body["sizeBytes"], 100 * 1024);
+        assert_eq!(body["offset"], 36 * 1024);
+        assert_eq!(body["content"].as_str().map(str::len), Some(64 * 1024));
+        assert!(body["content"]
+            .as_str()
+            .expect("inline tail")
+            .ends_with("KIMI-NATIVE-TAIL"));
+        crate::background_tasks::clear_session(backend_id);
     }
 
     #[test]
@@ -508,7 +600,7 @@ mod tests {
         assert!(json["error"]
             .as_str()
             .expect("error")
-            .contains("no output file was announced"));
+            .contains("no output was announced"));
 
         // The file vanishing after registration: 404, not an empty 200.
         std::fs::remove_file(&path).expect("remove");

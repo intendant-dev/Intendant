@@ -490,6 +490,13 @@ pub(crate) struct StationControlsSummary {
     /// Global Claude Code runtime knobs (empty model = CLI default).
     pub(crate) claude_model: String,
     pub(crate) claude_permission_mode: String,
+    pub(crate) kimi_model: String,
+    pub(crate) kimi_thinking: String,
+    pub(crate) kimi_permission_mode: String,
+    pub(crate) kimi_plan_mode: bool,
+    pub(crate) kimi_swarm_mode: bool,
+    /// `None` = Kimi profile default, `Some([])` = no optional tools.
+    pub(crate) kimi_allowed_tools: Option<Vec<String>>,
     pub(crate) managed_context: String,
     /// Managed-capable (Intendant-aware fork) codex binary; empty when no
     /// dedicated fork is configured.
@@ -627,6 +634,12 @@ impl Default for StationControlsSummary {
             service_tier: String::new(),
             claude_model: String::new(),
             claude_permission_mode: String::new(),
+            kimi_model: String::new(),
+            kimi_thinking: String::new(),
+            kimi_permission_mode: String::new(),
+            kimi_plan_mode: false,
+            kimi_swarm_mode: false,
+            kimi_allowed_tools: None,
             managed_context: String::new(),
             managed_command: String::new(),
             context_archive: String::new(),

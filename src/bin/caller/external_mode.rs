@@ -1,5 +1,5 @@
 //! The external-agent execution shape: run_external_agent_mode
-//! supervises a third-party coding CLI (Codex, Claude Code) as the
+//! supervises a third-party coding CLI (Codex, Claude Code, Kimi Code) as the
 //! session's backend, draining its events into the app event stream.
 
 // Same entangled class as the drain (external_events.rs): keeps the
@@ -201,6 +201,8 @@ pub(crate) async fn run_external_agent_mode(
         );
     } else if backend == external_agent::AgentBackend::ClaudeCode {
         emit_claude_code_session_capabilities(&bus, intendant_session_id.as_deref());
+    } else if backend == external_agent::AgentBackend::Kimi {
+        emit_kimi_session_capabilities(&bus, intendant_session_id.as_deref());
     }
     // Use one control receiver across idle waits and active turn drains.
     // A second parked receiver would retain mid-turn controls and replay them
@@ -315,6 +317,11 @@ pub(crate) async fn run_external_agent_mode(
         if live_session_id != intendant_session_id {
             emit_claude_code_session_capabilities(&bus, live_session_id.as_deref());
         }
+    } else if backend == external_agent::AgentBackend::Kimi {
+        emit_kimi_session_capabilities(&bus, intendant_session_id.as_deref());
+        if live_session_id != intendant_session_id {
+            emit_kimi_session_capabilities(&bus, live_session_id.as_deref());
+        }
     }
     if emit_session_started_after_identity {
         if let Some(session_id) = live_session_id.clone() {
@@ -353,6 +360,15 @@ pub(crate) async fn run_external_agent_mode(
         {
             claude_user_turn_state_from_history(&platform::home_dir(), session_id)
                 .unwrap_or_default()
+        }
+        (external_agent::AgentBackend::Kimi, Some(_), session_id)
+            if backend.thread_id_is_canonical(session_id) =>
+        {
+            crate::web_gateway::session_catalog::kimi_history::kimi_user_turn_state_from_history(
+                &platform::home_dir(),
+                session_id,
+            )
+            .unwrap_or_default()
         }
         _ => UserTurnRevisionState::default(),
     };
@@ -593,6 +609,52 @@ pub(crate) async fn run_external_agent_mode(
                                 if let Some(child_thread_id) =
                                     scoped_event_codex_subagent_thread_id(&event_thread_id, &stats)
                                 {
+                                    if should_route_idle_external_child_interaction(
+                                        &backend, &event,
+                                    ) {
+                                        // Subscribe before checking the supervisor sender:
+                                        // a Stop before the subscription closes that sender,
+                                        // while a Stop after it is buffered here. The
+                                        // interaction wait can therefore never strand the
+                                        // backend after the supervisor removes this session.
+                                        let mut idle_interaction_lifecycle_rx =
+                                            bus.subscribe_intents();
+                                        if supervised_by_session_supervisor
+                                            && follow_up_rx.is_closed()
+                                        {
+                                            let reason =
+                                                "session stopped while awaiting child interaction"
+                                                    .to_string();
+                                            slog(&session_log, |l| l.info(&reason));
+                                            stats.terminal_outcome = Some(reason);
+                                            break 'outer;
+                                        }
+                                        let outcome = handle_idle_external_child_interaction(
+                                            agent.as_mut(),
+                                            &drain_config,
+                                            &mut stats,
+                                            child_thread_id,
+                                            event,
+                                            &mut idle_interaction_lifecycle_rx,
+                                        )
+                                        .await;
+                                        match outcome {
+                                            IdleExternalChildInteractionOutcome::Resolved => {
+                                                continue;
+                                            }
+                                            IdleExternalChildInteractionOutcome::StopRequested {
+                                                reason,
+                                            } => {
+                                                slog(&session_log, |l| {
+                                                    l.info(&format!(
+                                                        "Stop requested during idle child interaction: {reason}"
+                                                    ))
+                                                });
+                                                stats.terminal_outcome = Some(reason);
+                                                break 'outer;
+                                            }
+                                        }
+                                    }
                                     handle_idle_codex_subagent_event(
                                         &drain_config,
                                         &mut stats,

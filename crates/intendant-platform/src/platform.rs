@@ -12,49 +12,50 @@ use std::time::Duration;
 /// bundle, a systemd unit, or a bare `ssh host cmd` — the shell profile that
 /// normally extends `PATH` is never sourced, so per-user installs are
 /// invisible. This prepends the standard locations (skipping any already
-/// present) so tools like the external coding agents (`claude`, `codex`,
+/// present) so tools like the external coding agents (`claude`, `codex`, `kimi`,
 /// `gemini`), `ffmpeg`, `cliclick`, and `wasm-pack` stay discoverable:
 ///
-/// - `~/.local/bin` — where the external agents' native installers place their
-///   launcher; applies on every Unix platform (macOS and Linux).
+/// - `~/.kimi-code/bin` — Kimi Code's native installer location.
+/// - `~/.local/bin` — where several external agents' native installers place
+///   their launcher.
 /// - `/opt/homebrew/bin` (Apple Silicon) and `/usr/local/bin` (Intel) — the
 ///   Homebrew prefixes; macOS only.
 pub fn ensure_tool_paths() {
-    #[cfg(unix)]
-    {
-        use std::path::PathBuf;
+    use std::path::PathBuf;
 
-        // Directories that hold user-installed CLIs but are commonly absent
-        // from PATH in non-login launch contexts. Order = search priority.
-        let candidates: Vec<PathBuf> = vec![
-            home_dir().join(".local/bin"),
-            #[cfg(target_os = "macos")]
-            PathBuf::from("/opt/homebrew/bin"),
-            #[cfg(target_os = "macos")]
-            PathBuf::from("/usr/local/bin"),
-        ];
-
-        let current = std::env::var_os("PATH").unwrap_or_default();
-        let additions: Vec<PathBuf> = candidates
-            .into_iter()
-            .filter(|dir| dir.is_dir() && !path_contains_dir(&current, dir))
-            .collect();
-        if additions.is_empty() {
-            return;
-        }
-
-        // Prepend the missing dirs ahead of the existing PATH. Guard the empty
-        // case so we never synthesize a bare separator — an empty PATH entry
-        // resolves to the current directory, a footgun.
-        let existing: Vec<PathBuf> = if current.is_empty() {
-            Vec::new()
-        } else {
-            std::env::split_paths(&current).collect()
-        };
-        if let Ok(joined) = std::env::join_paths(additions.into_iter().chain(existing)) {
-            std::env::set_var("PATH", joined);
-        }
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let additions: Vec<PathBuf> = tool_path_candidates(&home_dir())
+        .into_iter()
+        .filter(|dir| dir.is_dir() && !path_contains_dir(&current, dir))
+        .collect();
+    if additions.is_empty() {
+        return;
     }
+
+    // Prepend the missing dirs ahead of the existing PATH. Guard the empty
+    // case so we never synthesize a bare separator — an empty PATH entry
+    // resolves to the current directory, a footgun.
+    let existing: Vec<PathBuf> = if current.is_empty() {
+        Vec::new()
+    } else {
+        std::env::split_paths(&current).collect()
+    };
+    if let Ok(joined) = std::env::join_paths(additions.into_iter().chain(existing)) {
+        std::env::set_var("PATH", joined);
+    }
+}
+
+/// User-installed CLI locations in search priority order. Kept pure so tests
+/// never need to mutate the process-wide home or PATH.
+fn tool_path_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    vec![
+        home.join(".kimi-code").join("bin"),
+        home.join(".local").join("bin"),
+        #[cfg(target_os = "macos")]
+        std::path::PathBuf::from("/opt/homebrew/bin"),
+        #[cfg(target_os = "macos")]
+        std::path::PathBuf::from("/usr/local/bin"),
+    ]
 }
 
 /// Is `dir` present in `path` (a `PATH`-style `OsStr`) as an exact entry?
@@ -64,7 +65,6 @@ pub fn ensure_tool_paths() {
 /// naive `str::contains` substring test gets this wrong and would skip adding a
 /// directory that only resembles one already there — hiding user-installed
 /// external agents (e.g. `claude`) from non-login launches of Intendant.
-#[cfg(unix)]
 fn path_contains_dir(path: &std::ffi::OsStr, dir: &std::path::Path) -> bool {
     std::env::split_paths(path).any(|entry| entry == dir)
 }
@@ -177,6 +177,30 @@ pub fn interrupt_process(pid: u32) {
 
 #[cfg(not(unix))]
 pub fn interrupt_process(_pid: u32) {}
+
+/// Report whether the named filesystem entry itself is a link-like object.
+///
+/// `Path::is_symlink` covers Unix symbolic links, but on Windows a directory
+/// junction is a reparse point rather than necessarily a symbolic link. State
+/// and credential boundaries must reject both without following the leaf, so
+/// inspect `symlink_metadata` and the Windows reparse attribute directly.
+pub fn path_leaf_is_symlink_or_reparse(path: &std::path::Path) -> std::io::Result<bool> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(true);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0);
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+}
 
 /// Check whether a process with the given PID is currently running.
 ///
@@ -436,7 +460,7 @@ pub fn terminate_unprotected_descendants_now(root_pid: u32, protected: &HashSet<
 /// Ask the OS to deliver SIGTERM to the child when this (parent) process
 /// dies for ANY reason — including SIGKILL, where no userspace cleanup
 /// (Drop impls, shutdown hooks) ever runs. Used for spawned external-agent
-/// processes (codex/claude/gemini app-servers), which previously survived
+/// processes (codex/claude/kimi/gemini app-servers), which previously survived
 /// hard daemon deaths as orphans.
 ///
 /// Linux-only (`PR_SET_PDEATHSIG`); macOS and Windows have no direct
@@ -917,8 +941,8 @@ pub async fn spawn_detached_restart(cmd: &str) -> Result<u32, String> {
 /// Build a [`tokio::process::Command`] for an external program, resolving the
 /// program name in a platform-correct way.
 ///
-/// External-agent CLIs (codex, gemini, claude) are configured by name and
-/// default to bare names ("codex" / "gemini" / "claude"). Callers chain the
+/// External-agent CLIs (codex, gemini, claude, kimi) are configured by name and
+/// default to bare names ("codex" / "gemini" / "claude" / "kimi"). Callers chain the
 /// usual builder methods (`.args()`, `.current_dir()`, `.stdin()`, …) onto the
 /// returned `Command` and then `.spawn()`.
 ///
@@ -1590,9 +1614,562 @@ pub fn kill_process_group(pid: u32) {
     }
 }
 
+/// Replace a Windows filesystem object's DACL with an owner-private,
+/// inheritance-protected allow-list.
+///
+/// The exact trustees are the current process user, LocalSystem, and the
+/// built-in Administrators group. Directories propagate that same private
+/// allow-list to children; files do not. Existing inherited or explicit ACEs
+/// are discarded instead of merged, so a permissive profile/temp-directory
+/// ACL cannot survive the stamp.
+///
+/// This is intentionally Windows-only. Unix callers keep using atomic
+/// creation modes (`0700` directories, `0600` files), which are both simpler
+/// and race-free there.
+#[cfg(windows)]
+pub fn set_owner_private_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    owner_private_acl::set(path)
+}
+
+/// Verify that a Windows filesystem object stays inside an owner-private ACL
+/// boundary.
+///
+/// Every access-granting ACE must name the current process user, LocalSystem,
+/// or built-in Administrators; unknown/callback/object ACE forms and null
+/// DACLs fail closed. A protected DACL is accepted directly. A newly-created
+/// child may instead carry only safe inherited ACEs, but then its immediate
+/// parent must itself have a protected owner-private DACL. That second form is
+/// required for applications which create credentials by atomically renaming
+/// a temporary file inside a private directory: Windows preserves the
+/// temporary file's inherited ACL rather than marking the child protected.
+#[cfg(windows)]
+pub fn validate_owner_private_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    owner_private_acl::validate(path)
+}
+
+#[cfg(windows)]
+mod owner_private_acl {
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE,
+        HLOCAL,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+        NO_MULTIPLE_TRUSTEE, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID,
+        TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, CreateWellKnownSid, EqualSid, GetAce, GetAclInformation,
+        GetSecurityDescriptorControl, GetTokenInformation, IsValidSid, TokenUser,
+        WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+        ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERITED_ACE,
+        OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SECURITY_MAX_SID_SIZE, SE_DACL_PRESENT, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_GENERIC_READ};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    const ACCESS_ALLOWED_ACE_TYPE_VALUE: u8 = 0;
+    const SID_HEADER_SIZE: usize = 8;
+
+    struct Handle(HANDLE);
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: this guard owns the real token handle returned by
+                // OpenProcessToken and drops it exactly once.
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct LocalMemory(HLOCAL);
+
+    impl Drop for LocalMemory {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: SetEntriesInAclW/GetNamedSecurityInfoW allocate
+                // their result with LocalAlloc and transfer it to the caller.
+                // This guard owns that allocation and frees it exactly once.
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+    }
+
+    struct CurrentUserSid {
+        // GetTokenInformation writes a TOKEN_USER followed by SID storage.
+        // usize elements give the buffer sufficient alignment for TOKEN_USER.
+        storage: Vec<usize>,
+    }
+
+    impl CurrentUserSid {
+        fn query() -> io::Result<Self> {
+            let mut raw_token = null_mut();
+            // SAFETY: GetCurrentProcess returns a valid pseudo-handle and
+            // raw_token is a live out-pointer. TOKEN_QUERY is the minimal
+            // access needed for TokenUser.
+            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) } == 0 {
+                return Err(last_error("OpenProcessToken"));
+            }
+            let token = Handle(raw_token);
+
+            let mut needed = 0u32;
+            // SAFETY: a null/zero buffer is the documented size probe. The
+            // function initializes `needed` even though it returns false with
+            // ERROR_INSUFFICIENT_BUFFER.
+            let first =
+                unsafe { GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut needed) };
+            if first != 0 || needed == 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+                return Err(last_error("GetTokenInformation(TokenUser size)"));
+            }
+
+            let word = std::mem::size_of::<usize>();
+            let words = (needed as usize)
+                .checked_add(word - 1)
+                .and_then(|bytes| bytes.checked_div(word))
+                .ok_or_else(|| io::Error::other("TokenUser buffer size overflow"))?;
+            let mut storage = vec![0usize; words];
+            // SAFETY: storage has at least `needed` writable bytes and
+            // TOKEN_USER alignment; token remains open for the query.
+            if unsafe {
+                GetTokenInformation(
+                    token.0,
+                    TokenUser,
+                    storage.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed,
+                )
+            } == 0
+            {
+                return Err(last_error("GetTokenInformation(TokenUser)"));
+            }
+            let sid = {
+                // SAFETY: the successful TokenUser query initialized a
+                // TOKEN_USER at the aligned start of storage.
+                let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
+                user.User.Sid
+            };
+            // SAFETY: sid points into the initialized TokenUser buffer and is
+            // valid for the duration of this check.
+            if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+                return Err(io::Error::other(
+                    "GetTokenInformation returned an invalid user SID",
+                ));
+            }
+            Ok(Self { storage })
+        }
+
+        fn as_ptr(&self) -> PSID {
+            // SAFETY: construction only succeeds after TOKEN_USER was written
+            // to this aligned buffer, which remains alive behind `self`.
+            unsafe { (&*self.storage.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+        }
+    }
+
+    struct WellKnownSid {
+        // SECURITY_MAX_SID_SIZE bytes, aligned for SID sub-authorities.
+        storage: Vec<usize>,
+    }
+
+    impl WellKnownSid {
+        fn new(kind: i32) -> io::Result<Self> {
+            let word = std::mem::size_of::<usize>();
+            let words = (SECURITY_MAX_SID_SIZE as usize)
+                .checked_add(word - 1)
+                .and_then(|bytes| bytes.checked_div(word))
+                .ok_or_else(|| io::Error::other("well-known SID buffer size overflow"))?;
+            let mut storage = vec![0usize; words];
+            let mut size = SECURITY_MAX_SID_SIZE;
+            // SAFETY: storage has SECURITY_MAX_SID_SIZE writable bytes,
+            // domain SID is optional for these absolute well-known SIDs, and
+            // `size` is a live in/out length.
+            if unsafe {
+                CreateWellKnownSid(kind, null_mut(), storage.as_mut_ptr().cast(), &mut size)
+            } == 0
+            {
+                return Err(last_error("CreateWellKnownSid"));
+            }
+            Ok(Self { storage })
+        }
+
+        fn as_ptr(&self) -> PSID {
+            self.storage.as_ptr().cast_mut().cast()
+        }
+    }
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    fn last_error(operation: &str) -> io::Error {
+        let source = io::Error::last_os_error();
+        io::Error::new(source.kind(), format!("{operation}: {source}"))
+    }
+
+    fn status_error(operation: &str, path: &Path, status: u32) -> io::Error {
+        let source = io::Error::from_raw_os_error(status as i32);
+        io::Error::new(
+            source.kind(),
+            format!("{operation}({}): {source}", path.display()),
+        )
+    }
+
+    fn invalid_acl(path: &Path, message: impl std::fmt::Display) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "owner-private ACL check failed for {}: {message}",
+                path.display()
+            ),
+        )
+    }
+
+    fn trustee(sid: PSID, trustee_type: i32, inheritance: u32) -> EXPLICIT_ACCESS_W {
+        EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: inheritance,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: trustee_type,
+                // With TRUSTEE_IS_SID this nominal string pointer is a PSID.
+                ptstrName: sid.cast(),
+            },
+        }
+    }
+
+    pub(super) fn set(path: &Path) -> io::Result<()> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to stamp ACL through symlink {}", path.display()),
+            ));
+        }
+
+        let current = CurrentUserSid::query()?;
+        let system = WellKnownSid::new(WinLocalSystemSid)?;
+        let administrators = WellKnownSid::new(WinBuiltinAdministratorsSid)?;
+        let inheritance = if metadata.is_dir() {
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+        } else {
+            0
+        };
+        let entries = [
+            trustee(current.as_ptr(), TRUSTEE_IS_USER, inheritance),
+            trustee(system.as_ptr(), TRUSTEE_IS_USER, inheritance),
+            trustee(administrators.as_ptr(), TRUSTEE_IS_GROUP, inheritance),
+        ];
+
+        let mut raw_acl: *mut ACL = null_mut();
+        // SAFETY: entries and every SID they reference remain live for the
+        // call; old ACL is null because this is an exact replacement; raw_acl
+        // is a live out-pointer which receives a LocalAlloc allocation.
+        let status = unsafe {
+            SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), null(), &mut raw_acl)
+        };
+        if status != ERROR_SUCCESS {
+            return Err(status_error("SetEntriesInAclW", path, status));
+        }
+        if raw_acl.is_null() {
+            return Err(io::Error::other(
+                "SetEntriesInAclW returned a null private ACL",
+            ));
+        }
+        let _acl = LocalMemory(raw_acl.cast());
+        let wide = wide(path);
+        // SAFETY: wide is NUL-terminated; raw_acl points to the valid ACL
+        // above; owner/group/SACL are intentionally unchanged. The protected
+        // flag disables inheritance while DACL_SECURITY_INFORMATION replaces
+        // all existing grant entries atomically.
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                raw_acl,
+                null(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(status_error("SetNamedSecurityInfoW", path, status));
+        }
+
+        // Read the descriptor back: a successful setter followed by a policy
+        // check avoids treating a filesystem/provider that ignored protection
+        // bits as private.
+        validate_acl(path, true).map(|_| ())
+    }
+
+    pub(super) fn validate(path: &Path) -> io::Result<()> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(invalid_acl(path, "object is a symlink"));
+        }
+
+        let protected = validate_acl(path, false)?;
+        if protected {
+            return Ok(());
+        }
+
+        // Files created by atomic temp-file + rename inherit the protected
+        // bridge directory's private entries, but Windows leaves the child's
+        // own SE_DACL_PROTECTED bit clear. Accept that form only when the
+        // immediate source of inheritance is itself protected and private.
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid_acl(path, "unprotected object has no parent"))?;
+        validate_acl(parent, true).map(|_| ()).map_err(|error| {
+            invalid_acl(
+                path,
+                format!("unprotected DACL has no protected private parent: {error}"),
+            )
+        })
+    }
+
+    /// Validate every granting ACE and return whether the DACL is protected.
+    fn validate_acl(path: &Path, require_protected: bool) -> io::Result<bool> {
+        let current = CurrentUserSid::query()?;
+        let system = WellKnownSid::new(WinLocalSystemSid)?;
+        let administrators = WellKnownSid::new(WinBuiltinAdministratorsSid)?;
+        let allowed = [current.as_ptr(), system.as_ptr(), administrators.as_ptr()];
+
+        let wide = wide(path);
+        let mut dacl: *mut ACL = null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: wide is NUL-terminated; dacl and descriptor are live
+        // out-pointers. The returned DACL points inside descriptor, whose
+        // LocalAlloc allocation remains held below during inspection.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(status_error("GetNamedSecurityInfoW", path, status));
+        }
+        if descriptor.is_null() {
+            return Err(invalid_acl(path, "security descriptor is null"));
+        }
+        let _descriptor = LocalMemory(descriptor);
+        if dacl.is_null() {
+            return Err(invalid_acl(path, "DACL is absent or null"));
+        }
+
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        // SAFETY: descriptor is the live security descriptor returned above;
+        // control and revision are writable out-pointers.
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+            return Err(last_error("GetSecurityDescriptorControl"));
+        }
+        if control & SE_DACL_PRESENT == 0 {
+            return Err(invalid_acl(path, "security descriptor has no DACL"));
+        }
+        let protected = control & SE_DACL_PROTECTED != 0;
+        if require_protected && !protected {
+            return Err(invalid_acl(path, "DACL inheritance is not protected"));
+        }
+
+        // SAFETY: ACL_SIZE_INFORMATION is plain integer POD, and zero is a
+        // valid initialization before GetAclInformation fills every field.
+        let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: dacl points inside the live descriptor and info is a
+        // correctly-sized writable out-buffer for AclSizeInformation.
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(last_error("GetAclInformation"));
+        }
+        let acl_start = dacl as usize;
+        let acl_end = acl_start
+            .checked_add(info.AclBytesInUse as usize)
+            .ok_or_else(|| invalid_acl(path, "ACL byte length overflow"))?;
+        let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+        let mut current_user_can_read = false;
+
+        for index in 0..info.AceCount {
+            let mut ace_ptr: *mut c_void = null_mut();
+            // SAFETY: index is below AceCount and ace_ptr is a live
+            // out-pointer. A successful call returns a pointer within dacl.
+            if unsafe { GetAce(dacl, index, &mut ace_ptr) } == 0 {
+                return Err(last_error("GetAce"));
+            }
+            if ace_ptr.is_null() {
+                return Err(invalid_acl(path, format!("ACE {index} is null")));
+            }
+            let ace_start = ace_ptr as usize;
+            let header_end = ace_start
+                .checked_add(std::mem::size_of::<ACE_HEADER>())
+                .ok_or_else(|| invalid_acl(path, format!("ACE {index} address overflow")))?;
+            if ace_start < acl_start || header_end > acl_end {
+                return Err(invalid_acl(path, format!("ACE {index} is outside its ACL")));
+            }
+            // SAFETY: the bounds above prove a complete ACE_HEADER lies in
+            // the ACL. read_unaligned does not assume ACE alignment.
+            let header = unsafe { ace_ptr.cast::<ACE_HEADER>().read_unaligned() };
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE_VALUE {
+                return Err(invalid_acl(
+                    path,
+                    format!(
+                        "ACE {index} uses unsupported type {} instead of a simple allow entry",
+                        header.AceType
+                    ),
+                ));
+            }
+            let ace_size = usize::from(header.AceSize);
+            let ace_end = ace_start
+                .checked_add(ace_size)
+                .ok_or_else(|| invalid_acl(path, format!("ACE {index} size overflow")))?;
+            if ace_size < std::mem::size_of::<ACCESS_ALLOWED_ACE>() || ace_end > acl_end {
+                return Err(invalid_acl(path, format!("ACE {index} has invalid size")));
+            }
+            if protected && header.AceFlags & INHERITED_ACE as u8 != 0 {
+                return Err(invalid_acl(
+                    path,
+                    format!("protected DACL contains inherited ACE {index}"),
+                ));
+            }
+
+            // SAFETY: the validated fixed-size allow ACE lies wholly inside
+            // the ACL. read_unaligned handles the API's byte alignment.
+            let ace = unsafe { ace_ptr.cast::<ACCESS_ALLOWED_ACE>().read_unaligned() };
+            let sid_bytes_available = ace_size - sid_offset;
+            if sid_bytes_available < SID_HEADER_SIZE {
+                return Err(invalid_acl(path, format!("ACE {index} SID is truncated")));
+            }
+            // SAFETY: sid_offset is the ABI offset inside the validated ACE,
+            // and at least a full SID header remains.
+            let sid_bytes = unsafe { ace_ptr.cast::<u8>().add(sid_offset) };
+            // SAFETY: byte 1 is within the bounded SID header.
+            let sub_authorities = usize::from(unsafe { *sid_bytes.add(1) });
+            let sid_size = sub_authorities
+                .checked_mul(std::mem::size_of::<u32>())
+                .and_then(|bytes| SID_HEADER_SIZE.checked_add(bytes))
+                .ok_or_else(|| invalid_acl(path, format!("ACE {index} SID size overflow")))?;
+            if sid_size > sid_bytes_available {
+                return Err(invalid_acl(
+                    path,
+                    format!("ACE {index} SID exceeds the ACE"),
+                ));
+            }
+            let sid: PSID = sid_bytes.cast();
+            // SAFETY: the complete SID length derived from its bounded header
+            // fits inside this ACE.
+            if unsafe { IsValidSid(sid) } == 0 {
+                return Err(invalid_acl(path, format!("ACE {index} SID is invalid")));
+            }
+
+            let mut allowed_index = None;
+            for (candidate_index, candidate) in allowed.iter().enumerate() {
+                // SAFETY: sid and every candidate are valid live SIDs;
+                // EqualSid is read-only.
+                if unsafe { EqualSid(sid, *candidate) } != 0 {
+                    allowed_index = Some(candidate_index);
+                    break;
+                }
+            }
+            let Some(allowed_index) = allowed_index else {
+                return Err(invalid_acl(
+                    path,
+                    format!("ACE {index} grants access to a non-private trustee"),
+                ));
+            };
+            if allowed_index == 0 && ace.Mask & FILE_GENERIC_READ == FILE_GENERIC_READ {
+                current_user_can_read = true;
+            }
+        }
+
+        if !current_user_can_read {
+            return Err(invalid_acl(
+                path,
+                "current user has no complete file-read grant",
+            ));
+        }
+        Ok(protected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_leaf_link_probe_accepts_real_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("directory");
+        let file = temp.path().join("file");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, b"real").unwrap();
+
+        assert!(!path_leaf_is_symlink_or_reparse(&directory).unwrap());
+        assert!(!path_leaf_is_symlink_or_reparse(&file).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_leaf_link_probe_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(path_leaf_is_symlink_or_reparse(&link).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_private_acl_covers_stamped_objects_and_inherited_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let private = temp.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+
+        set_owner_private_permissions(&private).unwrap();
+        validate_owner_private_permissions(&private).unwrap();
+
+        // Atomic credential writers create a temporary child after the
+        // parent stamp and rename it into place. Its DACL is safely inherited
+        // (not independently protected), which the validator must recognize
+        // through the protected private parent.
+        let inherited = private.join("server.token.tmp");
+        std::fs::write(&inherited, b"secret").unwrap();
+        validate_owner_private_permissions(&inherited).unwrap();
+
+        // Files Intendant itself owns can be independently protected too.
+        set_owner_private_permissions(&inherited).unwrap();
+        validate_owner_private_permissions(&inherited).unwrap();
+    }
 
     /// Adjudication probe for the [`main_display_pixel_size`] unit contract
     /// (points, not backing pixels): run manually on new hardware/macOS
@@ -1734,6 +2311,14 @@ mod tests {
         ));
         // Absent entirely.
         assert!(!path_contains_dir(OsStr::new("/usr/bin:/bin"), target));
+    }
+
+    #[test]
+    fn tool_path_candidates_include_native_external_agent_installers() {
+        let home = std::path::Path::new("test-home");
+        let candidates = tool_path_candidates(home);
+        assert_eq!(candidates[0], home.join(".kimi-code").join("bin"));
+        assert_eq!(candidates[1], home.join(".local").join("bin"));
     }
 
     #[test]
@@ -1892,7 +2477,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn spawn_command_is_passthrough_on_unix() {
-        for name in ["codex", "gemini", "claude", "/usr/local/bin/codex"] {
+        for name in ["codex", "gemini", "claude", "kimi", "/usr/local/bin/codex"] {
             let cmd = spawn_command(name);
             assert_eq!(
                 cmd.as_std().get_program(),

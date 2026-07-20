@@ -248,7 +248,7 @@
 
             <div class="acc-section-head">
               <div class="acc-section-title">Agent accounts — this daemon</div>
-              <div class="acc-section-sub">Sign this machine's coding-agent CLIs (Claude Code, Codex) into their accounts without touching a terminal. The daemon drives each official sign-in on a private terminal it never shows to agents; the token exchange stays inside the CLI, and the credential lands in the CLI's own store on this machine. One sign-in ceremony runs at a time.</div>
+              <div class="acc-section-sub">Sign this machine's coding-agent CLIs (Claude Code, Codex, Kimi Code) into their accounts without touching a terminal. The daemon drives each official sign-in on a private terminal it never shows to agents; the token exchange stays inside the CLI, and the credential lands in the CLI's own store on this machine. One sign-in ceremony runs at a time.</div>
             </div>
             <div id="agent-signin-section"></div>
 
@@ -372,6 +372,7 @@
                   <option value="">None (internal agent)</option>
                   <option value="codex">Codex (OpenAI)</option>
                   <option value="claude-code">Claude Code (Anthropic)</option>
+                  <option value="kimi">Kimi Code (Moonshot AI)</option>
                 </select>
               </div>
               <div class="settings-row">
@@ -418,6 +419,60 @@
                 </select>
               </div>
               <div class="settings-row">
+                <label for="set-kimi-model-select">Kimi model</label>
+                <select id="set-kimi-model-select">
+                  <option value="">Kimi account default</option>
+                  <option value="kimi-code/kimi-for-coding">K2.7 Coding</option>
+                  <option value="kimi-code/kimi-for-coding-highspeed">K2.7 Coding Highspeed</option>
+                  <option value="kimi-code/k3">K3</option>
+                  <option value="__custom__">Custom model id…</option>
+                </select>
+              </div>
+              <div class="settings-row hidden" id="set-kimi-model-custom-row">
+                <label for="set-kimi-model-custom">Custom Kimi id</label>
+                <input id="set-kimi-model-custom" type="text" placeholder="e.g. kimi-code/kimi-for-coding" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="settings-row">
+                <label for="set-kimi-thinking">Kimi thinking</label>
+                <select id="set-kimi-thinking">
+                  <option value="">Model default</option>
+                  <option value="off">off</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                  <option value="max">max</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label for="set-kimi-permission-mode">Kimi permissions</label>
+                <select id="set-kimi-permission-mode">
+                  <option value="manual">manual</option>
+                  <option value="auto">auto</option>
+                  <option value="yolo">yolo</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label for="set-kimi-plan-mode">Kimi plan mode</label>
+                <input id="set-kimi-plan-mode" type="checkbox">
+              </div>
+              <div class="settings-row">
+                <label for="set-kimi-swarm-mode">Kimi swarm mode</label>
+                <input id="set-kimi-swarm-mode" type="checkbox">
+              </div>
+              <div class="settings-row">
+                <label for="set-kimi-tools-mode">Kimi active tools</label>
+                <select id="set-kimi-tools-mode">
+                  <option value="default">Kimi profile default</option>
+                  <option value="exact">Exact list</option>
+                  <option value="none">No optional tools</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label for="set-kimi-allowed-tools">Exact tool names</label>
+                <textarea id="set-kimi-allowed-tools" rows="3" autocomplete="off" spellcheck="false" placeholder="one per line, e.g. Read"></textarea>
+              </div>
+              <div class="settings-row">
                 <label>Codex binary</label>
                 <input id="set-codex-command" type="text" placeholder="codex or /usr/local/bin/codex" autocomplete="off">
               </div>
@@ -428,6 +483,10 @@
               <div class="settings-row">
                 <label>Claude binary</label>
                 <input id="set-claude-command" type="text" placeholder="claude or /usr/local/bin/claude" autocomplete="off">
+              </div>
+              <div class="settings-row">
+                <label>Kimi binary</label>
+                <input id="set-kimi-command" type="text" placeholder="kimi or /usr/local/bin/kimi" autocomplete="off">
               </div>
               <div class="settings-row">
                 <label>Codex tier</label>
@@ -649,7 +708,7 @@
                 <textarea id="set-sandbox-extra-paths" rows="3" placeholder="/absolute/path/one&#10;or/relative/to/the/project" spellcheck="false"></textarea>
               </div>
               <p class="settings-note">One path per line — absolute, or relative to the project root. Applies to new commands immediately.</p>
-              <p class="settings-note">External agents (Codex, Claude Code) use their own sandbox settings — see the session config.</p>
+              <p class="settings-note">External agents (Codex, Claude Code, Kimi Code) use their own permission/sandbox settings — see the session config.</p>
             </section>
           </div>
         </div>
@@ -856,6 +915,69 @@
         <option value="ultracode">ultracode</option>
       </select>
     </div>
+    <div class="session-config-row" id="session-config-kimi-model-row">
+      <label for="session-config-kimi-model">Kimi model</label>
+      <select id="session-config-kimi-model" onchange="onSessionConfigKimiModelChange()">
+        <option value="inherit">inherit Control default</option>
+        <option value="kimi-code/kimi-for-coding">K2.7 Coding</option>
+        <option value="kimi-code/kimi-for-coding-highspeed">K2.7 Coding Highspeed</option>
+        <option value="kimi-code/k3">K3</option>
+        <option value="__custom__">Custom model id…</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-kimi-model-custom-row" style="display:none">
+      <label for="session-config-kimi-model-custom">Custom id</label>
+      <input id="session-config-kimi-model-custom" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. kimi-code/kimi-for-coding">
+    </div>
+    <div class="session-config-row" id="session-config-kimi-thinking-row">
+      <label for="session-config-kimi-thinking">Thinking</label>
+      <select id="session-config-kimi-thinking">
+        <option value="inherit">inherit Control default</option>
+        <option value="off">off</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+        <option value="xhigh">xhigh</option>
+        <option value="max">max</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-kimi-permission-row">
+      <label for="session-config-kimi-permission-mode">Permissions</label>
+      <select id="session-config-kimi-permission-mode">
+        <option value="inherit">inherit Control default</option>
+        <option value="manual">manual</option>
+        <option value="auto">auto</option>
+        <option value="yolo">yolo</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-kimi-plan-row">
+      <label for="session-config-kimi-plan-mode">Plan mode</label>
+      <select id="session-config-kimi-plan-mode">
+        <option value="inherit">inherit Control default</option>
+        <option value="true">on</option>
+        <option value="false">off</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-kimi-swarm-row">
+      <label for="session-config-kimi-swarm-mode">Swarm mode</label>
+      <select id="session-config-kimi-swarm-mode">
+        <option value="inherit">inherit Control default</option>
+        <option value="true">on</option>
+        <option value="false">off</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-kimi-tools-mode-row">
+      <label for="session-config-kimi-tools-mode">Active tools</label>
+      <select id="session-config-kimi-tools-mode" onchange="onSessionConfigKimiToolsModeChange()">
+        <option value="inherit">inherit Control default</option>
+        <option value="exact">exact list</option>
+        <option value="none">no optional tools</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-kimi-tools-row">
+      <label for="session-config-kimi-allowed-tools">Exact names</label>
+      <textarea id="session-config-kimi-allowed-tools" rows="3" autocomplete="off" spellcheck="false" placeholder="Read, Write"></textarea>
+    </div>
     <div class="session-config-status" id="session-config-status"></div>
     <div class="modal-actions">
       <button class="modal-cancel" type="button" onclick="closeSessionConfigModal()">Cancel</button>
@@ -933,6 +1055,7 @@
         <option value="">Internal agent</option>
         <option value="codex">Codex</option>
         <option value="claude-code">Claude Code</option>
+        <option value="kimi">Kimi</option>
       </select>
     </div>
     <div class="session-config-row">

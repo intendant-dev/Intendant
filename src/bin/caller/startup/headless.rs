@@ -464,11 +464,13 @@ pub(crate) async fn run_headless_mode(
     let agent_backend = initial_agent_backend.clone();
     let shared_codex_config = shared_codex_config_from_project(&project);
     let shared_claude_config = shared_claude_config_from_project(&project);
+    let shared_kimi_config = shared_kimi_config_from_project(&project);
     let _control_plane_handle = control_plane::spawn(control_plane::ControlPlaneState {
         autonomy: autonomy.clone(),
         external_agent: shared_external_agent.clone(),
         codex_config: shared_codex_config.clone(),
         claude_config: shared_claude_config.clone(),
+        kimi_config: shared_kimi_config.clone(),
         bus: bus.clone(),
         project_root: Some(project.root.clone()),
     });
@@ -516,6 +518,7 @@ pub(crate) async fn run_headless_mode(
                     shared_external_agent: shared_external_agent.clone(),
                     shared_codex_config: shared_codex_config.clone(),
                     shared_claude_config: shared_claude_config.clone(),
+                    shared_kimi_config: shared_kimi_config.clone(),
                     frame_registry: frame_registry.clone(),
                     session_registry: Some(session_registry.clone()),
                     peer_registry: headless_peer_registry.clone(),
@@ -617,6 +620,7 @@ pub(crate) async fn run_headless_mode(
             shared_external_agent.clone(),
             shared_codex_config.clone(),
             shared_claude_config.clone(),
+            shared_kimi_config.clone(),
             if use_web { Some(web_port) } else { None },
             startup_external_resume_session.clone(),
             startup_external_resume_overrides,
@@ -727,6 +731,7 @@ pub(crate) async fn run_headless_mode(
             shared_external_agent: shared_external_agent.clone(),
             shared_codex_config: shared_codex_config.clone(),
             shared_claude_config: shared_claude_config.clone(),
+            shared_kimi_config: shared_kimi_config.clone(),
             frame_registry: frame_registry.clone(),
             session_registry: Some(session_registry.clone()),
             peer_registry: headless_peer_registry.clone(),

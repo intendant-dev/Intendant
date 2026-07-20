@@ -607,7 +607,7 @@ impl GitVitalsProber {
 /// backend-native id announced mid-flight by `SessionIdentity` — and the
 /// two vitals producers arrive keyed by *different* members of that pair
 /// (git probes ride the registered wrapper id, usage snapshots the id the
-/// drain stamps, native for Codex/Claude Code). Without folding, each
+/// drain stamps, native for Codex/Claude Code/Kimi Code). Without folding, each
 /// logical session holds two half-empty hub entries whose emissions
 /// overwrite each other on the frontend (the identity-seam drop class:
 /// the git family blanks to "not reported" the moment usage wins the
@@ -820,7 +820,7 @@ fn cache_vitals_from_usage(
 /// Bus listener feeding the cache and activity sections: every backend's
 /// usage rail converges on `AppEvent::UsageSnapshot` and every activity
 /// machine on `AppEvent::SessionActivity`, so this one consumer covers
-/// native, Claude Code, and Codex sessions alike. `SessionIdentity`
+/// native, Claude Code, Codex, and Kimi Code sessions alike. `SessionIdentity`
 /// linkages feed the hub's alias map so usage keyed by the backend-native
 /// id and git probes keyed by the wrapper id land in one entry (split
 /// entries emit half-empty snapshots that blank each other's chips).
@@ -1277,7 +1277,7 @@ pub(crate) fn spawn_session_vitals_producer(
 ///   its activity-locus state, retargeting the probe when the work moved
 ///   into a different checkout (see [`GitTarget::observe_write_activity`]).
 /// - `SessionCwdAnnounced` seeds the locus from the backend's own
-///   working-directory statement (Claude Code's `system:init` echo, Codex
+///   working-directory statement (Claude Code's `system:init` echo, Codex/Kimi
 ///   applied thread settings) — authoritative, so it retargets
 ///   immediately (see [`GitTarget::seed_locus`]).
 ///

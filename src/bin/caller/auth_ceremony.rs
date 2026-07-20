@@ -3,13 +3,13 @@
 //! One provider-tagged state machine drives every "sign this daemon's
 //! agent CLI into an account" flow ([`crate::claude_auth_ceremony`] for
 //! `claude auth login`, [`crate::codex_auth_ceremony`] for
-//! `codex login --device-auth`). The per-provider drivers own the spawn,
-//! the output parsing, and the custody tier gate; this module owns what
-//! must be uniform across them:
+//! `codex login --device-auth`, and [`crate::kimi_auth_ceremony`] for
+//! `kimi login`). The per-provider drivers own the spawn, output parsing,
+//! and custody tier gate; this module owns what must be uniform across them:
 //!
 //! - **Single-flight is daemon-wide.** One credential ceremony runs at a
-//!   time, ever — a running Claude ceremony refuses a Codex start and
-//!   vice versa. The single global [`manager`] slot is the mechanism.
+//!   time, ever — a running ceremony refuses every other provider's start.
+//!   The single global [`manager`] slot is the mechanism.
 //! - The private-PTY transport and its reaping (cancel, timeout, late
 //!   exits), with per-ceremony timeouts (each provider's flow carries
 //!   its own deadline — the device code's expiry for Codex).
@@ -44,6 +44,7 @@ const CODE_MAX_LEN: usize = 512;
 pub(crate) enum Provider {
     Claude,
     Codex,
+    Kimi,
 }
 
 impl Provider {
@@ -51,6 +52,7 @@ impl Provider {
         match self {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
+            Provider::Kimi => "kimi",
         }
     }
 
@@ -61,6 +63,7 @@ impl Provider {
         match self {
             Provider::Claude => Duration::from_secs(5 * 60),
             Provider::Codex => Duration::from_secs(15 * 60),
+            Provider::Kimi => Duration::from_secs(15 * 60),
         }
     }
 }
@@ -77,8 +80,8 @@ pub(crate) enum CeremonyPhase {
     /// shown; waiting for the owner to complete the browser step (the
     /// CLI polls its server on its own — nothing is typed back).
     AwaitingUser,
-    /// Waiting for the CLI's verdict (Claude: code written; Codex: the
-    /// CLI exited and the status probe is deciding).
+    /// Waiting for the CLI's verdict (Claude: code written; Codex/Kimi:
+    /// the CLI exited and the status probe is deciding).
     Verifying,
     Success,
     Failed,
@@ -113,7 +116,8 @@ impl CeremonyPhase {
 }
 
 /// Account facts from the provider CLI's own status probe after a
-/// successful login (`claude auth status` / `codex login status`).
+/// successful login (`claude auth status`, `codex login status`, or
+/// Kimi's credential-file probe).
 /// Fields a provider cannot report stay `None`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CeremonyAccount {
@@ -1231,9 +1235,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn idle_status_is_idle_for_both_providers() {
+    fn idle_status_is_idle_for_all_providers() {
         let manager = CeremonyManager::default();
-        for provider in [Provider::Claude, Provider::Codex] {
+        for provider in [Provider::Claude, Provider::Codex, Provider::Kimi] {
             assert_eq!(
                 manager.status_value_for(provider),
                 serde_json::json!({"phase": "idle"})

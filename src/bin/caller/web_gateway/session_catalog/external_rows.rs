@@ -380,6 +380,7 @@ pub(crate) fn pretty_external_source_label(source: &str) -> String {
         "codex" => "Codex".to_string(),
         "claude-code" => "Claude Code".to_string(),
         "gemini" => "Gemini CLI".to_string(),
+        "kimi" => "Kimi".to_string(),
         "intendant" => "Intendant".to_string(),
         other => other.to_string(),
     }

@@ -139,6 +139,25 @@ pub(crate) fn file_dependency_fingerprint(path: &Path) -> String {
     }
 }
 
+/// Stable, bounded cache dependency for a logical record spread across
+/// several files (Kimi's state + per-agent wires). Paths are normalized and
+/// sorted before hashing, so directory enumeration order cannot churn keys.
+pub(crate) fn files_dependency_fingerprint<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> String {
+    let mut dependencies = paths
+        .into_iter()
+        .map(file_dependency_fingerprint)
+        .collect::<Vec<_>>();
+    dependencies.sort();
+    let digest = ring::digest::digest(&ring::digest::SHA256, dependencies.join("\n").as_bytes());
+    let mut encoded = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
+}
+
 pub(crate) fn session_list_cache_key(
     namespace: &'static str,
     path: &Path,
@@ -223,6 +242,8 @@ pub(crate) fn persisted_namespace_schema(namespace: &str) -> u32 {
         // v2: usage includes GPT-5.6 cache writes; v1 would deserialize the
         // new bucket as zero and preserve an understated historical cost.
         "codex" => 2,
+        // v1: directory-spanning dependency key (state + selected wire).
+        "kimi" => 1,
         _ => 0,
     }
 }
@@ -370,10 +391,11 @@ pub(crate) fn preload_session_index() {
     static PRELOADED: std::sync::Once = std::sync::Once::new();
     PRELOADED.call_once(|| {
         let base = session_index_dir();
-        let namespaces: [(&'static str, PreloadApply); 4] = [
+        let namespaces: [(&'static str, PreloadApply); 5] = [
             ("codex", preload_codex_entry),
             ("claude-code", preload_row_entry),
             ("gemini", preload_row_entry),
+            ("kimi", preload_row_entry),
             ("codex-parent-baseline", preload_baseline_entry),
         ];
         std::thread::scope(|scope| {

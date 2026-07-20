@@ -24,7 +24,16 @@ impl SessionSupervisor {
         };
 
         if let Some((managed_id, managed_source)) = managed.as_ref() {
-            if managed_source == "codex" {
+            let supports_native_rename = external_agent::AgentBackend::from_str_loose(
+                managed_source,
+            )
+            .is_some_and(|backend| {
+                matches!(
+                    backend,
+                    external_agent::AgentBackend::Codex | external_agent::AgentBackend::Kimi
+                )
+            });
+            if supports_native_rename {
                 self.config.bus.send(AppEvent::ControlCommand(
                     event::ControlMsg::CodexThreadAction {
                         session_id: Some(managed_id.clone()),
@@ -153,6 +162,7 @@ impl SessionSupervisor {
         }
         let is_codex = matches!(backend, external_agent::AgentBackend::Codex);
         let is_claude = matches!(backend, external_agent::AgentBackend::ClaudeCode);
+        let is_kimi = matches!(backend, external_agent::AgentBackend::Kimi);
         let clear_codex_sandbox =
             is_codex && session_config_clear_value(overrides.codex_sandbox.as_deref());
         let clear_codex_approval_policy =
@@ -178,6 +188,25 @@ impl SessionSupervisor {
             is_claude && session_config_clear_value(overrides.claude_allowed_tools.as_deref());
         let clear_claude_effort =
             is_claude && session_config_clear_value(overrides.claude_effort.as_deref());
+        let clear_kimi_model =
+            is_kimi && session_config_clear_value(overrides.kimi_model.as_deref());
+        let clear_kimi_thinking =
+            is_kimi && session_config_clear_value(overrides.kimi_thinking.as_deref());
+        let clear_kimi_permission_mode = is_kimi
+            && session_config_clear_value_keeping_default(
+                overrides.kimi_permission_mode.as_deref(),
+            );
+        let clear_kimi_allowed_tools = is_kimi
+            && overrides
+                .kimi_allowed_tools
+                .as_deref()
+                .is_some_and(|tools| {
+                    crate::session_config::normalize_kimi_allowed_tools(Some(tools)).is_none()
+                });
+        let clear_kimi_plan_mode =
+            is_kimi && session_config_clear_value(overrides.kimi_plan_mode.as_deref());
+        let clear_kimi_swarm_mode =
+            is_kimi && session_config_clear_value(overrides.kimi_swarm_mode.as_deref());
         let mut config = crate::session_config::from_wire_fields(
             overrides.as_wire_fields(backend.as_short_str()),
         );
@@ -229,6 +258,24 @@ impl SessionSupervisor {
         }
         if clear_claude_effort {
             config.claude_effort = None;
+        }
+        if clear_kimi_model {
+            config.kimi_model = None;
+        }
+        if clear_kimi_thinking {
+            config.kimi_thinking = None;
+        }
+        if clear_kimi_permission_mode {
+            config.kimi_permission_mode = None;
+        }
+        if clear_kimi_allowed_tools {
+            config.kimi_allowed_tools = None;
+        }
+        if clear_kimi_plan_mode {
+            config.kimi_plan_mode = None;
+        }
+        if clear_kimi_swarm_mode {
+            config.kimi_swarm_mode = None;
         }
         if config.is_empty() {
             let message = "Session config failed: no launch settings supplied".to_string();
@@ -498,7 +545,7 @@ impl SessionAgentSelection {
             .map(Self::External)
             .ok_or_else(|| {
                 format!(
-                    "unknown agent '{}' (expected internal, codex, or claude-code)",
+                    "unknown agent '{}' (expected internal, codex, claude-code, or kimi)",
                     trimmed
                 )
             })
@@ -545,6 +592,12 @@ pub(crate) struct LaunchOverrides {
     pub(crate) claude_permission_mode: Option<String>,
     pub(crate) claude_allowed_tools: Option<String>,
     pub(crate) claude_effort: Option<String>,
+    pub(crate) kimi_model: Option<String>,
+    pub(crate) kimi_thinking: Option<String>,
+    pub(crate) kimi_permission_mode: Option<String>,
+    pub(crate) kimi_allowed_tools: Option<String>,
+    pub(crate) kimi_plan_mode: Option<String>,
+    pub(crate) kimi_swarm_mode: Option<String>,
     /// Internal-only anchor-fork parameters (set by the supervisor's fork
     /// orchestrator, never parsed from any wire message — deliberately
     /// absent from `as_wire_fields`, so `ResumeSession` senders cannot
@@ -560,6 +613,8 @@ pub(crate) struct LaunchOverrides {
     pub(crate) codex_fork_rollback_turns: Option<u32>,
     pub(crate) codex_fork_rollback_item_id: Option<String>,
     pub(crate) codex_fork_rollback_position: Option<String>,
+    pub(crate) kimi_fork_rollback_turns: Option<u32>,
+    pub(crate) kimi_fork_expected_horizon: Option<String>,
 }
 
 impl LaunchOverrides {
@@ -587,6 +642,12 @@ impl LaunchOverrides {
             claude_permission_mode: self.claude_permission_mode.as_deref(),
             claude_allowed_tools: self.claude_allowed_tools.as_deref(),
             claude_effort: self.claude_effort.as_deref(),
+            kimi_model: self.kimi_model.as_deref(),
+            kimi_thinking: self.kimi_thinking.as_deref(),
+            kimi_permission_mode: self.kimi_permission_mode.as_deref(),
+            kimi_allowed_tools: self.kimi_allowed_tools.as_deref(),
+            kimi_plan_mode: self.kimi_plan_mode.as_deref(),
+            kimi_swarm_mode: self.kimi_swarm_mode.as_deref(),
         }
     }
 
@@ -620,6 +681,12 @@ impl LaunchOverrides {
         }
         if self.codex_fork_rollback_position.is_some() {
             config.codex_fork_rollback_position = self.codex_fork_rollback_position.clone();
+        }
+        if self.kimi_fork_rollback_turns.is_some() {
+            config.kimi_fork_rollback_turns = self.kimi_fork_rollback_turns;
+        }
+        if self.kimi_fork_expected_horizon.is_some() {
+            config.kimi_fork_expected_horizon = self.kimi_fork_expected_horizon.clone();
         }
     }
 }
@@ -674,6 +741,9 @@ pub(crate) fn apply_session_agent_command(
         }
         external_agent::AgentBackend::ClaudeCode => {
             project.config.agent.claude_code.command = command;
+        }
+        external_agent::AgentBackend::Kimi => {
+            project.config.agent.kimi.command = command;
         }
     }
 }
@@ -734,6 +804,93 @@ pub(crate) fn apply_session_claude_effort(
             Ok(())
         }
         _ => Err("claude_effort requires Claude Code".to_string()),
+    }
+}
+
+pub(crate) fn apply_session_kimi_model(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    model: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Kimi => {
+            project.config.agent.kimi.model = Some(model);
+            Ok(())
+        }
+        _ => Err("kimi_model requires Kimi".to_string()),
+    }
+}
+
+pub(crate) fn apply_session_kimi_thinking(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    thinking: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Kimi => {
+            project.config.agent.kimi.thinking =
+                crate::project::normalize_kimi_thinking(Some(&thinking));
+            Ok(())
+        }
+        _ => Err("kimi_thinking requires Kimi".to_string()),
+    }
+}
+
+pub(crate) fn apply_session_kimi_permission_mode(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    mode: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Kimi => {
+            project.config.agent.kimi.permission_mode =
+                crate::project::normalize_kimi_permission_mode(&mode);
+            Ok(())
+        }
+        _ => Err("kimi_permission_mode requires Kimi".to_string()),
+    }
+}
+
+pub(crate) fn apply_session_kimi_allowed_tools(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    tools: Vec<String>,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Kimi => {
+            project.config.agent.kimi.allowed_tools =
+                Some(crate::project::normalize_kimi_allowed_tools(&tools));
+            Ok(())
+        }
+        _ => Err("kimi_allowed_tools requires Kimi".to_string()),
+    }
+}
+
+pub(crate) fn apply_session_kimi_plan_mode(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    enabled: bool,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Kimi => {
+            project.config.agent.kimi.plan_mode = enabled;
+            Ok(())
+        }
+        _ => Err("kimi_plan_mode requires Kimi".to_string()),
+    }
+}
+
+pub(crate) fn apply_session_kimi_swarm_mode(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    enabled: bool,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Kimi => {
+            project.config.agent.kimi.swarm_mode = enabled;
+            Ok(())
+        }
+        _ => Err("kimi_swarm_mode requires Kimi".to_string()),
     }
 }
 
@@ -842,6 +999,13 @@ pub(crate) fn effective_session_agent_config_from_project(
             }
         }
     }
+    if matches!(backend, external_agent::AgentBackend::Kimi) {
+        if let Some(overrides) = overrides {
+            if overrides.kimi_home.is_some() {
+                config.kimi_home = overrides.kimi_home.clone();
+            }
+        }
+    }
     // Fork lineage is a per-session fact, never derivable from the project.
     if let Some(overrides) = overrides {
         if overrides.forked_from.is_some() {
@@ -867,6 +1031,12 @@ pub(crate) fn effective_session_agent_config_from_project(
         }
         if overrides.codex_fork_rollback_position.is_some() {
             config.codex_fork_rollback_position = overrides.codex_fork_rollback_position.clone();
+        }
+        if overrides.kimi_fork_rollback_turns.is_some() {
+            config.kimi_fork_rollback_turns = overrides.kimi_fork_rollback_turns;
+        }
+        if overrides.kimi_fork_expected_horizon.is_some() {
+            config.kimi_fork_expected_horizon = overrides.kimi_fork_expected_horizon.clone();
         }
     }
     config
@@ -965,6 +1135,27 @@ mod tests {
             config.codex_fork_rollback_position.as_deref(),
             Some("after")
         );
+
+        let kimi_overrides = crate::session_config::SessionAgentConfig {
+            forked_from: Some("session_parent".to_string()),
+            fork_relationship: Some("anchor-fork".to_string()),
+            fork_anchor: Some("{\"kind\":\"turn-boundary\",\"turn\":2}".to_string()),
+            kimi_fork_rollback_turns: Some(4),
+            kimi_fork_expected_horizon: Some("{\"active_turns\":6}".to_string()),
+            kimi_home: Some("/tmp/private-kimi-bridge".to_string()),
+            ..Default::default()
+        };
+        let kimi = effective_session_agent_config_from_project(
+            &external_agent::AgentBackend::Kimi,
+            &project,
+            Some(&kimi_overrides),
+        );
+        assert_eq!(kimi.kimi_fork_rollback_turns, Some(4));
+        assert_eq!(
+            kimi.kimi_fork_expected_horizon.as_deref(),
+            Some("{\"active_turns\":6}")
+        );
+        assert_eq!(kimi.kimi_home.as_deref(), Some("/tmp/private-kimi-bridge"));
     }
 
     #[tokio::test]
@@ -1005,6 +1196,44 @@ mod tests {
                 .map(|session| session.phase.as_str()),
             Some("thinking")
         );
+    }
+
+    #[tokio::test]
+    async fn kimi_managed_rename_dispatches_native_thread_action() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "kimi-session".to_string(),
+                managed_session("kimi-session", "kimi"),
+            );
+        }
+
+        supervisor
+            .rename_session(
+                "kimi-session".to_string(),
+                Some("kimi-session".to_string()),
+                Some("kimi".to_string()),
+                "Native Kimi title".to_string(),
+            )
+            .await;
+
+        let event = events.recv().await.expect("native rename action");
+        match event {
+            AppEvent::ControlCommand(event::ControlMsg::CodexThreadAction {
+                session_id,
+                op,
+                params,
+                ..
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("kimi-session"));
+                assert_eq!(op, "rename");
+                assert_eq!(params["name"], "Native Kimi title");
+            }
+            other => panic!("unexpected rename event: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1156,6 +1385,10 @@ mod tests {
             SessionAgentSelection::from_wire(Some("internal")).unwrap(),
             SessionAgentSelection::Internal
         );
+        assert_eq!(
+            SessionAgentSelection::from_wire(Some("kimi-code")).unwrap(),
+            SessionAgentSelection::External(external_agent::AgentBackend::Kimi)
+        );
         // Retired backend: "gemini" must no longer resolve to a live backend.
         assert!(SessionAgentSelection::from_wire(Some("gemini")).is_err());
         assert!(SessionAgentSelection::from_wire(Some("unknown")).is_err());
@@ -1259,6 +1492,86 @@ mod tests {
         assert!(cross.claude_permission_mode.is_none());
         assert!(cross.claude_allowed_tools.is_none());
         assert!(cross.claude_effort.is_none());
+
+        let kimi_overrides = LaunchOverrides {
+            agent_command: Some("/tmp/kimi".to_string()),
+            kimi_model: Some("k2.7 coding".to_string()),
+            kimi_thinking: Some("high".to_string()),
+            kimi_permission_mode: Some("yolo".to_string()),
+            kimi_allowed_tools: Some("Read,\nWrite,Read".to_string()),
+            kimi_plan_mode: Some("true".to_string()),
+            kimi_swarm_mode: Some("enabled".to_string()),
+            ..Default::default()
+        };
+        let kimi =
+            crate::session_config::from_wire_fields(kimi_overrides.as_wire_fields("kimi-code"));
+        assert_eq!(kimi.agent_command.as_deref(), Some("/tmp/kimi"));
+        assert_eq!(kimi.kimi_model.as_deref(), Some("k2.7 coding"));
+        assert_eq!(kimi.kimi_thinking.as_deref(), Some("high"));
+        assert_eq!(kimi.kimi_permission_mode.as_deref(), Some("yolo"));
+        assert_eq!(
+            kimi.kimi_allowed_tools.as_deref(),
+            Some(&["Read".to_string(), "Write".to_string()][..])
+        );
+        assert_eq!(kimi.kimi_plan_mode, Some(true));
+        assert_eq!(kimi.kimi_swarm_mode, Some(true));
+        let cross = crate::session_config::from_wire_fields(kimi_overrides.as_wire_fields("codex"));
+        assert!(cross.kimi_model.is_none());
+        assert!(cross.kimi_thinking.is_none());
+        assert!(cross.kimi_permission_mode.is_none());
+        assert!(cross.kimi_allowed_tools.is_none());
+        assert!(cross.kimi_plan_mode.is_none());
+        assert!(cross.kimi_swarm_mode.is_none());
+    }
+
+    #[test]
+    fn applies_all_session_kimi_controls_to_kimi_only() {
+        let mut project = Project {
+            root: PathBuf::from("/tmp/project"),
+            config: crate::project::ProjectConfig::default(),
+        };
+        let kimi = external_agent::AgentBackend::Kimi;
+        apply_session_kimi_model(&mut project, &kimi, "k2.7 coding".to_string()).unwrap();
+        apply_session_kimi_thinking(&mut project, &kimi, " HIGH ".to_string()).unwrap();
+        apply_session_kimi_permission_mode(&mut project, &kimi, "bypass-permissions".to_string())
+            .unwrap();
+        apply_session_kimi_allowed_tools(
+            &mut project,
+            &kimi,
+            vec![
+                " Read ".to_string(),
+                "Write".to_string(),
+                "Read".to_string(),
+            ],
+        )
+        .unwrap();
+        apply_session_kimi_plan_mode(&mut project, &kimi, true).unwrap();
+        apply_session_kimi_swarm_mode(&mut project, &kimi, true).unwrap();
+        assert_eq!(
+            project.config.agent.kimi.model.as_deref(),
+            Some("k2.7 coding")
+        );
+        assert_eq!(project.config.agent.kimi.thinking.as_deref(), Some("high"));
+        assert_eq!(project.config.agent.kimi.permission_mode, "yolo");
+        assert_eq!(
+            project.config.agent.kimi.allowed_tools.as_deref(),
+            Some(&["Read".to_string(), "Write".to_string()][..])
+        );
+        assert!(project.config.agent.kimi.plan_mode);
+        assert!(project.config.agent.kimi.swarm_mode);
+
+        let codex = external_agent::AgentBackend::Codex;
+        for error in [
+            apply_session_kimi_model(&mut project, &codex, "model".to_string()).unwrap_err(),
+            apply_session_kimi_thinking(&mut project, &codex, "high".to_string()).unwrap_err(),
+            apply_session_kimi_permission_mode(&mut project, &codex, "auto".to_string())
+                .unwrap_err(),
+            apply_session_kimi_allowed_tools(&mut project, &codex, Vec::new()).unwrap_err(),
+            apply_session_kimi_plan_mode(&mut project, &codex, false).unwrap_err(),
+            apply_session_kimi_swarm_mode(&mut project, &codex, false).unwrap_err(),
+        ] {
+            assert!(error.contains("requires Kimi"), "got: {error}");
+        }
     }
 
     #[test]

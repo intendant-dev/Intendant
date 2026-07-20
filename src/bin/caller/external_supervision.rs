@@ -364,6 +364,13 @@ pub(crate) fn claude_runtime_config_equal(
         && a.allowed_tools == b.allowed_tools
 }
 
+pub(crate) fn kimi_runtime_config_equal(
+    a: &control_plane::KimiRuntimeConfig,
+    b: &control_plane::KimiRuntimeConfig,
+) -> bool {
+    a == b
+}
+
 pub(crate) fn normalize_diff_file_path(path: &str) -> Option<String> {
     let path = path.split('\t').next().unwrap_or(path).trim();
     if path == "/dev/null" {
@@ -711,6 +718,18 @@ pub(crate) async fn create_external_agent(
 > {
     use external_agent::{AgentBackend, AgentConfig};
 
+    // Select and hold a leased OAuth home before any backend constructor can
+    // spawn. Expiry/revocation during initialize/start_thread parks cleanup;
+    // success atomically promotes this provisional nonce to the real wrapper
+    // and backend identities below, while every `?` error drops the guard and
+    // re-sweeps.
+    let leased_home_startup =
+        crate::credential_leases::hold_leased_home_for_external_startup(backend.as_short_str())
+            .map_err(|error| {
+                CallerError::ExternalAgent(format!(
+                    "prepare leased credential home for {backend}: {error}"
+                ))
+            })?;
     let mcp_session_id = mcp_session_id.or_else(|| session_log_id(session_log));
     let mcp_auth_token =
         web_port.map(|_| crate::web_gateway::loopback_mcp_auth_token().to_string());
@@ -849,6 +868,9 @@ pub(crate) async fn create_external_agent(
                 fork_resume,
                 fork_from_rollout_path: codex_fork_rollout_path.clone(),
                 fork_cut: codex_fork_cut.clone(),
+                kimi_fork_rollback_turns: None,
+                kimi_fork_expected_horizon: None,
+                kimi_allowed_tools: None,
                 codex_home,
                 protocol_watch,
             };
@@ -897,6 +919,62 @@ pub(crate) async fn create_external_agent(
                 fork_resume,
                 fork_from_rollout_path: None,
                 fork_cut: None,
+                kimi_fork_rollback_turns: None,
+                kimi_fork_expected_horizon: None,
+                kimi_allowed_tools: None,
+                codex_home: None,
+                protocol_watch,
+            };
+            (agent, config)
+        }
+        AgentBackend::Kimi => {
+            let cfg = &project.config.agent.kimi;
+            let protocol_watch = external_agent::protocol_watch::ProtocolWatchHandle::new_in(
+                crate::platform::intendant_home(),
+                AgentBackend::Kimi,
+                "server-v1",
+                &cfg.command,
+            );
+            let launch = external_agent::kimi_code::KimiLaunchConfig {
+                model: cfg.model.clone(),
+                thinking: project::normalize_kimi_thinking(cfg.thinking.as_deref()),
+                permission_mode: project::normalize_kimi_permission_mode(&cfg.permission_mode),
+                allowed_tools: cfg.allowed_tools.clone(),
+                plan_mode: cfg.plan_mode,
+                swarm_mode: cfg.swarm_mode,
+            };
+            let agent = Box::new(external_agent::kimi_code::KimiCodeAgent::new(
+                cfg.command.clone(),
+                launch,
+                web_port,
+            ));
+            let config = AgentConfig {
+                model: cfg.model.clone(),
+                working_dir: project.root.clone(),
+                request_trace_dir: None,
+                request_trace_temporary: false,
+                context_archive: "off".to_string(),
+                approval_policy: project::normalize_kimi_permission_mode(&cfg.permission_mode),
+                sandbox: String::new(),
+                reasoning_effort: project::normalize_kimi_thinking(cfg.thinking.as_deref()),
+                service_tier: None,
+                web_search: false,
+                network_access: false,
+                writable_roots: Vec::new(),
+                codex_managed_context: false,
+                web_port,
+                mcp_auth_token: mcp_auth_token.clone(),
+                dns_credential_env: crate::credential_leases::configured_dns_credential_child_scrub(
+                ),
+                dns_credential_store,
+                mcp_session_id: mcp_session_id.clone(),
+                resume_session: resume_session.clone(),
+                fork_resume,
+                fork_from_rollout_path: None,
+                fork_cut: None,
+                kimi_fork_rollback_turns: cfg.kimi_fork_rollback_turns,
+                kimi_fork_expected_horizon: cfg.kimi_fork_expected_horizon.clone(),
+                kimi_allowed_tools: cfg.allowed_tools.clone(),
                 codex_home: None,
                 protocol_watch,
             };
@@ -904,10 +982,80 @@ pub(crate) async fn create_external_agent(
         }
     };
 
-    let event_rx = agent.initialize(config).await?;
+    let event_rx = crate::credential_leases::scope_leased_home_for_external_startup(
+        leased_home_startup.as_ref(),
+        agent.initialize(config),
+    )
+    .await?;
     slog(session_log, |l| l.debug("External agent initialized"));
 
+    // Kimi's native session history is written below a per-wrapper bridge,
+    // not necessarily the user's default KIMI_CODE_HOME. Persist that exact
+    // prepared root before start_thread can create or mutate native history:
+    // if the daemon exits during the first attach/create RPC, the next
+    // catalog/search/fork-point reader can still recover the bridge. The
+    // config writer is atomic; failure is fail-closed so we never knowingly
+    // create history that Intendant cannot rediscover.
+    if *backend == AgentBackend::Kimi {
+        let persistence = (|| {
+            let mut launch = agent.launch_config_snapshot().ok_or_else(|| {
+                "Kimi adapter did not expose its prepared launch config".to_string()
+            })?;
+            if launch.kimi_home.is_none() {
+                return Err("Kimi adapter did not expose its prepared bridge home".to_string());
+            }
+            let log_dir = session_log
+                .lock()
+                .map_err(|_| "session log lock poisoned".to_string())?
+                .dir()
+                .to_path_buf();
+            if let Some(existing) = crate::session_config::read_log_dir_config(&log_dir) {
+                launch.merge_missing_from(existing);
+            }
+            crate::session_config::write_log_dir_config(&log_dir, &launch)?;
+            if let Some(resume) = resume_session
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                crate::session_config::write_external_overlay(
+                    &crate::platform::home_dir(),
+                    "kimi",
+                    resume,
+                    &launch,
+                )?;
+            }
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = persistence {
+            let _ = agent.shutdown().await;
+            return Err(CallerError::ExternalAgent(format!(
+                "persist prepared Kimi bridge home: {error}"
+            )));
+        }
+    }
+
     let thread = agent.start_thread().await?;
+    if let Some(mut startup) = leased_home_startup {
+        let canonical_backend_id = if backend.thread_id_is_canonical(&thread.thread_id) {
+            thread.thread_id.as_str()
+        } else {
+            ""
+        };
+        if let Err(error) = startup.promote(&[
+            mcp_session_id.as_deref().unwrap_or_default(),
+            canonical_backend_id,
+        ]) {
+            // Revocation deliberately refuses promotion. Stop the process
+            // while the provisional hold still pins its home, then Drop the
+            // hold so queued cleanup cannot race a final credential refresh.
+            let _ = agent.shutdown().await;
+            drop(startup);
+            return Err(CallerError::ExternalAgent(format!(
+                "register lease-backed external session: {error}"
+            )));
+        }
+    }
     slog(session_log, |l| {
         l.debug(&format!("External agent thread: {}", thread.thread_id))
     });
@@ -1192,6 +1340,21 @@ pub(crate) fn shared_claude_config_from_project(
             allowed_tools: cfg.allowed_tools.clone(),
         },
     ))
+}
+
+pub(crate) fn shared_kimi_config_from_project(
+    project: &Project,
+) -> control_plane::SharedKimiConfig {
+    let cfg = &project.config.agent.kimi;
+    Arc::new(tokio::sync::RwLock::new(control_plane::KimiRuntimeConfig {
+        command: cfg.command.clone(),
+        model: cfg.model.clone(),
+        thinking: project::normalize_kimi_thinking(cfg.thinking.as_deref()),
+        permission_mode: project::normalize_kimi_permission_mode(&cfg.permission_mode),
+        allowed_tools: cfg.allowed_tools.clone(),
+        plan_mode: cfg.plan_mode,
+        swarm_mode: cfg.swarm_mode,
+    }))
 }
 
 /// Live Codex config for the control plane — seeded from TOML, updated

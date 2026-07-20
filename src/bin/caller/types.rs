@@ -750,6 +750,29 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         allowed_tools: Option<Vec<String>>,
     },
+    /// Mirror of `CodexConfigChanged` for Kimi.
+    KimiConfigChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        model_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        thinking_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        plan_mode: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        swarm_mode: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_tools: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allowed_tools_cleared: bool,
+    },
     Usage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
@@ -1032,8 +1055,8 @@ pub enum OutboundEvent {
     /// The agent's conversation was rolled back to a specific round.
     /// Emitted after `POST /api/session/current/rollback` with
     /// `revert_conversation: true`. `backend` is one of "native",
-    /// "codex", "claude-code", "gemini"; `method` is "truncated"
-    /// (native / Codex `thread/rollback`) or "session-reset"
+    /// "codex", "claude-code", "kimi", "gemini"; `method` is "truncated"
+    /// (native / Codex `thread/rollback` / Kimi `undo`) or "session-reset"
     /// (CC / Gemini re-init).
     ConversationRolledBack {
         #[serde(default, skip_serializing_if = "Option::is_none")]

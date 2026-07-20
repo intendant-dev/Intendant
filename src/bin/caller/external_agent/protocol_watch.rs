@@ -314,6 +314,88 @@ const CODEX_ITEM_TYPES: &[&str] = &[
     "function_call_output",
 ];
 
+// Kimi Code 0.27.0's server-v1 WebSocket event vocabulary. The adapter
+// consumes a subset, but the watch distinguishes known ignorable additions
+// from genuinely novel wire shapes.
+const KIMI_SERVER_EVENT_TYPES: &[&str] = &[
+    "error",
+    "warning",
+    "agent.status.updated",
+    "session.meta.updated",
+    "event.session.created",
+    "event.workspace.created",
+    "event.workspace.updated",
+    "event.workspace.deleted",
+    "event.session.work_changed",
+    "event.session.status_changed",
+    "event.session.updated",
+    "event.session.deleted",
+    "event.session.usage_updated",
+    "event.session.history_compacted",
+    "event.approval.requested",
+    "event.approval.resolved",
+    "event.approval.expired",
+    "event.question.requested",
+    "event.question.answered",
+    "event.question.dismissed",
+    "event.config.changed",
+    "event.model_catalog.changed",
+    "event.fs.changed",
+    "event.goal.updated",
+    "event.message.created",
+    "event.message.updated",
+    "event.assistant.delta",
+    "event.assistant.tool_use_started",
+    "event.assistant.tool_use_delta",
+    "event.assistant.tool_use_completed",
+    "event.assistant.completed",
+    "event.tool.started",
+    "event.tool.output",
+    "event.tool.progress",
+    "event.tool.completed",
+    "event.task.created",
+    "event.task.progress",
+    "event.task.completed",
+    "goal.updated",
+    "skill.activated",
+    "plugin_command.activated",
+    "turn.started",
+    "turn.ended",
+    "turn.step.started",
+    "turn.step.completed",
+    "turn.step.retrying",
+    "turn.step.interrupted",
+    "assistant.delta",
+    "hook.result",
+    "thinking.delta",
+    "tool.call.delta",
+    "tool.call.started",
+    "tool.progress",
+    "shell.output",
+    "shell.started",
+    "tool.result",
+    "tool.list.updated",
+    "mcp.server.status",
+    "subagent.spawned",
+    "subagent.started",
+    "subagent.suspended",
+    "subagent.completed",
+    "subagent.failed",
+    "compaction.started",
+    "compaction.blocked",
+    "compaction.cancelled",
+    "compaction.completed",
+    "task.started",
+    "task.terminated",
+    "background.task.started",
+    "background.task.terminated",
+    "cron.fired",
+    "prompt.submitted",
+    "prompt.completed",
+    "prompt.aborted",
+    "prompt.steered",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProtocolSurface {
@@ -334,6 +416,8 @@ pub(crate) enum ProtocolSurface {
     CodexServerRequest,
     CodexUnsupportedServerRequest,
     CodexItemType,
+    KimiRootField,
+    KimiEvent,
     MonitorCapacity,
 }
 
@@ -357,6 +441,8 @@ impl ProtocolSurface {
             Self::CodexServerRequest => "codex_server_request",
             Self::CodexUnsupportedServerRequest => "codex_unsupported_server_request",
             Self::CodexItemType => "codex_item_type",
+            Self::KimiRootField => "kimi_root_field",
+            Self::KimiEvent => "kimi_event",
             Self::MonitorCapacity => "monitor_capacity",
         }
     }
@@ -504,6 +590,7 @@ fn profile_key(profile: &str) -> &'static str {
         "default" => "default",
         "managed" => "managed",
         "vanilla" => "vanilla",
+        "server-v1" => "server-v1",
         _ => "other",
     }
 }
@@ -959,6 +1046,102 @@ pub(crate) fn codex_findings(value: &serde_json::Value) -> Vec<ProtocolFinding> 
     findings
 }
 
+/// Redacted compatibility checks for one Kimi server-v1 WebSocket event.
+/// Only envelope shape and the fixed event discriminator are inspected;
+/// payload values can contain user content and never enter diagnostics.
+pub(crate) fn kimi_findings(value: &serde_json::Value) -> Vec<ProtocolFinding> {
+    let mut findings = Vec::new();
+    let Some(object) = value.as_object() else {
+        findings.push(ProtocolFinding::kind_mismatch(
+            ProtocolSurface::KimiRootField,
+            "root",
+            JsonValueKind::Object,
+            JsonValueKind::of(Some(value)),
+        ));
+        return findings;
+    };
+    let Some(event_type) = require_string(
+        &mut findings,
+        ProtocolSurface::KimiEvent,
+        "type",
+        object.get("type"),
+    ) else {
+        return findings;
+    };
+    unknown_if_not_in(
+        &mut findings,
+        ProtocolSurface::KimiEvent,
+        &event_type,
+        KIMI_SERVER_EVENT_TYPES,
+        FindingSeverity::Warning,
+    );
+    for (field, kind) in [
+        ("seq", JsonValueKind::Number),
+        ("timestamp", JsonValueKind::String),
+        ("payload", JsonValueKind::Object),
+    ] {
+        let value = object.get(field);
+        if JsonValueKind::of(value) != kind {
+            findings.push(ProtocolFinding::kind_mismatch(
+                ProtocolSurface::KimiRootField,
+                field,
+                kind,
+                JsonValueKind::of(value),
+            ));
+        }
+    }
+    for (field, kind) in [
+        ("epoch", JsonValueKind::String),
+        ("session_id", JsonValueKind::String),
+        ("volatile", JsonValueKind::Bool),
+        ("offset", JsonValueKind::Number),
+    ] {
+        let Some(value) = object.get(field) else {
+            continue;
+        };
+        if JsonValueKind::of(Some(value)) != kind {
+            findings.push(ProtocolFinding::kind_mismatch(
+                ProtocolSurface::KimiRootField,
+                field,
+                kind,
+                JsonValueKind::of(Some(value)),
+            ));
+        }
+    }
+    for field in ["seq", "offset"] {
+        let Some(value) = object.get(field).filter(|value| value.is_number()) else {
+            continue;
+        };
+        let is_nonnegative_integer = value.as_u64().is_some()
+            || value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && number >= 0.0 && number.fract() == 0.0);
+        if !is_nonnegative_integer {
+            findings.push(ProtocolFinding::fixed(
+                ProtocolSurface::KimiRootField,
+                if field == "seq" {
+                    "seq_not_nonnegative_integer"
+                } else {
+                    "offset_not_nonnegative_integer"
+                },
+                FindingSeverity::Error,
+            ));
+        }
+    }
+    if object
+        .get("timestamp")
+        .and_then(|value| value.as_str())
+        .is_some_and(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).is_err())
+    {
+        findings.push(ProtocolFinding::fixed(
+            ProtocolSurface::KimiRootField,
+            "timestamp_not_iso_datetime",
+            FindingSeverity::Error,
+        ));
+    }
+    findings
+}
+
 pub(crate) fn codex_server_request_is_supported(method: &str) -> bool {
     CODEX_SUPPORTED_SERVER_REQUEST_METHODS.contains(&method)
 }
@@ -984,6 +1167,11 @@ pub(crate) fn codex_reported_version(initialize_result: &serde_json::Value) -> O
         .into_iter()
         .find_map(|path| initialize_result.pointer(path).and_then(|v| v.as_str()))
         .and_then(sanitize_codex_reported_version)
+}
+
+pub(crate) fn kimi_reported_version(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    strict_version_token(value).then(|| value.to_string())
 }
 
 fn sanitize_claude_reported_version(raw: &str) -> Option<String> {
@@ -1078,9 +1266,11 @@ pub(crate) fn manifest_digest(backend: &AgentBackend) -> String {
     // cache it: the status endpoint recomputes it per request otherwise.
     static CLAUDE_DIGEST: OnceLock<String> = OnceLock::new();
     static CODEX_DIGEST: OnceLock<String> = OnceLock::new();
+    static KIMI_DIGEST: OnceLock<String> = OnceLock::new();
     let cache = match backend {
         AgentBackend::ClaudeCode => &CLAUDE_DIGEST,
         AgentBackend::Codex => &CODEX_DIGEST,
+        AgentBackend::Kimi => &KIMI_DIGEST,
     };
     cache
         .get_or_init(|| compute_manifest_digest(backend))
@@ -1116,6 +1306,7 @@ fn compute_manifest_digest(backend: &AgentBackend) -> String {
             ),
             ("item", CODEX_ITEM_TYPES),
         ],
+        AgentBackend::Kimi => &[("server_event", KIMI_SERVER_EVENT_TYPES)],
     };
     let mut material = format!(
         "schema:{STORE_SCHEMA_VERSION}\0contract:{CONTRACT_REVISION}\0{}",
@@ -1288,6 +1479,7 @@ impl ProtocolWatchHandle {
             AgentBackend::Codex => reported_version
                 .as_deref()
                 .and_then(sanitize_codex_reported_version),
+            AgentBackend::Kimi => reported_version.as_deref().and_then(kimi_reported_version),
         };
         if self
             .inner
@@ -1875,6 +2067,83 @@ mod tests {
     }
 
     #[test]
+    fn kimi_known_events_are_accepted_and_unknown_events_are_redacted() {
+        assert!(kimi_findings(&serde_json::json!({
+            "type": "assistant.delta",
+            "seq": 7,
+            "epoch": "epoch-1",
+            "session_id": "session-secret",
+            "timestamp": "2026-07-19T12:00:00Z",
+            "payload": { "text": "SENTINEL_KIMI_CONTENT" },
+        }))
+        .is_empty());
+
+        let findings = kimi_findings(&serde_json::json!({
+            "type": "future.private.event",
+            "seq": 8,
+            "timestamp": "2026-07-19T12:00:01Z",
+            "payload": { "text": "SENTINEL_KIMI_CONTENT" },
+        }));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].surface, ProtocolSurface::KimiEvent);
+        assert!(findings[0].identifier.starts_with("<unknown:"));
+        let serialized = serde_json::to_string(&findings).unwrap();
+        assert!(!serialized.contains("future.private.event"));
+        assert!(!serialized.contains("SENTINEL_KIMI_CONTENT"));
+    }
+
+    #[test]
+    fn kimi_event_shape_drift_never_records_payload_values() {
+        let findings = kimi_findings(&serde_json::json!({
+            "type": "tool.result",
+            "seq": "SENTINEL_SEQUENCE",
+            "epoch": 17,
+            "session_id": ["SENTINEL_SESSION"],
+            "timestamp": false,
+            "payload": "SENTINEL_PAYLOAD",
+        }));
+        assert_eq!(findings.len(), 5);
+        assert!(findings.iter().all(|finding| {
+            finding.surface == ProtocolSurface::KimiRootField && finding.actual_kind.is_some()
+        }));
+        let serialized = serde_json::to_string(&findings).unwrap();
+        for secret in ["SENTINEL_SEQUENCE", "SENTINEL_SESSION", "SENTINEL_PAYLOAD"] {
+            assert!(!serialized.contains(secret));
+        }
+    }
+
+    #[test]
+    fn kimi_event_contract_requires_sequence_timestamp_and_payload() {
+        let missing = kimi_findings(&serde_json::json!({ "type": "turn.started" }));
+        assert_eq!(missing.len(), 3);
+        for field in ["seq", "timestamp", "payload"] {
+            assert!(missing.iter().any(|finding| {
+                finding.identifier == field && finding.actual_kind == Some(JsonValueKind::Missing)
+            }));
+        }
+
+        let semantic = kimi_findings(&serde_json::json!({
+            "type": "turn.started",
+            "seq": -1,
+            "offset": 1.5,
+            "timestamp": "SENTINEL_NOT_A_TIMESTAMP",
+            "payload": {},
+        }));
+        for identifier in [
+            "seq_not_nonnegative_integer",
+            "offset_not_nonnegative_integer",
+            "timestamp_not_iso_datetime",
+        ] {
+            assert!(semantic
+                .iter()
+                .any(|finding| finding.identifier == identifier));
+        }
+        assert!(!serde_json::to_string(&semantic)
+            .unwrap()
+            .contains("SENTINEL_NOT_A_TIMESTAMP"));
+    }
+
+    #[test]
     fn codex_rejects_non_u64_numeric_request_ids_as_shape_drift() {
         for id in [serde_json::json!(-1), serde_json::json!(1.5)] {
             let findings = codex_findings(&serde_json::json!({
@@ -2415,6 +2684,9 @@ mod tests {
             "version": "SECRET 12.34",
         }))
         .is_none());
+        assert_eq!(kimi_reported_version(" 0.27.0 ").as_deref(), Some("0.27.0"));
+        assert!(kimi_reported_version("kimi 0.27.0").is_none());
+        assert!(kimi_reported_version("secret\n0.27.0").is_none());
     }
 
     #[test]

@@ -1,15 +1,12 @@
 //! Live registry of backend-announced background tasks, per session — the
 //! read side of the background-task inspector.
 //!
-//! The Claude Code adapter (`external_agent/claude_code.rs`) records here
-//! what its wire already proves: a `system:task_started` with
-//! `task_type:"local_bash"` registers a running task, the launch-ack
-//! text contributes the CLI-announced output-file path when one parses,
-//! and the authoritative `system:task_notification` finishes the record
-//! (confirming or supplying the output path). The web gateway's
+//! External-agent adapters record only what their own wire proves. Claude
+//! Code contributes its announced output-file path; Kimi contributes its
+//! native task id and a bounded inline output preview fetched through the
+//! session-owned server client. The web gateway's
 //! `GET /api/session/{id}/background-tasks[/{task}/output]` routes read
-//! it — the only source an output path is EVER served from: clients name
-//! tasks, never paths.
+//! this registry — clients name tasks, never paths or server endpoints.
 //!
 //! Keys are the backend-native session id (the id stamped on every wire
 //! line, stable across resumes); routes resolve an Intendant wrapper id
@@ -63,12 +60,14 @@ impl BackgroundTaskStatus {
     }
 }
 
-/// One background task the backend announced. `output_file` is present
-/// only when the wire stated a path (launch-ack text or the
-/// notification's `output_file`) — wire-first honesty: no parsed path,
-/// no peek affordance, never a guessed location.
+/// One background task the backend announced. Output is present only when
+/// the backend supplied it: an announced file for Claude Code, or a bounded
+/// native task-output preview for Kimi. No backend statement means no peek
+/// affordance; paths and loopback credentials never cross this boundary.
 #[derive(Debug, Clone)]
 pub(crate) struct BackgroundTaskRecord {
+    /// Canonical external-agent source (`claude-code`, `kimi`).
+    pub(crate) source: String,
     /// Backend task id (`task_started.task_id`) — the public handle the
     /// routes use.
     pub(crate) task_id: String,
@@ -81,7 +80,16 @@ pub(crate) struct BackgroundTaskRecord {
     pub(crate) ended_at_epoch: Option<u64>,
     pub(crate) status: BackgroundTaskStatus,
     pub(crate) output_file: Option<PathBuf>,
+    /// Backend-returned output tail. This is intentionally data-only: the
+    /// registry never retains a Kimi loopback client or bearer token.
+    pub(crate) inline_output: Option<Vec<u8>>,
+    /// Authoritative total byte count when the backend reports one.
+    pub(crate) output_size_bytes: Option<u64>,
 }
+
+/// Hard ceiling for one retained inline output preview. It matches the
+/// dashboard route's maximum response tail and bounds global registry memory.
+pub(crate) const INLINE_OUTPUT_RETAINED_BYTES: usize = 256 * 1024;
 
 /// Retained finished records per session — enough for "what just ran",
 /// bounded so a long chatty session can't grow the registry unbounded.
@@ -165,9 +173,31 @@ impl Registry {
         description: &str,
         started_at_epoch: u64,
     ) {
+        self.record_started_for_source(
+            session_id,
+            "claude-code",
+            task_id,
+            tool_use_id,
+            description,
+            started_at_epoch,
+        );
+    }
+
+    /// Backend-qualified form of [`Self::record_started`]. New adapters use
+    /// this so shared read surfaces can report and route the task honestly.
+    pub(crate) fn record_started_for_source(
+        &mut self,
+        session_id: &str,
+        source: &str,
+        task_id: &str,
+        tool_use_id: &str,
+        description: &str,
+        started_at_epoch: u64,
+    ) {
         let session_id = session_id.trim();
+        let source = source.trim();
         let tool_use_id = tool_use_id.trim();
-        if session_id.is_empty() || tool_use_id.is_empty() {
+        if session_id.is_empty() || source.is_empty() || tool_use_id.is_empty() {
             return;
         }
         let entry = self.touch(session_id);
@@ -177,6 +207,7 @@ impl Registry {
             return;
         }
         entry.records.push(BackgroundTaskRecord {
+            source: source.to_string(),
             task_id: task_id.trim().to_string(),
             tool_use_id: tool_use_id.to_string(),
             description: description.to_string(),
@@ -184,6 +215,8 @@ impl Registry {
             ended_at_epoch: None,
             status: BackgroundTaskStatus::Running,
             output_file: None,
+            inline_output: None,
+            output_size_bytes: None,
         });
         self.evict_stale_sessions();
     }
@@ -208,6 +241,36 @@ impl Registry {
                 record.output_file = Some(output_file);
             }
         }
+    }
+
+    /// Cache a backend-returned output preview under its public task id. The
+    /// tail is retained, never a prefix, so the dashboard's tail semantics
+    /// stay useful when a backend returns more than the memory ceiling.
+    pub(crate) fn record_inline_output(
+        &mut self,
+        session_id: &str,
+        task_id: &str,
+        output: &[u8],
+        output_size_bytes: Option<u64>,
+    ) {
+        let Some(entry) = self.sessions.get_mut(session_id.trim()) else {
+            return;
+        };
+        let task_id = task_id.trim();
+        let Some(record) = entry
+            .records
+            .iter_mut()
+            .find(|record| record.task_id == task_id)
+        else {
+            return;
+        };
+        let start = output.len().saturating_sub(INLINE_OUTPUT_RETAINED_BYTES);
+        record.inline_output = Some(output[start..].to_vec());
+        record.output_size_bytes = Some(
+            output_size_bytes
+                .unwrap_or(output.len() as u64)
+                .max(output.len() as u64),
+        );
     }
 
     /// The `task_notification` end: mark the record finished, adopting
@@ -281,6 +344,18 @@ impl Registry {
         self.sessions.contains_key(session_id.trim())
     }
 
+    /// Canonical source of a known session, if at least one task established
+    /// it. Mixed-source rows under one backend-native id are refused instead
+    /// of guessing which adapter owns the id.
+    pub(crate) fn session_source(&self, session_id: &str) -> Option<String> {
+        let records = &self.sessions.get(session_id.trim())?.records;
+        let first = records.first()?.source.as_str();
+        records
+            .iter()
+            .all(|record| record.source == first)
+            .then(|| first.to_string())
+    }
+
     /// The record for `task_id` in `session_id`, if any. THE lookup the
     /// output route serves paths from — the client's task id resolves to
     /// the registry's stored path or nothing.
@@ -326,8 +401,35 @@ pub(crate) fn record_started(
     );
 }
 
+pub(crate) fn record_started_for_source(
+    session_id: &str,
+    source: &str,
+    task_id: &str,
+    tool_use_id: &str,
+    description: &str,
+    started_at_epoch: u64,
+) {
+    global().record_started_for_source(
+        session_id,
+        source,
+        task_id,
+        tool_use_id,
+        description,
+        started_at_epoch,
+    );
+}
+
 pub(crate) fn record_output_file(session_id: &str, tool_use_id: &str, output_file: PathBuf) {
     global().record_output_file(session_id, tool_use_id, output_file);
+}
+
+pub(crate) fn record_inline_output(
+    session_id: &str,
+    task_id: &str,
+    output: &[u8],
+    output_size_bytes: Option<u64>,
+) {
+    global().record_inline_output(session_id, task_id, output, output_size_bytes);
 }
 
 pub(crate) fn record_finished(
@@ -350,6 +452,10 @@ pub(crate) fn tasks_for_session(session_id: &str) -> Vec<BackgroundTaskRecord> {
 
 pub(crate) fn session_known(session_id: &str) -> bool {
     global().session_known(session_id)
+}
+
+pub(crate) fn session_source(session_id: &str) -> Option<String> {
+    global().session_source(session_id)
 }
 
 pub(crate) fn find_task(session_id: &str, task_id: &str) -> Option<BackgroundTaskRecord> {
@@ -397,6 +503,7 @@ mod tests {
         let tasks = reg.tasks_for_session(sid);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].task_id, "task-a");
+        assert_eq!(tasks[0].source, "claude-code");
         assert_eq!(tasks[0].status, BackgroundTaskStatus::Running);
         assert_eq!(tasks[0].started_at_epoch, 100);
         assert!(tasks[0].output_file.is_none());
@@ -432,6 +539,35 @@ mod tests {
         reg.clear_session(sid);
         assert!(!reg.session_known(sid));
         assert!(reg.find_task(sid, "task-a").is_none());
+    }
+
+    #[test]
+    fn kimi_inline_output_is_source_qualified_and_tail_bounded() {
+        let mut reg = Registry::new();
+        let sid = "session-kimi";
+        reg.record_started_for_source(sid, "kimi", "task-k", "task-k", "native process", 100);
+        let mut output = vec![b'a'; INLINE_OUTPUT_RETAINED_BYTES + 3];
+        output[INLINE_OUTPUT_RETAINED_BYTES] = b'X';
+        output[INLINE_OUTPUT_RETAINED_BYTES + 1] = b'Y';
+        output[INLINE_OUTPUT_RETAINED_BYTES + 2] = b'Z';
+        reg.record_inline_output(sid, "task-k", &output, Some(900_000));
+
+        let record = reg.find_task(sid, "task-k").expect("Kimi task");
+        assert_eq!(record.source, "kimi");
+        assert_eq!(reg.session_source(sid).as_deref(), Some("kimi"));
+        assert_eq!(
+            record.inline_output.as_ref().map(Vec::len),
+            Some(INLINE_OUTPUT_RETAINED_BYTES)
+        );
+        assert_eq!(
+            record
+                .inline_output
+                .as_deref()
+                .and_then(|bytes| bytes.last()),
+            Some(&b'Z')
+        );
+        assert_eq!(record.output_size_bytes, Some(900_000));
+        assert!(record.output_file.is_none());
     }
 
     #[test]

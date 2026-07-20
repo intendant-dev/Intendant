@@ -663,7 +663,9 @@ function renderSessionWindowGoal(win, goal) {
 function renderSessionWindowTier(win) {
   if (!win?.tier) return;
   const sid = win.sessionId || '';
-  if (!sid || !sessionWindowIsCodex(sid, win)) {
+  const ops = sid ? sessionThreadActionOps(sid) : null;
+  const supportsFast = Array.isArray(ops) ? ops.includes('fast') : sessionWindowIsCodex(sid, win);
+  if (!sid || !supportsFast) {
     win.tier.className = 'session-window-tier hidden';
     win.tier.textContent = '';
     win.tier.title = '';
@@ -2372,6 +2374,31 @@ async function appendSessionBackgroundTaskRows(sessionId, panel, container = pan
         openSessionBackgroundTaskOutput(sid, task);
       });
       row.appendChild(view);
+    }
+    // Kimi exposes native task cancellation. Route it through the existing
+    // live thread-action lane so backend lifecycle/auth remains owned by the
+    // attached adapter; the registry and this inspector stay data-only.
+    if (task.cancellable && task.taskId) {
+      const cancel = vxEl('button', 'vx-bgtask-view vx-bgtask-cancel', 'Cancel');
+      cancel.type = 'button';
+      cancel.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        cancel.disabled = true;
+        cancel.textContent = 'Cancelling…';
+        const sent = dispatchCodexThreadAction(
+          'task-cancel',
+          { task_id: String(task.taskId) },
+          sid
+        );
+        if (!sent) {
+          cancel.disabled = false;
+          cancel.textContent = 'Cancel';
+          return;
+        }
+        row.querySelector('.vx-bgtask-meta').textContent = 'cancelling…';
+      });
+      row.appendChild(cancel);
     }
     section.appendChild(row);
   }

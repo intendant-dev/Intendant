@@ -399,6 +399,7 @@ impl StationInner {
                 ("intendant", "internal"),
                 ("codex", "codex"),
                 ("claude", "claude-code"),
+                ("kimi", "kimi"),
             ] {
                 let cw = label.chars().count() as f32 * 5.8 + 16.0;
                 if cx + cw > agent_limit {

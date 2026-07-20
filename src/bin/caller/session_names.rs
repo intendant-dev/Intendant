@@ -32,6 +32,7 @@ pub fn normalize_source(raw: &str) -> String {
         "claude-code" | "claude_code" | "claudecode" | "claude code" | "cc" => {
             "claude-code".to_string()
         }
+        "kimi" | "kimi-code" | "kimi_code" | "kimicode" | "kimi code" => "kimi".to_string(),
         "gemini" | "gemini-cli" | "gemini_cli" | "gemini cli" => "gemini".to_string(),
         _ => value,
     }
@@ -275,6 +276,13 @@ mod tests {
 
         assert_eq!(sessions[0]["name"], "Nice name");
         assert_eq!(sessions[0]["task"], "Original task");
+    }
+
+    #[test]
+    fn kimi_source_aliases_normalize_to_one_overlay_namespace() {
+        for alias in ["kimi", "Kimi Code", "kimi-code", "kimi_code"] {
+            assert_eq!(normalize_source(alias), "kimi");
+        }
     }
 
     #[test]

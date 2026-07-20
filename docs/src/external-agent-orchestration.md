@@ -1,7 +1,7 @@
 # External-Agent Orchestration
 
-Intendant can hand a whole task to a third-party coding CLI — **OpenAI Codex** or
-**Claude Code** — and supervise it as a subordinate worker. The
+Intendant can hand a whole task to a third-party coding CLI — **OpenAI Codex**,
+**Claude Code**, or **Kimi Code** — and supervise it as a subordinate worker. The
 external tool does the actual coding; Intendant wraps it in its own oversight,
 display, and computer-use surface by pointing the tool's MCP client at Intendant's
 own [MCP server](./mcp-server.md).
@@ -79,19 +79,21 @@ plan updates, tool start/output/complete, approval and structured-question
 requests, diffs, usage/vitals facts, limit-rejected turns, and termination) is
 translated into that enum so the controller's display and oversight code is
 backend-agnostic. `AgentEvent::Scoped { thread_id, turn_id, .. }` wraps inner
-events when a backend (Codex) multiplexes several threads through one process.
+events when a backend multiplexes several threads or native sub-agents through
+one process (Codex threads and Kimi `:btw`/swarm agents).
 
 `AgentConfig` carries the working dir, model, approval policy, the
 **`web_port`** (used to generate the MCP-over-HTTP config), an optional
 `resume_session` id, and the Codex-only knobs (`sandbox`, `reasoning_effort`,
-`web_search`, `network_access`, `writable_roots`). Backends that don't model a
-field ignore it.
+`web_search`, `network_access`, `writable_roots`). Kimi's adapter additionally
+receives its launch profile (`thinking`, permission mode, plan mode, and swarm
+mode). Backends that don't model a field ignore it.
 
 The supported backend identities are the `AgentBackend` enum (`Codex`,
-`ClaudeCode`). `from_str_loose()` accepts the canonical short forms plus older
-Display forms (`codex`, `claude-code`/`claude_code`/`cc`, case-insensitive);
-`as_short_str()` emits the canonical wire form that matches the dashboard
-dropdown's `<option value>`.
+`ClaudeCode`, `Kimi`). `from_str_loose()` accepts the canonical short forms plus
+older/display forms (`codex`, `claude-code`/`claude_code`/`cc`, and
+`kimi`/`kimi-code`/`kimi_code`, case-insensitive); `as_short_str()` emits the
+canonical wire form that matches the dashboard dropdown's `<option value>`.
 
 Gemini CLI was previously supported as a backend and was retired in July 2026;
 persisted sessions from it remain readable but cannot be resumed.
@@ -102,32 +104,35 @@ persisted sessions from it remain readable but cannot be resumed.
 adapter from `[agent.<backend>]` config, then `run_external_agent_mode()`
 (`external_mode.rs`) drives the supervise loop.
 
-| | **Codex** (reference impl) | **Claude Code** |
-|---|---|---|
-| Module | `external_agent/codex/` (mod, threads, wire, context_trace, reader) | `external_agent/claude_code.rs` |
-| Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --permission-mode <mode>` |
-| Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio |
-| MCP injection | Per-process `-c mcp_servers.intendant.{type,url,bearer_token_env_var}` overrides plus scoped env; no workspace config file | Inline `--mcp-config '{…}'` JSON with an environment-expanded Authorization header |
-| Multi-thread | Yes — many threads per process | No |
-| Native thread id | Yes | Yes — announced via `AgentEvent::NativeSessionId` on the first turn (placeholder `claude-code-session` until then; `--resume` keeps the id stable so resumed threads are canonical immediately) |
-| Mid-turn steer | Yes (`turn/steer`) | No — 2.1.2xx discards stdin user messages mid-turn (2.1.200's absorb was a CLI bug, since removed); `steer_turn` reports queue semantics and the steer delivers at the turn boundary (or immediately as its own turn when idle) |
-| Mid-turn interrupt | Yes (`turn/interrupt`) | Yes (`control_request` `interrupt`; the process survives for follow-up turns) |
-| Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) |
-| Reasoning trace | Yes | Yes (`thinking` blocks) |
-| Rollback turns | Yes (`thread/rollback`) | No → session reset |
-| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | `compact`, `fork` (respawns via `--resume <id> --fork-session`), `side` (`/btw` — the same respawn carrying a side boundary + question as the child's first prompt; lineage `fork_relationship: "side"`), the full `goal*` family (wrapper goal engine), and live `model` / `permission-mode` — all via universal `thread_actions`. No fast/review/memory-reset — see [Dashboard and Station parity](#dashboard-and-station-parity-codex-vs-claude-code) |
-| Native sub-agents | Yes — collab tools spawn real attachable threads (`SubAgentToolCall`) | Yes — the in-band `Agent`/`Task` tool; async children stream `parent_tool_use_id`-tagged envelopes, surfaced as ephemeral `task-*` child sessions on the same `SubAgentToolCall`/relationship rail |
+| | **Codex** (reference impl) | **Claude Code** | **Kimi Code** |
+|---|---|---|---|
+| Module | `external_agent/codex/` (mod, threads, wire, context_trace, reader) | `external_agent/claude_code.rs` | `external_agent/kimi_code/` (mod, bridge, events, review, websocket, wire, rpc) |
+| Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --permission-mode <mode>` | `kimi server run --foreground --port 0 --log-level silent` |
+| Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio | bearer-authenticated loopback REST + reconnecting cursor/snapshot WebSocket (`server-v1`), plus a typed allowlist over authenticated reflected v2 RPCs |
+| MCP injection | Per-process `-c mcp_servers.intendant.{type,url,bearer_token_env_var}` overrides plus scoped env; no workspace config file | Inline `--mcp-config '{…}'` JSON with an environment-expanded Authorization header | Per-session bridge home containing generated `mcp.json`; scoped bearer stays in the child environment |
+| Multi-thread | Yes — many threads per process | No | Yes — the main session plus native `:btw` and swarm agents |
+| Native thread id | Yes | Yes — announced via `AgentEvent::NativeSessionId` on the first turn (placeholder `claude-code-session` until then; `--resume` keeps the id stable so resumed threads are canonical immediately) | Yes — returned at create/resume before the first prompt |
+| Mid-turn steer | Yes (`turn/steer`) | Queued by Intendant because 2.1.2xx discards stdin user messages mid-turn | Yes — Kimi queued prompts plus `prompts::steer`; a completion race becomes an ordinary immediate follow-up without losing text |
+| Mid-turn interrupt | Yes (`turn/interrupt`) | Yes (`control_request` `interrupt`; the process survives for follow-up turns) | Yes — active prompt abort, with a session abort fallback |
+| Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) | Yes — usage events plus typed `agentRPCService.getContext` snapshots: Kimi's current post-compaction model history and measured `tokenCount`, scoped to the exact selected main/composite agent, with the configured model catalog's context window |
+| Reasoning trace | Yes | Yes (`thinking` blocks) | Yes — thinking deltas/messages |
+| Rollback turns | Yes (`thread/rollback`) | No → session reset | Yes — native `undo`, including edit-and-rerun of an active historical user turn |
+| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | `compact`, `fork`, `side`, the full wrapper `goal*` family, and live `model` / `permission-mode` | Native `compact`, head and exact historical real-user-turn-boundary `fork`, `side`/`:btw`, `undo`, archive/restore/rename, goal get/set/pause/resume/complete/clear with enforced token/turn/wall-clock budgets, live model/thinking/permission/plan/swarm switches, official normal↔highspeed model toggling, supervisor-enforced tool-free read-only review turns over bounded controller-collected workspace evidence, background-task list/output/cancel, exact per-agent active-tool control, model catalog, and destructive per-agent context clear. Kimi has no persistent-memory plane equivalent to Codex `memory-reset`, explicit “mark budget-limited” setter, arbitrary item/message/child fork anchor, or child-only undo |
+| Native sub-agents | Yes — collab tools spawn real attachable threads (`SubAgentToolCall`) | Yes — the in-band `Agent`/`Task` tool; async children stream `parent_tool_use_id`-tagged envelopes, surfaced as ephemeral `task-*` child sessions on the same `SubAgentToolCall`/relationship rail | Yes — native swarm and `:btw` agents retain their own ids, scoped activity, relationships, status, and results |
 
-Both spawn through `crate::platform::spawn_command(&cfg.command)` with the
-working dir set to the project root and stdin/stdout/stderr piped; stderr is
-forwarded into the session activity log line-by-line
-(`spawn_stderr_forwarder` in `external_agent/mod.rs`), so transport/auth
-failures are visible from every frontend.
+All three spawn through `crate::platform::spawn_command(&cfg.command)` with the
+working dir set to the project root. Codex and Claude pipe their protocol over
+stdio and forward stderr into the session activity log. Kimi starts its local
+server in silent mode, reads the one-line ephemeral origin from stdout and the
+private bearer token from its isolated bridge home, validates the API/RPC
+contract, and immediately unlinks the on-disk token while retaining it only in
+the supervisor's HTTP clients. It then drains both streams; REST or WebSocket
+failures are normalized as backend errors for every frontend.
 
 ### Passive protocol compatibility watch
 
-Every supervised Codex or Claude Code process carries a passive compatibility
-watch. It fingerprints the resolved executable with filesystem metadata and,
+Every supervised Codex, Claude Code, or Kimi Code process carries a passive
+compatibility watch. It fingerprints the resolved executable with filesystem metadata and,
 while a user-started session is already running, compares fixed wire
 discriminants against the adapter's embedded vocabulary. Unknown message
 types, methods, subtypes, item types, and critical root-field type changes are
@@ -142,8 +147,9 @@ bounded: each handshake prunes the profile's artifact directories down to the
 four most recently observed fingerprints, so upgrade residue does not
 accumulate.
 
-The initial vocabulary baseline is Claude Code 2.1.210 and Codex app-server
-0.144.1. Known-but-intentionally-ignored notifications are included so the
+The initial vocabulary baseline is Claude Code 2.1.210, Codex app-server
+0.144.1, and Kimi Code server-v1 0.27.0. Known-but-intentionally-ignored
+notifications are included so the
 watch reports new protocol surface, not ordinary traffic the adapter already
 chose to ignore. Structural-check changes bump a separate contract revision,
 which is folded into the manifest digest.
@@ -179,15 +185,15 @@ known-but-unsupported request is itself a compatibility finding.
 
 What each supervised backend actually receives:
 
-| | **Codex** | **Claude Code** |
-|---|---|---|
-| MCP tool exposure | `tool_profile=core` (bootstrap set) | `tool_profile=core` (bootstrap set) |
-| Session-scoped MCP bearer | child env → Authorization header | child env → environment-expanded Authorization header |
-| `session_id` scope in URL | yes | yes |
-| `$INTENDANT` + `INTENDANT_MCP_URL` env (`ctl` bootstrap) | yes (+ `INTENDANT_MANAGED_CONTEXT`) | yes |
-| Guidance channel | managed-context developer message | first-prompt bootstrap addendum |
+| | **Codex** | **Claude Code** | **Kimi Code** |
+|---|---|---|---|
+| MCP tool exposure | `tool_profile=core` (bootstrap set) | `tool_profile=core` (bootstrap set) | `tool_profile=core` (bootstrap set) |
+| Session-scoped MCP bearer | child env → Authorization header | child env → environment-expanded Authorization header | child env → generated bridge MCP bearer-variable reference |
+| `session_id` scope in URL | yes | yes | yes |
+| `$INTENDANT` + `INTENDANT_MCP_URL` env (`ctl` bootstrap) | yes (+ `INTENDANT_MANAGED_CONTEXT`) | yes | yes |
+| Guidance channel | managed-context developer message | first-prompt bootstrap addendum | generated bridge-home MCP config + ordinary tool discovery |
 
-The bootstrap set for both Codex and Claude Code includes the CU path
+The bootstrap set for all three backends includes the CU path
 (`read_screen`, `take_screenshot`, `execute_cu_actions`, `list_displays`,
 `grant_user_display`, `revoke_user_display`) and the shared-view tools
 regardless of managed context; managed-context/fission tools remain
@@ -203,7 +209,8 @@ platform's process-bootstrap set (macOS `__CF_USER_TEXT_ENCODING`; Linux
 `DISPLAY`/`WAYLAND_DISPLAY`/`XDG_*`; Windows `SYSTEMROOT`, `COMSPEC`,
 `PATHEXT`, `APPDATA`, `USERPROFILE`, …), proxy vars
 (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`, either case), the CLIs'
-own config-home pointers (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`), and the
+own config-home pointers (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`,
+`KIMI_CODE_HOME`), and the
 `INTENDANT`/`INTENDANT_*` control channel. Everything else is dropped —
 in particular the controller's provider API keys
 (`OPENAI`/`ANTHROPIC`/`GEMINI_API_KEY` and every `*_API_KEY`/`*_API_TOKEN`
@@ -211,7 +218,7 @@ shape), ambient host credentials (`SSH_AUTH_SOCK`, `AWS_*` secrets,
 `GH_TOKEN`/`GITHUB_TOKEN`, `KUBECONFIG`, `DOCKER_CONFIG`, registry tokens),
 the Linux D-Bus session bus (`DBUS_SESSION_BUS_ADDRESS` — desktop-keyring
 reach), and `NODE_OPTIONS`. Backends authenticate with their own
-subscription auth under `HOME` (`~/.codex`, `~/.claude`) or a vault-leased
+subscription auth under `HOME` (`~/.codex`, `~/.claude`, `~/.kimi-code`) or a vault-leased
 home injected explicitly at spawn; they never see the controller's model
 keys.
 
@@ -226,10 +233,12 @@ this variable, so classified ambient credentials such as `SSH_AUTH_SOCK` do
 not survive into native shell commands even when the runtime process inherited
 them.
 
-### Codex (the reference backend)
+### Codex (the original reference backend)
 
-Codex is the most fully wired backend; Claude Code falls back to defaults for
-features it lacks.
+Codex was the first fully wired backend and remains the reference for its
+backend-specific managed-context, fission, and item-anchor rewind features.
+Claude Code and Kimi use the same universal supervision rails, exposing their
+own native capabilities where the upstream CLIs provide them.
 
 - **MCP injection — per-process config.** Codex receives the Intendant MCP
   server exclusively through command-line `-c` overrides on the app-server
@@ -698,6 +707,168 @@ recorded in the session's launch config. The reader reconciles the
 warning on divergence (once per distinct echoed value).
 `--allowedTools` is added from config when set.
 
+### Kimi Code
+
+Kimi uses the local `server-v1` interface rather than ACP. ACP is convenient
+for editor interoperability, but Kimi Code 0.27's ACP facade does not expose
+the native goal, undo, fork, side-agent, structured-interaction, background
+task, usage, and live-profile surfaces needed for Intendant parity. The
+adapter therefore starts one private `kimi server run` process per supervised
+session and speaks its bearer-authenticated loopback REST and WebSocket APIs.
+The server binds port `0`; its chosen origin is read from stdout, and its bearer
+is read from `server.token`. Neither value is put on argv or emitted as an
+Intendant event. Once health, metadata, and the typed v2 method catalog have
+been authenticated, Intendant unlinks `server.token`; the bearer remains only
+inside the supervisor's in-memory REST/RPC clients. Those loopback clients
+explicitly disable environment/system proxies so neither the bearer nor
+private control traffic can be redirected through an egress proxy.
+
+Kimi keeps its server lock, token, journal, and MCP config under
+`KIMI_CODE_HOME`. Sharing the user's primary home among simultaneous
+supervisors would serialize unrelated sessions and would require mutating the
+user's `mcp.json`, so Intendant creates a stable, 0700 bridge under
+`<kimi-home>/intendant-bridges/session-<hash>`. It mirrors the primary home's
+auth, config, sessions, skills, plugins, and caches (symlinks where supported,
+refreshed copies otherwise), while owning `server`, `server.token`, and a 0600
+merged `mcp.json`. The generated `intendant` entry wins over a same-named user
+entry, preserves every other user MCP server, and names
+`INTENDANT_MCP_BEARER_TOKEN`; no bearer is serialized into the file. A
+malformed primary `mcp.json` fails closed. Windows bridge objects receive and
+verify a protected owner/SYSTEM/Administrators DACL rather than relying on
+ambient profile inheritance. The predictable managed parent and session leaf
+must both be real directories: preplanted/replaced symlinks and canonical-path
+escapes fail closed before chmod, sync, pruning, or MCP generation. MCP files
+are written through a randomly named, create-new private temporary file and an
+atomic rename, so a guessed PID-based symlink cannot redirect the write.
+
+When symlinks are unavailable, bridge teardown copies back only Kimi's native
+`sessions/` tree and `session_index.jsonl`. Credentials, configuration,
+plugins, caches, MCP declarations, and server state are never copied from a
+bridge into the primary home: a long-lived bridge may hold a stale snapshot,
+so broader copy-back could undo a logout or resurrect removed authority.
+Before each launch, copy-backed mirrors are also reconciled recursively with
+the current primary home, removing credential/config/plugin/cache entries that
+the user deleted while retaining bridge-only session history.
+Duplicate native session ids across bridge and primary history resolve to the
+copy with the newest filesystem activity. Append-only journals merge only when
+one byte-exact ordered record sequence is a prefix of the other. Divergent
+histories fail closed instead of being treated as an unordered set (which
+could reorder turns); file identity, length, and prefix content are rechecked
+immediately before any suffix append. Link-like source/destination entries,
+including Windows junctions and other reparse points, are never traversed.
+
+The WebSocket driver subscribes after create/resume, snapshots first, and keeps
+a per-session sequence/epoch cursor. Disconnects reconnect with bounded
+backoff; gaps or epoch changes trigger a REST snapshot resync before deltas
+continue. Eight consecutive reconnect failures terminate the supervised
+backend instead of leaving a deceptively live session. Translation covers:
+
+- assistant and thinking deltas/messages, plan/todo changes, model/config
+  echoes, diffs, tool start/output/finish, background tasks, errors, usage and
+  context limits;
+- approval requests plus session-scoped approval, and Kimi's distinct
+  structured-question objects and answer schema;
+- native sub-agent spawn/start/suspend/resume/complete/fail events, scoped to
+  attachable child windows with normal relationship and activity rails;
+- session goals, compaction, archive state, prompt/turn completion, and a
+  snapshot of pending interactions after reconnect.
+
+Kimi also exposes several controls that are richer than the other shipped
+adapters:
+
+- **True queued steering.** Intendant submits a queued prompt and calls
+  `prompts::steer`; if the active turn ends in that race, Kimi starts the text
+  as the next ordinary turn, so it is never discarded.
+- **Native undo, edit/rerun, and historical forks.** `undo` backs `/undo` and
+  the universal active-user-message edit flow. The fork-point catalog exposes
+  every active real-user turn boundary: Intendant asks Kimi to fork the full
+  wire history, then synchronously applies the exact native undo count before
+  publishing or subscribing to the child. The planned head carries a compact
+  revision/floor/generation proof; after Kimi reports undo success, Intendant
+  reparses the child and requires the exact derived post-undo turn count and
+  fingerprint. A missing legacy proof or any mismatch fails closed and archives
+  the unpublished child. Arbitrary item/message anchors remain Codex-specific.
+- **Native side/swarm agents.** `:btw` creates a real Kimi agent inside the
+  session. Its first prompt carries the universal side-conversation contract,
+  and its activity remains scoped by `session-id:agent-id`. Swarm mode is a
+  launch and live profile switch, not an Intendant emulation.
+- **Live profile changes.** Model, thinking effort, permission mode
+  (`manual`/`auto`/`yolo`), plan mode, and swarm mode can change without
+  restarting the server; changes emit the same config-vitals rail as launch.
+- **Authenticated v2 controls.** The public v1 facade omits several registered
+  services that the same loopback server exposes through bearer-authenticated
+  v2 reflection. Intendant never offers a generic RPC passthrough: it validates
+  the expected method catalog and exposes only typed, fixed service/method
+  calls for goal completion/budgets, active tools, native current-context
+  history/`tokenCount`, model/profile facts, the configured model catalog, and
+  context clear. `getContext` is required by the startup capability handshake;
+  Intendant never substitutes the durable transcript when it is absent. RPC
+  and REST response bodies are stream-capped at 32 MiB, and ordinary file
+  attachments stream from a fixed-size opened file rather than buffering the
+  whole upload. This matters because reflection also contains
+  implementation-private methods that must not become a user dispatch surface.
+- **Native session actions.** Compact, head fork, undo, archive, restore,
+  rename, goal get/set/pause/resume/complete/clear, and side start/close are
+  advertised through `SessionCapabilities.thread_actions`. Goal limits are
+  native and enforced for tokens, turns, and wall-clock time. The same rail
+  exposes Kimi's background-task list/output/cancel endpoints, active/inactive
+  tool inventory, exact active-tool replacement (including an intentionally
+  empty set), activate-all, configured-model catalog, supervisor-enforced
+  read-only working-tree review with exactly zero active Kimi tools and a
+  bounded workspace-only evidence packet collected by the controller, K2.7
+  normal/highspeed toggle, and per-agent context clear. A review starts only
+  from an idle session with no pending interaction; after evidence collection
+  and tool disabling, the prompt set is checked again. If an interaction
+  appeared or Kimi queued rather than immediately started the review, the
+  adapter restores the prior tools and fails closed because its evidence is no
+  longer point-in-time. Protocol drift never widens tools until the exact
+  submitted prompt is proved absent.
+- **Native task inspector.** Kimi task ids/statuses feed the same dashboard
+  inspector used by Claude Code. The adapter refreshes bounded native output
+  previews into the data-only task registry, so frontends can tail output
+  without retaining Kimi's loopback bearer; running tasks expose Cancel through
+  the ordinary live thread-action lane.
+- **Child-scoped controls.** Every Kimi `:btw` side and native swarm child
+  advertises only the operations the server can target to that exact agent:
+  tool inventory/replacement/activate-all and destructive context clear.
+  Side conversations additionally advertise close. Dashboard, control-plane,
+  and slash-command routing preserve the composite child id in `threadId`;
+  parent-only operations remain blocked instead of silently affecting `main`.
+- **Native attachments.** Images are submitted as base64 content and ordinary
+  files are uploaded to Kimi's file API before the prompt, preserving their
+  name, media type, and size.
+
+The capability list intentionally omits operations Kimi 0.27 cannot perform
+honestly: arbitrary item/message/child fork anchors, item-anchor rewind, an
+explicit “mark budget-limited” transition, persistent-memory reset, and
+independent undo of one child agent. Historical forks are exact only at active
+real-user turn boundaries; superseded revisions, system prompts, and
+child-agent turns are not offered as anchors. Goal objective edits validate
+first, then use Kimi's native cancel-and-create sequence because there is no
+atomic edit endpoint. Native budget fields can be set but not individually
+cleared; cancel-and-recreate is the only reset and also resets goal identity
+and accounting, so Intendant never disguises it as a clear-limit edit. Kimi
+represents budget exhaustion as `blocked` plus reached/over-budget facts;
+Intendant derives the universal `budget-limited` display status but does not
+advertise a setter Kimi lacks.
+
+Active-tool control is deliberately not described as Claude
+`allowed_tools`: Claude's field is an approval allowlist where empty means
+unrestricted, while Kimi persists an exact active-tool name set where empty
+means no optional tools. An unset Intendant override leaves Kimi's current
+profile in control. `tools-all` resolves the live registered catalog and
+activates every name; it does not pretend to reconstruct an undefined profile
+default that Kimi's RPC cannot write.
+
+Create, resume, attach, `--continue`, per-session launch pins, restart with
+saved config, protocol compatibility diagnostics, session catalog/replay,
+usage aggregation, detail/deep/message search, names, aliases, file watching,
+vault leases, and the dashboard/Station control surfaces all use the same
+backend-neutral rails as Codex and Claude Code. Persisted Kimi history is read
+from its session store, including nested agents; leased and staged Kimi homes
+are swept alongside the normal home so custody does not make transcripts
+temporarily invisible.
+
 ## Rate-limit Parking
 
 Claude Code's `rate_limit_event` with status `rejected`, correlated with the
@@ -726,7 +897,7 @@ The park is an in-memory session-lane state, not a durable scheduler. Activity
 and session-log rows make the pause, queued messages, cancellation, and resend
 visible.
 
-## Dashboard and Station parity: Codex vs Claude Code
+## Dashboard and Station parity
 
 The per-session dashboard features (Activity → Timeline agent windows and the
 [Station](./station.md) canvas) were built against Codex first. An audit
@@ -741,6 +912,10 @@ booleans plus backend-specific knobs), `AgentEvent::GoalUpdated/GoalCleared`
 the lineage/fission ledgers and their `/api` serving, the
 capability-gated affordances in `app.html`, and `external_wrapper_index`.
 
+The original audit table below remains the detailed Claude Code catch-up
+record. Kimi was integrated after those rails became universal, so it plugs
+into them directly rather than adding a parallel `kimi_*` UI architecture.
+
 | Feature | Universal rail (exists today) | Codex producer | Claude Code today → plan |
 |---|---|---|---|
 | Steer / interrupt / stop affordances | `SessionCapabilities.{follow_up,steer,interrupt}`; the UI gates on capabilities, not backend type | emits all three | **Parity** (emits all three) |
@@ -754,6 +929,26 @@ capability-gated affordances in `app.html`, and `external_wrapper_index`.
 | Plan / todo display | `AgentEvent::PlanUpdate` exists | emits plan updates | **Translation live for both tool families.** `TodoWrite` tool calls translate into `PlanUpdate` (statuses normalized via the shared helper; the raw call and its acknowledgment are suppressed, failures still warn, a sub-agent's TodoWrite scopes to its `task-*` child; malformed inputs fall back to plain-tool rendering). Print-mode Claude Code (verified on 2.1.201) does not enable `TodoWrite` and exposes the incremental Task tools instead, so the adapter also folds `TaskCreate`/`TaskUpdate` into per-scope task-list state and re-renders the full snapshot on every mutation: the CLI only reveals the assigned id in `TaskCreate`'s tool_result, so creates hold a provisional entry until the ack arrives (failed creates retract it), updates upsert by id (unknown ids materialize a placeholder row — creation may predate the supervisor), `status: "deleted"` removes the row, and both acks are suppressed like TodoWrite's. `TaskList`/`TaskGet` stay plain tool calls |
 | Session vitals chip (git / prompt-cache / rate limits — the operator-statusline port) | `SessionVitals{git,cache,limits}` + `session_vitals` outbound/log/replay; a change-detecting hub (`session_vitals.rs`) merges sections from two producers — the fetch-free git prober (branch, dirty, ahead/behind, `merge-tree` parity, unpushed; primary session) and a bus listener over `UsageSnapshot` that computes the latest request's cache-hit receipt + TTL anchor and folds the sticky rate-limit windows the adapters attach (the countdown and once-per-idle-period expiry alert derive client-side; browser notifications only when permission is already granted). Station renders the same vitals as focus-panel rows (git/limits pre-formatted by the feed, the cache countdown live per frame) | `token_count` `last` bucket → hit receipt (no TTL — OpenAI's is undocumented, countdown hidden); `account/rateLimits/updated` `{primary,secondary}` windows → 5h/7d gauges, re-emitted between turns | **Cache + limits sections live** — per-request reads/writes/uncached from the wire usage, TTL flavor from `cache_creation` ephemeral splits (1h beta) with a 5-minute default; `rate_limit_event` utilization/resetsAt updates the gauge per window type (non-allowed statuses still warn). The native loop feeds the same rail through the derived `UsageSnapshot`, with `anthropic-ratelimit-*` per-minute headers as its gauges (header-less egress-relay calls degrade to none) |
 | Managed context / fission / rewind family | managed-context tools + ledgers | patched managed fork only | **Out of scope for parity** — Codex-fork-specific by design; Claude Code manages its own context (`/compact`, auto-compaction) |
+
+Kimi's current rail coverage is:
+
+| Universal rail | Kimi producer |
+|---|---|
+| Follow-up / steer / interrupt / stop | native prompt submit, `prompts::steer`, prompt/session abort |
+| Usage, context, reasoning, plan, tools, diffs | server-v1 event translation and reconnect snapshots |
+| Approvals and questions | distinct approval and structured-question endpoints, both rendered through the shared interaction UI |
+| Thread actions and goal chip | native compact/head-or-turn-boundary-fork/undo/archive/restore/side/rename; native goal get/set/pause/resume/complete/clear and enforced budgets; live model/thinking/permission/plan/swarm; normal/highspeed toggle; supervisor-enforced tool-free read-only review over bounded controller-collected evidence; background-task list/output/cancel; model catalog; exact per-agent active-tool report/set/all; per-agent context clear |
+| Relationships and sub-agent windows | native `:btw` and swarm agent events scoped to child ids |
+| Launch and persisted per-session config | command, model, thinking, permission, plan, swarm, and exact active-tool pins; Save applies every profile field live, Save & restart also replaces the binary |
+| Global Settings, dashboard Control, Station controls | command, model, thinking, permission, plan, swarm, and exact active-tool defaults, all persisted and broadcast through the control plane |
+| Catalog, replay, Stats, search, names | Kimi session-store parser plus external wrapper index, including leased/staged homes and child records |
+| Credentials | local-login detection, private `kimi login` ceremony, `oauth:kimi` full-credential vault leases, cleanup/staging |
+
+The intentional non-parity cells are upstream capability boundaries, not
+missing UI: no arbitrary item/message/child fork point, item-anchor rewind,
+explicit budget-limited setter or individual budget clear, Codex
+managed-context/fission or persistent-memory reset, or independent undo of one
+Kimi child agent in Kimi Code 0.27.
 
 Catch-up order (each step unlocks UI in both surfaces at once):
 
@@ -868,7 +1063,7 @@ defaults, so a bare `[agent]` with just `default_backend` works.
 ```toml
 [agent]
 # Which backend to use when --agent is not passed. Omit/empty = native agent.
-# Accepts: "codex", "claude-code".
+# Accepts: "codex", "claude-code", "kimi".
 default_backend = "codex"
 
 [agent.codex]
@@ -889,12 +1084,24 @@ command         = "claude"
 model           = "claude-sonnet-4-6"  # optional; any claude CLI --model value (e.g. "haiku")
 permission_mode = "default"           # default (alias manual) | acceptEdits | plan | auto | dontAsk | bypassPermissions
 allowed_tools   = []                  # e.g. ["Read", "Edit", "Bash"]; empty = all
+
+[agent.kimi]
+command         = "kimi"
+model           = "kimi-code/kimi-for-coding" # optional; "k2.7 coding" is accepted too
+thinking        = "high"                     # off | low | medium | high
+permission_mode = "manual"                   # manual | auto | yolo
+plan_mode       = false
+swarm_mode      = true
+# Exact active-tool replacement. Omit to inherit Kimi's profile; [] disables
+# every optional tool (unlike Claude's empty allowlist, which means all).
+allowed_tools   = ["Read", "Grep", "Glob", "AskUserQuestion"]
 ```
 
 Values are normalized at dispatch (`normalize_sandbox_mode`,
 `normalize_approval_policy`, `normalize_reasoning_effort`,
-`normalize_codex_managed_context`, `normalize_codex_context_archive`): unknown
-or empty values fall back to the safe
+`normalize_codex_managed_context`, `normalize_codex_context_archive`,
+`normalize_kimi_permission_mode`, `normalize_kimi_thinking`): unknown or empty
+authority values fall back to the safe
 default rather than silently escalating privileges (e.g. a typo'd Codex sandbox
 becomes `workspace-write`, not `danger-full-access`; an unknown
 `managed_context` becomes `vanilla`; an unknown `context_archive` becomes
@@ -905,6 +1112,7 @@ becomes `workspace-write`, not `danger-full-access`; an unknown
 ```bash
 intendant --agent codex "refactor the auth module"
 intendant --agent claude-code "add tests for the parser"
+intendant --agent kimi "implement the parser tests"
 ```
 
 `--agent <name>` parses via `AgentBackend::from_str_loose` and overrides
@@ -919,6 +1127,11 @@ shared state (when driven over MCP) → config default → native.
   child environment to the app-server process. It does not write
   `<workspace>/.codex/config.toml`, create
   `config.toml.intendant-backup`, or restore files on shutdown.
+- **Kimi bridge homes are supervisor state, not workspace state.** Kimi's
+  generated MCP declaration and server-private files live below
+  `KIMI_CODE_HOME/intendant-bridges`, never in the checkout and never in the
+  primary `mcp.json`. A stable bridge is intentionally reused for the same
+  Intendant session so resume keeps Kimi's server-side state addressable.
 - **Settings latch at thread/process start.** Codex latches sandbox, approval
   policy, model, reasoning effort, tool set, and writable roots at `thread/start`.
   Changing these mid-session requires a teardown + respawn. The daemon's runtime
@@ -954,9 +1167,9 @@ shared state (when driven over MCP) → config default → native.
   unsupported by this backend" from "feature attempted but failed" partly by these
   error messages — a backend without native steering returns the
   unsupported error, and the caller falls back to **queueing** the text onto the
-  context-injection queue for delivery at the next turn. Both current backends
-  (Codex, Claude Code) steer natively, so the fallback is dormant — but it is
-  the contract any future backend inherits. Don't reword those strings without
+  context-injection queue for delivery at the next turn. Codex and Kimi steer
+  natively; Claude Code deliberately takes this queued fallback because its
+  stream-json mode discards mid-turn input. Don't reword those strings without
   checking the drain logic.
 - **Only turn-implying events wake an idle session into the observe drain.**
   While idle, messages/reasoning/tool/plan/diff/turn events are treated as a

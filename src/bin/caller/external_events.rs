@@ -129,6 +129,21 @@ pub(crate) async fn drain_external_agent_events(
     .await
 }
 
+fn validated_kimi_child_action_result_session(
+    params: &serde_json::Value,
+    config: &DrainConfig<'_>,
+    stats: &LoopStats,
+    side_sessions: Option<&ExternalSideSessionState<'_>>,
+) -> Option<String> {
+    if external_backend_of_config(config) != Some(external_agent::AgentBackend::Kimi) {
+        return None;
+    }
+    let child_id = thread_id_from_action_params(params)?;
+    let is_side = side_sessions.is_some_and(|state| state.has_side_thread(&child_id));
+    let is_subagent = stats.codex_subagent_sessions.contains(&child_id);
+    (is_side || is_subagent).then_some(child_id)
+}
+
 #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn drain_external_agent_events_with_prefetched(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
@@ -747,13 +762,22 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         action,
                         params,
                         origin,
-                    }) if event_targets_session_or_alias(
+                    }) if event_targets_external_session_or_optional_side(
                         &session_id,
                         &local_session_id,
                         &alias_session_id,
+                        side_sessions
+                            .as_ref()
+                            .map(|state| &*state.open_side_threads),
                     ) => {
-                        let result_session_id =
-                            session_id.clone().or_else(|| local_session_id.clone());
+                        let result_session_id = validated_kimi_child_action_result_session(
+                            &params,
+                            config,
+                            stats,
+                            side_sessions.as_deref(),
+                        )
+                        .or_else(|| session_id.clone())
+                        .or_else(|| local_session_id.clone());
                         if !codex_thread_action_dedupe.mark_seen(&request_id) {
                             continue;
                         }
@@ -909,9 +933,14 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         } else {
                             params
                         };
-                        let effect =
-                            handle_external_thread_action(agent, action, params, session_id, config)
-                                .await;
+                        let effect = handle_external_thread_action(
+                            agent,
+                            action,
+                            params,
+                            result_session_id,
+                            config,
+                        )
+                        .await;
                         match effect {
                             ExternalThreadActionEffect::SideTurnStarted {
                                 parent_thread_id,
@@ -2779,6 +2808,264 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn drain_starts_kimi_subagent_once_and_ends_failed_child() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let mut observed = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("kimi-parent".to_string()),
+            alias_session_id: None,
+            backend_thread_id: Some("kimi-parent".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Kimi Code".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+            reload_credentials: None,
+        };
+        let child_id = "kimi-parent:agent-1";
+        let state = |status: &str, message: Option<&str>| external_agent::SubAgentState {
+            thread_id: child_id.to_string(),
+            status: status.to_string(),
+            message: message.map(str::to_string),
+        };
+        let event = |status: &str, child_status: &str, message: Option<&str>| {
+            external_agent::AgentEvent::SubAgentToolCall {
+                item_id: "call-1".to_string(),
+                tool: "researcher".to_string(),
+                status: status.to_string(),
+                sender_thread_id: "kimi-parent".to_string(),
+                receiver_thread_ids: vec![child_id.to_string()],
+                prompt: Some("inspect the implementation".to_string()),
+                model: None,
+                reasoning_effort: None,
+                agents: vec![state(child_status, message)],
+            }
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_tx
+            .send(event("inProgress", "pendingInit", None))
+            .unwrap();
+        event_tx.send(event("running", "running", None)).unwrap();
+        event_tx
+            .send(event("failed", "errored", Some("backend failed")))
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::TurnCompleted { message: None })
+            .unwrap();
+        drop(event_tx);
+
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> =
+            Box::new(ManagedDrainTestAgent { interrupts, steers });
+        let mut stats = LoopStats::default();
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
+            &mut dedupe,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert!(matches!(outcome, DrainOutcome::TurnCompleted { .. }));
+
+        let mut agent_started = 0;
+        let mut child_ended = 0;
+        while let Ok(event) = observed.try_recv() {
+            match event {
+                AppEvent::AgentStarted { .. } => agent_started += 1,
+                AppEvent::SessionEnded {
+                    session_id, reason, ..
+                } if session_id == child_id => {
+                    child_ended += 1;
+                    assert!(reason.contains("errored"));
+                    assert!(reason.contains("backend failed"));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            agent_started, 1,
+            "spawn is the only subagent envelope that starts tool activity"
+        );
+        assert_eq!(
+            child_ended, 1,
+            "an errored Kimi child must emit one terminal session event"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_routes_kimi_side_and_rewritten_subagent_actions_to_child() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let mut observed = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("kimi-parent".to_string()),
+            alias_session_id: None,
+            backend_thread_id: Some("kimi-parent".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Kimi Code".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+            reload_credentials: None,
+        };
+        let side_id = "kimi-parent:side-agent";
+        let subagent_id = "kimi-parent:worker-agent";
+        let mut open_side_threads =
+            HashMap::from([(side_id.to_string(), "kimi-parent".to_string())]);
+        let mut side_rounds = HashMap::new();
+        let mut side_turn_revisions = HashMap::new();
+        let mut side_sessions = ExternalSideSessionState {
+            open_side_threads: &mut open_side_threads,
+            side_rounds: &mut side_rounds,
+            side_turn_revisions: &mut side_turn_revisions,
+        };
+
+        bus.send(AppEvent::CodexThreadActionRequested {
+            request_id: "side-action".to_string(),
+            session_id: Some(side_id.to_string()),
+            action: "tools".to_string(),
+            params: serde_json::json!({}),
+            origin: Some("dashboard".to_string()),
+        });
+        bus.send(AppEvent::CodexThreadActionRequested {
+            request_id: "subagent-action".to_string(),
+            session_id: Some("kimi-parent".to_string()),
+            action: "context-clear".to_string(),
+            params: serde_json::json!({ "threadId": subagent_id }),
+            origin: Some("dashboard".to_string()),
+        });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_tx
+            .send(external_agent::AgentEvent::TurnCompleted { message: None })
+            .unwrap();
+        drop(event_tx);
+
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> =
+            Box::new(ThreadActionDrainTestAgent {
+                actions: actions.clone(),
+            });
+        let mut stats = LoopStats::default();
+        stats
+            .codex_subagent_sessions
+            .insert(subagent_id.to_string());
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
+            &mut dedupe,
+            Some(&mut side_sessions),
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert!(matches!(outcome, DrainOutcome::TurnCompleted { .. }));
+
+        let actions = actions.lock().unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].0, "tools");
+        assert_eq!(
+            thread_id_from_action_params(&actions[0].1).as_deref(),
+            Some(side_id),
+            "a direct side action must gain its child thread id"
+        );
+        assert_eq!(actions[1].0, "context-clear");
+        assert_eq!(
+            thread_id_from_action_params(&actions[1].1).as_deref(),
+            Some(subagent_id)
+        );
+        drop(actions);
+
+        let mut result_sessions = HashMap::new();
+        while let Ok(event) = observed.try_recv() {
+            if let AppEvent::CodexThreadActionResult {
+                session_id,
+                action,
+                success,
+                ..
+            } = event
+            {
+                assert!(success);
+                result_sessions.insert(action, session_id);
+            }
+        }
+        assert_eq!(
+            result_sessions.get("tools").and_then(Option::as_deref),
+            Some(side_id)
+        );
+        assert_eq!(
+            result_sessions
+                .get("context-clear")
+                .and_then(Option::as_deref),
+            Some(subagent_id),
+            "a parent-rewritten Kimi action must report back on the child session"
+        );
+    }
+
     /// A TurnLimitRejected from the adapter maps to the terminal
     /// LimitRejected outcome — immediately (no post-turn grace) and
     /// without any backend-error side effects.
@@ -2994,6 +3281,68 @@ mod tests {
     struct ManagedDrainTestAgent {
         interrupts: Arc<std::sync::atomic::AtomicUsize>,
         steers: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct ThreadActionDrainTestAgent {
+        actions: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl external_agent::ExternalAgent for ThreadActionDrainTestAgent {
+        fn name(&self) -> &str {
+            "Kimi Code"
+        }
+
+        async fn initialize(
+            &mut self,
+            _config: external_agent::AgentConfig,
+        ) -> Result<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>, CallerError>
+        {
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            Ok(rx)
+        }
+
+        async fn start_thread(&mut self) -> Result<external_agent::AgentThread, CallerError> {
+            Ok(external_agent::AgentThread {
+                thread_id: "kimi-parent".to_string(),
+            })
+        }
+
+        async fn send_message(
+            &mut self,
+            _thread: &external_agent::AgentThread,
+            _message: &str,
+        ) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn resolve_approval(
+            &mut self,
+            _request_id: &str,
+            _decision: external_agent::ApprovalDecision,
+        ) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn thread_action(
+            &mut self,
+            op: &str,
+            params: &serde_json::Value,
+        ) -> Result<String, CallerError> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push((op.to_string(), params.clone()));
+            Ok(format!("{op} applied"))
+        }
     }
 
     #[async_trait::async_trait]

@@ -85,7 +85,7 @@ check_core() {
         all_ok=false
     fi
 
-    # ripgrep — used by external agents (Codex, Claude Code) for code
+    # ripgrep — used by external agents (Codex, Claude Code, Kimi Code) for code
     # search. Missing `rg` causes agents to fall back to slower paths.
     if has_cmd rg; then
         ok "ripgrep"

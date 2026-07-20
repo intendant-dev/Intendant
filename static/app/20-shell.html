@@ -853,8 +853,90 @@
                 </div>
               </fieldset>
             </div>
+            <div id="control-kimi-section" style="display:none">
+              <fieldset class="control-group">
+                <legend>Session actions</legend>
+                <div class="control-actions-row">
+                  <button class="control-action-btn" data-codex-action="compact" title="Compact Kimi's current context">Compact</button>
+                  <button class="control-action-btn" data-codex-action="undo" title="Undo Kimi's most recent turn">Undo</button>
+                  <button class="control-action-btn" data-codex-action="fork" title="Fork the current Kimi session">Fork…</button>
+                  <button class="control-action-btn" data-codex-action="rename" title="Rename the current Kimi session">Rename…</button>
+                </div>
+                <div class="control-hint">
+                  Actions are gated by the live Kimi session's advertised capabilities and dispatch through Intendant's backend-neutral session-action channel.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Model</legend>
+                <div class="control-row">
+                  <label for="control-kimi-model">Override</label>
+                  <input type="text" id="control-kimi-model" placeholder="e.g. kimi-code/kimi-for-coding (empty = Kimi default)">
+                </div>
+                <div class="control-hint">
+                  Applies when the next Kimi session process starts. Empty leaves the selected Kimi provider and account defaults in charge.
+                </div>
+                <div class="control-row">
+                  <label for="control-kimi-thinking">Thinking</label>
+                  <select id="control-kimi-thinking">
+                    <option value="">model default</option>
+                    <option value="off">off</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                    <option value="xhigh">xhigh</option>
+                    <option value="max">max</option>
+                  </select>
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Authority</legend>
+                <div class="control-row">
+                  <label for="control-kimi-permission-mode">Permission mode</label>
+                  <select id="control-kimi-permission-mode">
+                    <option value="manual">manual</option>
+                    <option value="auto">auto</option>
+                    <option value="yolo">yolo</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  <strong>manual</strong> forwards Kimi's approval requests to Intendant. <strong>auto</strong> lets Kimi approve its safe-action set. <strong>yolo</strong> suppresses Kimi's permission prompts and should only be used inside a suitable external sandbox.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Native modes</legend>
+                <div class="control-row">
+                  <label for="control-kimi-plan-mode">Plan mode</label>
+                  <input type="checkbox" id="control-kimi-plan-mode">
+                </div>
+                <div class="control-row">
+                  <label for="control-kimi-swarm-mode">Swarm / sub-agents</label>
+                  <input type="checkbox" id="control-kimi-swarm-mode">
+                </div>
+                <div class="control-hint">
+                  These use Kimi's native planning and parallel sub-agent orchestration. They apply to the next Kimi session process.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Active tools</legend>
+                <div class="control-row">
+                  <label for="control-kimi-tools-mode">Availability</label>
+                  <select id="control-kimi-tools-mode">
+                    <option value="default">Kimi profile default</option>
+                    <option value="exact">Exact list</option>
+                    <option value="none">No optional tools</option>
+                  </select>
+                </div>
+                <div class="control-row">
+                  <label for="control-kimi-allowed-tools">Exact names</label>
+                  <textarea id="control-kimi-allowed-tools" rows="3" placeholder="one tool per line, e.g.&#10;Read&#10;Write" style="flex:1;padding:4px 8px;background:var(--surface0);border:1px solid var(--surface1);color:var(--text);border-radius:4px;font-size:12px;font-family:var(--font-mono);resize:vertical"></textarea>
+                </div>
+                <div class="control-hint">
+                  This controls which Kimi tools exist for the agent, not which calls skip approval. <strong>Profile default</strong> removes Intendant's override; <strong>No optional tools</strong> is an explicit empty set. Global changes apply on the next task; a live session's Configure dialog can apply an exact set immediately.
+                </div>
+              </fieldset>
+            </div>
             <div id="control-no-backend" class="control-disabled-overlay" style="display:none">
-              Pick Codex in Settings &rarr; Agent to configure backend-specific knobs.
+              Pick Codex, Claude Code, or Kimi Code in Settings &rarr; Agent to configure backend-specific knobs.
             </div>
           </div>
         </div>
@@ -987,6 +1069,7 @@
                 <button type="button" data-agent="codex">Codex</button>
                 <button type="button" data-agent="all">All</button>
                 <button type="button" data-agent="claude">Claude</button>
+                <button type="button" data-agent="kimi">Kimi</button>
               </div>
               <div class="token-activity-segment" id="token-activity-view" role="tablist" aria-label="Token activity view">
                 <button type="button" data-view="daily">Daily</button>
@@ -1304,6 +1387,7 @@
                     <label><input type="checkbox" value="external"> External agents</label>
                     <label><input type="checkbox" value="codex"> Codex</label>
                     <label><input type="checkbox" value="claude-code"> Claude</label>
+                    <label><input type="checkbox" value="kimi"> Kimi</label>
                   </div>
                 </div>
                 <div class="sessions-control sessions-multi-filter" data-session-filter="status">
@@ -1444,6 +1528,7 @@
                     <label><input type="checkbox" value="external"> External agents</label>
                     <label><input type="checkbox" value="codex"> Codex</label>
                     <label><input type="checkbox" value="claude-code"> Claude</label>
+                    <label><input type="checkbox" value="kimi"> Kimi</label>
                   </div>
                 </div>
                 <div class="sessions-control sessions-multi-filter" data-session-filter="deep-status">
@@ -1573,6 +1658,7 @@
                       <option value="internal">Internal agent</option>
                       <option value="codex">Codex</option>
                       <option value="claude-code">Claude Code</option>
+                      <option value="kimi">Kimi Code</option>
                     </select>
                   </label>
                   <label class="sessions-new-session-field" for="new-session-execution" id="new-session-execution-wrap"
@@ -1593,13 +1679,13 @@
                   <span class="sessions-fueled-text" id="new-session-fueled-text">Fueled &mdash; model credentials active, ready to launch.</span>
                 </div>
                 <div id="new-session-unfueled-banner" class="sessions-unfueled-banner hidden">
-                  <span class="sessions-unfueled-text">No model credentials on this daemon &mdash; the internal agent can&rsquo;t start. External agents (Codex, Claude Code) sign in with their own accounts and still work.</span>
+                  <span class="sessions-unfueled-text">No model credentials on this daemon &mdash; the internal agent can&rsquo;t start. External agents (Codex, Claude Code, Kimi Code) sign in with their own accounts and still work.</span>
                   <button type="button" class="ui-btn sessions-unfueled-add-keys" onclick="focusSettingsApiKeys()">Add API keys</button>
                 </div>
                 <details class="ui-fold sessions-new-external-fold" id="new-session-external-fold">
                   <summary>External agent options</summary>
                   <div class="ui-fold-body">
-                    <p class="ui-fold-hint">These apply to external agents — pick Codex or Claude Code above to enable.</p>
+                    <p class="ui-fold-hint">These apply to external agents — pick Codex, Claude Code, or Kimi Code above to enable.</p>
                     <div class="sessions-new-agent-row sessions-new-external-grid">
                       <div class="sessions-new-session-field">
                         <label for="new-session-agent-command">Binary path</label>
@@ -1663,6 +1749,61 @@
                           <option value="max">max</option>
                           <option value="ultracode">ultracode</option>
                         </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-kimi-model-select">
+                        Kimi model
+                        <select id="new-session-kimi-model-select" onchange="onNewSessionKimiModelSelectChange()" disabled>
+                          <option value="">Global setting</option>
+                          <option value="kimi-code/kimi-for-coding">K2.7 Coding</option>
+                          <option value="kimi-code/kimi-for-coding-highspeed">K2.7 Coding Highspeed</option>
+                          <option value="kimi-code/k3">K3</option>
+                          <option value="__custom__">Custom model id…</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field hidden" for="new-session-kimi-model" id="new-session-kimi-model-custom-row">
+                        Custom model id
+                        <input id="new-session-kimi-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. kimi-code/kimi-for-coding" disabled>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-kimi-thinking">
+                        Kimi thinking
+                        <select id="new-session-kimi-thinking" disabled>
+                          <option value="">Global setting</option>
+                          <option value="off">off</option>
+                          <option value="low">low</option>
+                          <option value="medium">medium</option>
+                          <option value="high">high</option>
+                          <option value="xhigh">xhigh</option>
+                          <option value="max">max</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-kimi-permission-mode">
+                        Kimi permissions
+                        <select id="new-session-kimi-permission-mode" disabled>
+                          <option value="">Global setting</option>
+                          <option value="manual">manual</option>
+                          <option value="auto">auto</option>
+                          <option value="yolo">yolo</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-kimi-plan-mode">
+                        Kimi plan mode
+                        <input id="new-session-kimi-plan-mode" type="checkbox" disabled>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-kimi-swarm-mode">
+                        Kimi swarm mode
+                        <input id="new-session-kimi-swarm-mode" type="checkbox" disabled>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-kimi-tools-mode">
+                        Kimi active tools
+                        <select id="new-session-kimi-tools-mode" onchange="onNewSessionKimiToolsModeChange()" disabled>
+                          <option value="inherit">Global setting</option>
+                          <option value="exact">Exact list</option>
+                          <option value="none">No optional tools</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-kimi-allowed-tools">
+                        Exact tool names
+                        <textarea id="new-session-kimi-allowed-tools" rows="2" autocomplete="off" spellcheck="false" placeholder="Read, Write" disabled></textarea>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-codex-sandbox">
                         Sandbox

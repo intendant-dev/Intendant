@@ -291,6 +291,41 @@ function populateSettingsClaudeModel(configuredModel) {
   updateSettingsClaudeCustomModelRow();
 }
 
+function settingsKimiModelValue() {
+  const select = document.getElementById('set-kimi-model-select');
+  if (!select) return '';
+  if (select.value === '__custom__') {
+    return document.getElementById('set-kimi-model-custom')?.value.trim() || '';
+  }
+  return select.value || '';
+}
+
+function updateSettingsKimiCustomModelRow() {
+  const custom = document.getElementById('set-kimi-model-select')?.value === '__custom__';
+  document.getElementById('set-kimi-model-custom-row')?.classList.toggle('hidden', !custom);
+}
+
+function populateSettingsKimiModel(configuredModel) {
+  const select = document.getElementById('set-kimi-model-select');
+  const customInput = document.getElementById('set-kimi-model-custom');
+  if (!select) return;
+  const model = String(configuredModel || '').trim();
+  const known = [
+    'kimi-code/kimi-for-coding',
+    'kimi-code/kimi-for-coding-highspeed',
+    'kimi-code/k3',
+  ];
+  select.value = !model ? '' : (known.includes(model) ? model : '__custom__');
+  if (customInput) customInput.value = model && !known.includes(model) ? model : '';
+  updateSettingsKimiCustomModelRow();
+}
+
+function updateSettingsKimiToolsMode() {
+  const mode = document.getElementById('set-kimi-tools-mode')?.value || 'default';
+  const input = document.getElementById('set-kimi-allowed-tools');
+  if (input) input.disabled = mode !== 'exact';
+}
+
 async function loadSettings() {
   try {
     const d = await fetchDashboardSettings();
@@ -321,6 +356,7 @@ async function loadSettings() {
     document.getElementById('set-codex-command').value = d.codex_command || 'codex';
     document.getElementById('set-codex-managed-command').value = d.codex_managed_command || '';
     document.getElementById('set-claude-command').value = d.claude_command || 'claude';
+    document.getElementById('set-kimi-command').value = d.kimi_command || 'kimi';
     document.getElementById('set-codex-service-tier').value = normalizeCodexServiceTier(d.codex_service_tier || '');
     controlCodexConfig = {
       command: d.codex_command || 'codex',
@@ -341,10 +377,29 @@ async function loadSettings() {
       permission_mode: d.claude_permission_mode || 'default',
       allowed_tools: Array.isArray(d.claude_allowed_tools) ? d.claude_allowed_tools : [],
     };
+    controlKimiConfig = {
+      command: d.kimi_command || 'kimi',
+      model: d.kimi_model || '',
+      thinking: d.kimi_thinking || '',
+      permission_mode: d.kimi_permission_mode || 'manual',
+      plan_mode: !!d.kimi_plan_mode,
+      swarm_mode: !!d.kimi_swarm_mode,
+      allowed_tools: kimiAllowedToolsFromSettings(d),
+    };
     setNewSessionAgentDefaults(d);
     populateSettingsCodexModel(d.codex_model, d.codex_reasoning_effort);
     populateSettingsClaudeModel(d.claude_model);
+    populateSettingsKimiModel(d.kimi_model);
     document.getElementById('set-claude-permission-mode').value = controlClaudeConfig.permission_mode;
+    document.getElementById('set-kimi-thinking').value = controlKimiConfig.thinking;
+    document.getElementById('set-kimi-permission-mode').value = controlKimiConfig.permission_mode;
+    document.getElementById('set-kimi-plan-mode').checked = controlKimiConfig.plan_mode;
+    document.getElementById('set-kimi-swarm-mode').checked = controlKimiConfig.swarm_mode;
+    renderKimiToolsEditor(
+      'set-kimi-tools-mode',
+      'set-kimi-allowed-tools',
+      controlKimiConfig.allowed_tools,
+    );
     // External agent: persisted to intendant.toml via `[agent]
     // default_backend`. Sync the Settings dropdown and status bar
     // worker identity here — on a fresh daemon boot there are no
@@ -391,6 +446,16 @@ async function saveSettings() {
   const selectedClaudeModel = settingsClaudeModelValue();
   const selectedClaudePermissionMode = g('set-claude-permission-mode')?.value || 'default';
   const selectedClaudeCommand = (g('set-claude-command')?.value || '').trim() || 'claude';
+  const selectedKimiModel = settingsKimiModelValue();
+  const selectedKimiThinking = g('set-kimi-thinking')?.value || '';
+  const selectedKimiPermissionMode = g('set-kimi-permission-mode')?.value || 'manual';
+  const selectedKimiPlanMode = !!g('set-kimi-plan-mode')?.checked;
+  const selectedKimiSwarmMode = !!g('set-kimi-swarm-mode')?.checked;
+  const selectedKimiAllowedTools = readKimiToolsEditor(
+    'set-kimi-tools-mode',
+    'set-kimi-allowed-tools',
+  );
+  const selectedKimiCommand = (g('set-kimi-command')?.value || '').trim() || 'kimi';
   const payload = {
     cu_provider: g('set-cu-provider').value || null,
     cu_model: g('set-cu-model').value || null,
@@ -427,6 +492,7 @@ async function saveSettings() {
     // Empty string is meaningful: it clears the managed-fork override.
     codex_managed_command: (g('set-codex-managed-command').value || '').trim(),
     claude_command: selectedClaudeCommand,
+    kimi_command: selectedKimiCommand,
     codex_sandbox: controlCodexConfig.sandbox || 'workspace-write',
     codex_approval_policy: controlCodexConfig.approval_policy || 'on-request',
     // Empty strings are explicit clears. `null`/omission means "leave this
@@ -446,6 +512,13 @@ async function saveSettings() {
     claude_allowed_tools: Array.isArray(controlClaudeConfig.allowed_tools)
       ? controlClaudeConfig.allowed_tools
       : [],
+    kimi_model: selectedKimiModel,
+    kimi_thinking: selectedKimiThinking,
+    kimi_permission_mode: selectedKimiPermissionMode,
+    kimi_plan_mode: selectedKimiPlanMode,
+    kimi_swarm_mode: selectedKimiSwarmMode,
+    kimi_allowed_tools: selectedKimiAllowedTools,
+    kimi_allowed_tools_cleared: selectedKimiAllowedTools === null,
   };
   let settingsSaved = false;
   try {
@@ -494,10 +567,26 @@ async function saveSettings() {
   controlCodexConfig.service_tier = selectedCodexServiceTier;
   controlClaudeConfig.model = selectedClaudeModel;
   controlClaudeConfig.permission_mode = selectedClaudePermissionMode;
+  controlKimiConfig = {
+    command: selectedKimiCommand,
+    model: selectedKimiModel,
+    thinking: selectedKimiThinking,
+    permission_mode: selectedKimiPermissionMode,
+    plan_mode: selectedKimiPlanMode,
+    swarm_mode: selectedKimiSwarmMode,
+    allowed_tools: selectedKimiAllowedTools,
+  };
   newSessionCodexDefaultServiceTier = selectedCodexServiceTier;
   newSessionCodexGlobalModel = selectedCodexModel;
   newSessionCodexGlobalReasoningEffort = selectedCodexReasoningEffort;
   newSessionAgentCommands['claude-code'] = selectedClaudeCommand;
+  newSessionAgentCommands.kimi = selectedKimiCommand;
+  newSessionKimiGlobalModel = selectedKimiModel;
+  newSessionKimiGlobalThinking = selectedKimiThinking;
+  newSessionKimiGlobalPermissionMode = selectedKimiPermissionMode;
+  newSessionKimiGlobalPlanMode = selectedKimiPlanMode;
+  newSessionKimiGlobalSwarmMode = selectedKimiSwarmMode;
+  newSessionKimiGlobalAllowedTools = selectedKimiAllowedTools;
   if (!newSessionCodexFastModeTouched) {
     newSessionCodexFastMode = codexServiceTierIsFast(selectedCodexServiceTier);
   }
@@ -544,6 +633,13 @@ async function saveSettings() {
     action: 'set_claude_allowed_tools',
     tools: Array.isArray(controlClaudeConfig.allowed_tools) ? controlClaudeConfig.allowed_tools : [],
   });
+  dispatchControlMsg({ action: 'set_kimi_command', command: selectedKimiCommand });
+  dispatchControlMsg({ action: 'set_kimi_model', model: selectedKimiModel || null });
+  dispatchControlMsg({ action: 'set_kimi_thinking', thinking: selectedKimiThinking || null });
+  dispatchControlMsg({ action: 'set_kimi_permission_mode', mode: selectedKimiPermissionMode });
+  dispatchControlMsg({ action: 'set_kimi_plan_mode', enabled: selectedKimiPlanMode });
+  dispatchControlMsg({ action: 'set_kimi_swarm_mode', enabled: selectedKimiSwarmMode });
+  dispatchControlMsg({ action: 'set_kimi_allowed_tools', tools: selectedKimiAllowedTools });
   // The save may have recomputed the live write-grant set (extra grants
   // resolve and dedup daemon-side) — re-pull just this card's view so
   // "where it can write" stays truthful.
@@ -564,6 +660,8 @@ document.getElementById('set-codex-model-custom')?.addEventListener('input', () 
   populateSettingsCodexReasoningEfforts();
 });
 document.getElementById('set-claude-model-select')?.addEventListener('change', updateSettingsClaudeCustomModelRow);
+document.getElementById('set-kimi-model-select')?.addEventListener('change', updateSettingsKimiCustomModelRow);
+document.getElementById('set-kimi-tools-mode')?.addEventListener('change', updateSettingsKimiToolsMode);
 document.getElementById('download-session-report-btn')?.addEventListener('click', downloadSessionReportViaDashboardControl);
 document.getElementById('connect-self-test-btn')?.addEventListener('click', () => {
   runConnectSelfTests().catch(err => {
@@ -1181,7 +1279,7 @@ function summarizeSessionUsage(sessions) {
 function agentUsageKey(session) {
   const source = (session && session.source) || 'intendant';
   if (source === 'claude-code') return 'claude';
-  if (source === 'codex' || source === 'intendant') return source;
+  if (source === 'codex' || source === 'kimi' || source === 'intendant') return source;
   return 'other';
 }
 
@@ -1189,6 +1287,7 @@ function agentUsageLabel(key) {
   return {
     codex: 'Codex',
     claude: 'Claude Code',
+    kimi: 'Kimi Code',
     intendant: 'Intendant Internal',
     other: 'Other',
   }[key] || key;
@@ -1232,7 +1331,7 @@ function addEntryToAgentUsageBucket(bucket, sessionId, entry) {
 }
 
 function summarizeUsageByAgent(sessions) {
-  const order = ['codex', 'claude', 'intendant', 'other'];
+  const order = ['codex', 'claude', 'kimi', 'intendant', 'other'];
   const periods = [
     { key: 'today', label: 'Today' },
     { key: 'week', label: 'Last 7 Days' },
@@ -1289,6 +1388,7 @@ function tokenActivityAgentLabel(key) {
     all: 'All',
     codex: 'Codex',
     claude: 'Claude',
+    kimi: 'Kimi',
     intendant: 'Intendant',
     other: 'Other',
   }[key] || key;
@@ -2127,7 +2227,7 @@ const UI2_BY_MODEL_CARD_LIMIT = 8;
 
 // Session-source chip for a model card. Honest labels only: the corpus
 // knows which backend ran a session (source), not which live role
-// (main/presence) a model played — so the chip says native/codex/claude,
+// (main/presence) a model played — so the chip says native/codex/claude/kimi,
 // never a role the data can't prove.
 function ui2ModelSourceChipHtml(bucket) {
   const sources = Array.from(bucket.sources);
@@ -2136,6 +2236,7 @@ function ui2ModelSourceChipHtml(bucket) {
     intendant: 'native',
     codex: 'codex',
     claude: 'claude code',
+    kimi: 'kimi code',
     other: 'other',
     mixed: 'mixed',
   }[key] || key;

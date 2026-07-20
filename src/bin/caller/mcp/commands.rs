@@ -576,6 +576,98 @@ pub(crate) async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::SetKimiCommand { command } => {
+            emit_control_result(
+                control_tx,
+                "set_kimi_command",
+                true,
+                format!("Kimi command set to {command} (applies on next task)"),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetKimiModel { model } => {
+            let label = model
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("<default>");
+            emit_control_result(
+                control_tx,
+                "set_kimi_model",
+                true,
+                format!("Kimi model set to {label} (applies on next task)"),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetKimiThinking { thinking } => {
+            let label = crate::project::normalize_kimi_thinking(thinking.as_deref())
+                .unwrap_or_else(|| "<default>".to_string());
+            emit_control_result(
+                control_tx,
+                "set_kimi_thinking",
+                true,
+                format!("Kimi thinking set to {label} (applies on next task)"),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetKimiPermissionMode { mode } => {
+            emit_control_result(
+                control_tx,
+                "set_kimi_permission_mode",
+                true,
+                format!(
+                    "Kimi permission mode set to {} (applies on next task)",
+                    crate::project::normalize_kimi_permission_mode(&mode)
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetKimiPlanMode { enabled } => {
+            emit_control_result(
+                control_tx,
+                "set_kimi_plan_mode",
+                true,
+                format!(
+                    "Kimi plan mode {} (applies on next task)",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetKimiSwarmMode { enabled } => {
+            emit_control_result(
+                control_tx,
+                "set_kimi_swarm_mode",
+                true,
+                format!(
+                    "Kimi swarm mode {} (applies on next task)",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetKimiAllowedTools { tools } => {
+            let message = match tools {
+                None => {
+                    "Kimi active-tool override cleared — native profile defaults apply on the next task"
+                        .to_string()
+                }
+                Some(tools) if tools.is_empty() => {
+                    "Kimi active tools set to none (applies on next task)".to_string()
+                }
+                Some(tools) => format!(
+                    "Kimi active tools set exactly to {} (applies on next task)",
+                    tools.join(", ")
+                ),
+            };
+            emit_control_result(control_tx, "set_kimi_allowed_tools", true, message, None);
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::SetVerbosity { level } => {
             let parsed = match level.to_lowercase().as_str() {
                 "quiet" => Some(Verbosity::Quiet),

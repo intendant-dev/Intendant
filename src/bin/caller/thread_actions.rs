@@ -13,8 +13,9 @@ use crate::{
     external_tool_failure_content, external_tool_preview_text,
     inspect_context_rewind_anchor_from_rollout, list_context_rewind_anchors_from_rollout,
     resolve_managed_context_edit_branch_target, scan_context_rewind_anchor_catalog,
-    truncate_string_copy, ContextRewindAnchorCatalogEntry, DrainOutcome, ExternalDiffDeltaTracker,
-    LoopStats, PendingRuntimeSteer, UserTurnRevisionState,
+    truncate_string_copy, unanswered_question_answers, user_question_preview,
+    ContextRewindAnchorCatalogEntry, DrainOutcome, ExternalDiffDeltaTracker, LoopStats,
+    PendingRuntimeSteer, UserTurnRevisionState,
 };
 use crate::{slog, DrainConfig};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -79,27 +80,43 @@ pub(crate) fn side_thread_ids_from_message(message: &str) -> Option<(String, Str
 pub(crate) fn fork_session_name_from_params(params: &serde_json::Value) -> Option<String> {
     params
         .get("name")
+        .or_else(|| params.get("title"))
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
 }
 
-pub(crate) fn codex_thread_rename_name_from_result(
+fn external_thread_rename_name_from_result(
+    backend: &external_agent::AgentBackend,
     params: &serde_json::Value,
     message: &str,
 ) -> Option<String> {
     fork_session_name_from_params(params).or_else(|| {
+        let prefix = match backend {
+            external_agent::AgentBackend::Codex => "Codex thread renamed to ",
+            external_agent::AgentBackend::Kimi => "Kimi session renamed to ",
+            external_agent::AgentBackend::ClaudeCode => "Claude Code session renamed to ",
+        };
         message
-            .strip_prefix("Codex thread renamed to ")
+            .strip_prefix(prefix)
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .map(str::to_string)
     })
 }
 
-pub(crate) fn persist_codex_thread_rename_overlay(
+#[cfg(test)]
+pub(crate) fn codex_thread_rename_name_from_result(
+    params: &serde_json::Value,
+    message: &str,
+) -> Option<String> {
+    external_thread_rename_name_from_result(&external_agent::AgentBackend::Codex, params, message)
+}
+
+fn persist_external_thread_rename_overlay(
     home: &Path,
+    backend: &external_agent::AgentBackend,
     session_id: Option<&str>,
     params: &serde_json::Value,
     message: &str,
@@ -107,10 +124,26 @@ pub(crate) fn persist_codex_thread_rename_overlay(
     let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
         return Ok(None);
     };
-    let Some(name) = codex_thread_rename_name_from_result(params, message) else {
+    let Some(name) = external_thread_rename_name_from_result(backend, params, message) else {
         return Ok(None);
     };
-    crate::session_names::rename_session(home, "codex", session_id, &name).map(Some)
+    crate::session_names::rename_session(home, backend.as_short_str(), session_id, &name).map(Some)
+}
+
+#[cfg(test)]
+pub(crate) fn persist_codex_thread_rename_overlay(
+    home: &Path,
+    session_id: Option<&str>,
+    params: &serde_json::Value,
+    message: &str,
+) -> Result<Option<String>, String> {
+    persist_external_thread_rename_overlay(
+        home,
+        &external_agent::AgentBackend::Codex,
+        session_id,
+        params,
+        message,
+    )
 }
 
 pub(crate) fn codex_thread_action_capabilities() -> Vec<String> {
@@ -301,6 +334,45 @@ pub(crate) const GOAL_THREAD_ACTION_OPS: [&str; 9] = [
     "goal-budget-limited",
 ];
 
+/// Kimi's native goal API supports completion and enforced budget limits, but
+/// has no direct "mark budget-limited" transition. Exhausted native limits
+/// instead produce `blocked` plus reached/over-budget facts, which the adapter
+/// derives to the universal display status without advertising a fake setter.
+pub(crate) const KIMI_GOAL_THREAD_ACTION_OPS: [&str; 8] = [
+    "goal",
+    "goal-set",
+    "goal-edit",
+    "goal-get",
+    "goal-clear",
+    "goal-pause",
+    "goal-resume",
+    "goal-complete",
+];
+
+/// Kimi operations that its server can scope to an in-process child agent.
+/// This is the single capability/routing allow-list for both `:btw` sides
+/// and native Kimi subagents. Side teardown is relation-specific and is
+/// added by `kimi_child_thread_action_capabilities`.
+pub(crate) const KIMI_CHILD_THREAD_ACTION_OPS: [&str; 4] =
+    ["context-clear", "tools", "tools-set", "tools-all"];
+
+pub(crate) fn kimi_child_thread_action_allowed(op: &str, relationship: &str) -> bool {
+    let op = op.trim().to_ascii_lowercase().replace('_', "-");
+    KIMI_CHILD_THREAD_ACTION_OPS.contains(&op.as_str())
+        || (relationship == "side" && op == "side-close")
+}
+
+pub(crate) fn kimi_child_thread_action_capabilities(relationship: &str) -> Vec<String> {
+    let mut actions = KIMI_CHILD_THREAD_ACTION_OPS
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if relationship == "side" {
+        actions.push("side-close".to_string());
+    }
+    actions
+}
+
 pub(crate) fn goal_thread_action_op(op: &str) -> bool {
     op == "goal" || op.starts_with("goal-")
 }
@@ -334,6 +406,39 @@ pub(crate) fn claude_code_thread_action_capabilities() -> Vec<String> {
         .chain(["model", "permission-mode"])
         .map(str::to_string)
         .collect()
+}
+
+/// Kimi's server API exposes native session lifecycle, goal, and live profile
+/// controls beyond the common external-agent surface.
+pub(crate) fn kimi_thread_action_capabilities() -> Vec<String> {
+    [
+        "compact",
+        "fork",
+        "side",
+        "side-close",
+        "undo",
+        "rename",
+        "archive",
+        "restore",
+        "review",
+        "fast",
+    ]
+    .into_iter()
+    .chain(KIMI_CHILD_THREAD_ACTION_OPS)
+    .chain(KIMI_GOAL_THREAD_ACTION_OPS)
+    .chain([
+        "model",
+        "thinking",
+        "permission-mode",
+        "plan-mode",
+        "swarm-mode",
+        "tasks",
+        "task-output",
+        "task-cancel",
+        "models",
+    ])
+    .map(str::to_string)
+    .collect()
 }
 
 /// Capabilities of the primary NATIVE session: follow-up turns, mid-turn
@@ -403,8 +508,35 @@ pub(crate) fn emit_claude_code_session_capabilities(bus: &EventBus, session_id: 
     });
 }
 
+pub(crate) fn kimi_external_session_capabilities() -> types::SessionCapabilities {
+    types::SessionCapabilities {
+        follow_up: true,
+        steer: true,
+        interrupt: true,
+        thread_actions: kimi_thread_action_capabilities(),
+        codex_thread_actions: Vec::new(),
+        codex_managed_context: None,
+        codex_sandbox: None,
+        codex_approval_policy: None,
+        codex_context_archive: None,
+        codex_command: None,
+        codex_fast_mode: None,
+        codex_service_tier: None,
+    }
+}
+
+pub(crate) fn emit_kimi_session_capabilities(bus: &EventBus, session_id: Option<&str>) {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    bus.send(AppEvent::SessionCapabilities {
+        session_id: session_id.to_string(),
+        capabilities: kimi_external_session_capabilities(),
+    });
+}
+
 pub(crate) fn side_session_prompt_from_params(params: &serde_json::Value) -> Option<String> {
-    ["prompt", "message", "text", "task"]
+    ["prompt", "question", "message", "text", "task"]
         .iter()
         .find_map(|key| params.get(*key).and_then(|v| v.as_str()))
         .or_else(|| params.as_str())
@@ -814,8 +946,9 @@ pub(crate) fn emit_session_relationship(
     });
 }
 
-pub(crate) fn emit_codex_fork_session_name(
+pub(crate) fn emit_external_fork_session_name(
     bus: &EventBus,
+    backend: &external_agent::AgentBackend,
     child_id: &str,
     params: &serde_json::Value,
 ) {
@@ -823,11 +956,211 @@ pub(crate) fn emit_codex_fork_session_name(
         return;
     };
     bus.send(AppEvent::ControlCommand(event::ControlMsg::RenameSession {
-        source: Some("codex".to_string()),
+        source: Some(backend.as_short_str().to_string()),
         session_id: child_id.to_string(),
         backend_session_id: Some(child_id.to_string()),
         name,
     }));
+}
+
+fn clear_fork_staging_and_lineage(config: &mut crate::session_config::SessionAgentConfig) {
+    config.forked_from = None;
+    config.fork_relationship = None;
+    config.fork_anchor = None;
+    config.codex_fork_rollout_path = None;
+    config.codex_fork_rollback_turns = None;
+    config.codex_fork_rollback_item_id = None;
+    config.codex_fork_rollback_position = None;
+    config.kimi_fork_rollback_turns = None;
+    config.kimi_fork_expected_horizon = None;
+}
+
+fn current_external_launch_config(
+    agent: &dyn external_agent::ExternalAgent,
+    config: &DrainConfig<'_>,
+    backend: &external_agent::AgentBackend,
+) -> Option<crate::session_config::SessionAgentConfig> {
+    let existing = crate::session_config::read_log_dir_config(config.log_dir);
+    let mut launch = agent
+        .launch_config_snapshot()
+        .or_else(|| existing.clone())?;
+    if let Some(existing) = existing {
+        // Adapter snapshots own the live launch-affecting fields. Preserve
+        // controller-owned lineage and project metadata that the adapter
+        // cannot observe.
+        launch.merge_missing_from(existing);
+    }
+    launch.source = Some(backend.as_short_str().to_string());
+    if launch.project_root.is_none() {
+        launch.project_root = Some(config.project_root.to_string_lossy().to_string());
+    }
+    Some(launch)
+}
+
+/// Persist a backend-owned in-place profile change under every live address
+/// for the session. Kimi uses this after model/fast/thinking/permission/
+/// plan/swarm/tool mutations so a restart or native fork reproduces the exact
+/// active profile, including an explicitly empty tool set.
+pub(crate) fn persist_live_external_launch_config(
+    agent: &dyn external_agent::ExternalAgent,
+    config: &DrainConfig<'_>,
+    backend: &external_agent::AgentBackend,
+    result_session_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(mut launch) = agent.launch_config_snapshot() else {
+        return Err(format!(
+            "{} adapter did not provide a live launch snapshot",
+            backend
+        ));
+    };
+    if let Some(existing) = crate::session_config::read_log_dir_config(config.log_dir) {
+        launch.merge_missing_from(existing);
+    }
+    launch.source = Some(backend.as_short_str().to_string());
+    if launch.project_root.is_none() {
+        launch.project_root = Some(config.project_root.to_string_lossy().to_string());
+    }
+    crate::session_config::write_log_dir_config(config.log_dir, &launch).map_err(|error| {
+        format!(
+            "persist {} live launch config failed: {error}",
+            backend.as_short_str()
+        )
+    })?;
+
+    let home = crate::platform::home_dir();
+    let mut seen = std::collections::HashSet::new();
+    for id in [
+        result_session_id,
+        config.session_id.as_deref(),
+        config.alias_session_id.as_deref(),
+        config.backend_thread_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|id| !id.is_empty())
+    {
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+        crate::session_config::write_external_overlay(&home, backend.as_short_str(), id, &launch)
+            .map_err(|error| {
+            format!(
+                "persist {} live launch overlay for {} failed: {error}",
+                backend.as_short_str(),
+                short_external_session_id(id)
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Seed the already-created native fork's backend overlay before asking the
+/// supervisor to attach it. This prevents a Kimi fork from being relaunched
+/// with today's global profile instead of the exact live parent profile.
+pub(crate) fn persist_external_fork_child_launch_overlay(
+    agent: &dyn external_agent::ExternalAgent,
+    config: &DrainConfig<'_>,
+    backend: &external_agent::AgentBackend,
+    child_id: &str,
+) -> Result<crate::session_config::SessionAgentConfig, String> {
+    persist_external_child_launch_overlay_at(agent, config, backend, child_id, config.project_root)
+}
+
+fn persist_external_child_launch_overlay_at(
+    agent: &dyn external_agent::ExternalAgent,
+    config: &DrainConfig<'_>,
+    backend: &external_agent::AgentBackend,
+    child_id: &str,
+    project_root: &Path,
+) -> Result<crate::session_config::SessionAgentConfig, String> {
+    let mut launch = current_external_launch_config(agent, config, backend).ok_or_else(|| {
+        format!(
+            "{} adapter did not provide launch state for fork child {}",
+            backend,
+            short_external_session_id(child_id)
+        )
+    })?;
+    clear_fork_staging_and_lineage(&mut launch);
+    launch.project_root = Some(project_root.to_string_lossy().to_string());
+    crate::session_config::replace_external_overlay(
+        &crate::platform::home_dir(),
+        backend.as_short_str(),
+        child_id,
+        &launch,
+    )
+    .map_err(|error| {
+        format!(
+            "persist {} fork-child launch overlay for {} failed: {error}",
+            backend.as_short_str(),
+            short_external_session_id(child_id)
+        )
+    })?;
+    Ok(launch)
+}
+
+/// Build the attach request for a backend-native fork that already exists.
+///
+/// Codex still carries its legacy resume-time fields directly on the control
+/// message. Kimi and Claude rehydrate their complete per-session overlay from
+/// the external overlay store, so only their executable override rides here.
+pub(crate) fn resume_existing_external_fork_control(
+    backend: &external_agent::AgentBackend,
+    child_id: &str,
+    project_root: &Path,
+    launch: Option<&crate::session_config::SessionAgentConfig>,
+) -> event::ControlMsg {
+    let codex = matches!(backend, external_agent::AgentBackend::Codex);
+    event::ControlMsg::ResumeSession {
+        source: backend.as_short_str().to_string(),
+        session_id: child_id.to_string(),
+        resume_id: Some(child_id.to_string()),
+        project_root: Some(project_root.to_string_lossy().to_string()),
+        task: None,
+        direct: Some(true),
+        fork: false,
+        relationship_kind: None,
+        auto_attach: false,
+        attachments: Vec::new(),
+        agent_command: launch.and_then(|config| config.agent_command.clone()),
+        codex_sandbox: codex
+            .then(|| launch.and_then(|config| config.codex_sandbox.clone()))
+            .flatten(),
+        codex_approval_policy: codex
+            .then(|| launch.and_then(|config| config.codex_approval_policy.clone()))
+            .flatten(),
+        codex_managed_context: codex
+            .then(|| launch.and_then(|config| config.codex_managed_context.clone()))
+            .flatten(),
+        codex_context_archive: codex
+            .then(|| launch.and_then(|config| config.codex_context_archive.clone()))
+            .flatten(),
+    }
+}
+
+pub(crate) fn kimi_launch_mutating_thread_action(op: &str) -> bool {
+    matches!(
+        op,
+        "fast"
+            | "model"
+            | "model-set"
+            | "set-model"
+            | "thinking"
+            | "thinking-set"
+            | "effort"
+            | "permission-mode"
+            | "permission_mode"
+            | "permissions"
+            | "plan-mode"
+            | "plan_mode"
+            | "swarm-mode"
+            | "swarm_mode"
+            | "tools-set"
+            | "tool-set"
+            | "tools-all"
+            | "tools_set"
+            | "tools_all"
+    )
 }
 
 pub(crate) async fn apply_context_rewind_backout_action(
@@ -1193,6 +1526,7 @@ pub(crate) struct FissionSpawnContext<'a> {
     group_id: &'a str,
     use_worktree_override: Option<bool>,
     project_root_is_git: bool,
+    backend: &'a external_agent::AgentBackend,
     launch: Option<&'a crate::session_config::SessionAgentConfig>,
 }
 
@@ -1258,13 +1592,16 @@ pub(crate) async fn apply_fission_spawn_action(
     )
     .map_err(|e| format!("failed to record fission group {group_id}: {e}"))?;
 
-    let launch = crate::session_config::read_log_dir_config(config.log_dir);
+    let backend = external_backend_of_config(config).unwrap_or(external_agent::AgentBackend::Codex);
+    let launch = current_external_launch_config(agent.as_ref(), config, &backend)
+        .or_else(|| crate::session_config::read_log_dir_config(config.log_dir));
     let ctx = FissionSpawnContext {
         parent_thread_id: &parent_thread_id,
         anchor_item_id: &anchor_item_id,
         group_id: &group_id,
         use_worktree_override: fission_spawn_use_worktree_override(params),
         project_root_is_git: fission_project_root_is_git_repo(config.project_root),
+        backend: &backend,
         launch: launch.as_ref(),
     };
     let mut results = Vec::new();
@@ -1387,6 +1724,25 @@ pub(crate) async fn spawn_single_fission_branch(
             return Err(format!("live-thread fork failed: {e}{cleanup}"));
         }
     };
+    let branch_project_root = branch_worktree
+        .as_ref()
+        .map(|wt| wt.path.as_path())
+        .unwrap_or(config.project_root);
+    if matches!(ctx.backend, external_agent::AgentBackend::Kimi) {
+        if let Err(error) = persist_external_child_launch_overlay_at(
+            agent.as_ref(),
+            config,
+            ctx.backend,
+            &child.thread_id,
+            branch_project_root,
+        ) {
+            let cleanup = cleanup_fission_worktree(config.project_root, &branch_worktree).await;
+            return Err(format!(
+                "refusing to attach forked thread {} without an exact {} launch overlay: {error}{cleanup}",
+                child.thread_id, ctx.backend
+            ));
+        }
+    }
 
     let charter = fission_charter_message(
         ctx.group_id,
@@ -1435,7 +1791,7 @@ pub(crate) async fn spawn_single_fission_branch(
     config
         .bus
         .send(AppEvent::ControlCommand(event::ControlMsg::RenameSession {
-            source: Some("codex".to_string()),
+            source: Some(ctx.backend.as_short_str().to_string()),
             session_id: child.thread_id.clone(),
             backend_session_id: Some(child.thread_id.clone()),
             name: display_name,
@@ -1447,29 +1803,18 @@ pub(crate) async fn spawn_single_fission_branch(
         "fission-branch",
         false,
     );
-    let branch_project_root = branch_worktree
-        .as_ref()
-        .map(|wt| wt.path.as_path())
-        .unwrap_or(config.project_root);
-    config
-        .bus
-        .send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
-            source: "codex".to_string(),
-            session_id: child.thread_id.clone(),
-            resume_id: Some(child.thread_id.clone()),
-            project_root: Some(branch_project_root.to_string_lossy().to_string()),
-            task: Some(kickoff),
-            direct: Some(true),
-            fork: false,
-            relationship_kind: None,
-            auto_attach: false,
-            attachments: Vec::new(),
-            agent_command: ctx.launch.and_then(|cfg| cfg.agent_command.clone()),
-            codex_sandbox: ctx.launch.and_then(|cfg| cfg.codex_sandbox.clone()),
-            codex_approval_policy: ctx.launch.and_then(|cfg| cfg.codex_approval_policy.clone()),
-            codex_managed_context: ctx.launch.and_then(|cfg| cfg.codex_managed_context.clone()),
-            codex_context_archive: ctx.launch.and_then(|cfg| cfg.codex_context_archive.clone()),
-        }));
+    let mut resume = resume_existing_external_fork_control(
+        ctx.backend,
+        &child.thread_id,
+        branch_project_root,
+        ctx.launch,
+    );
+    if let event::ControlMsg::ResumeSession { task, .. } = &mut resume {
+        if !matches!(ctx.backend, external_agent::AgentBackend::Kimi) {
+            *task = Some(kickoff);
+        }
+    }
+    config.bus.send(AppEvent::ControlCommand(resume));
 
     let location = branch_worktree
         .as_ref()
@@ -1796,6 +2141,8 @@ pub(crate) async fn handle_external_thread_action(
     let params = thread_action_params_for_target(&op, params, &target_session_id, config);
     let action_thread_id = thread_id_from_action_params(&params);
     let result_session_id = target_session_id.or_else(|| config.session_id.clone());
+    let action_backend = external_backend_of_config(config)
+        .or_else(|| external_agent::AgentBackend::from_str_loose(agent.name()));
     // Backends without an in-process fork (Claude Code) fork by respawning:
     // a NEW supervisor session resumes the current thread with the backend's
     // fork flag, and the child announces its own native id on its first turn
@@ -1854,26 +2201,49 @@ pub(crate) async fn handle_external_thread_action(
         Err(e) => (false, e),
     };
     if success && op == "rename" {
-        if let Some(home) = dirs::home_dir() {
-            match persist_codex_thread_rename_overlay(
+        if let (Some(home), Some(backend)) = (dirs::home_dir(), action_backend.as_ref()) {
+            let overlay_session_id = if *backend == external_agent::AgentBackend::Kimi {
+                action_thread_id.as_deref().or(result_session_id.as_deref())
+            } else {
+                result_session_id.as_deref()
+            };
+            match persist_external_thread_rename_overlay(
                 &home,
-                result_session_id.as_deref(),
+                backend,
+                overlay_session_id,
                 &params,
                 &message,
             ) {
                 Ok(Some(name)) => {
-                    message = format!("Codex thread renamed to {}", name);
+                    message = match backend {
+                        external_agent::AgentBackend::Codex => {
+                            format!("Codex thread renamed to {name}")
+                        }
+                        external_agent::AgentBackend::ClaudeCode => {
+                            format!("Claude Code session renamed to {name}")
+                        }
+                        external_agent::AgentBackend::Kimi => {
+                            format!("Kimi session renamed to {name}")
+                        }
+                    };
                 }
                 Ok(None) => {}
                 Err(err) => slog(config.session_log, |l| {
-                    l.warn(&format!("Failed to persist Codex thread rename: {err}"))
+                    l.warn(&format!(
+                        "Failed to persist {} thread rename: {err}",
+                        backend.as_short_str()
+                    ))
                 }),
             }
         }
     }
+    let action_label = action_backend
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "External agent".to_string());
     slog(config.session_log, |l| {
         l.info(&format!(
-            "Codex thread action /{}: {} — {}",
+            "{action_label} thread action /{}: {} — {}",
             op,
             if success { "ok" } else { "FAILED" },
             codex_thread_action_log_message(&op, &message)
@@ -1887,7 +2257,7 @@ pub(crate) async fn handle_external_thread_action(
         record_id: None,
     });
 
-    if success && op == "fast" {
+    if success && op == "fast" && action_backend == Some(external_agent::AgentBackend::Codex) {
         let service_tier = agent.service_tier().map(str::to_string);
         persist_codex_service_tier_for_drain(
             config,
@@ -1900,10 +2270,35 @@ pub(crate) async fn handle_external_thread_action(
             service_tier.as_deref(),
         );
     }
+    if success
+        && action_backend == Some(external_agent::AgentBackend::Kimi)
+        && kimi_launch_mutating_thread_action(&op)
+    {
+        if let Err(error) = persist_live_external_launch_config(
+            agent.as_ref(),
+            config,
+            &external_agent::AgentBackend::Kimi,
+            result_session_id.as_deref(),
+        ) {
+            slog(config.session_log, |log| log.warn(&error));
+            config.bus.send(AppEvent::LogEntry {
+                session_id: result_session_id.clone(),
+                level: "error".into(),
+                source: "Kimi".into(),
+                content: format!(
+                    "Live Kimi profile changed, but its restart/fork configuration was not persisted: {error}"
+                ),
+                turn: None,
+            });
+        }
+    }
 
     if success && op == "fork" {
-        if let Some(child_id) = forked_thread_id_from_message(&message) {
-            emit_codex_fork_session_name(config.bus, &child_id, &params);
+        if let (Some(child_id), Some(backend)) = (
+            forked_thread_id_from_message(&message),
+            action_backend.as_ref(),
+        ) {
+            emit_external_fork_session_name(config.bus, backend, &child_id, &params);
             emit_session_relationship(
                 config.bus,
                 action_thread_id
@@ -1914,36 +2309,35 @@ pub(crate) async fn handle_external_thread_action(
                 "fork",
                 false,
             );
-            config
-                .bus
-                .send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
-                    source: "codex".to_string(),
-                    session_id: child_id.clone(),
-                    resume_id: Some(child_id),
-                    project_root: Some(config.project_root.to_string_lossy().to_string()),
-                    task: None,
-                    direct: Some(true),
-                    fork: false,
-                    relationship_kind: None,
-                    auto_attach: false,
-                    attachments: Vec::new(),
-                    agent_command: crate::session_config::read_log_dir_config(config.log_dir)
-                        .and_then(|cfg| cfg.agent_command),
-                    codex_sandbox: crate::session_config::read_log_dir_config(config.log_dir)
-                        .and_then(|cfg| cfg.codex_sandbox),
-                    codex_approval_policy: crate::session_config::read_log_dir_config(
-                        config.log_dir,
-                    )
-                    .and_then(|cfg| cfg.codex_approval_policy),
-                    codex_managed_context: crate::session_config::read_log_dir_config(
-                        config.log_dir,
-                    )
-                    .and_then(|cfg| cfg.codex_managed_context),
-                    codex_context_archive: crate::session_config::read_log_dir_config(
-                        config.log_dir,
-                    )
-                    .and_then(|cfg| cfg.codex_context_archive),
-                }));
+            match persist_external_fork_child_launch_overlay(
+                agent.as_ref(),
+                config,
+                backend,
+                &child_id,
+            ) {
+                Ok(launch) => {
+                    config.bus.send(AppEvent::ControlCommand(
+                        resume_existing_external_fork_control(
+                            backend,
+                            &child_id,
+                            config.project_root,
+                            Some(&launch),
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    slog(config.session_log, |log| log.warn(&error));
+                    config.bus.send(AppEvent::CodexThreadActionResult {
+                        session_id: Some(child_id),
+                        action: "fork-attach".into(),
+                        success: false,
+                        message: format!(
+                            "native fork exists, but Intendant refused to attach it without an exact persisted launch profile: {error}"
+                        ),
+                        record_id: None,
+                    });
+                }
+            }
         }
     }
 
@@ -2067,7 +2461,11 @@ pub(crate) async fn maybe_handle_codex_fast_slash_steer(
 }
 
 pub(crate) fn undo_turns_from_params(params: &serde_json::Value) -> u32 {
-    params.get("turns").and_then(|v| v.as_u64()).unwrap_or(1) as u32
+    params
+        .get("turns")
+        .or_else(|| params.get("count"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32
 }
 
 pub(crate) fn side_rewind_first_turn_for_undo(
@@ -2168,9 +2566,12 @@ pub(crate) async fn handle_parent_undo_thread_action(
         Ok(message) => (true, message),
         Err(message) => (false, message),
     };
+    let label = external_backend_of_config(config)
+        .map(|backend| backend.to_string())
+        .unwrap_or_else(|| "External agent".to_string());
     slog(config.session_log, |l| {
         l.info(&format!(
-            "Codex thread action /undo: {} — {}",
+            "{label} thread action /undo: {} — {}",
             if success { "ok" } else { "FAILED" },
             message
         ))
@@ -2258,9 +2659,12 @@ pub(crate) async fn handle_side_undo_thread_action(
         Ok(message) => (true, message),
         Err(message) => (false, message),
     };
+    let label = external_backend_of_config(config)
+        .map(|backend| backend.to_string())
+        .unwrap_or_else(|| "External agent".to_string());
     slog(config.session_log, |l| {
         l.info(&format!(
-            "Codex side thread action /undo: {} — {}",
+            "{label} side thread action /undo: {} — {}",
             if success { "ok" } else { "FAILED" },
             message
         ))
@@ -2280,10 +2684,19 @@ pub(crate) fn emit_side_session_started(
     child_thread_id: &str,
     prompt: Option<&str>,
 ) {
+    let backend = external_backend_of_config(config);
+    let source = backend
+        .as_ref()
+        .map(external_agent::AgentBackend::as_short_str)
+        .unwrap_or("codex");
+    let label = backend
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "External agent".to_string());
     slog(config.session_log, |l| {
         l.info(&format!(
-            "Codex /side: side conversation started in thread {} from parent {}",
-            child_thread_id, parent_thread_id
+            "{label} /side: side conversation started in thread {child_thread_id} from parent \
+             {parent_thread_id}"
         ))
     });
     config.bus.send(AppEvent::SessionStarted {
@@ -2297,7 +2710,7 @@ pub(crate) fn emit_side_session_started(
     });
     config.bus.send(AppEvent::SessionIdentity {
         session_id: child_thread_id.to_string(),
-        source: "codex".to_string(),
+        source: source.to_string(),
         backend_session_id: child_thread_id.to_string(),
     });
     let parent_session_id = config.session_id.as_deref().unwrap_or(parent_thread_id);
@@ -2308,10 +2721,29 @@ pub(crate) fn emit_side_session_started(
         "side",
         true,
     );
+    if matches!(backend, Some(external_agent::AgentBackend::Kimi)) {
+        config.bus.send(AppEvent::SessionCapabilities {
+            session_id: child_thread_id.to_string(),
+            capabilities: types::SessionCapabilities {
+                follow_up: true,
+                steer: false,
+                interrupt: false,
+                thread_actions: kimi_child_thread_action_capabilities("side"),
+                codex_thread_actions: Vec::new(),
+                codex_managed_context: None,
+                codex_sandbox: None,
+                codex_approval_policy: None,
+                codex_context_archive: None,
+                codex_command: None,
+                codex_fast_mode: None,
+                codex_service_tier: None,
+            },
+        });
+    }
 }
 
 /// Which external backend this drain supervises, from its display source
-/// ("Codex", "Claude Code"). None for unknown/legacy sources.
+/// ("Codex", "Claude Code", "Kimi Code"). None for unknown/legacy sources.
 pub(crate) fn external_backend_of_config(
     config: &DrainConfig<'_>,
 ) -> Option<external_agent::AgentBackend> {
@@ -2365,13 +2797,18 @@ pub(crate) fn emit_external_subagent_started(
         "subagent",
         false,
     );
+    let thread_actions = if matches!(backend, Some(external_agent::AgentBackend::Kimi)) {
+        kimi_child_thread_action_capabilities("subagent")
+    } else {
+        Vec::new()
+    };
     config.bus.send(AppEvent::SessionCapabilities {
         session_id: child_thread_id.to_string(),
         capabilities: types::SessionCapabilities {
             follow_up: !matches!(backend, Some(external_agent::AgentBackend::ClaudeCode)),
             steer: false,
             interrupt: false,
-            thread_actions: Vec::new(),
+            thread_actions,
             codex_thread_actions: Vec::new(),
             codex_managed_context: None,
             codex_sandbox: None,
@@ -2885,9 +3322,10 @@ pub(crate) async fn drain_external_child_turn(
     child_thread_id: String,
     conversation_kind: &str,
 ) {
+    let backend_label = external_agent_log_source(config.agent_source.as_deref());
     slog(config.session_log, |l| {
         l.info(&format!(
-            "Draining Codex {} conversation {}",
+            "Draining {backend_label} {} conversation {}",
             conversation_kind, child_thread_id
         ))
     });
@@ -2984,7 +3422,7 @@ pub(crate) async fn drain_external_child_turn(
             child_config.bus.send(AppEvent::LogEntry {
                 session_id: child_config.session_id.clone(),
                 level: "error".to_string(),
-                source: "Codex".to_string(),
+                source: backend_label.clone(),
                 content,
                 turn: None,
             });
@@ -2993,7 +3431,7 @@ pub(crate) async fn drain_external_child_turn(
             child_config.bus.send(AppEvent::LogEntry {
                 session_id: child_config.session_id.clone(),
                 level: "warn".to_string(),
-                source: "Codex".to_string(),
+                source: backend_label.clone(),
                 content: format!(
                     "Agent interrupted: {} conversation stopped: {}",
                     conversation_kind, reason
@@ -3004,7 +3442,7 @@ pub(crate) async fn drain_external_child_turn(
         DrainOutcome::Terminated { reason, exit_code } => {
             slog(config.session_log, |l| {
                 l.warn(&format!(
-                    "Codex terminated during {} conversation: {} (exit code: {:?})",
+                    "{backend_label} terminated during {} conversation: {} (exit code: {:?})",
                     conversation_kind, reason, exit_code
                 ))
             });
@@ -3012,8 +3450,8 @@ pub(crate) async fn drain_external_child_turn(
         DrainOutcome::ChannelClosed => {
             slog(config.session_log, |l| {
                 l.warn(&format!(
-                    "Codex {} conversation event channel closed",
-                    conversation_kind
+                    "{backend_label} {} conversation event channel closed",
+                    conversation_kind,
                 ))
             });
         }
@@ -3115,6 +3553,444 @@ pub(crate) fn scoped_event_codex_subagent_thread_id(
         .map(str::to_string)
 }
 
+pub(crate) fn is_idle_external_child_interaction(event: &external_agent::AgentEvent) -> bool {
+    matches!(
+        event,
+        external_agent::AgentEvent::ApprovalRequest { .. }
+            | external_agent::AgentEvent::FileApprovalRequest { .. }
+            | external_agent::AgentEvent::UserQuestionRequest { .. }
+    )
+}
+
+pub(crate) fn should_route_idle_external_child_interaction(
+    backend: &external_agent::AgentBackend,
+    event: &external_agent::AgentEvent,
+) -> bool {
+    *backend == external_agent::AgentBackend::Kimi && is_idle_external_child_interaction(event)
+}
+
+fn arm_idle_child_response(
+    config: &DrainConfig<'_>,
+    id: u64,
+) -> tokio::sync::oneshot::Receiver<event::ApprovalResponse> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Some(slot) = config.json_approval {
+        *slot.lock().unwrap() = Some((id, tx));
+    } else {
+        config.approval_registry.lock().unwrap().insert(id, tx);
+    }
+    rx
+}
+
+fn disarm_idle_child_response(config: &DrainConfig<'_>, id: u64) {
+    if let Some(slot) = config.json_approval {
+        let mut slot = slot.lock().unwrap();
+        if slot.as_ref().is_some_and(|(armed_id, _)| *armed_id == id) {
+            slot.take();
+        }
+    } else {
+        config.approval_registry.lock().unwrap().remove(&id);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IdleExternalChildInteractionOutcome {
+    Resolved,
+    StopRequested { reason: String },
+}
+
+enum IdleChildResponse {
+    Response(Result<event::ApprovalResponse, tokio::sync::oneshot::error::RecvError>),
+    StopRequested { reason: String },
+}
+
+fn idle_child_stop_reason(
+    event: &AppEvent,
+    config: &DrainConfig<'_>,
+    child_thread_id: &str,
+) -> Option<String> {
+    // SessionEnded follows SessionStopRequested on the supervisor's lossless
+    // intent lane. Waiting on that lifecycle event avoids losing Stop behind
+    // high-volume model deltas in the best-effort broadcast ring.
+    let AppEvent::SessionEnded {
+        session_id, reason, ..
+    } = event
+    else {
+        return None;
+    };
+    let targets_interaction = session_id == child_thread_id
+        || config.session_id.as_deref() == Some(session_id)
+        || config.alias_session_id.as_deref() == Some(session_id);
+    if targets_interaction {
+        Some(reason.clone())
+    } else {
+        None
+    }
+}
+
+async fn wait_for_idle_child_response(
+    mut response_rx: tokio::sync::oneshot::Receiver<event::ApprovalResponse>,
+    lifecycle_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    config: &DrainConfig<'_>,
+    child_thread_id: &str,
+    approval_id: u64,
+    child_session_id: &Option<String>,
+) -> IdleChildResponse {
+    loop {
+        tokio::select! {
+            biased;
+            lifecycle_event = lifecycle_rx.recv() => {
+                match lifecycle_event {
+                    Some(event) => {
+                        if let Some(reason) =
+                            idle_child_stop_reason(&event, config, child_thread_id)
+                        {
+                            disarm_idle_child_response(config, approval_id);
+                            config.bus.send(AppEvent::ApprovalResolved {
+                                session_id: child_session_id.clone(),
+                                id: approval_id,
+                                action: "skip".to_string(),
+                            });
+                            return IdleChildResponse::StopRequested { reason };
+                        }
+                    }
+                    None => return IdleChildResponse::Response(response_rx.await),
+                }
+            }
+            response = &mut response_rx => {
+                return IdleChildResponse::Response(response);
+            }
+        }
+    }
+}
+
+fn emit_idle_child_resolution_error(
+    config: &DrainConfig<'_>,
+    child_thread_id: &str,
+    kind: &str,
+    error: &crate::error::CallerError,
+) {
+    let content = format!("Failed to resolve idle child {kind}: {error}");
+    slog(config.session_log, |log| log.warn(&content));
+    config.bus.send(AppEvent::LogEntry {
+        session_id: Some(child_thread_id.to_string()),
+        level: "warn".to_string(),
+        source: external_agent_log_source(config.agent_source.as_deref()),
+        content,
+        turn: None,
+    });
+}
+
+/// Resolve a human-interaction request emitted by a background external
+/// child while its parent conversation is idle.
+///
+/// Kimi's child agents share the parent's backend session and therefore the
+/// parent's `ExternalAgent` answer channel, but the dashboard/control event
+/// must carry the composite child id. The ordinary active-turn drain already
+/// builds that child scope; this is its idle-loop counterpart.
+pub(crate) async fn handle_idle_external_child_interaction(
+    agent: &mut dyn external_agent::ExternalAgent,
+    config: &DrainConfig<'_>,
+    stats: &mut LoopStats,
+    child_thread_id: String,
+    event: external_agent::AgentEvent,
+    lifecycle_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> IdleExternalChildInteractionOutcome {
+    note_external_subagent_liveness(stats, &child_thread_id, &event);
+    let child_session_id = Some(child_thread_id.clone());
+    let child_turn = stats
+        .codex_subagent_rounds
+        .get(&child_thread_id)
+        .copied()
+        .unwrap_or(0);
+
+    match event {
+        external_agent::AgentEvent::ApprovalRequest {
+            request_id,
+            command,
+            category,
+        } => {
+            let action_category = match category {
+                external_agent::ApprovalCategory::CommandExecution
+                | external_agent::ApprovalCategory::PermissionGrant => {
+                    crate::autonomy::ActionCategory::CommandExec
+                }
+                external_agent::ApprovalCategory::FileChange => {
+                    crate::autonomy::ActionCategory::FileWrite
+                }
+                external_agent::ApprovalCategory::McpTool => {
+                    crate::autonomy::ActionCategory::ToolCall
+                }
+            };
+            resolve_idle_child_approval(
+                agent,
+                config,
+                &child_thread_id,
+                child_session_id,
+                child_turn,
+                request_id,
+                command,
+                action_category,
+                lifecycle_rx,
+            )
+            .await
+        }
+        external_agent::AgentEvent::FileApprovalRequest {
+            request_id,
+            path,
+            diff,
+        } => {
+            let preview = format!("file change: {path}");
+            let display = if diff.trim().is_empty() {
+                preview.clone()
+            } else {
+                format!("{preview}\n{diff}")
+            };
+            resolve_idle_child_approval(
+                agent,
+                config,
+                &child_thread_id,
+                child_session_id,
+                child_turn,
+                request_id,
+                display,
+                crate::autonomy::ActionCategory::FileWrite,
+                lifecycle_rx,
+            )
+            .await
+        }
+        external_agent::AgentEvent::UserQuestionRequest {
+            request_id,
+            questions,
+        } => {
+            let preview = user_question_preview(&questions);
+            if config.headless && config.json_approval.is_none() && config.web_port.is_none() {
+                let content = format!("No user available to answer: {preview}");
+                config.bus.send(AppEvent::LogEntry {
+                    session_id: child_session_id,
+                    level: "warn".to_string(),
+                    source: external_agent_log_source(config.agent_source.as_deref()),
+                    content,
+                    turn: None,
+                });
+                let answers = unanswered_question_answers(
+                    &questions,
+                    "No user is connected to answer right now. Proceed using your best judgment \
+                     based on the context so far; you can re-ask later if it is still relevant.",
+                );
+                if let Err(error) = agent.resolve_user_question(&request_id, &answers).await {
+                    emit_idle_child_resolution_error(config, &child_thread_id, "question", &error);
+                }
+                return IdleExternalChildInteractionOutcome::Resolved;
+            }
+
+            let id = event::next_approval_id();
+            let rx = arm_idle_child_response(config, id);
+            config.bus.send(AppEvent::UserQuestionRequired {
+                session_id: child_session_id.clone(),
+                id,
+                questions: questions.clone(),
+            });
+            crate::emit_external_turn_status(
+                config.bus,
+                &config.autonomy,
+                Some(&child_thread_id),
+                child_turn,
+                "waiting_human",
+                format!(
+                    "Awaiting answer: {}",
+                    preview.chars().take(80).collect::<String>()
+                ),
+            )
+            .await;
+
+            let response = match wait_for_idle_child_response(
+                rx,
+                lifecycle_rx,
+                config,
+                &child_thread_id,
+                id,
+                &child_session_id,
+            )
+            .await
+            {
+                IdleChildResponse::Response(response) => response,
+                IdleChildResponse::StopRequested { reason } => {
+                    return IdleExternalChildInteractionOutcome::StopRequested { reason };
+                }
+            };
+            let (action, result) = match response {
+                Ok(event::ApprovalResponse::Answer { answers }) => (
+                    "answer",
+                    agent.resolve_user_question(&request_id, &answers).await,
+                ),
+                Ok(event::ApprovalResponse::Approve | event::ApprovalResponse::ApproveAll) => {
+                    let answers = unanswered_question_answers(
+                        &questions,
+                        "The supervisor let this question through without selecting an option. \
+                         Proceed using your best judgment.",
+                    );
+                    (
+                        "approve",
+                        agent.resolve_user_question(&request_id, &answers).await,
+                    )
+                }
+                Ok(event::ApprovalResponse::Deny) => (
+                    "deny",
+                    agent
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
+                        .await,
+                ),
+                Ok(event::ApprovalResponse::Skip) => (
+                    "skip",
+                    agent
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
+                        .await,
+                ),
+                Err(_) => (
+                    "deny",
+                    agent
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
+                        .await,
+                ),
+            };
+            config.bus.send(AppEvent::ApprovalResolved {
+                session_id: child_session_id,
+                id,
+                action: action.to_string(),
+            });
+            if let Err(error) = result {
+                emit_idle_child_resolution_error(config, &child_thread_id, "question", &error);
+            }
+            crate::emit_external_turn_status(
+                config.bus,
+                &config.autonomy,
+                Some(&child_thread_id),
+                child_turn,
+                "running",
+                "Question resolved — continuing".to_string(),
+            )
+            .await;
+            IdleExternalChildInteractionOutcome::Resolved
+        }
+        _ => IdleExternalChildInteractionOutcome::Resolved,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_idle_child_approval(
+    agent: &mut dyn external_agent::ExternalAgent,
+    config: &DrainConfig<'_>,
+    child_thread_id: &str,
+    child_session_id: Option<String>,
+    child_turn: usize,
+    request_id: String,
+    preview: String,
+    category: crate::autonomy::ActionCategory,
+    lifecycle_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> IdleExternalChildInteractionOutcome {
+    let policy = config
+        .autonomy
+        .read()
+        .await
+        .external_approval_decision(category);
+    let immediate = if policy == crate::autonomy::ExternalApprovalDecision::AutoApprove {
+        config.bus.send(AppEvent::AutoApproved {
+            preview: preview.clone(),
+        });
+        Some((external_agent::ApprovalDecision::Accept, "approve"))
+    } else if policy == crate::autonomy::ExternalApprovalDecision::Reject
+        || (config.headless && config.json_approval.is_none() && config.web_port.is_none())
+    {
+        Some((external_agent::ApprovalDecision::Decline, "deny"))
+    } else {
+        None
+    };
+
+    if let Some((decision, action)) = immediate {
+        let result = agent.resolve_approval(&request_id, decision).await;
+        config.bus.send(AppEvent::ApprovalResolved {
+            session_id: child_session_id,
+            id: 0,
+            action: action.to_string(),
+        });
+        if let Err(error) = result {
+            emit_idle_child_resolution_error(config, child_thread_id, "approval", &error);
+        }
+        return IdleExternalChildInteractionOutcome::Resolved;
+    }
+
+    let id = event::next_approval_id();
+    let rx = arm_idle_child_response(config, id);
+    config.bus.send(AppEvent::ApprovalRequired {
+        session_id: child_session_id.clone(),
+        id,
+        command_preview: preview.clone(),
+        category,
+    });
+    crate::emit_external_turn_status(
+        config.bus,
+        &config.autonomy,
+        Some(child_thread_id),
+        child_turn,
+        "waiting_approval",
+        format!(
+            "Awaiting approval: {}",
+            preview.chars().take(80).collect::<String>()
+        ),
+    )
+    .await;
+
+    let response = match wait_for_idle_child_response(
+        rx,
+        lifecycle_rx,
+        config,
+        child_thread_id,
+        id,
+        &child_session_id,
+    )
+    .await
+    {
+        IdleChildResponse::Response(response) => response,
+        IdleChildResponse::StopRequested { reason } => {
+            return IdleExternalChildInteractionOutcome::StopRequested { reason };
+        }
+    };
+    let (decision, action) = match response {
+        Ok(event::ApprovalResponse::Approve) => {
+            (external_agent::ApprovalDecision::Accept, "approve")
+        }
+        Ok(event::ApprovalResponse::ApproveAll) => (
+            external_agent::ApprovalDecision::AcceptForSession,
+            "approve_all",
+        ),
+        Ok(event::ApprovalResponse::Deny) => (external_agent::ApprovalDecision::Decline, "deny"),
+        Ok(event::ApprovalResponse::Skip) => (external_agent::ApprovalDecision::Cancel, "skip"),
+        Ok(event::ApprovalResponse::Answer { .. }) | Err(_) => {
+            (external_agent::ApprovalDecision::Decline, "deny")
+        }
+    };
+    let result = agent.resolve_approval(&request_id, decision).await;
+    config.bus.send(AppEvent::ApprovalResolved {
+        session_id: child_session_id,
+        id,
+        action: action.to_string(),
+    });
+    if let Err(error) = result {
+        emit_idle_child_resolution_error(config, child_thread_id, "approval", &error);
+    }
+    crate::emit_external_turn_status(
+        config.bus,
+        &config.autonomy,
+        Some(child_thread_id),
+        child_turn,
+        "running",
+        "Approval resolved — continuing".to_string(),
+    )
+    .await;
+    IdleExternalChildInteractionOutcome::Resolved
+}
+
 pub(crate) fn emit_external_session_goal(
     config: &DrainConfig<'_>,
     session_id: Option<String>,
@@ -3170,6 +4046,8 @@ pub(crate) fn persist_native_backend_session_id(config: &DrainConfig<'_>, native
         // Frontends may address the session by either id after the
         // identity upgrade; advertise capabilities under the native id too.
         emit_claude_code_session_capabilities(config.bus, Some(native_id));
+    } else if backend == external_agent::AgentBackend::Kimi {
+        emit_kimi_session_capabilities(config.bus, Some(native_id));
     }
     let mut launch = crate::session_config::read_log_dir_config(config.log_dir).unwrap_or_default();
     if launch.source.is_none() {
@@ -3184,6 +4062,8 @@ pub(crate) fn persist_native_backend_session_id(config: &DrainConfig<'_>, native
     launch.codex_fork_rollback_turns = None;
     launch.codex_fork_rollback_item_id = None;
     launch.codex_fork_rollback_position = None;
+    launch.kimi_fork_rollback_turns = None;
+    launch.kimi_fork_expected_horizon = None;
     if let Err(e) = crate::session_config::write_external_overlay(
         &platform::home_dir(),
         backend.as_short_str(),
@@ -3564,6 +4444,37 @@ mod tests {
     }
 
     #[test]
+    fn kimi_thread_rename_overlay_uses_kimi_namespace_and_message() {
+        let home = tempfile::TempDir::new().unwrap();
+        let backend = external_agent::AgentBackend::Kimi;
+        let persisted = persist_external_thread_rename_overlay(
+            home.path(),
+            &backend,
+            Some("session-kimi-1"),
+            &serde_json::json!({}),
+            "Kimi session renamed to Native title",
+        )
+        .unwrap();
+        assert_eq!(persisted.as_deref(), Some("Native title"));
+
+        let mut sessions = vec![
+            serde_json::json!({
+                "source": "kimi",
+                "session_id": "session-kimi-1",
+                "name": "Old Kimi name"
+            }),
+            serde_json::json!({
+                "source": "codex",
+                "session_id": "session-kimi-1",
+                "name": "Unrelated Codex name"
+            }),
+        ];
+        crate::session_names::apply_session_name_overlays(home.path(), &mut sessions);
+        assert_eq!(sessions[0]["name"], "Native title");
+        assert_eq!(sessions[1]["name"], "Unrelated Codex name");
+    }
+
+    #[test]
     fn codex_thread_action_capabilities_cover_dashboard_actions() {
         let actions = codex_thread_action_capabilities();
         for action in [
@@ -3664,6 +4575,70 @@ mod tests {
             assert!(
                 registry.contains(op),
                 "op {op} missing from the dashboard action registry"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_capabilities_match_native_server_actions() {
+        let caps = kimi_external_session_capabilities();
+        assert!(caps.follow_up && caps.steer && caps.interrupt);
+        for op in [
+            "compact",
+            "fork",
+            "side",
+            "side-close",
+            "undo",
+            "rename",
+            "archive",
+            "restore",
+            "review",
+            "fast",
+            "context-clear",
+            "goal",
+            "goal-set",
+            "goal-edit",
+            "goal-get",
+            "goal-clear",
+            "goal-pause",
+            "goal-resume",
+            "goal-complete",
+            "model",
+            "thinking",
+            "permission-mode",
+            "plan-mode",
+            "swarm-mode",
+            "tasks",
+            "task-output",
+            "task-cancel",
+            "tools",
+            "tools-set",
+            "tools-all",
+            "models",
+        ] {
+            assert!(
+                caps.thread_actions.iter().any(|candidate| candidate == op),
+                "missing advertised Kimi thread action: {op}"
+            );
+        }
+        assert_eq!(
+            kimi_child_thread_action_capabilities("subagent"),
+            ["context-clear", "tools", "tools-set", "tools-all"]
+        );
+        assert_eq!(
+            kimi_child_thread_action_capabilities("side"),
+            [
+                "context-clear",
+                "tools",
+                "tools-set",
+                "tools-all",
+                "side-close",
+            ]
+        );
+        for op in ["goal-budget-limited", "memory-reset"] {
+            assert!(
+                !caps.thread_actions.iter().any(|candidate| candidate == op),
+                "advertised unsupported Kimi thread action: {op}"
             );
         }
     }
@@ -3938,6 +4913,374 @@ mod tests {
         assert_eq!(scoped_event_codex_subagent_thread_id(&None, &stats), None);
     }
 
+    #[derive(Default)]
+    struct IdleInteractionTestAgent {
+        approvals: Vec<(String, external_agent::ApprovalDecision)>,
+        answers: Vec<(String, HashMap<String, String>)>,
+    }
+
+    #[async_trait::async_trait]
+    impl external_agent::ExternalAgent for IdleInteractionTestAgent {
+        fn name(&self) -> &str {
+            "kimi"
+        }
+
+        async fn initialize(
+            &mut self,
+            _config: external_agent::AgentConfig,
+        ) -> Result<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>, CallerError>
+        {
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            Ok(rx)
+        }
+
+        async fn start_thread(&mut self) -> Result<external_agent::AgentThread, CallerError> {
+            Ok(external_agent::AgentThread {
+                thread_id: "session_parent".to_string(),
+            })
+        }
+
+        async fn send_message(
+            &mut self,
+            _thread: &external_agent::AgentThread,
+            _message: &str,
+        ) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn resolve_approval(
+            &mut self,
+            request_id: &str,
+            decision: external_agent::ApprovalDecision,
+        ) -> Result<(), CallerError> {
+            self.approvals.push((request_id.to_string(), decision));
+            Ok(())
+        }
+
+        async fn resolve_user_question(
+            &mut self,
+            request_id: &str,
+            answers: &HashMap<String, String>,
+        ) -> Result<(), CallerError> {
+            self.answers.push((request_id.to_string(), answers.clone()));
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> Result<(), CallerError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_kimi_background_child_surfaces_and_resolves_interactions() {
+        let bus = EventBus::new();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: Some(8765),
+            session_id: Some("session_parent".to_string()),
+            alias_session_id: None,
+            backend_thread_id: Some("session_parent".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("kimi".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: false,
+            context_injection: &context_injection,
+            reload_credentials: None,
+        };
+        let child = "session_parent:agent-7";
+        let mut stats = LoopStats::default();
+        stats
+            .codex_subagent_parent_threads
+            .insert(child.to_string(), "session_parent".to_string());
+        let mut agent = IdleInteractionTestAgent::default();
+
+        let mut approval_events = bus.subscribe();
+        let approval_responder = async {
+            loop {
+                if let AppEvent::ApprovalRequired {
+                    session_id,
+                    id,
+                    command_preview,
+                    ..
+                } = approval_events.recv().await.unwrap()
+                {
+                    assert_eq!(session_id.as_deref(), Some(child));
+                    assert_eq!(command_preview, "run background check");
+                    approval_registry
+                        .lock()
+                        .unwrap()
+                        .remove(&id)
+                        .unwrap()
+                        .send(event::ApprovalResponse::Approve)
+                        .unwrap();
+                    break;
+                }
+            }
+        };
+        let mut approval_stop_events = bus.subscribe_intents();
+        let approval_handler = handle_idle_external_child_interaction(
+            &mut agent,
+            &config,
+            &mut stats,
+            child.to_string(),
+            external_agent::AgentEvent::ApprovalRequest {
+                request_id: "approval-1".to_string(),
+                command: "run background check".to_string(),
+                category: external_agent::ApprovalCategory::CommandExecution,
+            },
+            &mut approval_stop_events,
+        );
+        tokio::join!(approval_handler, approval_responder);
+        assert_eq!(
+            agent.approvals,
+            vec![(
+                "approval-1".to_string(),
+                external_agent::ApprovalDecision::Accept
+            )]
+        );
+
+        let mut file_events = bus.subscribe();
+        let file_responder = async {
+            loop {
+                if let AppEvent::ApprovalRequired {
+                    session_id,
+                    id,
+                    command_preview,
+                    ..
+                } = file_events.recv().await.unwrap()
+                {
+                    assert_eq!(session_id.as_deref(), Some(child));
+                    assert!(command_preview.contains("file change: src/lib.rs"));
+                    assert!(command_preview.contains("+new line"));
+                    approval_registry
+                        .lock()
+                        .unwrap()
+                        .remove(&id)
+                        .unwrap()
+                        .send(event::ApprovalResponse::Deny)
+                        .unwrap();
+                    break;
+                }
+            }
+        };
+        let mut file_stop_events = bus.subscribe_intents();
+        let file_handler = handle_idle_external_child_interaction(
+            &mut agent,
+            &config,
+            &mut stats,
+            child.to_string(),
+            external_agent::AgentEvent::FileApprovalRequest {
+                request_id: "approval-file".to_string(),
+                path: "src/lib.rs".to_string(),
+                diff: "+new line".to_string(),
+            },
+            &mut file_stop_events,
+        );
+        tokio::join!(file_handler, file_responder);
+        assert_eq!(
+            agent.approvals.last(),
+            Some(&(
+                "approval-file".to_string(),
+                external_agent::ApprovalDecision::Decline
+            ))
+        );
+
+        let questions = vec![types::UserQuestion {
+            question: "Which branch?".to_string(),
+            header: "Branch".to_string(),
+            options: vec![types::UserQuestionOption {
+                label: "feature".to_string(),
+                description: String::new(),
+            }],
+            multi_select: false,
+            previews: Vec::new(),
+        }];
+        let mut question_events = bus.subscribe();
+        let question_responder = async {
+            loop {
+                if let AppEvent::UserQuestionRequired {
+                    session_id,
+                    id,
+                    questions,
+                } = question_events.recv().await.unwrap()
+                {
+                    assert_eq!(session_id.as_deref(), Some(child));
+                    assert_eq!(questions[0].question, "Which branch?");
+                    approval_registry
+                        .lock()
+                        .unwrap()
+                        .remove(&id)
+                        .unwrap()
+                        .send(event::ApprovalResponse::Answer {
+                            answers: HashMap::from([(
+                                "Which branch?".to_string(),
+                                "feature".to_string(),
+                            )]),
+                        })
+                        .unwrap();
+                    break;
+                }
+            }
+        };
+        let mut question_stop_events = bus.subscribe_intents();
+        let question_handler = handle_idle_external_child_interaction(
+            &mut agent,
+            &config,
+            &mut stats,
+            child.to_string(),
+            external_agent::AgentEvent::UserQuestionRequest {
+                request_id: "question-1".to_string(),
+                questions,
+            },
+            &mut question_stop_events,
+        );
+        tokio::join!(question_handler, question_responder);
+        assert_eq!(agent.answers.len(), 1);
+        assert_eq!(agent.answers[0].0, "question-1");
+        assert_eq!(
+            agent.answers[0].1.get("Which branch?").map(String::as_str),
+            Some("feature")
+        );
+
+        // The dispatch gate remains Kimi-only in external_mode; Codex keeps
+        // its established idle-subagent behavior while Kimi interactions use
+        // this answer path.
+        let interaction = external_agent::AgentEvent::UserQuestionRequest {
+            request_id: "q".to_string(),
+            questions: Vec::new(),
+        };
+        assert!(should_route_idle_external_child_interaction(
+            &external_agent::AgentBackend::Kimi,
+            &interaction,
+        ));
+        assert!(!should_route_idle_external_child_interaction(
+            &external_agent::AgentBackend::Codex,
+            &interaction,
+        ));
+        assert!(!should_route_idle_external_child_interaction(
+            &external_agent::AgentBackend::ClaudeCode,
+            &interaction,
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_kimi_background_child_interaction_yields_promptly_to_stop() {
+        let bus = EventBus::new();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: Some(8765),
+            session_id: Some("session_parent".to_string()),
+            alias_session_id: Some("intendant_alias".to_string()),
+            backend_thread_id: Some("session_parent".to_string()),
+            autonomy: autonomy::shared_autonomy(AutonomyState::default()),
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("kimi".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: false,
+            context_injection: &context_injection,
+            reload_credentials: None,
+        };
+        let child = "session_parent:agent-7";
+        let mut stats = LoopStats::default();
+        stats
+            .codex_subagent_parent_threads
+            .insert(child.to_string(), "session_parent".to_string());
+        let mut agent = IdleInteractionTestAgent::default();
+        let mut stop_events = bus.subscribe_intents();
+        let mut rail_events = bus.subscribe();
+
+        let stop_after_prompt = async {
+            let approval_id = loop {
+                if let AppEvent::ApprovalRequired { id, session_id, .. } =
+                    rail_events.recv().await.unwrap()
+                {
+                    assert_eq!(session_id.as_deref(), Some(child));
+                    break id;
+                }
+            };
+            bus.send(AppEvent::SessionStopRequested {
+                session_id: Some("intendant_alias".to_string()),
+                reason: "user stopped session".to_string(),
+            });
+            bus.send(AppEvent::SessionEnded {
+                session_id: "intendant_alias".to_string(),
+                reason: "user stopped session".to_string(),
+                error_kind: None,
+            });
+            loop {
+                if let AppEvent::ApprovalResolved {
+                    id,
+                    action,
+                    session_id,
+                } = rail_events.recv().await.unwrap()
+                {
+                    if id == approval_id {
+                        assert_eq!(action, "skip");
+                        assert_eq!(session_id.as_deref(), Some(child));
+                        break approval_id;
+                    }
+                }
+            }
+        };
+        let interaction = handle_idle_external_child_interaction(
+            &mut agent,
+            &config,
+            &mut stats,
+            child.to_string(),
+            external_agent::AgentEvent::ApprovalRequest {
+                request_id: "approval-stop".to_string(),
+                command: "wait forever".to_string(),
+                category: external_agent::ApprovalCategory::CommandExecution,
+            },
+            &mut stop_events,
+        );
+
+        let (outcome, approval_id) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::join!(interaction, stop_after_prompt)
+            })
+            .await
+            .expect("a stop must cancel the idle interaction wait promptly");
+
+        assert_eq!(
+            outcome,
+            IdleExternalChildInteractionOutcome::StopRequested {
+                reason: "user stopped session".to_string(),
+            }
+        );
+        assert!(!approval_registry.lock().unwrap().contains_key(&approval_id));
+        assert!(
+            agent.approvals.is_empty(),
+            "shutdown owns backend cancellation; the idle wait must not issue a late approval"
+        );
+    }
+
     #[test]
     fn idle_codex_subagent_turn_completed_marks_child_ready() {
         let bus = EventBus::new();
@@ -4173,6 +5516,79 @@ mod tests {
                 "{event:?} must not clear the terminal mark"
             );
         }
+    }
+
+    #[test]
+    fn kimi_side_and_subagent_emit_relation_scoped_thread_actions() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("kimi-parent".to_string()),
+            alias_session_id: None,
+            backend_thread_id: Some("kimi-parent".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Kimi Code".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+            reload_credentials: None,
+        };
+
+        emit_side_session_started(
+            &config,
+            "kimi-parent",
+            "kimi-parent:side-agent",
+            Some("side prompt"),
+        );
+        emit_external_subagent_started(
+            &config,
+            "kimi-parent",
+            "kimi-parent:worker-agent",
+            Some("worker prompt"),
+            None,
+            None,
+        );
+
+        let mut child_actions = HashMap::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::SessionCapabilities {
+                session_id,
+                capabilities,
+            } = event
+            {
+                child_actions.insert(session_id, capabilities.thread_actions);
+            }
+        }
+        assert_eq!(
+            child_actions.get("kimi-parent:side-agent"),
+            Some(&kimi_child_thread_action_capabilities("side"))
+        );
+        assert_eq!(
+            child_actions.get("kimi-parent:worker-agent"),
+            Some(&kimi_child_thread_action_capabilities("subagent"))
+        );
+        assert!(
+            !child_actions["kimi-parent:worker-agent"]
+                .iter()
+                .any(|op| op == "side-close"),
+            "side-close must only be advertised on side relationships"
+        );
     }
 
     #[test]

@@ -79,14 +79,36 @@ impl SessionSupervisor {
                             // (or the unattached-session responder) reports
                             // per-backend support honestly, so /goal works
                             // wherever a goal engine answers.
-                            if source == "codex"
+                            let blocked_codex_subagent = source == "codex"
                                 && relation
                                     .as_ref()
-                                    .is_some_and(|rel| rel.relationship == "subagent")
-                            {
+                                    .is_some_and(|rel| rel.relationship == "subagent");
+                            let kimi_child = kimi_related_child_thread_action(
+                                &source,
+                                relation.as_ref(),
+                                &requested_id,
+                                &managed_id,
+                            );
+                            let blocked_kimi_child = kimi_child
+                                && !relation.as_ref().is_some_and(|relation| {
+                                    kimi_child_thread_action_allowed(
+                                        &command.op,
+                                        &relation.relationship,
+                                    )
+                                });
+                            if blocked_codex_subagent || blocked_kimi_child {
+                                let backend = external_agent::AgentBackend::from_str_loose(&source)
+                                    .map(|backend| backend.to_string())
+                                    .unwrap_or_else(|| source.clone());
+                                let relationship = relation
+                                    .as_ref()
+                                    .map(|rel| rel.relationship.as_str())
+                                    .unwrap_or("related");
                                 self.warn(&format!(
-                                    "Slash command /{} is not supported for Codex subagent session {}",
+                                    "Slash command /{} is not supported for {} {} session {}; use the parent session instead",
                                     command.op,
+                                    backend,
+                                    relationship,
                                     short_session(&requested_id)
                                 ));
                                 return;
@@ -100,11 +122,20 @@ impl SessionSupervisor {
                                     attachments.len()
                                 ));
                             }
+                            let params = if kimi_child {
+                                thread_action_params_with_thread_id(
+                                    &command.op,
+                                    command.params,
+                                    Some(&requested_id),
+                                )
+                            } else {
+                                command.params
+                            };
                             self.config.bus.send(AppEvent::ControlCommand(
                                 event::ControlMsg::CodexThreadAction {
                                     session_id: Some(managed_id),
                                     op: command.op,
-                                    params: command.params,
+                                    params,
                                     origin: None,
                                 },
                             ));
@@ -818,19 +849,20 @@ impl SessionSupervisor {
             };
             // Related sessions that are managed sessions in their own right
             // (native sub-agents) can be stopped directly; only related
-            // backend threads inside a parent's process (Codex threads)
+            // backend threads inside a parent's process (for example Codex
+            // forks and Kimi :btw agents)
             // must be stopped via their parent.
             if state.related_sessions.contains_key(&requested_id)
                 && !state.sessions.contains_key(&requested_id)
             {
                 drop(state);
                 self.warn(&format!(
-                    "Stop session dropped: {} is a related Codex thread; stop the parent session instead",
+                    "Stop session dropped: {} is a related backend thread; stop the parent session instead",
                     short_session(&requested_id)
                 ));
                 self.ack_targeted_action_noop(
                     &requested_id,
-                    "Nothing to stop here — this is a Codex thread inside its parent session; stop the parent session instead.",
+                    "Nothing to stop here — this backend thread lives inside its parent session; stop the parent session instead.",
                 );
                 return None;
             }
@@ -1011,16 +1043,24 @@ impl SessionSupervisor {
             ));
             return;
         };
+        let slash_command = parse_codex_slash_command(&text);
         // Related sessions that are managed sessions in their own right
-        // (native sub-agents) take steers directly; only related backend
-        // threads inside a parent's process (Codex subagents) cannot.
+        // (native sub-agents) take steers directly; related backend threads
+        // inside a parent's process cannot. Recognized thread actions are
+        // handled below before this restriction so Kimi's explicitly
+        // child-scoped operations can still use the parent-owned channel.
         if relation
             .as_ref()
             .is_some_and(|rel| rel.relationship == "subagent")
             && !requested_is_managed
+            && slash_command.is_none()
         {
+            let backend = external_agent::AgentBackend::from_str_loose(&source)
+                .map(|backend| backend.to_string())
+                .unwrap_or_else(|| source.clone());
             self.warn(&format!(
-                "Steer dropped: Codex subagent session {} does not support mid-turn steering; send a follow-up instead",
+                "Steer dropped: {} subagent session {} does not support mid-turn steering; send a follow-up instead",
+                backend,
                 short_session(requested_id.as_deref().unwrap_or(&managed_id))
             ));
             return;
@@ -1028,22 +1068,42 @@ impl SessionSupervisor {
 
         let steer_id = id.unwrap_or_default();
         let event_session_id = requested_id.clone().or(Some(managed_id.clone()));
-        if let Some(parsed) = parse_codex_slash_command(&text) {
+        if let Some(parsed) = slash_command {
             match parsed {
                 Ok(command) => {
                     // Dispatch for every source — the attached loop (or the
                     // unattached-session responder) reports per-backend
                     // support honestly, so /goal works wherever a goal
                     // engine answers.
-                    if source == "codex"
+                    let blocked_codex_side = source == "codex"
                         && relation
                             .as_ref()
-                            .is_some_and(|rel| rel.relationship == "side")
-                    {
+                            .is_some_and(|rel| rel.relationship == "side");
+                    let requested = requested_id.as_deref().unwrap_or(&managed_id);
+                    let kimi_child = kimi_related_child_thread_action(
+                        &source,
+                        relation.as_ref(),
+                        requested,
+                        &managed_id,
+                    );
+                    let blocked_kimi_child = kimi_child
+                        && !relation.as_ref().is_some_and(|relation| {
+                            kimi_child_thread_action_allowed(&command.op, &relation.relationship)
+                        });
+                    if blocked_codex_side || blocked_kimi_child {
+                        let backend = external_agent::AgentBackend::from_str_loose(&source)
+                            .map(|backend| backend.to_string())
+                            .unwrap_or_else(|| source.clone());
+                        let relationship = relation
+                            .as_ref()
+                            .map(|rel| rel.relationship.as_str())
+                            .unwrap_or("related");
                         self.warn(&format!(
-                            "Slash command /{} is not supported for Codex side session {}; use the parent thread instead",
+                            "Slash command /{} is not supported for {} {} session {}; use the parent session instead",
                             command.op,
-                            short_session(requested_id.as_deref().unwrap_or(&managed_id))
+                            backend,
+                            relationship,
+                            short_session(requested)
                         ));
                         return;
                     }
@@ -1056,11 +1116,20 @@ impl SessionSupervisor {
                             attachments.len()
                         ));
                     }
+                    let params = if kimi_child {
+                        thread_action_params_with_thread_id(
+                            &command.op,
+                            command.params,
+                            Some(requested),
+                        )
+                    } else {
+                        command.params
+                    };
                     self.config.bus.send(AppEvent::ControlCommand(
                         event::ControlMsg::CodexThreadAction {
                             session_id: Some(managed_id),
                             op: command.op,
-                            params: command.params,
+                            params,
                             origin: None,
                         },
                     ));
@@ -1265,6 +1334,18 @@ pub(crate) fn lookup_edit_route_target_in_state(
     (target_id, entry, relation)
 }
 
+fn kimi_related_child_thread_action(
+    source: &str,
+    relation: Option<&RelatedSession>,
+    requested_id: &str,
+    managed_id: &str,
+) -> bool {
+    external_agent::AgentBackend::from_str_loose(source) == Some(external_agent::AgentBackend::Kimi)
+        && relation
+            .is_some_and(|relation| matches!(relation.relationship.as_str(), "side" | "subagent"))
+        && requested_id != managed_id
+}
+
 pub(crate) fn may_be_persisted_external_wrapper_id(session_id: &str) -> bool {
     uuid::Uuid::parse_str(session_id.trim()).is_ok()
 }
@@ -1312,6 +1393,27 @@ pub(crate) fn parse_codex_slash_command(text: &str) -> Option<Result<CodexSlashC
             Some(Ok(CodexSlashCommand {
                 op: "fast".to_string(),
                 params: serde_json::json!({}),
+            }))
+        }
+        "context-clear" | "context_clear" | "tools" | "tools-all" | "tools_all" => {
+            if !args.is_empty() {
+                return Some(Err(format!("/{name} does not accept arguments")));
+            }
+            Some(Ok(CodexSlashCommand {
+                op: name.replace('_', "-"),
+                params: serde_json::json!({}),
+            }))
+        }
+        "tools-set" | "tools_set" => {
+            let names = args
+                .split(|character: char| character == ',' || character.is_whitespace())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            Some(Ok(CodexSlashCommand {
+                op: "tools-set".to_string(),
+                params: serde_json::json!({ "names": names }),
             }))
         }
         "goal" => Some(parse_goal_slash_command(args)),
@@ -1378,6 +1480,45 @@ pub(crate) fn parse_goal_slash_command(args: &str) -> Result<CodexSlashCommand, 
                     serde_json::Value::Number(budget.into()),
                 );
             }
+            "--turn-budget" | "--turns" => {
+                let Some(value) = parts.next() else {
+                    return Err("/goal failed: turn budget must be a positive integer".to_string());
+                };
+                let budget = parse_positive_goal_limit(value, "turn budget")?;
+                params.insert(
+                    "turnBudget".to_string(),
+                    serde_json::Value::Number(budget.into()),
+                );
+            }
+            "--wall-clock-budget-ms" | "--wall-clock-ms" | "--wall-ms" => {
+                let Some(value) = parts.next() else {
+                    return Err(
+                        "/goal failed: wall-clock budget milliseconds must be a positive integer"
+                            .to_string(),
+                    );
+                };
+                let budget = parse_positive_goal_limit(value, "wall-clock budget milliseconds")?;
+                params.insert(
+                    "wallClockBudgetMs".to_string(),
+                    serde_json::Value::Number(budget.into()),
+                );
+            }
+            "--wall-clock-budget"
+            | "--wall-clock-budget-seconds"
+            | "--wall-clock-seconds"
+            | "--wall-seconds" => {
+                let Some(value) = parts.next() else {
+                    return Err(
+                        "/goal failed: wall-clock budget seconds must be a positive integer"
+                            .to_string(),
+                    );
+                };
+                let budget = parse_positive_goal_limit(value, "wall-clock budget seconds")?;
+                params.insert(
+                    "wallClockBudgetSeconds".to_string(),
+                    serde_json::Value::Number(budget.into()),
+                );
+            }
             other if other.starts_with("--status=") => {
                 let value = other.trim_start_matches("--status=");
                 if value.is_empty() {
@@ -1409,8 +1550,68 @@ pub(crate) fn parse_goal_slash_command(args: &str) -> Result<CodexSlashCommand, 
                     serde_json::Value::Number(budget.into()),
                 );
             }
+            other if other.starts_with("--turn-budget=") => {
+                let budget = parse_positive_goal_limit(
+                    other.trim_start_matches("--turn-budget="),
+                    "turn budget",
+                )?;
+                params.insert(
+                    "turnBudget".to_string(),
+                    serde_json::Value::Number(budget.into()),
+                );
+            }
+            other if other.starts_with("--turns=") => {
+                let budget =
+                    parse_positive_goal_limit(other.trim_start_matches("--turns="), "turn budget")?;
+                params.insert(
+                    "turnBudget".to_string(),
+                    serde_json::Value::Number(budget.into()),
+                );
+            }
+            other
+                if ["--wall-clock-budget-ms=", "--wall-clock-ms=", "--wall-ms="]
+                    .iter()
+                    .any(|prefix| other.starts_with(prefix)) =>
+            {
+                let value = other
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or_default();
+                let budget = parse_positive_goal_limit(value, "wall-clock budget milliseconds")?;
+                params.insert(
+                    "wallClockBudgetMs".to_string(),
+                    serde_json::Value::Number(budget.into()),
+                );
+            }
+            other
+                if [
+                    "--wall-clock-budget=",
+                    "--wall-clock-budget-seconds=",
+                    "--wall-clock-seconds=",
+                    "--wall-seconds=",
+                ]
+                .iter()
+                .any(|prefix| other.starts_with(prefix)) =>
+            {
+                let value = other
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or_default();
+                let budget = parse_positive_goal_limit(value, "wall-clock budget seconds")?;
+                params.insert(
+                    "wallClockBudgetSeconds".to_string(),
+                    serde_json::Value::Number(budget.into()),
+                );
+            }
             other => objective_parts.push(other),
         }
+    }
+
+    if params.contains_key("wallClockBudgetMs") && params.contains_key("wallClockBudgetSeconds") {
+        return Err(
+            "/goal failed: provide wall-clock budget in milliseconds or seconds, not both"
+                .to_string(),
+        );
     }
 
     let objective = unquote_slash_value(&objective_parts.join(" "));
@@ -1432,9 +1633,13 @@ pub(crate) fn parse_goal_slash_command(args: &str) -> Result<CodexSlashCommand, 
 }
 
 pub(crate) fn parse_positive_budget(value: &str) -> Result<u64, String> {
+    parse_positive_goal_limit(value, "token budget")
+}
+
+fn parse_positive_goal_limit(value: &str, label: &str) -> Result<u64, String> {
     match value.parse::<u64>() {
         Ok(n) if n > 0 => Ok(n),
-        _ => Err("/goal failed: token budget must be a positive integer".to_string()),
+        _ => Err(format!("/goal failed: {label} must be a positive integer")),
     }
 }
 
@@ -2011,6 +2216,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kimi_unsafe_child_follow_up_slash_never_targets_parent_session() {
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "kimi-parent".to_string(),
+                managed_session("kimi-parent", "kimi"),
+            );
+            assert!(state.apply_related_session("kimi-parent", "kimi-parent:btw:agent-1", "side"));
+        }
+
+        supervisor
+            .route_follow_up(
+                Some("kimi-parent:btw:agent-1".to_string()),
+                "/goal clear".to_string(),
+                Some(true),
+                Vec::new(),
+                None,
+            )
+            .await;
+
+        let mut saw_block_warning = false;
+        while let Ok(event) = bus_rx.try_recv() {
+            match event {
+                AppEvent::ControlCommand(event::ControlMsg::CodexThreadAction {
+                    session_id,
+                    op,
+                    ..
+                }) => {
+                    panic!(
+                        "Kimi child slash action /{op} must not target its parent ({session_id:?})"
+                    );
+                }
+                AppEvent::LogEntry { content, .. }
+                    if content.contains(
+                        "Slash command /goal-clear is not supported for Kimi side session",
+                    ) =>
+                {
+                    saw_block_warning = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_block_warning,
+            "the rejected child action should explain that the parent must be targeted explicitly"
+        );
+    }
+
+    #[tokio::test]
+    async fn kimi_child_follow_up_action_uses_parent_channel_with_child_thread_id() {
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "kimi-parent".to_string(),
+                managed_session("kimi-parent", "kimi"),
+            );
+            assert!(state.apply_related_session(
+                "kimi-parent",
+                "kimi-parent:subagent-1",
+                "subagent"
+            ));
+        }
+
+        supervisor
+            .route_follow_up(
+                Some("kimi-parent:subagent-1".to_string()),
+                "/tools".to_string(),
+                Some(true),
+                Vec::new(),
+                None,
+            )
+            .await;
+
+        match bus_rx.try_recv().expect("thread action") {
+            AppEvent::ControlCommand(event::ControlMsg::CodexThreadAction {
+                session_id,
+                op,
+                params,
+                ..
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("kimi-parent"));
+                assert_eq!(op, "tools");
+                assert_eq!(
+                    thread_id_from_action_params(&params).as_deref(),
+                    Some("kimi-parent:subagent-1")
+                );
+            }
+            other => panic!("expected child-scoped thread action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kimi_related_child_action_guard_uses_shared_relation_safe_set() {
+        let side = RelatedSession {
+            parent_session_id: "kimi-parent".to_string(),
+            relationship: "side".to_string(),
+        };
+        let subagent = RelatedSession {
+            parent_session_id: "kimi-parent".to_string(),
+            relationship: "subagent".to_string(),
+        };
+        assert!(kimi_related_child_thread_action(
+            "kimi",
+            Some(&side),
+            "kimi-parent:btw:agent-1",
+            "kimi-parent",
+        ));
+        assert!(kimi_child_thread_action_allowed("side-close", "side"));
+        assert!(!kimi_child_thread_action_allowed("side-close", "subagent"));
+        for op in KIMI_CHILD_THREAD_ACTION_OPS {
+            assert!(kimi_child_thread_action_allowed(op, "side"));
+            assert!(kimi_child_thread_action_allowed(op, "subagent"));
+        }
+        assert!(!kimi_child_thread_action_allowed("goal-clear", "side"));
+        assert!(kimi_related_child_thread_action(
+            "kimi",
+            Some(&subagent),
+            "kimi-parent:subagent-1",
+            "kimi-parent",
+        ));
+    }
+
+    #[test]
+    fn kimi_child_slash_commands_parse_to_canonical_actions() {
+        for (input, op) in [
+            ("/context-clear", "context-clear"),
+            ("/tools", "tools"),
+            ("/tools-all", "tools-all"),
+        ] {
+            let command = parse_codex_slash_command(input)
+                .expect("recognized")
+                .expect("valid");
+            assert_eq!(command.op, op);
+            assert_eq!(command.params, serde_json::json!({}));
+        }
+        let command = parse_codex_slash_command("/tools-set ReadFile, Shell Search")
+            .expect("recognized")
+            .expect("valid");
+        assert_eq!(command.op, "tools-set");
+        assert_eq!(
+            command.params,
+            serde_json::json!({ "names": ["ReadFile", "Shell", "Search"] })
+        );
+    }
+
+    #[tokio::test]
     async fn side_edit_preserves_child_target_on_parent_channel() {
         let bus = EventBus::new();
         let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
@@ -2339,6 +2696,108 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn kimi_child_steer_slash_never_targets_parent_session() {
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "kimi-parent".to_string(),
+                managed_session("kimi-parent", "kimi"),
+            );
+            assert!(state.apply_related_session("kimi-parent", "kimi-parent:btw:agent-1", "side"));
+        }
+
+        supervisor
+            .route_steer(
+                Some("kimi-parent:btw:agent-1".to_string()),
+                "/goal clear".to_string(),
+                Some("steer-child-slash".to_string()),
+                Vec::new(),
+            )
+            .await;
+
+        let mut saw_block_warning = false;
+        while let Ok(event) = bus_rx.try_recv() {
+            match event {
+                AppEvent::ControlCommand(event::ControlMsg::CodexThreadAction {
+                    session_id,
+                    op,
+                    ..
+                }) => {
+                    panic!(
+                        "Kimi child steer slash /{op} must not target its parent ({session_id:?})"
+                    );
+                }
+                AppEvent::SteerDelivered { id, .. } if id == "steer-child-slash" => {
+                    panic!("a rejected Kimi child slash must not be acknowledged as delivered");
+                }
+                AppEvent::LogEntry { content, .. }
+                    if content.contains(
+                        "Slash command /goal-clear is not supported for Kimi side session",
+                    ) =>
+                {
+                    saw_block_warning = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_block_warning,
+            "the rejected child steer action should explain that the parent must be targeted explicitly"
+        );
+    }
+
+    #[tokio::test]
+    async fn kimi_child_steer_action_uses_parent_channel_with_child_thread_id() {
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "kimi-parent".to_string(),
+                managed_session("kimi-parent", "kimi"),
+            );
+            assert!(state.apply_related_session("kimi-parent", "kimi-parent:worker-1", "subagent"));
+        }
+
+        supervisor
+            .route_steer(
+                Some("kimi-parent:worker-1".to_string()),
+                "/tools-all".to_string(),
+                Some("steer-child-tools".to_string()),
+                Vec::new(),
+            )
+            .await;
+
+        match bus_rx.try_recv().expect("thread action") {
+            AppEvent::ControlCommand(event::ControlMsg::CodexThreadAction {
+                session_id,
+                op,
+                params,
+                ..
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("kimi-parent"));
+                assert_eq!(op, "tools-all");
+                assert_eq!(
+                    thread_id_from_action_params(&params).as_deref(),
+                    Some("kimi-parent:worker-1")
+                );
+            }
+            other => panic!("expected child-scoped thread action, got {other:?}"),
+        }
+        match bus_rx.try_recv().expect("steer delivery") {
+            AppEvent::SteerDelivered { session_id, id, .. } => {
+                assert_eq!(session_id.as_deref(), Some("kimi-parent:worker-1"));
+                assert_eq!(id, "steer-child-tools");
+            }
+            other => panic!("expected SteerDelivered, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parses_fork_slash_command_with_name() {
         let command = slash("/fork dashboard branch");
@@ -2366,6 +2825,50 @@ mod tests {
         assert_eq!(command.op, "goal");
         assert_eq!(command.params["objective"], "Ship multi-session UX");
         assert_eq!(command.params["tokenBudget"], 200000);
+    }
+
+    #[test]
+    fn parses_kimi_goal_slash_command_with_all_native_budgets() {
+        let command = slash(
+            "/goal Ship Kimi parity --token-budget=200000 --turn-budget 40 \
+             --wall-clock-budget-seconds=900",
+        );
+        assert_eq!(command.op, "goal");
+        assert_eq!(command.params["objective"], "Ship Kimi parity");
+        assert_eq!(command.params["tokenBudget"], 200000);
+        assert_eq!(command.params["turnBudget"], 40);
+        assert_eq!(command.params["wallClockBudgetSeconds"], 900);
+
+        let milliseconds = slash("/goal Tune latency --wall-clock-ms 2500");
+        assert_eq!(milliseconds.params["objective"], "Tune latency");
+        assert_eq!(milliseconds.params["wallClockBudgetMs"], 2500);
+    }
+
+    #[test]
+    fn rejects_invalid_kimi_goal_slash_budgets() {
+        for (command, label) in [
+            ("/goal Ship --turn-budget 0", "turn budget"),
+            (
+                "/goal Ship --wall-clock-budget-seconds=soon",
+                "wall-clock budget seconds",
+            ),
+            (
+                "/goal Ship --wall-clock-budget-ms 0",
+                "wall-clock budget milliseconds",
+            ),
+        ] {
+            let error = parse_codex_slash_command(command)
+                .expect("recognized slash command")
+                .unwrap_err();
+            assert!(error.contains(label), "got: {error}");
+        }
+
+        let error = parse_codex_slash_command(
+            "/goal Ship --wall-clock-budget-ms 500 --wall-clock-seconds 1",
+        )
+        .expect("recognized slash command")
+        .unwrap_err();
+        assert!(error.contains("milliseconds or seconds"), "got: {error}");
     }
 
     #[test]

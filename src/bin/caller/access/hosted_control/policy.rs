@@ -346,6 +346,12 @@ pub fn hosted_control_msg_allowed(
             claude_model,
             claude_permission_mode,
             claude_effort,
+            kimi_model,
+            kimi_thinking,
+            kimi_permission_mode,
+            kimi_plan_mode,
+            kimi_swarm_mode,
+            kimi_allowed_tools,
             codex_model,
             codex_reasoning_effort,
             codex_sandbox,
@@ -371,6 +377,12 @@ pub fn hosted_control_msg_allowed(
                 && claude_model.is_none()
                 && claude_permission_mode.is_none()
                 && claude_effort.is_none()
+                && kimi_model.is_none()
+                && kimi_thinking.is_none()
+                && kimi_permission_mode.is_none()
+                && kimi_plan_mode.is_none()
+                && kimi_swarm_mode.is_none()
+                && kimi_allowed_tools.is_none()
                 && codex_model.is_none()
                 && codex_reasoning_effort.is_none()
                 && codex_sandbox.is_none()
@@ -468,6 +480,12 @@ pub fn hosted_control_msg_allowed(
             claude_permission_mode,
             claude_allowed_tools,
             claude_effort,
+            kimi_model,
+            kimi_thinking,
+            kimi_permission_mode,
+            kimi_plan_mode,
+            kimi_swarm_mode,
+            kimi_allowed_tools,
         } => {
             preset == HostedPreset::Operate
                 && session_is_hosted_eligible(state, session_id)
@@ -485,6 +503,12 @@ pub fn hosted_control_msg_allowed(
                 && claude_permission_mode.is_none()
                 && claude_allowed_tools.is_none()
                 && claude_effort.is_none()
+                && kimi_model.is_none()
+                && kimi_thinking.is_none()
+                && kimi_permission_mode.is_none()
+                && kimi_plan_mode.is_none()
+                && kimi_swarm_mode.is_none()
+                && kimi_allowed_tools.is_none()
         }
         ControlMsg::RequestDisplayInputAuthority { display_id: _ }
         | ControlMsg::ReleaseDisplayInputAuthority { display_id: _ }
@@ -520,6 +544,13 @@ pub fn hosted_control_msg_allowed(
         | ControlMsg::SetClaudeModel { .. }
         | ControlMsg::SetClaudePermissionMode { .. }
         | ControlMsg::SetClaudeAllowedTools { .. }
+        | ControlMsg::SetKimiCommand { .. }
+        | ControlMsg::SetKimiModel { .. }
+        | ControlMsg::SetKimiThinking { .. }
+        | ControlMsg::SetKimiPermissionMode { .. }
+        | ControlMsg::SetKimiPlanMode { .. }
+        | ControlMsg::SetKimiSwarmMode { .. }
+        | ControlMsg::SetKimiAllowedTools { .. }
         | ControlMsg::SetVerbosity { .. }
         | ControlMsg::ScheduleControllerRestart { .. }
         | ControlMsg::ControllerTurnComplete { .. }

@@ -373,7 +373,7 @@ function updateLogEmptyState() {
 const LOG_EMPTY_DEFAULT_TITLE = 'No activity yet';
 const LOG_EMPTY_DEFAULT_HINT = 'Send a task below to start the agent, or pick a session from Sessions.';
 
-/* External-agent availability (Codex / Claude Code): which backends this
+/* External-agent availability (Codex / Claude Code / Kimi Code): which backends this
    daemon can actually spawn. External agents run on their own accounts,
    so the fueling nudge must not read as "nothing works" while one is
    present — and the new-session picker greys out backends whose CLI is
@@ -714,6 +714,7 @@ const SESSION_SOURCE_FILTER_OPTIONS = [
   { value: 'external', label: 'External agents', plural: 'sources' },
   { value: 'codex', label: 'Codex', plural: 'sources' },
   { value: 'claude-code', label: 'Claude', plural: 'sources' },
+  { value: 'kimi', label: 'Kimi', plural: 'sources' },
 ];
 const SESSION_STATUS_FILTER_OPTIONS = [
   { value: 'active', label: 'Active', plural: 'statuses' },
@@ -896,6 +897,7 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'session_agent_config_result',
   'codex_config_changed',
   'claude_config_changed',
+  'kimi_config_changed',
   'usage',
   'usage_update',
   'presence_usage_update',
@@ -925,6 +927,13 @@ const DASHBOARD_CONTROL_MSG_RPC_ACTIONS = new Set([
   'set_claude_model',
   'set_claude_permission_mode',
   'set_claude_allowed_tools',
+  'set_kimi_command',
+  'set_kimi_model',
+  'set_kimi_thinking',
+  'set_kimi_permission_mode',
+  'set_kimi_plan_mode',
+  'set_kimi_swarm_mode',
+  'set_kimi_allowed_tools',
   'set_codex_reasoning_effort',
   'set_codex_service_tier',
   'set_codex_web_search',

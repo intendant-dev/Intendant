@@ -1764,6 +1764,11 @@ body.context-focus-active {
   cursor: pointer;
 }
 .vx-bgtask-view:hover { background: var(--surface1); }
+.vx-bgtask-view:disabled { opacity: .55; cursor: wait; }
+.vx-bgtask-cancel {
+  border-color: color-mix(in srgb, var(--red) 45%, var(--surface1));
+  color: var(--red);
+}
 
 #bg-output-viewer[hidden] { display: none; }
 #bg-output-viewer .bgov-backdrop {
@@ -3530,4 +3535,3 @@ body.context-focus-active {
   transition: height 0.3s, opacity 0.15s;
 }
 .history-bar:hover { opacity: 1; }
-

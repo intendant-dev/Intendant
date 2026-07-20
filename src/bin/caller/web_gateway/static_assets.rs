@@ -853,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn global_codex_and_claude_model_defaults_are_wired_in_settings() {
+    fn global_external_agent_model_defaults_are_wired_in_settings() {
         for id in [
             "set-codex-model-select",
             "set-codex-model-custom",
@@ -861,13 +861,74 @@ mod tests {
             "set-claude-model-select",
             "set-claude-model-custom",
             "set-claude-permission-mode",
+            "set-kimi-model-select",
+            "set-kimi-model-custom",
+            "set-kimi-thinking",
+            "set-kimi-permission-mode",
+            "set-kimi-plan-mode",
+            "set-kimi-swarm-mode",
         ] {
             assert!(APP_HTML.contains(&format!(r#"id="{id}""#)), "missing {id}");
         }
         assert!(APP_HTML.contains("codex_model: selectedCodexModel"));
         assert!(APP_HTML.contains("claude_model: selectedClaudeModel"));
+        assert!(APP_HTML.contains("kimi_model: selectedKimiModel"));
         assert!(APP_HTML.contains("function populateSettingsCodexModel"));
         assert!(APP_HTML.contains("function populateSettingsClaudeModel"));
+        assert!(APP_HTML.contains("function populateSettingsKimiModel"));
+    }
+
+    #[test]
+    fn new_session_kimi_overrides_are_wired() {
+        for id in [
+            "new-session-kimi-model-select",
+            "new-session-kimi-model",
+            "new-session-kimi-thinking",
+            "new-session-kimi-permission-mode",
+            "new-session-kimi-plan-mode",
+            "new-session-kimi-swarm-mode",
+        ] {
+            assert!(APP_HTML.contains(&format!(r#"id="{id}""#)), "missing {id}");
+        }
+        assert!(APP_HTML.contains("if (model) msg.kimi_model = model;"));
+        assert!(APP_HTML.contains("msg.kimi_thinking = thinking;"));
+        assert!(APP_HTML.contains("msg.kimi_permission_mode = permissionMode;"));
+        assert!(APP_HTML.contains("msg.kimi_plan_mode ="));
+        assert!(APP_HTML.contains("msg.kimi_swarm_mode ="));
+    }
+
+    #[test]
+    fn kimi_historical_fork_points_are_joined_to_transcript_turns() {
+        fn section(start: &str, end: &str) -> &'static str {
+            APP_HTML
+                .split_once(start)
+                .and_then(|(_, rest)| rest.split_once(end).map(|(body, _)| body))
+                .unwrap_or_else(|| panic!("missing app.html section {start:?} .. {end:?}"))
+        }
+
+        // The catalog index, panel-to-row jump, and row-to-point lookup must
+        // all use the same whole-turn convention: boundary k is rendered on
+        // the following user prompt (user_turn_index k + 1).
+        let catalog_index = section(
+            "function sessionForkStoreInlineIndex(",
+            "\nfunction sessionForkRefreshDetailAffordances(",
+        );
+        assert!(catalog_index.contains("source === 'codex' || source === 'kimi'"));
+        assert!(catalog_index.contains("point.kind === 'turn-boundary'"));
+
+        let row_match = section(
+            "function sessionForkRowMatchesPoint(",
+            "\nfunction sessionForkJumpToPoint(",
+        );
+        assert!(row_match.contains("source === 'codex' || source === 'kimi'"));
+        assert!(row_match.contains("record.user_turn_index === point.turn + 1"));
+
+        let row_lookup = section(
+            "function sessionForkInlinePointForRecord(",
+            "\nfunction sessionForkRowHint(",
+        );
+        assert!(row_lookup.contains("idx.source === 'codex' || idx.source === 'kimi'"));
+        assert!(row_lookup.contains("idx.byRow.get(`turn:${turn - 1}`)"));
     }
 
     #[test]
@@ -1183,6 +1244,26 @@ mod tests {
         assert!(APP_HTML.contains("sendControl({ t: 'mu', x, y, b })"));
         assert!(APP_HTML.contains("handlers.pointercancel = (e) =>"));
         assert!(APP_HTML.contains("owner._flushHeldKeys?.();"));
+    }
+
+    #[test]
+    fn agent_signin_refresh_is_derived_from_the_provider_catalog() {
+        for provider in ["claude", "codex", "kimi"] {
+            assert!(
+                APP_HTML.contains(&format!("  {provider}: {{")),
+                "missing {provider} from AGENT_SIGNIN_PROVIDERS"
+            );
+        }
+        assert!(APP_HTML.contains("for (const provider of Object.keys(AGENT_SIGNIN_PROVIDERS)) {"));
+        assert!(APP_HTML.contains("agentSigninRefresh(provider).catch(() => {});"));
+    }
+
+    #[test]
+    fn dashboard_refreshes_every_declared_external_agent_signin_card() {
+        assert!(APP_HTML.contains("const AGENT_SIGNIN_PROVIDERS = {"));
+        assert!(APP_HTML.contains("  kimi: {"));
+        assert!(APP_HTML.contains("for (const provider of Object.keys(AGENT_SIGNIN_PROVIDERS)) {"));
+        assert!(APP_HTML.contains("agentSigninRefresh(provider).catch(() => {});"));
     }
 
     #[test]

@@ -1078,6 +1078,12 @@ function stationBuildControlsSummary() {
       : 0,
     claudeModel: controlClaudeConfig.model || '',
     claudePermissionMode: controlClaudeConfig.permission_mode || 'default',
+    kimiModel: controlKimiConfig.model || '',
+    kimiThinking: controlKimiConfig.thinking || '',
+    kimiPermissionMode: controlKimiConfig.permission_mode || 'manual',
+    kimiPlanMode: !!controlKimiConfig.plan_mode,
+    kimiSwarmMode: !!controlKimiConfig.swarm_mode,
+    kimiAllowedTools: controlKimiConfig.allowed_tools,
     newSessionAgent: newSessionConfiguredAgent || backend || '',
     sessionId,
     sessionLabel: stationSessionShortLabel(sessionId),
@@ -2409,4 +2415,3 @@ let lastLiveFrameLen = 0; // For frame dedup — skip if JPEG size barely change
 let tickerFramesSent = 0;
 let tickerFramesDropped = 0;
 let tickerExpanded = false;
-

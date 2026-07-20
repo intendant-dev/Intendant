@@ -19,6 +19,7 @@ pub(crate) struct DaemonConfig {
         Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     pub(crate) shared_codex_config: control_plane::SharedCodexConfig,
     pub(crate) shared_claude_config: control_plane::SharedClaudeConfig,
+    pub(crate) shared_kimi_config: control_plane::SharedKimiConfig,
     pub(crate) frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     pub(crate) session_registry: Option<display::SharedSessionRegistry>,
     pub(crate) peer_registry: Option<peer::PeerRegistry>,
@@ -48,6 +49,7 @@ pub(crate) async fn run_daemon_loop(config: DaemonConfig) {
         shared_external_agent: config.shared_external_agent,
         shared_codex_config: config.shared_codex_config,
         shared_claude_config: config.shared_claude_config,
+        shared_kimi_config: config.shared_kimi_config,
         frame_registry: config.frame_registry,
         session_registry: config.session_registry,
         peer_registry: config.peer_registry,
@@ -172,6 +174,7 @@ pub(crate) async fn run_daemon(
 
     let shared_codex_config = shared_codex_config_from_project(project);
     let shared_claude_config = shared_claude_config_from_project(project);
+    let shared_kimi_config = shared_kimi_config_from_project(project);
     let settings_root = project_root
         .clone()
         .unwrap_or_else(project::daemon_settings_config_root);
@@ -180,6 +183,7 @@ pub(crate) async fn run_daemon(
         external_agent: shared_external_agent.clone(),
         codex_config: shared_codex_config.clone(),
         claude_config: shared_claude_config.clone(),
+        kimi_config: shared_kimi_config.clone(),
         bus: bus.clone(),
         project_root: Some(settings_root),
     });
@@ -228,6 +232,7 @@ pub(crate) async fn run_daemon(
             shared_external_agent,
             shared_codex_config,
             shared_claude_config,
+            shared_kimi_config,
             frame_registry,
             session_registry: Some(session_registry.clone()),
             peer_registry: Some(gateway.peer_registry.clone()),

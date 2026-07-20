@@ -20,9 +20,9 @@
 > explicit `mode: "access_token"`) are now the browser OAuth default.
 > Raw dashboard-control callers must send that mode explicitly; omitted
 > OAuth mode remains the legacy full-credential grant. Reach caveat:
-> OpenAI's token endpoint serves any browser origin, so Codex works
-> out of the box; Anthropic's origin-allowlists browsers away, so Claude
-> Code still needs the full-credential opt-in until that changes.
+> OpenAI's and Kimi's token endpoints serve browser origins, so Codex and
+> Kimi work out of the box; Anthropic's origin-allowlists browsers away, so
+> Claude Code still needs the full-credential opt-in until that changes.
 > Coverage: `scripts/validate-vault.cjs` exercises vault custody;
 > `scripts/validate-credential-leases.cjs` and
 > `scripts/validate-client-egress.cjs` pin the default hosted boundary
@@ -39,7 +39,8 @@ Every Intendant daemon today reads its provider credentials from a plain
 `.env` file (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`) or,
 for the external agents, from their own on-disk auth stores (Codex:
 `auth.json` under `CODEX_HOME`; Claude Code: its credentials file or the
-macOS keychain). Consequences:
+macOS keychain; Kimi Code: `credentials/kimi-code.json` under
+`KIMI_CODE_HOME`). Consequences:
 
 - Credentials live **at rest, in plaintext, forever** on every machine
   that runs a daemon — in disk images, VPS snapshots, backups, and
@@ -50,7 +51,8 @@ macOS keychain). Consequences:
   "spin up a box for the
   afternoon" out of reach.
 - The user's *subscription* identities (ChatGPT plan auth for Codex,
-  Claude plan auth for Claude Code — both now permitted for programmatic
+  Claude plan auth for Claude Code, Kimi plan auth for Kimi Code — all
+  permitted for programmatic
   use under their current terms) are duplicated onto every machine, with
   no central place to see or withdraw them.
 
@@ -73,7 +75,7 @@ to every server.
 **Contents (v1 tenants).** Provider API keys (Anthropic, OpenAI, Gemini,
 plus voice keys migrating in from today's per-origin `localStorage`), and
 subscription OAuth credential sets for the external agents (Codex,
-Claude Code). Each entry carries a kind, a label, provider metadata, and
+Claude Code, Kimi Code). Each entry carries a kind, a label, provider metadata, and
 optional per-daemon scoping rules (below).
 
 Entries may also carry an **unseal policy** (`unseal_policy:
@@ -318,14 +320,14 @@ copy until the session ends — expiry and revocation cannot claw back
 copies already served. Ending the session is the lever that cuts a
 running consumer off today.
 
-**The OAuth split (Codex, Claude Code).** Subscription OAuth is *better*
+**The OAuth split (Codex, Claude Code, Kimi Code).** Subscription OAuth is *better*
 suited to leasing than raw keys, because the protocol already separates
 durable from ephemeral authority:
 
 - **Access-token lease (the browser UX default):** the browser keeps the **refresh
   token** in the vault and never leases it. It performs token refresh
   itself against the provider's token endpoint (rotated refresh tokens
-  are written back into the vault — both providers rotate) and leases
+  are written back into the vault when the provider rotates them) and leases
   only short-lived **access tokens** over the tunnel, as material with
   every durable field blanked and `mode: "access_token"` on the grant.
   Raw dashboard-control callers must send `mode: "access_token"` for
@@ -338,8 +340,8 @@ durable from ephemeral authority:
   authority horizon is the provider's own access TTL (typically ≤1h)
   past the last re-grant, no matter what an attacker does. Reach: this
   needs the token endpoint to answer browser CORS. OpenAI's
-  (`auth.openai.com`) serves `Access-Control-Allow-Origin: *`, so
-  **Codex fuels this way out of the box**; Anthropic's
+  (`auth.openai.com`) and Kimi's (`auth.kimi.com`) serve browser origins, so
+  **Codex and Kimi fuel this way out of the box**; Anthropic's
   (`console.anthropic.com`) allowlists origins and refuses others, so
   **Claude Code cannot refresh in the browser today** and stays behind
   the full-credential opt-in (the UI says exactly that).
@@ -351,22 +353,33 @@ durable from ephemeral authority:
   then depends on our lease discipline (and, worst case, the provider's
   session-revocation page).
 
-**External-agent materialization (a documented weakening).** Codex and
-Claude Code are child processes that read credentials from files, not
+**External-agent materialization (a documented weakening).** Codex, Claude
+Code, and Kimi Code are child processes that read credentials from files, not
 from process memory we control. A lease for them therefore materializes
 a daemon-private temporary home under `<state-root>/leased-auth`, outside
-any project worktree: `codex-home/auth.json` for Codex and
-`claude-home/.credentials.json` for Claude Code. The directories are
-0700 and the auth files are 0600 on Unix; Windows relies on the user's
-profile ACLs. Spawns point the child process at them with `CODEX_HOME` or
-`CLAUDE_CONFIG_DIR`. The materialization is
+any project worktree: `codex-home/auth.json` for Codex,
+`claude-home/.credentials.json` for Claude Code, and
+`kimi-home/credentials/kimi-code.json` for Kimi Code. The directories are
+0700 and the auth files are 0600 on Unix. On Windows, every materialization
+root, agent home, nested credential directory, credential file, and copied
+configuration file receives a protected current-user/SYSTEM/Administrators
+DACL instead of trusting ambient profile inheritance; Kimi's per-session
+bridge applies the same policy. Spawns point the child process at them with
+`CODEX_HOME` or `CLAUDE_CONFIG_DIR`, or `KIMI_CODE_HOME`. The materialization is
 deleted on lease expiry, revocation, and daemon shutdown. During an
 active lease those bytes are on disk; the ledger says so plainly.
 Mitigations: the materialization root is outside worktrees and is never
 seen by rewind/snapshot machinery, the file exists only while leased,
-and crash recovery deletes stale materializations at startup.
+and crash recovery deletes stale materializations at startup. Before writing
+any credential bytes, the controller requires the swept root, agent home,
+every nested credential directory, and the destination leaf to be real
+contained objects—not symbolic links, Windows junctions, or other reparse
+points. It writes through a randomly named create-new private sibling and an
+atomic replacement, then revalidates the result. Cleanup likewise removes
+link-like children as leaves and refuses canonical paths outside the swept
+root.
 
-To preserve CLI behavior, materialization also attempts to copy Codex
+To preserve CLI behavior, materialization also attempts to copy Codex/Kimi
 `config.toml` or Claude `settings.json` from the user's ordinary home. Those
 copies are currently **best-effort and silent on failure**, and the daemon does
 not inspect arbitrary user configuration to prove it contains no secrets; only
@@ -384,10 +397,18 @@ outside any further sweep, which is strictly worse than the bounded
 deferral. The lease itself still dies on time (no new spawn or resume sees
 the home), and **revocation and shutdown are not deferred** — a deliberate
 revoke, the shutdown guard, and the startup crash sweep all delete
-immediately, live session or not.
+immediately, live session or not. Startup closes the identity-publication
+race with a provisional liveness registration acquired before credential
+selection and backend initialization. Expiry during that window parks cleanup
+and atomically promotes the hold to the wrapper/backend ids only after
+`start_thread` succeeds; every failed startup releases it and triggers the
+parked sweep. A deliberate revoke racing that provisional window prevents the
+startup from being published and cleanup runs after the partially started
+backend is shut down.
 
 **Transcript staging at cleanup.** The materialized home also holds the
-agent's session transcripts (Codex `sessions/`, Claude `projects/`), and
+agent's session transcripts (Codex `sessions/`/`archived_sessions`, Claude
+`projects/`, Kimi `sessions/`), and
 deleting the home would erase them from message search. Cleanup therefore
 first *renames* those transcript subdirectories into a credential-free
 staging area under `<state-root>/cache/message_search/staging/`
@@ -441,15 +462,16 @@ device code's own expiry. V1 is the ChatGPT subscription lane only (the
 `--with-api-key` / `--with-access-token` stdin lanes are a different
 custody class and stay follow-ups).
 
-Seven `credentials.manage`-gated routes carry the two ceremonies
+Ten `credentials.manage`-gated routes carry the three ceremonies
 (`/api/claude-auth/{start,status,code,cancel}` +
 `/api/codex-auth/{start,status,cancel}` — the device flow deliberately
-has no code-submission leaf — with datachannel twins, docs table in
+has no code-submission leaf — plus
+`/api/kimi-auth/{start,status,cancel}`) with datachannel twins, docs table in
 [Web Dashboard](./web-dashboard.md)); hosted-provenance clients are
 hard-refused at the handlers, and explicit cancel (verified
-non-destructive against both CLIs) or the timeout reaps the process.
+non-destructive against all three CLIs) or the timeout reaps the process.
 **Tier gate:** a daemon whose backend credential is custody-managed
-(active `oauth:claude-code` / `oauth:codex` lease) or whose provider
+(active `oauth:claude-code` / `oauth:codex` / `oauth:kimi` lease) or whose provider
 rides a client-egress relay refuses the ceremony — a dashboard login
 would park a durable credential on disk behind the owner's off-box
 custody choice. (The OpenAI egress arm is structurally vacant today —
@@ -476,7 +498,7 @@ failure for their server farm — and it isn't even uniformly possible:
 | Anthropic | Yes (opt-in CORS header) | `anthropic-dangerous-direct-browser-access` |
 | Gemini | Yes | the voice client already does it |
 | OpenAI | Generally no | completions API refuses browser CORS |
-| Codex / Claude Code (subscription) | No | they are local child processes by nature |
+| Codex / Claude Code / Kimi Code (subscription) | No | they are local child processes by nature |
 
 For an authorized trusted channel, **leases are the default
 egress-preserving mechanism** (daemon calls
@@ -580,16 +602,16 @@ create the missing cross-origin delivery bridge.
 2. ✅ Lease RPCs + controller-side memory custody + `credentials.manage`
    gate (operator holds it; peer lane excluded) + lease-first provider
    plumbing. `.env` fallback untouched; distinct "unfueled" error.
-3. ✅ OAuth materialization for Codex (`CODEX_HOME`) and Claude Code
-   (`CLAUDE_CONFIG_DIR`): private temporary homes under
-   `<state-root>/leased-auth/{codex-home,claude-home}`, outside
+3. ✅ OAuth materialization for Codex (`CODEX_HOME`), Claude Code
+   (`CLAUDE_CONFIG_DIR`), and Kimi Code (`KIMI_CODE_HOME`): private temporary homes under
+   `<state-root>/leased-auth/{codex-home,claude-home,kimi-home}`, outside
    worktrees and snapshots, deleted on expiry, revocation, shutdown, and
    a startup recovery sweep; full-credential opt-in per daemon (OFF by
    default in the browser UX). Access-token mode shipped as the browser
    OAuth default (browser refresh + rotation write-back; daemon-verified
    refresh-free material; raw RPC callers must send
-   `mode: "access_token"` explicitly; Codex live, Claude Code pending
-   provider CORS).
+   `mode: "access_token"` explicitly; Codex and Kimi live, Claude Code
+   pending provider CORS).
 4. ✅ Offline-lease knob, fueling panel (per-daemon status, revocation,
    usage audit fields), dry-daemon Web Push. Custody trail shipped: the
    daemon records every grant/expiry/revocation/relay change (+ restart

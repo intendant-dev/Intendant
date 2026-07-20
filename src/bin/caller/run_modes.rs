@@ -104,6 +104,7 @@ pub(crate) async fn run_with_presence(
     shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     shared_codex_config: control_plane::SharedCodexConfig,
     shared_claude_config: control_plane::SharedClaudeConfig,
+    shared_kimi_config: control_plane::SharedKimiConfig,
     web_port: Option<u16>,
     resume_session: Option<String>,
     resume_session_config: Option<session_config::SessionAgentConfig>,
@@ -334,6 +335,7 @@ pub(crate) async fn run_with_presence(
     // and build a fresh one. Only meaningful when the backend is Codex.
     let mut persistent_codex_config: Option<control_plane::CodexRuntimeConfig> = None;
     let mut persistent_claude_config: Option<control_plane::ClaudeRuntimeConfig> = None;
+    let mut persistent_kimi_config: Option<control_plane::KimiRuntimeConfig> = None;
 
     // Side channel for thread actions (Codex slash commands) dispatched from
     // the dashboard / MCP between tasks. We subscribe to the bus here (not
@@ -826,7 +828,7 @@ pub(crate) async fn run_with_presence(
                         log_dir: &log_dir,
                         approval_registry: &approval_registry,
                         json_approval: None,
-                        agent_source: Some("Codex".to_string()),
+                        agent_source: Some(agent.name().to_string()),
                         suppress_agent_started: true,
                         persist_model_responses_inline: false,
                         headless: false,
@@ -1220,7 +1222,7 @@ pub(crate) async fn run_with_presence(
                         log_dir: &log_dir,
                         approval_registry: &approval_registry,
                         json_approval: None,
-                        agent_source: Some("Codex".to_string()),
+                        agent_source: Some(agent.name().to_string()),
                         suppress_agent_started: true,
                         persist_model_responses_inline: false,
                         headless: false,
@@ -1251,6 +1253,7 @@ pub(crate) async fn run_with_presence(
                         });
                     action_params =
                         thread_action_params_with_thread_id(&op, action_params, target_thread_id);
+                    let fission_agent_source = agent.name().to_string();
                     let drain_config = DrainConfig {
                         bus: &bus,
                         web_port,
@@ -1267,7 +1270,7 @@ pub(crate) async fn run_with_presence(
                         log_dir: &log_dir,
                         approval_registry: &approval_registry,
                         json_approval: None,
-                        agent_source: Some("Codex".to_string()),
+                        agent_source: Some(fission_agent_source),
                         suppress_agent_started: true,
                         persist_model_responses_inline: false,
                         headless: false,
@@ -1351,9 +1354,18 @@ pub(crate) async fn run_with_presence(
                     Err(e) => (false, e),
                 };
                 let result_session_id = session_id.or_else(|| local_session_id.clone());
+                let action_backend = persistent_agent_backend.clone().or_else(|| {
+                    persistent_agent.as_ref().and_then(|agent| {
+                        external_agent::AgentBackend::from_str_loose(agent.name())
+                    })
+                });
+                let action_label = action_backend
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "External agent".to_string());
                 slog(&session_log, |l| {
                     l.info(&format!(
-                        "Codex thread action /{}: {} — {}",
+                        "{action_label} thread action /{}: {} — {}",
                         op,
                         if success { "ok" } else { "FAILED" },
                         codex_thread_action_log_message(&op, &message)
@@ -1366,7 +1378,10 @@ pub(crate) async fn run_with_presence(
                     message: message.clone(),
                     record_id: None,
                 });
-                if success && op == "fast" {
+                if success
+                    && op == "fast"
+                    && action_backend == Some(external_agent::AgentBackend::Codex)
+                {
                     let service_tier = persistent_agent
                         .as_ref()
                         .and_then(|agent| agent.service_tier().map(str::to_string));
@@ -1404,45 +1419,121 @@ pub(crate) async fn run_with_presence(
                         service_tier.as_deref(),
                     );
                 }
+                if success
+                    && action_backend == Some(external_agent::AgentBackend::Kimi)
+                    && kimi_launch_mutating_thread_action(&op)
+                {
+                    if let Some(agent) = persistent_agent.as_ref() {
+                        let drain_config = DrainConfig {
+                            bus: &bus,
+                            web_port,
+                            session_id: local_session_id.clone(),
+                            alias_session_id: persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.clone()),
+                            backend_thread_id: persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.clone()),
+                            autonomy: autonomy.clone(),
+                            session_log: &session_log,
+                            project_root: &project.root,
+                            log_dir: &log_dir,
+                            approval_registry: &approval_registry,
+                            json_approval: None,
+                            agent_source: Some("Kimi".to_string()),
+                            suppress_agent_started: true,
+                            persist_model_responses_inline: false,
+                            headless: false,
+                            context_injection: &context_injection,
+                            reload_credentials: None,
+                        };
+                        if let Err(error) = persist_live_external_launch_config(
+                            agent.as_ref(),
+                            &drain_config,
+                            &external_agent::AgentBackend::Kimi,
+                            result_session_id.as_deref(),
+                        ) {
+                            slog(&session_log, |log| log.warn(&error));
+                            bus.send(AppEvent::LogEntry {
+                                session_id: result_session_id.clone(),
+                                level: "error".into(),
+                                source: "Kimi".into(),
+                                content: format!(
+                                    "Live Kimi profile changed, but its restart/fork configuration was not persisted: {error}"
+                                ),
+                                turn: None,
+                            });
+                        }
+                    }
+                }
                 if success && op == "fork" {
-                    if let Some(child_id) = forked_thread_id_from_message(&message) {
-                        emit_codex_fork_session_name(&bus, &child_id, &action_params);
+                    if let (Some(child_id), Some(backend), Some(agent)) = (
+                        forked_thread_id_from_message(&message),
+                        action_backend.as_ref(),
+                        persistent_agent.as_ref(),
+                    ) {
+                        emit_external_fork_session_name(&bus, backend, &child_id, &action_params);
+                        let relationship_parent = thread_id_from_action_params(&action_params)
+                            .or_else(|| result_session_id.clone());
                         emit_session_relationship(
                             &bus,
-                            result_session_id.as_deref(),
+                            relationship_parent.as_deref(),
                             &child_id,
                             "fork",
                             false,
                         );
-                        bus.send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
-                            source: "codex".to_string(),
-                            session_id: child_id.clone(),
-                            resume_id: Some(child_id),
-                            project_root: Some(project_root.to_string_lossy().to_string()),
-                            task: None,
-                            direct: Some(true),
-                            fork: false,
-                            relationship_kind: None,
-                            auto_attach: false,
-                            attachments: Vec::new(),
-                            agent_command: Some(project.config.agent.codex.command.clone()),
-                            codex_sandbox: Some(crate::project::normalize_sandbox_mode(
-                                &project.config.agent.codex.sandbox,
-                            )),
-                            codex_approval_policy: Some(crate::project::normalize_approval_policy(
-                                &project.config.agent.codex.approval_policy,
-                            )),
-                            codex_managed_context: Some(
-                                crate::project::normalize_codex_managed_context(
-                                    &project.config.agent.codex.managed_context,
-                                ),
-                            ),
-                            codex_context_archive: Some(
-                                crate::project::normalize_codex_context_archive(
-                                    &project.config.agent.codex.context_archive,
-                                ),
-                            ),
-                        }));
+                        let drain_config = DrainConfig {
+                            bus: &bus,
+                            web_port,
+                            session_id: local_session_id.clone(),
+                            alias_session_id: persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.clone()),
+                            backend_thread_id: persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.clone()),
+                            autonomy: autonomy.clone(),
+                            session_log: &session_log,
+                            project_root: &project.root,
+                            log_dir: &log_dir,
+                            approval_registry: &approval_registry,
+                            json_approval: None,
+                            agent_source: Some(backend.to_string()),
+                            suppress_agent_started: true,
+                            persist_model_responses_inline: false,
+                            headless: false,
+                            context_injection: &context_injection,
+                            reload_credentials: None,
+                        };
+                        match persist_external_fork_child_launch_overlay(
+                            agent.as_ref(),
+                            &drain_config,
+                            backend,
+                            &child_id,
+                        ) {
+                            Ok(launch) => {
+                                bus.send(AppEvent::ControlCommand(
+                                    resume_existing_external_fork_control(
+                                        backend,
+                                        &child_id,
+                                        &project_root,
+                                        Some(&launch),
+                                    ),
+                                ));
+                            }
+                            Err(error) => {
+                                slog(&session_log, |log| log.warn(&error));
+                                bus.send(AppEvent::CodexThreadActionResult {
+                                    session_id: Some(child_id),
+                                    action: "fork-attach".into(),
+                                    success: false,
+                                    message: format!(
+                                        "native fork exists, but Intendant refused to attach it without an exact persisted launch profile: {error}"
+                                    ),
+                                    record_id: None,
+                                });
+                            }
+                        }
                     }
                 }
                 if success && op == "side" {
@@ -1476,7 +1567,7 @@ pub(crate) async fn run_with_presence(
                                 log_dir: &log_dir,
                                 approval_registry: &approval_registry,
                                 json_approval: None,
-                                agent_source: Some("Codex".to_string()),
+                                agent_source: action_backend.as_ref().map(ToString::to_string),
                                 suppress_agent_started: true,
                                 persist_model_responses_inline: false,
                                 headless: false,
@@ -1511,14 +1602,25 @@ pub(crate) async fn run_with_presence(
                             )
                             .await;
                         } else {
+                            let label = action_backend
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "External agent".to_string());
                             slog(&session_log, |l| {
-                                l.warn("Codex side conversation started but no event receiver is available")
+                                l.warn(&format!(
+                                    "{label} side conversation started but no event receiver is available"
+                                ))
                             });
                         }
                     }
                 } else if success && matches!(op.as_str(), "side-close" | "side_close") {
                     if let Some(child_thread_id) = side_child_thread_id_from_params(&action_params)
                     {
+                        bus.send(AppEvent::SessionEnded {
+                            session_id: child_thread_id.clone(),
+                            reason: "side conversation closed".to_string(),
+                            error_kind: None,
+                        });
                         let mut side_state = ExternalSideSessionState {
                             open_side_threads: &mut persistent_open_side_threads,
                             side_rounds: &mut persistent_side_rounds,
@@ -1924,6 +2026,7 @@ pub(crate) async fn run_with_presence(
                             persistent_event_rx = None;
                             persistent_codex_config = None;
                             persistent_claude_config = None;
+                            persistent_kimi_config = None;
                             bus.send(AppEvent::ConversationRolledBack {
                                 session_id: local_session_id.clone(),
                                 round_id,
@@ -2125,6 +2228,7 @@ pub(crate) async fn run_with_presence(
         // effect on the NEXT task by forcing an agent rebuild.
         let current_codex_config = shared_codex_config.read().await.clone();
         let current_claude_config = shared_claude_config.read().await.clone();
+        let current_kimi_config = shared_kimi_config.read().await.clone();
 
         // Teardown conditions:
         //  - backend changed (any agent)
@@ -2140,11 +2244,16 @@ pub(crate) async fn run_with_presence(
         ) && persistent_claude_config
             .as_ref()
             .is_some_and(|prev| !claude_runtime_config_equal(prev, &current_claude_config));
+        let kimi_config_changed = matches!(agent_backend, Some(external_agent::AgentBackend::Kimi))
+            && persistent_kimi_config
+                .as_ref()
+                .is_some_and(|prev| !kimi_runtime_config_equal(prev, &current_kimi_config));
 
         if persistent_agent.is_some()
             && (agent_backend != persistent_agent_backend
                 || codex_config_changed
-                || claude_config_changed)
+                || claude_config_changed
+                || kimi_config_changed)
         {
             if codex_config_changed {
                 slog(&session_log, |l| {
@@ -2156,11 +2265,17 @@ pub(crate) async fn run_with_presence(
                     l.info("Claude Code config changed; rebuilding agent for next task")
                 });
             }
+            if kimi_config_changed {
+                slog(&session_log, |l| {
+                    l.info("Kimi config changed; rebuilding agent for next task")
+                });
+            }
             persistent_agent = None;
             persistent_thread = None;
             persistent_event_rx = None;
             persistent_codex_config = None;
             persistent_claude_config = None;
+            persistent_kimi_config = None;
             persistent_diff_tracker = ExternalDiffDeltaTracker::default();
             persistent_pending_runtime_steers.clear();
             persistent_handled_steer_ids.clear();
@@ -2213,6 +2328,16 @@ pub(crate) async fn run_with_presence(
                     cc.model = current_claude_config.model.clone();
                     cc.permission_mode = current_claude_config.permission_mode.clone();
                     cc.allowed_tools = current_claude_config.allowed_tools.clone();
+                }
+                if matches!(backend, external_agent::AgentBackend::Kimi) {
+                    let kimi = &mut proj.config.agent.kimi;
+                    kimi.command = current_kimi_config.command.clone();
+                    kimi.model = current_kimi_config.model.clone();
+                    kimi.thinking = current_kimi_config.thinking.clone();
+                    kimi.permission_mode = current_kimi_config.permission_mode.clone();
+                    kimi.plan_mode = current_kimi_config.plan_mode;
+                    kimi.swarm_mode = current_kimi_config.swarm_mode;
+                    kimi.allowed_tools = current_kimi_config.allowed_tools.clone();
                 }
                 // The first agent build may be resuming a session from a
                 // startup `--resume`/`--continue`. That session's persisted
@@ -2284,6 +2409,8 @@ pub(crate) async fn run_with_presence(
                         &bus,
                         session_log_id(&session_log).as_deref(),
                     );
+                } else if *backend == external_agent::AgentBackend::Kimi {
+                    emit_kimi_session_capabilities(&bus, session_log_id(&session_log).as_deref());
                 }
                 persistent_agent = Some(agent);
                 persistent_thread = Some(thread);
@@ -2311,6 +2438,12 @@ pub(crate) async fn run_with_presence(
                 } else {
                     None
                 };
+                persistent_kimi_config =
+                    if matches!(agent_backend, Some(external_agent::AgentBackend::Kimi)) {
+                        Some(current_kimi_config.clone())
+                    } else {
+                        None
+                    };
             }
 
             let session_dir = session_log

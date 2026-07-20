@@ -17,7 +17,7 @@
 /// `~/.codex` live" across the caller. It exists because the historical
 /// `std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())` pattern is
 /// Unix-only: Windows does not set `HOME`, so that pattern silently resolved
-/// to `C:\tmp`, while external agents (Codex, Claude Code, Gemini) and the
+/// to `C:\tmp`, while external agents (Codex, Claude Code, Kimi Code, Gemini) and the
 /// session-log writer use the *real* user profile (`C:\Users\<user>`). The
 /// mismatch meant the dashboard scanned the wrong directory on Windows and
 /// never discovered standalone external-agent sessions.

@@ -40,6 +40,7 @@ pub struct SessionSupervisorConfig {
     pub shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
     pub shared_codex_config: control_plane::SharedCodexConfig,
     pub shared_claude_config: control_plane::SharedClaudeConfig,
+    pub shared_kimi_config: control_plane::SharedKimiConfig,
     pub frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     /// Live display sessions, when the daemon runs a display pipeline. CU
     /// screenshots prefer their in-memory frames over subprocess capture.
@@ -783,6 +784,17 @@ mod tests {
                     model: None,
                     permission_mode: "default".to_string(),
                     allowed_tools: Vec::new(),
+                },
+            )),
+            shared_kimi_config: Arc::new(tokio::sync::RwLock::new(
+                control_plane::KimiRuntimeConfig {
+                    command: "kimi".to_string(),
+                    model: None,
+                    thinking: None,
+                    permission_mode: "manual".to_string(),
+                    allowed_tools: None,
+                    plan_mode: false,
+                    swarm_mode: false,
                 },
             )),
             frame_registry: Arc::new(tokio::sync::RwLock::new(frames::FrameRegistry::new(

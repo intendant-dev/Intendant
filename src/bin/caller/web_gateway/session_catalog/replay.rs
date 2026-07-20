@@ -856,6 +856,7 @@ pub(crate) fn external_backend_session_from_replay(contents: &str) -> Option<(St
 /// window for it and can even hand it the prompt target.
 pub(crate) fn scraped_external_thread_id_is_canonical(id: &str) -> bool {
     crate::external_agent::AgentBackend::ClaudeCode.thread_id_is_canonical(id)
+        || kimi_history::split_kimi_session_id(id).is_some()
 }
 
 pub(crate) fn external_backend_session_id_from_replay(contents: &str) -> Option<String> {

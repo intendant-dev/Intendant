@@ -20,6 +20,10 @@
 //! - **claude-code**: message-boundary anchors on the transcript's uuid
 //!   chain, including inactive sibling branch tips (a follow-up phase; the
 //!   catalog reports `supported: false` until the tree parser lands).
+//! - **kimi**: exact active real-user-turn boundaries at or after the latest
+//!   compaction/clear floor. Kimi's native head fork is followed by atomic
+//!   undo on the idle child before subscription or its first prompt. Item,
+//!   message, and independently addressed child-agent anchors stay unsupported.
 
 mod claude_surgery;
 mod claude_tree;
@@ -86,7 +90,7 @@ pub(crate) struct ForkPoint {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ForkPointCatalog {
     pub(crate) session_id: String,
-    /// `intendant` | `codex` | `claude-code` | `gemini`.
+    /// `intendant` | `codex` | `claude-code` | `gemini` | `kimi`.
     pub(crate) source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) backend_session_id: Option<String>,
@@ -153,8 +157,8 @@ impl Default for ForkPointQuery {
 
 /// The wire form of a chosen fork point, carried by
 /// `ControlMsg::ForkSessionAtAnchor`. Field usage mirrors `ForkPoint`:
-/// codex anchors use `item_id`/`position` or `turn`, native uses `seq`,
-/// claude-code uses `message_uuid`.
+/// Codex anchors use `item_id`/`position` or `turn`, Kimi uses `turn`,
+/// native uses `seq`, and Claude Code uses `message_uuid`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ForkAnchorSpec {
     /// Fork-point kind from the catalog (`turn-boundary`, `item-anchor`,
