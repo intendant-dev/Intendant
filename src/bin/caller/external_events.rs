@@ -131,6 +131,74 @@ pub(crate) async fn drain_external_agent_events(
     .await
 }
 
+fn validated_kimi_child_action_result_session(
+    params: &serde_json::Value,
+    config: &DrainConfig<'_>,
+    stats: &LoopStats,
+    side_sessions: Option<&ExternalSideSessionState<'_>>,
+) -> Option<String> {
+    if external_backend_of_config(config) != Some(external_agent::AgentBackend::Kimi) {
+        return None;
+    }
+    let child_id = thread_id_from_action_params(params)?;
+    let is_side = side_sessions.is_some_and(|state| state.has_side_thread(&child_id));
+    let is_subagent = stats.codex_subagent_sessions.contains(&child_id);
+    (is_side || is_subagent).then_some(child_id)
+}
+
+fn claim_external_side_turn_completion(
+    active_side_turns: &mut HashSet<String>,
+    completed_kimi_side_turns: &mut HashSet<(String, String)>,
+    backend: Option<external_agent::AgentBackend>,
+    thread_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> bool {
+    if backend == Some(external_agent::AgentBackend::Kimi) {
+        if let (Some(thread_id), Some(turn_id)) = (thread_id, turn_id) {
+            // Kimi gives every native side turn a stable composite thread id
+            // and numeric turn id. That pair remains authoritative when a
+            // /side request races the parent's post-turn grace: the generic
+            // active marker can already be absent even though this is the
+            // child's first and only terminal. The pair also makes the
+            // synthetic 0.28 step terminal and a later turn.ended alias
+            // exactly-once.
+            active_side_turns.remove(thread_id);
+            return completed_kimi_side_turns.insert((thread_id.to_string(), turn_id.to_string()));
+        }
+    }
+    claim_active_side_turn_completion(active_side_turns, thread_id)
+}
+
+fn defer_pending_parent_completion_for_active_side(
+    pending_turn_completion: bool,
+    active_side_turns: &HashSet<String>,
+    post_turn_sleep_active: &mut bool,
+) {
+    if pending_turn_completion && !active_side_turns.is_empty() {
+        // A side turn can begin during the parent's post-terminal grace.
+        // Suspend that grace until every active child reports a terminal;
+        // otherwise the outer idle loop observes the late child terminal as
+        // a new backend turn and waits forever for a second parent terminal.
+        *post_turn_sleep_active = false;
+    }
+}
+
+pub(crate) fn external_stop_reason_from_control_intent(
+    event: &AppEvent,
+    session_id: &Option<String>,
+    alias_session_id: &Option<String>,
+    announced_native_session_id: Option<&str>,
+) -> Option<String> {
+    let AppEvent::ControlCommand(event::ControlMsg::StopSession { session_id: target }) = event
+    else {
+        return None;
+    };
+    let target = Some(target.clone());
+    let targets_primary = event_targets_session_or_alias(&target, session_id, alias_session_id)
+        || announced_native_session_id.is_some_and(|native| target.as_deref() == Some(native));
+    targets_primary.then(|| "stopped by user".to_string())
+}
+
 #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn drain_external_agent_events_with_prefetched(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
@@ -191,6 +259,9 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
     let mut post_turn_sleep_active = false;
     let mut pending_turn_completion: Option<(Option<String>, usize)> = None;
     let mut active_side_turns: HashSet<String> = HashSet::new();
+    let mut completed_kimi_side_turns: HashSet<(String, String)> = HashSet::new();
+    let mut external_intent_rx = config.bus.subscribe_intents();
+    let mut external_intent_open = true;
     let mut pending_context_rewind: Option<ExternalContextRewindRequest> = None;
     let mut pending_context_rewind_turn_stop = ManagedContextRewindTurnStopTracker::default();
     let mut pending_backend_recovery: Option<ExternalBackendRecovery> = None;
@@ -315,6 +386,25 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
         } else {
             tokio::select! {
             biased;
+            maybe_intent = external_intent_rx.recv(), if external_intent_open => {
+                match maybe_intent {
+                    Some(event) => {
+                        if let Some(reason) = external_stop_reason_from_control_intent(
+                            &event,
+                            &local_session_id,
+                            &alias_session_id,
+                            stats.announced_native_session_id.as_deref(),
+                        ) {
+                            return DrainOutcome::Terminated {
+                                reason,
+                                exit_code: None,
+                            };
+                        }
+                    }
+                    None => external_intent_open = false,
+                }
+                continue;
+            }
             bus_event = bus_rx.recv() => {
                 // Frontends address this session by its backend-native id
                 // once announced (mid-flight, via SessionIdentity). The
@@ -561,7 +651,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                 agent.name()
                             );
                             slog(config.session_log, |l| l.info(&reason));
-                            start_external_side_followup_turn(
+                            let started = start_external_side_followup_turn(
                                 agent,
                                 config,
                                 &mut side_sessions,
@@ -573,6 +663,13 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                 Some(id),
                             )
                             .await;
+                            if started {
+                                defer_pending_parent_completion_for_active_side(
+                                    pending_turn_completion.is_some(),
+                                    &active_side_turns,
+                                    &mut post_turn_sleep_active,
+                                );
+                            }
                             continue;
                         }
                         // Try native mid-turn steering first. On success the
@@ -654,7 +751,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                         agent.name()
                                     );
                                     slog(config.session_log, |l| l.info(&reason));
-                                    start_external_side_followup_turn(
+                                    let started = start_external_side_followup_turn(
                                         agent,
                                         config,
                                         &mut side_sessions,
@@ -666,6 +763,13 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                         Some(id),
                                     )
                                     .await;
+                                    if started {
+                                        defer_pending_parent_completion_for_active_side(
+                                            pending_turn_completion.is_some(),
+                                            &active_side_turns,
+                                            &mut post_turn_sleep_active,
+                                        );
+                                    }
                                     continue;
                                 }
                                 if !target_is_side && external_steer_error_is_no_active_turn(&e) {
@@ -736,7 +840,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         attachments,
                         follow_up_id,
                     }) => {
-                        start_external_side_followup_turn(
+                        let started = start_external_side_followup_turn(
                             agent,
                             config,
                             &mut side_sessions,
@@ -748,6 +852,13 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                             None,
                         )
                         .await;
+                        if started {
+                            defer_pending_parent_completion_for_active_side(
+                                pending_turn_completion.is_some(),
+                                &active_side_turns,
+                                &mut post_turn_sleep_active,
+                            );
+                        }
                         continue;
                     }
                     Ok(AppEvent::CodexThreadActionRequested {
@@ -756,13 +867,22 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         action,
                         params,
                         origin,
-                    }) if event_targets_session_or_alias(
+                    }) if event_targets_external_session_or_optional_side(
                         &session_id,
                         &local_session_id,
                         &alias_session_id,
+                        side_sessions
+                            .as_ref()
+                            .map(|state| &*state.open_side_threads),
                     ) => {
-                        let result_session_id =
-                            session_id.clone().or_else(|| local_session_id.clone());
+                        let result_session_id = validated_kimi_child_action_result_session(
+                            &params,
+                            config,
+                            stats,
+                            side_sessions.as_deref(),
+                        )
+                        .or_else(|| session_id.clone())
+                        .or_else(|| local_session_id.clone());
                         if !codex_thread_action_dedupe.mark_seen(&request_id) {
                             continue;
                         }
@@ -918,9 +1038,14 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         } else {
                             params
                         };
-                        let effect =
-                            handle_external_thread_action(agent, action, params, session_id, config)
-                                .await;
+                        let effect = handle_external_thread_action(
+                            agent,
+                            action,
+                            params,
+                            result_session_id,
+                            config,
+                        )
+                        .await;
                         match effect {
                             ExternalThreadActionEffect::SideTurnStarted {
                                 parent_thread_id,
@@ -933,6 +1058,11 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                         child_thread_id.clone(),
                                     );
                                     active_side_turns.insert(child_thread_id.clone());
+                                    defer_pending_parent_completion_for_active_side(
+                                        pending_turn_completion.is_some(),
+                                        &active_side_turns,
+                                        &mut post_turn_sleep_active,
+                                    );
                                     emit_side_session_started(
                                         config,
                                         &parent_thread_id,
@@ -945,6 +1075,17 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                 if let Some(state) = side_sessions.as_deref_mut() {
                                     state.record_closed(&child_thread_id);
                                 }
+                                active_side_turns.remove(&child_thread_id);
+                                if pending_turn_completion.is_some()
+                                    && active_side_turns.is_empty()
+                                {
+                                    post_turn_sleep_active = true;
+                                    post_turn_sleep.as_mut().reset(
+                                        tokio::time::Instant::now()
+                                            + EXTERNAL_POST_TURN_DRAIN_GRACE,
+                                    );
+                                }
+                                emit_side_session_closed(config.bus, child_thread_id);
                             }
                             ExternalThreadActionEffect::None => {}
                         }
@@ -988,6 +1129,13 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 }
             }
             _ = &mut post_turn_sleep, if post_turn_sleep_active => {
+                if !active_side_turns.is_empty() {
+                    // Defensive race check: the bus lane is biased ahead of
+                    // this timer, but a child may become active at the exact
+                    // deadline. Its terminal will re-arm the grace.
+                    post_turn_sleep_active = false;
+                    continue;
+                }
                 let (message, turns_in_round) = pending_turn_completion
                     .take()
                     .expect("post-turn sleep active only while completion is pending");
@@ -1002,7 +1150,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
             }
         };
 
-        let (event_thread_id, _event_turn_id, event) = event.into_scope();
+        let (event_thread_id, event_turn_id, event) = event.into_scope();
         let event_is_primary =
             scoped_event_targets_config(&event_thread_id, &local_session_id, &alias_session_id);
         let side_thread_id = event_thread_id.as_deref().and_then(|thread_id| {
@@ -2373,9 +2521,12 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
             external_agent::AgentEvent::TurnCompleted { message } => {
                 if event_is_side || event_is_codex_subagent {
                     if event_is_side
-                        && !claim_active_side_turn_completion(
+                        && !claim_external_side_turn_completion(
                             &mut active_side_turns,
-                            config.session_id.as_deref(),
+                            &mut completed_kimi_side_turns,
+                            external_backend_of_config(config),
+                            side_thread_id.as_deref(),
+                            event_turn_id.as_deref(),
                         )
                     {
                         continue;
@@ -2448,9 +2599,12 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     // A limit-rejected child turn ends like any child turn
                     // end; the park machinery is a primary-thread concern.
                     if event_is_side
-                        && !claim_active_side_turn_completion(
+                        && !claim_external_side_turn_completion(
                             &mut active_side_turns,
-                            config.session_id.as_deref(),
+                            &mut completed_kimi_side_turns,
+                            external_backend_of_config(config),
+                            side_thread_id.as_deref(),
+                            event_turn_id.as_deref(),
                         )
                     {
                         continue;
@@ -2721,6 +2875,308 @@ pub(crate) fn codex_subagent_parent_threads_from_log(
 mod tests {
     use super::*;
 
+    #[test]
+    fn kimi_side_terminal_uses_native_turn_identity_when_active_marker_raced() {
+        let mut active = HashSet::new();
+        let mut completed = HashSet::new();
+
+        assert!(claim_external_side_turn_completion(
+            &mut active,
+            &mut completed,
+            Some(external_agent::AgentBackend::Kimi),
+            Some("session-1:agent-0"),
+            Some("0"),
+        ));
+        assert!(!claim_external_side_turn_completion(
+            &mut active,
+            &mut completed,
+            Some(external_agent::AgentBackend::Kimi),
+            Some("session-1:agent-0"),
+            Some("0"),
+        ));
+        assert!(claim_external_side_turn_completion(
+            &mut active,
+            &mut completed,
+            Some(external_agent::AgentBackend::Kimi),
+            Some("session-1:agent-0"),
+            Some("1"),
+        ));
+    }
+
+    #[test]
+    fn non_kimi_side_terminal_still_requires_an_active_marker() {
+        let mut active = HashSet::new();
+        let mut completed = HashSet::new();
+
+        assert!(!claim_external_side_turn_completion(
+            &mut active,
+            &mut completed,
+            Some(external_agent::AgentBackend::Codex),
+            Some("side-1"),
+            Some("turn-1"),
+        ));
+        active.insert("side-1".to_string());
+        assert!(claim_external_side_turn_completion(
+            &mut active,
+            &mut completed,
+            Some(external_agent::AgentBackend::Codex),
+            Some("side-1"),
+            Some("turn-1"),
+        ));
+    }
+
+    #[test]
+    fn raw_stop_intent_matches_primary_identity_group_only() {
+        let wrapper_stop = AppEvent::ControlCommand(event::ControlMsg::StopSession {
+            session_id: "wrapper-id".to_string(),
+        });
+        let native_stop = AppEvent::ControlCommand(event::ControlMsg::StopSession {
+            session_id: "native-id".to_string(),
+        });
+        let foreign_stop = AppEvent::ControlCommand(event::ControlMsg::StopSession {
+            session_id: "foreign-id".to_string(),
+        });
+        let session_id = Some("wrapper-id".to_string());
+        let alias = Some("older-wrapper-id".to_string());
+
+        assert_eq!(
+            external_stop_reason_from_control_intent(
+                &wrapper_stop,
+                &session_id,
+                &alias,
+                Some("native-id"),
+            )
+            .as_deref(),
+            Some("stopped by user")
+        );
+        assert_eq!(
+            external_stop_reason_from_control_intent(
+                &native_stop,
+                &session_id,
+                &alias,
+                Some("native-id"),
+            )
+            .as_deref(),
+            Some("stopped by user")
+        );
+        assert!(external_stop_reason_from_control_intent(
+            &foreign_stop,
+            &session_id,
+            &alias,
+            Some("native-id"),
+        )
+        .is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_drain_consumes_raw_stop_from_lossless_intent_lane() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("wrapper-id".to_string()),
+            alias_session_id: None,
+            backend_thread_id: Some("native-id".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Kimi Code".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+            reload_credentials: None,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let delayed_bus = bus.clone();
+        let delayed_stop = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            delayed_bus.send(AppEvent::ControlCommand(event::ControlMsg::StopSession {
+                session_id: "wrapper-id".to_string(),
+            }));
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            drop(event_tx);
+        });
+
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> =
+            Box::new(ManagedDrainTestAgent { interrupts, steers });
+        let mut stats = LoopStats::default();
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
+            &mut dedupe,
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+        delayed_stop.abort();
+
+        assert!(matches!(
+            outcome,
+            DrainOutcome::Terminated {
+                reason,
+                exit_code: None
+            } if reason == "stopped by user"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parent_completion_waits_for_side_started_during_grace() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("kimi-parent".to_string()),
+            alias_session_id: None,
+            backend_thread_id: Some("kimi-parent".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Kimi Code".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+            reload_credentials: None,
+        };
+        let side_id = "kimi-parent:agent-0";
+        let mut open_side_threads = HashMap::new();
+        let mut side_rounds = HashMap::new();
+        let mut side_turn_revisions = HashMap::new();
+        let mut side_sessions = ExternalSideSessionState {
+            open_side_threads: &mut open_side_threads,
+            side_rounds: &mut side_rounds,
+            side_turn_revisions: &mut side_turn_revisions,
+        };
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_tx
+            .send(external_agent::AgentEvent::scoped(
+                Some("kimi-parent".to_string()),
+                Some("8".to_string()),
+                external_agent::AgentEvent::TurnCompleted { message: None },
+            ))
+            .unwrap();
+        let delayed_bus = bus.clone();
+        let delayed_events = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            delayed_bus.send(AppEvent::CodexThreadActionRequested {
+                request_id: "start-side-during-grace".to_string(),
+                session_id: Some("kimi-parent".to_string()),
+                action: "side".to_string(),
+                params: serde_json::json!({ "prompt": "inspect the race" }),
+                origin: Some("dashboard".to_string()),
+            });
+            // Cross the parent's original 750 ms deadline before reporting
+            // the child terminal. A premature drain returns at that deadline.
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            event_tx
+                .send(external_agent::AgentEvent::scoped(
+                    Some(side_id.to_string()),
+                    Some("0".to_string()),
+                    external_agent::AgentEvent::TurnCompleted {
+                        message: Some("child done".to_string()),
+                    },
+                ))
+                .unwrap();
+            // Keep the channel open while the post-child grace expires.
+            tokio::time::sleep(EXTERNAL_POST_TURN_DRAIN_GRACE).await;
+        });
+
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> =
+            Box::new(ThreadActionDrainTestAgent {
+                actions: actions.clone(),
+            });
+        let mut stats = LoopStats::default();
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+        let started_at = tokio::time::Instant::now();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
+            &mut dedupe,
+            Some(&mut side_sessions),
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+        delayed_events.abort();
+
+        assert!(matches!(outcome, DrainOutcome::TurnCompleted { .. }));
+        assert!(
+            started_at.elapsed() >= std::time::Duration::from_millis(1_500),
+            "the parent drain must wait for the child terminal and a fresh grace period"
+        );
+        let actions = actions.lock().unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].0, "side");
+        assert_eq!(
+            actions[0].1.get("prompt").and_then(|value| value.as_str()),
+            Some("inspect the race")
+        );
+        assert_eq!(
+            thread_id_from_action_params(&actions[0].1).as_deref(),
+            Some("kimi-parent")
+        );
+        assert!(open_side_threads.contains_key(side_id));
+    }
+
     /// A dashboard steer targeting the (rotated) primary id, arriving while
     /// a turn drains, must reach the backend's steer hook — this is the
     /// turn-2 shape of the "steering doesn't work" report.
@@ -2809,6 +3265,266 @@ mod tests {
             steers.as_slice(),
             ["mid-turn steer text"],
             "targeted steer must reach the backend steer hook"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_starts_kimi_subagent_once_and_ends_failed_child() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let mut observed = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("kimi-parent".to_string()),
+            alias_session_id: None,
+            backend_thread_id: Some("kimi-parent".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Kimi Code".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+            reload_credentials: None,
+        };
+        let child_id = "kimi-parent:agent-1";
+        let state = |status: &str, message: Option<&str>| external_agent::SubAgentState {
+            thread_id: child_id.to_string(),
+            status: status.to_string(),
+            message: message.map(str::to_string),
+        };
+        let event = |status: &str, child_status: &str, message: Option<&str>| {
+            external_agent::AgentEvent::SubAgentToolCall {
+                item_id: "call-1".to_string(),
+                tool: "researcher".to_string(),
+                status: status.to_string(),
+                sender_thread_id: "kimi-parent".to_string(),
+                receiver_thread_ids: vec![child_id.to_string()],
+                prompt: Some("inspect the implementation".to_string()),
+                model: None,
+                reasoning_effort: None,
+                agents: vec![state(child_status, message)],
+            }
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_tx
+            .send(event("inProgress", "pendingInit", None))
+            .unwrap();
+        event_tx.send(event("running", "running", None)).unwrap();
+        event_tx
+            .send(event("failed", "errored", Some("backend failed")))
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::TurnCompleted { message: None })
+            .unwrap();
+        drop(event_tx);
+
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> =
+            Box::new(ManagedDrainTestAgent { interrupts, steers });
+        let mut stats = LoopStats::default();
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
+            &mut dedupe,
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert!(matches!(outcome, DrainOutcome::TurnCompleted { .. }));
+
+        let mut agent_started = 0;
+        let mut child_ended = 0;
+        while let Ok(event) = observed.try_recv() {
+            match event {
+                AppEvent::AgentStarted { .. } => agent_started += 1,
+                AppEvent::SessionEnded {
+                    session_id, reason, ..
+                } if session_id == child_id => {
+                    child_ended += 1;
+                    assert!(reason.contains("errored"));
+                    assert!(reason.contains("backend failed"));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            agent_started, 1,
+            "spawn is the only subagent envelope that starts tool activity"
+        );
+        assert_eq!(
+            child_ended, 1,
+            "an errored Kimi child must emit one terminal session event"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_routes_kimi_side_and_rewritten_subagent_actions_to_child() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let mut observed = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("kimi-parent".to_string()),
+            alias_session_id: None,
+            backend_thread_id: Some("kimi-parent".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Kimi Code".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+            reload_credentials: None,
+        };
+        let side_id = "kimi-parent:side-agent";
+        let subagent_id = "kimi-parent:worker-agent";
+        let mut open_side_threads =
+            HashMap::from([(side_id.to_string(), "kimi-parent".to_string())]);
+        let mut side_rounds = HashMap::new();
+        let mut side_turn_revisions = HashMap::new();
+        let mut side_sessions = ExternalSideSessionState {
+            open_side_threads: &mut open_side_threads,
+            side_rounds: &mut side_rounds,
+            side_turn_revisions: &mut side_turn_revisions,
+        };
+
+        bus.send(AppEvent::CodexThreadActionRequested {
+            request_id: "side-action".to_string(),
+            session_id: Some(side_id.to_string()),
+            action: "tools".to_string(),
+            params: serde_json::json!({}),
+            origin: Some("dashboard".to_string()),
+        });
+        bus.send(AppEvent::CodexThreadActionRequested {
+            request_id: "subagent-action".to_string(),
+            session_id: Some("kimi-parent".to_string()),
+            action: "context-clear".to_string(),
+            params: serde_json::json!({ "threadId": subagent_id }),
+            origin: Some("dashboard".to_string()),
+        });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_tx
+            .send(external_agent::AgentEvent::TurnCompleted { message: None })
+            .unwrap();
+        drop(event_tx);
+
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> =
+            Box::new(ThreadActionDrainTestAgent {
+                actions: actions.clone(),
+            });
+        let mut stats = LoopStats::default();
+        stats
+            .codex_subagent_sessions
+            .insert(subagent_id.to_string());
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
+            &mut dedupe,
+            Some(&mut side_sessions),
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert!(matches!(outcome, DrainOutcome::TurnCompleted { .. }));
+
+        let actions = actions.lock().unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].0, "tools");
+        assert_eq!(
+            thread_id_from_action_params(&actions[0].1).as_deref(),
+            Some(side_id),
+            "a direct side action must gain its child thread id"
+        );
+        assert_eq!(actions[1].0, "context-clear");
+        assert_eq!(
+            thread_id_from_action_params(&actions[1].1).as_deref(),
+            Some(subagent_id)
+        );
+        drop(actions);
+
+        let mut result_sessions = HashMap::new();
+        while let Ok(event) = observed.try_recv() {
+            if let AppEvent::CodexThreadActionResult {
+                session_id,
+                action,
+                success,
+                ..
+            } = event
+            {
+                assert!(success);
+                result_sessions.insert(action, session_id);
+            }
+        }
+        assert_eq!(
+            result_sessions.get("tools").and_then(Option::as_deref),
+            Some(side_id)
+        );
+        assert_eq!(
+            result_sessions
+                .get("context-clear")
+                .and_then(Option::as_deref),
+            Some(subagent_id),
+            "a parent-rewritten Kimi action must report back on the child session"
         );
     }
 
@@ -3028,6 +3744,75 @@ mod tests {
     struct ManagedDrainTestAgent {
         interrupts: Arc<std::sync::atomic::AtomicUsize>,
         steers: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct ThreadActionDrainTestAgent {
+        actions: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl external_agent::ExternalAgent for ThreadActionDrainTestAgent {
+        fn name(&self) -> &str {
+            "Kimi Code"
+        }
+
+        async fn initialize(
+            &mut self,
+            _config: external_agent::AgentConfig,
+        ) -> Result<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>, CallerError>
+        {
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            Ok(rx)
+        }
+
+        async fn start_thread(&mut self) -> Result<external_agent::AgentThread, CallerError> {
+            Ok(external_agent::AgentThread {
+                thread_id: "kimi-parent".to_string(),
+            })
+        }
+
+        async fn send_message(
+            &mut self,
+            _thread: &external_agent::AgentThread,
+            _message: &str,
+        ) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn resolve_approval(
+            &mut self,
+            _request_id: &str,
+            _decision: external_agent::ApprovalDecision,
+        ) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn thread_action(
+            &mut self,
+            op: &str,
+            params: &serde_json::Value,
+        ) -> Result<String, CallerError> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push((op.to_string(), params.clone()));
+            if op == "side" {
+                Ok(
+                    "side conversation started in thread kimi-parent:agent-0 from parent kimi-parent"
+                        .to_string(),
+                )
+            } else {
+                Ok(format!("{op} applied"))
+            }
+        }
     }
 
     #[async_trait::async_trait]

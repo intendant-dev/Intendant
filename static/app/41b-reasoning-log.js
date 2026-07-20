@@ -1,6 +1,6 @@
 // ── Reasoning ("Thinking") rows ────────────────────────────────────────
 // First-class Activity rows for the agent's reasoning summaries. One
-// grammar across all three backends (Claude Code thinking blocks, Codex
+// grammar across all four backends (Claude Code/Kimi thinking blocks, Codex
 // reasoning items, native provider reasoning summaries): the daemon emits
 // them as log rows with level "model" + kind "reasoning" and the RAW
 // reasoning text as content — no prefix, no markup. This fragment owns

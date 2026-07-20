@@ -404,7 +404,7 @@ impl AutonomyState {
     }
 
     /// Decide how to handle an approval request that an *external agent*
-    /// (Codex / Gemini / Claude Code) explicitly emitted.
+    /// (Codex / Gemini / Claude Code / Kimi Code) explicitly emitted.
     ///
     /// This is deliberately distinct from [`Self::needs_approval`], which
     /// classifies actions that intendant itself initiates. The external

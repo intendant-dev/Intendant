@@ -160,6 +160,9 @@ function processCommands(cmds) {
       case 'codex_config_changed':
         applyCodexConfigChanged(c);
         break;
+      case 'kimi_config_changed':
+        applyKimiConfigChanged(c);
+        break;
       case 'codex_thread_action_requested':
         handleCodexThreadActionRequested(c);
         break;
@@ -993,6 +996,62 @@ let controlCodexConfig = {
   managed_context: 'vanilla',
   context_archive: 'summary',
 };
+let controlKimiConfig = {
+  command: 'kimi',
+  model: '',
+  thinking: '',
+  permission_mode: 'manual',
+  plan_mode: false,
+  swarm_mode: false,
+  // null = native Kimi profile, [] = deliberately no optional tools.
+  allowed_tools: null,
+};
+
+function normalizeKimiToolNames(value) {
+  const values = Array.isArray(value) ? value : String(value || '').split(/[\n,]/);
+  const normalized = [];
+  for (const candidate of values) {
+    const name = String(candidate || '').trim();
+    if (name && !normalized.includes(name)) normalized.push(name);
+  }
+  return normalized;
+}
+
+function kimiAllowedToolsFromSettings(settings) {
+  if (settings?.kimi_allowed_tools_cleared === true) return null;
+  return Array.isArray(settings?.kimi_allowed_tools)
+    ? normalizeKimiToolNames(settings.kimi_allowed_tools)
+    : null;
+}
+
+function kimiToolsMode(tools, inheritValue = 'default') {
+  if (tools === null || tools === undefined) return inheritValue;
+  return tools.length ? 'exact' : 'none';
+}
+
+function renderKimiToolsEditor(modeId, toolsId, tools, inheritValue = 'default') {
+  const mode = document.getElementById(modeId);
+  const input = document.getElementById(toolsId);
+  const selected = kimiToolsMode(tools, inheritValue);
+  if (mode) mode.value = selected;
+  if (input) {
+    input.value = Array.isArray(tools) && tools.length ? tools.join('\n') : '';
+    input.disabled = selected !== 'exact' || !!mode?.disabled;
+  }
+}
+
+function readKimiToolsEditor(modeId, toolsId) {
+  const mode = document.getElementById(modeId)?.value || 'inherit';
+  if (mode === 'default' || mode === 'inherit') return null;
+  if (mode === 'none') return [];
+  return normalizeKimiToolNames(document.getElementById(toolsId)?.value || '');
+}
+
+function sameKimiAllowedTools(left, right) {
+  if (left === null || left === undefined) return right === null || right === undefined;
+  if (right === null || right === undefined || left.length !== right.length) return false;
+  return left.every((name, index) => name === right[index]);
+}
 // Per-category approval rules (internal-agent autonomy gates). Mirrored from
 // /api/settings; live edits dispatch the `set_approval_rule` ControlMsg.
 const CONTROL_APPROVAL_CATEGORIES = [
@@ -1007,6 +1066,7 @@ let newSessionConfiguredAgent = '';
 let newSessionAgentCommands = {
   codex: 'codex',
   'claude-code': 'claude',
+  kimi: 'kimi',
 };
 let newSessionCodexManagedContext = 'vanilla';
 let newSessionCodexContextArchive = 'summary';
@@ -1045,6 +1105,12 @@ let newSessionCodexModelCatalog = NEW_SESSION_CODEX_MODEL_FALLBACK.map(entry => 
 let newSessionCodexReasoningEfforts = [...NEW_SESSION_CODEX_REASONING_FALLBACK];
 let newSessionCodexGlobalModel = '';
 let newSessionCodexGlobalReasoningEffort = '';
+let newSessionKimiGlobalModel = '';
+let newSessionKimiGlobalThinking = '';
+let newSessionKimiGlobalPermissionMode = 'manual';
+let newSessionKimiGlobalPlanMode = false;
+let newSessionKimiGlobalSwarmMode = false;
+let newSessionKimiGlobalAllowedTools = null;
 let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnName = '';
@@ -1107,6 +1173,15 @@ async function refreshControlPane() {
       permission_mode: d.claude_permission_mode || 'default',
       allowed_tools: Array.isArray(d.claude_allowed_tools) ? d.claude_allowed_tools : [],
     };
+    controlKimiConfig = {
+      command: d.kimi_command || 'kimi',
+      model: d.kimi_model || '',
+      thinking: d.kimi_thinking || '',
+      permission_mode: d.kimi_permission_mode || 'manual',
+      plan_mode: !!d.kimi_plan_mode,
+      swarm_mode: !!d.kimi_swarm_mode,
+      allowed_tools: kimiAllowedToolsFromSettings(d),
+    };
     controlApprovalRules = {};
     for (const cat of CONTROL_APPROVAL_CATEGORIES) {
       const v = d['approval_' + cat];
@@ -1122,13 +1197,16 @@ function renderControlPane() {
   const badge = document.getElementById('control-backend-badge');
   const codexSection = document.getElementById('control-codex-section');
   const claudeSection = document.getElementById('control-claude-section');
+  const kimiSection = document.getElementById('control-kimi-section');
   const emptyMsg = document.getElementById('control-no-backend');
   const isCodex = controlCurrentBackend === 'codex';
   const isClaude = controlCurrentBackend === 'claude-code';
+  const isKimi = controlCurrentBackend === 'kimi';
   if (badge) badge.textContent = controlCurrentBackend || 'none';
   if (codexSection) codexSection.style.display = isCodex ? '' : 'none';
   if (claudeSection) claudeSection.style.display = isClaude ? '' : 'none';
-  if (emptyMsg) emptyMsg.style.display = (isCodex || isClaude) ? 'none' : '';
+  if (kimiSection) kimiSection.style.display = isKimi ? '' : 'none';
+  if (emptyMsg) emptyMsg.style.display = (isCodex || isClaude || isKimi) ? 'none' : '';
   const $ = id => document.getElementById(id);
   if (isClaude) {
     const modelInp = $('control-claude-model');
@@ -1137,6 +1215,23 @@ function renderControlPane() {
     if (modelInp) modelInp.value = controlClaudeConfig.model || '';
     if (modeSel) modeSel.value = controlClaudeConfig.permission_mode || 'default';
     if (toolsTA) toolsTA.value = (controlClaudeConfig.allowed_tools || []).join('\n');
+  }
+  if (isKimi) {
+    const modelInp = $('control-kimi-model');
+    const thinkingSel = $('control-kimi-thinking');
+    const permissionSel = $('control-kimi-permission-mode');
+    const planToggle = $('control-kimi-plan-mode');
+    const swarmToggle = $('control-kimi-swarm-mode');
+    if (modelInp) modelInp.value = controlKimiConfig.model || '';
+    if (thinkingSel) thinkingSel.value = controlKimiConfig.thinking || '';
+    if (permissionSel) permissionSel.value = controlKimiConfig.permission_mode || 'manual';
+    if (planToggle) planToggle.checked = !!controlKimiConfig.plan_mode;
+    if (swarmToggle) swarmToggle.checked = !!controlKimiConfig.swarm_mode;
+    renderKimiToolsEditor(
+      'control-kimi-tools-mode',
+      'control-kimi-allowed-tools',
+      controlKimiConfig.allowed_tools,
+    );
   }
   if (isCodex) {
     const sandboxSel = $('control-codex-sandbox');
@@ -1327,6 +1422,71 @@ function onControlClaudeAllowedToolsCommit(ev) {
   dispatchControlMsg({ action: 'set_claude_allowed_tools', tools });
 }
 
+function onControlKimiModelCommit(ev) {
+  const model = ev.target.value.trim();
+  if (model === String(controlKimiConfig.model || '').trim()) return;
+  controlKimiConfig.model = model;
+  dispatchControlMsg({ action: 'set_kimi_model', model: model || null });
+}
+
+function onControlKimiThinkingChange(ev) {
+  const thinking = ev.target.value || '';
+  if (thinking === (controlKimiConfig.thinking || '')) return;
+  controlKimiConfig.thinking = thinking;
+  dispatchControlMsg({ action: 'set_kimi_thinking', thinking: thinking || null });
+}
+
+function onControlKimiPermissionModeChange(ev) {
+  const mode = ev.target.value || 'manual';
+  if (mode === (controlKimiConfig.permission_mode || 'manual')) return;
+  controlKimiConfig.permission_mode = mode;
+  dispatchControlMsg({ action: 'set_kimi_permission_mode', mode });
+}
+
+function onControlKimiPlanModeChange(ev) {
+  const enabled = !!ev.target.checked;
+  if (enabled === !!controlKimiConfig.plan_mode) return;
+  controlKimiConfig.plan_mode = enabled;
+  dispatchControlMsg({ action: 'set_kimi_plan_mode', enabled });
+}
+
+function onControlKimiSwarmModeChange(ev) {
+  const enabled = !!ev.target.checked;
+  if (enabled === !!controlKimiConfig.swarm_mode) return;
+  controlKimiConfig.swarm_mode = enabled;
+  dispatchControlMsg({ action: 'set_kimi_swarm_mode', enabled });
+}
+
+function onControlKimiAllowedToolsCommit(ev) {
+  if (
+    ev?.target?.id === 'control-kimi-tools-mode' &&
+    ev.target.value === 'exact' &&
+    normalizeKimiToolNames(
+      document.getElementById('control-kimi-allowed-tools')?.value || '',
+    ).length === 0
+  ) {
+    const input = document.getElementById('control-kimi-allowed-tools');
+    if (input) {
+      input.disabled = false;
+      input.focus();
+    }
+    return;
+  }
+  const tools = readKimiToolsEditor(
+    'control-kimi-tools-mode',
+    'control-kimi-allowed-tools',
+  );
+  renderKimiToolsEditor(
+    'control-kimi-tools-mode',
+    'control-kimi-allowed-tools',
+    tools,
+  );
+  if (sameKimiAllowedTools(tools, controlKimiConfig.allowed_tools)) return;
+  controlKimiConfig.allowed_tools = tools;
+  newSessionKimiGlobalAllowedTools = tools;
+  dispatchControlMsg({ action: 'set_kimi_allowed_tools', tools });
+}
+
 function onControlReasoningChange(ev) {
   const effort = ev.target.value;
   if (effort === (controlCodexConfig.reasoning_effort || '')) return;
@@ -1414,6 +1574,50 @@ function applyClaudeConfigChanged(evt) {
     controlClaudeConfig.allowed_tools = evt.allowed_tools;
   }
   if (controlCurrentBackend === 'claude-code') renderControlPane();
+}
+
+function applyKimiConfigChanged(evt) {
+  if (evt.command) {
+    controlKimiConfig.command = evt.command;
+    newSessionAgentCommands.kimi = evt.command;
+    const input = document.getElementById('set-kimi-command');
+    if (input) input.value = evt.command;
+  }
+  if (evt.model !== undefined && evt.model !== null) {
+    controlKimiConfig.model = evt.model;
+    newSessionKimiGlobalModel = evt.model;
+  } else if (evt.model_cleared) {
+    controlKimiConfig.model = '';
+    newSessionKimiGlobalModel = '';
+  }
+  if (evt.thinking !== undefined && evt.thinking !== null) {
+    controlKimiConfig.thinking = evt.thinking;
+    newSessionKimiGlobalThinking = evt.thinking;
+  } else if (evt.thinking_cleared) {
+    controlKimiConfig.thinking = '';
+    newSessionKimiGlobalThinking = '';
+  }
+  if (evt.permission_mode) {
+    controlKimiConfig.permission_mode = evt.permission_mode;
+    newSessionKimiGlobalPermissionMode = evt.permission_mode;
+  }
+  if (typeof evt.plan_mode === 'boolean') {
+    controlKimiConfig.plan_mode = evt.plan_mode;
+    newSessionKimiGlobalPlanMode = evt.plan_mode;
+  }
+  if (typeof evt.swarm_mode === 'boolean') {
+    controlKimiConfig.swarm_mode = evt.swarm_mode;
+    newSessionKimiGlobalSwarmMode = evt.swarm_mode;
+  }
+  if (Array.isArray(evt.allowed_tools)) {
+    controlKimiConfig.allowed_tools = normalizeKimiToolNames(evt.allowed_tools);
+    newSessionKimiGlobalAllowedTools = controlKimiConfig.allowed_tools;
+  } else if (evt.allowed_tools_cleared) {
+    controlKimiConfig.allowed_tools = null;
+    newSessionKimiGlobalAllowedTools = null;
+  }
+  renderNewSessionAgentControls();
+  if (controlCurrentBackend === 'kimi') renderControlPane();
 }
 
 // Apply a CodexConfigChanged event from the server, keeping the pane in
@@ -1522,15 +1726,17 @@ function queueDetachedCodexThreadAction(sessionId, op, params = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) return false;
   const resume = detachedSessionResumeMessage(sid, '', true, []);
-  if (!resume || normalizeAgentId(resume.source) !== 'codex') {
-    showControlToast('error', `/${op} failed: Codex session is not attached`);
+  const source = normalizeAgentId(resume?.source);
+  if (!resume || !source) {
+    showControlToast('error', `/${op} failed: external session is not attached`);
     return false;
   }
+  const label = prettyAgentName(source) || 'external agent';
   const item = { op, params: params || {}, noticeHandle: 0, timeoutHandle: 0 };
   item.noticeHandle = setTimeout(() => {
     const queue = pendingDetachedCodexThreadActions.get(sid) || [];
     if (queue.includes(item)) {
-      showControlToast('info', `Still attaching Codex session before /${op}`);
+      showControlToast('info', `Still attaching ${label} session before /${op}`);
     }
   }, DETACHED_CODEX_ACTION_ATTACH_NOTICE_MS);
   item.timeoutHandle = setTimeout(() => {
@@ -1539,7 +1745,7 @@ function queueDetachedCodexThreadAction(sessionId, op, params = {}) {
     if (next.length > 0) pendingDetachedCodexThreadActions.set(sid, next);
     else pendingDetachedCodexThreadActions.delete(sid);
     clearTimeout(item.noticeHandle);
-    showControlToast('error', `/${op} failed: Codex session did not attach`);
+    showControlToast('error', `/${op} failed: ${label} session did not attach`);
   }, DETACHED_CODEX_ACTION_ATTACH_TIMEOUT_MS);
   const queue = pendingDetachedCodexThreadActions.get(sid) || [];
   const shouldRequestAttach = queue.length === 0;
@@ -1547,7 +1753,7 @@ function queueDetachedCodexThreadAction(sessionId, op, params = {}) {
   pendingDetachedCodexThreadActions.set(sid, queue);
   if (shouldRequestAttach) dispatchControlMsg(resume);
   stationUpsertCodexThreadActionActivity(op, sid, 'attaching');
-  showControlToast('info', `Attaching Codex session before /${op}`);
+  showControlToast('info', `Attaching ${label} session before /${op}`);
   return true;
 }
 
@@ -1561,9 +1767,9 @@ function canAttachSessionWindow(sessionId, win = null) {
 
 function canQueueDetachedCodexThreadAction(sessionId) {
   const sid = String(sessionId || '').trim();
-  if (!sid || !sessionWindowIsCodex(sid) || !canAttachSessionWindow(sid)) return false;
+  if (!sid || !canAttachSessionWindow(sid)) return false;
   const resume = detachedSessionResumeMessage(sid, '', true, []);
-  return !!resume && normalizeAgentId(resume.source) === 'codex';
+  return !!resume && !!normalizeAgentId(resume.source);
 }
 
 function flushPendingDetachedCodexThreadActions(sessionId) {
@@ -1585,10 +1791,6 @@ function dispatchCodexThreadAction(op, params, sessionId = '', options = {}) {
   const normalizedOp = String(op || '').trim().toLowerCase().replace(/_/g, '-');
   if (!sid) {
     showControlToast('error', `/${op} needs a target session`);
-    return false;
-  }
-  if (sid && sessionWindowIsSide(sid) && !codexThreadActionAllowedForSide(op)) {
-    showControlToast('error', `/${op} is not available in a /side window; use the parent thread`);
     return false;
   }
   const actionState = options.internalSideClose && normalizedOp === 'side-close'
@@ -1650,10 +1852,11 @@ function unquoteSlashValue(value) {
 
 function takeGoalNumberOption(text, names) {
   for (const name of names) {
-    const re = new RegExp(`(?:^|\\s)--${name}(?:=|\\s+)(\\d+)(?=\\s|$)`, 'i');
+    const re = new RegExp(`(?:^|\\s)--${name}(?:=|\\s+)(\\S+)(?=\\s|$)`, 'i');
     const match = text.match(re);
     if (match) {
-      const value = parseInt(match[1], 10);
+      const raw = match[1];
+      const value = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
       const nextText = (text.slice(0, match.index) + ' ' + text.slice(match.index + match[0].length)).replace(/\s+/g, ' ').trim();
       return { found: true, value, text: nextText };
     }
@@ -1740,11 +1943,47 @@ function parseGoalSlash(rest) {
 
   const budget = takeGoalNumberOption(text, ['budget', 'token-budget', 'tokens']);
   if (budget.found) {
-    if (!Number.isFinite(budget.value) || budget.value <= 0) {
+    if (!Number.isSafeInteger(budget.value) || budget.value <= 0) {
       return { error: '/goal failed: token budget must be a positive integer' };
     }
     params.tokenBudget = budget.value;
     text = budget.text;
+  }
+
+  const turnBudget = takeGoalNumberOption(text, ['turn-budget', 'turns']);
+  if (turnBudget.found) {
+    if (!Number.isSafeInteger(turnBudget.value) || turnBudget.value <= 0) {
+      return { error: '/goal failed: turn budget must be a positive integer' };
+    }
+    params.turnBudget = turnBudget.value;
+    text = turnBudget.text;
+  }
+
+  const wallClockBudgetMs = takeGoalNumberOption(
+    text,
+    ['wall-clock-budget-ms', 'wall-clock-ms', 'wall-ms']
+  );
+  if (wallClockBudgetMs.found) {
+    if (!Number.isSafeInteger(wallClockBudgetMs.value) || wallClockBudgetMs.value <= 0) {
+      return { error: '/goal failed: wall-clock budget milliseconds must be a positive integer' };
+    }
+    params.wallClockBudgetMs = wallClockBudgetMs.value;
+    text = wallClockBudgetMs.text;
+  }
+
+  const wallClockBudgetSeconds = takeGoalNumberOption(
+    text,
+    ['wall-clock-budget', 'wall-clock-budget-seconds', 'wall-clock-seconds', 'wall-seconds']
+  );
+  if (wallClockBudgetSeconds.found) {
+    if (!Number.isSafeInteger(wallClockBudgetSeconds.value) || wallClockBudgetSeconds.value <= 0) {
+      return { error: '/goal failed: wall-clock budget seconds must be a positive integer' };
+    }
+    if (wallClockBudgetMs.found) {
+      return { error: '/goal failed: provide wall-clock budget in milliseconds or seconds, not both' };
+    }
+    params.wallClockBudgetSeconds = wallClockBudgetSeconds.value;
+    text = wallClockBudgetSeconds.text;
   }
 
   const clearBudget = takeGoalFlag(text, ['clear-budget', 'no-budget']);
@@ -1966,9 +2205,17 @@ function handleCodexThreadActionResult(evt) {
   let successText = `/${evt.action}: ${evt.message}`;
   if (evt.success && evt.action === 'rename') {
     const sid = String(evt.session_id || '').trim();
-    const name = String(evt.message || '').replace(/^Codex thread renamed to\s+/i, '').trim();
-    if (sid && name && name !== evt.message) {
-      applySessionRenameToUi(sid, 'codex', name);
+    const rename = String(evt.message || '').match(
+      /^(Codex thread|Claude Code session|Kimi session) renamed to\s+(.+)$/i
+    );
+    const name = String(rename?.[2] || '').trim();
+    const source = /^Kimi session$/i.test(rename?.[1] || '')
+      ? 'kimi'
+      : /^Claude Code session$/i.test(rename?.[1] || '')
+        ? 'claude-code'
+        : 'codex';
+    if (sid && name) {
+      applySessionRenameToUi(sid, source, name);
       updateSessionWindow(sid, { name });
       successText = `Renamed session to ${name}`;
     }
@@ -2079,6 +2326,54 @@ function currentGoalForSessionAction(sessionId) {
   return null;
 }
 
+function sessionTargetUsesKimiGoalBudgets(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return false;
+  for (const id of relatedSessionIdsForSession(sid)) {
+    if (externalSourceForSessionWindow(id) === 'kimi') return true;
+    const actions = sessionThreadActionOps(id);
+    if (
+      Array.isArray(actions) &&
+      actions.includes('thinking') &&
+      actions.includes('models') &&
+      actions.includes('tools-set')
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function parsePositiveGoalBudgetInput(value) {
+  const raw = String(value || '').trim();
+  if (!/^\d+$/.test(raw)) return null;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+async function promptOptionalGoalBudget({
+  title,
+  label,
+  submitLabel,
+  errorLabel,
+}) {
+  const raw = await showDashboardPrompt({
+    title,
+    label,
+    placeholder: 'Optional',
+    multiline: false,
+    submitLabel,
+  });
+  if (raw === null) return { ok: false, value: null };
+  if (!raw.trim()) return { ok: true, value: null };
+  const value = parsePositiveGoalBudgetInput(raw);
+  if (value === null) {
+    showControlToast('error', `/goal failed: ${errorLabel} must be a positive integer`);
+    return { ok: false, value: null };
+  }
+  return { ok: true, value };
+}
+
 async function promptCodexThreadActionParams(opts = {}) {
   let params = {};
   if (opts.promptName) {
@@ -2107,12 +2402,27 @@ async function promptCodexThreadActionParams(opts = {}) {
     const prompt = await showDashboardPrompt({
       title: 'Review prompt',
       label: 'Prompt',
-      placeholder: 'Leave empty to review current changes with Codex defaults',
+      placeholder: 'Leave empty to review current changes with backend defaults',
       rows: 5,
       submitLabel: 'Review',
     });
     if (prompt === null) return null;
     if (prompt.trim()) params.prompt = prompt.trim();
+  } else if (opts.promptTools) {
+    const tools = await showDashboardPrompt({
+      title: 'Set active tools',
+      label: 'Exact tool names',
+      placeholder: 'Comma- or newline-separated; leave empty to disable all tools',
+      rows: 5,
+      submitLabel: 'Continue',
+    });
+    if (tools === null) return null;
+    params.names = Array.from(new Set(
+      tools
+        .split(/[\n,]/)
+        .map(name => name.trim())
+        .filter(Boolean)
+    ));
   } else if (opts.promptRename) {
     const name = await showDashboardPrompt({
       title: 'Rename thread',
@@ -2144,21 +2454,35 @@ async function promptCodexThreadActionParams(opts = {}) {
       return null;
     }
     params.objective = objective.trim();
-    const budget = await showDashboardPrompt({
+    const kimiBudgets = sessionTargetUsesKimiGoalBudgets(opts.sessionId);
+    const tokenBudget = await promptOptionalGoalBudget({
       title: 'Set token budget',
       label: 'Token budget',
-      placeholder: 'Optional',
-      multiline: false,
-      submitLabel: 'Set goal',
+      submitLabel: kimiBudgets ? 'Continue' : 'Set goal',
+      errorLabel: 'token budget',
     });
-    if (budget === null) return null;
-    if (budget.trim()) {
-      const parsed = parseInt(budget.trim(), 10);
-      if (isNaN(parsed) || parsed <= 0) {
-        showControlToast('error', '/goal failed: token budget must be a positive integer');
-        return null;
+    if (!tokenBudget.ok) return null;
+    if (tokenBudget.value !== null) params.tokenBudget = tokenBudget.value;
+    if (kimiBudgets) {
+      const turnBudget = await promptOptionalGoalBudget({
+        title: 'Set Kimi turn budget',
+        label: 'Turn budget',
+        submitLabel: 'Continue',
+        errorLabel: 'turn budget',
+      });
+      if (!turnBudget.ok) return null;
+      if (turnBudget.value !== null) params.turnBudget = turnBudget.value;
+
+      const wallClockBudget = await promptOptionalGoalBudget({
+        title: 'Set Kimi wall-clock budget',
+        label: 'Wall-clock budget (seconds)',
+        submitLabel: 'Set goal',
+        errorLabel: 'wall-clock budget seconds',
+      });
+      if (!wallClockBudget.ok) return null;
+      if (wallClockBudget.value !== null) {
+        params.wallClockBudgetSeconds = wallClockBudget.value;
       }
-      params.tokenBudget = parsed;
     }
   } else if (opts.promptGoalEdit) {
     const goal = currentGoalForSessionAction(opts.sessionId);
@@ -2193,7 +2517,7 @@ async function promptCodexThreadActionParams(opts = {}) {
   }
   if (opts.confirm) {
     const ok = await showDashboardConfirm({
-      title: opts.confirmTitle || 'Confirm Codex action',
+      title: opts.confirmTitle || 'Confirm thread action',
       message: opts.confirm,
       confirmLabel: opts.confirmLabel || 'Continue',
     });
@@ -2209,7 +2533,7 @@ async function onControlActionBtnClick(ev) {
   if (!op) return;
   const spec = codexThreadActionSpec(op);
   if (!spec) {
-    showControlToast('error', `Unknown Codex thread action /${op}`);
+    showControlToast('error', `Unknown thread action /${op}`);
     return;
   }
   await runCodexThreadActionFromUi(op, spec);
@@ -2221,6 +2545,7 @@ async function runCodexThreadActionFromUi(op, opts = {}, sessionId = '') {
     promptName: opts.promptName,
     promptSide: opts.promptSide,
     promptReview: opts.promptReview,
+    promptTools: opts.promptTools,
     promptRename: opts.promptRename,
     promptGoal: opts.promptGoal,
     promptGoalEdit: opts.promptGoalEdit,
@@ -2316,6 +2641,42 @@ function wireControlPaneListeners() {
       if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
         ev.preventDefault();
         onControlClaudeAllowedToolsCommit(ev);
+      }
+    });
+  }
+
+  // ── Kimi Code section ──
+  const kimiModelInp = $('control-kimi-model');
+  const kimiThinkingSel = $('control-kimi-thinking');
+  const kimiPermissionSel = $('control-kimi-permission-mode');
+  const kimiPlanToggle = $('control-kimi-plan-mode');
+  const kimiSwarmToggle = $('control-kimi-swarm-mode');
+  const kimiToolsModeSelect = $('control-kimi-tools-mode');
+  const kimiToolsInput = $('control-kimi-allowed-tools');
+  if (kimiThinkingSel) kimiThinkingSel.addEventListener('change', onControlKimiThinkingChange);
+  if (kimiPermissionSel) kimiPermissionSel.addEventListener('change', onControlKimiPermissionModeChange);
+  if (kimiPlanToggle) kimiPlanToggle.addEventListener('change', onControlKimiPlanModeChange);
+  if (kimiSwarmToggle) kimiSwarmToggle.addEventListener('change', onControlKimiSwarmModeChange);
+  if (kimiToolsModeSelect) {
+    kimiToolsModeSelect.addEventListener('change', onControlKimiAllowedToolsCommit);
+  }
+  if (kimiToolsInput) {
+    kimiToolsInput.addEventListener('change', onControlKimiAllowedToolsCommit);
+    kimiToolsInput.addEventListener('blur', onControlKimiAllowedToolsCommit);
+    kimiToolsInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault();
+        onControlKimiAllowedToolsCommit();
+      }
+    });
+  }
+  if (kimiModelInp) {
+    kimiModelInp.addEventListener('change', onControlKimiModelCommit);
+    kimiModelInp.addEventListener('blur', onControlKimiModelCommit);
+    kimiModelInp.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        onControlKimiModelCommit(ev);
       }
     });
   }

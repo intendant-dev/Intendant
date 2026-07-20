@@ -187,9 +187,11 @@ optionally isolated in a git worktree. It reports back with the
 Selected with `--agent <backend>` or when an external backend is configured
 (including `backend` on `spawn_sub_agent`). Instead of running Intendant's own
 loop, the controller spawns and supervises an external coding CLI as a
-subordinate worker (`external_agent::AgentBackend`): `Codex` or `ClaudeCode`.
+subordinate worker (`external_agent::AgentBackend`): `Codex`, `ClaudeCode`, or
+`Kimi`.
 Intendant translates its task, approval, and attachment surface onto each
-backend's native protocol (Codex app-server JSON-RPC, Claude Code stream-json)
+backend's native protocol (Codex app-server JSON-RPC, Claude Code stream-json,
+or Kimi Code's authenticated local REST/WebSocket server)
 and surfaces their events back onto the EventBus so every frontend renders
 them identically. This is a master/worker relationship — see
 [External-Agent Orchestration](./external-agent-orchestration.md).
@@ -197,7 +199,7 @@ them identically. This is a master/worker relationship — see
 > **Peer federation is orthogonal to all of these.** The `peer/` module federates
 > with *other* autonomous daemons (other Intendants, A2A-speaking peers,
 > MCP-shaped peers) as equals, where `external_agent` supervises a *subordinate*
-> CLI. The two compose: a peer Intendant can itself supervise a Codex subprocess
+> CLI. The two compose: a peer Intendant can itself supervise an external-agent subprocess
 > while being driven from this side as a peer. Federation is shipped and
 > continues to harden.
 

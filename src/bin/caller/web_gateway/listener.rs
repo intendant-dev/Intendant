@@ -37,30 +37,51 @@ const MAX_PRE_AUTH_CONNECTIONS: usize = 256;
 pub(crate) enum GatewayIngress {
     Direct,
     ReachabilityRelay,
+    /// The dedicated session-MCP loopback listener: serves ONLY `/mcp`,
+    /// and only to callers presenting a session-scoped `mcp_token` — never
+    /// the tokenless root-capable `local_process` default, never dashboard
+    /// or API routes. It exists for the sandboxed runtime's shell
+    /// commands: the macOS Seatbelt loopback guard deliberately cuts the
+    /// runtime off from the daemon's MAIN port (tokenless loopback there
+    /// is root-equivalent — a sandbox escape), while this listener can
+    /// only ever mint the calling session's own `agent_session` authority,
+    /// which the session's tool loop already holds.
+    SessionMcp,
 }
 
 impl GatewayIngress {
     pub(crate) fn is_reachability_relay(self) -> bool {
         matches!(self, Self::ReachabilityRelay)
     }
+
+    pub(crate) fn is_session_mcp(self) -> bool {
+        matches!(self, Self::SessionMcp)
+    }
 }
 
 async fn accept_gateway_connection(
     listener: &TcpListener,
     relay_ingress_listener: Option<&TcpListener>,
+    session_mcp_listener: Option<&TcpListener>,
 ) -> (
     GatewayIngress,
     std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>,
 ) {
-    if let Some(relay_ingress_listener) = relay_ingress_listener {
-        tokio::select! {
+    match (relay_ingress_listener, session_mcp_listener) {
+        (Some(relay), Some(session)) => tokio::select! {
             accepted = listener.accept() => (GatewayIngress::Direct, accepted),
-            accepted = relay_ingress_listener.accept() => {
-                (GatewayIngress::ReachabilityRelay, accepted)
-            }
-        }
-    } else {
-        (GatewayIngress::Direct, listener.accept().await)
+            accepted = relay.accept() => (GatewayIngress::ReachabilityRelay, accepted),
+            accepted = session.accept() => (GatewayIngress::SessionMcp, accepted),
+        },
+        (Some(relay), None) => tokio::select! {
+            accepted = listener.accept() => (GatewayIngress::Direct, accepted),
+            accepted = relay.accept() => (GatewayIngress::ReachabilityRelay, accepted),
+        },
+        (None, Some(session)) => tokio::select! {
+            accepted = listener.accept() => (GatewayIngress::Direct, accepted),
+            accepted = session.accept() => (GatewayIngress::SessionMcp, accepted),
+        },
+        (None, None) => (GatewayIngress::Direct, listener.accept().await),
     }
 }
 
@@ -100,6 +121,39 @@ async fn read_relay_source_bucket(
         return None;
     }
     Some(bucket.to_string())
+}
+
+/// Bind the dedicated session-MCP loopback listener (see
+/// [`GatewayIngress::SessionMcp`]) and record its port for the supervised
+/// native launch arm. IPv4 loopback, kernel-assigned port; the injected
+/// bootstrap URL names `127.0.0.1` so the sandboxed client never depends
+/// on `localhost` resolution order. Failure is non-fatal: without the
+/// listener, native in-runtime `ctl` degrades to unattributed writes
+/// exactly as before this listener existed.
+fn bind_session_mcp_ingress() -> Option<TcpListener> {
+    let socket = match tokio::net::TcpSocket::new_v4() {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("[web_gateway] failed to create session-mcp ingress socket: {error}");
+            return None;
+        }
+    };
+    if let Err(error) = socket.bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))) {
+        eprintln!("[web_gateway] failed to bind session-mcp loopback ingress: {error}");
+        return None;
+    }
+    match socket.listen(128) {
+        Ok(listener) => {
+            if let Ok(addr) = listener.local_addr() {
+                super::mcp_gate::record_session_mcp_port(addr.port());
+            }
+            Some(listener)
+        }
+        Err(error) => {
+            eprintln!("[web_gateway] failed to listen on session-mcp ingress: {error}");
+            None
+        }
+    }
 }
 
 fn bind_relay_gateway_ingress(config: &crate::project::ConnectConfig) -> Option<TcpListener> {
@@ -1143,7 +1197,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     // Cache all currently externally-attached sessions so refreshed browsers
     // can rehydrate every open Activity window with the same compact
     // transcript shown in the Sessions tab. This must be a set, not "last
-    // attached", because multiple Codex/Claude/Gemini session windows may be
+    // attached", because multiple Codex/Claude/Kimi/Gemini session windows may be
     // open at once.
     let attached_external_sessions = bootstrap_caches.attached_external_sessions.clone();
     // Cache the latest user_display_granted event. The authoritative
@@ -1277,6 +1331,15 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     // behind `embedded_static_asset`), so its cache lives here.
     let app_html_cache: Arc<OnceLock<(String, Vec<u8>)>> = Arc::new(OnceLock::new());
     let tls_failure_log_state: TlsFailureLogState = Arc::new(Mutex::new(HashMap::new()));
+    // Bound before the accept task spawns (not inside it) so the port is
+    // recorded by the time any supervised session launches — the launch arm
+    // reads it synchronously when building the runtime bootstrap env. Only
+    // meaningful where /mcp can serve at all.
+    let session_mcp_listener = if mcp_server.is_some() {
+        bind_session_mcp_ingress()
+    } else {
+        None
+    };
     let lifecycle_shared_session = shared_session.clone();
     let lifecycle_authority = Arc::clone(&display_input_authority);
     let lifecycle_authority_change_tx = authority_change_tx.clone();
@@ -1307,6 +1370,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
 
         let mut listener = listener;
         let mut relay_ingress_listener = relay_ingress_listener;
+        let mut session_mcp_listener = session_mcp_listener;
         let bind_addr = listener.local_addr().ok();
         let port = bind_addr.map(|a| a.port()).unwrap_or(0);
 
@@ -1316,14 +1380,19 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
 
         let mut fatal_accept_streak: u32 = 0;
         let mut relay_fatal_accept_streak: u32 = 0;
+        let mut session_mcp_fatal_accept_streak: u32 = 0;
         // Bounds concurrent connections still in the pre-auth handshake
         // phase (see `MAX_PRE_AUTH_CONNECTIONS`). Each accepted connection
         // takes a permit at the top of its task and releases it once it is
         // established (or on any early return).
         let preauth_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PRE_AUTH_CONNECTIONS));
         loop {
-            let (gateway_ingress, accepted) =
-                accept_gateway_connection(&listener, relay_ingress_listener.as_ref()).await;
+            let (gateway_ingress, accepted) = accept_gateway_connection(
+                &listener,
+                relay_ingress_listener.as_ref(),
+                session_mcp_listener.as_ref(),
+            )
+            .await;
             let (stream, peer_addr) = match (gateway_ingress, accepted) {
                 (GatewayIngress::Direct, Ok(conn)) => {
                     fatal_accept_streak = 0;
@@ -1332,6 +1401,35 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                 (GatewayIngress::ReachabilityRelay, Ok(conn)) => {
                     relay_fatal_accept_streak = 0;
                     conn
+                }
+                (GatewayIngress::SessionMcp, Ok(conn)) => {
+                    session_mcp_fatal_accept_streak = 0;
+                    conn
+                }
+                (GatewayIngress::SessionMcp, Err(error)) => {
+                    if should_continue_after_accept_error(&error) {
+                        eprintln!(
+                            "[web_gateway] session-mcp ingress accept failed: {error} (continuing)"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    session_mcp_fatal_accept_streak += 1;
+                    if session_mcp_fatal_accept_streak < FATAL_ACCEPT_REBIND_THRESHOLD {
+                        eprintln!(
+                            "[web_gateway] session-mcp ingress accept failed: {error} \
+                             (retry {session_mcp_fatal_accept_streak}/{FATAL_ACCEPT_REBIND_THRESHOLD} before disabling)"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    eprintln!(
+                        "[web_gateway] session-mcp ingress failed persistently: {error}; \
+                         disabling it (in-runtime ctl degrades to unattributed writes)"
+                    );
+                    session_mcp_listener = None;
+                    session_mcp_fatal_accept_streak = 0;
+                    continue;
                 }
                 (GatewayIngress::ReachabilityRelay, Err(error)) => {
                     if should_continue_after_accept_error(&error) {
@@ -1587,6 +1685,13 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                 // these bytes (method chars are ASCII >= 0x41).
                 let looks_like_stun_tcp =
                     peeked >= 22 && buf[2] < 2 && buf[6..10] == [0x21, 0x12, 0xA4, 0x42];
+                if looks_like_stun_tcp && gateway_ingress.is_session_mcp() {
+                    // The session-MCP ingress is an HTTP-only door; it is
+                    // not another entrance to the ICE-TCP media lane.
+                    use tokio::io::AsyncWriteExt;
+                    let _ = raw_stream.shutdown().await;
+                    return;
+                }
                 if looks_like_stun_tcp {
                     // Consume the first RFC 4571 frame from the stream
                     // (peek leaves it in the kernel buffer; we have to
@@ -1675,8 +1780,18 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                 } else {
                     String::from_utf8_lossy(&buf[..peeked]).to_string()
                 };
-                let allow_loopback_cleartext_mcp = gateway_ingress == GatewayIngress::Direct
-                    && is_loopback_cleartext_mcp_request(peer_addr, is_tls, &cleartext_header_text);
+                // The dedicated session-MCP ingress is loopback cleartext
+                // /mcp BY DESIGN (its clients are sandboxed local shells
+                // that cannot present the dashboard certificate), so it
+                // shares the Direct listener's loopback-/mcp exception.
+                let allow_loopback_cleartext_mcp = matches!(
+                    gateway_ingress,
+                    GatewayIngress::Direct | GatewayIngress::SessionMcp
+                ) && is_loopback_cleartext_mcp_request(
+                    peer_addr,
+                    is_tls,
+                    &cleartext_header_text,
+                );
 
                 // Strict TLS: when a TLS acceptor is configured the dashboard
                 // is HTTPS/WSS-only. A connection that reaches this point is
@@ -1899,6 +2014,19 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         extract_host_header_ip(&header_text);
 
                     if is_websocket {
+                        // The session-MCP ingress serves exactly one thing;
+                        // it has no WS surface (no event lane, no tunnel).
+                        if gateway_ingress.is_session_mcp() {
+                            use tokio::io::AsyncWriteExt;
+                            let response = HttpResponse::with_content(
+                                "403 Forbidden",
+                                "text/plain",
+                                "this listener serves session-scoped /mcp only\n",
+                            )
+                            .into_string();
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            return;
+                        }
                         // Upgrades never loop: the connection stops being
                         // HTTP. Hand the WS path everything it needs —
                         // whether this was request 1 or a kept-alive

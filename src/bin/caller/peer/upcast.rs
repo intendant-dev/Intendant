@@ -1580,6 +1580,57 @@ impl AppEventUpcaster {
                 }
             }
 
+            AppEvent::KimiConfigChanged {
+                command,
+                model,
+                model_cleared,
+                thinking,
+                thinking_cleared,
+                permission_mode,
+                plan_mode,
+                swarm_mode,
+                allowed_tools,
+                allowed_tools_cleared,
+            } => {
+                let mut parts = Vec::new();
+                if let Some(v) = command {
+                    parts.push(format!("command={v}"));
+                }
+                if let Some(v) = model {
+                    parts.push(format!("model={v}"));
+                } else if *model_cleared {
+                    parts.push("model=<default>".to_string());
+                }
+                if let Some(v) = thinking {
+                    parts.push(format!("thinking={v}"));
+                } else if *thinking_cleared {
+                    parts.push("thinking=<default>".to_string());
+                }
+                if let Some(v) = permission_mode {
+                    parts.push(format!("permission_mode={v}"));
+                }
+                if let Some(v) = plan_mode {
+                    parts.push(format!("plan_mode={v}"));
+                }
+                if let Some(v) = swarm_mode {
+                    parts.push(format!("swarm_mode={v}"));
+                }
+                if let Some(v) = allowed_tools {
+                    parts.push(format!("allowed_tools=[{} active]", v.len()));
+                } else if *allowed_tools_cleared {
+                    parts.push("allowed_tools=<native-default>".to_string());
+                }
+                if parts.is_empty() {
+                    vec![]
+                } else {
+                    vec![log_event(
+                        LogLevel::Info,
+                        "config",
+                        format!("kimi config: {}", parts.join(", ")),
+                    )]
+                }
+            }
+
             // ---- Budget / safety ----
             AppEvent::BudgetWarning { pct, remaining } => vec![log_event(
                 LogLevel::Warn,
@@ -2964,6 +3015,57 @@ impl WireEventUpcaster {
                         LogLevel::Info,
                         "config",
                         format!("claude config: {}", parts.join(", ")),
+                    )]
+                }
+            }
+
+            OutboundEvent::KimiConfigChanged {
+                command,
+                model,
+                model_cleared,
+                thinking,
+                thinking_cleared,
+                permission_mode,
+                plan_mode,
+                swarm_mode,
+                allowed_tools,
+                allowed_tools_cleared,
+            } => {
+                let mut parts = Vec::new();
+                if let Some(v) = command {
+                    parts.push(format!("command={v}"));
+                }
+                if let Some(v) = model {
+                    parts.push(format!("model={v}"));
+                } else if *model_cleared {
+                    parts.push("model=<default>".to_string());
+                }
+                if let Some(v) = thinking {
+                    parts.push(format!("thinking={v}"));
+                } else if *thinking_cleared {
+                    parts.push("thinking=<default>".to_string());
+                }
+                if let Some(v) = permission_mode {
+                    parts.push(format!("permission_mode={v}"));
+                }
+                if let Some(v) = plan_mode {
+                    parts.push(format!("plan_mode={v}"));
+                }
+                if let Some(v) = swarm_mode {
+                    parts.push(format!("swarm_mode={v}"));
+                }
+                if let Some(v) = allowed_tools {
+                    parts.push(format!("allowed_tools=[{} active]", v.len()));
+                } else if *allowed_tools_cleared {
+                    parts.push("allowed_tools=<native-default>".to_string());
+                }
+                if parts.is_empty() {
+                    vec![]
+                } else {
+                    vec![log_event(
+                        LogLevel::Info,
+                        "config",
+                        format!("kimi config: {}", parts.join(", ")),
                     )]
                 }
             }

@@ -1213,6 +1213,191 @@ pub(crate) fn list_gemini_sessions_with_limit(
     rows
 }
 
+fn kimi_usage_to_session_usage(usage: kimi_history::KimiUsage) -> SessionUsage {
+    SessionUsage {
+        total_tokens: usage.total(),
+        prompt_tokens: usage
+            .input_other
+            .saturating_add(usage.cache_read)
+            .saturating_add(usage.cache_creation),
+        completion_tokens: usage.output,
+        cache_creation_tokens: usage.cache_creation,
+        cached_tokens: usage.cache_read,
+    }
+}
+
+fn kimi_history_preview(history: &kimi_history::KimiAgentHistory) -> Option<serde_json::Value> {
+    let mut preview = SessionPreviewBuilder::default();
+    for entry in &history.entries {
+        if entry
+            .get("superseded")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(content) = entry
+            .get("content")
+            .and_then(|value| value.as_str())
+            .filter(|content| !content.trim().is_empty())
+        else {
+            continue;
+        };
+        match external_transcript_entry_role(entry) {
+            Some("user") => preview.push_user(content),
+            Some("assistant") => preview.push_assistant(content),
+            _ => {}
+        }
+    }
+    preview.into_value()
+}
+
+fn kimi_agent_row(
+    location: &kimi_history::KimiSessionLocation,
+    agent_location: &kimi_history::KimiAgentLocation,
+    history: &kimi_history::KimiAgentHistory,
+) -> serde_json::Value {
+    let is_main = agent_location.id == kimi_history::KIMI_MAIN_AGENT;
+    let session_id = if is_main {
+        location.session_id.clone()
+    } else {
+        kimi_history::kimi_child_session_id(&location.session_id, &agent_location.id)
+            .expect("validated Kimi agent id")
+    };
+    let created_at = history
+        .created_at
+        .clone()
+        .or_else(|| location.created_at.clone());
+    let updated_at = history
+        .updated_at
+        .clone()
+        .or_else(|| location.updated_at.clone())
+        .or_else(|| file_mtime_string(&agent_location.wire_path));
+    let name = if is_main {
+        location.title.clone()
+    } else {
+        Some(format!("Kimi subagent {}", agent_location.id))
+    };
+    let task = history
+        .first_prompt
+        .clone()
+        .or_else(|| is_main.then(|| location.last_prompt.clone()).flatten());
+    let path = if is_main {
+        location.session_dir.clone()
+    } else {
+        agent_location.wire_path.clone()
+    };
+    let bytes = if is_main {
+        location
+            .all_dependency_paths()
+            .map(file_size)
+            .fold(0u64, u64::saturating_add)
+    } else {
+        file_size(&agent_location.wire_path)
+    };
+    let mut session = external_session_json(
+        kimi_history::KIMI_SOURCE,
+        kimi_history::KIMI_SOURCE_LABEL,
+        session_id.clone(),
+        session_id,
+        created_at,
+        updated_at,
+        name,
+        task,
+        kimi_history::KIMI_SOURCE_LABEL,
+        history.model.clone(),
+        history.turns,
+        derive_project_root_from_cwd(location.work_dir.as_deref()),
+        location.work_dir.clone(),
+        Some(path.to_string_lossy().to_string()),
+        bytes,
+    );
+    apply_session_usage(
+        &mut session,
+        kimi_usage_to_session_usage(history.usage),
+        history.model.as_deref(),
+    );
+    let daily_usage = history
+        .daily_usage
+        .iter()
+        .map(|(day, usage)| (day.clone(), kimi_usage_to_session_usage(*usage)))
+        .collect::<BTreeMap<_, _>>();
+    apply_session_daily_usage(&mut session, &daily_usage, history.model.as_deref());
+    if let Some(preview) = kimi_history_preview(history) {
+        session["preview"] = preview;
+    }
+    session["agent_id"] = serde_json::json!(agent_location.id);
+    if let Some(agent_type) = agent_location.agent_type.as_deref() {
+        session["agent_type"] = serde_json::json!(agent_type);
+    }
+    if !is_main {
+        let parent_agent_id = agent_location
+            .parent_id
+            .as_deref()
+            .unwrap_or(kimi_history::KIMI_MAIN_AGENT);
+        let parent_session_id = if parent_agent_id == kimi_history::KIMI_MAIN_AGENT {
+            location.session_id.clone()
+        } else {
+            kimi_history::kimi_child_session_id(&location.session_id, parent_agent_id)
+                .unwrap_or_else(|| location.session_id.clone())
+        };
+        session["parent_session_id"] = serde_json::json!(parent_session_id);
+        session["parent_id"] = serde_json::json!(parent_session_id);
+        session["relationship_kind"] = serde_json::json!("subagent");
+        session["relationship"] = serde_json::json!("subagent");
+        session["thread_source"] = serde_json::json!("subagent");
+        session["role"] = serde_json::json!("sub-agent");
+    }
+    session
+}
+
+#[allow(dead_code)]
+pub(crate) fn list_kimi_sessions(home: &Path) -> Vec<serde_json::Value> {
+    list_kimi_sessions_with_limit(home, EXTERNAL_SESSION_SCAN_LIMIT)
+}
+
+pub(crate) fn list_kimi_sessions_with_limit(
+    home: &Path,
+    scan_limit: usize,
+) -> Vec<serde_json::Value> {
+    let locations = kimi_history::list_kimi_sessions_from_home(home, scan_limit);
+    let mut rows = Vec::new();
+    for location in locations {
+        let dependency = files_dependency_fingerprint(location.all_dependency_paths());
+        let keys = location
+            .agents
+            .iter()
+            .map(|agent| {
+                session_list_cache_key(
+                    "kimi",
+                    &agent.wire_path,
+                    format!("kimi-row-v1:{dependency}:{}", agent.id),
+                )
+            })
+            .collect::<Vec<_>>();
+        let cached = keys
+            .iter()
+            .map(|key| key.as_ref().and_then(cached_session_list_row))
+            .collect::<Vec<_>>();
+        if cached.iter().all(Option::is_some) {
+            rows.extend(cached.into_iter().flatten());
+            continue;
+        }
+
+        let parsed = kimi_history::parse_kimi_session(location.clone());
+        for ((agent_location, agent_history), key) in
+            location.agents.iter().zip(parsed.agents.iter()).zip(keys)
+        {
+            let row = kimi_agent_row(&location, agent_location, agent_history);
+            if let Some(key) = key {
+                store_session_list_row(key, &row);
+            }
+            rows.push(row);
+        }
+    }
+    rows
+}
+
 // Consolidated (message-search F3 phase 2): the streaming id reader moved
 // to `external_agent::codex::rollout` (this file's copy was the canonical
 // body), and the finder delegates to `codex_history`'s engine — which
@@ -3562,5 +3747,108 @@ mod tests {
                 "paged message 7"
             ]
         );
+    }
+
+    #[test]
+    fn kimi_real_shape_lists_main_and_child_with_usage_and_hydration() {
+        const SESSION: &str = "session_11111111-2222-3333-4444-555555555555";
+        let home = tempfile::tempdir().unwrap();
+        let session_dir = home
+            .path()
+            .join(".kimi-code/sessions/wd_repo")
+            .join(SESSION);
+        std::fs::create_dir_all(session_dir.join("agents/main")).unwrap();
+        std::fs::create_dir_all(session_dir.join("agents/agent-0")).unwrap();
+        std::fs::write(
+            session_dir.join("state.json"),
+            serde_json::json!({
+                "createdAt":"2026-07-19T10:00:00.000Z",
+                "updatedAt":"2026-07-19T10:01:00.000Z",
+                "title":"Catalog Kimi history",
+                "lastPrompt":"catalog Kimi history",
+                "workDir":"/repo",
+                "agents":{
+                    "main":{"type":"main","parentAgentId":null},
+                    "agent-0":{"type":"sub","parentAgentId":"main"}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let write_wire = |agent: &str, lines: &[serde_json::Value]| {
+            std::fs::write(
+                session_dir.join("agents").join(agent).join("wire.jsonl"),
+                lines
+                    .iter()
+                    .map(serde_json::Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n",
+            )
+            .unwrap();
+        };
+        write_wire(
+            "main",
+            &[
+                serde_json::json!({"type":"config.update","modelAlias":"kimi-code/k2.7-coding","time":1784455200000i64}),
+                serde_json::json!({"type":"turn.prompt","input":[{"type":"text","text":"catalog Kimi history"}],"origin":{"kind":"user"},"time":1784455201000i64}),
+                serde_json::json!({"type":"context.append_loop_event","event":{"type":"content.part","uuid":"main-answer","part":{"type":"text","text":"main persisted answer"}},"time":1784455202000i64}),
+                serde_json::json!({"type":"usage.record","model":"kimi-code/k2.7-coding","usage":{"inputOther":10,"output":3,"inputCacheRead":20,"inputCacheCreation":4},"time":1784455203000i64}),
+                serde_json::json!({"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"agent-call","result":{"output":"agent_id: agent-0\nstatus: completed\n\n[summary]\nchild done"}},"time":1784455205000i64}),
+            ],
+        );
+        write_wire(
+            "agent-0",
+            &[
+                serde_json::json!({"type":"turn.prompt","input":[{"type":"text","text":"child persisted prompt"}],"origin":{"kind":"system_trigger"},"time":1784455202500i64}),
+                serde_json::json!({"type":"context.append_loop_event","event":{"type":"content.part","uuid":"child-answer","part":{"type":"text","text":"child persisted answer"}},"time":1784455202600i64}),
+                serde_json::json!({"type":"usage.record","model":"kimi-code/k2.7-coding","usage":{"inputOther":2,"output":1,"inputCacheRead":5,"inputCacheCreation":0},"time":1784455202700i64}),
+            ],
+        );
+        std::fs::write(
+            home.path().join(".kimi-code/session_index.jsonl"),
+            serde_json::json!({
+                "sessionId":SESSION,
+                "sessionDir":session_dir,
+                "workDir":"/repo"
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let rows = list_kimi_sessions(home.path());
+        assert_eq!(rows.len(), 2);
+        let main = rows
+            .iter()
+            .find(|row| row["session_id"] == SESSION)
+            .unwrap();
+        assert_eq!(main["model"], "kimi-code/k2.7-coding");
+        assert_eq!(main["total_tokens"], 37);
+        assert_eq!(main["prompt_tokens"], 34);
+        assert_eq!(main["cached_tokens"], 20);
+        let child_id = format!("{SESSION}:agent-0");
+        let child = rows
+            .iter()
+            .find(|row| row["session_id"] == child_id)
+            .unwrap();
+        assert_eq!(child["parent_session_id"], SESSION);
+        assert_eq!(child["relationship_kind"], "subagent");
+        assert_eq!(child["total_tokens"], 8);
+        assert_eq!(child["prompt_tokens"], 7);
+
+        let main_entries =
+            external_session_entries_from_home(home.path(), "kimi", SESSION).unwrap();
+        assert!(main_entries.iter().any(|entry| {
+            entry.get("content").and_then(|value| value.as_str()) == Some("main persisted answer")
+        }));
+        let child_entries =
+            external_session_entries_from_home(home.path(), "kimi", &child_id).unwrap();
+        assert!(child_entries.iter().any(|entry| {
+            entry.get("content").and_then(|value| value.as_str()) == Some("child persisted answer")
+        }));
+        assert!(child_entries.iter().any(|entry| {
+            entry.get("kind").and_then(|value| value.as_str()) == Some("subagent_terminal")
+        }));
     }
 }

@@ -170,6 +170,17 @@ pub(crate) fn merge_intendant_wrapper_into_external_session(
         ("claude_permission_mode", "claude_permission_mode"),
         ("claude_allowed_tools", "claude_allowed_tools"),
         ("claude_effort", "claude_effort"),
+        // Kimi's live profile is persisted on the wrapper too. Preserve it
+        // when the wrapper collapses into Kimi's native session row, just as
+        // we do for Claude, so forks and resumed sessions remain editable
+        // from the catalog without silently reverting to global defaults.
+        ("kimi_model", "kimi_model"),
+        ("kimi_thinking", "kimi_thinking"),
+        ("kimi_permission_mode", "kimi_permission_mode"),
+        ("kimi_allowed_tools", "kimi_allowed_tools"),
+        ("kimi_plan_mode", "kimi_plan_mode"),
+        ("kimi_swarm_mode", "kimi_swarm_mode"),
+        ("kimi_home", "kimi_home"),
     ] {
         if let Some(value) = wrapper_obj.get(wrapper_key) {
             obj.insert(target_key.to_string(), value.clone());
@@ -380,6 +391,7 @@ pub(crate) fn pretty_external_source_label(source: &str) -> String {
         "codex" => "Codex".to_string(),
         "claude-code" => "Claude Code".to_string(),
         "gemini" => "Gemini CLI".to_string(),
+        "kimi" => "Kimi".to_string(),
         "intendant" => "Intendant".to_string(),
         other => other.to_string(),
     }
@@ -2099,6 +2111,41 @@ mod tests {
         assert_eq!(relationships.len(), 1);
         assert_eq!(relationships[0]["parent_session_id"], "parent");
         assert_eq!(relationships[0]["child_session_id"], "child");
+    }
+
+    #[test]
+    fn merged_kimi_session_preserves_exact_wrapper_profile() {
+        let mut external = serde_json::json!({
+            "source": "kimi",
+            "session_id": "session_backend",
+            "resume_id": "session_backend",
+        });
+        let wrapper = serde_json::json!({
+            "session_id": "wrapper",
+            "backend_source": "kimi",
+            "backend_session_id": "session_backend",
+            "kimi_model": "kimi-code/kimi-for-coding",
+            "kimi_thinking": "on",
+            "kimi_permission_mode": "manual",
+            "kimi_allowed_tools": ["Read", "Write"],
+            "kimi_plan_mode": true,
+            "kimi_swarm_mode": false,
+            "kimi_home": "/isolated/kimi-home",
+        });
+
+        merge_intendant_wrapper_into_external_session(&mut external, &wrapper);
+
+        for key in [
+            "kimi_model",
+            "kimi_thinking",
+            "kimi_permission_mode",
+            "kimi_allowed_tools",
+            "kimi_plan_mode",
+            "kimi_swarm_mode",
+            "kimi_home",
+        ] {
+            assert_eq!(external[key], wrapper[key], "{key} was not preserved");
+        }
     }
 
     #[test]

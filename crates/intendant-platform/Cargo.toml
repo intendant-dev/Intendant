@@ -23,6 +23,10 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    # Owner-private state ACLs: exact protected DACL stamping and validation
+    # for credentials and external-agent bridge state.
+    "Win32_Security",
+    "Win32_Security_Authorization",
     # GetFileInformationByHandle / BY_HANDLE_FILE_INFORMATION for
     # `platform::FileIdentity` (real (volume, file-index) file identity).
     "Win32_Storage_FileSystem",

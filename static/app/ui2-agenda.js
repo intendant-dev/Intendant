@@ -15,6 +15,15 @@ let agendaFilter = 'open';
 let agendaFetchInFlight = null;
 let agendaLoadError = '';
 let agendaReminderPolicy = null; // owner delivery policy (Settings-gated)
+// Session-resolution join from the list response: recorded session id →
+// { source, conversation_id, key, name } for the Sessions-tab row. Ids the
+// daemon could not resolve have no entry — surfaces fall back to the raw
+// id. `attempted` remembers ids a fetch already tried, so an unresolvable
+// id never causes refetch loops on the event lane.
+let agendaSessions = {};
+let agendaSessionLookupsAttempted = new Set();
+// Items whose full annotation thread is expanded (render caps at 3).
+const agendaExpandedThreads = new Set();
 
 async function agendaRefresh() {
   if (agendaFetchInFlight) return agendaFetchInFlight;
@@ -26,6 +35,9 @@ async function agendaRefresh() {
         agendaCounts = resp.body.counts || agendaCounts;
         agendaSkippedLines = resp.body.skipped_lines || 0;
         agendaReminderPolicy = resp.body.reminder_policy || agendaReminderPolicy;
+        agendaSessions = resp.body.sessions || {};
+        agendaSessionLookupsAttempted = new Set(
+          agendaItems.flatMap(agendaItemSessionIds));
         agendaLoadError = '';
         agendaAnnounceParkedAsks();
       } else {
@@ -86,7 +98,27 @@ function agendaObserveServerMessage(d) {
   if (at >= 0) agendaItems[at] = d.item;
   else agendaItems.push(d.item);
   if (d.counts) agendaCounts = d.counts;
+  // A session id this tab has never tried to resolve (a fresh session
+  // parked something): refetch once to pick up the join entry. Ids that
+  // already failed resolution stay raw — no loops.
+  const unresolved = agendaItemSessionIds(d.item).some(
+    (id) => !(id in agendaSessions) && !agendaSessionLookupsAttempted.has(id));
+  if (unresolved) agendaRefresh();
   agendaRenderAll();
+}
+
+// Every session id an item's attribution views reference (provenance,
+// answer, effect proposals and runs) — the daemon-side twin drives the
+// join map in the list response.
+function agendaItemSessionIds(item) {
+  const ids = [];
+  if (item.provenance && item.provenance.session_id) ids.push(item.provenance.session_id);
+  if (item.answer && item.answer.session_id) ids.push(item.answer.session_id);
+  (item.effects || []).forEach((effect) => {
+    if (effect.proposed_session_id) ids.push(effect.proposed_session_id);
+    if (effect.last_run && effect.last_run.session_id) ids.push(effect.last_run.session_id);
+  });
+  return ids;
 }
 
 function agendaTabVisible() {
@@ -149,10 +181,47 @@ function agendaDueChip(item) {
   return `<span class="agenda-chip due${overdue ? ' overdue' : ''}">due ${escapeHtml(label)}</span>`;
 }
 
+function agendaSessionInfo(id) {
+  return (id && agendaSessions && agendaSessions[id]) || null;
+}
+
+// ---- F2 derived presentation (client twin of the daemon's is_blocked /
+// dependency_state — like the overdue chip, derived at render time from
+// facts the tab already holds; never stored, never on the wire).
+
+function agendaFindItem(id) {
+  return (agendaItems || []).find((item) => item.id === id) || null;
+}
+
+// One edge's render judgment: { satisfied, review } where review is
+// '' | 'target_retired' | 'target_missing'.
+function agendaEdgeState(edge) {
+  const target = agendaFindItem(edge.target_id);
+  if (!target) return { satisfied: false, review: 'target_missing' };
+  if (target.status === 'done') return { satisfied: true, review: '' };
+  if (target.status === 'retired') return { satisfied: false, review: 'target_retired' };
+  return { satisfied: false, review: '' };
+}
+
+function agendaItemIsBlocked(item) {
+  if (item.status !== 'open') return false;
+  if ((item.blockers || []).some((b) => !b.cleared)) return true;
+  return (item.relies_on || []).some((edge) => !agendaEdgeState(edge).satisfied);
+}
+
 function agendaActorLabel(p) {
-  // Gate-attributed actor (A2): kind + session/principal, rendered for
-  // humans. Data only — never markup.
-  if (p.session_id) return `session ${p.session_id.slice(0, 12)}`;
+  // Gate-attributed actor (A2), rendered for humans. Session ids resolve
+  // through the join map to the conversation's human name; unresolved ids
+  // degrade to the raw truncated id. Plain TEXT only — callers escape.
+  if (p.session_id) {
+    const s = agendaSessionInfo(p.session_id);
+    if (s && s.name) return `session “${s.name}”`;
+    if (s) {
+      const prefix = s.source && s.source !== 'intendant' ? `${s.source} ` : '';
+      return `${prefix}session ${String(s.conversation_id || p.session_id).slice(0, 8)}`;
+    }
+    return `session ${p.session_id.slice(0, 12)}`;
+  }
   if (p.kind === 'dashboard') return 'you';
   if (p.kind === 'local_process') return 'local ctl';
   if (p.kind === 'peer') return 'a peer daemon';
@@ -160,16 +229,74 @@ function agendaActorLabel(p) {
   return p.principal || '';
 }
 
+// Full attribution HTML: the resolved session name as a jump link to its
+// Sessions-tab conversation row, raw ids + principal + kind in the tooltip
+// (no more suppression — they moved, not vanished), and self-described
+// `--source` labels rendered visibly AS self-described. Everything is
+// data: each fragment is escaped, none of it is ever executed.
+function agendaActorHtml(p) {
+  const bits = [];
+  if (p.session_id) {
+    const s = agendaSessionInfo(p.session_id);
+    const label = agendaActorLabel(p);
+    const tip = [
+      `session id: ${p.session_id}`,
+      s && s.conversation_id && s.conversation_id !== p.session_id
+        ? `conversation: ${s.conversation_id}` : '',
+      p.principal ? `principal: ${p.principal}` : '',
+      p.kind ? `kind: ${p.kind}` : '',
+    ].filter(Boolean).join('\n');
+    if (s && s.key) {
+      bits.push(`<a href="#sessions" class="agenda-session-link" data-session-key="${escapeHtml(s.key)}" title="${escapeHtml(tip)}">${escapeHtml(label)}</a>`);
+    } else {
+      bits.push(`<span title="${escapeHtml(tip)}">${escapeHtml(label)}</span>`);
+    }
+  } else {
+    const label = agendaActorLabel(p);
+    if (label) {
+      bits.push(p.principal && label !== p.principal
+        ? `<span title="${escapeHtml(`principal: ${p.principal}`)}">${escapeHtml(label)}</span>`
+        : escapeHtml(label));
+    }
+  }
+  if (p.source) {
+    bits.push(`<span class="agenda-self-described" title="self-described label — UNVERIFIED, never attribution">— self-described: ${escapeHtml(p.source)}</span>`);
+  }
+  return bits.join(' ');
+}
+
 function agendaProvenanceLine(item) {
   const p = item.provenance || {};
   const created = p.created_ms
     ? new Date(p.created_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
     : '';
-  const who = agendaActorLabel(p);
+  const who = agendaActorHtml(p);
   const parts = [];
-  if (created) parts.push(`parked ${created}`);
+  if (created) parts.push(escapeHtml(`parked ${created}`));
   if (who) parts.push(`by ${who}`);
-  return escapeHtml(parts.join(' · '));
+  return parts.join(' · ');
+}
+
+// Jump to the conversation's row on the Sessions tab: switch tabs, then
+// focus/flash the card once the list renders it (rows are keyed by
+// sessionListRowKey = source<conversation id>). If the row is not in
+// the loaded window the jump degrades to just opening the tab.
+function agendaJumpToSession(key) {
+  if (!key) return;
+  routeTo('sessions');
+  const deadline = Date.now() + 4000;
+  const selector = `[data-session-key="${window.CSS && CSS.escape ? CSS.escape(key) : key}"]`;
+  const seek = () => {
+    const card = document.querySelector(selector);
+    if (card) {
+      card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      card.classList.add('agenda-jump-flash');
+      setTimeout(() => card.classList.remove('agenda-jump-flash'), 2400);
+      return;
+    }
+    if (Date.now() < deadline) setTimeout(seek, 200);
+  };
+  seek();
 }
 
 // Scheduled-session effect (A5): render the manifest under review, its
@@ -203,7 +330,7 @@ function agendaEffectBlock(item) {
     const glyphs = { completed: '✓', failed: '✗', missed: '⊘', unknown: '?', started: '▶' };
     const classes = { completed: 'completed', failed: 'failed', started: 'armed' };
     const bits = [`${glyphs[run.state] || '·'} ${run.state}`];
-    if (run.session_id) bits.push(`session ${run.session_id.slice(0, 12)}`);
+    if (run.session_id) bits.push(agendaActorLabel({ session_id: run.session_id }));
     stateHtml = `<span class="agenda-effect-state ${classes[run.state] || 'attention'}">${escapeHtml(bits.join(' · '))}</span>`;
     if (run.note) {
       // Session summaries / failure reasons are quoted data, like bodies.
@@ -236,12 +363,140 @@ function agendaEffectBlock(item) {
   </div>`;
 }
 
+// The item's thread + gates (F2): annotations (capped with an expander),
+// blockers with their clear affordance and cleared history, dependency
+// chips with satisfied/review markers, and the note/block composer.
+// Everything is data rendered escaped; nothing here executes or obeys.
+function agendaThreadBlock(item) {
+  const parts = [];
+  const notes = item.annotations || [];
+  if (notes.length) {
+    const cap = 3;
+    const shown = agendaExpandedThreads.has(item.id) ? notes : notes.slice(-cap);
+    const rows = shown.map((note) => {
+      const when = note.at_ms
+        ? new Date(note.at_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+        : '';
+      const who = agendaActorHtml(note);
+      const meta = [who, escapeHtml(when)].filter(Boolean).join(' · ');
+      return `<div class="agenda-note">↳ ${escapeHtml(note.text)}
+        <span class="agenda-item-meta">— ${meta}</span></div>`;
+    });
+    const more = notes.length > shown.length
+      ? `<button type="button" class="agenda-thread-more" data-id="${escapeHtml(item.id)}">show all ${notes.length} notes</button>`
+      : '';
+    parts.push(`<div class="agenda-thread">${rows.join('')}${more}</div>`);
+  }
+  const blockers = item.blockers || [];
+  if (blockers.length) {
+    const rows = blockers.map((blocker) => {
+      const who = agendaActorHtml(blocker);
+      if (blocker.cleared) {
+        const clearedBy = agendaActorHtml(blocker.cleared);
+        return `<div class="agenda-blocker cleared">✓ <s>${escapeHtml(blocker.criterion)}</s>
+          <span class="agenda-item-meta">— cleared${clearedBy ? ` by ${clearedBy}` : ''}</span></div>`;
+      }
+      const clear = item.status === 'open'
+        ? `<button type="button" class="agenda-btn agenda-clear-blocker" data-id="${escapeHtml(item.id)}" data-blocker="${escapeHtml(blocker.blocker_id)}">Clear</button>`
+        : '';
+      return `<div class="agenda-blocker">
+        <span class="agenda-blocker-text" title="${escapeHtml(blocker.blocker_id)}">⛔ ${escapeHtml(blocker.criterion)}</span>
+        <span class="agenda-item-meta">${who ? `— set by ${who}` : ''}</span>${clear}
+      </div>`;
+    });
+    parts.push(`<div class="agenda-blockers">${rows.join('')}</div>`);
+  }
+  const edges = item.relies_on || [];
+  if (edges.length) {
+    const chips = edges.map((edge) => {
+      const state = agendaEdgeState(edge);
+      const target = agendaFindItem(edge.target_id);
+      const label = target ? target.title : edge.target_id.slice(0, 10);
+      const marker = state.review === 'target_retired'
+        ? ' · prerequisite retired — review'
+        : state.review === 'target_missing'
+          ? ' · prerequisite missing'
+          : '';
+      const cls = state.satisfied ? 'satisfied' : state.review ? 'review' : 'waiting';
+      const remove = item.status === 'open'
+        ? `<button type="button" class="agenda-edge-remove" data-id="${escapeHtml(item.id)}" data-target="${escapeHtml(edge.target_id)}" aria-label="Remove dependency" title="Remove dependency">×</button>`
+        : '';
+      return `<span class="agenda-edge ${cls}" title="${escapeHtml(edge.target_id)}">
+        ${state.satisfied ? '✓' : '…'} needs ${escapeHtml(label)}${escapeHtml(marker)}${remove}</span>`;
+    });
+    parts.push(`<div class="agenda-edges">${chips.join('')}</div>`);
+  }
+  // Composer: annotate any non-retired item; block only open ones.
+  if (item.status !== 'retired') {
+    const blockBtn = item.status === 'open'
+      ? `<button type="button" class="agenda-btn agenda-thread-block" data-id="${escapeHtml(item.id)}">Block</button>`
+      : '';
+    parts.push(`<div class="agenda-thread-add">
+      <input type="text" class="agenda-thread-input" maxlength="4000"
+             placeholder="Add a note — or state a blocker…" aria-label="Note or blocker" data-id="${escapeHtml(item.id)}" />
+      <button type="button" class="agenda-btn agenda-thread-note" data-id="${escapeHtml(item.id)}">Note</button>
+      ${blockBtn}
+    </div>`);
+  }
+  return parts.length ? `<div class="agenda-item-thread">${parts.join('')}</div>` : '';
+}
+
+// F3 follow-up affordance: the live, composer-targetable session window
+// carrying the item's recorded conversation, if one exists RIGHT NOW.
+// Purely a navigation affordance — sessions die, so items must stand
+// alone; this appears only when following up happens to be possible.
+function agendaFollowUpSid(item) {
+  const recorded = item.provenance && item.provenance.session_id;
+  if (!recorded) return null;
+  if (typeof sessionWindows === 'undefined'
+    || typeof isPromptTargetSessionUsable !== 'function') return null;
+  const s = agendaSessionInfo(recorded);
+  const conversationId = (s && s.conversation_id) || recorded;
+  for (const sid of sessionWindows.keys()) {
+    if (!isPromptTargetSessionUsable(sid)) continue;
+    if (sid === recorded || sid === conversationId) return sid;
+    const meta = (typeof sessionMetadataById !== 'undefined'
+      && sessionMetadataById.get(sid)) || {};
+    const backend = String(meta.backend_session_id || meta.backendSessionId || '').trim();
+    if (backend && backend === conversationId) return sid;
+  }
+  return null;
+}
+
+// Open the composer targeted at the recorder's conversation with the item
+// quoted as data. No daemon write happens here.
+function agendaFollowUpWithRecorder(item, sid) {
+  routeTo('activity');
+  if (typeof focusSessionWindow === 'function') focusSessionWindow(sid);
+  const input = document.getElementById('activity-task-input');
+  if (input) {
+    const body = item.body ? `\n> ${String(item.body).split('\n').join('\n> ')}` : '';
+    input.value =
+      `Following up on agenda item ${item.id} (quoted):\n> ${item.title}${body}\n\n`;
+    input.focus();
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.setSelectionRange(input.value.length, input.value.length);
+  }
+}
+
 function agendaActionButtons(item) {
   const actions = [];
   if (item.status === 'open') actions.push(['complete', 'Complete'], ['retire', 'Retire']);
   else if (item.status === 'done') actions.push(['reopen', 'Reopen'], ['retire', 'Retire']);
   else actions.push(['reopen', 'Reopen']);
-  const buttons = actions
+  let extra = '';
+  if (item.status === 'open') {
+    // Owner start-now: ONE gesture — the daemon mints the manifest from
+    // this item, the gesture is the approval (digest bound server-side
+    // under the same lock), and it fires through the ordinary scheduled
+    // lane. Owner surface = this dashboard; agents get NotPermitted.
+    extra += `<button type="button" class="agenda-btn agenda-start-now" data-id="${escapeHtml(item.id)}" title="Mint + approve a session from this item and start it now (runs through the standard scheduled lane)">Start now</button>`;
+    const sid = agendaFollowUpSid(item);
+    if (sid) {
+      extra += `<button type="button" class="agenda-btn agenda-follow-up" data-id="${escapeHtml(item.id)}" data-sid="${escapeHtml(sid)}" title="The recording conversation is live — open the composer targeted at it with this item quoted">Follow up</button>`;
+    }
+  }
+  const buttons = extra + actions
     .map(([op, label]) =>
       `<button type="button" class="agenda-btn" data-op="${op}" data-id="${escapeHtml(item.id)}">${label}</button>`)
     .join('');
@@ -378,7 +633,9 @@ function agendaRenderTab() {
     return;
   }
   const filtered = agendaItems.filter((item) =>
-    agendaFilter === 'all' ? true : item.status === agendaFilter);
+    agendaFilter === 'all' ? true
+      : agendaFilter === 'blocked' ? agendaItemIsBlocked(item)
+        : item.status === agendaFilter);
   if (!filtered.length) {
     const what = agendaFilter === 'all' ? '' : `${agendaFilter} `;
     list.innerHTML =
@@ -411,14 +668,17 @@ function agendaRenderTab() {
         <span class="agenda-item-meta">— ${escapeHtml([who && `by ${who}`, when].filter(Boolean).join(' · '))}</span>
       </div>`;
     }
+    const blockedChip = agendaItemIsBlocked(item)
+      ? '<span class="agenda-chip blocked">blocked</span>'
+      : '';
     return `<div class="agenda-item" data-status="${escapeHtml(item.status)}">
       <div class="agenda-item-head">
         ${agendaGlyph(item.status, item.kind)}
         <span class="agenda-item-kind">${escapeHtml(item.kind)}</span>
         <span class="agenda-item-title">${escapeHtml(item.title)}</span>
-        ${agendaDueChip(item)}${tags}
+        ${blockedChip}${agendaDueChip(item)}${tags}
       </div>
-      ${body}${answerBlock}${agendaEffectBlock(item)}
+      ${body}${answerBlock}${agendaThreadBlock(item)}${agendaEffectBlock(item)}
       <div class="agenda-item-foot">
         <span class="agenda-item-meta">${agendaProvenanceLine(item)}</span>
         <span class="agenda-item-actions">${agendaActionButtons(item)}</span>
@@ -426,6 +686,12 @@ function agendaRenderTab() {
     </div>`;
   });
   list.innerHTML = rows.join('');
+  list.querySelectorAll('a.agenda-session-link').forEach((link) => {
+    link.addEventListener('click', (e) => {
+      e.preventDefault();
+      agendaJumpToSession(link.dataset.sessionKey);
+    });
+  });
   list.querySelectorAll('button[data-op]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const params = { op: btn.dataset.op, id: btn.dataset.id };
@@ -437,6 +703,59 @@ function agendaRenderTab() {
   list.querySelectorAll('select.agenda-bell').forEach((sel) => {
     sel.addEventListener('change', () =>
       agendaSetItemUrgency(sel.dataset.id, sel.value, sel));
+  });
+  // F3 act-on-item wiring.
+  list.querySelectorAll('button.agenda-start-now').forEach((btn) => {
+    btn.addEventListener('click', () =>
+      agendaSendOp({ op: 'start_now', id: btn.dataset.id }, btn));
+  });
+  list.querySelectorAll('button.agenda-follow-up').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const item = agendaFindItem(btn.dataset.id);
+      if (item) agendaFollowUpWithRecorder(item, btn.dataset.sid);
+    });
+  });
+  // F2 thread + gates wiring.
+  list.querySelectorAll('button.agenda-thread-more').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      agendaExpandedThreads.add(btn.dataset.id);
+      agendaRenderTab();
+    });
+  });
+  list.querySelectorAll('button.agenda-clear-blocker').forEach((btn) => {
+    btn.addEventListener('click', () =>
+      agendaSendOp({ op: 'clear_blocker', id: btn.dataset.id, blocker_id: btn.dataset.blocker }, btn));
+  });
+  list.querySelectorAll('button.agenda-edge-remove').forEach((btn) => {
+    btn.addEventListener('click', () =>
+      agendaSendOp({ op: 'remove_relies_on', id: btn.dataset.id, target_id: btn.dataset.target }, btn));
+  });
+  const submitThread = async (id, input, op, control) => {
+    const text = (input.value || '').trim();
+    if (!text) return;
+    input.disabled = true;
+    const params = op === 'set_blocker'
+      ? { op, id, criterion: text }
+      : { op, id, text };
+    const ok = await agendaSendOp(params, control);
+    input.disabled = false;
+    if (!ok) input.focus();
+  };
+  list.querySelectorAll('button.agenda-thread-note').forEach((btn) => {
+    const input = list.querySelector(`input.agenda-thread-input[data-id="${btn.dataset.id}"]`);
+    if (!input) return;
+    btn.addEventListener('click', () => submitThread(btn.dataset.id, input, 'annotate', btn));
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submitThread(btn.dataset.id, input, 'annotate', btn);
+      }
+    });
+  });
+  list.querySelectorAll('button.agenda-thread-block').forEach((btn) => {
+    const input = list.querySelector(`input.agenda-thread-input[data-id="${btn.dataset.id}"]`);
+    if (!input) return;
+    btn.addEventListener('click', () => submitThread(btn.dataset.id, input, 'set_blocker', btn));
   });
   const submitAnswer = async (id, input, control) => {
     const text = (input.value || '').trim();
@@ -515,10 +834,14 @@ function agendaRenderCard() {
   // Oldest first: long-parked intent stays visible instead of scrolling away.
   const rows = open.slice(0, 5).map((item) => {
     const p = item.provenance || {};
-    // Agent-parked items carry their session provenance right on the card.
+    // Agent-parked items carry their session provenance right on the card,
+    // by resolved name when the join map has one (raw id in the tooltip).
+    const s = agendaSessionInfo(p.session_id);
     const who = p.session_id
-      ? `<span class="agenda-card-row-who">· sess ${escapeHtml(p.session_id.slice(0, 8))}</span>`
-      : '';
+      ? `<span class="agenda-card-row-who" title="${escapeHtml(p.session_id)}">· ${escapeHtml(s && s.name ? s.name : `sess ${p.session_id.slice(0, 8)}`)}</span>`
+      : (p.source
+        ? `<span class="agenda-card-row-who" title="self-described label — unverified">· ${escapeHtml(p.source)}</span>`
+        : '');
     const q = item.kind === 'question'
       ? '<span class="agenda-card-q" aria-label="question">?</span>'
       : '';
@@ -599,6 +922,22 @@ function agendaPositionCard() {
     }
     agendaBuildCard();
     agendaRefresh();
+    // Follow-up affordance liveness: the button is derived at render time
+    // from session-window state the agenda has no event lane for, so a
+    // visible tab re-renders when (and only when) the eligibility
+    // signature changes — the target-switch poll idiom, write-guarded.
+    let followUpSig = '';
+    setInterval(() => {
+      if (!agendaTabVisible() || !Array.isArray(agendaItems)) return;
+      const sig = agendaItems
+        .filter((item) => item.status === 'open')
+        .map((item) => `${item.id}:${agendaFollowUpSid(item) || ''}`)
+        .join('|');
+      if (sig !== followUpSig) {
+        followUpSig = sig;
+        agendaRenderTab();
+      }
+    }, 2000);
     // Pane-gated: the card lives in #activity-log-pane, so with the
     // Activity tab parked (another tab, or document.hidden) the reposition
     // tick used to write data-rail-hidden into a display:none subtree once

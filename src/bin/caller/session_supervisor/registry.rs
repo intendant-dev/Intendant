@@ -161,22 +161,25 @@ impl SessionSupervisor {
         if backend_session_id.is_empty() {
             return None;
         }
-        let candidates = [external_agent::AgentBackend::Codex]
-            .into_iter()
-            .filter(|backend| {
-                backend.supports_user_message_rewind()
-                    && external_agent::source_session_id_is_canonical(
-                        backend.as_short_str(),
-                        backend_session_id,
-                    )
-            })
-            .flat_map(|backend| {
-                let source = backend.as_short_str().to_string();
-                crate::external_wrapper_index::wrappers_for(home, &source, backend_session_id)
-                    .into_iter()
-                    .map(move |record| (source.clone(), record.intendant_session_id))
-            })
-            .collect::<Vec<_>>();
+        let candidates = [
+            external_agent::AgentBackend::Codex,
+            external_agent::AgentBackend::Kimi,
+        ]
+        .into_iter()
+        .filter(|backend| {
+            backend.supports_user_message_rewind()
+                && external_agent::source_session_id_is_canonical(
+                    backend.as_short_str(),
+                    backend_session_id,
+                )
+        })
+        .flat_map(|backend| {
+            let source = backend.as_short_str().to_string();
+            crate::external_wrapper_index::wrappers_for(home, &source, backend_session_id)
+                .into_iter()
+                .map(move |record| (source.clone(), record.intendant_session_id))
+        })
+        .collect::<Vec<_>>();
         if candidates.is_empty() {
             return None;
         }
@@ -405,6 +408,17 @@ impl SessionSupervisor {
                 let cfg = &mut project.config.agent.claude_code;
                 cfg.model = current.model;
                 cfg.permission_mode = current.permission_mode;
+                cfg.allowed_tools = current.allowed_tools;
+            }
+            Some(external_agent::AgentBackend::Kimi) => {
+                let current = self.config.shared_kimi_config.read().await.clone();
+                let cfg = &mut project.config.agent.kimi;
+                cfg.command = current.command;
+                cfg.model = current.model;
+                cfg.thinking = current.thinking;
+                cfg.permission_mode = current.permission_mode;
+                cfg.plan_mode = current.plan_mode;
+                cfg.swarm_mode = current.swarm_mode;
                 cfg.allowed_tools = current.allowed_tools;
             }
             None => {}

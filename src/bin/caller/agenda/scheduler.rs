@@ -663,6 +663,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: Some(due_ms),
+                    source: None,
                 },
                 None,
             )
@@ -710,16 +711,29 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: Some(now_ms() + 3_600_000),
+                    source: None,
                 },
                 None,
             )
             .unwrap();
         handle
-            .apply(AgendaCommand::Complete { id: future.id }, None)
+            .apply(
+                AgendaCommand::Complete {
+                    id: future.id,
+                    source: None,
+                },
+                None,
+            )
             .unwrap();
         // And completing the first item is fine even though it fired.
         handle
-            .apply(AgendaCommand::Complete { id: item_id }, None)
+            .apply(
+                AgendaCommand::Complete {
+                    id: item_id,
+                    source: None,
+                },
+                None,
+            )
             .unwrap();
         let wake = run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
         assert_eq!(wake, None, "no open due items ⇒ nothing scheduled");
@@ -808,6 +822,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    source: None,
                 },
                 None,
             )
@@ -819,6 +834,7 @@ mod tests {
                     goal: "run the nightly sweep".into(),
                     fire_at_ms,
                     orchestrate: false,
+                    source: None,
                 },
                 None,
             )
@@ -864,6 +880,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    source: None,
                 },
                 None,
             )
@@ -875,6 +892,7 @@ mod tests {
                     goal: "must not run".into(),
                     fire_at_ms: now_ms() - 60_000,
                     orchestrate: false,
+                    source: None,
                 },
                 None,
             )
@@ -974,6 +992,7 @@ mod tests {
                     goal: "run the nightly sweep, rev 2".into(),
                     fire_at_ms: now_ms() - 30_000,
                     orchestrate: false,
+                    source: None,
                 },
                 None,
             )
@@ -1034,6 +1053,116 @@ mod tests {
         assert_eq!(run.state, "completed");
         assert_eq!(run.note.as_deref(), Some("rev 2 done"));
         assert_eq!(run.session_id.as_deref(), Some("sess-run-2"));
+    }
+
+    /// F3 start-now rides the ordinary scheduled lane end to end at unit
+    /// level: the gesture's approved now-manifest dispatches exactly one
+    /// delegation-tagged StartTask on the next pass, the receipt journals
+    /// `started`, DoneSignal journals `completed` with the write-back —
+    /// one occurrence arc, no bypass, and the spent occurrence never
+    /// re-fires.
+    #[tokio::test]
+    async fn start_now_dispatches_one_occurrence_through_the_standard_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = Arc::new(AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus,
+            dir.path(),
+        ));
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Task,
+                    title: "start me now".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        handle
+            .apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                },
+                owner(),
+            )
+            .unwrap();
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut dispatched = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                task,
+                delegation_id: Some(delegation_id),
+                ..
+            }) = event
+            {
+                dispatched.push((task, delegation_id));
+            }
+        }
+        assert_eq!(dispatched.len(), 1, "exactly one occurrence dispatches");
+        assert!(dispatched[0].0.contains("start me now"));
+        assert!(dispatched[0].0.contains(&item.id));
+        let occurrence_id = dispatched[0]
+            .1
+            .strip_prefix(DELEGATION_PREFIX)
+            .unwrap()
+            .to_string();
+
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id: dispatched[0].1.clone(),
+                session_id: "sess-now".into(),
+            },
+        );
+        assert_eq!(
+            journal.progress(&occurrence_id).started.as_deref(),
+            Some("sess-now")
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::DoneSignal {
+                session_id: Some("sess-now".into()),
+                message: Some("follow-through done".into()),
+            },
+        );
+        assert_eq!(
+            journal.progress(&occurrence_id).terminal,
+            Some(OccurrenceState::Completed)
+        );
+        let (items, _, _) = handle.snapshot();
+        let run = items.iter().find(|i| i.id == item.id).unwrap().effects[0]
+            .last_run
+            .clone()
+            .unwrap();
+        assert_eq!(run.state, "completed");
+        assert_eq!(run.session_id.as_deref(), Some("sess-now"));
+        assert_eq!(run.note.as_deref(), Some("follow-through done"));
+
+        // Spent: another pass dispatches nothing.
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    AppEvent::ControlCommand(ControlMsg::StartTask { .. })
+                ),
+                "spent start-now occurrence must not re-dispatch"
+            );
+        }
     }
 
     #[tokio::test]

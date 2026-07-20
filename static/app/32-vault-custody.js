@@ -1207,6 +1207,12 @@ const VAULT_OAUTH_PROVIDERS = {
     corsNote:
       'Anthropic’s token endpoint refuses browser origins, so this tab cannot refresh Claude Code tokens — enable full-credential OAuth leases to fuel it.',
   },
+  'oauth:kimi': {
+    tokenUrl: 'https://auth.kimi.com/api/oauth/token',
+    // Kimi Code's public device-flow OAuth client id.
+    clientId: '17e5f671-d194-4dfb-9706-5516cb48c098',
+    formEncoded: true,
+  },
 };
 /* Refresh when the current token has less life left than this. With
    provider access tokens living ≈1 h against a 5-minute renewal tick,
@@ -1217,6 +1223,7 @@ const vaultOauthEndpointOverrides = {}; // validator-only (debug handle)
 function vaultOauthRefreshTokenOf(kind, secretJson) {
   if (kind === 'oauth:codex') return String(secretJson?.tokens?.refresh_token || '');
   if (kind === 'oauth:claude-code') return String(secretJson?.claudeAiOauth?.refreshToken || '');
+  if (kind === 'oauth:kimi') return String(secretJson?.refresh_token || '');
   return '';
 }
 
@@ -1224,6 +1231,7 @@ function vaultOauthRefreshTokenOf(kind, secretJson) {
    which reads as already-stale so the first fueling always refreshes. */
 function vaultOauthExpiryMs(kind, secretJson) {
   if (kind === 'oauth:claude-code') return Number(secretJson?.claudeAiOauth?.expiresAt) || 0;
+  if (kind === 'oauth:kimi') return (Number(secretJson?.expires_at) || 0) * 1000;
   if (kind === 'oauth:codex') {
     try {
       // ChatGPT-plan access tokens are JWTs; exp is authoritative and
@@ -1249,6 +1257,7 @@ function vaultOauthAccessMaterial(kind, secretJson) {
     if (typeof copy.OPENAI_API_KEY === 'string') copy.OPENAI_API_KEY = null;
   }
   if (kind === 'oauth:claude-code' && copy.claudeAiOauth) copy.claudeAiOauth.refreshToken = '';
+  if (kind === 'oauth:kimi') copy.refresh_token = '';
   return JSON.stringify(copy);
 }
 
@@ -1269,15 +1278,22 @@ async function vaultOauthRefresh(kind, entry) {
   if (!refreshToken) throw new Error('the stored auth JSON has no refresh token — re-paste the auth file');
   let response;
   try {
+    const refreshBody = {
+      grant_type: 'refresh_token',
+      client_id: provider.clientId,
+      refresh_token: refreshToken,
+      ...(provider.scope ? { scope: provider.scope } : {}),
+    };
     response = await fetch(vaultOauthEndpointOverrides[kind] || provider.tokenUrl, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'refresh_token',
-        client_id: provider.clientId,
-        refresh_token: refreshToken,
-        ...(provider.scope ? { scope: provider.scope } : {}),
-      }),
+      headers: {
+        'content-type': provider.formEncoded
+          ? 'application/x-www-form-urlencoded'
+          : 'application/json',
+      },
+      body: provider.formEncoded
+        ? new URLSearchParams(refreshBody).toString()
+        : JSON.stringify(refreshBody),
     });
   } catch (err) {
     throw new Error(
@@ -1299,6 +1315,15 @@ async function vaultOauthRefresh(kind, entry) {
     secretJson.claudeAiOauth.accessToken = String(fresh.access_token);
     if (fresh.refresh_token) secretJson.claudeAiOauth.refreshToken = String(fresh.refresh_token);
     if (fresh.expires_in) secretJson.claudeAiOauth.expiresAt = nowMs + Number(fresh.expires_in) * 1000;
+  } else if (kind === 'oauth:kimi') {
+    secretJson.access_token = String(fresh.access_token);
+    if (fresh.refresh_token) secretJson.refresh_token = String(fresh.refresh_token);
+    if (fresh.expires_in) {
+      secretJson.expires_in = Number(fresh.expires_in);
+      secretJson.expires_at = Math.floor(nowMs / 1000) + Number(fresh.expires_in);
+    }
+    if (fresh.scope) secretJson.scope = String(fresh.scope);
+    if (fresh.token_type) secretJson.token_type = String(fresh.token_type);
   }
   vaultUpsertEntry({ id: entry.id, secret: JSON.stringify(secretJson) });
   return secretJson;
@@ -1380,7 +1405,7 @@ function vaultEntryLeaseKind(entry) {
   if (entry.kind === 'api_key' && entry.provider === 'rfc2136-dns') {
     return 'dns:rfc2136';
   }
-  if (entry.kind === 'oauth' && ['codex', 'claude-code'].includes(entry.provider)) {
+  if (entry.kind === 'oauth' && ['codex', 'claude-code', 'kimi'].includes(entry.provider)) {
     return `oauth:${entry.provider}`;
   }
   return null;
@@ -1538,18 +1563,19 @@ function renderAccessCustodySection() {
 }
 
 /* ── Agent account sign-in ceremonies ──
-   The guided sign-in cards (/api/claude-auth/* + /api/codex-auth/*):
+   The guided sign-in cards (/api/claude-auth/*, /api/codex-auth/*, and
+   /api/kimi-auth/*):
    the daemon runs each CLI's own login ceremony on a private PTY; a
    card walks the owner through it. Claude: open the sign-in URL in
-   THIS browser, paste the code Anthropic shows back here. Codex: open
-   the verification URL, type the one-time code the card shows into
-   OpenAI's page — nothing comes back to the daemon. Token exchanges
+   THIS browser, paste the code Anthropic shows back here. Codex/Kimi:
+   open the verification URL and type the one-time code the card shows
+   into the provider's page — nothing comes back to the daemon. Token exchanges
    stay inside the CLIs on the daemon; this page only ever sees the
-   sign-in URL (and, for Codex, the one-time code the owner must read).
+   sign-in URL (and, for Codex/Kimi, the one-time code the owner must read).
    Custody-gated on the daemon (credentials.manage + hosted-provenance
    + lease/egress tier refusals) — the cards render whatever refusal
    the daemon states. One credential ceremony runs at a time across
-   both providers (the daemon's status reports `busy_with`). */
+   all external-agent providers (the daemon's status reports `busy_with`). */
 const AGENT_SIGNIN_PROVIDERS = {
   claude: {
     label: 'Claude',
@@ -1592,6 +1618,7 @@ const AGENT_SIGNIN_PROVIDERS = {
     startLabel: 'Start Codex sign-in',
     openLabel: 'Open OpenAI sign-in',
     checkNote: 'Check that your browser shows auth.openai.com before signing in.',
+    devicePageName: 'OpenAI',
     unsupportedNote:
       'This daemon predates the Codex sign-in ceremony — upgrade it to sign in from here.',
     backendMatch: backend => backend.includes('codex'),
@@ -1608,6 +1635,38 @@ const AGENT_SIGNIN_PROVIDERS = {
       awaiting_user: 'Open the link, sign in, then type the one-time code below into OpenAI’s page.',
       verifying: 'Confirming the sign-in with OpenAI…',
       success: 'This machine’s Codex now uses the new account.',
+    },
+  },
+  kimi: {
+    label: 'Kimi',
+    statusMethod: 'api_kimi_auth_status',
+    startMethod: 'api_kimi_auth_start',
+    cancelMethod: 'api_kimi_auth_cancel',
+    codeMethod: null,
+    startParams: { mode: 'kimi-code' },
+    blastCopy:
+      "This signs this machine's Kimi Code into a Kimi account. Every Kimi session on " +
+      'this machine uses it. Running sessions keep the old account until reloaded.',
+    startLabel: 'Start Kimi sign-in',
+    openLabel: 'Open Kimi sign-in',
+    checkNote:
+      'Check that your browser shows kimi.com (current CLI) or auth.kimi.com (older CLI) before signing in.',
+    devicePageName: 'Kimi',
+    unsupportedNote:
+      'This daemon predates the Kimi sign-in ceremony — upgrade it to sign in from here.',
+    backendMatch: backend => backend.includes('kimi'),
+    sessionsTitle: 'Live Kimi sessions',
+    noSessionsNote: 'No live Kimi sessions — new sessions start on the new account.',
+    sessionKind: 'kimi',
+    deviceWarning:
+      'Continue only if you started this login in Kimi Code. If a website or another person ' +
+      'gave you this code, cancel.',
+    lines: {
+      idle: 'Sign this daemon into a Kimi account (device sign-in for Kimi Code).',
+      starting: 'Starting Kimi Code’s sign-in…',
+      awaiting_user: 'Open the link, sign in, then type the one-time code below into Kimi’s page.',
+      verifying: 'Confirming the sign-in with Kimi…',
+      success: 'This machine’s Kimi Code now uses the new account.',
     },
   },
 };
@@ -1628,6 +1687,7 @@ function agentSigninProviderState() {
 const agentSigninState = {
   claude: agentSigninProviderState(),
   codex: agentSigninProviderState(),
+  kimi: agentSigninProviderState(),
 };
 
 function agentSigninPhase(provider) {
@@ -1698,7 +1758,7 @@ function agentSigninEnsurePoll(provider) {
   }
 }
 
-/* 1s countdown ticker for the codex one-time code's expiry: updates the
+/* 1s countdown ticker for device-flow one-time-code expiry: updates the
    countdown text in place (never a full re-render per tick). */
 let agentSigninTickTimer = null;
 function agentSigninCountdownText(deadlineMs) {
@@ -1715,19 +1775,17 @@ function agentSigninRenderCountdowns() {
   }
 }
 function agentSigninEnsureTicker() {
-  const needsTick = agentSigninPhase('codex') === 'awaiting_user';
+  const needsTick = Object.keys(AGENT_SIGNIN_PROVIDERS)
+    .some(provider => agentSigninPhase(provider) === 'awaiting_user');
   if (needsTick && !agentSigninTickTimer) {
     agentSigninTickTimer = window.setInterval(() => {
-      // Pane gate: the countdown lives in the Access pane
-      // (#agent-signin-section), so with that tab parked (or the page
-      // backgrounded) the per-second textContent write hit a display:none
-      // subtree — and still ran style invalidation. While parked, defer
-      // ONE repaint; flushPaneRenders runs it on pane re-entry, so the
-      // countdown is correct the instant the pane shows.
-      if (!paneIsVisible('access')) {
-        renderOrDefer('access', 'agent-signin-countdown', agentSigninRenderCountdowns);
-        return;
-      }
+      // ui-v2 reparents #agent-signin-section into Vault; the legacy
+      // location is Access → Advanced. Avoid writes while both are hidden.
+      const watching =
+        typeof paneIsVisible !== 'function' ||
+        paneIsVisible('vault') ||
+        paneIsVisible('access');
+      if (!watching) return;
       agentSigninRenderCountdowns();
     }, 1000);
   } else if (!needsTick && agentSigninTickTimer) {
@@ -2074,13 +2132,14 @@ function agentSigninProviderCard(provider) {
     card.appendChild(stepOne);
 
     if (phase === 'awaiting_user') {
-      // Codex device step: the owner reads the one-time code off this
-      // card and types it into OpenAI's page.
+      // Device-flow step (Codex/Kimi): the owner reads the one-time code
+      // off this card and types it into the provider's page.
       const stepTwo = document.createElement('div');
       stepTwo.className = 'agent-signin-step';
       const stepTwoLabel = document.createElement('div');
       stepTwoLabel.className = 'vault-note';
-      stepTwoLabel.textContent = '2. Enter this one-time code on the OpenAI page';
+      stepTwoLabel.textContent =
+        `2. Enter this one-time code on the ${spec.devicePageName || spec.label} page`;
       stepTwo.appendChild(stepTwoLabel);
       const userCode = String(status?.user_code || '');
       if (userCode) {
@@ -2635,6 +2694,7 @@ function vaultProviderLabel(provider) {
   if (provider === 'gemini') return 'Gemini';
   if (provider === 'codex') return 'Codex (subscription)';
   if (provider === 'claude-code') return 'Claude Code (subscription)';
+  if (provider === 'kimi') return 'Kimi Code (subscription)';
   if (provider === 'cloudflare-dns') return 'Cloudflare DNS';
   if (provider === 'rfc2136-dns') return 'RFC2136 TSIG';
   return provider || 'custom';
@@ -2846,7 +2906,7 @@ function vaultRenderAddForm(card) {
   const fillProviders = () => {
     providerSelect.innerHTML = '';
     const providers = kindSelect.value === 'oauth'
-      ? ['codex', 'claude-code']
+      ? ['codex', 'claude-code', 'kimi']
       : ['anthropic', 'openai', 'gemini', 'cloudflare-dns', 'rfc2136-dns'];
     for (const provider of providers) {
       const option = document.createElement('option');
@@ -2871,7 +2931,7 @@ function vaultRenderAddForm(card) {
   const secretArea = document.createElement('textarea');
   secretArea.className = 'vault-phrase-input';
   secretArea.rows = 4;
-  secretArea.placeholder = 'Paste the agent auth file JSON (Codex: ~/.codex/auth.json · Claude Code: ~/.claude/.credentials.json)';
+  secretArea.placeholder = 'Paste the agent auth file JSON (Codex: ~/.codex/auth.json · Claude Code: ~/.claude/.credentials.json · Kimi: ~/.kimi-code/credentials/kimi-code.json)';
   secretArea.style.display = 'none';
   kindSelect.addEventListener('change', () => {
     fillProviders();
@@ -3105,7 +3165,7 @@ function vaultRenderFueling(card) {
     label.htmlFor = 'vault-oauth-lease-toggle';
     label.className = 'vault-note';
     label.textContent =
-      'Fuel OAuth with the full credential file instead of browser-refreshed access tokens. While such a lease is live the daemon holds durable subscription authority; revocation then depends on lease discipline (worst case: the provider’s session-revocation page). Needed for Claude Code today — Anthropic’s token endpoint refuses browser refresh — and for autonomy beyond the provider’s access-token lifetime.';
+      'Fuel OAuth with the full credential file instead of browser-refreshed access tokens. While such a lease is live the daemon holds durable subscription authority; revocation then depends on lease discipline (worst case: the provider’s session-revocation page). Needed for Claude Code today — Anthropic’s token endpoint refuses browser refresh — and for autonomy beyond any provider’s access-token lifetime.';
     oauthRow.append(toggle, label);
     card.appendChild(oauthRow);
   }
@@ -3248,8 +3308,9 @@ function renderAccessVaultSection() {
   vaultRefreshCustody().catch(() => {});
   // So do the agent sign-in cards (their own mount + freshness guards).
   renderAgentSigninSection();
-  agentSigninRefresh('claude').catch(() => {});
-  agentSigninRefresh('codex').catch(() => {});
+  for (const provider of Object.keys(AGENT_SIGNIN_PROVIDERS)) {
+    agentSigninRefresh(provider).catch(() => {});
+  }
 
   const card = document.createElement('div');
   card.className = 'vault-card';

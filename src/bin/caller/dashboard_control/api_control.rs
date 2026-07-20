@@ -1675,29 +1675,39 @@ pub(crate) async fn apply_dashboard_diagnostics_visual_marker(
     }
 }
 
+/// The settings/control RPC lane's allowlist, declared once by wire action.
+/// The parity test below pins the dashboard mirror to this exact set.
+pub(crate) const DASHBOARD_CONTROL_MSG_ACTIONS: &[&str] = &[
+    "set_autonomy",
+    "set_approval_rule",
+    "set_external_agent",
+    "set_codex_command",
+    "set_codex_managed_command",
+    "set_codex_sandbox",
+    "set_codex_approval_policy",
+    "set_codex_model",
+    "set_codex_reasoning_effort",
+    "set_codex_service_tier",
+    "set_codex_web_search",
+    "set_codex_network_access",
+    "set_codex_writable_roots",
+    "set_codex_managed_context",
+    "set_codex_context_archive",
+    "set_claude_model",
+    "set_claude_permission_mode",
+    "set_claude_allowed_tools",
+    "set_kimi_command",
+    "set_kimi_model",
+    "set_kimi_thinking",
+    "set_kimi_permission_mode",
+    "set_kimi_plan_mode",
+    "set_kimi_swarm_mode",
+    "set_kimi_allowed_tools",
+    "set_verbosity",
+];
+
 pub(crate) fn dashboard_control_msg_allowed(ctrl: &ControlMsg) -> bool {
-    matches!(
-        ctrl,
-        ControlMsg::SetAutonomy { .. }
-            | ControlMsg::SetApprovalRule { .. }
-            | ControlMsg::SetExternalAgent { .. }
-            | ControlMsg::SetCodexCommand { .. }
-            | ControlMsg::SetCodexManagedCommand { .. }
-            | ControlMsg::SetCodexSandbox { .. }
-            | ControlMsg::SetCodexApprovalPolicy { .. }
-            | ControlMsg::SetCodexModel { .. }
-            | ControlMsg::SetCodexReasoningEffort { .. }
-            | ControlMsg::SetCodexServiceTier { .. }
-            | ControlMsg::SetCodexWebSearch { .. }
-            | ControlMsg::SetCodexNetworkAccess { .. }
-            | ControlMsg::SetCodexWritableRoots { .. }
-            | ControlMsg::SetCodexManagedContext { .. }
-            | ControlMsg::SetCodexContextArchive { .. }
-            | ControlMsg::SetClaudeModel { .. }
-            | ControlMsg::SetClaudePermissionMode { .. }
-            | ControlMsg::SetClaudeAllowedTools { .. }
-            | ControlMsg::SetVerbosity { .. }
-    )
+    DASHBOARD_CONTROL_MSG_ACTIONS.contains(&dashboard_control_msg_action(ctrl))
 }
 
 pub(crate) fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
@@ -1798,6 +1808,13 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::SetClaudeModel { .. } => "set_claude_model",
         ControlMsg::SetClaudePermissionMode { .. } => "set_claude_permission_mode",
         ControlMsg::SetClaudeAllowedTools { .. } => "set_claude_allowed_tools",
+        ControlMsg::SetKimiCommand { .. } => "set_kimi_command",
+        ControlMsg::SetKimiModel { .. } => "set_kimi_model",
+        ControlMsg::SetKimiThinking { .. } => "set_kimi_thinking",
+        ControlMsg::SetKimiPermissionMode { .. } => "set_kimi_permission_mode",
+        ControlMsg::SetKimiPlanMode { .. } => "set_kimi_plan_mode",
+        ControlMsg::SetKimiSwarmMode { .. } => "set_kimi_swarm_mode",
+        ControlMsg::SetKimiAllowedTools { .. } => "set_kimi_allowed_tools",
         ControlMsg::SetVerbosity { .. } => "set_verbosity",
         ControlMsg::ScheduleControllerRestart { .. } => "schedule_controller_restart",
         ControlMsg::ControllerTurnComplete { .. } => "controller_turn_complete",
@@ -1980,6 +1997,45 @@ pub(crate) async fn api_codex_auth_cancel_response(
         id,
         crate::web_gateway::codex_auth_cancel_api_response(control_grant_is_hosted(&runtime.grant)),
         "codex auth cancel",
+    )
+}
+
+pub(crate) async fn api_kimi_auth_start_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    frame_api_response(
+        id,
+        crate::web_gateway::kimi_auth_start_api_response(
+            control_grant_is_hosted(&runtime.grant),
+            &body_text,
+            runtime.project_root.as_deref(),
+        ),
+        "kimi auth start",
+    )
+}
+
+pub(crate) async fn api_kimi_auth_status_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::kimi_auth_status_api_response(control_grant_is_hosted(&runtime.grant)),
+        "kimi auth status",
+    )
+}
+
+pub(crate) async fn api_kimi_auth_cancel_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::kimi_auth_cancel_api_response(control_grant_is_hosted(&runtime.grant)),
+        "kimi auth cancel",
     )
 }
 
@@ -3798,6 +3854,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spa_control_msg_rpc_set_mirrors_dashboard_control_allowlist() {
+        let app = include_str!("../../../../static/app.html");
+        let start = "const DASHBOARD_CONTROL_MSG_RPC_ACTIONS = new Set([";
+        let from = app
+            .find(start)
+            .expect("DASHBOARD_CONTROL_MSG_RPC_ACTIONS set not found in app.html")
+            + start.len();
+        let rest = &app[from..];
+        let to = rest
+            .find("]);")
+            .expect("DASHBOARD_CONTROL_MSG_RPC_ACTIONS set is unterminated");
+        let js_set: std::collections::BTreeSet<&str> =
+            rest[..to].split('\'').skip(1).step_by(2).collect();
+        let rust_set: std::collections::BTreeSet<&str> =
+            DASHBOARD_CONTROL_MSG_ACTIONS.iter().copied().collect();
+        assert_eq!(
+            js_set, rust_set,
+            "DASHBOARD_CONTROL_MSG_RPC_ACTIONS (static/app/31-init-identity-fleet.js) \
+             drifted from DASHBOARD_CONTROL_MSG_ACTIONS"
+        );
+    }
+
     /// Reload-credentials rides the session-control lane like restart:
     /// wire name, lane admission, and the session-manage classification
     /// (it is session lifecycle — the ceremony that writes the store is
@@ -3816,6 +3895,41 @@ mod tests {
             crate::access::access_policy::control_msg_operation(&msg),
             crate::peer::access_policy::PeerOperation::SessionManage,
         );
+    }
+
+    #[test]
+    fn kimi_allowed_tools_control_msg_preserves_authority_states_and_lane() {
+        for (probe, expected) in [
+            (
+                serde_json::json!({"action": "set_kimi_allowed_tools"}),
+                None,
+            ),
+            (
+                serde_json::json!({"action": "set_kimi_allowed_tools", "tools": []}),
+                Some(Vec::new()),
+            ),
+            (
+                serde_json::json!({
+                    "action": "set_kimi_allowed_tools",
+                    "tools": ["Read", "Write"]
+                }),
+                Some(vec!["Read".to_string(), "Write".to_string()]),
+            ),
+        ] {
+            let msg: ControlMsg = serde_json::from_value(probe).expect("Kimi tools parses");
+            let ControlMsg::SetKimiAllowedTools { tools } = &msg else {
+                unreachable!("Kimi tools probe parsed as another action");
+            };
+            assert_eq!(tools, &expected);
+            assert_eq!(dashboard_control_msg_action(&msg), "set_kimi_allowed_tools");
+            assert!(dashboard_control_msg_allowed(&msg));
+            assert!(!dashboard_session_control_msg_allowed(&msg));
+            assert!(!dashboard_action_msg_allowed(&msg));
+            assert_eq!(
+                crate::access::access_policy::control_msg_operation(&msg),
+                crate::peer::access_policy::PeerOperation::Settings,
+            );
+        }
     }
 
     /// Executable repointing rides the settings carry allowlist but

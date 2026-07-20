@@ -4,7 +4,18 @@ description: "Use when the user should see an agent-owned display through Intend
 compatibility: Requires a reachable Intendant daemon (supervised sessions have $INTENDANT and INTENDANT_MCP_URL injected).
 ---
 
-> If `$INTENDANT`/`INTENDANT_MCP_URL` is unset and no local Intendant daemon answers, this skill does not apply — say so and stop.
+> Resolve the CLI first:
+>
+> ```bash
+> INTENDANT="${INTENDANT:-$(command -v intendant || cat "${INTENDANT_HOME:-$HOME/.intendant}/cli-path" 2>/dev/null || echo intendant)}"
+> ```
+>
+> If that resolves nothing anywhere (no `$INTENDANT`, nothing on PATH, no
+> `cli-path` descriptor under the Intendant state root), Intendant likely
+> isn't on this machine — this skill does not apply; say so and stop. If
+> the CLI resolves but the daemon does not answer, that is a DIFFERENT
+> stop: say the daemon appears down — do not claim the skill doesn't
+> apply. (A running daemon refreshes the descriptor at boot.)
 
 # Visual Collaboration
 

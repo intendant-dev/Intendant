@@ -597,7 +597,7 @@ html.ui-v2 .ui2-vault-moved-go {
 html.ui-v2 .ui2-vault-moved-go:hover { background: var(--surface-2); border-color: var(--iris); }
 
 /* ── Agent sign-in ceremony cards (#agent-signin-section) ──
-   One card per provider (Claude, Codex) in their own mount between the
+   One card per provider (Claude, Codex, Kimi) in their own mount between the
    vault and the custody trail, so they work with the vault locked,
    absent, or never created. Mirrors the vault section's treatment
    (card unwrap, eyebrow status lines, pill chips, row cards, control
@@ -795,8 +795,8 @@ html.ui-v2 #agent-signin-section .agent-signin-code:focus-visible {
   outline: 2px solid var(--iris);
   outline-offset: 1px;
 }
-/* The Codex one-time code: BIG, mono, select-all — the owner reads or
-   copies it into OpenAI's page, so legibility is the whole point. */
+/* Device-flow one-time codes: BIG, mono, select-all — the owner reads or
+   copies one into the provider's page, so legibility is the whole point. */
 html.ui-v2 #agent-signin-section .agent-signin-device-row {
   align-items: center;
   gap: 12px;

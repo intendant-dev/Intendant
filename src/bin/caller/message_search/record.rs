@@ -21,6 +21,7 @@ pub(crate) enum Source {
     Intendant,
     Codex,
     ClaudeCode,
+    Kimi,
 }
 
 impl Source {
@@ -29,6 +30,7 @@ impl Source {
             Source::Intendant => "intendant",
             Source::Codex => "codex",
             Source::ClaudeCode => "claude-code",
+            Source::Kimi => "kimi",
         }
     }
 }
@@ -64,7 +66,7 @@ pub(crate) enum Locator {
         content_hash16: String,
     },
     /// External record with a native id (Claude record `uuid`, Codex
-    /// `response_item` id).
+    /// `response_item` id, or Kimi wire-record id).
     ExternalRecordId { record_id: String },
     /// External record without a native id: file line + content hash;
     /// `generation` pins which rewrite of the source produced it (Codex
@@ -134,6 +136,14 @@ pub(crate) enum SupersessionMark {
     GenerationRestore {
         active_generation: Generation,
         at_ms: i64,
+    },
+    /// Exact external records retired by a source-native undo. Kimi's
+    /// per-agent turn ordinals overlap inside one parent shard, so a
+    /// turn-count mark would retire unrelated child messages.
+    RecordIds {
+        record_ids: Vec<String>,
+        at_ms: i64,
+        reason: String,
     },
 }
 
@@ -212,6 +222,17 @@ pub(crate) fn derive_active(records: &[MessageRecord], marks: &[SupersessionMark
                 ..
             } => {
                 active_generation = *restored;
+            }
+            SupersessionMark::RecordIds { record_ids, .. } => {
+                for (index, record) in records.iter().enumerate() {
+                    if record
+                        .item_id
+                        .as_ref()
+                        .is_some_and(|item_id| record_ids.contains(item_id))
+                    {
+                        active[index] = false;
+                    }
+                }
             }
         }
     }

@@ -16,6 +16,22 @@ pub(crate) fn loopback_mcp_auth_token() -> &'static str {
     LOOPBACK_MCP_AUTH_TOKEN.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
 }
 
+/// Port of the dedicated session-MCP loopback listener
+/// ([`GatewayIngress::SessionMcp`]), recorded at bind. The supervised
+/// native launch arm reads it to build the runtime child's bootstrap URL —
+/// that listener stays outside the sandbox's loopback guard because it can
+/// only mint the calling session's own authority (session-scoped tokens
+/// required; every other rung refused).
+static SESSION_MCP_PORT: OnceLock<u16> = OnceLock::new();
+
+pub(crate) fn record_session_mcp_port(port: u16) {
+    let _ = SESSION_MCP_PORT.set(port);
+}
+
+pub(crate) fn session_mcp_port() -> Option<u16> {
+    SESSION_MCP_PORT.get().copied()
+}
+
 pub(crate) fn has_browser_origin_headers(header_text: &str) -> bool {
     http_header_present(header_text, "origin")
         || http_header_present(header_text, "sec-fetch-site")
@@ -546,6 +562,10 @@ pub(crate) async fn handle_mcp_post(
     tls_client_cert_fingerprint: Option<String>,
     peer_addr: std::net::SocketAddr,
     bus: EventBus,
+    // True on the dedicated session-MCP ingress: only session-scoped
+    // tokens bind; every other rung (peer, process token, browser, mTLS,
+    // tokenless loopback) is refused at the access edge.
+    session_token_only: bool,
 ) {
     // MCP Streamable HTTP endpoint.
     //
@@ -562,15 +582,19 @@ pub(crate) async fn handle_mcp_post(
         // shared token alone no longer authorizes the
         // tool surface — see `mcp_http_access_context`.
         let cert_dir = crate::access::backend::select_backend().cert_dir();
-        let mcp_access = match mcp_http_access_context(
-            &cert_dir,
-            peer_connection_identity.as_ref(),
-            tls_client_cert_fingerprint.as_deref(),
-            tls_client_cert_present,
-            is_tls,
-            peer_addr,
-            header_text,
-        ) {
+        let mcp_access = match if session_token_only {
+            session_only_mcp_access_context(&cert_dir, header_text)
+        } else {
+            mcp_http_access_context(
+                &cert_dir,
+                peer_connection_identity.as_ref(),
+                tls_client_cert_fingerprint.as_deref(),
+                tls_client_cert_present,
+                is_tls,
+                peer_addr,
+                header_text,
+            )
+        } {
             Ok(access) => access,
             Err((status, message)) => {
                 let reason = match status {
@@ -662,6 +686,35 @@ pub(crate) async fn handle_mcp_stream(mut stream: DemuxStream, header_text: &str
         stream.park().await;
     } else {
         finalize_http_stream(&mut stream).await;
+    }
+}
+
+/// The session-MCP ingress access ladder: exactly one rung. A
+/// session-scoped token binds that agent session; everything else — peer
+/// identity, the shared process token, browser origins, mTLS
+/// certificates, tokenless loopback — is refused by name. This single
+/// rung is what keeps the dedicated listener sound OUTSIDE the sandbox's
+/// loopback guard: nothing reachable through it exceeds the calling
+/// session's own gate-resolved authority, so a prompt-injected shell
+/// gains nothing its session's tool loop does not already have.
+pub(crate) fn session_only_mcp_access_context(
+    cert_dir: &std::path::Path,
+    header_text: &str,
+) -> Result<HttpAccessContext, (u16, String)> {
+    match mcp_request_token_binding(header_text) {
+        McpTokenBinding::Session(session_id) => {
+            mcp_agent_session_context(cert_dir, &session_id, "http", true)
+        }
+        McpTokenBinding::Invalid => Err((
+            401,
+            "invalid mcp_token; use the URL Intendant injected (INTENDANT_MCP_URL)".to_string(),
+        )),
+        McpTokenBinding::Process | McpTokenBinding::Missing => Err((
+            403,
+            "this listener serves session-scoped MCP tokens only — call with your \
+             injected INTENDANT_MCP_URL, or use the daemon's main gateway port"
+                .to_string(),
+        )),
     }
 }
 
@@ -938,6 +991,62 @@ mod tests {
         .expect_err("remote tokenless /mcp must refuse");
         assert_eq!(refused.0, 401);
         assert!(refused.1.contains("mcp_token"), "{}", refused.1);
+    }
+
+    /// The dedicated session-MCP ingress ladder has exactly one rung: a
+    /// session-scoped token binds that agent session; the tokenless
+    /// root-capable default, the shared process token, and wrong tokens
+    /// never bind. This property is what keeps the listener sound OUTSIDE
+    /// the runtime sandbox's gateway-port guard.
+    #[test]
+    fn session_only_access_context_refuses_everything_but_session_tokens() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Tokenless — even loopback — is refused: no root default here.
+        let err = session_only_mcp_access_context(
+            tmp.path(),
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 403);
+
+        // The shared per-process token is refused: root-equivalent
+        // possession has no business on this listener.
+        let process_request = format!(
+            "POST /mcp?mcp_token={} HTTP/1.1\r\nHost: h\r\n\r\n",
+            loopback_mcp_auth_token()
+        );
+        let err = session_only_mcp_access_context(tmp.path(), &process_request).unwrap_err();
+        assert_eq!(err.0, 403);
+
+        // A wrong explicit token fails loud.
+        let err = session_only_mcp_access_context(
+            tmp.path(),
+            "POST /mcp?session_id=sess-a&mcp_token=wrong HTTP/1.1\r\nHost: h\r\n\r\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 401);
+
+        // The one rung: a session-scoped token binds exactly that session.
+        let derived = session_scoped_mcp_token(loopback_mcp_auth_token(), "sess-a");
+        let request =
+            format!("POST /mcp?session_id=sess-a&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n");
+        let access = session_only_mcp_access_context(tmp.path(), &request).unwrap();
+        assert!(
+            access
+                .principal
+                .id
+                .starts_with("principal:agent-session:sess-a"),
+            "session token must bind the agent-session principal, got {}",
+            access.principal.id
+        );
+
+        // And it cannot bind a DIFFERENT session's identity: the token is
+        // preimage-bound to its session id.
+        let forged =
+            format!("POST /mcp?session_id=sess-b&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n");
+        let err = session_only_mcp_access_context(tmp.path(), &forged).unwrap_err();
+        assert_eq!(err.0, 401);
     }
 
     #[test]

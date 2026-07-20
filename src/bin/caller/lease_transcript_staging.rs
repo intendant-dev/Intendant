@@ -2,7 +2,8 @@
 //! program (see `docs/src/credential-custody.md` and
 //! `docs/src/session-logging.md`).
 //!
-//! A materialized home (the synthesized `CODEX_HOME` / `CLAUDE_CONFIG_DIR`
+//! A materialized home (the synthesized `CODEX_HOME` / `CLAUDE_CONFIG_DIR` /
+//! `KIMI_CODE_HOME`
 //! under `<state-root>/leased-auth`) holds the borrowed secret AND the
 //! agent's transcripts. Custody demands the secret die on time — cleanup
 //! must never wait on indexing — so cleanup RENAMES the transcript

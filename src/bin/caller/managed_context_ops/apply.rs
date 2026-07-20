@@ -3,6 +3,7 @@
 //! and child turn-complete events.
 
 use super::*;
+use crate::external_agent_log_source;
 
 pub(crate) async fn apply_external_context_rewind(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
@@ -610,11 +611,12 @@ pub(crate) fn emit_child_turn_complete(
     conversation_kind: &str,
     message: Option<String>,
 ) {
-    emit_child_turn_complete_for_session(
+    emit_child_turn_complete_for_session_with_source(
         config.bus,
         config.session_id.clone(),
         conversation_kind,
         message,
+        &external_agent_log_source(config.agent_source.as_deref()),
     );
 }
 
@@ -624,24 +626,48 @@ pub(crate) fn emit_child_turn_complete_for_session(
     conversation_kind: &str,
     message: Option<String>,
 ) {
+    emit_child_turn_complete_for_session_with_source(
+        bus,
+        session_id,
+        conversation_kind,
+        message,
+        "Codex",
+    );
+}
+
+fn emit_child_turn_complete_for_session_with_source(
+    bus: &EventBus,
+    session_id: Option<String>,
+    conversation_kind: &str,
+    message: Option<String>,
+    source: &str,
+) {
+    let done_message = message.clone();
     if let Some(message) = message {
         bus.send(AppEvent::LogEntry {
             session_id: session_id.clone(),
             level: "info".to_string(),
-            source: "Codex".to_string(),
+            source: source.to_string(),
             content: message,
             turn: None,
         });
     }
     bus.send(AppEvent::LogEntry {
-        session_id,
+        session_id: session_id.clone(),
         level: "info".to_string(),
-        source: "Codex".to_string(),
+        source: source.to_string(),
         content: format!(
             "Round complete: {} conversation ready for follow-up",
             conversation_kind
         ),
         turn: None,
+    });
+    // A side/subagent conversation remains attachable after a turn, so this
+    // is not SessionEnded or TaskComplete. DoneSignal is the same scoped,
+    // non-teardown turn boundary used by a primary supervised session.
+    bus.send(AppEvent::DoneSignal {
+        session_id,
+        message: done_message,
     });
 }
 

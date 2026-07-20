@@ -218,7 +218,7 @@ pub struct SettingsPayload {
     #[serde(default)]
     pub sandbox_extra_write_paths: Option<Vec<String>>,
     // External agent default (persisted to `[agent] default_backend`).
-    // Values: "codex" | "claude-code" | "gemini" | None (internal agent).
+    // Values: "codex" | "claude-code" | "kimi" | None (internal agent).
     #[serde(default)]
     pub external_agent: Option<String>,
     // Codex runtime config (persisted to `[agent.codex]`). Mirrored here so
@@ -271,6 +271,27 @@ pub struct SettingsPayload {
     pub claude_permission_mode: Option<String>,
     #[serde(default)]
     pub claude_allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub kimi_command: Option<String>,
+    #[serde(default)]
+    pub kimi_model: Option<String>,
+    #[serde(default)]
+    pub kimi_thinking: Option<String>,
+    #[serde(default)]
+    pub kimi_permission_mode: Option<String>,
+    #[serde(default)]
+    pub kimi_plan_mode: Option<bool>,
+    #[serde(default)]
+    pub kimi_swarm_mode: Option<bool>,
+    /// Kimi's exact active-tool override. `Some([])` means no optional tools;
+    /// `None` is only a mutation when `kimi_allowed_tools_cleared` is true.
+    #[serde(default)]
+    pub kimi_allowed_tools: Option<Vec<String>>,
+    /// Explicitly remove the override and restore Kimi's native profile
+    /// defaults. Needed because an omitted or JSON-null `Option` otherwise
+    /// means "leave this Settings field unchanged" on PATCH-like POSTs.
+    #[serde(default)]
+    pub kimi_allowed_tools_cleared: Option<bool>,
     // Per-category approval rules (persisted to `[approval]`). Exposed here
     // for the dashboard's "Approval rules" controls to populate the selects.
     // Live edits flow through the `set_approval_rule` ControlMsg, not through
@@ -409,6 +430,18 @@ pub(crate) fn settings_payload_from_config(
             &config.agent.claude_code.permission_mode,
         )),
         claude_allowed_tools: Some(config.agent.claude_code.allowed_tools.clone()),
+        kimi_command: Some(config.agent.kimi.command.clone()),
+        kimi_model: config.agent.kimi.model.clone(),
+        kimi_thinking: crate::project::normalize_kimi_thinking(
+            config.agent.kimi.thinking.as_deref(),
+        ),
+        kimi_permission_mode: Some(crate::project::normalize_kimi_permission_mode(
+            &config.agent.kimi.permission_mode,
+        )),
+        kimi_plan_mode: Some(config.agent.kimi.plan_mode),
+        kimi_swarm_mode: Some(config.agent.kimi.swarm_mode),
+        kimi_allowed_tools: config.agent.kimi.allowed_tools.clone(),
+        kimi_allowed_tools_cleared: Some(config.agent.kimi.allowed_tools.is_none()),
         approval_file_read: config.approval.file_read.as_str().to_string(),
         approval_file_write: config.approval.file_write.as_str().to_string(),
         approval_file_delete: config.approval.file_delete.as_str().to_string(),
@@ -637,6 +670,36 @@ pub(crate) fn apply_settings_payload(
             .filter(|t| !t.is_empty())
             .collect();
     }
+    if payload.kimi_command.is_some() {
+        config.agent.kimi.command =
+            normalize_settings_agent_command(payload.kimi_command.as_deref(), "kimi");
+    }
+    if payload.kimi_model.is_some() {
+        config.agent.kimi.model = payload
+            .kimi_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(ToString::to_string);
+    }
+    if payload.kimi_thinking.is_some() {
+        config.agent.kimi.thinking =
+            crate::project::normalize_kimi_thinking(payload.kimi_thinking.as_deref());
+    }
+    if let Some(mode) = payload.kimi_permission_mode.as_deref() {
+        config.agent.kimi.permission_mode = crate::project::normalize_kimi_permission_mode(mode);
+    }
+    if let Some(enabled) = payload.kimi_plan_mode {
+        config.agent.kimi.plan_mode = enabled;
+    }
+    if let Some(enabled) = payload.kimi_swarm_mode {
+        config.agent.kimi.swarm_mode = enabled;
+    }
+    if payload.kimi_allowed_tools_cleared == Some(true) {
+        config.agent.kimi.allowed_tools = None;
+    } else if let Some(tools) = payload.kimi_allowed_tools.as_deref() {
+        config.agent.kimi.allowed_tools = Some(normalize_kimi_allowed_tools(tools));
+    }
 }
 
 pub(crate) fn settings_post_result(
@@ -689,6 +752,12 @@ fn executable_repoint_denials(
         let next = normalize_settings_agent_command(payload.claude_command.as_deref(), "claude");
         if next != config.agent.claude_code.command {
             denied.push("claude_command");
+        }
+    }
+    if payload.kimi_command.is_some() {
+        let next = normalize_settings_agent_command(payload.kimi_command.as_deref(), "kimi");
+        if next != config.agent.kimi.command {
+            denied.push("kimi_command");
         }
     }
     denied
@@ -888,6 +957,56 @@ pub(crate) fn dispatch_agent_settings_control_msgs(bus: &EventBus, payload: &Set
             ControlMsg::SetClaudeAllowedTools { tools },
         ));
     }
+    if let Some(command) = payload.kimi_command.clone() {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetKimiCommand {
+            command,
+        }));
+    }
+    if payload.kimi_model.is_some() {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetKimiModel {
+            model: payload.kimi_model.clone(),
+        }));
+    }
+    if payload.kimi_thinking.is_some() {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetKimiThinking {
+            thinking: payload.kimi_thinking.clone(),
+        }));
+    }
+    if let Some(mode) = payload.kimi_permission_mode.clone() {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetKimiPermissionMode { mode },
+        ));
+    }
+    if let Some(enabled) = payload.kimi_plan_mode {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetKimiPlanMode {
+            enabled,
+        }));
+    }
+    if let Some(enabled) = payload.kimi_swarm_mode {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetKimiSwarmMode {
+            enabled,
+        }));
+    }
+    if payload.kimi_allowed_tools_cleared == Some(true) {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetKimiAllowedTools {
+            tools: None,
+        }));
+    } else if let Some(tools) = payload.kimi_allowed_tools.clone() {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetKimiAllowedTools {
+            tools: Some(tools),
+        }));
+    }
+}
+
+fn normalize_kimi_allowed_tools(tools: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for tool in tools {
+        let tool = tool.trim();
+        if !tool.is_empty() && !normalized.iter().any(|candidate| candidate == tool) {
+            normalized.push(tool.to_string());
+        }
+    }
+    normalized
 }
 
 /// Return JSON with boolean flags indicating which API keys are usable —
@@ -925,11 +1044,11 @@ pub(crate) fn project_root_response_body(project_root: Option<&Path>) -> String 
     .to_string()
 }
 
-/// Availability of the external-agent backends (Codex, Claude Code):
+/// Availability of the external-agent backends (Codex, Claude Code, Kimi):
 /// the configured command, whether it resolves to an executable, when this
 /// daemon last ran a session with it, and passive protocol-compatibility
 /// evidence for that exact artifact. The status path remains stat/read-only
-/// and never launches either CLI. Deliberately independent
+/// and never launches any CLI. Deliberately independent
 /// of provider fueling — external agents bring their own credentials, so
 /// the dashboard pairs this with the `fueled` flag instead of letting the
 /// first-run nudge claim an unfueled daemon can't do anything. `home`
@@ -1343,6 +1462,7 @@ mod tests {
             crate::project::Project::from_root(settings_root.path().to_path_buf()).unwrap();
         project.config.agent.codex.model = Some("gpt-5.6-sol".to_string());
         project.config.agent.claude_code.model = Some("fable".to_string());
+        project.config.agent.kimi.model = Some("k2.7 coding".to_string());
         project.save_config().unwrap();
         let runtime = RuntimeSettingsState {
             settings_root: Some(settings_root.path().to_path_buf()),
@@ -1354,6 +1474,7 @@ mod tests {
 
         assert_eq!(value["codex_model"], "gpt-5.6-sol");
         assert_eq!(value["claude_model"], "fable");
+        assert_eq!(value["kimi_model"], "k2.7 coding");
     }
 
     #[test]
@@ -1386,6 +1507,14 @@ mod tests {
         assert_eq!(payload.codex_sandbox, None);
         assert_eq!(payload.codex_approval_policy, None);
         assert_eq!(payload.codex_managed_context, None);
+        assert_eq!(payload.kimi_command, None);
+        assert_eq!(payload.kimi_model, None);
+        assert_eq!(payload.kimi_thinking, None);
+        assert_eq!(payload.kimi_permission_mode, None);
+        assert_eq!(payload.kimi_plan_mode, None);
+        assert_eq!(payload.kimi_swarm_mode, None);
+        assert_eq!(payload.kimi_allowed_tools, None);
+        assert_eq!(payload.kimi_allowed_tools_cleared, None);
         assert_eq!(payload.sandbox_enabled, None);
         assert_eq!(payload.sandbox_extra_write_paths, None);
 
@@ -1395,6 +1524,13 @@ mod tests {
         config.agent.codex.approval_policy = "never".to_string();
         config.agent.codex.managed_context = "managed".to_string();
         config.agent.codex.service_tier = Some("priority".to_string());
+        config.agent.kimi.command = "/keep/kimi".to_string();
+        config.agent.kimi.model = Some("keep-model".to_string());
+        config.agent.kimi.thinking = Some("keep-thinking".to_string());
+        config.agent.kimi.permission_mode = "auto".to_string();
+        config.agent.kimi.plan_mode = true;
+        config.agent.kimi.swarm_mode = true;
+        config.agent.kimi.allowed_tools = Some(vec!["Read".to_string()]);
         config.sandbox.enabled = Some(false);
         config.sandbox.extra_write_paths = vec!["/keep/me".to_string()];
         apply_settings_payload(&mut config, &payload);
@@ -1405,6 +1541,12 @@ mod tests {
         assert_eq!(config.agent.codex.approval_policy, "never");
         assert_eq!(config.agent.codex.managed_context, "managed");
         assert_eq!(config.agent.codex.service_tier.as_deref(), Some("priority"));
+        assert_eq!(config.agent.kimi.command, "/keep/kimi");
+        assert_eq!(config.agent.kimi.model.as_deref(), Some("keep-model"));
+        assert_eq!(config.agent.kimi.thinking.as_deref(), Some("keep-thinking"));
+        assert_eq!(config.agent.kimi.permission_mode, "auto");
+        assert!(config.agent.kimi.plan_mode);
+        assert!(config.agent.kimi.swarm_mode);
         // Older clients that omit the runtime-sandbox fields must not
         // clear the persisted [sandbox] config.
         assert_eq!(config.sandbox.enabled, Some(false));
@@ -1418,6 +1560,13 @@ mod tests {
         config.agent.codex.managed_context = "managed".to_string();
         config.agent.codex.service_tier = Some("priority".to_string());
         config.agent.claude_code.command = "/usr/local/bin/claude".to_string();
+        config.agent.kimi.command = "/usr/local/bin/kimi".to_string();
+        config.agent.kimi.model = Some("k2.7 coding".to_string());
+        config.agent.kimi.thinking = Some("high".to_string());
+        config.agent.kimi.permission_mode = "auto".to_string();
+        config.agent.kimi.plan_mode = true;
+        config.agent.kimi.swarm_mode = true;
+        config.agent.kimi.allowed_tools = Some(vec!["Read".to_string()]);
 
         let payload = settings_payload_from_config(&config);
         assert_eq!(
@@ -1450,6 +1599,14 @@ mod tests {
             payload.claude_command.as_deref(),
             Some("/usr/local/bin/claude")
         );
+        assert_eq!(payload.kimi_command.as_deref(), Some("/usr/local/bin/kimi"));
+        assert_eq!(payload.kimi_model.as_deref(), Some("k2.7 coding"));
+        assert_eq!(payload.kimi_thinking.as_deref(), Some("high"));
+        assert_eq!(payload.kimi_permission_mode.as_deref(), Some("auto"));
+        assert_eq!(payload.kimi_plan_mode, Some(true));
+        assert_eq!(payload.kimi_swarm_mode, Some(true));
+        assert_eq!(payload.kimi_allowed_tools, Some(vec!["Read".to_string()]));
+        assert_eq!(payload.kimi_allowed_tools_cleared, Some(false));
 
         let body = serde_json::json!({
             "cu_provider": null,
@@ -1476,7 +1633,15 @@ mod tests {
             "codex_approval_policy": "never",
             "codex_service_tier": "normal",
             "codex_managed_context": "true",
-            "claude_command": "  /opt/claude/bin/claude  "
+            "claude_command": "  /opt/claude/bin/claude  ",
+            "kimi_command": "  /opt/kimi/bin/kimi  ",
+            "kimi_model": " k2.7 coding ",
+            "kimi_thinking": " HIGH ",
+            "kimi_permission_mode": "bypass-permissions",
+            "kimi_plan_mode": false,
+            "kimi_swarm_mode": true,
+            "kimi_allowed_tools": [" Read ", "Write", "Read"],
+            "kimi_allowed_tools_cleared": false
         })
         .to_string();
 
@@ -1489,6 +1654,36 @@ mod tests {
         assert_eq!(config.agent.codex.service_tier.as_deref(), Some("standard"));
         assert_eq!(config.agent.codex.managed_context, "managed");
         assert_eq!(config.agent.claude_code.command, "/opt/claude/bin/claude");
+        assert_eq!(config.agent.kimi.command, "/opt/kimi/bin/kimi");
+        assert_eq!(config.agent.kimi.model.as_deref(), Some("k2.7 coding"));
+        assert_eq!(config.agent.kimi.thinking.as_deref(), Some("high"));
+        assert_eq!(config.agent.kimi.permission_mode, "yolo");
+        assert!(!config.agent.kimi.plan_mode);
+        assert!(config.agent.kimi.swarm_mode);
+        assert_eq!(
+            config.agent.kimi.allowed_tools,
+            Some(vec!["Read".to_string(), "Write".to_string()])
+        );
+    }
+
+    #[test]
+    fn kimi_allowed_tools_settings_preserve_empty_and_explicit_clear() {
+        let mut config = crate::project::ProjectConfig::default();
+        let mut payload = settings_payload_from_config(&config);
+        payload.kimi_allowed_tools = Some(Vec::new());
+        payload.kimi_allowed_tools_cleared = Some(false);
+        apply_settings_payload(&mut config, &payload);
+        assert_eq!(config.agent.kimi.allowed_tools, Some(Vec::new()));
+
+        let mut clear = settings_payload_from_config(&config);
+        clear.kimi_allowed_tools = None;
+        clear.kimi_allowed_tools_cleared = Some(true);
+        apply_settings_payload(&mut config, &clear);
+        assert_eq!(config.agent.kimi.allowed_tools, None);
+
+        let round_trip = settings_payload_from_config(&config);
+        assert_eq!(round_trip.kimi_allowed_tools, None);
+        assert_eq!(round_trip.kimi_allowed_tools_cleared, Some(true));
     }
 
     #[test]
@@ -1554,7 +1749,15 @@ mod tests {
             "codex_context_archive": "exact",
             "claude_model": "fable",
             "claude_permission_mode": "plan",
-            "claude_allowed_tools": ["Read"]
+            "claude_allowed_tools": ["Read"],
+            "kimi_command": "/opt/kimi/bin/kimi",
+            "kimi_model": "k2.7 coding",
+            "kimi_thinking": "high",
+            "kimi_permission_mode": "yolo",
+            "kimi_plan_mode": true,
+            "kimi_swarm_mode": true,
+            "kimi_allowed_tools": [],
+            "kimi_allowed_tools_cleared": false
         })
         .to_string();
 
@@ -1570,6 +1773,13 @@ mod tests {
         let mut saw_archive = false;
         let mut saw_claude_model = false;
         let mut saw_claude_permission = false;
+        let mut saw_kimi_command = false;
+        let mut saw_kimi_model = false;
+        let mut saw_kimi_thinking = false;
+        let mut saw_kimi_permission = false;
+        let mut saw_kimi_plan = false;
+        let mut saw_kimi_swarm = false;
+        let mut saw_kimi_allowed_tools = false;
         while let Ok(event) = rx.try_recv() {
             let AppEvent::ControlCommand(msg) = event else {
                 continue;
@@ -1611,6 +1821,34 @@ mod tests {
                     assert_eq!(mode, "plan");
                     saw_claude_permission = true;
                 }
+                ControlMsg::SetKimiCommand { command } => {
+                    assert_eq!(command, "/opt/kimi/bin/kimi");
+                    saw_kimi_command = true;
+                }
+                ControlMsg::SetKimiModel { model } => {
+                    assert_eq!(model.as_deref(), Some("k2.7 coding"));
+                    saw_kimi_model = true;
+                }
+                ControlMsg::SetKimiThinking { thinking } => {
+                    assert_eq!(thinking.as_deref(), Some("high"));
+                    saw_kimi_thinking = true;
+                }
+                ControlMsg::SetKimiPermissionMode { mode } => {
+                    assert_eq!(mode, "yolo");
+                    saw_kimi_permission = true;
+                }
+                ControlMsg::SetKimiPlanMode { enabled } => {
+                    assert!(enabled);
+                    saw_kimi_plan = true;
+                }
+                ControlMsg::SetKimiSwarmMode { enabled } => {
+                    assert!(enabled);
+                    saw_kimi_swarm = true;
+                }
+                ControlMsg::SetKimiAllowedTools { tools } => {
+                    assert_eq!(tools, Some(Vec::new()));
+                    saw_kimi_allowed_tools = true;
+                }
                 _ => {}
             }
         }
@@ -1626,6 +1864,19 @@ mod tests {
             saw_claude_permission,
             "SetClaudePermissionMode was not dispatched"
         );
+        assert!(saw_kimi_command, "SetKimiCommand was not dispatched");
+        assert!(saw_kimi_model, "SetKimiModel was not dispatched");
+        assert!(saw_kimi_thinking, "SetKimiThinking was not dispatched");
+        assert!(
+            saw_kimi_permission,
+            "SetKimiPermissionMode was not dispatched"
+        );
+        assert!(saw_kimi_plan, "SetKimiPlanMode was not dispatched");
+        assert!(saw_kimi_swarm, "SetKimiSwarmMode was not dispatched");
+        assert!(
+            saw_kimi_allowed_tools,
+            "SetKimiAllowedTools was not dispatched"
+        );
 
         // The synchronous TOML write still happened (read-after-write
         // consistency for an immediate GET /api/settings).
@@ -1633,6 +1884,8 @@ mod tests {
         assert!(saved.contains("managed_context = \"managed\""));
         assert!(saved.contains("model = \"gpt-5.6-sol\""));
         assert!(saved.contains("model = \"fable\""));
+        assert!(saved.contains("command = \"/opt/kimi/bin/kimi\""));
+        assert!(saved.contains("model = \"k2.7 coding\""));
     }
 
     // ── S5 golden transcripts: settings / keys family ──
@@ -2066,6 +2319,12 @@ mod tests {
                             | ControlMsg::SetClaudeModel { .. }
                             | ControlMsg::SetClaudePermissionMode { .. }
                             | ControlMsg::SetClaudeAllowedTools { .. }
+                            | ControlMsg::SetKimiCommand { .. }
+                            | ControlMsg::SetKimiModel { .. }
+                            | ControlMsg::SetKimiThinking { .. }
+                            | ControlMsg::SetKimiPermissionMode { .. }
+                            | ControlMsg::SetKimiPlanMode { .. }
+                            | ControlMsg::SetKimiSwarmMode { .. }
                     ),
                     "unexpected codex control msg for absent payload field: {msg:?}"
                 );
@@ -2236,6 +2495,7 @@ mod tests {
         let mut body = minimal_settings_body();
         body["codex_command"] = serde_json::json!("/tmp/evil-codex");
         body["claude_command"] = serde_json::json!("/tmp/evil-claude");
+        body["kimi_command"] = serde_json::json!("/tmp/evil-kimi");
 
         let (status, response) = settings_post_result_with_sandbox_apply(
             &body.to_string(),
@@ -2247,6 +2507,7 @@ mod tests {
         assert_eq!(status, 403, "{response}");
         assert!(response.contains("codex_command"), "{response}");
         assert!(response.contains("claude_command"), "{response}");
+        assert!(response.contains("kimi_command"), "{response}");
         assert!(
             !dir.path().join("intendant.toml").exists(),
             "denied save must not persist config"
@@ -2267,6 +2528,7 @@ mod tests {
             reloaded.config.agent.claude_code.command,
             "/tmp/evil-claude"
         );
+        assert_eq!(reloaded.config.agent.kimi.command, "/tmp/evil-kimi");
     }
 
     #[test]

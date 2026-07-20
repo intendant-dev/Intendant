@@ -19,6 +19,17 @@
 
 use super::*;
 
+/// Resolve the canonical composite id emitted for a persisted Kimi child
+/// (`<session_id>:<agent_id>`) to that child's wire. Unlike Claude's
+/// synthetic task ids, the native agent id and relationship already live in
+/// `state.json`; no correlation heuristic is needed.
+pub(crate) fn find_kimi_subagent_wire(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let (_, agent_id) = kimi_history::split_kimi_session_id(session_id)?;
+    agent_id?;
+    let location = kimi_history::find_kimi_session_from_home(home, session_id)?;
+    Some(location.selected_agent(session_id)?.wire_path.clone())
+}
+
 /// Sidecar metas are a handful of short fields; anything bigger is not a
 /// meta this resolver understands, and skipping it keeps the scan's read
 /// volume bounded by construction.

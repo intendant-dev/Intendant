@@ -4,12 +4,12 @@
 //! Resolution ladder for `{id}`: an Intendant wrapper session resolves to
 //! its canonical external identity first (so the catalog is derived from
 //! the backend's own transcript), then a plain native log dir, then the
-//! backend stores directly (a bare codex rollout id / claude session id).
+//! backend stores directly (a bare Codex rollout, Claude, or Kimi session id).
 
 use super::*;
 use crate::session_fork::{
-    claude_fork_points, codex_fork_points, native_fork_points, ForkPointCatalog, ForkPointQuery,
-    FORK_POINT_DEFAULT_LIMIT,
+    claude_fork_points, codex_fork_points, kimi_fork_points_from_history, native_fork_points,
+    ForkPointCatalog, ForkPointQuery, FORK_POINT_DEFAULT_LIMIT,
 };
 use std::io;
 use std::path::{Path, PathBuf};
@@ -121,6 +121,14 @@ fn resolve_fork_point_catalog(
     if let Some(transcript) = find_claude_session_file(home, session_id) {
         return claude_fork_points(session_id, session_id, &transcript, query).map(Some);
     }
+    if let Some(location) =
+        session_catalog::kimi_history::find_kimi_session_from_home(home, session_id)
+    {
+        let history = session_catalog::kimi_history::parse_kimi_session(location);
+        return Ok(Some(kimi_fork_points_from_history(
+            session_id, session_id, &history, query,
+        )));
+    }
     Ok(None)
 }
 
@@ -153,6 +161,22 @@ fn external_fork_point_catalog(
                 "transcript not found under the claude session store",
             )),
         },
+        "kimi" => {
+            match session_catalog::kimi_history::find_kimi_session_from_home(home, backend_id) {
+                Some(location) => {
+                    let history = session_catalog::kimi_history::parse_kimi_session(location);
+                    Ok(kimi_fork_points_from_history(
+                        session_id, backend_id, &history, query,
+                    ))
+                }
+                None => Ok(ForkPointCatalog::unsupported(
+                    session_id,
+                    "kimi",
+                    Some(backend_id),
+                    "session not found under the Kimi session store",
+                )),
+            }
+        }
         other => Ok(ForkPointCatalog::unsupported(
             session_id,
             other,
@@ -216,6 +240,33 @@ mod tests {
             body,
         )
         .expect("rollout");
+    }
+
+    fn seed_kimi_session(home: &Path, session_id: &str) {
+        let dir = home
+            .join(".kimi-code")
+            .join("sessions")
+            .join("project")
+            .join(session_id);
+        let wire_dir = dir.join("agents").join("main");
+        std::fs::create_dir_all(&wire_dir).expect("mkdir");
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::json!({
+                "workDir": "/tmp/project",
+                "agents": {"main": {"type": "main"}}
+            })
+            .to_string(),
+        )
+        .expect("state");
+        let lines = [
+            serde_json::json!({"type":"turn.prompt","input":[{"type":"text","text":"one"}],"origin":{"kind":"user"},"time":1}),
+            serde_json::json!({"type":"turn.prompt","input":[{"type":"text","text":"two"}],"origin":{"kind":"user"},"time":2}),
+            serde_json::json!({"type":"turn.prompt","input":[{"type":"text","text":"superseded"}],"origin":{"kind":"user"},"time":3}),
+            serde_json::json!({"type":"context.undo","count":1,"time":4}),
+        ];
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(wire_dir.join("wire.jsonl"), body).expect("wire");
     }
 
     #[test]
@@ -290,6 +341,30 @@ mod tests {
             .filter_map(|point| point["id"].as_str())
             .collect();
         assert_eq!(ids, vec!["head", "msg:a1"]);
+    }
+
+    #[test]
+    fn bare_kimi_id_resolves_to_active_turn_catalog() {
+        let home = tempfile::tempdir().expect("home");
+        let codex_root = home.path().join(".codex");
+        let session_id = "session_route_fork_points";
+        seed_kimi_session(home.path(), session_id);
+        let (status, body) = response_json(session_fork_points_response_with_roots(
+            &request_line(session_id, ""),
+            home.path(),
+            &codex_root,
+        ));
+        assert_eq!(status, 200);
+        assert_eq!(body["source"], "kimi");
+        assert_eq!(body["supported"], true);
+        let ids: Vec<&str> = body["fork_points"]
+            .as_array()
+            .expect("points")
+            .iter()
+            .filter_map(|point| point["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["head", "turn:1"]);
+        assert_eq!(body["fork_points"][0]["turn"], 2);
     }
 
     #[test]

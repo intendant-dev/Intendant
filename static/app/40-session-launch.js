@@ -161,7 +161,60 @@ function openSessionConfigModal(sessionOrId) {
       effortSel.value = String(meta.claude_effort || meta.claudeEffort || '').trim() || 'inherit';
     }
   }
+  const isKimi = source === 'kimi';
+  for (const rowId of ['session-config-kimi-model-row', 'session-config-kimi-model-custom-row',
+    'session-config-kimi-thinking-row', 'session-config-kimi-permission-row',
+    'session-config-kimi-plan-row', 'session-config-kimi-swarm-row',
+    'session-config-kimi-tools-mode-row', 'session-config-kimi-tools-row']) {
+    const row = document.getElementById(rowId);
+    if (row) row.style.display = isKimi ? '' : 'none';
+  }
+  if (isKimi) {
+    const knownModels = [
+      'kimi-code/kimi-for-coding',
+      'kimi-code/kimi-for-coding-highspeed',
+      'kimi-code/k3',
+    ];
+    const pinnedModel = String(meta.kimi_model || meta.kimiModel || '').trim();
+    const modelSel = document.getElementById('session-config-kimi-model');
+    const customInput = document.getElementById('session-config-kimi-model-custom');
+    if (modelSel) {
+      modelSel.value = !pinnedModel ? 'inherit'
+        : (knownModels.includes(pinnedModel) ? pinnedModel : '__custom__');
+    }
+    if (customInput) {
+      customInput.value = pinnedModel && !knownModels.includes(pinnedModel) ? pinnedModel : '';
+    }
+    const thinkingSel = document.getElementById('session-config-kimi-thinking');
+    if (thinkingSel) {
+      thinkingSel.value = String(meta.kimi_thinking || meta.kimiThinking || '').trim() || 'inherit';
+    }
+    const permissionSel = document.getElementById('session-config-kimi-permission-mode');
+    if (permissionSel) {
+      permissionSel.value =
+        String(meta.kimi_permission_mode || meta.kimiPermissionMode || '').trim() || 'inherit';
+    }
+    const boolPin = (snake, camel) => {
+      const value = meta[snake] ?? meta[camel];
+      return typeof value === 'boolean' ? String(value) : 'inherit';
+    };
+    const planSel = document.getElementById('session-config-kimi-plan-mode');
+    if (planSel) planSel.value = boolPin('kimi_plan_mode', 'kimiPlanMode');
+    const swarmSel = document.getElementById('session-config-kimi-swarm-mode');
+    if (swarmSel) swarmSel.value = boolPin('kimi_swarm_mode', 'kimiSwarmMode');
+    const pinnedTools = meta.kimi_allowed_tools ?? meta.kimiAllowedTools;
+    const tools = Array.isArray(pinnedTools)
+      ? normalizeKimiToolNames(pinnedTools)
+      : null;
+    renderKimiToolsEditor(
+      'session-config-kimi-tools-mode',
+      'session-config-kimi-allowed-tools',
+      tools,
+      'inherit',
+    );
+  }
   updateSessionConfigClaudeCustomRow();
+  updateSessionConfigKimiCustomRow();
   const status = document.getElementById('session-config-status');
   if (status) {
     status.className = 'session-config-status';
@@ -169,7 +222,9 @@ function openSessionConfigModal(sessionOrId) {
       ? 'Managed requires a patched Codex binary. Save & restart applies changes now.'
       : (isClaude
         ? 'Save applies model & permissions to the live session; tools & effort apply at the next launch (or Save & restart).'
-        : 'Save & restart applies changes now.');
+        : (isKimi
+          ? 'Save applies Kimi model, thinking, permissions, plan, swarm, and explicit tool sets live. Restoring Kimi profile-default tools requires Save & restart.'
+          : 'Save & restart applies changes now.'));
   }
   const modal = document.getElementById('session-config-modal');
   if (modal) modal.style.display = 'flex';
@@ -257,7 +312,8 @@ function handleSessionConfigResult(result) {
     pending.approvalPolicy,
     pending.mode,
     pending.archiveMode,
-    pending.claudeForm
+    pending.claudeForm,
+    pending.kimiForm
   );
   scheduleSessionsMetadataRefresh(200);
   showControlToast('success', pending.restart ? 'Launch config saved; restarting session' : 'Launch config saved');
@@ -298,7 +354,45 @@ function applyClaudePinsLocal(target, claudeForm, { snake }) {
   }
 }
 
-function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mode, archiveMode, claudeForm) {
+function applyKimiPinsLocal(target, kimiForm, { snake }) {
+  if (!kimiForm) return;
+  const keys = snake
+    ? {
+        model: 'kimi_model',
+        thinking: 'kimi_thinking',
+        permissionMode: 'kimi_permission_mode',
+        planMode: 'kimi_plan_mode',
+        swarmMode: 'kimi_swarm_mode',
+        allowedTools: 'kimi_allowed_tools',
+      }
+    : {
+        model: 'kimiModel',
+        thinking: 'kimiThinking',
+        permissionMode: 'kimiPermissionMode',
+        planMode: 'kimiPlanMode',
+        swarmMode: 'kimiSwarmMode',
+        allowedTools: 'kimiAllowedTools',
+      };
+  for (const key of ['model', 'thinking', 'permissionMode']) {
+    const value = kimiForm[key];
+    if (!value || value === 'inherit') delete target[keys[key]];
+    else target[keys[key]] = value;
+  }
+  for (const key of ['planMode', 'swarmMode']) {
+    const value = kimiForm[key];
+    if (!value || value === 'inherit') delete target[keys[key]];
+    else target[keys[key]] = value === 'true';
+  }
+  if (!kimiForm.allowedTools || kimiForm.allowedTools === 'inherit') {
+    delete target[keys.allowedTools];
+  } else if (kimiForm.allowedTools === 'none') {
+    target[keys.allowedTools] = [];
+  } else {
+    target[keys.allowedTools] = normalizeKimiToolNames(kimiForm.allowedTools);
+  }
+}
+
+function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mode, archiveMode, claudeForm, kimiForm) {
   const ids = Array.from(new Set([
     meta.sessionId,
     meta.backendSessionId,
@@ -322,6 +416,9 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
     };
     if (meta.source === 'claude-code') {
       applyClaudePinsLocal(next, claudeForm, { snake: false });
+    }
+    if (meta.source === 'kimi') {
+      applyKimiPinsLocal(next, kimiForm, { snake: false });
     }
     sessionMetadataById.set(id, next);
     if (sessionWindows.has(id)) updateSessionWindow(id, next);
@@ -367,6 +464,9 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
     if (meta.source === 'claude-code') {
       applyClaudePinsLocal(session, claudeForm, { snake: true });
     }
+    if (meta.source === 'kimi') {
+      applyKimiPinsLocal(session, kimiForm, { snake: true });
+    }
   }
   persistSessionWindowState();
 }
@@ -395,6 +495,49 @@ function onSessionConfigClaudeModelChange() {
 }
 window.onSessionConfigClaudeModelChange = onSessionConfigClaudeModelChange;
 
+function sessionConfigKimiFormValues() {
+  const modelChoice = document.getElementById('session-config-kimi-model')?.value || 'inherit';
+  const custom = document.getElementById('session-config-kimi-model-custom')?.value.trim() || '';
+  const toolsMode = document.getElementById('session-config-kimi-tools-mode')?.value || 'inherit';
+  const toolNames = normalizeKimiToolNames(
+    document.getElementById('session-config-kimi-allowed-tools')?.value || '',
+  );
+  const allowedTools = toolsMode === 'inherit'
+    ? 'inherit'
+    : (toolsMode === 'none' || toolNames.length === 0 ? 'none' : toolNames.join(','));
+  return {
+    model: modelChoice === '__custom__' ? (custom || 'inherit') : modelChoice,
+    thinking: document.getElementById('session-config-kimi-thinking')?.value || 'inherit',
+    permissionMode:
+      document.getElementById('session-config-kimi-permission-mode')?.value || 'inherit',
+    planMode: document.getElementById('session-config-kimi-plan-mode')?.value || 'inherit',
+    swarmMode: document.getElementById('session-config-kimi-swarm-mode')?.value || 'inherit',
+    allowedTools,
+  };
+}
+
+function updateSessionConfigKimiCustomRow() {
+  const sel = document.getElementById('session-config-kimi-model');
+  const row = document.getElementById('session-config-kimi-model-custom-row');
+  if (!sel || !row) return;
+  const visible = document.getElementById('session-config-kimi-model-row')?.style.display !== 'none';
+  row.style.display = visible && sel.value === '__custom__' ? '' : 'none';
+}
+function onSessionConfigKimiModelChange() {
+  updateSessionConfigKimiCustomRow();
+}
+window.onSessionConfigKimiModelChange = onSessionConfigKimiModelChange;
+
+function onSessionConfigKimiToolsModeChange() {
+  const mode = document.getElementById('session-config-kimi-tools-mode')?.value || 'inherit';
+  const input = document.getElementById('session-config-kimi-allowed-tools');
+  if (input) {
+    input.disabled = mode !== 'exact';
+    if (mode === 'exact') input.focus();
+  }
+}
+window.onSessionConfigKimiToolsModeChange = onSessionConfigKimiToolsModeChange;
+
 function saveSessionConfigModal(options = {}) {
   if (!sessionConfigEditing || !app) return;
   const command = document.getElementById('session-config-command')?.value.trim() || '';
@@ -415,6 +558,7 @@ function saveSessionConfigModal(options = {}) {
   // the explicit 'inherit' clear sentinel (a missing field would silently
   // KEEP an existing pin — see the supervisor's clear-before-merge dance).
   const claudeForm = sessionConfigClaudeFormValues();
+  const kimiForm = sessionConfigKimiFormValues();
   const payload = {
     action: 'configure_session_agent',
     session_id: sessionConfigEditing.sessionId,
@@ -433,6 +577,14 @@ function saveSessionConfigModal(options = {}) {
       claude_permission_mode: claudeForm.permissionMode,
       claude_allowed_tools: claudeForm.allowedTools,
       claude_effort: claudeForm.effort,
+    } : {}),
+    ...(sessionConfigEditing.source === 'kimi' ? {
+      kimi_model: kimiForm.model,
+      kimi_thinking: kimiForm.thinking,
+      kimi_permission_mode: kimiForm.permissionMode,
+      kimi_plan_mode: kimiForm.planMode,
+      kimi_swarm_mode: kimiForm.swarmMode,
+      kimi_allowed_tools: kimiForm.allowedTools,
     } : {}),
   };
   try {
@@ -456,6 +608,7 @@ function saveSessionConfigModal(options = {}) {
       mode,
       archiveMode,
       claudeForm: sessionConfigEditing.source === 'claude-code' ? claudeForm : null,
+      kimiForm: sessionConfigEditing.source === 'kimi' ? kimiForm : null,
       restart: options.restart === true,
       timeoutHandle: setTimeout(() => {
         const pending = sessionConfigSavePending;
@@ -492,6 +645,59 @@ function saveSessionConfigModal(options = {}) {
         dispatchCodexThreadAction(
           'permission-mode',
           { mode: claudeForm.permissionMode },
+          sessionConfigEditing.sessionId,
+        );
+      }
+    }
+    if (
+      sessionConfigEditing.source === 'kimi' &&
+      options.restart !== true &&
+      !sessionWindowIsDetached(sessionConfigEditing.sessionId)
+    ) {
+      const model = kimiForm.model === 'inherit' ? (controlKimiConfig.model || '') : kimiForm.model;
+      const thinking = kimiForm.thinking === 'inherit'
+        ? (controlKimiConfig.thinking || '')
+        : kimiForm.thinking;
+      const permissionMode = kimiForm.permissionMode === 'inherit'
+        ? (controlKimiConfig.permission_mode || 'manual')
+        : kimiForm.permissionMode;
+      const planEnabled = kimiForm.planMode === 'inherit'
+        ? !!controlKimiConfig.plan_mode
+        : kimiForm.planMode === 'true';
+      const swarmEnabled = kimiForm.swarmMode === 'inherit'
+        ? !!controlKimiConfig.swarm_mode
+        : kimiForm.swarmMode === 'true';
+      // An inherited Kimi value can legitimately be unset globally. Do not
+      // turn that absence into an invalid empty live mutation; the persisted
+      // per-session pin was already cleared above.
+      const liveModel = String(model || '').trim();
+      const liveThinking = String(thinking || '').trim();
+      if (liveModel) {
+        dispatchCodexThreadAction('model', { model: liveModel }, sessionConfigEditing.sessionId);
+      }
+      if (liveThinking) {
+        dispatchCodexThreadAction(
+          'thinking',
+          { thinking: liveThinking },
+          sessionConfigEditing.sessionId,
+        );
+      }
+      dispatchCodexThreadAction(
+        'permission-mode',
+        { mode: permissionMode },
+        sessionConfigEditing.sessionId,
+      );
+      dispatchCodexThreadAction('plan-mode', { enabled: planEnabled }, sessionConfigEditing.sessionId);
+      dispatchCodexThreadAction('swarm-mode', { enabled: swarmEnabled }, sessionConfigEditing.sessionId);
+      const effectiveTools = kimiForm.allowedTools === 'inherit'
+        ? controlKimiConfig.allowed_tools
+        : (kimiForm.allowedTools === 'none'
+          ? []
+          : normalizeKimiToolNames(kimiForm.allowedTools));
+      if (effectiveTools !== null) {
+        dispatchCodexThreadAction(
+          'tools-set',
+          { names: effectiveTools },
           sessionConfigEditing.sessionId,
         );
       }
@@ -617,15 +823,38 @@ const CODEX_THREAD_ACTION_SPECS = Object.freeze({
   fork: Object.freeze({ promptName: true }),
   side: Object.freeze({ promptSide: true }),
   review: Object.freeze({ promptReview: true }),
+  archive: Object.freeze({ confirm: 'Archive this backend thread? Its history remains restorable.' }),
+  restore: Object.freeze({}),
+  'context-clear': Object.freeze({
+    confirmTitle: 'Clear conversation context?',
+    confirm: 'Permanently clear the selected Kimi agent’s native conversation context? Intendant’s audit log remains, but Kimi will no longer receive the cleared context.',
+    confirmLabel: 'Clear context',
+  }),
   rename: Object.freeze({ promptRename: true }),
   goal: Object.freeze({ promptGoal: true }),
   'goal-get': Object.freeze({}),
   'goal-edit': Object.freeze({ promptGoalEdit: true }),
   'goal-pause': Object.freeze({}),
   'goal-resume': Object.freeze({}),
-  'goal-clear': Object.freeze({ confirm: 'Clear the current Codex goal?' }),
+  'goal-complete': Object.freeze({ confirm: 'Mark the current goal complete?' }),
+  'goal-budget-limited': Object.freeze({ confirm: 'Mark the current goal budget-limited?' }),
+  'goal-clear': Object.freeze({ confirm: 'Clear the current goal?' }),
   init: Object.freeze({}),
   'memory-reset': Object.freeze({}),
+  tasks: Object.freeze({}),
+  tools: Object.freeze({}),
+  models: Object.freeze({}),
+  'tools-set': Object.freeze({
+    promptTools: true,
+    confirmTitle: 'Replace active tools?',
+    confirm: 'Apply this exact active-tool set to the selected Kimi agent? An empty list disables every optional tool.',
+    confirmLabel: 'Apply tools',
+  }),
+  'tools-all': Object.freeze({
+    confirmTitle: 'Activate every tool?',
+    confirm: 'Activate every tool currently registered for the selected Kimi agent?',
+    confirmLabel: 'Activate all',
+  }),
 });
 
 function codexThreadActionSpec(op) {
@@ -635,7 +864,10 @@ function codexThreadActionSpec(op) {
 const SESSION_WINDOW_CODEX_ACTIONS = [
   { op: 'fork', label: 'Fork...', title: 'Fork this thread into a new session', ...CODEX_THREAD_ACTION_SPECS.fork },
   { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral context fork', ...CODEX_THREAD_ACTION_SPECS.side },
-  { op: 'fast', label: 'Fast', title: 'Toggle Codex Fast service tier for future turns' },
+  { op: 'review', label: 'Review changes...', title: 'Review the current working tree without modifying it', ...CODEX_THREAD_ACTION_SPECS.review },
+  { op: 'fast', label: 'Fast', title: 'Toggle the backend’s fast model or service tier for future turns' },
+  { op: 'models', label: 'Kimi model catalog', title: 'List the models configured in Kimi’s authenticated catalog' },
+  { op: 'undo', label: 'Undo last turn', title: 'Remove the latest backend conversation turn', ...CODEX_THREAD_ACTION_SPECS.undo },
   {
     label: 'Configure goal...',
     title: 'Configure this thread goal',
@@ -645,10 +877,25 @@ const SESSION_WINDOW_CODEX_ACTIONS = [
       { op: 'goal-edit', label: 'Edit goal...', title: 'Edit this thread goal objective', ...CODEX_THREAD_ACTION_SPECS['goal-edit'] },
       { op: 'goal-pause', label: 'Pause goal', title: 'Pause this thread goal' },
       { op: 'goal-resume', label: 'Resume goal', title: 'Resume this thread goal' },
+      { op: 'goal-complete', label: 'Mark complete', title: 'Mark this thread goal complete', ...CODEX_THREAD_ACTION_SPECS['goal-complete'] },
+      { op: 'goal-budget-limited', label: 'Mark budget-limited', title: 'Mark this thread goal budget-limited', ...CODEX_THREAD_ACTION_SPECS['goal-budget-limited'] },
       { op: 'goal-clear', label: 'Clear goal', title: 'Clear this thread goal', ...CODEX_THREAD_ACTION_SPECS['goal-clear'] },
     ],
   },
   { op: 'compact', label: 'Compact', title: 'Compact this thread history' },
+  { op: 'context-clear', label: 'Clear Kimi context...', title: 'Clear this Kimi agent’s native conversation context', ...CODEX_THREAD_ACTION_SPECS['context-clear'] },
+  { op: 'tasks', label: 'Background task status', title: 'List native background tasks' },
+  {
+    label: 'Kimi tools...',
+    title: 'Inspect or replace this Kimi agent’s active tools',
+    children: [
+      { op: 'tools', label: 'Tool status', title: 'List active and inactive tools for this Kimi agent' },
+      { op: 'tools-set', label: 'Set exact tools...', title: 'Replace this Kimi agent’s exact active-tool set', ...CODEX_THREAD_ACTION_SPECS['tools-set'] },
+      { op: 'tools-all', label: 'Activate all tools...', title: 'Activate every tool registered for this Kimi agent', ...CODEX_THREAD_ACTION_SPECS['tools-all'] },
+    ],
+  },
+  { op: 'archive', label: 'Archive thread...', title: 'Archive this backend thread', ...CODEX_THREAD_ACTION_SPECS.archive },
+  { op: 'restore', label: 'Restore thread', title: 'Restore this archived backend thread' },
 ];
 
 function flattenSessionWindowActions(actions, out = []) {
@@ -1743,16 +1990,42 @@ function sessionThreadActionOps(sessionId) {
 
 function sessionCodexFastMode(sessionId) {
   const capabilities = getSessionCapabilities(sessionId);
-  if (!capabilities) return null;
-  if (typeof capabilities.codexFastMode === 'boolean') return capabilities.codexFastMode;
-  const tier = String(capabilities.codexServiceTier || '').trim().toLowerCase();
-  if (!tier) return null;
-  return tier === 'priority' || tier === 'fast';
+  if (capabilities) {
+    if (typeof capabilities.codexFastMode === 'boolean') return capabilities.codexFastMode;
+    const tier = String(capabilities.codexServiceTier || '').trim().toLowerCase();
+    if (tier) return tier === 'priority' || tier === 'fast';
+  }
+  // Kimi's fast path is an official sibling K2.7 model, not a request
+  // service-tier bit. Its config-facts event is the authoritative live echo,
+  // so infer the same generic UI state from that model without polluting the
+  // legacy Codex-named capability fields.
+  const meta = sessionMetadataById.get(String(sessionId || '').trim()) || {};
+  const source = normalizeAgentId(meta.backendSource || meta.source || meta.sourceLabel || '');
+  if (source !== 'kimi') return null;
+  const model = String(meta.vitals?.config?.model || '').trim().toLowerCase();
+  if (model.endsWith('/kimi-for-coding-highspeed') || model === 'kimi-for-coding-highspeed') {
+    return true;
+  }
+  if (model.endsWith('/kimi-for-coding') || model === 'kimi-for-coding') {
+    return false;
+  }
+  return null;
 }
 
 function sessionCodexServiceTierTitle(sessionId) {
   const fastMode = sessionCodexFastMode(sessionId);
-  if (fastMode === null) return 'Codex service tier has not been reported for this session yet';
+  const meta = sessionMetadataById.get(String(sessionId || '').trim()) || {};
+  const source = normalizeAgentId(meta.backendSource || meta.source || meta.sourceLabel || '');
+  if (fastMode === null) {
+    return source === 'kimi'
+      ? 'Kimi has not reported a K2.7 normal/highspeed model for this session yet'
+      : 'Codex service tier has not been reported for this session yet';
+  }
+  if (source === 'kimi') {
+    return fastMode
+      ? 'Kimi K2.7 Coding Highspeed is selected for future turns; active turns continue unchanged'
+      : 'Kimi K2.7 Coding is selected for future turns';
+  }
   const capabilities = getSessionCapabilities(sessionId) || {};
   const rawTier = String(capabilities.codexServiceTier || '').trim();
   const suffix = rawTier ? ` (${rawTier})` : '';
@@ -1770,7 +2043,7 @@ function updateControlFastButtonState() {
     btn.classList.toggle('active', fastMode === true);
     if (fastMode === null) {
       btn.removeAttribute('aria-pressed');
-      btn.title = 'Toggle Codex Fast service tier for future turns (/fast)';
+      btn.title = 'Toggle the backend’s fast model or service tier for future turns (/fast)';
     } else {
       btn.setAttribute('aria-pressed', fastMode ? 'true' : 'false');
       btn.title = `${sessionCodexServiceTierTitle(sid)}. Click to toggle (/fast).`;
@@ -1801,17 +2074,24 @@ function sessionSupportsInterrupt(sessionId) {
 
 function codexThreadActionStateForSession(sessionId, op) {
   const normalized = String(op || '').trim().toLowerCase().replace(/_/g, '-');
+  const ops = sessionThreadActionOps(sessionId);
   if (sessionWindowIsSide(sessionId)) {
+    if (Array.isArray(ops)) {
+      return ops.includes(normalized)
+        ? { allowed: true, reason: '' }
+        : { allowed: false, reason: 'Unsupported in this /side window' };
+    }
     return codexThreadActionAllowedForSide(normalized)
       ? { allowed: true, reason: '' }
       : { allowed: false, reason: 'Unsupported in a /side window' };
   }
-  const ops = sessionThreadActionOps(sessionId);
   if (Array.isArray(ops) && !ops.includes(normalized)) {
     return { allowed: false, reason: 'Unsupported for this session' };
   }
   if (sessionWindowIsSubagent(sessionId)) {
-    return { allowed: false, reason: 'Unsupported for subagent threads' };
+    return Array.isArray(ops)
+      ? { allowed: true, reason: '' }
+      : { allowed: false, reason: 'Unsupported for subagent threads' };
   }
   // Thread actions operate on the attached backend thread, not on an
   // active turn. An attached idle backend can fork/side/compact; only
@@ -1921,12 +2201,12 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
   const advertisedOps = sessionThreadActionOps(sid);
   const opVisible = (op) => (Array.isArray(advertisedOps)
     ? advertisedOps.includes(String(op || '').trim())
-    : isCodex);
+    : (isCodex && !isSide && !sessionWindowIsSubagent(sid)));
   win.actionMenu?.querySelectorAll('[data-session-window-codex-action]').forEach(item => {
     const op = item.dataset.sessionWindowAction || '';
     const spec = sessionWindowCodexActionByOp(op);
     const state = codexThreadActionStateForSession(sid, op);
-    const visible = opVisible(op) && !isSide;
+    const visible = opVisible(op);
     item.classList.toggle('hidden', !visible);
     item.disabled = visible ? !state.allowed : false;
     if (op === 'fast' && state.allowed) {
@@ -1945,12 +2225,12 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
   win.actionMenu?.querySelectorAll('[data-session-window-codex-submenu]').forEach(submenu => {
     const childActions = Array.from(submenu.querySelectorAll('[data-session-window-codex-action]'));
     const anyChildVisible = childActions.some(item => !item.classList.contains('hidden'));
-    submenu.classList.toggle('hidden', !anyChildVisible || isSide);
-    if (!anyChildVisible || isSide) submenu.classList.remove('open');
+    submenu.classList.toggle('hidden', !anyChildVisible);
+    if (!anyChildVisible) submenu.classList.remove('open');
     const trigger = submenu.querySelector('[data-session-window-submenu-trigger]');
     const hasEnabledChild = childActions.some(item => !item.disabled && !item.classList.contains('hidden'));
     if (trigger) {
-      trigger.disabled = anyChildVisible && !isSide ? !hasEnabledChild : false;
+      trigger.disabled = anyChildVisible ? !hasEnabledChild : false;
       trigger.setAttribute('aria-disabled', trigger.disabled ? 'true' : 'false');
       trigger.setAttribute('aria-expanded', submenu.classList.contains('open') ? 'true' : 'false');
     }
@@ -1959,7 +2239,7 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
     const anyThreadActionVisible = !!win.actionMenu.querySelector(
       '[data-session-window-codex-action]:not(.hidden), [data-session-window-codex-submenu]:not(.hidden)'
     );
-    item.classList.toggle('hidden', !anyThreadActionVisible || isSide);
+    item.classList.toggle('hidden', !anyThreadActionVisible);
   });
 }
 
@@ -2348,13 +2628,12 @@ function sideCloseParamsForSession(sessionId) {
 }
 
 // Capability-driven: only a parent that advertises `side-close` can end the
-// side in-process (Codex). A respawned side (Claude Code /btw) is its own
-// live backend — no advertised op, so Stop session applies to it instead.
+// side in-process (Codex and Kimi). A respawned side (Claude Code /btw) is
+// its own live backend — no advertised op, so Stop session applies instead.
 function sideCloseSupportedForSession(sessionId) {
   const close = sideCloseParamsForSession(sessionId);
   if (!close) return false;
-  const parentMeta = sessionMetadataById.get(close.parentSessionId) || {};
-  const ops = (parentMeta.capabilities || {}).codexThreadActions;
+  const ops = sessionThreadActionOps(close.parentSessionId);
   return Array.isArray(ops) && ops.includes('side-close');
 }
 
@@ -2689,7 +2968,7 @@ async function chooseSessionWindowCloseAction(sessionId) {
     message: stopAvailability.ok
       ? 'Hide card only removes this card from this dashboard. Stop session ends the live backend and removes it from active dashboards.'
       : canCloseSide
-      ? 'Hide card only removes this card from this dashboard. Close side ends the side conversation in the parent Codex thread.'
+      ? 'Hide card only removes this card from this dashboard. Close side ends the side conversation in its parent backend thread.'
       : 'Hide card only removes this card from this dashboard.',
     warning: stopAvailability.ok
       ? 'Session history remains available either way.'
@@ -2741,4 +3020,3 @@ function attachSessionWindowAction(sessionId) {
   dispatchControlMsg(msg);
   showControlToast('info', `Attaching session ${shortSessionId(sid)}`);
 }
-

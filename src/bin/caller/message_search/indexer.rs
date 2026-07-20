@@ -24,6 +24,7 @@ use super::cursor::{CursorCheck, SourceCursor};
 use super::extract_claude::extract_claude_session;
 use super::extract_codex::extract_codex_session;
 use super::extract_intendant::extract_intendant_session;
+use super::extract_kimi::extract_kimi_session;
 use super::record::{Generation, Source};
 use super::store::{PublishOutcome, SessionShard, Snapshot, Store, RETENTION_MS};
 use std::collections::{HashMap, HashSet};
@@ -50,6 +51,9 @@ pub(crate) struct SweepRoots {
     /// Claude project roots: each directly contains per-project dirs of
     /// `<uuid>.jsonl` mains and `<uuid>/subagents/agent-*.jsonl` files.
     pub claude_project_roots: Vec<PathBuf>,
+    /// Kimi homes: each directly contains `session_index.jsonl` and
+    /// `sessions/<workdir-key>/session_<uuid>/`.
+    pub kimi_roots: Vec<PathBuf>,
     /// Staged lease entries (whole entry dirs): deleted once every
     /// transcript file inside was published — the drain half of the
     /// custody design (deletion never waited on us; indexing consumes the
@@ -134,6 +138,16 @@ impl Indexer {
             &mut stats,
         );
         self.sweep_claude(
+            roots,
+            &store,
+            &snapshot,
+            &cursor_by_path,
+            &mut seen_paths,
+            &mut failed_paths,
+            horizon,
+            &mut stats,
+        );
+        self.sweep_kimi(
             roots,
             &store,
             &snapshot,
@@ -616,6 +630,117 @@ impl Indexer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // one sweep's shared frame, threaded to each lane
+    fn sweep_kimi(
+        &mut self,
+        roots: &SweepRoots,
+        store: &Store,
+        snapshot: &Snapshot,
+        cursor_by_path: &HashMap<PathBuf, (String, SourceCursor)>,
+        seen_paths: &mut HashSet<PathBuf>,
+        failed_paths: &mut Vec<PathBuf>,
+        horizon_ms: i64,
+        stats: &mut SweepStats,
+    ) {
+        let mut locations = HashMap::<
+            String,
+            crate::web_gateway::session_catalog::kimi_history::KimiSessionLocation,
+        >::new();
+        for root in &roots.kimi_roots {
+            for location in crate::web_gateway::session_catalog::kimi_history::list_kimi_sessions_in(
+                root,
+                crate::web_gateway::session_catalog::kimi_history::KIMI_SESSION_SCAN_LIMIT,
+            ) {
+                let replace = locations
+                    .get(&location.session_id)
+                    .map(|current| location.activity_mtime() > current.activity_mtime())
+                    .unwrap_or(true);
+                if replace {
+                    locations.insert(location.session_id.clone(), location);
+                }
+            }
+        }
+        let mut locations = locations.into_values().collect::<Vec<_>>();
+        locations.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+
+        for location in locations {
+            let source_paths = location
+                .all_dependency_paths()
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>();
+            let newest_mtime = source_paths
+                .iter()
+                .map(|path| file_mtime_ms(path))
+                .max()
+                .unwrap_or(0);
+            if newest_mtime < horizon_ms {
+                continue;
+            }
+            for path in &source_paths {
+                seen_paths.insert(path.clone());
+            }
+            let session_key = format!("{}:{}", Source::Kimi.as_str(), location.session_id);
+            if snapshot.manifest.tombstones.contains_key(&session_key) {
+                continue;
+            }
+            let saved_source_count = snapshot
+                .manifest
+                .sessions
+                .get(&session_key)
+                .map(|entry| entry.cursors.len())
+                .unwrap_or(0);
+            let all_unchanged = saved_source_count == source_paths.len()
+                && source_paths.iter().all(|path| {
+                    cursor_by_path.get(path).is_some_and(|(key, cursor)| {
+                        key == &session_key && cursor.check() == CursorCheck::Unchanged
+                    })
+                });
+            if all_unchanged {
+                stats.skipped_unchanged += 1;
+                continue;
+            }
+            let primary = location
+                .agents
+                .iter()
+                .find(|agent| {
+                    agent.id == crate::web_gateway::session_catalog::kimi_history::KIMI_MAIN_AGENT
+                })
+                .map(|agent| agent.wire_path.clone())
+                .unwrap_or_else(|| location.state_path.clone());
+            if !cursor_by_path.contains_key(&primary)
+                && self.skip_known_unpublishable(&primary, stats)
+            {
+                continue;
+            }
+            stats.parsed += 1;
+            match extract_kimi_session(location) {
+                Ok((shard, cursors)) => {
+                    if shard.records.is_empty() {
+                        self.remember_unpublishable(&primary, cursors);
+                        continue;
+                    }
+                    self.publish(
+                        store,
+                        &session_key,
+                        shard,
+                        cursors,
+                        &primary,
+                        failed_paths,
+                        stats,
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[message-search] Kimi extract {} failed: {err}",
+                        primary.display()
+                    );
+                    failed_paths.push(primary);
+                    stats.failures += 1;
+                }
+            }
+        }
+    }
+
     fn skip_unchanged(
         &mut self,
         path: &Path,
@@ -772,12 +897,27 @@ pub(crate) fn resolve_production_roots() -> SweepRoots {
             crate::web_gateway::session_catalog::backend_lists::codex_dir(&user_home),
         ],
         claude_project_roots: vec![user_home.join(".claude").join("projects")],
+        kimi_roots: vec![
+            crate::web_gateway::session_catalog::kimi_history::kimi_home_in(&user_home),
+        ],
         staged_entries: Vec::new(),
     };
     add_registry_and_staged_roots(&staging.active, &staging.staging, &mut roots);
     let logs_root = roots.intendant_logs.clone();
     add_session_codex_home_roots(&logs_root, &mut roots);
+    add_session_kimi_home_roots(&logs_root, &mut roots);
     roots
+}
+
+/// Per-session Kimi home overrides mirror the Codex override lane. The
+/// launch/config writer owns the field; this read-only sweep merely makes
+/// those persisted sessions searchable.
+pub(crate) fn add_session_kimi_home_roots(logs_root: &Path, roots: &mut SweepRoots) {
+    for home in crate::session_config::persisted_kimi_homes_in_logs(logs_root) {
+        if !roots.kimi_roots.contains(&home) {
+            roots.kimi_roots.push(home);
+        }
+    }
 }
 
 /// Per-session `codex_home` overrides (docs-audit finding 2026-07-12): a
@@ -835,6 +975,7 @@ pub(crate) fn add_registry_and_staged_roots(
                 // (`sessions/` / `projects/`) — see the staging module.
                 Some("codex") => roots.codex_roots.push(home),
                 Some("claude-code") => roots.claude_project_roots.push(home.join("projects")),
+                Some("kimi") => roots.kimi_roots.push(home),
                 _ => {}
             }
         }
@@ -845,18 +986,48 @@ pub(crate) fn add_registry_and_staged_roots(
             if !path.is_dir() {
                 continue;
             }
-            // Entry layout mirrors the home it came from; a manifest
-            // names the source, but the dirs speak for themselves and a
-            // manifest-less entry (write failure) still drains.
-            if path.join("sessions").is_dir() || path.join("archived_sessions").is_dir() {
-                roots.codex_roots.push(path.clone());
-            }
-            if path.join("projects").is_dir() {
-                roots.claude_project_roots.push(path.join("projects"));
+            // `sessions/` is shared by Codex and Kimi, so the staging
+            // manifest is authoritative when present. A manifest-less
+            // remnant falls back to the producer shape (`state.json` +
+            // `agents/` marks Kimi); this keeps cleanup best-effort.
+            let source = std::fs::read_to_string(path.join("manifest.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|value| {
+                    value
+                        .get("source")
+                        .and_then(|source| source.as_str())
+                        .map(str::to_string)
+                });
+            match source.as_deref() {
+                Some("kimi") => roots.kimi_roots.push(path.clone()),
+                Some("claude-code") => {
+                    roots.claude_project_roots.push(path.join("projects"));
+                }
+                Some("codex") => roots.codex_roots.push(path.clone()),
+                _ if staged_entry_looks_like_kimi(&path) => roots.kimi_roots.push(path.clone()),
+                _ => {
+                    if path.join("sessions").is_dir() || path.join("archived_sessions").is_dir() {
+                        roots.codex_roots.push(path.clone());
+                    }
+                    if path.join("projects").is_dir() {
+                        roots.claude_project_roots.push(path.join("projects"));
+                    }
+                }
             }
             roots.staged_entries.push(path);
         }
     }
+}
+
+fn staged_entry_looks_like_kimi(entry: &Path) -> bool {
+    let mut state_files = Vec::new();
+    collect_suffix_files(&entry.join("sessions"), "state.json", 4, &mut state_files);
+    state_files.into_iter().any(|state| {
+        state
+            .parent()
+            .is_some_and(|session| session.join("agents").is_dir())
+    })
 }
 
 /// Boot wiring: the periodic sweep task. The first sweep runs one full
@@ -953,6 +1124,7 @@ mod tests {
             intendant_logs: tmp.join("logs"),
             codex_roots: vec![tmp.join("codex-home")],
             claude_project_roots: vec![tmp.join("claude-projects")],
+            kimi_roots: vec![tmp.join("kimi-home")],
             staged_entries: Vec::new(),
         }
     }
@@ -1331,6 +1503,176 @@ mod tests {
                 .text,
             "override rollout text"
         );
+    }
+
+    fn write_kimi_session(root: &Path, session_id: &str, text: &str) {
+        let dir = root.join("sessions").join("wd_repo").join(session_id);
+        std::fs::create_dir_all(dir.join("agents/main")).unwrap();
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::json!({
+                "createdAt": now_iso(-30),
+                "updatedAt": now_iso(-10),
+                "title": text,
+                "lastPrompt": text,
+                "workDir": "/repo",
+                "agents": {"main": {"type": "main", "parentAgentId": null}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        write_lines(
+            &dir.join("agents/main/wire.jsonl"),
+            &[
+                serde_json::json!({
+                    "type":"turn.prompt",
+                    "input":[{"type":"text","text":text}],
+                    "origin":{"kind":"user"},
+                    "time":now_ms() - 2_000
+                }),
+                serde_json::json!({
+                    "type":"context.append_loop_event",
+                    "event":{"type":"content.part","uuid":"answer","part":{"type":"text","text":format!("{text} answer")}},
+                    "time":now_ms() - 1_000
+                }),
+            ],
+        );
+    }
+
+    #[test]
+    fn persisted_kimi_bridge_home_is_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut roots = rig(tmp.path());
+        roots.kimi_roots.clear();
+        let bridge = tmp.path().join("private-kimi-bridge");
+        let session_id = "session_99999999-aaaa-bbbb-cccc-dddddddddddd";
+        write_kimi_session(&bridge, session_id, "bridge-only Kimi searchable");
+        let config_dir = roots.intendant_logs.join("kimi-wrapper");
+        let config = crate::session_config::SessionAgentConfig {
+            source: Some("kimi".to_string()),
+            kimi_home: Some(bridge.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        crate::session_config::write_log_dir_config(&config_dir, &config).unwrap();
+
+        let logs_root = roots.intendant_logs.clone();
+        add_session_kimi_home_roots(&logs_root, &mut roots);
+        assert_eq!(roots.kimi_roots, vec![bridge]);
+        let mut indexer = Indexer::default();
+        assert_eq!(indexer.sweep(&roots).published, 1);
+        assert_eq!(
+            Store::open(&roots.store_root)
+                .unwrap()
+                .snapshot()
+                .read_shard(&format!("kimi:{session_id}"))
+                .unwrap()
+                .records[0]
+                .text,
+            "bridge-only Kimi searchable"
+        );
+    }
+
+    #[test]
+    fn duplicate_kimi_roots_publish_only_the_newest_session_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut roots = rig(tmp.path());
+        roots.kimi_roots.clear();
+        let stale = tmp.path().join("stale-kimi");
+        let current = tmp.path().join("current-kimi");
+        let session_id = "session_88888888-aaaa-bbbb-cccc-dddddddddddd";
+        write_kimi_session(&stale, session_id, "stale duplicate");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        write_kimi_session(&current, session_id, "current duplicate");
+
+        // The stale mirror is deliberately last: root iteration order must
+        // not decide which copy owns the session shard.
+        roots.kimi_roots = vec![current.clone(), stale];
+        let mut indexer = Indexer::default();
+        assert_eq!(indexer.sweep(&roots).published, 1);
+        let snapshot = Store::open(&roots.store_root).unwrap().snapshot();
+        let key = format!("kimi:{session_id}");
+        let shard = snapshot.read_shard(&key).unwrap();
+        assert_eq!(shard.records[0].text, "current duplicate");
+        assert!(
+            snapshot.manifest.sessions[&key]
+                .cursors
+                .iter()
+                .all(|cursor| cursor.path.starts_with(&current)),
+            "only the newest mirror may own persisted cursors"
+        );
+    }
+
+    #[test]
+    fn kimi_active_and_staged_roots_publish_real_session_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut roots = rig(tmp.path());
+        roots.kimi_roots.clear();
+        let active_root = tmp.path().join("leased-active");
+        let staging_root = tmp.path().join("staging");
+        let live_home = tmp.path().join("leased-kimi-home");
+        let staged_home = staging_root.join("kimi-home-1");
+        write_kimi_session(
+            &live_home,
+            "session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "live Kimi searchable",
+        );
+        write_kimi_session(
+            &staged_home,
+            "session_11111111-2222-3333-4444-555555555555",
+            "staged Kimi searchable",
+        );
+        std::fs::create_dir_all(&active_root).unwrap();
+        std::fs::write(
+            active_root.join("kimi.json"),
+            serde_json::json!({
+                "schema":1,
+                "dir_name":"kimi-home",
+                "source":"kimi",
+                "home":live_home
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            staged_home.join("manifest.json"),
+            serde_json::json!({
+                "schema":1,
+                "dir_name":"kimi-home",
+                "source":"kimi",
+                "dirs":["sessions"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        add_registry_and_staged_roots(&active_root, &staging_root, &mut roots);
+        assert!(roots.kimi_roots.contains(&live_home));
+        assert!(roots.kimi_roots.contains(&staged_home));
+        assert!(
+            !roots.codex_roots.contains(&live_home) && !roots.codex_roots.contains(&staged_home),
+            "shared sessions/ layout must not misclassify Kimi as Codex"
+        );
+
+        let mut indexer = Indexer::default();
+        let stats = indexer.sweep(&roots);
+        assert_eq!(stats.published, 2);
+        assert_eq!(stats.drained_entries, 1);
+        let snapshot = Store::open(&roots.store_root).unwrap().snapshot();
+        for (id, text) in [
+            (
+                "session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "live Kimi searchable",
+            ),
+            (
+                "session_11111111-2222-3333-4444-555555555555",
+                "staged Kimi searchable",
+            ),
+        ] {
+            let shard = snapshot
+                .read_shard(&format!("kimi:{id}"))
+                .expect("Kimi shard");
+            assert_eq!(shard.records[0].source, Source::Kimi);
+            assert_eq!(shard.records[0].text, text);
+        }
     }
 
     #[test]

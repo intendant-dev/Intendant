@@ -70,6 +70,8 @@ mod routes_claude_auth;
 pub(crate) use routes_claude_auth::*;
 mod routes_codex_auth;
 pub(crate) use routes_codex_auth::*;
+mod routes_kimi_auth;
+pub(crate) use routes_kimi_auth::*;
 
 mod mcp_gate;
 pub(crate) use mcp_gate::*;
@@ -307,7 +309,7 @@ impl Default for WebGatewayConfig {
 // (~tens of seconds on a real corpus). One small JSON file per entry,
 // written atomically via tempfile+rename: daemons sharing a HOME can only
 // race toward equivalent content, never corrupt an entry. External
-// stores (~/.codex, ~/.claude, ~/.gemini) are never written — the index
+// stores (~/.codex, ~/.claude, ~/.kimi-code, ~/.gemini) are never written — the index
 // mirrors them under ~/.intendant/cache/session_index/.
 //
 // Entries carry a per-namespace schema stamp: when the value shape changes

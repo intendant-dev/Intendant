@@ -674,6 +674,7 @@ mod tests {
                 principal: None,
                 session_id: None,
                 kind: None,
+                source: None,
                 created_ms: 1,
             },
             status,
@@ -683,6 +684,9 @@ mod tests {
             effects: Vec::new(),
             ask: None,
             dismissed: None,
+            annotations: Vec::new(),
+            blockers: Vec::new(),
+            relies_on: Vec::new(),
         }
     }
 

@@ -3,7 +3,7 @@
 //! native event lane it consumes).
 //!
 //! Layering: the per-source extractors (`extract_intendant` /
-//! `extract_codex` / `extract_claude`) derive [`MessageRecord`]s +
+//! `extract_codex` / `extract_claude` / `extract_kimi`) derive [`MessageRecord`]s +
 //! [`SupersessionMark`]s per session from the canonical sources; the
 //! [`indexer`] sweep enumerates this box's sources (session logs, Codex
 //! and Claude homes, leased-active homes, staged lease remnants) and
@@ -20,6 +20,7 @@ pub(crate) mod cursor;
 mod extract_claude;
 mod extract_codex;
 mod extract_intendant;
+mod extract_kimi;
 mod indexer;
 mod query;
 mod record;

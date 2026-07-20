@@ -155,6 +155,23 @@ pub(crate) async fn serve_http_request(
     // a query parameter can no longer be shadowed by them.
     let (req_method, req_path, req_query) = parse_request_target(request_line);
 
+    // The dedicated session-MCP ingress serves exactly one path. Refuse
+    // everything else before any routing, preflight, or asset handling —
+    // a sandboxed shell probing this port must find /mcp or nothing.
+    if gateway_ingress.is_session_mcp() && req_path != "/mcp" {
+        use tokio::io::AsyncWriteExt;
+        let response = HttpResponse::with_content(
+            "403 Forbidden",
+            "text/plain; charset=utf-8",
+            "this listener serves session-scoped /mcp only\n",
+        )
+        .header("Cache-Control", "no-store")
+        .header("Connection", "close");
+        let _ = stream.write_all(&response.into_bytes()).await;
+        finalize_http_stream(&mut stream).await;
+        return;
+    }
+
     // Connect mode belongs on Connect's unprivileged hosted origin. If a
     // hosted page could navigate an mTLS-bearing browser to the daemon's own
     // origin with attacker-selected `connect_base`, privileged SPA code would
@@ -1563,6 +1580,35 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::KimiAuthStart => {
+                return handle_kimi_auth_start(
+                    stream,
+                    route_body,
+                    project_root,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::KimiAuthStatus => {
+                return handle_kimi_auth_status(
+                    stream,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::KimiAuthCancel => {
+                return handle_kimi_auth_cancel(
+                    stream,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::ExternalAgents => {
                 // The transport edge resolves the ambient home; the
                 // handler below it is path-parameterized (hermeticity
@@ -1912,6 +1958,7 @@ pub(crate) async fn serve_http_request(
                     tls_client_cert_fingerprint,
                     peer_addr,
                     bus.clone(),
+                    gateway_ingress.is_session_mcp(),
                 )
                 .await;
             }

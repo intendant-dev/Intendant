@@ -2,7 +2,7 @@
 
 The `--mcp` flag runs Intendant as a [Model Context Protocol](https://modelcontextprotocol.io/)
 server over stdio JSON-RPC (`src/bin/caller/mcp/`). It lets an external agent
-(Claude Code, Codex, etc.) observe and control Intendant through a broad
+(Claude Code, Codex, Kimi Code, etc.) observe and control Intendant through a broad
 operational tool surface: session actions, display/CU/frame tools, shared-view
 collaboration, live audio, managed context, and controller orchestration.
 Presentation-only dashboard affordances are not necessarily one-for-one tools.
@@ -388,7 +388,7 @@ Resources provide push-based observation via subscriptions. The server emits
 ## Controller Restart Workflow
 
 Use this when you want Intendant to trigger a controller re-init cycle safely
-(e.g. an external Codex/Claude controller relaunching itself).
+(e.g. an external Codex/Claude/Kimi controller relaunching itself).
 
 1. Call `schedule_controller_restart`; capture `restart_id` + `turn_complete_token`.
 2. Before ending the controlling agent's turn, call `controller_turn_complete`
@@ -427,7 +427,7 @@ Use this when you want Intendant to trigger a controller re-init cycle safely
 
 ### Controller recursion profile
 
-Recommended for Codex/Claude-style controllers:
+Recommended for Codex/Claude/Kimi-style controllers:
 
 - Set `auto_start_task=false` (or omit it — `false` is the default).
 - Use `restart_command` to relaunch the external controller process.

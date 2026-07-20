@@ -1536,6 +1536,354 @@ async fn ctl_session_note_posts_a_display_only_note_with_image() {
     .await;
 }
 
+/// F1 attribution coverage, end to end: a NATIVE supervised session runs
+/// `intendant ctl agenda add` as an ordinary shell command through the
+/// sandboxed runtime, and the parked item's durable actor is
+/// `agent_session` with that session's id — proof the session-scoped
+/// `INTENDANT_MCP_URL` injection reaches the runtime's command env and the
+/// gate resolves it (before this, native-session ctl recorded an anonymous
+/// `local_process`). The in-session command refuses to run without the
+/// injected URL, so a broken injection fails HERE and can never fall back
+/// onto some other daemon's default port.
+#[tokio::test]
+async fn native_session_ctl_agenda_add_attributes_to_the_session() {
+    let intendant = intendant_bin();
+    // Three steps, portable across sh and cmd (no POSIX-only syntax — the
+    // Windows runtime shells through cmd, where `[`/`{` broke this test in
+    // the merge queue). Step 1 echoes the injected URL: `%VAR%` expands on
+    // cmd while `$VAR` expands on sh, so EITHER platform puts
+    // `/mcp?session_id=` in the transcript iff the injection reached the
+    // runtime env. Step 2's expectation gates the actual ctl write on that
+    // proof (an unmet expectation is a loud provider error), so a broken
+    // injection can never fall back onto some other daemon's default port.
+    // Step 3 gates completion on ctl echoing the minted item back.
+    let script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Probing the injected bootstrap.",
+                  "tool_calls": [{ "name": "exec_command",
+                                   "arguments": { "nonce": 1, "command":
+                                       "echo INJECTED %INTENDANT_MCP_URL%$INTENDANT_MCP_URL" } }] },
+                { "expect_transcript_contains": "/mcp?session_id=",
+                  "content": "Parking the follow-up on the agenda.",
+                  // Unquoted binary path: cmd mishandles a quote-leading
+                  // command string (`'"C:\…\intendant.exe"' is not
+                  // recognized` — the second queue failure), and every CI
+                  // and fleet target path is space-free.
+                  "tool_calls": [{ "name": "exec_command",
+                                   "arguments": { "nonce": 2, "command": format!(
+                                       "{intendant} ctl --json agenda add parked-from-inside --task"
+                                   ) } }] },
+                { "expect_transcript_contains": "parked-from-inside",
+                  "content": "Parked.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "agenda write done" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let daemon = spawn_daemon(&client, &script).await;
+    let port = daemon.port;
+
+    // A SUPERVISED session (the dashboard's create_session lane — the
+    // supervisor launch arm that computes the bootstrap), not the daemon's
+    // resident head session. First control message can race startup on a
+    // saturated box; retry until session_started.
+    use futures_util::SinkExt;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+    let mut started = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "park an agenda follow-up",
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send create_session");
+        started = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("session_started")
+                && json
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|task| task.contains("agenda follow-up"))
+        })
+        .await;
+        if started.is_some() {
+            break;
+        }
+    }
+    let started = started.unwrap_or_else(|| {
+        panic!(
+            "create_session never started; daemon log:\n{}",
+            daemon.log_tail()
+        )
+    });
+    let session_id = started["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session_started must carry the id: {started}"))
+        .to_string();
+
+    // The durable proof: the item exists with session-grade attribution.
+    let item = poll_until(
+        "the agenda item parked from inside the session",
+        RUN_TIMEOUT,
+        || async {
+            let agenda =
+                http_get_json(&client, &format!("http://127.0.0.1:{port}/api/agenda")).await?;
+            agenda
+                .get("items")?
+                .as_array()?
+                .iter()
+                .find(|item| item["title"] == "parked-from-inside")
+                .cloned()
+        },
+        || {
+            format!(
+                "--- turn artifacts (runtime stdout/stderr) ---\n{}\n\
+                 --- session logs ---\n{}\n--- daemon log tail ---\n{}",
+                tail(&daemon.rig.turn_artifacts(), 4000),
+                tail(&daemon.rig.session_logs(), 3000),
+                daemon.log_tail()
+            )
+        },
+    )
+    .await;
+    let provenance = &item["provenance"];
+    assert_eq!(
+        provenance["kind"], "agent_session",
+        "ctl from inside a native session must attribute as the session, \
+         not local_process: {item}"
+    );
+    let recorded_sid = provenance["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("provenance must carry the session id: {item}"));
+    assert_eq!(
+        recorded_sid, session_id,
+        "the durable actor must be exactly the supervised session that ran \
+         the command: {item}"
+    );
+
+    // `--source` from an UNSUPERVISED caller (the ctl helper scrubs the
+    // bootstrap env): the item records `local_process` plus the
+    // self-described label as data beside the attribution — the exact
+    // inputs the card renders as "local ctl — self-described: LABEL".
+    let labeled = ctl(
+        &daemon,
+        &[
+            "agenda",
+            "add",
+            "labeled-from-hook",
+            "--task",
+            "--source",
+            "deploy-hook",
+        ],
+    )
+    .await;
+    assert!(labeled.status.success(), "{}", text_of(&labeled));
+    let agenda = http_get_json(&client, &format!("http://127.0.0.1:{port}/api/agenda"))
+        .await
+        .expect("GET /api/agenda");
+    let labeled_item = agenda["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|item| item["title"] == "labeled-from-hook")
+        .unwrap_or_else(|| panic!("labeled item missing from {agenda}"));
+    assert_eq!(labeled_item["provenance"]["source"], "deploy-hook");
+    assert_eq!(labeled_item["provenance"]["kind"], "local_process");
+    assert!(
+        labeled_item["provenance"].get("session_id").is_none(),
+        "a self-described label must never become session attribution: {labeled_item}"
+    );
+}
+
+/// F1.5 CLI discovery, hermetic: with `$INTENDANT` unset and a PATH that
+/// cannot resolve `intendant`, the skills' canonical resolver preamble
+/// finds the controller through the boot-written discovery descriptor
+/// (`<state root>/cli-path`, no jq needed) and a real `ctl agenda list`
+/// round-trips against the booted daemon. Unix-gated: the preamble is the
+/// skills' POSIX one-liner.
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_descriptor_resolves_the_cli_for_unsupervised_shells() {
+    let script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let daemon = spawn_daemon(&client, &script).await;
+    let port = daemon.port;
+
+    // The daemon's boot wrote the descriptor into the rig's state root.
+    let cli_path_file = daemon.rig.home.path().join(".intendant").join("cli-path");
+    let recorded = std::fs::read_to_string(&cli_path_file)
+        .unwrap_or_else(|e| panic!("boot must write {}: {e}", cli_path_file.display()));
+    assert_eq!(
+        recorded.trim(),
+        intendant_bin(),
+        "descriptor names this build"
+    );
+
+    // The exact canonical preamble every CLI-invoking skill carries
+    // (pinned against skills/ by the repo grep test).
+    let preamble = r#"INTENDANT="${INTENDANT:-$(command -v intendant || cat "${INTENDANT_HOME:-$HOME/.intendant}/cli-path" 2>/dev/null || echo intendant)}""#;
+    let shell = format!(
+        "{preamble}\necho RESOLVED=$INTENDANT\nexec \"$INTENDANT\" ctl --url http://127.0.0.1:{port}/mcp agenda list"
+    );
+    let output = tokio::process::Command::new("/bin/bash")
+        .arg("-c")
+        .arg(&shell)
+        .env_clear()
+        // A PATH with shell basics but no cargo bins: `command -v
+        // intendant` must fail so the descriptor is the resolving rung.
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", daemon.rig.home.path())
+        .output()
+        .await
+        .expect("run the resolver shell");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "resolver round-trip failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("RESOLVED={}", intendant_bin())),
+        "the descriptor rung must resolve this build's controller:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("open ·"),
+        "ctl agenda list must answer through the resolved CLI:\n{stdout}"
+    );
+}
+
+/// F3 owner start-now, end to end against the real binaries: one owner
+/// gesture (`ctl agenda start` — local_process is an owner surface) mints
+/// and approves a manifest from the item and fires it through the SAME
+/// scheduled lane as any timed firing — proven by the occurrence journal
+/// carrying exactly one prepared→started→completed arc and the DoneSignal
+/// outcome writing back to the item. Also proves the tenant edge refuses
+/// the combined verb to non-owner actors at the HTTP surface.
+#[tokio::test]
+async fn agenda_start_now_fires_one_occurrence_and_writes_back() {
+    const DONE_MESSAGE: &str = "start-now follow-through complete";
+    let script = serde_json::json!({
+        "profiles": [
+            { "match": "Agenda follow-through for item", "steps": [
+                { "content": "Working the started item.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": DONE_MESSAGE } }] }
+            ]},
+            { "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]}
+        ]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let daemon = spawn_daemon(&client, &script).await;
+    let port = daemon.port;
+
+    let added = ctl(
+        &daemon,
+        &["--json", "agenda", "add", "start-now-e2e-item", "--task"],
+    )
+    .await;
+    assert!(added.status.success(), "{}", text_of(&added));
+    let item_id = stdout_json(&added)["item"]["id"]
+        .as_str()
+        .expect("minted item id")
+        .to_string();
+
+    let started = ctl(&daemon, &["agenda", "start", &item_id[..10]]).await;
+    assert!(started.status.success(), "{}", text_of(&started));
+
+    // The outcome writes back through the standard lane.
+    let item = poll_until(
+        "the start-now outcome write-back",
+        RUN_TIMEOUT,
+        || async {
+            let agenda =
+                http_get_json(&client, &format!("http://127.0.0.1:{port}/api/agenda")).await?;
+            let item = agenda
+                .get("items")?
+                .as_array()?
+                .iter()
+                .find(|item| item["id"] == item_id.as_str())?
+                .clone();
+            (item.pointer("/effects/0/last_run/state")? == "completed").then_some(item)
+        },
+        || {
+            format!(
+                "--- session logs ---\n{}\n--- daemon log tail ---\n{}",
+                tail(&daemon.rig.session_logs(), 2000),
+                daemon.log_tail()
+            )
+        },
+    )
+    .await;
+    let run = &item["effects"][0]["last_run"];
+    assert_eq!(run["note"], DONE_MESSAGE, "{item}");
+    assert!(
+        run["session_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "{item}"
+    );
+    let occurrence_id = run["occurrence_id"].as_str().expect("occurrence id");
+    let approval = &item["effects"][0]["approval"];
+    assert_eq!(
+        approval["digest"], item["effects"][0]["digest"],
+        "the gesture's approval binds the minted digest: {item}"
+    );
+
+    // The occurrence journal carries exactly one arc for this firing:
+    // prepared → started → completed, one occurrence id, no duplicates.
+    let journal_path = daemon
+        .rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("agenda")
+        .join("occurrences.jsonl");
+    let journal = std::fs::read_to_string(&journal_path).expect("occurrence journal");
+    let states: Vec<String> = journal
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|row| row["occurrence_id"] == occurrence_id)
+        .filter_map(|row| row["state"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        states,
+        vec!["prepared", "started", "completed"],
+        "one clean occurrence arc, never a bypass:\n{journal}"
+    );
+
+    // The non-owner refusal (NotPermitted{verb:"start_now"} for
+    // agent_session/peer/unattributed/None) is pinned at unit level on
+    // the tenant-edge funnel every lane converges through
+    // (`start_now_is_owner_surface_and_binds_its_own_digest`).
+}
+
 /// Task #6 end to end, against the real binaries: a resumable upload
 /// rides direct HTTP as job create → capped raw chunks → commit,
 /// survives a "client restart" (re-list by handle, resume at the

@@ -53,7 +53,7 @@ for the headless `tests/e2e/` suite and demos) and requires
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. On macOS/Linux it also holds `access-certs/`; Windows keeps that store under the OS data directory instead. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), the Windows access-cert store, the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves), and the current macOS durable Memory plane at `~/.intendant/memory-plane` (which does not yet honor `INTENDANT_HOME`). |
+| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. On macOS/Linux it also holds `access-certs/`; Windows keeps that store under the OS data directory instead. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`, `~/.kimi-code`), the Windows access-cert store, the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves), and the current macOS durable Memory plane at `~/.intendant/memory-plane` (which does not yet honor `INTENDANT_HOME`). |
 | `INTENDANT_MEMORY_EPHEMERAL` | unset | Set to `1` to force the owner-plane Memory service to use an in-memory plane. With the variable unset, macOS attempts durable storage at `~/.intendant/memory-plane` and falls back softly to an honestly labeled ephemeral plane if bootstrap fails; Linux and Windows currently use the ephemeral plane. |
 | `INTENDANT_LOOPBACK_TOKEN` | unset | **Client-side only.** Explicit loopback admission token for `intendant ctl` and harnesses, overriding the automatic per-port file discovery (`<state root>/loopback-tokens/<port>.token`). Every daemon boot mints and persists that per-instance token (0600) and refuses tokenless loopback requests to owner-posture surfaces; see the trust-architecture chapter's "Loopback trust vs. the runtime sandbox". The daemon itself never reads this variable — a daemon-side env intake would leak into child processes — and the runtime child-environment allowlist never passes it to model-driven code. |
 
@@ -297,7 +297,7 @@ Routes coding tasks to an external CLI agent instead of the native loop (see
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `default_backend` | string | unset (use native) | `codex` or `claude-code` |
+| `default_backend` | string | unset (use native) | `codex`, `claude-code`, or `kimi` |
 
 `[agent.codex]`:
 
@@ -337,9 +337,28 @@ preserve Codex's normal user configuration inheritance.
 | `allowed_tools` | array | `[]` (all) | Restrict the tool set |
 | `max_budget_usd` | float | unset | CLI-enforced dollar backstop passed as `--max-budget-usd`; cumulative for the session, its resumes, AND its forks — a forked or `/btw` side child inherits the parent's counted spend (probed 2.1.206), so children of an exhausted parent fail immediately with the same hint. On exceed every further turn fails with `error_max_budget_usd` (surfaced as a backend error with a recovery hint). Must be positive: a zero/negative/non-finite value refuses the spawn instead of silently disarming (the CLI itself rejects `--max-budget-usd 0`) |
 
-Unknown or empty values for `approval_policy`, `sandbox`, `reasoning_effort`,
-are normalized to the safe default so a config typo cannot silently escalate
-privileges.
+`[agent.kimi]`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `command` | string | `kimi` | Path or command name for the Kimi Code binary |
+| `model` | string | unset | Model override. Blank inherits Kimi's configured default. The installed subscription catalog includes `kimi-code/kimi-for-coding` (K2.7 Coding), `kimi-code/kimi-for-coding-highspeed` (K2.7 Coding Highspeed), and `kimi-code/k3` (K3); a custom configured id is also accepted |
+| `thinking` | string | unset | Thinking-effort override. Blank/`inherit` leaves the selected model's Kimi default in control |
+| `permission_mode` | string | `manual` | `manual` (interactive approval), `auto`, or `yolo` (bypass). `default` is accepted as an alias for `manual` |
+| `plan_mode` | bool | `false` | Start new Kimi sessions in native plan mode |
+| `swarm_mode` | bool | `false` | Enable Kimi's native swarm/sub-agent mode |
+| `allowed_tools` | array or unset | unset | Exact active-tool names applied through Kimi's authenticated agent RPC. Unset leaves the current Kimi profile in control; `[]` intentionally disables every optional tool. This is not Claude's approval allowlist, whose empty value means unrestricted |
+
+All seven Kimi fields can be pinned per session. Model, thinking, permission,
+plan, swarm, and active-tool changes apply live to an attached session;
+changing the command requires restart. Intendant runs a private `kimi server`
+beneath a per-session bridge home, so concurrent Kimi sessions do not contend
+for the primary home's server lock and Intendant never edits the user's
+`~/.kimi-code/mcp.json`.
+
+Unknown or empty values for authority-shaped fields such as Codex
+`approval_policy`/`sandbox` and Kimi `permission_mode` are normalized to their
+safe defaults so a config typo cannot silently escalate privileges.
 
 ### `[live_audio]`
 
@@ -1077,6 +1096,15 @@ writable_roots = []
 command = "claude"
 permission_mode = "default"
 allowed_tools = []
+
+[agent.kimi]
+command = "kimi"
+# model = "kimi-code/kimi-for-coding"
+# thinking = "high"
+permission_mode = "manual"
+plan_mode = false
+swarm_mode = false
+# allowed_tools = ["AskUserQuestion", "Write"]
 
 [live_audio]
 enabled = false

@@ -190,7 +190,7 @@ html.ui-v2 #tab-stats .ui2-model-name {
   white-space: nowrap;
 }
 /* Source chips follow the design's session-source tint map:
-   native = iris, Codex = neutral, Claude Code = amber. */
+   native = iris, Codex = neutral, Claude Code = amber, Kimi = sky. */
 html.ui-v2 #tab-stats .ui2-model-chip {
   flex-shrink: 0;
   font: 400 10.5px var(--mono);
@@ -206,6 +206,10 @@ html.ui-v2 #tab-stats .ui2-model-chip.is-intendant {
 html.ui-v2 #tab-stats .ui2-model-chip.is-claude {
   background: rgba(var(--amber-rgb), .12);
   color: var(--amber);
+}
+html.ui-v2 #tab-stats .ui2-model-chip.is-kimi {
+  background: rgba(var(--sky-rgb), .12);
+  color: var(--sky);
 }
 html.ui-v2 #tab-stats .ui2-model-cost {
   margin-left: auto;

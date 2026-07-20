@@ -302,7 +302,7 @@ folded in), and the loop continues from the rehydrated turn. `session_meta.json`
 is updated with the new task.
 
 `conversation.jsonl` is specific to Intendant's **internal** agent. External
-backends (Codex / Claude Code) own their own conversation history; the
+backends (Codex / Claude Code / Kimi Code) own their own conversation history; the
 session supervisor resumes those through each backend's native resume token (see
 [Control Plane & Persistent Daemon](./control-plane-and-daemon.md) →
 `ResumeSession`), keyed by the session `source`.
@@ -327,8 +327,8 @@ session is an Intendant session or an external backend's. This lives in
 `session_names.rs`.
 
 - **Source normalization.** Free-form source strings collapse to a canonical set:
-  `intendant`, `codex`, `claude-code` (so `"claude code"` and `"cc"` map
-  correctly).
+  `intendant`, `codex`, `claude-code`, `kimi` (so `"claude code"`/`"cc"` and
+  `"kimi code"`/`"kimi-code"` map correctly).
 - **Intendant sessions** store the name directly in their own
   `session_meta.json` (`write_intendant_session_name`), located by id or prefix
   under `<state-root>/logs/`.
@@ -395,7 +395,7 @@ The message-search subsystem (`message_search/` — every module carries a doc
 header worth reading before changing it) maintains a rolling, message-only
 index over the last **14 days** of conversations on this box: native sessions
 via the message lane above, plus the supervised backends' own transcripts
-(Codex rollouts, Claude Code project files). It backs the dashboard's
+(Codex rollouts, Claude Code project files, and Kimi session/agent wires). It backs the dashboard's
 quick-search message lane and the ⌘K command palette, answering "where did we
 say X"
 from pre-extracted shards instead of raw-log scans. The exhaustive audit path
@@ -475,19 +475,21 @@ irreversible stamp. Mark kinds:
 | `TurnCount { num_turns }` | Codex `thread_rolled_back` | the last N still-active user turns (and their assistant records) supersede — bounded by what exists, so corrupt counts cannot loop |
 | `ItemAnchor { item_id, position }` | Codex item-anchored rewind | everything after the anchored item (or from it, `position: "before"`) supersedes |
 | `GenerationRestore { active_generation }` | Codex same-thread restore | records of generations newer than the restored one stop reading active |
+| `RecordIds { record_ids, reason, at_ms }` | Kimi `context.undo` | the exact main/child wire records identified by Kimi's undo become superseded while remaining searchable |
 
 Locators say where a hit lives in its source — opaque to clients, versioned by
 variant, and **frozen** (resolution verifies exactly the way extraction
 minted): `native_message_id` (a `conversation_message` id),
 `native_event` (legacy user-side: line number + content hash),
 `native_sidecar_span` (legacy assistant: file/offset/len + hash),
-`external_record_id` (Claude record `uuid`, Codex `response_item` id), and
+`external_record_id` (Claude record `uuid`, Codex `response_item` id, or
+Kimi agent-qualified wire record id), and
 `external_line` (generation + line + hash, for external records without a
 native id).
 
 ### The extractors
 
-All three are hermetic — every entry point takes its paths as parameters; only
+All four are hermetic — every entry point takes its paths as parameters; only
 the indexer's production edge resolves the real environment.
 
 - **Intendant** (`extract_intendant.rs`) — walks one session log dir
@@ -536,6 +538,21 @@ the indexer's production edge resolves the real environment.
   `tool_result` blocks, so the parent's copy of a subagent's final report is
   never double-indexed). This extractor **never emits supersession marks**:
   Claude Code has no rollback mechanism, and compaction is not supersession.
+- **Kimi Code** (`extract_kimi.rs`) — one native session consists of
+  `state.json` plus `agents/main/wire.jsonl` and zero or more
+  `agents/<agent-id>/wire.jsonl` files. Main and child prose publish under the
+  canonical parent session id; child records carry `subagent: true`, and every
+  record id is agent-qualified so equal wire ids cannot collide across agents.
+  Kimi `context.undo` becomes an exact `RecordIds` mark, keeping removed prose
+  findable with `superseded=true`. Reasoning and tool payloads are not indexed
+  as conversation messages. Parsing is fail-closed and bounded: an index is at
+  most 8 MiB with 256 KiB records, `state.json` is at most 2 MiB, an agent wire
+  is at most 64 MiB with 2 MiB records, and one hydrated session reads at most
+  128 MiB / 200,000 wire records across at most 256 agents. Session discovery
+  has both result and directory-entry budgets, and the catalog/search lanes
+  consider the newest 2,000 sessions rather than accepting an unbounded
+  `usize::MAX` scan. A live torn final JSONL record remains unconsumed for the
+  next sweep; an oversized record/file is never partially published.
 
 ### The indexer sweep
 
@@ -547,7 +564,8 @@ real file I/O and run under `spawn_blocking`. One sweep:
 - enumerates `<state-root>/logs/*/session.jsonl`, the Codex roots (the user's
   Codex home plus leased-active homes and staged lease entries), and the
   Claude project roots (`~/.claude/projects` plus the leased/staged
-  equivalents);
+  equivalents), plus Kimi homes (`~/.kimi-code`/`KIMI_CODE_HOME` and their
+  leased/staged equivalents);
 - checks each known file against its stored cursor (`cursor.rs`:
   `FileIdentity` + length + mtime + a 4 KiB prefix hash +
   `last_complete_line_offset`) — `Unchanged` skips without reading,
@@ -563,7 +581,7 @@ real file I/O and run under `spawn_blocking`. One sweep:
   inside it has been published.
 
 **Leased homes and custody** (`lease_transcript_staging.rs`): OAuth leases
-materialize private `CODEX_HOME`/`CLAUDE_CONFIG_DIR` roots that hold the
+materialize private `CODEX_HOME`/`CLAUDE_CONFIG_DIR`/`KIMI_CODE_HOME` roots that hold the
 borrowed secret *and* the agent's transcripts. Live homes are registered under
 `leased-active/` and indexed during the lease; on cleanup
 (expiry/revocation/shutdown/crash sweep) the transcript subdirectories are
@@ -594,7 +612,7 @@ owns transport, the freshness refresh, and a per-daemon concurrency cap of 2
 | Param | Meaning |
 |---|---|
 | `q` | required; ≤ 256 bytes, ≤ 8 whitespace-separated terms — **all terms must match within one message** |
-| `source` | comma list of `intendant`, `codex`, `claude-code`; empty or `all` = every source |
+| `source` | comma list of `intendant`, `codex`, `claude-code`, `kimi`; empty or `all` = every source |
 | `include_superseded` | default `true`: superseded hits are included and badged, hideable by the client |
 | `subagents` | default `true`: include Claude subagent records |
 | `cursor` | opaque continuation cursor from the previous page |

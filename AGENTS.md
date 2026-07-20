@@ -11,7 +11,7 @@
 
 ## What Intendant Is
 
-Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. A daemon-wide Agenda preserves parked intent, reminders, durable questions, and digest-approved scheduled sessions; the Memory plane preserves explicitly retrieved, provenance-labeled claims over a vendored owner-plane writer/reducer kernel. Beyond running its own agent loop, Intendant **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines**. It is provider-agnostic (OpenAI, Anthropic, Gemini) and cross-platform (macOS, Linux, Windows — all first-class). Its shipped trust anchors are local presence and an independently reached direct-mTLS dashboard; CLI and MCP provide automation, and the dashboard provides visual, voice, and phone control. The packaged macOS app contains a local mTLS bridge, but no Developer ID-signed/notarized release has been published for this alpha. An `-unsigned-dev` app artifact is not a distribution trust anchor.
+Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. A daemon-wide Agenda preserves parked intent, reminders, durable questions, and digest-approved scheduled sessions; the Memory plane preserves explicitly retrieved, provenance-labeled claims over a vendored owner-plane writer/reducer kernel. Beyond running its own agent loop, Intendant **supervises external coding agents** (Codex, Claude Code, Kimi Code) as managed backends and **federates with peer machines**. It is provider-agnostic (OpenAI, Anthropic, Gemini) and cross-platform (macOS, Linux, Windows — all first-class). Its shipped trust anchors are local presence and an independently reached direct-mTLS dashboard; CLI and MCP provide automation, and the dashboard provides visual, voice, and phone control. The packaged macOS app contains a local mTLS bridge, but no Developer ID-signed/notarized release has been published for this alpha. An `-unsigned-dev` app artifact is not a distribution trust anchor.
 
 Past the single box, daemons federate into a **network of agentic networks** — fleets owned by people and organizations, where owners grant other people and other daemons scoped access to their machines, infrastructure, and resources. Three pillars carry it: the **trust architecture** (authority is minted only by the local authority of the governed resource — plane-root capabilities govern plane data, daemon-local IAM governs daemon effects, and Connect mints neither; a hosted claim is discovery/route metadata and creates no principal or grant; the default binary fixes hosted provenance at the zero-permission `role:none` and treats rendezvous-controlled fleet WebPKI names as discovery-only, so shipped daemon control requires a trusted local or independently reached daemon-served direct/mTLS surface; org root keys sign grant documents and revocation lists), **credential custody** (sealed vault stores, time-boxed leases, and client egress exist, but the default build has no bridge from a Connect-origin account vault to a trusted daemon session; `.env` remains supported, and active full-credential OAuth leases temporarily materialize private auth files), and the **zero-install discovery client** (a browser tab can link a daemon with a single-use twelve-word claim code and find the fleet, but cannot control it). Connect remains self-hostable and is not an authority mint, but it is trusted for availability, account/route metadata, and the browser code and installers it serves. The name is the thesis: agents perform, orchestrators conduct, the Intendant runs the house — and answers to the owner.
 
@@ -33,7 +33,7 @@ Read the relevant chapter before changing a subsystem:
 |---|---|
 | Whole-system overview, the agent loop, streaming, caching | `docs/src/architecture.md` |
 | Native multi-agent orchestration (modes, sub-agents, worktrees) | `docs/src/multi-agent.md` |
-| Supervising Codex / Claude Code | `docs/src/external-agent-orchestration.md` |
+| Supervising Codex / Claude Code / Kimi Code | `docs/src/external-agent-orchestration.md` |
 | Control plane, persistent daemon, session lifecycle | `docs/src/control-plane-and-daemon.md` |
 | Daemon-wide Agenda, reminders/schedules, owner-plane Memory | `docs/src/agenda-and-memory.md` |
 | Runtime stdin/stdout JSON protocol | `docs/src/runtime-protocol.md` |
@@ -133,7 +133,7 @@ src/
 │   ├── sub_agent.rs, worktree.rs, worktree_inventory.rs, agent_runner.rs   # native multi-agent
 │   ├── managed_context_ops/, context_rewind.rs, fission_ledger.rs, fission_lifecycle.rs, lineage_ledger.rs   # managed context: pressure/rewinds/fission/lineage
 │   ├── session_fork/, message_search/   # backend-aware fork surgery; cross-backend transcript index
-│   ├── external_agent/         # supervise Codex / Claude Code (+ external_wrapper_index.rs)
+│   ├── external_agent/         # supervise Codex / Claude Code / Kimi Code (+ external_wrapper_index.rs)
 │   ├── access/                 # trust architecture: client keys, IAM, org roots/issuers/ORL, enrollment, peer identity policy + cert pinning, platform keystores
 │   ├── credential_leases.rs, credential_egress.rs, daemon_identity.rs, connect_rendezvous.rs   # credential custody; Connect client
 │   ├── peer/, web_tls.rs       # peer federation (transport, pairing; identity policy lives in access/); native HTTPS/WSS
@@ -145,7 +145,7 @@ src/
 │   ├── mcp/, mcp_client.rs, control.rs
 │   ├── transfer_store.rs, upload_store.rs, peer_file_transfer.rs   # transfer jobs; upload/attachment stores
 │   ├── session_log/, session_names.rs, session_vitals.rs, background_tasks.rs, project.rs, app_state_pricing.rs
-│   ├── auth_ceremony.rs, codex_auth_ceremony.rs, claude_auth_ceremony.rs, global_store.rs
+│   ├── auth_ceremony.rs, {codex,claude,kimi}_auth_ceremony.rs, global_store.rs
 │   ├── sandbox.rs, daemon_log_tee.rs, diagnostics.rs, …
 └── bin/connect/                # intendant-connect: hosted rendezvous (accounts, daemon claims, fleet sync, vault blobs, push, transparency log)
 crates/{presence-core, presence-web, station-web}   # WASM: shared presence types/tools/dispatch, browser presence client, Station renderer

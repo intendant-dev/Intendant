@@ -1,5 +1,5 @@
 //! The external-agent execution shape: run_external_agent_mode
-//! supervises a third-party coding CLI (Codex, Claude Code) as the
+//! supervises a third-party coding CLI (Codex, Claude Code, Kimi Code) as the
 //! session's backend, draining its events into the app event stream.
 
 // Same entangled class as the drain (external_events.rs): keeps the
@@ -29,6 +29,25 @@ fn warn_undeliverable_images(
             ));
         });
     }
+}
+
+/// Translate an idle backend cwd announcement without opening an observed
+/// turn. Kept as one shared predicate for the persistent-presence and
+/// standalone external loops: an unscoped announcement belongs to the primary
+/// conversation, while a scoped side/sub-agent announcement must not retarget
+/// the primary session's git locus.
+pub(crate) fn idle_external_cwd_event(
+    event_thread_id: &Option<String>,
+    session_id: &Option<String>,
+    alias_session_id: &Option<String>,
+    cwd: String,
+) -> Option<AppEvent> {
+    (!cwd.trim().is_empty()
+        && scoped_event_targets_config(event_thread_id, session_id, alias_session_id))
+    .then(|| AppEvent::SessionCwdAnnounced {
+        session_id: session_id.clone(),
+        cwd,
+    })
 }
 
 /// In-place backend respawn for reload-credentials (the dashboard's
@@ -201,6 +220,8 @@ pub(crate) async fn run_external_agent_mode(
         );
     } else if backend == external_agent::AgentBackend::ClaudeCode {
         emit_claude_code_session_capabilities(&bus, intendant_session_id.as_deref());
+    } else if backend == external_agent::AgentBackend::Kimi {
+        emit_kimi_session_capabilities(&bus, intendant_session_id.as_deref());
     }
     // Use one control receiver across idle waits and active turn drains.
     // A second parked receiver would retain mid-turn controls and replay them
@@ -214,6 +235,12 @@ pub(crate) async fn run_external_agent_mode(
     // the backend starts are buffered here and consumed at the first
     // idle/drain poll.
     let mut external_control_rx = bus.subscribe();
+    // Stop additionally rides the lossless intent lane. The shared broadcast
+    // receiver also carries high-volume model/context traffic and can lag
+    // exactly when a foreground session is asked to stop; the originating
+    // ControlCommand remains ordered and lossless here.
+    let mut external_intent_rx = bus.subscribe_intents();
+    let mut external_intent_open = true;
     let (mut agent, thread, mut event_rx) = match create_external_agent(
         &backend,
         &project,
@@ -315,6 +342,11 @@ pub(crate) async fn run_external_agent_mode(
         if live_session_id != intendant_session_id {
             emit_claude_code_session_capabilities(&bus, live_session_id.as_deref());
         }
+    } else if backend == external_agent::AgentBackend::Kimi {
+        emit_kimi_session_capabilities(&bus, intendant_session_id.as_deref());
+        if live_session_id != intendant_session_id {
+            emit_kimi_session_capabilities(&bus, live_session_id.as_deref());
+        }
     }
     if emit_session_started_after_identity {
         if let Some(session_id) = live_session_id.clone() {
@@ -353,6 +385,15 @@ pub(crate) async fn run_external_agent_mode(
         {
             claude_user_turn_state_from_history(&platform::home_dir(), session_id)
                 .unwrap_or_default()
+        }
+        (external_agent::AgentBackend::Kimi, Some(_), session_id)
+            if backend.thread_id_is_canonical(session_id) =>
+        {
+            crate::web_gateway::session_catalog::kimi_history::kimi_user_turn_state_from_history(
+                &platform::home_dir(),
+                session_id,
+            )
+            .unwrap_or_default()
         }
         // A `--fork-session` resume starts on the placeholder id — the
         // forked child announces its own id only mid-turn, after the
@@ -515,6 +556,28 @@ pub(crate) async fn run_external_agent_mode(
                     break FollowUpMessage::text(String::new());
                 }
                 tokio::select! {
+                    maybe_intent = external_intent_rx.recv(), if external_intent_open => {
+                        match maybe_intent {
+                            Some(event) => {
+                                if let Some(reason) = external_stop_reason_from_control_intent(
+                                    &event,
+                                    &live_session_id,
+                                    &drain_config.alias_session_id,
+                                    stats.announced_native_session_id.as_deref(),
+                                ) {
+                                    slog(&session_log, |l| {
+                                        l.info(&format!(
+                                            "Stop requested on lossless intent lane while idle: {reason}"
+                                        ))
+                                    });
+                                    stats.terminal_outcome = Some(reason);
+                                    break 'outer;
+                                }
+                            }
+                            None => external_intent_open = false,
+                        }
+                        continue;
+                    }
                     maybe_followup = follow_up_rx.recv() => {
                         match maybe_followup {
                             Some(followup) => {
@@ -602,6 +665,52 @@ pub(crate) async fn run_external_agent_mode(
                                 if let Some(child_thread_id) =
                                     scoped_event_codex_subagent_thread_id(&event_thread_id, &stats)
                                 {
+                                    if should_route_idle_external_child_interaction(
+                                        &backend, &event,
+                                    ) {
+                                        // Subscribe before checking the supervisor sender:
+                                        // a Stop before the subscription closes that sender,
+                                        // while a Stop after it is buffered here. The
+                                        // interaction wait can therefore never strand the
+                                        // backend after the supervisor removes this session.
+                                        let mut idle_interaction_lifecycle_rx =
+                                            bus.subscribe_intents();
+                                        if supervised_by_session_supervisor
+                                            && follow_up_rx.is_closed()
+                                        {
+                                            let reason =
+                                                "session stopped while awaiting child interaction"
+                                                    .to_string();
+                                            slog(&session_log, |l| l.info(&reason));
+                                            stats.terminal_outcome = Some(reason);
+                                            break 'outer;
+                                        }
+                                        let outcome = handle_idle_external_child_interaction(
+                                            agent.as_mut(),
+                                            &drain_config,
+                                            &mut stats,
+                                            child_thread_id,
+                                            event,
+                                            &mut idle_interaction_lifecycle_rx,
+                                        )
+                                        .await;
+                                        match outcome {
+                                            IdleExternalChildInteractionOutcome::Resolved => {
+                                                continue;
+                                            }
+                                            IdleExternalChildInteractionOutcome::StopRequested {
+                                                reason,
+                                            } => {
+                                                slog(&session_log, |l| {
+                                                    l.info(&format!(
+                                                        "Stop requested during idle child interaction: {reason}"
+                                                    ))
+                                                });
+                                                stats.terminal_outcome = Some(reason);
+                                                break 'outer;
+                                            }
+                                        }
+                                    }
                                     handle_idle_codex_subagent_event(
                                         &drain_config,
                                         &mut stats,
@@ -707,6 +816,26 @@ pub(crate) async fn run_external_agent_mode(
                                             session_id: drain_config.session_id.clone(),
                                             facts,
                                         });
+                                    }
+                                    external_agent::AgentEvent::CwdAnnounced { cwd } => {
+                                        // Working-directory announcements are
+                                        // ambient session metadata, not proof
+                                        // that a backend turn started. Kimi
+                                        // emits one while an empty-task
+                                        // resumed/forked wrapper attaches; if
+                                        // it falls into the observe drain
+                                        // below, that drain waits forever for
+                                        // a turn completion that can never
+                                        // arrive and the wrapper stops
+                                        // accepting follow-ups.
+                                        if let Some(event) = idle_external_cwd_event(
+                                            &event_thread_id,
+                                            &live_session_id,
+                                            &drain_config.alias_session_id,
+                                            cwd,
+                                        ) {
+                                            bus.send(event);
+                                        }
                                     }
                                     external_agent::AgentEvent::BackendError {
                                         message,
@@ -1344,6 +1473,7 @@ pub(crate) async fn run_external_agent_mode(
                                     open_side_threads.remove(&child_thread_id);
                                     side_rounds.remove(&child_thread_id);
                                     side_turn_revisions.remove(&child_thread_id);
+                                    emit_side_session_closed(&bus, child_thread_id);
                                 }
                             }
                             Ok(AppEvent::InterruptRequested { session_id })
@@ -3456,4 +3586,46 @@ pub(crate) async fn run_external_agent_mode(
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_cwd_announcement_is_housekeeping_for_the_primary_session() {
+        let session_id = Some("session-main".to_string());
+        let alias_session_id = Some("wrapper-main".to_string());
+
+        assert!(matches!(
+            idle_external_cwd_event(
+                &None,
+                &session_id,
+                &alias_session_id,
+                "/repo".to_string(),
+            ),
+            Some(AppEvent::SessionCwdAnnounced {
+                session_id: Some(id),
+                cwd,
+            }) if id == "session-main" && cwd == "/repo"
+        ));
+        assert!(idle_external_cwd_event(
+            &Some("wrapper-main".to_string()),
+            &session_id,
+            &alias_session_id,
+            "/repo".to_string(),
+        )
+        .is_some());
+        assert!(idle_external_cwd_event(
+            &Some("side-thread".to_string()),
+            &session_id,
+            &alias_session_id,
+            "/other".to_string(),
+        )
+        .is_none());
+        assert!(
+            idle_external_cwd_event(&None, &session_id, &alias_session_id, "  ".to_string(),)
+                .is_none()
+        );
+    }
 }

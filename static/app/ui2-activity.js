@@ -565,7 +565,7 @@ function ui2TagEntry(e) {
   if (e.classList.contains('ui2-raw-checked')) return;
   e.classList.add('ui2-raw-checked');
   const text = (e.querySelector('.log-content')?.textContent || '').trim();
-  if (/^\[(codex|claude(-code)?|backend) stderr\]/i.test(text)) {
+  if (/^\[(codex|claude(-code)?|kimi(-code)?|backend) stderr\]/i.test(text)) {
     e.classList.add('ui2-stderr');
   }
   if (e.classList.contains('source-steer')) {
