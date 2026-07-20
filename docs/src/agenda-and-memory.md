@@ -62,6 +62,8 @@ The supported commands are:
 
 - `add`, `patch`, `complete`, `reopen`, and `retire`;
 - `answer` for an open question (answering also resolves it);
+- `annotate`, `set_blocker`, `clear_blocker`, `add_relies_on`, and
+  `remove_relies_on` — the item's thread and gates (below);
 - `propose_effect`, `approve_effect`, and `revoke_effect` for a scheduled
   session.
 
@@ -74,6 +76,38 @@ A question is the durable, non-blocking counterpart to `ask_user`. Parking it
 does not stop a session. The owner can answer later, and a future session can
 read the reply from the item. Reopening an answered question clears the
 current reply view but not the historical operation.
+
+### Threads, blockers, and dependencies
+
+Three follow-through vocabularies extend items, all ordinary attributed
+operations in the same append-only log:
+
+- **Annotations** (`annotate`) append an attributed, timestamped note to an
+  item of any status — the thread under it. Full history folds; surfaces cap
+  the render with an expander. Intake caps each note at the body limit and
+  an item at 500 annotations (a pathology rail, not a budget).
+- **Blockers** (`set_blocker` / `clear_blocker`) state a human criterion —
+  "api access granted", "waiting on the vendor" — on an open item. **No
+  machinery evaluates blockers**: no watchers, no pollers, no condition
+  language. The daemon mints the blocker id at intake; clears are
+  operations, never deletions — a cleared blocker stays rendered as history
+  with the clearing actor. Setting and clearing are plain `agenda.write`
+  acts; the housekeeping mandate governs agent *conduct* (agents without a
+  mandate annotate with evidence instead of clearing), not capability.
+- **Dependencies** (`add_relies_on` / `remove_relies_on`) draw edges to
+  other items. A completed prerequisite satisfies the edge by pure
+  recomputation at read time; a **retired** prerequisite does not silently
+  satisfy — the dependent renders "prerequisite retired — review"; a target
+  missing from the fold renders "prerequisite missing"; cycles simply render
+  every member blocked (direct status lookup, nothing walks).
+
+**Blocked is derived presentation, never state.** An open item with any
+uncleared blocker or unsatisfied dependency renders a blocked chip, and
+list surfaces can filter on it (`ctl agenda list --blocked`, the dashboard
+filter) — but the value is computed at render time by each surface (the
+daemon ships the same pure helper for ctl and tests), never stored, never
+put on the wire, and never a notification trigger: the reminder lane
+remains the only thing that fires.
 
 ### Due reminders
 
