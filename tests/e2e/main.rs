@@ -1384,9 +1384,13 @@ async fn native_session_ctl_agenda_add_attributes_to_the_session() {
                                        "echo INJECTED %INTENDANT_MCP_URL%$INTENDANT_MCP_URL" } }] },
                 { "expect_transcript_contains": "/mcp?session_id=",
                   "content": "Parking the follow-up on the agenda.",
+                  // Unquoted binary path: cmd mishandles a quote-leading
+                  // command string (`'"C:\…\intendant.exe"' is not
+                  // recognized` — the second queue failure), and every CI
+                  // and fleet target path is space-free.
                   "tool_calls": [{ "name": "exec_command",
                                    "arguments": { "nonce": 2, "command": format!(
-                                       "\"{intendant}\" ctl --json agenda add parked-from-inside --task"
+                                       "{intendant} ctl --json agenda add parked-from-inside --task"
                                    ) } }] },
                 { "expect_transcript_contains": "parked-from-inside",
                   "content": "Parked.",
