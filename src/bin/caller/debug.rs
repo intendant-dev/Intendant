@@ -68,7 +68,16 @@ pub fn daemon_recordings_dir() -> PathBuf {
 /// macOS: opens a native browser window via `open`.
 #[cfg(target_os = "macos")]
 pub async fn setup_debug_screen(web_port: u16) -> Result<DebugScreen, String> {
-    let url = format!("http://localhost:{}/app?passive=1", web_port);
+    // The passive viewer is an owner surface like any dashboard tab: hand
+    // it this boot's loopback admission token (in-process value — no file
+    // read) or its WS/API calls would be refused. Argv exposure is
+    // transient (`open` exits immediately) on an operator-invoked debug
+    // path.
+    let url = format!(
+        "http://localhost:{}/app?passive=1&token={}",
+        web_port,
+        crate::loopback_token::loopback_admission_token()
+    );
 
     // On macOS, `open` launches the default browser — no virtual display needed.
     let browser = tokio::process::Command::new("open")
@@ -120,9 +129,15 @@ user_pref("datareporting.policy.dataSubmissionEnabled", false);
         let _ = std::fs::write(&user_js, prefs);
     }
 
-    // Launch Firefox in passive mode on the debug display
+    // Launch Firefox in passive mode on the debug display. Same
+    // loopback-admission handoff as the macOS arm: the viewer's WS/API
+    // calls need this boot's token.
     let display_arg = format!(":{}", display_id);
-    let url = format!("http://localhost:{}/app?passive=1", web_port);
+    let url = format!(
+        "http://localhost:{}/app?passive=1&token={}",
+        web_port,
+        crate::loopback_token::loopback_admission_token()
+    );
     let firefox = tokio::process::Command::new("firefox")
         .args([
             "-profile",

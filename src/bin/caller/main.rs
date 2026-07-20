@@ -58,6 +58,7 @@ mod lineage_ledger;
 mod linux_display_env;
 mod live_audio;
 mod live_audio_types;
+mod loopback_token;
 mod mcp;
 mod mcp_client;
 mod memory;

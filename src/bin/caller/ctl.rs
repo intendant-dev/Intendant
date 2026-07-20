@@ -20,6 +20,15 @@ struct Config {
     /// Outbound `Authorization: Bearer` for the resolved peer (its
     /// `[[peer]] bearer_token`); sent only in peer mode.
     bearer: Option<String>,
+    /// The local daemon's per-boot loopback admission token, discovered
+    /// with zero user action (`INTENDANT_LOOPBACK_TOKEN` env override,
+    /// else the per-port file under the state root). `None` in peer
+    /// mode, for non-loopback `--url` targets (the token must never
+    /// leave the box), and in supervised sessions (`INTENDANT_MCP_URL`
+    /// present): a session ctl keeps its injected, possibly
+    /// scope-limited lane rather than escalating itself to owner by
+    /// reading the file.
+    loopback_token: Option<String>,
 }
 
 #[derive(Debug)]
@@ -52,6 +61,7 @@ pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
                 call_tool(&client, &config, "get_status", Value::Object(Map::new())).await?;
             print_tool_response(response, &config, None)?;
         }
+        "dashboard-url" => run_dashboard_url(&config)?,
         "logs" => run_logs(&client, &config, &command[1..]).await?,
         "tools" | "tool" => run_tools(&client, &config, &command[1..]).await?,
         "display" => run_display(&client, &config, &command[1..]).await?,
@@ -184,10 +194,16 @@ fn parse_global_args(mut raw: Vec<String>) -> Result<(Config, Vec<String>), Stri
         }
         other => other,
     };
+    let from_session_env = !url_flag_given && !base_url.trim().is_empty();
     let base_url = if base_url.trim().is_empty() {
         format!("http://localhost:{port}/mcp")
     } else {
         base_url
+    };
+    let loopback_token = if peer.is_some() {
+        None
+    } else {
+        discover_loopback_token_for(&base_url, from_session_env)
     };
 
     Ok((
@@ -199,9 +215,80 @@ fn parse_global_args(mut raw: Vec<String>) -> Result<(Config, Vec<String>), Stri
             json: json_output,
             peer,
             bearer: None,
+            loopback_token,
         },
         command,
     ))
+}
+
+/// Print the local dashboard's owner URL — scheme from the daemon's
+/// per-instance sidecar, this boot's admission token attached — for
+/// service-mode daemons (no tty saw the boot print) and bare-URL muscle
+/// memory. Local-only: the token authenticates loopback admission and
+/// must never ride to a peer.
+fn run_dashboard_url(config: &Config) -> Result<(), String> {
+    if config.peer.is_some() {
+        return Err("dashboard-url is local-only; a peer publishes its own owner surfaces".into());
+    }
+    let url = reqwest::Url::parse(&config.base_url)
+        .map_err(|e| format!("invalid MCP URL '{}': {e}", config.base_url))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "cannot determine the daemon port from the MCP URL".to_string())?;
+    let home = crate::platform::intendant_home();
+    let scheme = std::fs::read_to_string(crate::loopback_token::loopback_sidecar_path(&home, port))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|meta| {
+            meta.get("scheme")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "http".to_string());
+    let token = config
+        .loopback_token
+        .clone()
+        .or_else(|| crate::loopback_token::discover_client_token(None, &home, port))
+        .ok_or_else(|| {
+            format!(
+                "no loopback admission token found for port {port} — is the daemon running \
+                 against this home? (expected {})",
+                crate::loopback_token::loopback_token_path(&home, port).display()
+            )
+        })?;
+    println!("{scheme}://127.0.0.1:{port}/?token={token}");
+    Ok(())
+}
+
+/// Zero-friction loopback-token discovery for local mode. The env
+/// override always wins (the owner said so); otherwise supervised
+/// sessions (base URL from `INTENDANT_MCP_URL`) get `None` — their
+/// injected `mcp_token` lane already authenticates at exactly the
+/// session's authority, and file discovery here would silently escalate
+/// scoped sessions to owner posture. Explicit `--url`/`--port`/default
+/// targets read the per-port token file, loopback hosts only.
+fn discover_loopback_token_for(base_url: &str, from_session_env: bool) -> Option<String> {
+    let env_override = std::env::var(crate::loopback_token::LOOPBACK_TOKEN_ENV).ok();
+    if let Some(explicit) = env_override.as_deref().map(str::trim) {
+        if !explicit.is_empty() {
+            return Some(explicit.to_string());
+        }
+    }
+    if from_session_env {
+        return None;
+    }
+    let url = reqwest::Url::parse(base_url).ok()?;
+    let host_is_loopback = match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => std::net::IpAddr::from(ip).to_canonical().is_loopback(),
+        Some(url::Host::Ipv6(ip)) => std::net::IpAddr::from(ip).to_canonical().is_loopback(),
+        None => false,
+    };
+    if !host_is_loopback {
+        return None;
+    }
+    let port = url.port_or_known_default()?;
+    crate::loopback_token::discover_client_token(None, &crate::platform::intendant_home(), port)
 }
 
 fn parse_output_flags(mut config: Config, raw: Vec<String>) -> (Config, Vec<String>) {
@@ -3024,6 +3111,11 @@ async fn rpc(
         "params": params,
     });
     let mut request = client.post(url).json(&body);
+    if config.peer.is_none() {
+        if let Some(token) = &config.loopback_token {
+            request = request.header(crate::loopback_token::LOOPBACK_TOKEN_HEADER, token);
+        }
+    }
     if config.peer.is_some() {
         // Opt into fail-closed peer semantics on the target gateway: without
         // a client cert the request is rejected instead of downgraded to an
@@ -3436,6 +3528,7 @@ Global flags:\n\
 \n\
 Commands:\n\
   status                    Get current status\n\
+  dashboard-url             Print the local dashboard URL carrying this boot's loopback admission token\n\
   logs                      Read log entries\n\
   tools                     Lazy MCP tool discovery and generic calls\n\
   display                   Displays, frames, screenshots, display claims\n\
@@ -4589,6 +4682,7 @@ mod tests {
             json: false,
             peer: None,
             bearer: None,
+            loopback_token: None,
         }
     }
 

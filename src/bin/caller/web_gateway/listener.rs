@@ -2121,14 +2121,21 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                             || remote_client_auth_missing)
                     {
                         use tokio::io::AsyncWriteExt;
-                        let body = serde_json::json!({
-                            "error": if remote_client_auth_missing {
-                                "verified client certificate or authenticated peer identity required for remote dashboard access"
-                            } else {
-                                "mTLS client certificate required"
-                            }
-                        })
-                        .to_string();
+                        // Local-but-tokenless gets the named token error,
+                        // not certificate guidance.
+                        let error_message = if direct_loopback_missing_admission_token(
+                            gateway_ingress,
+                            peer_addr,
+                            &header_text,
+                        ) {
+                            crate::loopback_token::refusal_error_message()
+                        } else if remote_client_auth_missing {
+                            "verified client certificate or authenticated peer identity required for remote dashboard access"
+                                .to_string()
+                        } else {
+                            "mTLS client certificate required".to_string()
+                        };
+                        let body = serde_json::json!({ "error": error_message }).to_string();
                         let response = HttpResponse::with_content(
                             "401 Unauthorized",
                             "application/json",
@@ -2207,6 +2214,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                             peer_connection_identity.as_ref(),
                             tls_client_cert_fingerprint.as_deref(),
                             tls_client_cert_present,
+                            crate::loopback_token::loopback_token_presented(&header_text),
                         ) {
                             Ok(grant) => grant,
                             Err(message) => {
@@ -3317,13 +3325,36 @@ mod tests {
         }
     }
 
+    /// Insert this process's loopback admission token after the request
+    /// line, the way every owner client presents it — raw-request tests
+    /// stopped being admissible tokenless when the loopback gate
+    /// shipped. Requests that already carry the header pass through.
+    fn with_test_loopback_token(request: &str) -> String {
+        if request
+            .to_ascii_lowercase()
+            .contains("\r\nx-intendant-loopback-token:")
+        {
+            return request.to_string();
+        }
+        request.replacen(
+            "\r\n",
+            &format!(
+                "\r\nx-intendant-loopback-token: {}\r\n",
+                crate::loopback_token::loopback_admission_token()
+            ),
+            1,
+        )
+    }
+
     async fn tls_request(
         addr: std::net::SocketAddr,
         server_cert: rustls::pki_types::CertificateDer<'static>,
         request: &str,
     ) -> String {
         let mut tls = tls_test_stream(addr, server_cert).await;
-        tls.write_all(request.as_bytes()).await.unwrap();
+        tls.write_all(with_test_loopback_token(request).as_bytes())
+            .await
+            .unwrap();
         let mut response = Vec::new();
         tokio::time::timeout(
             tokio::time::Duration::from_secs(10),
@@ -3341,7 +3372,12 @@ mod tests {
         request: &str,
     ) -> String {
         let mut tls = relay_tls_test_stream(addr, server_cert).await;
-        tls.write_all(request.as_bytes()).await.unwrap();
+        // Injected on the relay lane too — deliberately: the admission
+        // token must never make relay ingress trusted-local, so these
+        // tests' relay refusals hold WITH the token presented.
+        tls.write_all(with_test_loopback_token(request).as_bytes())
+            .await
+            .unwrap();
         let mut response = Vec::new();
         tokio::time::timeout(
             tokio::time::Duration::from_secs(10),
@@ -4005,7 +4041,11 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         // Send a Status control message
@@ -4061,7 +4101,11 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (_ws_tx, mut ws_rx) = ws.split();
 
@@ -4120,7 +4164,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .write_all(with_test_loopback_token("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
             .await
             .unwrap();
 
@@ -4180,7 +4224,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .write_all(with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
             .await
             .unwrap();
 
@@ -4234,7 +4278,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .write_all(with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -4313,7 +4357,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .write_all(with_test_loopback_token("GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -4423,7 +4467,11 @@ mod tests {
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         // Send presence_connect (new protocol)
@@ -4494,7 +4542,11 @@ mod tests {
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         ws.send(Message::Text(
@@ -4571,7 +4623,11 @@ mod tests {
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (_ws_tx_split, mut ws_rx) = ws.split();
 
@@ -4626,7 +4682,11 @@ mod tests {
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
         let (_ws, mut ws_rx) = tokio_tungstenite::connect_async(&url)
             .await
             .unwrap()
@@ -4690,7 +4750,11 @@ mod tests {
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
         let (_ws, mut ws_rx) = tokio_tungstenite::connect_async(&url)
             .await
             .unwrap()
@@ -4762,7 +4826,11 @@ mod tests {
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         // Send a check_status tool request
@@ -4824,7 +4892,11 @@ mod tests {
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         // Send an approve_action tool request
@@ -4891,7 +4963,11 @@ mod tests {
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         // Send presence_connect
@@ -4952,7 +5028,11 @@ mod tests {
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         // Send a control action (routes through EventBus regardless of active state)
@@ -5021,7 +5101,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"POST /session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .write_all(with_test_loopback_token("POST /session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())
             .await
             .unwrap();
 
@@ -5142,7 +5222,11 @@ mod tests {
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         // Send presence_connect
@@ -5198,7 +5282,11 @@ mod tests {
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
 
         // First browser connects — becomes active
         let (mut ws1, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -5289,7 +5377,11 @@ mod tests {
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
 
         // Browser 1 connects and becomes active
         let (ws1, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -5415,7 +5507,11 @@ mod tests {
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
 
         // First browser connects and becomes active
         let (mut ws1, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -5516,7 +5612,11 @@ mod tests {
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("ws://127.0.0.1:{}", port);
+        let url = format!(
+            "ws://127.0.0.1:{}/?token={}",
+            port,
+            crate::loopback_token::loopback_admission_token()
+        );
 
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (mut ws_tx, mut ws_rx) = ws.split();
@@ -5666,7 +5766,7 @@ mod tests {
         // Request 1: HTTP/1.1 defaults to keep-alive; the framed JSON
         // response advertises it and the connection stays open.
         stream
-            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
             .await
             .unwrap();
         let resp1 = read_one_http_response(&mut stream).await;
@@ -5681,7 +5781,7 @@ mod tests {
         // funnel (write_api_response): the rewritten header tail must
         // advertise keep-alive there too.
         stream
-            .write_all(b"GET /api/project-root HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(with_test_loopback_token("GET /api/project-root HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
             .await
             .unwrap();
         let resp2 = read_one_http_response(&mut stream).await;
@@ -5691,7 +5791,7 @@ mod tests {
 
         // Request 3: a static-asset chain arm, same connection still.
         stream
-            .write_all(b"GET /audio-processor.js HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(with_test_loopback_token("GET /audio-processor.js HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
             .await
             .unwrap();
         let resp3 = read_one_http_response(&mut stream).await;
@@ -5701,7 +5801,7 @@ mod tests {
         // Request 4 says close: the server honors it and the connection
         // ends cleanly right after the response.
         stream
-            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .write_all(with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
             .await
             .unwrap();
         let resp4 = read_one_http_response(&mut stream).await;
@@ -5729,7 +5829,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET /config HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .write_all(with_test_loopback_token("GET /config HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes())
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -5757,7 +5857,7 @@ mod tests {
 
         // Plain request first; the connection parks for reuse.
         stream
-            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
             .await
             .unwrap();
         let resp = read_one_http_response(&mut stream).await;
@@ -5767,10 +5867,15 @@ mod tests {
         // connection: the loop replays the captured head to the upgrade
         // handshake and hands the connection off — it must never keep
         // looping past an upgrade.
-        let (ws, upgrade_response) =
-            tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), stream)
-                .await
-                .expect("WS upgrade on a kept-alive connection");
+        let (ws, upgrade_response) = tokio_tungstenite::client_async(
+            format!(
+                "ws://127.0.0.1:{port}/ws?token={}",
+                crate::loopback_token::loopback_admission_token()
+            ),
+            stream,
+        )
+        .await
+        .expect("WS upgrade on a kept-alive connection");
         assert_eq!(
             upgrade_response.status(),
             tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS
@@ -5788,7 +5893,7 @@ mod tests {
             .unwrap();
         for i in 1..=KEEP_ALIVE_MAX_REQUESTS {
             stream
-                .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .write_all(with_test_loopback_token("GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
                 .await
                 .unwrap();
             let resp = read_one_http_response(&mut stream).await;

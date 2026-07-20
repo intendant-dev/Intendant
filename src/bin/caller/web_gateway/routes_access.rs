@@ -2763,6 +2763,7 @@ pub(crate) fn http_access_context(
     tls_client_cert_fingerprint: Option<&str>,
     tls_client_cert_present: bool,
     is_tls: bool,
+    trusted_local_admitted: bool,
 ) -> Result<HttpAccessContext, String> {
     if let Some(identity) = identity {
         return Ok(HttpAccessContext {
@@ -2785,6 +2786,14 @@ pub(crate) fn http_access_context(
             principal: browser_mtls_principal_for_state(&state, None, transport),
             iam_state: Some(state),
         });
+    }
+    // The certless fallback is the trusted-local owner lane. Its
+    // admission fact (direct loopback + per-boot token, or the /mcp
+    // token carve-out) is decided at the transport edge and passed in;
+    // minting root here without it would let any gate-bypassing path
+    // recreate tokenless loopback. Fail closed.
+    if !trusted_local_admitted {
+        return Err(crate::loopback_token::refusal_error_message());
     }
     Ok(HttpAccessContext {
         principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
@@ -2818,6 +2827,7 @@ pub(crate) fn dashboard_control_grant_for_client(
     identity: Option<&PeerConnectionIdentity>,
     tls_client_cert_fingerprint: Option<&str>,
     tls_client_cert_present: bool,
+    trusted_local_admitted: bool,
 ) -> Result<crate::dashboard_control::DashboardControlGrant, String> {
     if let Some(identity) = identity {
         return Ok(crate::dashboard_control::DashboardControlGrant::Peer {
@@ -2856,6 +2866,13 @@ pub(crate) fn dashboard_control_grant_for_client(
                 authority_memo: Default::default(),
             },
         );
+    }
+    // Same admission contract as `http_access_context`'s certless arm:
+    // TrustedLocal is the loopback owner lane, reachable only with the
+    // per-boot admission token. Callers refuse earlier with the named
+    // token error; this is the fail-closed backstop.
+    if !trusted_local_admitted {
+        return Err(crate::loopback_token::refusal_error_message());
     }
     Ok(crate::dashboard_control::DashboardControlGrant::TrustedLocal)
 }
@@ -3931,7 +3948,8 @@ mod tests {
         });
         crate::access::iam::save_state(tmp.path(), &state).unwrap();
 
-        let access = http_access_context(tmp.path(), None, Some("ab123"), true, true).unwrap();
+        let access =
+            http_access_context(tmp.path(), None, Some("ab123"), true, true, false).unwrap();
         assert_eq!(access.principal.kind, "browser_certificate");
         assert!(
             access
@@ -3958,8 +3976,15 @@ mod tests {
         let owner_fingerprint =
             crate::access::certs::read_owner_client_cert_fingerprint(tmp.path()).unwrap();
 
-        let request =
-            http_access_context(tmp.path(), None, Some(&owner_fingerprint), true, true).unwrap();
+        let request = http_access_context(
+            tmp.path(),
+            None,
+            Some(&owner_fingerprint),
+            true,
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(request.principal.kind, "browser_certificate");
         assert_eq!(request.principal.source, "browser-mtls-ungranted");
         assert_eq!(request.principal.role_id, "role:none");
@@ -3981,8 +4006,15 @@ mod tests {
             crate::access::iam::migrate_generated_browser_mtls_owner_root_at_startup(tmp.path())
                 .unwrap()
         );
-        let after_startup =
-            http_access_context(tmp.path(), None, Some(&owner_fingerprint), true, true).unwrap();
+        let after_startup = http_access_context(
+            tmp.path(),
+            None,
+            Some(&owner_fingerprint),
+            true,
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(after_startup.principal.role_id, "role:root");
     }
 
@@ -4019,7 +4051,8 @@ mod tests {
         )
         .unwrap();
 
-        let access = http_access_context(tmp.path(), None, Some("a1ce"), true, true).unwrap();
+        let access =
+            http_access_context(tmp.path(), None, Some("a1ce"), true, true, false).unwrap();
         let inspect = access.decision(crate::peer::access_policy::PeerOperation::AccessInspect);
         let manage = access.decision(crate::peer::access_policy::PeerOperation::AccessManage);
 
@@ -4065,7 +4098,8 @@ mod tests {
             &actor,
         )
         .unwrap();
-        let files_only = http_access_context(tmp.path(), None, Some("f11e"), true, true).unwrap();
+        let files_only =
+            http_access_context(tmp.path(), None, Some("f11e"), true, true, false).unwrap();
         assert!(files_only.decision(PeerOperation::FilesystemWrite).allowed);
         let relay = files_only.decision(PeerOperation::PeerUse);
         assert!(!relay.allowed);
@@ -4087,7 +4121,8 @@ mod tests {
                 &actor,
             )
             .unwrap();
-            let access = http_access_context(tmp.path(), None, Some(hex), true, true).unwrap();
+            let access =
+                http_access_context(tmp.path(), None, Some(hex), true, true, false).unwrap();
             assert!(
                 access.decision(PeerOperation::PeerUse).allowed,
                 "{role} should relay peer signaling"
@@ -4135,7 +4170,8 @@ mod tests {
             &actor,
         )
         .unwrap();
-        let scoped = http_access_context(tmp.path(), None, Some("f11e"), true, true).unwrap();
+        let scoped =
+            http_access_context(tmp.path(), None, Some("f11e"), true, true, false).unwrap();
         let scoped_grant = crate::dashboard_control::DashboardControlGrant::UserClient {
             principal: scoped.principal.clone(),
             iam_state: scoped.iam_state.clone().expect("scoped iam state"),
@@ -4243,7 +4279,8 @@ mod tests {
         assert_eq!(result["created_grant"], true);
         assert_eq!(result["iam"]["capabilities"]["write_api_available"], true);
 
-        let access = http_access_context(tmp.path(), None, Some("ab456"), true, true).unwrap();
+        let access =
+            http_access_context(tmp.path(), None, Some("ab456"), true, true, false).unwrap();
         assert_eq!(access.principal.kind, "browser_certificate");
         assert_eq!(access.principal.label, "Alice browser");
         assert!(
@@ -4289,7 +4326,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(updated["grant"]["status"], "revoked");
-        let access = http_access_context(tmp.path(), None, Some("cafe"), true, true).unwrap();
+        let access =
+            http_access_context(tmp.path(), None, Some("cafe"), true, true, false).unwrap();
         assert_eq!(access.principal.kind, "browser_certificate");
         assert!(
             !access
@@ -4471,7 +4509,8 @@ mod tests {
         crate::access::iam::save_state(tmp.path(), &state).unwrap();
 
         let grant =
-            dashboard_control_grant_for_client(tmp.path(), None, Some("AA:22"), true).unwrap();
+            dashboard_control_grant_for_client(tmp.path(), None, Some("AA:22"), true, false)
+                .unwrap();
         let crate::dashboard_control::DashboardControlGrant::UserClient { principal, .. } = grant
         else {
             panic!("a scoped mTLS certificate must not be upgraded to root");
@@ -4482,12 +4521,42 @@ mod tests {
         // neither the WebSocket nor DataChannel stage because the pre-session
         // gate sees no effective operation.
         let unknown =
-            dashboard_control_grant_for_client(tmp.path(), None, Some("BB:33"), true).unwrap();
+            dashboard_control_grant_for_client(tmp.path(), None, Some("BB:33"), true, false)
+                .unwrap();
         assert!(matches!(
             unknown,
             crate::dashboard_control::DashboardControlGrant::UserClient { .. }
         ));
         assert!(!unknown.has_any_effective_operation());
+    }
+
+    /// The certless fallback arms are the trusted-local owner lane; both
+    /// constructors fail closed unless the transport edge attests
+    /// loopback-token admission. A gate-bypassing path can therefore
+    /// never recreate tokenless-loopback root, and admitted callers mint
+    /// exactly the pre-token principals (no new vocabulary).
+    #[test]
+    fn certless_owner_lane_fails_closed_without_loopback_admission() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let refused = http_access_context(tmp.path(), None, None, false, false, false)
+            .expect_err("certless context without admission must refuse");
+        assert!(
+            refused.contains("loopback-tokens"),
+            "refusal must carry the named token guidance: {refused}"
+        );
+        let admitted = http_access_context(tmp.path(), None, None, false, false, true).unwrap();
+        assert_eq!(admitted.principal.id, "principal:root:dashboard");
+
+        let refused = dashboard_control_grant_for_client(tmp.path(), None, None, false, false)
+            .expect_err("certless grant without admission must refuse");
+        assert!(refused.contains("loopback-tokens"), "{refused}");
+        let admitted =
+            dashboard_control_grant_for_client(tmp.path(), None, None, false, true).unwrap();
+        assert!(matches!(
+            admitted,
+            crate::dashboard_control::DashboardControlGrant::TrustedLocal
+        ));
     }
 
     // ── S6 golden transcripts: access inspect/connect/tier family ──
@@ -4770,7 +4839,7 @@ mod tests {
             &actor,
         )
         .unwrap();
-        let context = http_access_context(tmp, None, Some("601d"), true, true).unwrap();
+        let context = http_access_context(tmp, None, Some("601d"), true, true, false).unwrap();
         assert!(
             !context
                 .decision(crate::peer::access_policy::PeerOperation::AccessManage)

@@ -138,6 +138,10 @@ pub(crate) fn seatbelt_credential_deny_clause() -> Result<String, String> {
     deny_dirs.push(state_root.join("access-certs"));
     deny_dirs.push(state_root.join("leased-auth"));
     deny_dirs.push(state_root.join("claude-auth"));
+    // Per-boot loopback admission tokens: reading one from a sandboxed
+    // shell would re-open the loopback owner surface the port guard
+    // closes (loopback_token.rs documents the envelope).
+    deny_dirs.push(state_root.join(crate::loopback_token::LOOPBACK_TOKEN_DIR));
     let mut deny_files: Vec<PathBuf> = vec![
         state_root.join("custody-audit.jsonl"),
         state_root.join("connect.toml"),
