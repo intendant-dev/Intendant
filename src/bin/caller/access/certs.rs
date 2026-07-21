@@ -202,8 +202,9 @@ pub fn ensure_certs(
     let p12_bytes =
         build_apple_compatible_p12(&client_key, &client_cert, &[ca_cert], label, &password)?;
     // The .p12 bundles the client private key — same owner-only-from-creation
-    // treatment as the bare key files.
-    intendant_core::state_paths::write_private_file(&cert_dir.join(CLIENT_P12), &p12_bytes)?;
+    // and custody-aware treatment as the bare key files.
+    crate::key_custody::write_key_material(&cert_dir.join(CLIENT_P12), &p12_bytes)
+        .map_err(AccessError)?;
     state::write_p12_password(cert_dir, &password)?;
 
     println!(":: certificates generated in {}", cert_dir.display());
@@ -256,7 +257,7 @@ pub fn issue_client_identity(cert_dir: &Path, label: &str) -> AccessResult<Issue
     }
 
     let ca_pem = std::fs::read_to_string(ca_path)?;
-    let ca_key_pem = std::fs::read_to_string(key_path)?;
+    let ca_key_pem = read_ca_key_pem(&key_path)?;
     let ca_key = KeyPair::from_pem(&ca_key_pem)?;
     let ca_issuer = issuer_from_pem(&ca_pem, ca_key)?;
     let (cert, key) = generate_client_cert(&ca_issuer, label)?;
@@ -298,7 +299,7 @@ pub fn issue_client_certificate_for_public_key(
     }
 
     let ca_pem = std::fs::read_to_string(ca_path)?;
-    let ca_key_pem = std::fs::read_to_string(key_path)?;
+    let ca_key_pem = read_ca_key_pem(&key_path)?;
     let ca_key = KeyPair::from_pem(&ca_key_pem)?;
     let ca_issuer = issuer_from_pem(&ca_pem, ca_key)?;
     let public_key = SubjectPublicKeyInfo::from_pem(public_key_pem)
@@ -310,7 +311,7 @@ pub fn issue_client_certificate_for_public_key(
 
 fn regenerate_server_cert(cert_dir: &Path, server_names: &ServerNames) -> AccessResult<()> {
     let ca_pem = std::fs::read_to_string(cert_dir.join(CA_CRT))?;
-    let ca_key_pem = std::fs::read_to_string(cert_dir.join(CA_KEY))?;
+    let ca_key_pem = read_ca_key_pem(&cert_dir.join(CA_KEY))?;
     let ca_key = KeyPair::from_pem(&ca_key_pem)?;
     let ca_issuer = issuer_from_pem(&ca_pem, ca_key)?;
 
@@ -589,10 +590,22 @@ fn write_pem_cert(path: &Path, cert: &Certificate) -> AccessResult<()> {
 }
 
 /// Private keys are 0600 on Unix from the moment the file exists — never
-/// write-then-chmod (Windows relies on the profile ACL).
+/// write-then-chmod (Windows relies on the profile ACL). Custody-aware:
+/// regenerating a migrated key refreshes its custody entry instead of
+/// regressing it to a plain file.
 fn write_pem_private_key(path: &Path, key: &KeyPair) -> AccessResult<()> {
-    intendant_core::state_paths::write_private_file(path, key.serialize_pem())?;
+    crate::key_custody::write_key_material(path, key.serialize_pem().as_bytes())
+        .map_err(AccessError)?;
     Ok(())
+}
+
+/// Read the CA private key as PEM text through the custody seam — a
+/// plain file serves as-is, a migrated key comes out of custody.
+fn read_ca_key_pem(path: &Path) -> AccessResult<String> {
+    let material = crate::key_custody::read_key_material(path).map_err(AccessError)?;
+    let pem = std::str::from_utf8(material.as_bytes())
+        .map_err(|e| AccessError(format!("CA key {} is not UTF-8 PEM: {e}", path.display())))?;
+    Ok(pem.to_string())
 }
 
 /// Read a PEM-encoded certificate file and return its DER bytes.

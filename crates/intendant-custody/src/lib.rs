@@ -25,6 +25,28 @@ pub use file_backend::PlainFileBackend;
 pub use names::validate_entry_name;
 pub use wrapped::{WrappedBlobBackend, WrappingKeyProvider};
 
+/// Exit codes for the `custody-probe` helper binary (the acceptance
+/// rig's unregistered caller). The acceptance test asserts on these, so
+/// the probe's outcome vocabulary is pinned here rather than duplicated.
+pub mod probe_exit {
+    /// The probe retrieved the entry (caller discrimination FAILED —
+    /// an unregistered binary read the wrapping key silently).
+    pub const RETRIEVED: i32 = 0;
+    /// Bad invocation / non-macOS.
+    pub const USAGE: i32 = 2;
+    /// [`crate::CustodyError::DeniedNonInteractive`] — the acceptance
+    /// deny class.
+    pub const DENIED_NON_INTERACTIVE: i32 = 3;
+    /// [`crate::CustodyError::NotFound`].
+    pub const NOT_FOUND: i32 = 4;
+    /// [`crate::CustodyError::Unsealable`].
+    pub const UNSEALABLE: i32 = 5;
+    /// [`crate::CustodyError::BackendUnavailable`].
+    pub const BACKEND_UNAVAILABLE: i32 = 6;
+    /// Any other custody error.
+    pub const OTHER: i32 = 7;
+}
+
 use zeroize::Zeroizing;
 
 /// Retrieved secret material. The buffer is zeroized on drop; callers
@@ -32,7 +54,10 @@ use zeroize::Zeroizing;
 pub struct Secret(Zeroizing<Vec<u8>>);
 
 impl Secret {
-    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+    /// Wrap material in a zeroizing buffer. Public so callers whose
+    /// fallback lane reads plain files can hand both lanes' material to
+    /// consumers under one hygiene type.
+    pub fn new(bytes: Vec<u8>) -> Self {
         Self(Zeroizing::new(bytes))
     }
 

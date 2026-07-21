@@ -2921,6 +2921,7 @@ dependencies = [
  "image",
  "instant-acme",
  "intendant-core",
+ "intendant-custody",
  "intendant-display",
  "intendant-platform",
  "landlock",

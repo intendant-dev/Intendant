@@ -55,6 +55,7 @@ mod frontend;
 mod gateway_routes;
 mod global_store;
 mod hosted_verify;
+mod key_custody;
 mod lease_transcript_staging;
 mod lineage_ledger;
 mod linux_display_env;
@@ -402,6 +403,7 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("    ctl                   Control a running Intendant daemon over MCP");
     println!("    access                Configure dashboard TLS/mTLS access certificates");
+    println!("    custody               Show, migrate, or restore OS-keystore custody of access private keys");
     println!("    hosted-verify         Verify a rendezvous serves the code its transparency log commits to (--releases: app release artifacts)");
     println!("    org                   Create or print a local org root key");
     println!("    peer                  Pair and configure federated Intendant peers");
@@ -3145,6 +3147,21 @@ async fn main() -> Result<(), CallerError> {
                 );
                 Ok(())
             }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
+
+    // Intercept `intendant custody <action>` — show, migrate, or restore
+    // OS-keystore custody of the access private-key estate (Track K).
+    // Keyless and local like `org`; migration is opt-in by ruling, never
+    // an ambient side effect of some other command.
+    if env::args().nth(1).as_deref() == Some("custody") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        return match key_custody::run_cli(argv) {
+            Ok(()) => Ok(()),
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);

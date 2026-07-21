@@ -38,6 +38,24 @@ pub const EVENT_LEASE_CLEANUP_DEFERRED: &str = "lease_cleanup_deferred";
 /// A materialized leased auth home was deleted from disk (sweep, session
 /// end, revocation, or the startup sweep).
 pub const EVENT_LEASE_HOME_REMOVED: &str = "lease_home_removed";
+/// A class-1 private key file was relocated into OS-keystore custody
+/// (`intendant custody migrate`). Relocation, not rotation (Track K
+/// ruling Q6, owner-accepted 2026-07-21): pre-migration copies are
+/// unaffected.
+pub const EVENT_KEY_MIGRATED: &str = "key_custody_migrated";
+/// A custody-held key was returned to a plain file
+/// (`intendant custody restore`).
+pub const EVENT_KEY_RESTORED: &str = "key_custody_restored";
+/// A custody-held entry's material was replaced in place (key
+/// regeneration — recert, forced setup — while the entry is migrated).
+pub const EVENT_KEY_STORED: &str = "key_custody_stored";
+/// A custody operation for a migrated key failed — retrieval or store
+/// denied, backend unavailable, or blob unsealable. Fail-closed: no
+/// material was served and no file fallback occurred. (Pre-migration
+/// plain-file mode is deliberately not a per-read event: reads happen at
+/// every boot and dial, and `intendant custody status` labels the estate
+/// instead.)
+pub const EVENT_KEY_DENIED: &str = "key_custody_denied";
 
 /// How many events the in-memory tail keeps (and the file is trimmed
 /// to on rewrite).

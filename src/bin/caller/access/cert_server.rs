@@ -502,7 +502,10 @@ where
                 .await;
             }
             let p12 = cert_dir.join("client.p12");
-            match std::fs::read(&p12) {
+            // Custody-routed: a migrated .p12 is served out of the sealed
+            // custody entry; a custody failure is a loud 500, never a
+            // silent 404 that reads like "run setup again".
+            match crate::key_custody::read_key_material(&p12) {
                 Ok(bytes) => {
                     let filename = if path == "/client.pfx" {
                         "client.pfx"
@@ -513,17 +516,28 @@ where
                         &mut stream,
                         "200 OK",
                         "application/x-pkcs12",
-                        &bytes,
+                        bytes.as_bytes(),
                         filename,
                     )
                     .await
                 }
-                Err(_) => {
+                Err(_) if !p12.exists() => {
                     write_response(
                         &mut stream,
                         "404 Not Found",
                         "text/plain",
                         b"not found",
+                        &[],
+                    )
+                    .await
+                }
+                Err(error) => {
+                    eprintln!("!! client.p12 unavailable: {error}");
+                    write_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "text/plain",
+                        b"client identity bundle unavailable; see server log",
                         &[],
                     )
                     .await
@@ -1077,13 +1091,13 @@ fn mobileconfig_profile(
         "client.crt",
         AppleProfileCertRole::ClientIdentity,
     )?;
-    let p12 =
-        std::fs::read(cert_dir.join("client.p12")).map_err(|e| format!("read client.p12: {e}"))?;
+    let p12 = crate::key_custody::read_key_material(&cert_dir.join("client.p12"))
+        .map_err(|e| format!("read client.p12: {e}"))?;
     Ok(mobileconfig_profile_from_bytes(
         host_label,
         p12_password,
         &ca_der,
-        &p12,
+        p12.as_bytes(),
     ))
 }
 
