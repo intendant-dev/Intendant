@@ -39,6 +39,15 @@ fn default_sensitivity() -> String {
 /// this DTO-edge bound rejects loudly, never truncates.
 pub(crate) const MAX_REASON_CHARS: usize = 2000;
 
+/// The verdict vocabulary this build MINTS — the v1 subset of the
+/// kernel's closed §11.1 set (retract stays author/agent-lane
+/// machinery surfaced read-only; raise_class/declassify are
+/// fail-closed classification arms; pins are fail-closed at the
+/// stamped kernel). Single source: the service's judge match, its
+/// rejection text, and the Explorer's curation buttons (parity test)
+/// all derive from this list.
+pub(crate) const MINTED_VERDICTS: &[&str] = &["accept", "dispute", "retire", "supersede"];
+
 /// Arguments for a judgment (`judge` — the owner curation lane).
 /// `verdict` is the v1-minted subset of the kernel's closed §11.1
 /// vocabulary: `accept`, `dispute`, `retire`, `supersede` (retract is

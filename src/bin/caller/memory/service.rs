@@ -15,7 +15,7 @@ use crate::access::actor::{ActorBinding, ActorKind as GateActorKind};
 use super::plane::EphemeralPlane;
 use super::types::{
     hex32, ClaimProvenance, ClaimView, JudgeArgs, JudgmentView, MemoryError, ProposeArgs,
-    SearchArgs, MAX_REASON_CHARS,
+    SearchArgs, MAX_REASON_CHARS, MINTED_VERDICTS,
 };
 
 /// Search results are hard-capped regardless of the caller's ask
@@ -631,7 +631,7 @@ impl MemoryService {
                 return Err(MemoryError::Vocabulary {
                     what: "verdict",
                     got: other.to_string(),
-                    allowed: "accept, dispute, retire, supersede".into(),
+                    allowed: MINTED_VERDICTS.join(", "),
                 })
             }
         };
@@ -1280,6 +1280,31 @@ mod tests {
             options("memory-add-sensitivity"),
             kernel(&Class::ALL.iter().map(|c| c.as_str()).collect::<Vec<_>>()),
             "memory-add-sensitivity options drifted from Class::ALL"
+        );
+    }
+
+    /// The Explorer's curation buttons are a static mirror of the
+    /// service's MINTED verdict set (the same derive-don't-mirror
+    /// parity pin as the vocab selects): a verdict added or removed
+    /// on either side without the other fails here instead of
+    /// shipping as drift. Order included — the row reads in the
+    /// service's canonical order.
+    #[test]
+    fn explorer_verdict_actions_mirror_the_minted_set() {
+        let app = include_str!("../../../../static/app.html");
+        // The fragment renders the buttons through its `verb(...)`
+        // template helper — extract the literal call arguments in
+        // source order.
+        let mut buttons = Vec::new();
+        for (at, _) in app.match_indices("${verb('") {
+            let rest = &app[at + "${verb('".len()..];
+            let end = rest.find('\'').expect("unterminated verb call");
+            buttons.push(rest[..end].to_string());
+        }
+        assert_eq!(
+            buttons,
+            MINTED_VERDICTS.to_vec(),
+            "Explorer curation buttons drifted from MINTED_VERDICTS"
         );
     }
 

@@ -114,8 +114,9 @@ html.ui-v2 .memory-item-head {
   gap: 8px;
   flex-wrap: wrap;
 }
-/* Derived status chip: candidate is the authoring state; judgments
-   (a later slice) move claims to the other states. */
+/* Derived status chip: candidate is the authoring state; owner
+   judgments (the curation row below) move claims to the other
+   states. */
 html.ui-v2 .memory-status {
   font-family: var(--mono);
   font-size: 9.5px;
@@ -198,4 +199,85 @@ html.ui-v2 .memory-detail-value {
   font-size: 11px;
   color: var(--text-2);
   overflow-wrap: anywhere;
+}
+
+/* ---- Curation (Track J J2): judgment history + owner verdict
+   actions. ---- */
+html.ui-v2 .memory-judgments {
+  border-top: 1px dashed var(--line);
+  margin-top: 5px;
+  padding-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+html.ui-v2 .memory-judgment-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+}
+html.ui-v2 .memory-judgment-verdict {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+  color: var(--text-3);
+}
+html.ui-v2 .memory-judgment-verdict[data-verdict="accept"] { color: var(--green); }
+html.ui-v2 .memory-judgment-verdict[data-verdict="dispute"] { color: var(--amber); }
+html.ui-v2 .memory-judgment-verdict[data-verdict="supersede"] { color: var(--iris); }
+html.ui-v2 .memory-judgment-meta {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+/* Reasons are quoted data — rendered as text in quotation marks. */
+html.ui-v2 .memory-judgment-reason {
+  flex-basis: 100%;
+  font-size: 11.5px;
+  color: var(--text-2);
+  padding-left: 12px;
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .memory-judgment-successor {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--iris);
+  text-decoration: none;
+}
+html.ui-v2 .memory-judgment-successor:hover { text-decoration: underline; }
+html.ui-v2 .memory-curation {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+html.ui-v2 .memory-judge-btn {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 12px;
+  cursor: pointer;
+}
+html.ui-v2 .memory-judge-btn:hover {
+  color: var(--text);
+  border-color: var(--iris);
+}
+html.ui-v2 .memory-judge-strip input[type="text"] {
+  flex: 1 1 200px;
+  min-width: 140px;
+}
+html.ui-v2 .memory-judge-strip select {
+  max-width: 340px;
 }
