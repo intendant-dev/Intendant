@@ -369,6 +369,7 @@ impl AgendaStore {
             free_text: None,
             questions,
             wait_seconds: None,
+            park: false,
             session_id: None,
         };
         let (built, _wait) =
@@ -490,6 +491,14 @@ impl AgendaStore {
             action: action.to_string(),
         };
         self.append_op(op, actor, None, now_ms)
+    }
+
+    /// The item with `item_id`, whatever its status (freshened first).
+    pub(crate) fn item(&mut self, item_id: &str) -> Option<AgendaItem> {
+        if let Err(err) = self.refresh_if_stale() {
+            eprintln!("[agenda] refresh before item lookup failed: {err}");
+        }
+        self.items.get(item_id).cloned()
     }
 
     /// The item currently holding `ask_id` as an OPEN rich ask, if any.

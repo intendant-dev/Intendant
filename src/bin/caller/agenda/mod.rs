@@ -37,15 +37,21 @@ mod scheduler;
 mod store;
 mod types;
 
-pub(crate) use ask::{agenda_ask_pending, spawn_ask_resolver};
+pub(crate) use ask::{agenda_ask_pending, ask_outcome_delivery_text, spawn_ask_resolver};
 pub(crate) use blobs::find_blob;
 pub(crate) use handle::AgendaHandle;
 pub(crate) use reminders::ReminderPolicyPatch;
 pub(crate) use scheduler::spawn_reminder_scheduler;
 pub(crate) use store::{AgendaError, AgendaStore};
+pub(crate) use types::{
+    AgendaActor, AgendaAnswer, AgendaCommand, AgendaCounts, AgendaItem, AgendaStatus,
+};
+// Test-support seam: cross-module tests (supervisor delivery, blocking
+// waiter) drive real handle-side resolutions with structured content.
 #[cfg(test)]
-pub(crate) use types::AgendaKind;
-pub(crate) use types::{AgendaActor, AgendaCommand, AgendaCounts, AgendaItem, AgendaStatus};
+pub(crate) use ask::resolution_from_wire;
+#[cfg(test)]
+pub(crate) use types::{AgendaAskResolution, AgendaKind};
 
 use std::path::{Path, PathBuf};
 
