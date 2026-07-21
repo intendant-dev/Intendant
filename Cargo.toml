@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/app-html-assembler",
     "crates/intendant-core",
+    "crates/intendant-custody",
     "crates/intendant-display",
     "crates/intendant-platform",
     "crates/owner-plane-core",
@@ -82,6 +83,7 @@ dirs = "6"
 # Rust, so no setup-script changes are needed.
 which = "8"
 intendant-core = { path = "crates/intendant-core" }
+intendant-custody = { path = "crates/intendant-custody" }
 intendant-display = { path = "crates/intendant-display" }
 intendant-platform = { path = "crates/intendant-platform" }
 rmcp = { version = ">=1.4.0, <1.5.0", features = ["server", "transport-io", "client", "transport-child-process"] }

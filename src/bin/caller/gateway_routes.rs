@@ -222,6 +222,8 @@ pub(crate) const CLAUDE_AUTH_CODE_BODY_CAP_BYTES: usize = 2 * 1024;
 
 /// Body cap for the Codex sign-in ceremony start (`{"mode": …}` only).
 pub(crate) const CODEX_AUTH_START_BODY_CAP_BYTES: usize = 4 * 1024;
+/// Kimi's start body carries only the selected sign-in mode.
+pub(crate) const KIMI_AUTH_START_BODY_CAP_BYTES: usize = 4 * 1024;
 
 /// Links a table row to its dispatch arm in
 /// `web_gateway/http_dispatch.rs`. The match there is exhaustive, so a
@@ -311,6 +313,12 @@ pub(crate) enum RouteHandlerId {
     CodexAuthStatus,
     /// Cancel the Codex ceremony (Ctrl-C + reap; non-destructive).
     CodexAuthCancel,
+    /// Kimi Code sign-in ceremony: start `kimi login` on a private PTY.
+    KimiAuthStart,
+    /// Ceremony state + verification URL + one-time code.
+    KimiAuthStatus,
+    /// Cancel the Kimi ceremony (Ctrl-C + reap; non-destructive).
+    KimiAuthCancel,
     ExternalAgents,
     DiagnosticsVisualFreshness,
     Displays,
@@ -350,6 +358,9 @@ pub(crate) enum RouteHandlerId {
     /// connect status payload).
     AccessFleetCertRequest,
     DashboardTargets,
+    /// Same-home sibling loopback-token handoff (owner surfaces open
+    /// sibling daemons friction-free).
+    LocalDaemonTokens,
     /// Live dashboard connections (tab presence): the tabs registry
     /// snapshot with voice/input-authority ownership joined in.
     DashboardTabs,
@@ -367,6 +378,7 @@ pub(crate) enum RouteHandlerId {
     MemoryClaim,
     /// Propose one Memory claim (the candidate lane).
     MemoryPropose,
+    MemoryJudge,
     /// The whole /api/peers registry + pairing sub-router, moved
     /// verbatim (its internal shapes stay as they were; leaf-shape
     /// declarations are a deliberate follow-up, not part of the
@@ -968,6 +980,16 @@ pub(crate) static ROUTES: &[Route] = &[
     .with_tunnel(tunnel_method("api_memory_propose")),
     op_route(
         RouteMethod::Post,
+        PathPattern::Exact("/api/memory/judge"),
+        PeerOperation::MemoryWrite,
+        BodyPolicy::Default,
+        RouteHandlerId::MemoryJudge,
+        "Judge one Memory claim (owner curation: accept/dispute/retire/supersede + reason; \
+         ring-2 callers get the named actor-not-permitted denial)",
+    )
+    .with_tunnel(tunnel_method("api_memory_judge")),
+    op_route(
+        RouteMethod::Post,
         PathPattern::Exact("/api/session/current/redo"),
         PeerOperation::SessionManage,
         BodyPolicy::Default,
@@ -1181,7 +1203,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::SessionInspect,
         BodyPolicy::None,
         RouteHandlerId::SessionBackgroundTasks,
-        "Background tasks a supervised session announced (id, description, status, output availability)",
+        "Background tasks a supervised Claude Code or Kimi session announced (id, description, status, output/cancel availability)",
     )
     .with_tunnel(tunnel_method("api_session_background_tasks")),
     op_route(
@@ -1198,7 +1220,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::SessionInspect,
         BodyPolicy::None,
         RouteHandlerId::SessionBackgroundTaskOutput,
-        "Tail of one background task's output file (tail_kb query, capped; registry-resolved path)",
+        "Tail of one background task's registered file or bounded native output preview (tail_kb query, capped; registry-resolved, never a caller path/server endpoint)",
     )
     .with_tunnel(tunnel_method("api_session_background_task_output")),
     // ── Session detail + artifacts sub-router. Method-explicit ports of
@@ -1504,6 +1526,21 @@ pub(crate) static ROUTES: &[Route] = &[
         "Which provider keys are configured (presence only)",
     )
     .with_tunnel(tunnel_method("api_key_status")),
+    // ── Same-home sibling loopback-token handoff (ratified 2026-07-20):
+    //    the response contains per-boot loopback admission tokens, so
+    //    the route rides the credential-custody operation like the
+    //    sign-in ceremonies below — no peer profile (peer-root included)
+    //    and no scoped default carries it. HTTP-only, no tunnel twin:
+    //    the consumer is the trusted dashboard's open-sibling action,
+    //    and the payload must never leave the daemon's own origin.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/local-daemons/tokens"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::LocalDaemonTokens,
+        "Loopback admission tokens for same-home daemon instances (owner handoff)",
+    ),
     // ── Claude sign-in ceremony (claude_auth_ceremony.rs): the dashboard
     //    walks the owner through `claude auth login` on a daemon-private
     //    PTY. Gated on the credential-custody operation — the same class
@@ -1581,13 +1618,42 @@ pub(crate) static ROUTES: &[Route] = &[
         "Cancel the Codex sign-in ceremony (non-destructive; prior login keeps working)",
     )
     .with_tunnel(tunnel_method("api_codex_auth_cancel")),
+    // ── Kimi Code sign-in ceremony: Kimi's official CLI owns the
+    //    device-code token exchange and credential write.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/kimi-auth/start"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::Capped(KIMI_AUTH_START_BODY_CAP_BYTES),
+        RouteHandlerId::KimiAuthStart,
+        "Start the Kimi Code sign-in ceremony (`kimi login` on a daemon-private PTY)",
+    )
+    .with_tunnel(tunnel_method("api_kimi_auth_start")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/kimi-auth/status"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::KimiAuthStatus,
+        "Kimi Code sign-in ceremony state (verification URL + one-time code)",
+    )
+    .with_tunnel(tunnel_method("api_kimi_auth_status")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/kimi-auth/cancel"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::KimiAuthCancel,
+        "Cancel the Kimi Code sign-in ceremony (non-destructive; prior login keeps working)",
+    )
+    .with_tunnel(tunnel_method("api_kimi_auth_cancel")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/external-agents"),
         PeerOperation::SessionInspect,
         BodyPolicy::None,
         RouteHandlerId::ExternalAgents,
-        "Detected external coding agents (codex, claude)",
+        "Detected external coding agents (codex, claude, kimi)",
     )
     .with_tunnel(tunnel_method("api_external_agents")),
     op_route(
@@ -2833,6 +2899,11 @@ mod tests {
             BodyPolicy::Capped(CODEX_AUTH_START_BODY_CAP_BYTES)
         );
         assert_eq!(policy("POST", "/api/codex-auth/cancel"), BodyPolicy::None);
+        assert_eq!(
+            policy("POST", "/api/kimi-auth/start"),
+            BodyPolicy::Capped(KIMI_AUTH_START_BODY_CAP_BYTES)
+        );
+        assert_eq!(policy("POST", "/api/kimi-auth/cancel"), BodyPolicy::None);
         assert_eq!(
             policy("POST", "/api/access/org-grants"),
             BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES)

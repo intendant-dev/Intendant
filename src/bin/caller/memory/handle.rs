@@ -17,7 +17,7 @@ pub(crate) enum MemoryStorage {
     Ephemeral,
     Durable(std::path::PathBuf),
 }
-use super::types::{ClaimView, MemoryError, ProposeArgs, SearchArgs};
+use super::types::{ClaimView, JudgeArgs, MemoryError, ProposeArgs, SearchArgs};
 
 pub(crate) struct MemoryHandle {
     service: Mutex<MemoryService>,
@@ -69,6 +69,23 @@ impl MemoryHandle {
         actor: &crate::access::actor::ActorBinding,
     ) -> Result<ClaimView, MemoryError> {
         let view = self.lock().propose(args, actor)?;
+        self.bus.send(AppEvent::MemoryChanged {
+            claim: view.clone(),
+        });
+        Ok(view)
+    }
+
+    /// Judge a claim (owner curation — ruling R1: the service's
+    /// judgment choke authorizes owner surfaces and denies ring-2
+    /// with the named outcome). Admission broadcasts the target's
+    /// refreshed view — derived status just moved (or a recorded
+    /// non-counting judgment surfaced); rejections broadcast nothing.
+    pub(crate) fn judge(
+        &self,
+        args: JudgeArgs,
+        actor: &crate::access::actor::ActorBinding,
+    ) -> Result<ClaimView, MemoryError> {
+        let view = self.lock().judge(args, actor)?;
         self.bus.send(AppEvent::MemoryChanged {
             claim: view.clone(),
         });

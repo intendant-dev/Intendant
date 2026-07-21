@@ -332,7 +332,7 @@ jobs:
         if: github.event_name != 'merge_group' && runner.os != 'Linux' && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: |
           cargo check -p intendant --bins --locked --target ${{ matrix.target }}
-          cargo check -p intendant-core -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --tests --locked --target ${{ matrix.target }}
+          cargo check -p intendant-core -p intendant-custody -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --tests --locked --target ${{ matrix.target }}
 
       # Build and run the unit tests of the whole `intendant` package — all
       # three binaries (`intendant`, `intendant-runtime`, and
@@ -353,7 +353,7 @@ jobs:
           # how the core/display lib tests went dark after extraction.
           # owner-plane-core/-reducer carry the vendored D0-A kernel and
           # its §D corpus conformance gate (170 stamped vectors).
-          cargo test -p intendant-core -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --locked --target ${{ matrix.target }}
+          cargo test -p intendant-core -p intendant-custody -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --locked --target ${{ matrix.target }}
 
       # ── Quality gate: clippy (Linux leg; baseline zeroed 2026-07-11) ──
       # clippy is cfg-sensitive: the macOS-cut baseline left the Linux-only
@@ -473,13 +473,24 @@ jobs:
             exit 1
           fi
           echo "port=$port" >> "$GITHUB_OUTPUT"
+          # The per-boot loopback admission token: the daemon persists it
+          # before printing the Dashboard line; owner surfaces refuse
+          # tokenless loopback, so the probe opens the tokened URL the
+          # way a real owner would.
+          token_file="$rig/home/.intendant/loopback-tokens/$port.token"
+          if [ ! -s "$token_file" ]; then
+            echo "::error::loopback token file missing at $token_file"
+            tail -n 40 "$rig/daemon.log"
+            exit 1
+          fi
+          echo "token=$(cat "$token_file")" >> "$GITHUB_OUTPUT"
           echo "daemon pid=$pid port=$port"
 
       - name: dashboard-boot smoke
         if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
         run: >
           node scripts/smoke-dashboard-boot.cjs
-          --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/"
+          --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/?token=${{ steps.daemon.outputs.token }}"
           --artifact-dir "${{ steps.daemon.outputs.rig }}/artifacts"
 
       # Deep-link boots evaluate later-fragment code during script
@@ -493,7 +504,7 @@ jobs:
         run: |
           for hash in stats files; do
             node scripts/smoke-dashboard-boot.cjs \
-              --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/#$hash" \
+              --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/?token=${{ steps.daemon.outputs.token }}#$hash" \
               --artifact-dir "${{ steps.daemon.outputs.rig }}/artifacts"
           done
 

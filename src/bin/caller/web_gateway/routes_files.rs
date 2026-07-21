@@ -3901,7 +3901,7 @@ mod tests {
             &actor,
         )
         .unwrap();
-        let scoped = http_access_context(cert_dir.path(), None, Some("f11e"), true, true)
+        let scoped = http_access_context(cert_dir.path(), None, Some("f11e"), true, true, false)
             .expect("scoped context");
         let reason = scoped
             .decision(crate::peer::access_policy::PeerOperation::FilesystemWrite)

@@ -231,6 +231,20 @@ impl IntendantServer {
         }
     }
 
+    async fn memory_judge_inner(
+        &self,
+        args: crate::memory::JudgeArgs,
+        actor: &crate::access::actor::ActorBinding,
+    ) -> Result<serde_json::Value, String> {
+        let Some(memory) = self.memory_handle().await else {
+            return Err("memory service unavailable on this daemon".to_string());
+        };
+        match memory.judge(args, actor) {
+            Ok(claim) => Ok(serde_json::json!({ "claim": claim })),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
     async fn memory_propose_inner(
         &self,
         args: crate::memory::ProposeArgs,
@@ -566,6 +580,19 @@ impl IntendantServer {
                 Ok(match self.memory_propose_inner(args, &actor).await {
                     Ok(value) => text_tool_result(value.to_string()),
                     Err(message) => text_tool_error(format!("memory_propose failed: {message}")),
+                })
+            }
+            "memory_judge" => {
+                // The tool args ARE the judge vocabulary — the same
+                // shape the HTTP body and tunnel params carry. The
+                // service's judgment choke (ruling R1) decides from
+                // the gate-resolved actor; agent sessions get the
+                // named actor-not-permitted denial here.
+                let args: crate::memory::JudgeArgs =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(match self.memory_judge_inner(args, &actor).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("memory_judge failed: {message}")),
                 })
             }
             "set_autonomy" => {

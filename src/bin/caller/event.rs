@@ -985,6 +985,25 @@ pub enum AppEvent {
         allowed_tools: Option<Vec<String>>,
     },
 
+    /// Emitted when one or more Kimi runtime fields change.
+    KimiConfigChanged {
+        command: Option<String>,
+        model: Option<String>,
+        model_cleared: bool,
+        thinking: Option<String>,
+        thinking_cleared: bool,
+        permission_mode: Option<String>,
+        plan_mode: Option<bool>,
+        swarm_mode: Option<bool>,
+        /// Exact active-tool set. `Some([])` intentionally disables every
+        /// optional tool; `None` is unchanged unless
+        /// `allowed_tools_cleared` is true.
+        allowed_tools: Option<Vec<String>>,
+        /// True only when the override was explicitly removed so Kimi should
+        /// use its native profile defaults.
+        allowed_tools_cleared: bool,
+    },
+
     /// Log entry broadcast to external consumers (web UI, control socket).
     /// Emitted by the TUI's `log_sourced` for events without their own
     /// `OutboundEvent` variant, and by backend code (e.g.
@@ -1159,12 +1178,13 @@ pub enum AppEvent {
         ///     passed in `turns_to_drop`).
         turns_removed: u32,
         /// Which backend performed the rollback: `"native"`, `"codex"`,
-        /// `"claude-code"`, or `"gemini"`.
+        /// `"claude-code"`, `"kimi"`, or retired-history `"gemini"`.
         backend: String,
         /// How the rollback was performed: `"truncated"` for the native
-        /// agent and Codex's `thread/rollback`, or `"session-reset"` for
-        /// backends (CC, Gemini) that don't expose a protocol-level
-        /// rollback and re-initialize the session from scratch.
+        /// agent, Codex's `thread/rollback`, and Kimi's native `undo`, or
+        /// `"session-reset"` for backends (CC, retired Gemini) that don't
+        /// expose a protocol-level rollback and re-initialize the session
+        /// from scratch.
         method: String,
     },
 
@@ -1556,6 +1576,20 @@ pub enum ControlMsg {
         claude_allowed_tools: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_thinking: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_permission_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_plan_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_swarm_mode: Option<String>,
+        /// "inherit"/"default"/"global" clears the pin, "none" pins an
+        /// empty active set, otherwise comma/newline-separated exact names.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_allowed_tools: Option<String>,
     },
     /// Stop a live managed session. Unlike hiding a dashboard card, this
     /// removes the live session from daemon state and asks the backend process
@@ -1607,6 +1641,19 @@ pub enum ControlMsg {
         claude_allowed_tools: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_thinking: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_permission_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_plan_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_swarm_mode: Option<String>,
+        /// Same sentinel vocabulary as `ConfigureSessionAgent`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_allowed_tools: Option<String>,
     },
     /// Set the Claude Code model override (`--model`). `None`/missing lets
     /// the claude CLI pick its configured default. Applies to the NEXT task
@@ -1629,6 +1676,33 @@ pub enum ControlMsg {
     SetClaudeAllowedTools {
         #[serde(default)]
         tools: Vec<String>,
+    },
+    SetKimiCommand {
+        command: String,
+    },
+    SetKimiModel {
+        #[serde(default)]
+        model: Option<String>,
+    },
+    SetKimiThinking {
+        #[serde(default)]
+        thinking: Option<String>,
+    },
+    SetKimiPermissionMode {
+        mode: String,
+    },
+    SetKimiPlanMode {
+        enabled: bool,
+    },
+    SetKimiSwarmMode {
+        enabled: bool,
+    },
+    /// Replace Kimi's global active-tool override. `None` clears the override
+    /// and restores native profile defaults; `Some([])` disables all optional
+    /// tools; a non-empty list is exact.
+    SetKimiAllowedTools {
+        #[serde(default)]
+        tools: Option<Vec<String>>,
     },
     SetVerbosity {
         level: String,
@@ -1692,7 +1766,7 @@ pub enum ControlMsg {
         project_root: Option<String>,
         /// Optional one-shot agent override for this session. Omitted means
         /// use the configured default. Accepted values are "internal",
-        /// "codex", "claude-code", or "gemini".
+        /// "codex", "claude-code", or "kimi".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
         /// Optional one-shot executable path or command name for the selected
@@ -1712,6 +1786,21 @@ pub enum ControlMsg {
         /// applies when the resolved agent is Claude Code.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_effort: Option<String>,
+        /// Optional one-shot Kimi launch settings.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_thinking: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_permission_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_plan_mode: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_swarm_mode: Option<bool>,
+        /// One-shot Kimi active-tool pin. Uses the same sentinels as
+        /// `ConfigureSessionAgent` so explicit empty and inherit survive JSON.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kimi_allowed_tools: Option<String>,
         /// Optional one-shot Codex model override for this session (e.g.
         /// "gpt-5.3-codex"). Launch-time only — Codex sessions cannot switch
         /// models mid-session, so unlike `claude_model` there is no matching
@@ -1798,7 +1887,8 @@ pub enum ControlMsg {
         /// testing / …); unknown values fall back to the base prompt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
-        /// Child backend: "internal" (default), "codex", or "claude-code".
+        /// Child backend: "internal" (default), "codex", "claude-code", or
+        /// "kimi".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
         /// Isolate the child in a fresh git worktree off the parent
@@ -1858,7 +1948,8 @@ pub enum ControlMsg {
         delegation_id: Option<String>,
     },
     ResumeSession {
-        /// Session source: "intendant", "codex", "claude-code", or "gemini".
+        /// Session source: "intendant", "codex", "claude-code", "kimi", or
+        /// retired-history "gemini".
         source: String,
         /// Display id from the Sessions tab. For Intendant this is the
         /// session log id; for external backends it is the native session id.
@@ -1937,7 +2028,7 @@ pub enum ControlMsg {
     /// the wire cannot set. The child is spawned/attached immediately and
     /// announced via a `session_fork_result` event carrying `request_id`.
     ForkSessionAtAnchor {
-        /// Session source: "intendant", "codex", or "claude-code".
+        /// Session source: "intendant", "codex", "claude-code", or "kimi".
         source: String,
         /// Display id from the Sessions tab. For Intendant this is the
         /// session log id; for external backends the native session id.
@@ -3130,6 +3221,29 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             model_cleared: *model_cleared,
             permission_mode: permission_mode.clone(),
             allowed_tools: allowed_tools.clone(),
+        }),
+        AppEvent::KimiConfigChanged {
+            command,
+            model,
+            model_cleared,
+            thinking,
+            thinking_cleared,
+            permission_mode,
+            plan_mode,
+            swarm_mode,
+            allowed_tools,
+            allowed_tools_cleared,
+        } => Some(OutboundEvent::KimiConfigChanged {
+            command: command.clone(),
+            model: model.clone(),
+            model_cleared: *model_cleared,
+            thinking: thinking.clone(),
+            thinking_cleared: *thinking_cleared,
+            permission_mode: permission_mode.clone(),
+            plan_mode: *plan_mode,
+            swarm_mode: *swarm_mode,
+            allowed_tools: allowed_tools.clone(),
+            allowed_tools_cleared: *allowed_tools_cleared,
         }),
         AppEvent::LogEntry {
             session_id,
@@ -4853,6 +4967,12 @@ mod tests {
                 claude_model: None,
                 claude_effort: None,
                 claude_permission_mode: None,
+                kimi_model: None,
+                kimi_thinking: None,
+                kimi_permission_mode: None,
+                kimi_plan_mode: None,
+                kimi_swarm_mode: None,
+                kimi_allowed_tools: None,
                 codex_model: Some("gpt-5.3-codex".to_string()),
                 codex_reasoning_effort: Some("high".to_string()),
                 codex_sandbox: Some("danger-full-access".to_string()),
@@ -5092,6 +5212,28 @@ mod tests {
     }
 
     #[test]
+    fn control_msg_set_kimi_allowed_tools_preserves_three_states() {
+        for (json, expected) in [
+            (
+                r#"{"action":"set_kimi_allowed_tools","tools":["Read","Write"]}"#,
+                Some(vec!["Read".to_string(), "Write".to_string()]),
+            ),
+            (
+                r#"{"action":"set_kimi_allowed_tools","tools":[]}"#,
+                Some(Vec::new()),
+            ),
+            (r#"{"action":"set_kimi_allowed_tools","tools":null}"#, None),
+        ] {
+            match serde_json::from_str::<ControlMsg>(json).unwrap() {
+                ControlMsg::SetKimiAllowedTools { tools } => {
+                    assert_eq!(tools, expected);
+                }
+                other => panic!("expected SetKimiAllowedTools, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn control_msg_start_task_deserialize() {
         let json = r#"{"action":"start_task","task":"fix bug"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
@@ -5126,6 +5268,12 @@ mod tests {
                 claude_model,
                 claude_permission_mode,
                 claude_effort,
+                kimi_model,
+                kimi_thinking,
+                kimi_permission_mode,
+                kimi_plan_mode,
+                kimi_swarm_mode,
+                kimi_allowed_tools,
                 codex_model,
                 codex_reasoning_effort,
                 codex_sandbox,
@@ -5146,6 +5294,12 @@ mod tests {
                 assert!(claude_model.is_none());
                 assert!(claude_permission_mode.is_none());
                 assert!(claude_effort.is_none());
+                assert!(kimi_model.is_none());
+                assert!(kimi_thinking.is_none());
+                assert!(kimi_permission_mode.is_none());
+                assert!(kimi_plan_mode.is_none());
+                assert!(kimi_swarm_mode.is_none());
+                assert!(kimi_allowed_tools.is_none());
                 assert_eq!(name.as_deref(), Some("Bugfix work"));
                 assert_eq!(project_root.as_deref(), Some("/repo"));
                 assert_eq!(agent.as_deref(), Some("codex"));
@@ -5269,6 +5423,12 @@ mod tests {
                 claude_permission_mode,
                 claude_allowed_tools,
                 claude_effort,
+                kimi_model,
+                kimi_thinking,
+                kimi_permission_mode,
+                kimi_plan_mode,
+                kimi_swarm_mode,
+                kimi_allowed_tools,
             } => {
                 assert_eq!(session_id, "abc123");
                 assert_eq!(source.as_deref(), Some("codex"));
@@ -5283,6 +5443,12 @@ mod tests {
                 assert!(claude_permission_mode.is_none());
                 assert!(claude_allowed_tools.is_none());
                 assert!(claude_effort.is_none());
+                assert!(kimi_model.is_none());
+                assert!(kimi_thinking.is_none());
+                assert!(kimi_permission_mode.is_none());
+                assert!(kimi_plan_mode.is_none());
+                assert!(kimi_swarm_mode.is_none());
+                assert!(kimi_allowed_tools.is_none());
             }
             _ => panic!("expected ConfigureSessionAgent"),
         }
@@ -5304,6 +5470,28 @@ mod tests {
                     Some("Read,Bash(cargo test *)")
                 );
                 assert_eq!(claude_effort.as_deref(), Some("xhigh"));
+            }
+            _ => panic!("expected ConfigureSessionAgent"),
+        }
+
+        let json = r#"{"action":"configure_session_agent","session_id":"kimi-1","source":"kimi","kimi_model":"k2.7 coding","kimi_thinking":"high","kimi_permission_mode":"yolo","kimi_plan_mode":"true","kimi_swarm_mode":"enabled","kimi_allowed_tools":"none"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ConfigureSessionAgent {
+                kimi_model,
+                kimi_thinking,
+                kimi_permission_mode,
+                kimi_plan_mode,
+                kimi_swarm_mode,
+                kimi_allowed_tools,
+                ..
+            } => {
+                assert_eq!(kimi_model.as_deref(), Some("k2.7 coding"));
+                assert_eq!(kimi_thinking.as_deref(), Some("high"));
+                assert_eq!(kimi_permission_mode.as_deref(), Some("yolo"));
+                assert_eq!(kimi_plan_mode.as_deref(), Some("true"));
+                assert_eq!(kimi_swarm_mode.as_deref(), Some("enabled"));
+                assert_eq!(kimi_allowed_tools.as_deref(), Some("none"));
             }
             _ => panic!("expected ConfigureSessionAgent"),
         }
@@ -5385,6 +5573,12 @@ mod tests {
                 claude_permission_mode,
                 claude_allowed_tools,
                 claude_effort,
+                kimi_model,
+                kimi_thinking,
+                kimi_permission_mode,
+                kimi_plan_mode,
+                kimi_swarm_mode,
+                kimi_allowed_tools,
             } => {
                 assert_eq!(source, "codex");
                 assert_eq!(session_id, "thread-1");
@@ -5402,6 +5596,12 @@ mod tests {
                 assert!(claude_permission_mode.is_none());
                 assert!(claude_allowed_tools.is_none());
                 assert!(claude_effort.is_none());
+                assert!(kimi_model.is_none());
+                assert!(kimi_thinking.is_none());
+                assert!(kimi_permission_mode.is_none());
+                assert!(kimi_plan_mode.is_none());
+                assert!(kimi_swarm_mode.is_none());
+                assert!(kimi_allowed_tools.is_none());
             }
             _ => panic!("expected RestartSession"),
         }
@@ -6154,6 +6354,43 @@ mod tests {
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"log_entry\""));
         assert!(json.contains("\"session_id\":\"sess-log\""));
+    }
+
+    #[test]
+    fn outbound_kimi_config_preserves_empty_and_clear_distinction() {
+        let explicit_empty = app_event_to_outbound(&AppEvent::KimiConfigChanged {
+            command: None,
+            model: None,
+            model_cleared: false,
+            thinking: None,
+            thinking_cleared: false,
+            permission_mode: None,
+            plan_mode: None,
+            swarm_mode: None,
+            allowed_tools: Some(Vec::new()),
+            allowed_tools_cleared: false,
+        })
+        .unwrap();
+        let explicit_empty = serde_json::to_value(explicit_empty).unwrap();
+        assert_eq!(explicit_empty["allowed_tools"], serde_json::json!([]));
+        assert!(explicit_empty.get("allowed_tools_cleared").is_none());
+
+        let cleared = app_event_to_outbound(&AppEvent::KimiConfigChanged {
+            command: None,
+            model: None,
+            model_cleared: false,
+            thinking: None,
+            thinking_cleared: false,
+            permission_mode: None,
+            plan_mode: None,
+            swarm_mode: None,
+            allowed_tools: None,
+            allowed_tools_cleared: true,
+        })
+        .unwrap();
+        let cleared = serde_json::to_value(cleared).unwrap();
+        assert!(cleared.get("allowed_tools").is_none());
+        assert_eq!(cleared["allowed_tools_cleared"], true);
     }
 
     #[test]

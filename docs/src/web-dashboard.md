@@ -596,7 +596,7 @@ directory is safe to delete; it rebuilds on the next scan.
   aggregate tiles including **free disk** on the tightest worktree-hosting
   volume (amber under 10% free, rose under 5%) and **reclaimable** build
   output; and **related-session chips** — the sessions observed inside
-  each checkout, supervised and raw codex/claude alike. Clicking a chip
+  each checkout, supervised and raw Codex/Claude/Kimi alike. Clicking a chip
   focuses the live session window when one exists, otherwise it lands on
   Recent with the ID prefilled. Checkouts with a CACHEDIR.TAG-marked Cargo
   `target/` offer **Clean target/** — delete the build directory to
@@ -629,16 +629,22 @@ directory is safe to delete; it rebuilds on the next scan.
   for full model names), the permission mode, and the reasoning effort
   (`low` … `max`). The backend pick, binary path, model ids, and effort
   choices from the last launch submitted in this browser prefill the next
-  visit (per-browser localStorage; a remembered value that is no longer a
-  valid option — or a backend the daemon now reports missing — falls back
-  to the inherit default). The authority- and cost-shaped fields — sandbox,
+  visit. Kimi sessions get model (K2.7 Coding, K2.7 Coding Highspeed, K3,
+  inherit, or a custom id), thinking (`off` through `max`), permission
+  (`manual`/`auto`/`yolo`), exact active tools (unset/inherit is distinct from
+  an intentionally empty set), and explicit plan/swarm toggles. The
+  binary/model/effort/thinking convenience
+  values use per-browser localStorage; a remembered value that is no longer a
+  valid option — or a backend the daemon now reports missing — falls back to
+  the inherit default. The authority- and cost-shaped fields — sandbox,
   approval policy, permission mode, managed context, context replay, Fast
-  tier — deliberately re-seed from the global Settings defaults on every
-  visit so a one-off escalation never becomes a sticky default.
+  tier, and Kimi plan/swarm — deliberately re-seed from the global Settings
+  defaults on every visit so a one-off escalation or execution-shape change
+  never becomes a sticky default.
 
-**Settings → Providers & models** exposes the daemon's global Codex and Claude
-defaults independently of whichever backend is currently selected. With an
-attached project, Save writes that project's `intendant.toml`; a projectless
+**Settings → Providers & models** exposes the daemon's global Codex, Claude,
+and Kimi defaults independently of whichever backend is currently selected.
+With an attached project, Save writes that project's `intendant.toml`; a projectless
 daemon writes `<state-root>/intendant.toml` (normally
 `~/.intendant/intendant.toml`) while `/api/project-root` remains `null`. These
 defaults seed new sessions, but an existing session's persisted launch config
@@ -667,6 +673,19 @@ clear sentinels. On a live session, **Save** additionally applies the model
 and permission pins immediately (native `set_model` / `set_permission_mode`
 control requests); tools and effort take effect at the next launch or via
 **Save & restart**.
+
+Kimi sessions get seven pinnable rows: binary, model, thinking, permission,
+plan mode, swarm mode, and exact active tools. The tools row distinguishes
+**Inherit profile**, **None**, and an exact name list; an empty list really
+disables all optional tools. Save applies every profile field live through
+Kimi's native session APIs; Save & restart is needed only to replace the
+binary/process. Dashboard Control and Station expose the same live model,
+thinking, permission, plan, swarm, and active-tool controls. Kimi's action
+menu derives from its advertised actions — including compact, head fork,
+side, undo, archive/restore, goals and native budgets, review, normal/highspeed
+model switching, model/tool catalogs, exact tool changes, context clear, and
+background-task control — rather than a backend-name heuristic.
+
 The separate **Restart with saved config** action is a power-user shortcut for
 reapplying settings that were already persisted elsewhere.
 The Managed activity view exposes rewind anchors, saved records, restore, and
@@ -1824,6 +1843,7 @@ response omits the header.
 | GET | `/api/memory/search` | MemoryRead | own origin | none | Bounded Memory claim search (q, limit, candidates); results carry derived status |
 | GET | `/api/memory/claim` | MemoryRead | own origin | none | Read one Memory claim by id prefix (id); status derived at read time |
 | POST | `/api/memory/propose` | MemoryWrite | own origin | bounded | Propose one Memory claim (candidate lane; response reports effective durability) |
+| POST | `/api/memory/judge` | MemoryWrite | own origin | bounded | Judge one Memory claim (owner curation: accept/dispute/retire/supersede + reason; ring-2 callers get the named actor-not-permitted denial) |
 | POST | `/api/session/current/redo` | SessionManage | own origin | bounded | Redo the last rolled-back round |
 | POST | `/api/session/current/prune` | SessionManage | own origin | bounded | Prune rollback state for the current session |
 | POST | `/api/session/current/agent-output` | SessionManage | own origin | bounded | Fetch the current session's persisted agent output by id (POST-shaped read) |
@@ -1839,8 +1859,8 @@ response omits the header.
 | POST | `/api/session/{id}/{target}/delete` | SessionManage | own origin | none | Delete one data kind for a session (POST fallback) |
 | POST | `/api/session/{id}/agent-output` | SessionInspect | own origin | bounded | Fetch a session's persisted agent output by id (POST-shaped read) |
 | GET | `/api/session/{id}/fork-points` | SessionInspect | own origin | none | Unified fork-point catalog for a session (anchors + eligibility, backend-tagged) |
-| GET | `/api/session/{id}/background-tasks` | SessionInspect | own origin | none | Background tasks a supervised session announced (id, description, status, output availability) |
-| GET | `/api/session/{id}/background-tasks/{task}/output` | SessionInspect | own origin | none | Tail of one background task's output file (tail_kb query, capped; registry-resolved path) |
+| GET | `/api/session/{id}/background-tasks` | SessionInspect | own origin | none | Background tasks a supervised Claude Code or Kimi session announced (id, description, status, output/cancel availability) |
+| GET | `/api/session/{id}/background-tasks/{task}/output` | SessionInspect | own origin | none | Tail of one background task's registered file or bounded native output preview (tail_kb query, capped; registry-resolved, never a caller path/server endpoint) |
 | GET | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail and artifact sub-routes |
 | POST | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail sub-routes (POST fallback callers) |
 | GET | `/api/session/{id}/context-snapshot` | SessionInspect | own origin | none | Replay one archived context snapshot (file/request_id/request_index/ts selector) |
@@ -1869,6 +1889,7 @@ response omits the header.
 | GET | `/api/settings` | Settings | own origin | none | Current runtime settings |
 | POST | `/api/api-keys` | CredentialsManage | own origin | bounded | Store provider API keys in the daemon-config .env |
 | GET | `/api/api-key-status` | Settings | own origin | none | Which provider keys are configured (presence only) |
+| GET | `/api/local-daemons/tokens` | CredentialsManage | own origin | none | Loopback admission tokens for same-home daemon instances (owner handoff) |
 | POST | `/api/claude-auth/start` | CredentialsManage | own origin | ≤ 4 KiB | Start the Claude sign-in ceremony (`claude auth login` on a daemon-private PTY) |
 | GET | `/api/claude-auth/status` | CredentialsManage | own origin | none | Claude sign-in ceremony state (validated sign-in URL; account info on success) |
 | POST | `/api/claude-auth/code` | CredentialsManage | own origin | ≤ 2 KiB | Submit the pasted authorization code to the Claude sign-in ceremony |
@@ -1876,7 +1897,10 @@ response omits the header.
 | POST | `/api/codex-auth/start` | CredentialsManage | own origin | ≤ 4 KiB | Start the Codex sign-in ceremony (`codex login --device-auth` on a daemon-private PTY) |
 | GET | `/api/codex-auth/status` | CredentialsManage | own origin | none | Codex sign-in ceremony state (verification URL + one-time code; account info on success) |
 | POST | `/api/codex-auth/cancel` | CredentialsManage | own origin | none | Cancel the Codex sign-in ceremony (non-destructive; prior login keeps working) |
-| GET | `/api/external-agents` | SessionInspect | own origin | none | Detected external coding agents (codex, claude) |
+| POST | `/api/kimi-auth/start` | CredentialsManage | own origin | ≤ 4 KiB | Start the Kimi Code sign-in ceremony (`kimi login` on a daemon-private PTY) |
+| GET | `/api/kimi-auth/status` | CredentialsManage | own origin | none | Kimi Code sign-in ceremony state (verification URL + one-time code) |
+| POST | `/api/kimi-auth/cancel` | CredentialsManage | own origin | none | Cancel the Kimi Code sign-in ceremony (non-destructive; prior login keeps working) |
+| GET | `/api/external-agents` | SessionInspect | own origin | none | Detected external coding agents (codex, claude, kimi) |
 | POST | `/api/diagnostics/visual-freshness` | DisplayInput | own origin | ≤ 16 MiB | Visual-freshness diagnostics transcript sink (NDJSON body) |
 | GET | `/api/displays` | DisplayView | own origin | none | Enumerate active displays |
 | any | `/api/peer-pairing/requests[/…]` | public | public | streaming | Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath) |

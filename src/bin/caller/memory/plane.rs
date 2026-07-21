@@ -113,6 +113,19 @@ const GENESIS_BUDGET: Budget = Budget {
     max_bytes: 268_435_456,
 };
 
+/// The `workflow-v1` polref exactly as the genesis ceremony binds it
+/// to the home space (§11.3: id + version + content hash). Judgment
+/// and pin bodies must cite the target space's bound polref
+/// byte-exactly — a mismatch pends `policy-missing` — so the sealing
+/// path and the ceremony share THIS constructor and cannot drift.
+pub(crate) fn workflow_polref() -> Polref {
+    Polref {
+        id: "workflow-v1".into(),
+        version: 1,
+        hash: scenario::workflow_v1().hash(),
+    }
+}
+
 /// The plane's custody-tier secrets, surfaced ONLY by
 /// [`EphemeralPlane::bootstrap_with_custody`] for the durable custody
 /// adapter (`memory::store`). The in-memory service path
@@ -332,11 +345,7 @@ impl EphemeralPlane {
                 name_hash: rand32(),
                 space_class: Spaceclass::Personal,
                 class_minimum: Class::Private,
-                status_policy: Polref {
-                    id: "workflow-v1".into(),
-                    version: 1,
-                    hash: scenario::workflow_v1().hash(),
-                },
+                status_policy: workflow_polref(),
             },
             audit_space: Spacedef {
                 space_id: audit_space,
@@ -698,6 +707,32 @@ impl EphemeralPlane {
     /// service-side reimplementation.
     pub(crate) fn claim_status(&self, op_hash: &[u8; 32]) -> Option<&'static str> {
         self.state.claim_status(op_hash, now_ms())
+    }
+
+    /// The home space's control-bound status policy (the ceremony's
+    /// `workflow-v1` binding) — what every judgment on a home-space
+    /// claim must cite (§11.3; mismatch pends `policy-missing`).
+    pub(crate) fn home_status_policy(&self) -> Polref {
+        workflow_polref()
+    }
+
+    /// The HLC millisecond of the most recently sealed op — the exact
+    /// `created_ms` a restart recovers from its header, so live views
+    /// and rebuilt views agree on timestamps (ruling R2).
+    pub(crate) fn last_hlc_ms(&self) -> u64 {
+        self.hlc_last_ms
+    }
+
+    /// Test seam: the tail op's envelope actor as (kind, attested) —
+    /// the R1 condition-2 pin inspects exactly what got sealed.
+    #[cfg(test)]
+    pub(crate) fn tail_op_actor(&self) -> Option<(String, bool)> {
+        let raw = self.items.values().last()?;
+        let op = owner_plane_reducer::envelope::parse_op(raw).ok()?;
+        Some((
+            op.header.actor_kind.to_string(),
+            op.header.attested_by.is_some(),
+        ))
     }
 
     /// Number of held (admitted or pending) operations.

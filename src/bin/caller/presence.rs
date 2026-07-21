@@ -1095,6 +1095,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SessionRenameResult { .. }
         | AppEvent::SessionAgentConfigResult { .. }
         | AppEvent::ClaudeConfigChanged { .. }
+        | AppEvent::KimiConfigChanged { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::Tick
         | AppEvent::RecordingStarted { .. }

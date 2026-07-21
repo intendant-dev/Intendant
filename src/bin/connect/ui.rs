@@ -463,7 +463,7 @@ pub(crate) const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advis
           <div class="advq" data-q="fuel">
             <span class="ql">What will fuel it?</span>
             <button data-v="api" class="on">API keys</button>
-            <button data-v="sub">Subscriptions (Codex, Claude Code)</button>
+            <button data-v="sub">Subscriptions (Codex, Claude Code, Kimi Code)</button>
             <button data-v="both">Both</button>
           </div>
           <div class="advq" data-q="solo">
@@ -777,8 +777,8 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
         Intendant is an open-source operating environment for autonomous AI
         agents: a shell, files, a display it can see and control, voice, and
         phone calls — with layered human supervision. It runs its own agent
-        loop, supervises Codex and Claude Code as managed backends, and is
-        portable across OpenAI, Anthropic, and Gemini. The agent's machine
+        loop, supervises Codex, Claude Code, and Kimi Code as managed backends,
+        and is portable across OpenAI, Anthropic, Gemini, and Kimi. The agent's machine
         can run macOS, Linux, or Windows. Route discovery needs only this
         browser tab; control uses local presence or a browser enrolled for
         independently verified direct mTLS by a trusted daemon owner. No
@@ -948,7 +948,7 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
       <div class="grid">
         <div class="card">
           <h3>Bring your own agent</h3>
-          <p>Codex and Claude Code run as managed backends — under the
+          <p>Codex, Claude Code, and Kimi Code run as managed backends — under the
           same oversight, autonomy dial, and session logging as the
           native agent loop.</p>
         </div>
@@ -983,7 +983,7 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
       <p>In a theater, performers play and conductors orchestrate — the
       <strong>Intendant</strong> runs the house: who gets the stage, which
       productions run, on whose authority, with the books open. Here agents
-      perform, orchestrators conduct (Codex and Claude Code as guest
+      perform, orchestrators conduct (Codex, Claude Code, and Kimi Code as guest
       conductors), and the Intendant runs the house and answers to you —
       houses federate, companies tour on signed contracts, house rules always
       win: a network of agentic networks.</p>

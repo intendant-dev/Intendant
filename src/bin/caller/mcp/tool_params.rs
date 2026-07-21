@@ -1205,7 +1205,7 @@ pub(crate) fn persisted_log_dir_for_session_in_home(
     if let Some(log_dir) = find_session_log_dir_in_home(home, session_id) {
         return Some(log_dir);
     }
-    ["codex", "claude-code", "gemini"]
+    ["codex", "claude-code", "gemini", "kimi"]
         .into_iter()
         .find_map(|source| {
             crate::external_wrapper_index::active_wrapper_for(home, source, session_id)

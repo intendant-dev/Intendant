@@ -25,7 +25,9 @@ mod control_plane;
 mod coordination;
 mod custom_domain;
 mod cutover_absence;
+mod kimi_auth_ceremony;
 pub(crate) use intendant_core::conversation;
+mod cli_descriptor;
 mod credential_audit;
 mod credential_egress;
 mod credential_leases;
@@ -53,11 +55,13 @@ mod frontend;
 mod gateway_routes;
 mod global_store;
 mod hosted_verify;
+mod key_custody;
 mod lease_transcript_staging;
 mod lineage_ledger;
 mod linux_display_env;
 mod live_audio;
 mod live_audio_types;
+mod loopback_token;
 mod mcp;
 mod mcp_client;
 mod memory;
@@ -325,7 +329,7 @@ struct CliFlags {
     /// --record-display <ID>: Record an existing X11 display (repeatable).
     record_displays: Vec<u32>,
 
-    /// --agent <BACKEND>: Use external agent backend (codex, claude-code).
+    /// --agent <BACKEND>: Use external agent backend (codex, claude-code, kimi).
     agent_backend: Option<external_agent::AgentBackend>,
 
     /// --no-web: Disable web gateway (on by default).
@@ -383,7 +387,7 @@ fn print_help() {
     println!(
         "    --record-display <ID> Record an existing X11 display (e.g. 50 for :50, repeatable)"
     );
-    println!("    --agent <BACKEND>     Use external agent backend (codex, claude-code)");
+    println!("    --agent <BACKEND>     Use external agent backend (codex, claude-code, kimi)");
     println!("    --advertise-url <URL> WebSocket URL to advertise to peers in this daemon's");
     println!("                          Agent Card (repeatable, preference order). Overrides");
     println!("                          [server.advertise] in intendant.toml when given.");
@@ -399,6 +403,7 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("    ctl                   Control a running Intendant daemon over MCP");
     println!("    access                Configure dashboard TLS/mTLS access certificates");
+    println!("    custody               Show, migrate, or restore OS-keystore custody of access private keys");
     println!("    hosted-verify         Verify a rendezvous serves the code its transparency log commits to (--releases: app release artifacts)");
     println!("    org                   Create or print a local org root key");
     println!("    peer                  Pair and configure federated Intendant peers");
@@ -708,7 +713,7 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
                     let backend = external_agent::AgentBackend::from_str_loose(&args[i + 1])
                         .ok_or_else(|| {
                             CallerError::Config(format!(
-                                "Unknown agent backend: '{}'. Valid options: codex, claude-code",
+                                "Unknown agent backend: '{}'. Valid options: codex, claude-code, kimi",
                                 args[i + 1]
                             ))
                         })?;
@@ -1281,7 +1286,7 @@ async fn start_external_display_recordings(
 /// External-agent approvals deliberately do NOT route here: their
 /// "Approve all" is Intendant-enforced per external session
 /// (`approve_all_session` in the agent event loop) instead of flipping
-/// global autonomy — a button on one Codex/Claude session must not
+/// global autonomy — a button on one Codex/Claude/Kimi session must not
 /// escalate every other surface of the daemon.
 async fn apply_user_approval(
     response: event::ApprovalResponse,
@@ -3149,6 +3154,21 @@ async fn main() -> Result<(), CallerError> {
         };
     }
 
+    // Intercept `intendant custody <action>` — show, migrate, or restore
+    // OS-keystore custody of the access private-key estate (Track K).
+    // Keyless and local like `org`; migration is opt-in by ruling, never
+    // an ambient side effect of some other command.
+    if env::args().nth(1).as_deref() == Some("custody") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        return match key_custody::run_cli(argv) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
+
     // Intercept `intendant hosted-verify` — the out-of-band code-transparency
     // check against a rendezvous (docs/src/self-hosted-rendezvous.md). Like
     // `org`, a local path with no project or provider setup: deliberately
@@ -3426,7 +3446,7 @@ async fn main() -> Result<(), CallerError> {
     // the sweep's own GC rides a slow cadence).
     message_search::startup_gc();
     // The message-search indexer: a 30s cursor-driven sweep over this
-    // box's session logs, Codex/Claude homes (including leased-active
+    // box's session logs, Codex/Claude/Kimi homes (including leased-active
     // ones), and staged lease remnants. First sweep runs one interval
     // after boot, so one-shot CLI runs exit before paying for it.
     message_search::spawn_indexer();
@@ -3542,6 +3562,19 @@ async fn main() -> Result<(), CallerError> {
     // Only expose the web port to external agents when the web gateway is actually running.
     let web_port_for_agent: Option<u16> = if use_web { Some(web_port) } else { None };
 
+    // Daemon boot = a gateway-serving controller start: record where this
+    // controller binary lives so UNSUPERVISED agents can resolve a CLI
+    // (F1.5 discovery descriptor). Transient invocations (ctl, --no-web
+    // one-shots) never write it; failure only degrades discovery.
+    if use_web {
+        if let Err(err) = cli_descriptor::write_boot_descriptor(
+            &intendant_core::state_paths::intendant_home(),
+            web_port,
+        ) {
+            eprintln!("[cli-descriptor] not written: {err}");
+        }
+    }
+
     // Build the dashboard's TLS acceptor once (cheap to clone into each
     // gateway spawn site). Defaults to mTLS; `--no-tls` is the explicit
     // plaintext escape.
@@ -3606,7 +3639,7 @@ async fn main() -> Result<(), CallerError> {
             } else {
                 eprintln!(
                     "Note: starting without a model provider — the built-in agent stays off until an API key is configured. \
-                     External agents signed in with their own accounts (Claude Code, Codex) still work, \
+                     External agents signed in with their own accounts (Claude Code, Codex, Kimi Code) still work, \
                      as do the dashboard, display control, and session browsing.",
                 );
             }

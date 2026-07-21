@@ -3643,6 +3643,9 @@ enabled = true
             fork_resume: false,
             fork_from_rollout_path: None,
             fork_cut: None,
+            kimi_fork_rollback_turns: None,
+            kimi_fork_expected_horizon: None,
+            kimi_allowed_tools: None,
             codex_home: None,
             protocol_watch: None,
         };

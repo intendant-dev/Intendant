@@ -887,7 +887,7 @@ pub struct PeerSnapshot {
 /// let handle = spawn_peer(
 ///     peer_id, initial_card, via_urls, browser_tcp_via_url,
 ///     label_override, certificate_witness_vantage, credentials, log_sink,
-///     |events_tx| Box::new(IntendantWsTransport::new(url, events_tx)),
+///     |events_tx| Box::new(IntendantWsTransport::with_credentials(url, events_tx, crate::loopback_token::test_transport_credentials())),
 /// );
 /// ```
 ///
@@ -1068,9 +1068,15 @@ mod tests {
             None,
             None,
             crate::peer::PeerWitnessVantage::Unknown,
-            TransportCredentials::default(),
+            crate::loopback_token::test_transport_credentials(),
             log_tx,
-            move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
+            move |events_tx| {
+                Box::new(IntendantWsTransport::with_credentials(
+                    url_for_closure,
+                    events_tx,
+                    crate::loopback_token::test_transport_credentials(),
+                ))
+            },
         );
 
         // Wait until the actor fails the first connect and enters
@@ -1179,9 +1185,15 @@ mod tests {
             None,
             None,
             crate::peer::PeerWitnessVantage::Unknown,
-            TransportCredentials::default(),
+            crate::loopback_token::test_transport_credentials(),
             log_tx,
-            move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
+            move |events_tx| {
+                Box::new(IntendantWsTransport::with_credentials(
+                    url_for_closure,
+                    events_tx,
+                    crate::loopback_token::test_transport_credentials(),
+                ))
+            },
         );
 
         let connect_deadline = Instant::now() + Duration::from_secs(3);
@@ -1319,9 +1331,15 @@ mod tests {
             None,
             None,
             crate::peer::PeerWitnessVantage::Unknown,
-            TransportCredentials::default(),
+            crate::loopback_token::test_transport_credentials(),
             log_tx,
-            move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
+            move |events_tx| {
+                Box::new(IntendantWsTransport::with_credentials(
+                    url_for_closure,
+                    events_tx,
+                    crate::loopback_token::test_transport_credentials(),
+                ))
+            },
         );
 
         let connect_deadline = Instant::now() + Duration::from_secs(3);
@@ -1432,9 +1450,15 @@ mod tests {
             Some(browser_url.clone()),
             None,
             crate::peer::PeerWitnessVantage::Remote,
-            TransportCredentials::default(),
+            crate::loopback_token::test_transport_credentials(),
             log_tx,
-            move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
+            move |events_tx| {
+                Box::new(IntendantWsTransport::with_credentials(
+                    url_for_closure,
+                    events_tx,
+                    crate::loopback_token::test_transport_credentials(),
+                ))
+            },
         );
 
         let snap = handle.snapshot();
@@ -1496,9 +1520,15 @@ mod tests {
             None,
             None,
             crate::peer::PeerWitnessVantage::Unknown,
-            TransportCredentials::default(),
+            crate::loopback_token::test_transport_credentials(),
             log_tx,
-            move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
+            move |events_tx| {
+                Box::new(IntendantWsTransport::with_credentials(
+                    url_for_closure,
+                    events_tx,
+                    crate::loopback_token::test_transport_credentials(),
+                ))
+            },
         );
         assert!(handle.snapshot().browser_tcp_via_url.is_none());
         assert!(handle.browser_tcp_via_url().is_none());
@@ -1571,9 +1601,15 @@ mod tests {
             None,
             None,
             crate::peer::PeerWitnessVantage::Unknown,
-            TransportCredentials::default(),
+            crate::loopback_token::test_transport_credentials(),
             log_tx,
-            move |events_tx| Box::new(IntendantWsTransport::new(url, events_tx)),
+            move |events_tx| {
+                Box::new(IntendantWsTransport::with_credentials(
+                    url,
+                    events_tx,
+                    crate::loopback_token::test_transport_credentials(),
+                ))
+            },
         )
     }
 

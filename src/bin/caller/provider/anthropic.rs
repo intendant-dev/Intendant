@@ -249,12 +249,13 @@ impl AnthropicProvider {
     ) -> Result<ProviderHttpResponse, CallerError> {
         let url = format!("{}/v1/messages", self.endpoint);
         match &self.auth {
-            ProviderAuth::Key(api_key) => {
+            auth @ (ProviderAuth::Key(_) | ProviderAuth::PerRequest { .. }) => {
+                let api_key = auth.request_key()?;
                 let builder = || {
                     let request = self
                         .client
                         .post(&url)
-                        .header("x-api-key", api_key)
+                        .header("x-api-key", api_key.as_ref())
                         .header("anthropic-version", "2023-06-01")
                         .header("anthropic-beta", beta_header)
                         .header("content-type", "application/json")

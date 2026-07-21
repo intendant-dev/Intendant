@@ -25,23 +25,30 @@ impl DaemonIdentity {
 
     pub fn load_or_create(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        // Custody-routed (class 3): a migrated key file is a tombstone
+        // naming a sealed custody entry; a plain file serves as-is. The
+        // create branch always writes a plain file — custody is entered
+        // only through the opt-in `intendant custody migrate` verb.
+        match crate::key_custody::read_key_material_opt(path)
+            .map_err(|e| format!("daemon identity: {e}"))?
+        {
+            Some(material) => {
+                tighten_identity_dir(path);
+                Self::from_pkcs8(material.as_bytes())
+            }
+            None => {
                 let parent = path
                     .parent()
                     .ok_or_else(|| format!("identity path has no parent: {}", path.display()))?;
-                std::fs::create_dir_all(parent)
+                intendant_core::state_paths::create_private_dir_all(parent)
                     .map_err(|e| format!("create identity dir {}: {e}", parent.display()))?;
                 let rng = ring::rand::SystemRandom::new();
                 let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
                     .map_err(|_| "generate daemon identity key".to_string())?;
                 write_private_key(path, pkcs8.as_ref())?;
-                pkcs8.as_ref().to_vec()
+                Self::from_pkcs8(pkcs8.as_ref())
             }
-            Err(e) => return Err(format!("read daemon identity {}: {e}", path.display())),
-        };
-        Self::from_pkcs8(&bytes)
+        }
     }
 
     pub fn from_pkcs8(pkcs8: &[u8]) -> Result<Self, String> {
@@ -86,6 +93,25 @@ pub fn b64u(bytes: &[u8]) -> String {
 
 fn b64u_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)
+}
+
+/// Installs that predate the private-dir convention created the identity
+/// directory with umask defaults (0755 — group/other-listable, unlike the
+/// state-root convention). The key file itself has always been 0600; this
+/// tightens the existing directory on load so listings stop leaking.
+/// Best-effort: a failure never blocks identity load.
+fn tighten_identity_dir(key_path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = key_path.parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Ok(metadata) = std::fs::metadata(parent) {
+            if metadata.permissions().mode() & 0o077 != 0 {
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = key_path;
 }
 
 /// The daemon-identity state directory — also home to small identity-

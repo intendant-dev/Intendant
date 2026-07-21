@@ -84,7 +84,7 @@ pub struct ExperimentalConfig {
     /// task with a fast vision model that either completes it on the
     /// display or escalates to the main agent. Vaulted because the extra
     /// hop adds latency to every task, and under subscription-based
-    /// external agents (Codex, Claude Code) it drags in an API-key model
+    /// external agents (Codex, Claude Code, Kimi Code) it drags in an API-key model
     /// the deployment otherwise doesn't need. Frame-grounded dashboard
     /// dispatches (the user points at a display and issues a task) are
     /// NOT behind this flag — they are an explicit CU request, and the
@@ -126,6 +126,9 @@ pub struct ExternalAgentConfig {
     /// Claude Code settings.
     #[serde(default)]
     pub claude_code: ClaudeCodeConfig,
+    /// Kimi Code settings.
+    #[serde(default)]
+    pub kimi: KimiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -594,6 +597,105 @@ impl Default for ClaudeCodeConfig {
             effort: None,
             allowed_tools: Vec::new(),
             max_budget_usd: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KimiConfig {
+    /// Path or command name for the Kimi Code binary.
+    #[serde(default = "default_kimi_command")]
+    pub command: String,
+    /// Model to use. Unset delegates to Kimi's configured default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Thinking-effort override. Unset delegates to Kimi's model default.
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// Permission mode: `manual`, `auto`, or `yolo`.
+    #[serde(default = "default_kimi_permission_mode")]
+    pub permission_mode: String,
+    /// Optional exact active-tool override. `None` delegates to Kimi's
+    /// native profile defaults, `Some([])` disables all optional tools, and
+    /// a non-empty list enables exactly those named tools.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    /// Start the session in Kimi's plan mode.
+    #[serde(default)]
+    pub plan_mode: bool,
+    /// Enable Kimi's native swarm/sub-agent mode.
+    #[serde(default)]
+    pub swarm_mode: bool,
+    /// One-shot anchor-fork trim carried through an in-memory project clone.
+    /// Never accepted from or persisted to `intendant.toml`.
+    #[serde(skip)]
+    pub kimi_fork_rollback_turns: Option<u32>,
+    /// Serialized internal expected-head horizon for an anchor fork. Like
+    /// the rollback count, this only rides an in-memory project clone.
+    #[serde(skip)]
+    pub kimi_fork_expected_horizon: Option<String>,
+}
+
+fn default_kimi_command() -> String {
+    "kimi".to_string()
+}
+
+fn default_kimi_permission_mode() -> String {
+    "manual".to_string()
+}
+
+/// Canonicalize Kimi's permission policy. `default` names Kimi's
+/// interactive/manual policy; unknown authority-bearing values fail closed
+/// to `manual` instead of reaching the adapter or widening permissions.
+pub fn normalize_kimi_permission_mode(mode: &str) -> String {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "manual" => "manual".to_string(),
+        "auto" => "auto".to_string(),
+        "yolo" | "bypass" | "bypasspermissions" | "bypass-permissions" | "bypass_permissions" => {
+            "yolo".to_string()
+        }
+        _ => "manual".to_string(),
+    }
+}
+
+/// Canonicalize a Kimi thinking override. Empty and explicit inherit
+/// sentinels leave Kimi's configured model default in control.
+pub fn normalize_kimi_thinking(thinking: Option<&str>) -> Option<String> {
+    let trimmed = thinking.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "default" | "inherit" | "global"
+    ) {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+/// Canonicalize a Kimi active-tool override without collapsing an explicit
+/// empty list into the inherited/default state.
+pub fn normalize_kimi_allowed_tools(tools: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for tool in tools {
+        let tool = tool.trim();
+        if !tool.is_empty() && !normalized.iter().any(|candidate| candidate == tool) {
+            normalized.push(tool.to_string());
+        }
+    }
+    normalized
+}
+
+impl Default for KimiConfig {
+    fn default() -> Self {
+        Self {
+            command: default_kimi_command(),
+            model: None,
+            thinking: None,
+            permission_mode: default_kimi_permission_mode(),
+            allowed_tools: None,
+            plan_mode: false,
+            swarm_mode: false,
+            kimi_fork_rollback_turns: None,
+            kimi_fork_expected_horizon: None,
         }
     }
 }
@@ -2402,6 +2504,13 @@ context_window = 200000
         assert_eq!(config.agent.claude_code.permission_mode, "default");
         assert!(config.agent.claude_code.model.is_none());
         assert!(config.agent.claude_code.allowed_tools.is_empty());
+        assert_eq!(config.agent.kimi.command, "kimi");
+        assert_eq!(config.agent.kimi.permission_mode, "manual");
+        assert!(config.agent.kimi.model.is_none());
+        assert!(config.agent.kimi.thinking.is_none());
+        assert!(config.agent.kimi.allowed_tools.is_none());
+        assert!(!config.agent.kimi.plan_mode);
+        assert!(!config.agent.kimi.swarm_mode);
     }
 
     #[test]
@@ -2421,6 +2530,15 @@ command = "/usr/local/bin/claude"
 model = "claude-sonnet-4-20250514"
 permission_mode = "acceptEdits"
 allowed_tools = ["Read", "Edit", "Bash"]
+
+[agent.kimi]
+command = "/usr/local/bin/kimi"
+model = "k2.7-coding"
+thinking = "high"
+permission_mode = "auto"
+allowed_tools = ["Read", " Write ", "Read"]
+plan_mode = true
+swarm_mode = true
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.agent.default_backend.as_deref(), Some("codex"));
@@ -2439,6 +2557,23 @@ allowed_tools = ["Read", "Edit", "Bash"]
             config.agent.claude_code.allowed_tools,
             vec!["Read", "Edit", "Bash"]
         );
+        assert_eq!(config.agent.kimi.command, "/usr/local/bin/kimi");
+        assert_eq!(config.agent.kimi.model.as_deref(), Some("k2.7-coding"));
+        assert_eq!(config.agent.kimi.thinking.as_deref(), Some("high"));
+        assert_eq!(config.agent.kimi.permission_mode, "auto");
+        assert_eq!(
+            normalize_kimi_allowed_tools(
+                config
+                    .agent
+                    .kimi
+                    .allowed_tools
+                    .as_deref()
+                    .unwrap_or_default()
+            ),
+            vec!["Read", "Write"]
+        );
+        assert!(config.agent.kimi.plan_mode);
+        assert!(config.agent.kimi.swarm_mode);
     }
 
     #[test]
@@ -2458,6 +2593,46 @@ default_backend = "codex"
         assert!(config.agent.claude_code.model.is_none());
         assert_eq!(config.agent.claude_code.permission_mode, "default");
         assert!(config.agent.claude_code.allowed_tools.is_empty());
+        assert_eq!(config.agent.kimi.command, "kimi");
+        assert!(config.agent.kimi.model.is_none());
+        assert!(config.agent.kimi.thinking.is_none());
+        assert_eq!(config.agent.kimi.permission_mode, "manual");
+        assert!(config.agent.kimi.allowed_tools.is_none());
+        assert!(!config.agent.kimi.plan_mode);
+        assert!(!config.agent.kimi.swarm_mode);
+    }
+
+    #[test]
+    fn kimi_config_normalizers_preserve_policy_and_inherit_semantics() {
+        assert_eq!(normalize_kimi_permission_mode("default"), "manual");
+        assert_eq!(normalize_kimi_permission_mode("AUTO"), "auto");
+        assert_eq!(normalize_kimi_permission_mode("bypassPermissions"), "yolo");
+        assert_eq!(normalize_kimi_permission_mode("future-policy"), "manual");
+        assert_eq!(
+            normalize_kimi_thinking(Some(" HIGH ")).as_deref(),
+            Some("high")
+        );
+        assert_eq!(normalize_kimi_thinking(Some("inherit")), None);
+        assert_eq!(normalize_kimi_thinking(Some("  ")), None);
+        assert_eq!(
+            normalize_kimi_allowed_tools(&[
+                " Read ".to_string(),
+                String::new(),
+                "Write".to_string(),
+                "Read".to_string(),
+            ]),
+            vec!["Read", "Write"]
+        );
+
+        let default = toml::to_string(&KimiConfig::default()).unwrap();
+        assert!(!default.contains("allowed_tools"));
+        let explicit_none = KimiConfig {
+            allowed_tools: Some(Vec::new()),
+            ..KimiConfig::default()
+        };
+        let round_trip: KimiConfig =
+            toml::from_str(&toml::to_string(&explicit_none).unwrap()).unwrap();
+        assert_eq!(round_trip.allowed_tools, Some(Vec::new()));
     }
 
     #[test]

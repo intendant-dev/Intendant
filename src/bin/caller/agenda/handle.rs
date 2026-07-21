@@ -89,6 +89,9 @@ impl AgendaHandle {
         let verb = match cmd {
             AgendaCommand::ApproveEffect { .. } => "approve_effect",
             AgendaCommand::RevokeEffect { .. } => "revoke_effect",
+            // The combined mint+approve gesture embeds an approval, so it
+            // is owner-surface exactly like the approval alone.
+            AgendaCommand::StartNow { .. } => "start_now",
             _ => return Ok(()),
         };
         let owner_surface = matches!(
@@ -257,6 +260,7 @@ impl AgendaHandle {
                 id: item.id.clone(),
                 text,
                 structured: Some(resolution),
+                source: None,
             },
             None,
         )
@@ -446,6 +450,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    source: None,
                 },
                 Some(AgendaActor {
                     principal: Some("owner".into()),
@@ -470,7 +475,8 @@ mod tests {
         assert!(handle
             .apply(
                 AgendaCommand::Complete {
-                    id: "01UNKNOWN".into()
+                    id: "01UNKNOWN".into(),
+                    source: None,
                 },
                 None,
             )
@@ -503,6 +509,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    source: None,
                 },
                 actor("agent_session", Some("sess-a5")),
             )
@@ -516,6 +523,7 @@ mod tests {
                     goal: "run the cert sweep and report".into(),
                     fire_at_ms: 4_000_000_000_000,
                     orchestrate: false,
+                    source: None,
                 },
                 actor("agent_session", Some("sess-a5")),
             )
@@ -717,6 +725,7 @@ mod tests {
             .apply(
                 AgendaCommand::Reopen {
                     id: parked.id.clone(),
+                    source: None,
                 },
                 None,
             )
@@ -732,6 +741,7 @@ mod tests {
             .apply(
                 AgendaCommand::Complete {
                     id: parked.id.clone(),
+                    source: None,
                 },
                 None,
             )
@@ -895,6 +905,7 @@ mod tests {
                     id: parked.id.clone(),
                     text: "yes — ship it".into(),
                     structured: None,
+                    source: None,
                 },
                 None,
             )
@@ -909,6 +920,7 @@ mod tests {
             .apply(
                 AgendaCommand::Reopen {
                     id: parked.id.clone(),
+                    source: None,
                 },
                 None,
             )
@@ -918,6 +930,7 @@ mod tests {
             .apply(
                 AgendaCommand::Complete {
                     id: parked.id.clone(),
+                    source: None,
                 },
                 None,
             )
@@ -932,6 +945,7 @@ mod tests {
             .apply(
                 AgendaCommand::Complete {
                     id: parked.id.clone(),
+                    source: None,
                 },
                 None,
             )
@@ -947,6 +961,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    source: None,
                 },
                 None,
             )
@@ -957,6 +972,7 @@ mod tests {
                     id: plain.id.clone(),
                     text: "sure".into(),
                     structured: None,
+                    source: None,
                 },
                 None,
             )
@@ -1083,6 +1099,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    source: None,
                 },
                 None,
             )
@@ -1116,6 +1133,95 @@ mod tests {
         );
     }
 
+    /// F3's combined mint+approve gesture is owner-surface only, exactly
+    /// like the approval it embeds: agent sessions (their own items
+    /// included), peers, and unattributed callers get the named denial;
+    /// an owner surface gets an immediately-approved effect whose digest
+    /// binds the manifest minted in the same act, fire_at_ms = now.
+    #[test]
+    fn start_now_is_owner_surface_and_binds_its_own_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Task,
+                    title: "fix the flaky probe".into(),
+                    body: "details in the runbook".into(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                actor("agent_session", Some("sess-f3")),
+            )
+            .unwrap();
+
+        for (kind, session) in [
+            ("agent_session", Some("sess-f3")),
+            ("peer", None),
+            ("unattributed", None),
+        ] {
+            match handle.apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                },
+                actor(kind, session),
+            ) {
+                Err(AgendaError::NotPermitted { verb, actor }) => {
+                    assert_eq!(verb, "start_now");
+                    assert_eq!(actor, kind);
+                }
+                other => panic!("expected NotPermitted for {kind}, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            handle.apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                },
+                None,
+            ),
+            Err(AgendaError::NotPermitted { .. })
+        ));
+
+        let before_ms = now_ms();
+        let started = handle
+            .apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                },
+                actor("dashboard", None),
+            )
+            .unwrap();
+        let effect = &started.effects[0];
+        let approval = effect
+            .approval
+            .as_ref()
+            .expect("the gesture approves in the same act");
+        assert_eq!(approval.digest, effect.digest);
+        assert_eq!(approval.kind.as_deref(), Some("dashboard"));
+        assert!(effect.manifest.fire_at_ms >= before_ms);
+        assert!(effect.manifest.goal.contains(&item.id));
+        assert!(effect.manifest.goal.contains("fix the flaky probe"));
+        assert!(effect.manifest.goal.contains("details in the runbook"));
+
+        // Start-now on an already-scheduled item revises the same lineage
+        // (standing re-propose semantics) rather than growing a second
+        // effect.
+        let again = handle
+            .apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                },
+                actor("local_process", None),
+            )
+            .unwrap();
+        assert_eq!(again.effects.len(), 1);
+        assert_eq!(again.effects[0].effect_id, effect.effect_id);
+        assert!(again.effects[0].approval.is_some());
+    }
+
     /// Approval binds the digest: an edit (re-propose) voids it, and a
     /// stale digest is refused at intake with the named mismatch.
     #[test]
@@ -1131,6 +1237,7 @@ mod tests {
                     body: String::new(),
                     tags: Vec::new(),
                     due_ms: None,
+                    source: None,
                 },
                 None,
             )
@@ -1142,6 +1249,7 @@ mod tests {
                     goal: "summarize the week".into(),
                     fire_at_ms: 4_000_000_000_000,
                     orchestrate: false,
+                    source: None,
                 },
                 None,
             )
@@ -1178,6 +1286,7 @@ mod tests {
                     goal: "summarize the week AND email it".into(),
                     fire_at_ms: 4_000_000_000_000,
                     orchestrate: false,
+                    source: None,
                 },
                 None,
             )

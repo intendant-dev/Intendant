@@ -258,6 +258,7 @@ pub fn spawn_event_listener(
                     | AppEvent::SessionRenameResult { .. }
                     | AppEvent::SessionAgentConfigResult { .. }
                     | AppEvent::ClaudeConfigChanged { .. }
+                    | AppEvent::KimiConfigChanged { .. }
                     | AppEvent::SharedView { .. }
                     | AppEvent::DisplayRequestRaised { .. }
                     | AppEvent::DisplayRequestResolved { .. }

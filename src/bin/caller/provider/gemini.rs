@@ -114,13 +114,14 @@ impl GeminiProvider {
         streaming: bool,
     ) -> Result<ProviderHttpResponse, CallerError> {
         match &self.auth {
-            ProviderAuth::Key(api_key) => {
+            auth @ (ProviderAuth::Key(_) | ProviderAuth::PerRequest { .. }) => {
+                let api_key = auth.request_key()?;
                 let builder = || {
                     let request = self
                         .client
                         .post(url)
                         .header("content-type", "application/json")
-                        .header("x-goog-api-key", api_key)
+                        .header("x-goog-api-key", api_key.as_ref())
                         .body(request_body.clone());
                     if streaming {
                         request.timeout(STREAM_TIMEOUT)

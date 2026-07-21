@@ -2872,6 +2872,7 @@ mod tests {
                     id: item.id.clone(),
                     text: "yes — from the tab".into(),
                     structured: None,
+                    source: None,
                 },
                 None,
             )

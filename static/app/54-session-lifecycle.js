@@ -738,7 +738,7 @@ function autoAttachUnmanagedFollowUp(evt = {}) {
 // phase. The backend dispatcher routes appropriately (presence-mediated vs
 // direct, task_tx vs follow_up_tx) based on mode and the `direct` flag. The
 // old phase-based fork between start_task / follow_up was a TUI-centric
-// artifact — all agents (native, Codex, Claude Code) treat
+// artifact — all agents (native, Codex, Claude Code, Kimi Code) treat
 // subsequent messages as new turns in the existing conversation.
 // Shared by the Activity composer and the Station composer.
 function dispatchTaskText(text, options = {}) {
@@ -1357,4 +1357,3 @@ function fsPathLooksAbsolute(path) {
   const value = String(path || '').trim();
   return value === '~' || value.startsWith('~/') || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
 }
-

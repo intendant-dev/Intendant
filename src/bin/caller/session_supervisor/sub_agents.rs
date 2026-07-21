@@ -4,6 +4,19 @@
 
 use super::*;
 
+fn delegate_backend(agent: Option<&str>) -> Result<Option<external_agent::AgentBackend>, String> {
+    match agent.map(str::trim).unwrap_or("internal") {
+        "internal" | "" | "intendant" => Ok(None),
+        value => external_agent::AgentBackend::from_str_loose(value)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "unknown sub-agent backend `{value}`; use internal, codex, claude-code, or kimi"
+                )
+            }),
+    }
+}
+
 impl SessionSupervisor {
     /// Count of still-running sub-agent children of `parent_session_id`.
     pub(crate) async fn running_sub_agent_children(&self, parent_session_id: &str) -> usize {
@@ -64,15 +77,10 @@ impl SessionSupervisor {
             ));
             return;
         };
-        let backend = match agent.as_deref().map(str::trim).unwrap_or("internal") {
-            "internal" | "" | "intendant" => None,
-            "codex" => Some(external_agent::AgentBackend::Codex),
-            "claude-code" | "claude_code" => Some(external_agent::AgentBackend::ClaudeCode),
-            other => {
-                self.loop_error(format!(
-                    "Delegate failed: unknown sub-agent backend `{other}`; use internal, \
-                     codex, or claude-code"
-                ));
+        let backend = match delegate_backend(agent.as_deref()) {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.loop_error(format!("Delegate failed: {error}"));
                 return;
             }
         };
@@ -357,6 +365,28 @@ impl SessionSupervisor {
 mod tests {
     use super::*;
     use crate::session_supervisor::tests::{managed_session, test_supervisor};
+
+    #[test]
+    fn dashboard_delegate_accepts_every_external_backend_alias() {
+        assert_eq!(delegate_backend(None).unwrap(), None);
+        assert_eq!(
+            delegate_backend(Some("codex")).unwrap(),
+            Some(external_agent::AgentBackend::Codex)
+        );
+        assert_eq!(
+            delegate_backend(Some("claude_code")).unwrap(),
+            Some(external_agent::AgentBackend::ClaudeCode)
+        );
+        for alias in ["kimi", "kimi-code", "kimi_code", "Kimi Code"] {
+            assert_eq!(
+                delegate_backend(Some(alias)).unwrap(),
+                Some(external_agent::AgentBackend::Kimi)
+            );
+        }
+        assert!(delegate_backend(Some("unknown"))
+            .unwrap_err()
+            .contains("codex, claude-code, or kimi"));
+    }
 
     /// The scripted mock provider behind a test-held gate: every chat call
     /// waits for the test to release the gate first. This pins a spawned

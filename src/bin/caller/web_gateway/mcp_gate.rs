@@ -16,6 +16,22 @@ pub(crate) fn loopback_mcp_auth_token() -> &'static str {
     LOOPBACK_MCP_AUTH_TOKEN.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
 }
 
+/// Port of the dedicated session-MCP loopback listener
+/// ([`GatewayIngress::SessionMcp`]), recorded at bind. The supervised
+/// native launch arm reads it to build the runtime child's bootstrap URL —
+/// that listener stays outside the sandbox's loopback guard because it can
+/// only mint the calling session's own authority (session-scoped tokens
+/// required; every other rung refused).
+static SESSION_MCP_PORT: OnceLock<u16> = OnceLock::new();
+
+pub(crate) fn record_session_mcp_port(port: u16) {
+    let _ = SESSION_MCP_PORT.set(port);
+}
+
+pub(crate) fn session_mcp_port() -> Option<u16> {
+    SESSION_MCP_PORT.get().copied()
+}
+
 pub(crate) fn has_browser_origin_headers(header_text: &str) -> bool {
     http_header_present(header_text, "origin")
         || http_header_present(header_text, "sec-fetch-site")
@@ -546,6 +562,10 @@ pub(crate) async fn handle_mcp_post(
     tls_client_cert_fingerprint: Option<String>,
     peer_addr: std::net::SocketAddr,
     bus: EventBus,
+    // True on the dedicated session-MCP ingress: only session-scoped
+    // tokens bind; every other rung (peer, process token, browser, mTLS,
+    // tokenless loopback) is refused at the access edge.
+    session_token_only: bool,
 ) {
     // MCP Streamable HTTP endpoint.
     //
@@ -562,15 +582,19 @@ pub(crate) async fn handle_mcp_post(
         // shared token alone no longer authorizes the
         // tool surface — see `mcp_http_access_context`.
         let cert_dir = crate::access::backend::select_backend().cert_dir();
-        let mcp_access = match mcp_http_access_context(
-            &cert_dir,
-            peer_connection_identity.as_ref(),
-            tls_client_cert_fingerprint.as_deref(),
-            tls_client_cert_present,
-            is_tls,
-            peer_addr,
-            header_text,
-        ) {
+        let mcp_access = match if session_token_only {
+            session_only_mcp_access_context(&cert_dir, header_text)
+        } else {
+            mcp_http_access_context(
+                &cert_dir,
+                peer_connection_identity.as_ref(),
+                tls_client_cert_fingerprint.as_deref(),
+                tls_client_cert_present,
+                is_tls,
+                peer_addr,
+                header_text,
+            )
+        } {
             Ok(access) => access,
             Err((status, message)) => {
                 let reason = match status {
@@ -665,6 +689,35 @@ pub(crate) async fn handle_mcp_stream(mut stream: DemuxStream, header_text: &str
     }
 }
 
+/// The session-MCP ingress access ladder: exactly one rung. A
+/// session-scoped token binds that agent session; everything else — peer
+/// identity, the shared process token, browser origins, mTLS
+/// certificates, tokenless loopback — is refused by name. This single
+/// rung is what keeps the dedicated listener sound OUTSIDE the sandbox's
+/// loopback guard: nothing reachable through it exceeds the calling
+/// session's own gate-resolved authority, so a prompt-injected shell
+/// gains nothing its session's tool loop does not already have.
+pub(crate) fn session_only_mcp_access_context(
+    cert_dir: &std::path::Path,
+    header_text: &str,
+) -> Result<HttpAccessContext, (u16, String)> {
+    match mcp_request_token_binding(header_text) {
+        McpTokenBinding::Session(session_id) => {
+            mcp_agent_session_context(cert_dir, &session_id, "http", true)
+        }
+        McpTokenBinding::Invalid => Err((
+            401,
+            "invalid mcp_token; use the URL Intendant injected (INTENDANT_MCP_URL)".to_string(),
+        )),
+        McpTokenBinding::Process | McpTokenBinding::Missing => Err((
+            403,
+            "this listener serves session-scoped MCP tokens only — call with your \
+             injected INTENDANT_MCP_URL, or use the daemon's main gateway port"
+                .to_string(),
+        )),
+    }
+}
+
 /// Bind a `POST /mcp` request to an access principal, the same way the
 /// dashboard HTTP APIs and federation surfaces bind theirs. Resolution
 /// order:
@@ -705,6 +758,7 @@ pub(crate) fn mcp_http_access_context(
     peer_addr: std::net::SocketAddr,
     header_text: &str,
 ) -> Result<HttpAccessContext, (u16, String)> {
+    let loopback_admitted = crate::loopback_token::loopback_token_presented(header_text);
     let dashboard_equivalent_context = || {
         http_access_context(
             cert_dir,
@@ -712,6 +766,7 @@ pub(crate) fn mcp_http_access_context(
             tls_client_cert_fingerprint,
             tls_client_cert_present,
             is_tls,
+            loopback_admitted,
         )
         .map_err(|message| (500u16, message))
     };
@@ -764,6 +819,14 @@ pub(crate) fn mcp_http_access_context(
                     "mcp_token required: tokenless /mcp is only served to loopback clients"
                         .to_string(),
                 ));
+            }
+            // The mcp_token-less loopback tail mints `local_process` —
+            // owner posture. Like every owner-posture surface, it now
+            // requires the per-boot loopback admission token; transport
+            // reachability alone stopped being a credential when the
+            // token shipped.
+            if !loopback_admitted {
+                return Err((401, crate::loopback_token::refusal_error_message()));
             }
             if let Some(state) = load_state()? {
                 if let Some(principal) =
@@ -850,6 +913,141 @@ pub(crate) fn mcp_agent_session_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mcp_token-less loopback tail of the /mcp ladder mints
+    /// `local_process` — owner posture — so it now requires the per-boot
+    /// loopback admission token like every owner surface. The mcp_token
+    /// rungs (process + session-scoped) are untouched credentials.
+    #[test]
+    fn tokenless_loopback_mcp_requires_the_loopback_admission_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loopback: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        let refused = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n",
+        )
+        .expect_err("tokenless loopback /mcp must refuse");
+        assert_eq!(refused.0, 401);
+        assert!(
+            refused.1.contains("loopback-tokens"),
+            "named token guidance expected: {}",
+            refused.1
+        );
+
+        // Loopback-token'd requests bind the same local_process default
+        // as pre-token tokenless loopback did.
+        let admitted_request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:1\r\nx-intendant-loopback-token: {}\r\n\r\n",
+            crate::loopback_token::loopback_admission_token()
+        );
+        let admitted = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &admitted_request,
+        )
+        .unwrap();
+        assert_eq!(admitted.principal.id, "principal:local-process:loopback");
+
+        // The mcp process-token rung authenticates on its own, no
+        // loopback token required (supervised-backend bootstrap URLs).
+        let process_request = format!(
+            "POST /mcp?mcp_token={} HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n",
+            loopback_mcp_auth_token()
+        );
+        let via_process = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &process_request,
+        )
+        .unwrap();
+        assert_eq!(via_process.principal.id, "principal:mcp-token-holder");
+
+        // Non-loopback tokenless keeps its own refusal (not the token
+        // error — remote callers get mcp_token guidance).
+        let remote: std::net::SocketAddr = "10.0.0.5:9".parse().unwrap();
+        let refused = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            remote,
+            "POST /mcp HTTP/1.1\r\nHost: h\r\n\r\n",
+        )
+        .expect_err("remote tokenless /mcp must refuse");
+        assert_eq!(refused.0, 401);
+        assert!(refused.1.contains("mcp_token"), "{}", refused.1);
+    }
+
+    /// The dedicated session-MCP ingress ladder has exactly one rung: a
+    /// session-scoped token binds that agent session; the tokenless
+    /// root-capable default, the shared process token, and wrong tokens
+    /// never bind. This property is what keeps the listener sound OUTSIDE
+    /// the runtime sandbox's gateway-port guard.
+    #[test]
+    fn session_only_access_context_refuses_everything_but_session_tokens() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Tokenless — even loopback — is refused: no root default here.
+        let err = session_only_mcp_access_context(
+            tmp.path(),
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 403);
+
+        // The shared per-process token is refused: root-equivalent
+        // possession has no business on this listener.
+        let process_request = format!(
+            "POST /mcp?mcp_token={} HTTP/1.1\r\nHost: h\r\n\r\n",
+            loopback_mcp_auth_token()
+        );
+        let err = session_only_mcp_access_context(tmp.path(), &process_request).unwrap_err();
+        assert_eq!(err.0, 403);
+
+        // A wrong explicit token fails loud.
+        let err = session_only_mcp_access_context(
+            tmp.path(),
+            "POST /mcp?session_id=sess-a&mcp_token=wrong HTTP/1.1\r\nHost: h\r\n\r\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 401);
+
+        // The one rung: a session-scoped token binds exactly that session.
+        let derived = session_scoped_mcp_token(loopback_mcp_auth_token(), "sess-a");
+        let request =
+            format!("POST /mcp?session_id=sess-a&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n");
+        let access = session_only_mcp_access_context(tmp.path(), &request).unwrap();
+        assert!(
+            access
+                .principal
+                .id
+                .starts_with("principal:agent-session:sess-a"),
+            "session token must bind the agent-session principal, got {}",
+            access.principal.id
+        );
+
+        // And it cannot bind a DIFFERENT session's identity: the token is
+        // preimage-bound to its session id.
+        let forged =
+            format!("POST /mcp?session_id=sess-b&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n");
+        let err = session_only_mcp_access_context(tmp.path(), &forged).unwrap_err();
+        assert_eq!(err.0, 401);
+    }
 
     #[test]
     fn mcp_context_from_request_line_reads_session_scoped_managed_context() {
@@ -1520,6 +1718,129 @@ mod tests {
         );
     }
 
+    /// Track J exit criterion (rulings R1/R2, full MCP lane): an
+    /// owner-surface judgment moves derived status and records the
+    /// durable `owner` identity; a supervised agent session on the
+    /// SAME lane takes the named `actor-not-permitted` denial and the
+    /// claim does not move — the judgment choke, exercised through
+    /// the real gate.
+    #[tokio::test]
+    async fn memory_judgments_are_owner_lane_only_end_to_end() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bus = crate::event::EventBus::new();
+        let mut state = crate::mcp::McpAppState::new(
+            "test".into(),
+            "test".into(),
+            crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
+            tmp.path().join("logs"),
+        );
+        state.memory = Some(std::sync::Arc::new(
+            crate::memory::MemoryHandle::bootstrap(
+                bus.clone(),
+                crate::memory::MemoryStorage::Ephemeral,
+            )
+            .expect("ephemeral plane bootstraps"),
+        ));
+        let server = crate::mcp::IntendantServer::new(
+            std::sync::Arc::new(tokio::sync::RwLock::new(state)),
+            bus.clone(),
+        );
+        let dashboard_access = HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https"),
+            iam_state: None,
+        };
+        let session_access = HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+                "sess-e2e", "http", true,
+            ),
+            iam_state: None,
+        };
+        let rpc = |name: &str, arguments: serde_json::Value| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments },
+            })
+            .to_string()
+        };
+
+        let outcome = handle_mcp_http_request(
+            &rpc(
+                "memory_propose",
+                serde_json::json!({ "kind": "observation", "statement": "judged over the wire" }),
+            ),
+            &server,
+            None,
+            None,
+            None,
+            &dashboard_access,
+            None,
+            &bus,
+        )
+        .await;
+        let claim = memory_claim_from_outcome(outcome);
+        let claim_id = claim["id"].as_str().expect("claim id").to_string();
+
+        // The supervised session is refused with the NAMED outcome —
+        // and refused means refused: the claim stays candidate.
+        let outcome = handle_mcp_http_request(
+            &rpc(
+                "memory_judge",
+                serde_json::json!({ "verdict": "accept", "id": claim_id }),
+            ),
+            &server,
+            Some("sess-e2e"),
+            None,
+            None,
+            &session_access,
+            Some("sess-e2e".to_string()),
+            &bus,
+        )
+        .await;
+        let McpHttpOutcome::Response(resp) = outcome else {
+            panic!("expected a response outcome");
+        };
+        let result = resp.result.expect("tool result");
+        assert_eq!(
+            result.get("isError").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "agent-session judgment must be refused: {result}"
+        );
+        let text = result["content"][0]["text"].as_str().expect("error text");
+        assert!(
+            text.contains("actor-not-permitted"),
+            "the denial is the NAMED tenant-edge outcome, got: {text}"
+        );
+
+        // The owner surface judges the same claim: status moves, and
+        // the judgment history records the durable owner identity.
+        let outcome = handle_mcp_http_request(
+            &rpc(
+                "memory_judge",
+                serde_json::json!({
+                    "verdict": "accept", "id": claim_id,
+                    "reason": "verified over the wire",
+                }),
+            ),
+            &server,
+            None,
+            None,
+            None,
+            &dashboard_access,
+            None,
+            &bus,
+        )
+        .await;
+        let judged = memory_claim_from_outcome(outcome);
+        assert_eq!(judged["status"], "accepted", "owner judgment counts");
+        assert_eq!(judged["judgments"][0]["judged_by"]["actor"], "owner");
+        assert_eq!(
+            judged["judgments"][0]["judged_by"].get("principal"),
+            None,
+            "durable identity only (R2) — no principal survives the envelope"
+        );
+        assert_eq!(judged["judgments"][0]["reason"], "verified over the wire");
+    }
+
     #[test]
     fn mcp_http_access_context_binds_token_origin_and_loopback_paths() {
         use std::net::{Ipv4Addr, SocketAddr};
@@ -1527,10 +1848,18 @@ mod tests {
         let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 4000);
         let lan = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 9).into(), 4000);
         let plain = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
+        // The mcp_token-less loopback lane requires the per-boot
+        // admission token since the loopback gate shipped; with it the
+        // request binds the same local-process principal as before.
+        let admitted = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\
+             x-intendant-loopback-token: {}\r\n\r\n",
+            crate::loopback_token::loopback_admission_token()
+        );
 
-        // Tokenless loopback keeps working — bound to its own principal.
         let local =
-            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain).unwrap();
+            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, &admitted)
+                .unwrap();
         assert_eq!(local.principal.id, "principal:local-process:loopback");
         assert_eq!(local.principal.kind, "root_session");
         assert!(
@@ -1577,7 +1906,12 @@ mod tests {
             false,
             false,
             loopback,
-            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n",
+            &format!(
+                "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\
+                 Origin: http://localhost:8765\r\n\
+                 x-intendant-loopback-token: {}\r\n\r\n",
+                crate::loopback_token::loopback_admission_token()
+            ),
         )
         .unwrap();
         assert_eq!(dash.principal.id, "principal:root:dashboard");
@@ -1718,7 +2052,11 @@ mod tests {
             false,
             false,
             loopback,
-            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n",
+            &format!(
+                "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\
+                 x-intendant-loopback-token: {}\r\n\r\n",
+                crate::loopback_token::loopback_admission_token()
+            ),
         )
         .unwrap();
         assert_eq!(local.principal.kind, "local_process");
@@ -1758,6 +2096,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 4000);
         let plain = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
+        // The loopback-admitted twin: past the loopback gate, so the
+        // agent-scoping logic under test is what answers.
+        let admitted = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\
+             x-intendant-loopback-token: {}\r\n\r\n",
+            crate::loopback_token::loopback_admission_token()
+        );
         let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "test");
 
         let mut state = crate::access::iam::LocalIamState::default();
@@ -1774,10 +2119,17 @@ mod tests {
         .unwrap();
         crate::access::iam::save_state(tmp.path(), &state).unwrap();
 
-        // A scoped agent shedding its token no longer lands on a
-        // root-compatible default.
+        // Fully tokenless: the loopback admission gate answers first.
         let err = mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain)
             .unwrap_err();
+        assert_eq!(err.0, 401);
+        assert!(err.1.contains("loopback-tokens"), "guidance in: {}", err.1);
+
+        // Loopback-admitted but mcp_token-less while agent sessions are
+        // scoped: the scoping refusal, with its local_process guidance.
+        let err =
+            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, &admitted)
+                .unwrap_err();
         assert_eq!(err.0, 401);
         assert!(err.1.contains("local_process"), "guidance in: {}", err.1);
 
@@ -1809,7 +2161,8 @@ mod tests {
         .unwrap();
         crate::access::iam::save_state(tmp.path(), &state).unwrap();
         let local =
-            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain).unwrap();
+            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, &admitted)
+                .unwrap();
         assert_eq!(local.principal.kind, "local_process");
         assert_eq!(local.principal.role_id, "role:terminal");
     }
@@ -1873,10 +2226,10 @@ mod tests {
         assert!(!decision.allowed);
         assert!(decision.reason.contains("expired"), "{}", decision.reason);
 
-        // The tokenless loopback caller with a revoked local_process grant
-        // binds that principal and is denied per-op — the open default does
-        // not return, and the agent-scoping 401 does not mask the real
-        // reason.
+        // The loopback-admitted, mcp_token-less caller with a revoked
+        // local_process grant binds that principal and is denied per-op —
+        // the open default does not return, and the agent-scoping 401
+        // does not mask the real reason.
         let local = mcp_http_access_context(
             tmp.path(),
             None,
@@ -1884,7 +2237,11 @@ mod tests {
             false,
             false,
             loopback,
-            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n",
+            &format!(
+                "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\
+                 x-intendant-loopback-token: {}\r\n\r\n",
+                crate::loopback_token::loopback_admission_token()
+            ),
         )
         .unwrap();
         assert_eq!(local.principal.id, "principal:local-process:loopback");

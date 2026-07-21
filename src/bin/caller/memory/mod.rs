@@ -31,4 +31,4 @@ pub(crate) mod store;
 pub(crate) mod types;
 
 pub(crate) use handle::{MemoryHandle, MemoryStorage};
-pub(crate) use types::{ClaimView, MemoryError, ProposeArgs, SearchArgs};
+pub(crate) use types::{ClaimView, JudgeArgs, MemoryError, ProposeArgs, SearchArgs};

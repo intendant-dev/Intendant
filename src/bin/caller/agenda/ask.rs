@@ -328,6 +328,7 @@ mod tests {
                 principal: None,
                 session_id: Some("sess-ask".into()),
                 kind: Some("agent_session".into()),
+                source: None,
                 created_ms: 1,
             },
             status: AgendaStatus::Done,
@@ -340,6 +341,9 @@ mod tests {
                 questions,
             }),
             dismissed: None,
+            annotations: Vec::new(),
+            blockers: Vec::new(),
+            relies_on: Vec::new(),
         }
     }
 

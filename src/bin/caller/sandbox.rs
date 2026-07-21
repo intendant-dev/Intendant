@@ -138,6 +138,16 @@ pub(crate) fn seatbelt_credential_deny_clause() -> Result<String, String> {
     deny_dirs.push(state_root.join("access-certs"));
     deny_dirs.push(state_root.join("leased-auth"));
     deny_dirs.push(state_root.join("claude-auth"));
+    // Per-boot loopback admission tokens: reading one from a sandboxed
+    // shell would re-open the loopback owner surface the port guard
+    // closes (loopback_token.rs documents the envelope).
+    deny_dirs.push(state_root.join(crate::loopback_token::LOOPBACK_TOKEN_DIR));
+    // The daemon-identity signing key (class 3: browser-control,
+    // hosted-control, doorbell caller-ID) lives outside the state root;
+    // it deserves the same read wall as the trust store.
+    deny_dirs.push(canonicalize_for_profile(
+        &crate::daemon_identity::default_identity_dir(),
+    ));
     let mut deny_files: Vec<PathBuf> = vec![
         state_root.join("custody-audit.jsonl"),
         state_root.join("connect.toml"),
@@ -177,6 +187,13 @@ pub(crate) fn gateway_loopback_port() -> Option<u16> {
 /// Scoped to the daemon's own port; every other network destination
 /// stays open. Rides only the write-restricted (sandbox-on) profile:
 /// `--no-sandbox` keeps its whole-escape-hatch contract.
+///
+/// Legitimate in-session `ctl` does not need this port: supervised
+/// sessions' runtime env carries an `INTENDANT_MCP_URL` aimed at the
+/// dedicated session-MCP loopback listener (`GatewayIngress::SessionMcp`),
+/// which serves only `/mcp` to session-scoped tokens — it can never mint
+/// the root principal this deny exists to protect, so it stays outside
+/// the guard.
 #[cfg(target_os = "macos")]
 fn seatbelt_loopback_guard_clause() -> String {
     match gateway_loopback_port() {

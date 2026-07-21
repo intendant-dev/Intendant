@@ -423,3 +423,121 @@ html.ui-v2 .agenda-card-add input:focus {
   outline: none;
   border-color: var(--iris);
 }
+
+/* F1 provenance: resolved session names link to the conversation row on
+   the Sessions tab; self-described labels are visibly labeled data. */
+html.ui-v2 .agenda-session-link {
+  color: var(--iris);
+  text-decoration: none;
+  border-bottom: 1px dotted color-mix(in srgb, var(--iris) 55%, transparent);
+  cursor: pointer;
+}
+html.ui-v2 .agenda-session-link:hover {
+  color: var(--text);
+  border-bottom-color: var(--text);
+}
+html.ui-v2 .agenda-self-described {
+  color: var(--text-3);
+  font-style: italic;
+}
+/* Flash highlight on the Sessions-tab card an agenda jump lands on.
+   Defined here because the agenda owns the jump gesture. */
+.agenda-jump-flash {
+  animation: agenda-jump-flash-pulse 0.8s ease-in-out 3;
+}
+@keyframes agenda-jump-flash-pulse {
+  0%, 100% { outline: 2px solid transparent; outline-offset: 2px; }
+  50% { outline: 2px solid var(--iris, #7c7cf0); outline-offset: 2px; }
+}
+
+/* F2 gates & threads: annotations, blockers, dependency edges, blocked
+   chip. All content is escaped data. */
+html.ui-v2 .agenda-chip.blocked {
+  background: color-mix(in srgb, var(--red, #e06c75) 18%, transparent);
+  color: var(--red, #e06c75);
+  border: 1px solid color-mix(in srgb, var(--red, #e06c75) 45%, transparent);
+}
+html.ui-v2 .agenda-item-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 4px 0 2px 22px;
+}
+html.ui-v2 .agenda-note {
+  font-size: 11.5px;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .agenda-thread-more {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 11px;
+  color: var(--iris);
+  cursor: pointer;
+}
+html.ui-v2 .agenda-blocker {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text);
+}
+html.ui-v2 .agenda-blocker.cleared { color: var(--text-3); }
+html.ui-v2 .agenda-blocker-text { overflow-wrap: anywhere; }
+html.ui-v2 .agenda-blocker .agenda-btn { margin-left: auto; flex-shrink: 0; }
+html.ui-v2 .agenda-edges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+html.ui-v2 .agenda-edge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  border-radius: 999px;
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  color: var(--text-2);
+  max-width: 100%;
+}
+html.ui-v2 .agenda-edge.satisfied {
+  color: var(--green, #98c379);
+  border-color: color-mix(in srgb, var(--green, #98c379) 45%, transparent);
+}
+html.ui-v2 .agenda-edge.review {
+  color: var(--peach, #e5a06c);
+  border-color: color-mix(in srgb, var(--peach, #e5a06c) 45%, transparent);
+}
+html.ui-v2 .agenda-edge-remove {
+  background: none;
+  border: none;
+  padding: 0 0 0 2px;
+  color: var(--text-3);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+html.ui-v2 .agenda-edge-remove:hover { color: var(--red, #e06c75); }
+html.ui-v2 .agenda-thread-add {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+html.ui-v2 .agenda-thread-add .agenda-thread-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 11.5px;
+  padding: 4px 8px;
+}
+html.ui-v2 .agenda-thread-add .agenda-thread-input:focus {
+  outline: none;
+  border-color: var(--iris);
+}

@@ -100,6 +100,82 @@ window.qa = Object.assign(window.qa || {}, {
 // helpers treat None as "no enforcement."
 const FEDERATION_TOKEN_KEY = 'intendantFederationBearerToken';
 
+// ── Loopback admission token ──
+//
+// Every daemon boot mints a per-boot loopback admission token; without
+// it, loopback requests no longer reach the trusted-local owner lane
+// (tokenless loopback is refused with a named error). Owner surfaces
+// hand the token to this page as `?token=` on the opened URL — the
+// boot-printed URL, `intendant ctl dashboard-url`, QA rigs — and the
+// page stores it per-origin, strips it from the visible URL, and
+// attaches it to every same-origin request. mTLS transports ignore the
+// extra header (the client certificate authenticates those), so
+// attaching unconditionally is safe on every posture. Tokens rotate
+// each daemon boot: a stale stored token surfaces the daemon's named
+// 401 pointing at `intendant ctl dashboard-url`.
+const LOOPBACK_TOKEN_KEY = 'intendantLoopbackToken';
+
+(function captureLoopbackToken() {
+  try {
+    const params = new URLSearchParams(location.search);
+    const token = (params.get('token') || '').trim();
+    if (token) {
+      localStorage.setItem(LOOPBACK_TOKEN_KEY, token);
+      // Strip the secret from the visible/bookmarkable URL.
+      params.delete('token');
+      const query = params.toString();
+      history.replaceState(
+        null,
+        '',
+        location.pathname + (query ? '?' + query : '') + location.hash
+      );
+    }
+  } catch {
+    /* storage/history unavailable; the URL keeps carrying the token */
+  }
+})();
+
+function getLoopbackToken() {
+  try {
+    return localStorage.getItem(LOOPBACK_TOKEN_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+// Attach the loopback token to every same-origin request. Cross-cutting
+// by design — the token is transport admission, not per-call auth — and
+// deliberately installed BEFORE the hosted-control (31b), multihost
+// (49), and files-IDE (55) fetch wrappers so they chain through it.
+(function attachLoopbackTokenToFetch() {
+  const bareFetch = window.fetch.bind(window);
+  window.fetch = (input, init) => {
+    try {
+      const token = getLoopbackToken();
+      if (token) {
+        const url =
+          typeof input === 'string' ? input : (input && input.url) || '';
+        const sameOrigin =
+          url.startsWith('/') || url.startsWith(location.origin);
+        if (sameOrigin) {
+          const baseHeaders =
+            (init && init.headers) ||
+            (typeof input !== 'string' && input && input.headers) ||
+            {};
+          const headers = new Headers(baseHeaders);
+          if (!headers.has('x-intendant-loopback-token')) {
+            headers.set('x-intendant-loopback-token', token);
+          }
+          init = { ...(init || {}), headers };
+        }
+      }
+    } catch {
+      /* malformed input — fall through to the bare call untouched */
+    }
+    return bareFetch(input, init);
+  };
+})();
+
 function getFederationToken() {
   try {
     return localStorage.getItem(FEDERATION_TOKEN_KEY) || '';
@@ -153,7 +229,10 @@ function buildWsUrl(path) {
     const p = location.protocol === 'https:' ? 'wss:' : 'ws:';
     url = p + '//' + location.host + (path || '');
   }
-  const token = getFederationToken();
+  // Federation bearer when configured, else the loopback admission
+  // token — the daemon's verify_bearer_for_ws accepts either, and the
+  // loopback gate reads the same `?token=`.
+  const token = getFederationToken() || getLoopbackToken();
   if (token) {
     const sep = url.includes('?') ? '&' : '?';
     url += sep + 'token=' + encodeURIComponent(token);
@@ -373,7 +452,7 @@ function updateLogEmptyState() {
 const LOG_EMPTY_DEFAULT_TITLE = 'No activity yet';
 const LOG_EMPTY_DEFAULT_HINT = 'Send a task below to start the agent, or pick a session from Sessions.';
 
-/* External-agent availability (Codex / Claude Code): which backends this
+/* External-agent availability (Codex / Claude Code / Kimi Code): which backends this
    daemon can actually spawn. External agents run on their own accounts,
    so the fueling nudge must not read as "nothing works" while one is
    present — and the new-session picker greys out backends whose CLI is
@@ -714,6 +793,7 @@ const SESSION_SOURCE_FILTER_OPTIONS = [
   { value: 'external', label: 'External agents', plural: 'sources' },
   { value: 'codex', label: 'Codex', plural: 'sources' },
   { value: 'claude-code', label: 'Claude', plural: 'sources' },
+  { value: 'kimi', label: 'Kimi', plural: 'sources' },
 ];
 const SESSION_STATUS_FILTER_OPTIONS = [
   { value: 'active', label: 'Active', plural: 'statuses' },
@@ -896,6 +976,7 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'session_agent_config_result',
   'codex_config_changed',
   'claude_config_changed',
+  'kimi_config_changed',
   'usage',
   'usage_update',
   'presence_usage_update',
@@ -925,6 +1006,13 @@ const DASHBOARD_CONTROL_MSG_RPC_ACTIONS = new Set([
   'set_claude_model',
   'set_claude_permission_mode',
   'set_claude_allowed_tools',
+  'set_kimi_command',
+  'set_kimi_model',
+  'set_kimi_thinking',
+  'set_kimi_permission_mode',
+  'set_kimi_plan_mode',
+  'set_kimi_swarm_mode',
+  'set_kimi_allowed_tools',
   'set_codex_reasoning_effort',
   'set_codex_service_tier',
   'set_codex_web_search',

@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 pub mod claude_code;
 pub mod codex;
+pub mod kimi_code;
 pub(crate) mod protocol_watch;
 pub(crate) mod transcript_text;
 
@@ -117,8 +118,24 @@ pub(super) fn intendant_mcp_bearer_token(
 /// session id is present the token is *session-scoped* (derived from the
 /// per-process token and the session id), so the backend authenticates as
 /// exactly that supervised agent session to the daemon's IAM layer and cannot
-/// present another session's identity.
-pub(super) fn intendant_bootstrap_mcp_url(
+/// present another session's identity. `pub(crate)`: the supervised NATIVE
+/// launch arm reuses the same builder for the runtime child's bootstrap
+/// ([`crate::agent_runner::RuntimeMcpEnv`]) so both lanes stay one shape.
+pub(crate) fn intendant_bootstrap_mcp_url(
+    port: u16,
+    session_id: Option<&str>,
+    managed_context: Option<&str>,
+    mcp_token: Option<&str>,
+) -> String {
+    intendant_bootstrap_mcp_url_at("localhost", port, session_id, managed_context, mcp_token)
+}
+
+/// [`intendant_bootstrap_mcp_url`] with an explicit host. The native
+/// runtime bootstrap names `127.0.0.1` (its dedicated session-MCP
+/// listener binds IPv4 loopback, and the sandboxed client must not depend
+/// on `localhost` resolution order); external backends keep `localhost`.
+pub(crate) fn intendant_bootstrap_mcp_url_at(
+    host: &str,
     port: u16,
     session_id: Option<&str>,
     managed_context: Option<&str>,
@@ -141,7 +158,7 @@ pub(super) fn intendant_bootstrap_mcp_url(
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join("&");
-    format!("http://localhost:{port}/mcp?{query}")
+    format!("http://{host}:{port}/mcp?{query}")
 }
 
 /// Inject the `intendant ctl` bootstrap environment into a supervised child:
@@ -237,6 +254,7 @@ const EXTERNAL_CHILD_BASE_ENV: &[&str] = &[
     // Vault leases override these with explicit `.env()` injections.
     "CODEX_HOME",
     "CLAUDE_CONFIG_DIR",
+    "KIMI_CODE_HOME",
 ];
 
 /// True when a controller env var named `name` may be copied onto a
@@ -285,7 +303,7 @@ fn external_child_env_allowed(name: &str, passthrough: &HashSet<String>) -> bool
 ///
 /// Call this BEFORE a spawn site's deliberate `.env()` injections:
 /// explicit sets made after `env_clear()` survive it (the `INTENDANT_*`
-/// bootstrap env, leased `CODEX_HOME`/`CLAUDE_CONFIG_DIR`, the Linux GUI
+/// bootstrap env, leased `CODEX_HOME`/`CLAUDE_CONFIG_DIR`/`KIMI_CODE_HOME`, the Linux GUI
 /// env, trace roots).
 pub(super) fn apply_external_child_env_policy(command: &mut tokio::process::Command) {
     let passthrough = intendant_core::env_scrub::env_passthrough_set(
@@ -839,11 +857,10 @@ impl AgentImageAttachment {
 
 /// One non-image file attached to a user message.
 ///
-/// The current external backends (Codex and Claude Code) do not expose a
-/// native "document" content block, so we stage the file at a stable
-/// path inside (or near) the workspace and lean on the agent's existing
-/// file-read tools. The accompanying user message gets a short prelude
-/// pointing at the path — see `format_file_attachments_prelude`.
+/// Codex and Claude Code do not expose a native "document" content block, so
+/// their default path stages the file inside (or near) the workspace and adds
+/// a short message prelude. Kimi overrides the attachment sender and uploads
+/// the file to its native file API.
 #[derive(Debug, Clone)]
 pub struct AgentFileAttachment {
     /// Path on disk where the file lives. Should be inside (or reachable
@@ -935,6 +952,13 @@ pub enum AgentBackend {
     Codex,
     #[serde(rename = "claude-code", alias = "claude_code")]
     ClaudeCode,
+    #[serde(
+        rename = "kimi",
+        alias = "kimi-code",
+        alias = "kimi_code",
+        alias = "kimicode"
+    )]
+    Kimi,
 }
 
 impl AgentBackend {
@@ -951,6 +975,7 @@ impl AgentBackend {
             "claude-code" | "claude_code" | "claudecode" | "cc" | "claude code" => {
                 Some(Self::ClaudeCode)
             }
+            "kimi" | "kimi-code" | "kimi_code" | "kimicode" | "kimi code" => Some(Self::Kimi),
             _ => None,
         }
     }
@@ -963,6 +988,7 @@ impl AgentBackend {
         match self {
             AgentBackend::Codex => "codex",
             AgentBackend::ClaudeCode => "claude-code",
+            AgentBackend::Kimi => "kimi",
         }
     }
 
@@ -977,11 +1003,12 @@ impl AgentBackend {
             // today. Keep the Intendant log id as canonical until that backend
             // reports a usable native id.
             AgentBackend::ClaudeCode => thread_id != "claude-code-session",
+            AgentBackend::Kimi => true,
         }
     }
 
     pub fn supports_user_message_rewind(&self) -> bool {
-        matches!(self, AgentBackend::Codex)
+        matches!(self, AgentBackend::Codex | AgentBackend::Kimi)
     }
 
     #[allow(dead_code)]
@@ -1001,6 +1028,7 @@ impl std::fmt::Display for AgentBackend {
         match self {
             AgentBackend::Codex => write!(f, "Codex"),
             AgentBackend::ClaudeCode => write!(f, "Claude Code"),
+            AgentBackend::Kimi => write!(f, "Kimi"),
         }
     }
 }
@@ -1010,7 +1038,7 @@ impl std::fmt::Display for AgentBackend {
 /// supervised a session with it. External agents authenticate with their
 /// own accounts, independent of provider fueling — the dashboard pairs
 /// this with the `fueled` flag so an unfueled daemon that can still run
-/// Codex or Claude Code doesn't read as dead.
+/// Codex, Claude Code, or Kimi Code doesn't read as dead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendAvailability {
     pub backend: AgentBackend,
@@ -1059,6 +1087,23 @@ fn claude_code_local_login(home: &Path) -> Option<bool> {
     }
 }
 
+fn kimi_local_login(home: &Path) -> Option<bool> {
+    kimi_local_login_in(std::env::var_os("KIMI_CODE_HOME"), home)
+}
+
+/// `KIMI_CODE_HOME` injected for hermetic tests.
+fn kimi_local_login_in(env_kimi_home: Option<std::ffi::OsString>, home: &Path) -> Option<bool> {
+    let kimi_home = env_kimi_home
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".kimi-code"));
+    Some(
+        kimi_home
+            .join("credentials")
+            .join("kimi-code.json")
+            .is_file(),
+    )
+}
+
 /// Probe every supported backend. Stat-based (never executes the CLIs),
 /// so it is cheap enough to answer a dashboard request directly. Reads
 /// the persisted project config only — a runtime `set_codex_command`
@@ -1068,66 +1113,71 @@ pub fn backend_availability(
     home: &Path,
 ) -> Vec<BackendAvailability> {
     let state_root = crate::platform::intendant_home_in(home);
-    [AgentBackend::Codex, AgentBackend::ClaudeCode]
-        .into_iter()
-        .map(|backend| {
-            let command = match backend {
-                AgentBackend::Codex => agent_config.codex.command.clone(),
-                AgentBackend::ClaudeCode => agent_config.claude_code.command.clone(),
-            };
-            let mut installed = crate::platform::resolve_command_path(&command).is_some();
-            if !installed && backend == AgentBackend::Codex {
-                // Managed sessions spawn the Intendant-aware fork instead
-                // of `command`; either binary makes the backend usable.
-                installed = agent_config
-                    .codex
-                    .managed_command
-                    .as_deref()
-                    .is_some_and(|cmd| crate::platform::resolve_command_path(cmd).is_some());
+    [
+        AgentBackend::Codex,
+        AgentBackend::ClaudeCode,
+        AgentBackend::Kimi,
+    ]
+    .into_iter()
+    .map(|backend| {
+        let command = match backend {
+            AgentBackend::Codex => agent_config.codex.command.clone(),
+            AgentBackend::ClaudeCode => agent_config.claude_code.command.clone(),
+            AgentBackend::Kimi => agent_config.kimi.command.clone(),
+        };
+        let mut installed = crate::platform::resolve_command_path(&command).is_some();
+        if !installed && backend == AgentBackend::Codex {
+            // Managed sessions spawn the Intendant-aware fork instead
+            // of `command`; either binary makes the backend usable.
+            installed = agent_config
+                .codex
+                .managed_command
+                .as_deref()
+                .is_some_and(|cmd| crate::platform::resolve_command_path(cmd).is_some());
+        }
+        let last_used_secs =
+            crate::external_wrapper_index::wrappers_for_source(home, backend.as_short_str())
+                .iter()
+                .map(|record| record.updated_at_secs)
+                .max()
+                .filter(|secs| *secs > 0);
+        let leased =
+            crate::credential_leases::kind_is_active(&format!("oauth:{}", backend.as_short_str()));
+        let local_login = match backend {
+            AgentBackend::Codex => codex_local_login(home),
+            AgentBackend::ClaudeCode => claude_code_local_login(home),
+            AgentBackend::Kimi => kimi_local_login(home),
+        };
+        let (compatibility_command, compatibility_profile) = match backend {
+            AgentBackend::Codex => {
+                let managed = crate::project::codex_managed_context_enabled(
+                    &agent_config.codex.managed_context,
+                );
+                (
+                    agent_config.codex.effective_command(managed),
+                    if managed { "managed" } else { "vanilla" },
+                )
             }
-            let last_used_secs =
-                crate::external_wrapper_index::wrappers_for_source(home, backend.as_short_str())
-                    .iter()
-                    .map(|record| record.updated_at_secs)
-                    .max()
-                    .filter(|secs| *secs > 0);
-            let leased = crate::credential_leases::kind_is_active(&format!(
-                "oauth:{}",
-                backend.as_short_str()
-            ));
-            let local_login = match backend {
-                AgentBackend::Codex => codex_local_login(home),
-                AgentBackend::ClaudeCode => claude_code_local_login(home),
-            };
-            let (compatibility_command, compatibility_profile) = match backend {
-                AgentBackend::Codex => {
-                    let managed = crate::project::codex_managed_context_enabled(
-                        &agent_config.codex.managed_context,
-                    );
-                    (
-                        agent_config.codex.effective_command(managed),
-                        if managed { "managed" } else { "vanilla" },
-                    )
-                }
-                AgentBackend::ClaudeCode => (command.clone(), "default"),
-            };
-            let compatibility = protocol_watch::passive_status_in(
-                &state_root,
-                &backend,
-                compatibility_profile,
-                &compatibility_command,
-            );
-            BackendAvailability {
-                backend,
-                command,
-                installed,
-                last_used_secs,
-                leased,
-                local_login,
-                compatibility,
-            }
-        })
-        .collect()
+            AgentBackend::ClaudeCode => (command.clone(), "default"),
+            AgentBackend::Kimi => (command.clone(), "server-v1"),
+        };
+        let compatibility = protocol_watch::passive_status_in(
+            &state_root,
+            &backend,
+            compatibility_profile,
+            &compatibility_command,
+        );
+        BackendAvailability {
+            backend,
+            command,
+            installed,
+            last_used_secs,
+            leased,
+            local_login,
+            compatibility,
+        }
+    })
+    .collect()
 }
 
 /// The wire shape the dashboard consumes: `id` matches the new-session
@@ -1221,7 +1271,7 @@ pub enum AgentEvent {
     /// Partial session-config facts (model / effort / permission mode)
     /// observed at a protocol seam: launch config at spawn, the backend's
     /// own echoes (Claude Code `system:init` / `message_start`, Codex
-    /// thread-settings), accepted mid-session switches. Drains forward it
+    /// thread-settings, Kimi session profile), accepted mid-session switches. Drains forward it
     /// as `AppEvent::SessionConfigFacts` for the vitals hub, which folds
     /// fields sticky into the session's `config` section. Ambient
     /// bookkeeping — implies no turn.
@@ -1230,9 +1280,9 @@ pub enum AgentEvent {
     },
     /// Informational backend event that should be written to the activity log.
     Log { level: String, message: String },
-    /// Latest Codex `/goal` state for a thread.
+    /// Latest external-agent goal state for a thread.
     GoalUpdated { goal: crate::types::SessionGoal },
-    /// The Codex `/goal` state was cleared for a thread.
+    /// The external-agent goal state was cleared for a thread.
     GoalCleared,
     /// A backend/runtime error for the active turn.
     BackendError {
@@ -1275,7 +1325,7 @@ pub enum AgentEvent {
     FileActivity { paths: Vec<String> },
     /// The backend's own first-hand statement of the working directory it
     /// operates in (Claude Code's `system:init` `cwd` field, Codex's
-    /// `thread/settings/updated` effective settings). The drain forwards
+    /// `thread/settings/updated` effective settings, or Kimi session metadata). The drain forwards
     /// it as `AppEvent::SessionCwdAnnounced`, which seeds the git-vitals
     /// probe locus immediately — authoritative, unlike the
     /// [`AgentEvent::FileActivity`] write-path heuristic. Ambient
@@ -1524,6 +1574,16 @@ pub struct AgentConfig {
     /// Trim applied to the freshly forked thread (codex only; `None` = the
     /// anchor was the parent's head).
     pub fork_cut: Option<crate::session_fork::CodexForkCut>,
+    /// Atomic Kimi undo count applied to a freshly forked child before its
+    /// event subscription or first prompt. Internal anchor-fork input only.
+    pub kimi_fork_rollback_turns: Option<u32>,
+    /// Serialized Kimi source-of-truth head horizon captured when an anchor
+    /// fork is planned. The adapter validates it around the native fork
+    /// before applying `kimi_fork_rollback_turns`.
+    pub kimi_fork_expected_horizon: Option<String>,
+    /// Kimi exact active-tool override. `None` uses the native profile,
+    /// `Some([])` disables every optional tool.
+    pub kimi_allowed_tools: Option<Vec<String>>,
     /// Codex state directory to use for this session's app-server process.
     /// Codex-only; other backends ignore.
     pub codex_home: Option<PathBuf>,
@@ -1653,6 +1713,16 @@ pub trait ExternalAgent: Send + Sync {
     /// Codex uses this for its app-server `serviceTier` field; other backends
     /// currently do not expose tiered routing.
     fn service_tier(&self) -> Option<&str> {
+        None
+    }
+
+    /// Backend-owned snapshot of launch-affecting live state.
+    ///
+    /// Adapters with in-place profile mutation return the exact settings
+    /// needed to reproduce the current session after a supervisor restart.
+    /// The controller persists it only after a successful mutating action;
+    /// ordinary adapters keep the default `None`.
+    fn launch_config_snapshot(&self) -> Option<crate::session_config::SessionAgentConfig> {
         None
     }
 
@@ -1804,8 +1874,9 @@ pub trait ExternalAgent: Send + Sync {
         ForkHandling::Native
     }
 
-    /// Dispatch a backend-specific thread action (Codex: compact, fork, side,
-    /// side-close, rollback, review, memory-reset; other backends currently reject).
+    /// Dispatch a backend-specific thread action. Codex, Claude Code, and
+    /// Kimi each advertise the subset their adapter can execute; the default
+    /// implementation rejects actions for backends without a native mapping.
     /// Returns a short human-readable status message on success.
     async fn thread_action(
         &mut self,
@@ -2020,6 +2091,7 @@ mod tests {
             // CLI config-home pointers.
             "CODEX_HOME",
             "CLAUDE_CONFIG_DIR",
+            "KIMI_CODE_HOME",
             // Controller→child control channel (the mock-provider e2e rig
             // rides PROVIDER + INTENDANT_MOCK_* into children).
             "PROVIDER",
@@ -2338,6 +2410,7 @@ mod tests {
         let mut config = crate::project::ExternalAgentConfig::default();
         config.codex.command = "intendant-test-absent-codex".to_string();
         config.claude_code.command = "intendant-test-absent-claude".to_string();
+        config.kimi.command = "intendant-test-absent-kimi".to_string();
 
         // One recorded Codex session: its log-dir mtime becomes last_used.
         crate::external_wrapper_index::upsert(
@@ -2351,16 +2424,20 @@ mod tests {
         .unwrap();
 
         let availability = backend_availability(&config, home.path());
-        assert_eq!(availability.len(), 2);
+        assert_eq!(availability.len(), 3);
         assert_eq!(availability[0].backend, AgentBackend::Codex);
         assert!(!availability[0].installed);
         assert!(availability[0].last_used_secs.is_some());
         assert_eq!(availability[1].backend, AgentBackend::ClaudeCode);
         assert!(!availability[1].installed);
         assert_eq!(availability[1].last_used_secs, None);
+        assert_eq!(availability[2].backend, AgentBackend::Kimi);
+        assert!(!availability[2].installed);
+        assert_eq!(availability[2].last_used_secs, None);
         // A unit-test process holds no vault leases.
         assert!(!availability[0].leased);
         assert!(!availability[1].leased);
+        assert!(!availability[2].leased);
     }
 
     #[test]
@@ -2370,6 +2447,7 @@ mod tests {
         // Empty home: codex is definitively signed out; Claude Code is
         // unknowable on macOS (keychain) and signed out elsewhere.
         assert_eq!(codex_local_login_in(None, home.path()), Some(false));
+        assert_eq!(kimi_local_login_in(None, home.path()), Some(false));
         if cfg!(target_os = "macos") {
             assert_eq!(claude_code_local_login(home.path()), None);
         } else {
@@ -2380,14 +2458,25 @@ mod tests {
         std::fs::write(home.path().join(".codex/auth.json"), b"{}").unwrap();
         std::fs::create_dir_all(home.path().join(".claude")).unwrap();
         std::fs::write(home.path().join(".claude/.credentials.json"), b"{}").unwrap();
+        std::fs::create_dir_all(home.path().join(".kimi-code/credentials")).unwrap();
+        std::fs::write(
+            home.path().join(".kimi-code/credentials/kimi-code.json"),
+            b"{}",
+        )
+        .unwrap();
 
         assert_eq!(codex_local_login_in(None, home.path()), Some(true));
         assert_eq!(claude_code_local_login(home.path()), Some(true));
+        assert_eq!(kimi_local_login_in(None, home.path()), Some(true));
 
         // CODEX_HOME redirects the codex probe wholesale.
         let alt = tempfile::tempdir().unwrap();
         assert_eq!(
             codex_local_login_in(Some(alt.path().as_os_str().to_os_string()), home.path()),
+            Some(false)
+        );
+        assert_eq!(
+            kimi_local_login_in(Some(alt.path().as_os_str().to_os_string()), home.path()),
             Some(false)
         );
     }
@@ -2412,6 +2501,7 @@ mod tests {
         config.codex.command = "intendant-test-absent-codex".to_string();
         config.codex.managed_command = Some(fork.to_string_lossy().to_string());
         config.claude_code.command = "intendant-test-absent-claude".to_string();
+        config.kimi.command = "intendant-test-absent-kimi".to_string();
 
         let availability = backend_availability(&config, home.path());
         assert!(
@@ -2419,6 +2509,7 @@ mod tests {
             "a resolvable managed fork must count as installed"
         );
         assert!(!availability[1].installed);
+        assert!(!availability[2].installed);
     }
 
     #[test]
@@ -2428,13 +2519,14 @@ mod tests {
         config.codex.command = "intendant-test-absent-codex".to_string();
         config.codex.managed_command = None;
         config.claude_code.command = "intendant-test-absent-claude".to_string();
+        config.kimi.command = "intendant-test-absent-kimi".to_string();
         let value = backend_availability_json(&config, home.path());
         let entries = value.as_array().unwrap();
         let ids: Vec<&str> = entries
             .iter()
             .map(|entry| entry.get("id").and_then(|id| id.as_str()).unwrap())
             .collect();
-        assert_eq!(ids, vec!["codex", "claude-code"]);
+        assert_eq!(ids, vec!["codex", "claude-code", "kimi"]);
         for entry in entries {
             assert!(entry
                 .get("installed")
@@ -2489,6 +2581,17 @@ mod tests {
     }
 
     #[test]
+    fn from_str_loose_kimi_variants() {
+        for alias in ["kimi", "kimi-code", "kimi_code", "kimicode", "Kimi Code"] {
+            assert_eq!(
+                AgentBackend::from_str_loose(alias),
+                Some(AgentBackend::Kimi),
+                "alias {alias}"
+            );
+        }
+    }
+
+    #[test]
     fn from_str_loose_case_insensitive() {
         assert_eq!(
             AgentBackend::from_str_loose("CODEX"),
@@ -2502,16 +2605,24 @@ mod tests {
             AgentBackend::from_str_loose("CC"),
             Some(AgentBackend::ClaudeCode)
         );
+        assert_eq!(
+            AgentBackend::from_str_loose("KIMI"),
+            Some(AgentBackend::Kimi)
+        );
     }
 
     #[test]
     fn from_str_loose_accepts_display_forms() {
-        // The Display impl produces "Codex" / "Claude Code". `from_str_loose`
+        // The Display impl produces "Codex" / "Claude Code" / "Kimi Code". `from_str_loose`
         // must accept those (lowercased) so TOML files written in the
         // Display form by earlier code don't break startup.
         assert_eq!(
             AgentBackend::from_str_loose("Claude Code"),
             Some(AgentBackend::ClaudeCode)
+        );
+        assert_eq!(
+            AgentBackend::from_str_loose("Kimi"),
+            Some(AgentBackend::Kimi)
         );
     }
 
@@ -2521,8 +2632,13 @@ mod tests {
         // dropdown or the TOML round-trip breaks.
         assert_eq!(AgentBackend::Codex.as_short_str(), "codex");
         assert_eq!(AgentBackend::ClaudeCode.as_short_str(), "claude-code");
+        assert_eq!(AgentBackend::Kimi.as_short_str(), "kimi");
         // And from_str_loose must round-trip every as_short_str output.
-        for v in [AgentBackend::Codex, AgentBackend::ClaudeCode] {
+        for v in [
+            AgentBackend::Codex,
+            AgentBackend::ClaudeCode,
+            AgentBackend::Kimi,
+        ] {
             assert_eq!(AgentBackend::from_str_loose(v.as_short_str()), Some(v));
         }
     }
@@ -2532,6 +2648,7 @@ mod tests {
         assert!(AgentBackend::Codex.thread_id_is_canonical("019e37cf-34ad-7b08-8a1e-7ad5086eb39f"));
         assert!(!AgentBackend::ClaudeCode.thread_id_is_canonical("claude-code-session"));
         assert!(AgentBackend::ClaudeCode.thread_id_is_canonical("real-claude-session"));
+        assert!(AgentBackend::Kimi.thread_id_is_canonical("019-kimi-session"));
         assert!(!source_session_id_is_canonical("unknown", "abc"));
         assert!(source_session_id_is_canonical("codex", "019abc"));
     }
@@ -2540,12 +2657,14 @@ mod tests {
     fn user_message_rewind_capability_is_explicit() {
         assert!(AgentBackend::Codex.supports_user_message_rewind());
         assert!(!AgentBackend::ClaudeCode.supports_user_message_rewind());
+        assert!(AgentBackend::Kimi.supports_user_message_rewind());
     }
 
     #[test]
     fn item_anchor_rewind_capability_is_explicit() {
         assert!(AgentBackend::Codex.supports_item_anchor_rewind());
         assert!(!AgentBackend::ClaudeCode.supports_item_anchor_rewind());
+        assert!(!AgentBackend::Kimi.supports_item_anchor_rewind());
     }
 
     #[test]
@@ -2563,6 +2682,7 @@ mod tests {
     fn display_impl() {
         assert_eq!(format!("{}", AgentBackend::Codex), "Codex");
         assert_eq!(format!("{}", AgentBackend::ClaudeCode), "Claude Code");
+        assert_eq!(format!("{}", AgentBackend::Kimi), "Kimi");
     }
 
     #[test]
@@ -2583,6 +2703,11 @@ mod tests {
         // …while state persisted by the old serde form keeps parsing.
         let legacy: AgentBackend = serde_json::from_str(r#""claude_code""#).unwrap();
         assert_eq!(legacy, AgentBackend::ClaudeCode);
+
+        let json = serde_json::to_string(&AgentBackend::Kimi).unwrap();
+        assert_eq!(json, r#""kimi""#);
+        let parsed: AgentBackend = serde_json::from_str(r#""kimi-code""#).unwrap();
+        assert_eq!(parsed, AgentBackend::Kimi);
     }
 
     /// Minimal backend that only implements the required trait methods, so

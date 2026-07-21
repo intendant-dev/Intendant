@@ -314,10 +314,12 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         "agenda_list" => PeerOperation::AgendaRead,
         "agenda_op" => PeerOperation::AgendaWrite,
         // Memory: search/read are bounded retrieval; propose is the
-        // candidate-lane write class — the same operations the
-        // /api/memory rows carry.
+        // candidate-lane write class; judge is owner curation riding
+        // the same write class (the tenant edge denies ring-2 with
+        // the named outcome) — the same operations the /api/memory
+        // rows carry.
         "memory_search" | "memory_read" => PeerOperation::MemoryRead,
-        "memory_propose" => PeerOperation::MemoryWrite,
+        "memory_propose" | "memory_judge" => PeerOperation::MemoryWrite,
         _ => PeerOperation::RuntimeControl,
     }
 }
@@ -443,7 +445,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "agenda_op",
         manual_http_tool_definition!(
             "agenda_op",
-            "Apply one agenda operation, keyed by op: add (park a note, task, or question: kind, title, body?, tags?, due_ms?), ask (park a RICH multi-question ask as a durable question item: questions is the ask_user vocabulary — up to 4 of {question, header?, options?, pick_min?, pick_max?, free_text?, previews?} with the same preview kinds and caps; it renders on the dashboard question rail exactly like a live ask, returns immediately with the item and its rail ask_id, and the structured reply lands on the item), answer (id + text — reply to an open question; resolves it; structured? carries a rich-ask breakdown), patch (id + {title?, body?, tags?, due_ms? — null due_ms clears}), complete (id), reopen (id — resurrects done or retired; re-asking a question clears its reply view and re-surfaces a rich ask on the rail), retire (id — also deletes a rich ask's preview blobs), propose_effect (id + goal + fire_at_ms + orchestrate? — propose a scheduled session on the item: at that instant the daemon spawns a normal supervised session with that goal; NOTHING fires until the owner approves, so propose and move on), approve_effect (id + digest), or revoke_effect (id). Approval is the owner's act alone — dashboard and owner-shell surfaces only; agent and peer callers may propose but are refused approval by policy, so never attempt to approve (or revoke) a manifest, including your own. Approval binds the exact manifest digest: re-proposing revises the manifest and voids any approval. Session outcomes write back to the item (effects[].last_run). A question is a durable non-blocking ask: it badges the owner's attention rail and the reply is readable in a later session. due_ms delivers a reminder at that instant (owner policy controls loudness). Returns the item as it now stands; add returns its minted id. History is append-only — nothing is ever destroyed.",
+            "Apply one agenda operation, keyed by op: add (park a note, task, or question: kind, title, body?, tags?, due_ms?), ask (park a RICH multi-question ask as a durable question item: questions is the ask_user vocabulary — up to 4 of {question, header?, options?, pick_min?, pick_max?, free_text?, previews?} with the same preview kinds and caps; it renders on the dashboard question rail exactly like a live ask, returns immediately with the item and its rail ask_id, and the structured reply lands on the item), answer (id + text — reply to an open question; resolves it; structured? carries a rich-ask breakdown), patch (id + {title?, body?, tags?, due_ms? — null due_ms clears}), complete (id), reopen (id — resurrects done or retired; re-asking a question clears its reply view and re-surfaces a rich ask on the rail), retire (id — also deletes a rich ask's preview blobs), annotate (id + text — append an attributed note to the item's thread, any status), set_blocker (id + criterion — state a human blocking criterion on an open item; NOTHING evaluates it, no watcher exists; the daemon mints the blocker id), clear_blocker (id + blocker_id — an op recorded as history, never a deletion; you have no duty to review blockers and clear only when the owner asks or your mandate says so — otherwise annotate with evidence instead), add_relies_on / remove_relies_on (id + target_id — dependency edges; a done prerequisite satisfies by pure recomputation, a retired one flags the dependent for review; blocked is derived at read time and never notifies), propose_effect (id + goal + fire_at_ms + orchestrate? — propose a scheduled session on the item: at that instant the daemon spawns a normal supervised session with that goal; NOTHING fires until the owner approves, so propose and move on), approve_effect (id + digest), revoke_effect (id), or start_now (id — the owner's one-gesture mint+approve+fire-immediately; owner surfaces ONLY, so never call it as an agent: propose_effect and let the owner decide). Approval is the owner's act alone — dashboard and owner-shell surfaces only; agent and peer callers may propose but are refused approval by policy, so never attempt to approve (or revoke) a manifest, including your own. Approval binds the exact manifest digest: re-proposing revises the manifest and voids any approval. Session outcomes write back to the item (effects[].last_run). A question is a durable non-blocking ask: it badges the owner's attention rail and the reply is readable in a later session. due_ms delivers a reminder at that instant (owner policy controls loudness). Non-owner ops accept source? — a self-described, UNVERIFIED caller label for unsupervised processes; it renders visibly as self-described and never becomes attribution (supervised sessions are attributed automatically; omit it). Returns the item as it now stands; add returns its minted id. History is append-only — nothing is ever destroyed.",
             crate::agenda::AgendaCommand
         ),
     );
@@ -467,8 +469,16 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "memory_propose",
         manual_http_tool_definition!(
             "memory_propose",
-            "Propose one Memory claim (kind: observation|decision|episode|procedure|preference; statement; sensitivity: public|internal|private|sensitive, default private; optional project, labels). Proposals enter as CANDIDATES; this product slice exposes no judgment command. Your session id rides the claim's provenance, and the returned view reports the plane's effective durability (durable or ephemeral).",
+            "Propose one Memory claim (kind: observation|decision|episode|procedure|preference; statement; sensitivity: public|internal|private|sensitive, default private; optional project, labels). Proposals enter as CANDIDATES; judging them is the OWNER'S act (memory_judge is refused to agent callers) — if you disagree with an existing claim, propose a countering or corrected claim instead. Your session id rides the claim's provenance, and the returned view reports the plane's effective durability (durable or ephemeral).",
             crate::memory::ProposeArgs
+        ),
+    );
+    push(
+        "memory_judge",
+        manual_http_tool_definition!(
+            "memory_judge",
+            "Judge one Memory claim — OWNER curation (dashboard / owner-shell surfaces only; agent and peer callers are refused with actor-not-permitted, so never call this as an agent: propose a countering claim and let the owner judge). verdict: accept|dispute|retire|supersede; id: the target claim's hex id prefix (≥ 8 chars); optional reason (≤ 2000 chars, recorded verbatim in the sealed op); supersede additionally takes replacement (the superseding claim's id — supersession holds only while the replacement's derived status is accepted). Every judgment is an attributed append-only plane op; status is re-derived by the fold, never edited. Returns the target's refreshed view with its judgment history.",
+            crate::memory::JudgeArgs
         ),
     );
     push(
@@ -1313,15 +1323,21 @@ mod tests {
                 ops,
                 [
                     "add",
+                    "add_relies_on",
+                    "annotate",
                     "answer",
                     "approve_effect",
                     "ask",
+                    "clear_blocker",
                     "complete",
                     "patch",
                     "propose_effect",
+                    "remove_relies_on",
                     "reopen",
                     "retire",
-                    "revoke_effect"
+                    "revoke_effect",
+                    "set_blocker",
+                    "start_now"
                 ],
                 "agenda_op's served oneOf must keep the full AgendaCommand vocabulary"
             );

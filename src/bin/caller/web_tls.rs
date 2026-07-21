@@ -661,18 +661,23 @@ pub fn load_pem_cert_and_key(
         ));
     }
 
-    let key_bytes = std::fs::read(key_path)
-        .map_err(|e| format!("reading TLS key {}: {e}", key_path.display()))?;
+    // Custody-routed: a migrated key file is a tombstone naming a sealed
+    // custody entry; a plain file (including operator overrides) serves
+    // as-is. Fail-closed — no file fallback for migrated keys.
+    let key_bytes =
+        crate::key_custody::read_key_material(key_path).map_err(|e| format!("TLS key: {e}"))?;
     let key: rustls::pki_types::PrivateKeyDer<'static> =
-        rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| match e {
-            PemError::NoItemsFound => {
-                format!(
-                    "no private key found in {} (expected PKCS#8/PKCS#1/SEC1 PEM)",
-                    key_path.display()
-                )
-            }
-            err => format!("parsing TLS key {}: {err}", key_path.display()),
-        })?;
+        rustls::pki_types::PrivateKeyDer::from_pem_slice(key_bytes.as_bytes()).map_err(
+            |e| match e {
+                PemError::NoItemsFound => {
+                    format!(
+                        "no private key found in {} (expected PKCS#8/PKCS#1/SEC1 PEM)",
+                        key_path.display()
+                    )
+                }
+                err => format!("parsing TLS key {}: {err}", key_path.display()),
+            },
+        )?;
 
     Ok((cert_chain, key))
 }

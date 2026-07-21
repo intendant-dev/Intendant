@@ -155,6 +155,23 @@ pub(crate) async fn serve_http_request(
     // a query parameter can no longer be shadowed by them.
     let (req_method, req_path, req_query) = parse_request_target(request_line);
 
+    // The dedicated session-MCP ingress serves exactly one path. Refuse
+    // everything else before any routing, preflight, or asset handling —
+    // a sandboxed shell probing this port must find /mcp or nothing.
+    if gateway_ingress.is_session_mcp() && req_path != "/mcp" {
+        use tokio::io::AsyncWriteExt;
+        let response = HttpResponse::with_content(
+            "403 Forbidden",
+            "text/plain; charset=utf-8",
+            "this listener serves session-scoped /mcp only\n",
+        )
+        .header("Cache-Control", "no-store")
+        .header("Connection", "close");
+        let _ = stream.write_all(&response.into_bytes()).await;
+        finalize_http_stream(&mut stream).await;
+        return;
+    }
+
     // Connect mode belongs on Connect's unprivileged hosted origin. If a
     // hosted page could navigate an mTLS-bearing browser to the daemon's own
     // origin with attacker-selected `connect_base`, privileged SPA code would
@@ -514,19 +531,26 @@ pub(crate) async fn serve_http_request(
         peer_connection_identity.as_ref(),
     );
     if ((tls_client_cert_required && !tls_client_cert_present) || remote_client_auth_missing)
-        && !is_loopback_cleartext_mcp_request(peer_addr, is_tls, header_text)
+        && !cleartext_loopback_admitted(gateway_ingress, peer_addr, is_tls, header_text)
         && !authority_free_request
         && hosted_verified.is_none()
     {
         use tokio::io::AsyncWriteExt;
-        let body = serde_json::json!({
-            "error": if remote_client_auth_missing {
-                "verified client certificate or authenticated peer identity required for remote dashboard access"
-            } else {
-                "mTLS client certificate required"
-            }
-        })
-        .to_string();
+        // A local caller missing the per-boot token gets the named,
+        // actionable refusal; certificate guidance would misdirect it.
+        let error_message = if direct_loopback_missing_admission_token(
+            gateway_ingress,
+            peer_addr,
+            header_text,
+        ) {
+            crate::loopback_token::refusal_error_message()
+        } else if remote_client_auth_missing {
+            "verified client certificate or authenticated peer identity required for remote dashboard access"
+                .to_string()
+        } else {
+            "mTLS client certificate required".to_string()
+        };
+        let body = serde_json::json!({ "error": error_message }).to_string();
         let response = HttpResponse::with_content("401 Unauthorized", "application/json", body)
             .header("Cache-Control", "no-cache")
             .header("Connection", "close")
@@ -577,6 +601,11 @@ pub(crate) async fn serve_http_request(
             tls_client_cert_fingerprint.as_deref(),
             tls_client_cert_present,
             is_tls,
+            // Trusted-local admission: the per-boot loopback token, or
+            // the token-gated cleartext /mcp carve-out (its own ladder
+            // authorizes past this point).
+            crate::loopback_token::loopback_token_presented(header_text)
+                || is_loopback_cleartext_mcp_request(peer_addr, is_tls, header_text),
         ) {
             Ok(context) => context,
             Err(message) => {
@@ -1211,6 +1240,21 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::MemoryJudge => {
+                let actor = crate::access::actor::ActorBinding::from_principal(
+                    &http_access_context.principal,
+                    None,
+                );
+                return handle_memory_judge(
+                    stream,
+                    route_body,
+                    mcp_server,
+                    actor,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::AgendaBlobRaw => {
                 // The row's `{item_id}`/`{blob_id}` captures, in order.
                 let mut segments = route_captures.iter().map(|s| s.to_string());
@@ -1551,6 +1595,35 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::KimiAuthStart => {
+                return handle_kimi_auth_start(
+                    stream,
+                    route_body,
+                    project_root,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::KimiAuthStatus => {
+                return handle_kimi_auth_status(
+                    stream,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::KimiAuthCancel => {
+                return handle_kimi_auth_cancel(
+                    stream,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::ExternalAgents => {
                 // The transport edge resolves the ambient home; the
                 // handler below it is path-parameterized (hermeticity
@@ -1863,6 +1936,9 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::LocalDaemonTokens => {
+                return handle_local_daemon_tokens(stream, route.cors).await;
+            }
             RouteHandlerId::DashboardTabs => {
                 let response =
                     crate::web_gateway::dashboard_tabs_api_response(dashboard_control.tabs());
@@ -1900,6 +1976,7 @@ pub(crate) async fn serve_http_request(
                     tls_client_cert_fingerprint,
                     peer_addr,
                     bus.clone(),
+                    gateway_ingress.is_session_mcp(),
                 )
                 .await;
             }
@@ -1962,10 +2039,17 @@ pub(crate) async fn serve_http_request(
             tls_client_cert_fingerprint.as_deref(),
             peer_connection_identity.as_ref(),
         ) {
-            let response = json_error(
-                "401 Unauthorized",
-                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer",
-            );
+            let message = if direct_loopback_missing_admission_token(
+                gateway_ingress,
+                peer_addr,
+                header_text,
+            ) {
+                crate::loopback_token::refusal_error_message()
+            } else {
+                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer"
+                    .to_string()
+            };
+            let response = json_error("401 Unauthorized", message);
             let _ = stream.write_all(response.as_bytes()).await;
             finalize_http_stream(&mut stream).await;
             return;
@@ -1990,6 +2074,7 @@ pub(crate) async fn serve_http_request(
             peer_connection_identity.as_ref(),
             tls_client_cert_fingerprint.as_deref(),
             tls_client_cert_present,
+            crate::loopback_token::loopback_token_presented(header_text),
         ) {
             Ok(grant) => grant,
             Err(message) => {
@@ -2022,10 +2107,17 @@ pub(crate) async fn serve_http_request(
             tls_client_cert_fingerprint.as_deref(),
             peer_connection_identity.as_ref(),
         ) {
-            let response = json_error(
-                "401 Unauthorized",
-                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer",
-            );
+            let message = if direct_loopback_missing_admission_token(
+                gateway_ingress,
+                peer_addr,
+                header_text,
+            ) {
+                crate::loopback_token::refusal_error_message()
+            } else {
+                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer"
+                    .to_string()
+            };
+            let response = json_error("401 Unauthorized", message);
             let _ = stream.write_all(response.as_bytes()).await;
             finalize_http_stream(&mut stream).await;
             return;
@@ -2035,6 +2127,7 @@ pub(crate) async fn serve_http_request(
             peer_connection_identity.as_ref(),
             tls_client_cert_fingerprint.as_deref(),
             tls_client_cert_present,
+            crate::loopback_token::loopback_token_presented(header_text),
         ) {
             Ok(grant) => grant,
             Err(message) => {
@@ -2082,10 +2175,17 @@ pub(crate) async fn serve_http_request(
             tls_client_cert_fingerprint.as_deref(),
             peer_connection_identity.as_ref(),
         ) {
-            let response = json_error(
-                "401 Unauthorized",
-                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer",
-            );
+            let message = if direct_loopback_missing_admission_token(
+                gateway_ingress,
+                peer_addr,
+                header_text,
+            ) {
+                crate::loopback_token::refusal_error_message()
+            } else {
+                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer"
+                    .to_string()
+            };
+            let response = json_error("401 Unauthorized", message);
             let _ = stream.write_all(response.as_bytes()).await;
             finalize_http_stream(&mut stream).await;
             return;
@@ -2095,6 +2195,7 @@ pub(crate) async fn serve_http_request(
             peer_connection_identity.as_ref(),
             tls_client_cert_fingerprint.as_deref(),
             tls_client_cert_present,
+            crate::loopback_token::loopback_token_presented(header_text),
         ) {
             Ok(grant) => grant,
             Err(message) => {

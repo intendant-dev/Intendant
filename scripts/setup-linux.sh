@@ -105,7 +105,7 @@ APT_PACKAGES=(
     curl
     ca-certificates
 
-    # ripgrep — used by external agents (Codex, Claude Code) for code search.
+    # ripgrep — used by external agents (Codex, Claude Code, Kimi Code) for code search.
     # Missing `rg` causes agents to fall back to slower paths (targeted reads
     # or recursive greps) and wastes a tool-call probing for it.
     ripgrep

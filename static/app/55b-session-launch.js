@@ -131,6 +131,31 @@ function onNewSessionClaudeModelSelectChange() {
 }
 window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange;
 
+function updateNewSessionKimiCustomModelRow() {
+  const select = document.getElementById('new-session-kimi-model-select');
+  const row = document.getElementById('new-session-kimi-model-custom-row');
+  const input = document.getElementById('new-session-kimi-model');
+  if (!select || !row) return;
+  const custom = select.value === '__custom__' && !select.disabled;
+  row.classList.toggle('hidden', !custom);
+  if (input) input.disabled = !custom;
+}
+function onNewSessionKimiModelSelectChange() {
+  updateNewSessionKimiCustomModelRow();
+}
+window.onNewSessionKimiModelSelectChange = onNewSessionKimiModelSelectChange;
+
+function onNewSessionKimiToolsModeChange() {
+  const mode = document.getElementById('new-session-kimi-tools-mode')?.value || 'inherit';
+  const input = document.getElementById('new-session-kimi-allowed-tools');
+  const appliesToKimi = effectiveNewSessionAgentId() === 'kimi';
+  if (input) {
+    input.disabled = !appliesToKimi || mode !== 'exact';
+    if (appliesToKimi && mode === 'exact') input.focus();
+  }
+}
+window.onNewSessionKimiToolsModeChange = onNewSessionKimiToolsModeChange;
+
 // ── Last-used launch options (per-browser) ──
 // The agent picker and the identity-shaped external options (backend,
 // binary path, model ids, efforts) reset to their inherit choices on
@@ -169,6 +194,9 @@ function saveNewSessionAgentPrefs() {
     claude_model: value('new-session-claude-model-select'),
     claude_model_custom: value('new-session-claude-model').trim(),
     claude_effort: value('new-session-claude-effort'),
+    kimi_model: value('new-session-kimi-model-select'),
+    kimi_model_custom: value('new-session-kimi-model').trim(),
+    kimi_thinking: value('new-session-kimi-thinking'),
     saved_at: new Date().toISOString(),
   };
   try {
@@ -221,6 +249,14 @@ function applyNewSessionAgentPrefs() {
     updateNewSessionClaudeCustomModelRow();
   }
   restoreNewSessionSelectValue('new-session-claude-effort', prefs.claude_effort);
+  if (restoreNewSessionSelectValue('new-session-kimi-model-select', prefs.kimi_model)) {
+    if (prefs.kimi_model === '__custom__') {
+      const input = document.getElementById('new-session-kimi-model');
+      if (input) input.value = text(prefs.kimi_model_custom);
+    }
+    updateNewSessionKimiCustomModelRow();
+  }
+  restoreNewSessionSelectValue('new-session-kimi-thinking', prefs.kimi_thinking);
   newSessionAgentPrefsApplied = true;
   // Sync the fold/enabled state now for a restored external backend. A
   // render is only safe once the effective agent is known-external —
@@ -284,6 +320,7 @@ function setNewSessionAgentDefaults(settings) {
   newSessionAgentCommands = {
     codex: settings.codex_command || 'codex',
     'claude-code': settings.claude_command || 'claude',
+    kimi: settings.kimi_command || 'kimi',
   };
   newSessionCodexManagedContext =
     settings.codex_managed_context === 'managed' ? 'managed' : 'vanilla';
@@ -293,6 +330,12 @@ function setNewSessionAgentDefaults(settings) {
   newSessionCodexDefaultServiceTier = normalizeCodexServiceTier(settings.codex_service_tier || '');
   newSessionCodexGlobalModel = String(settings.codex_model || '').trim();
   newSessionCodexGlobalReasoningEffort = String(settings.codex_reasoning_effort || '').trim();
+  newSessionKimiGlobalModel = String(settings.kimi_model || '').trim();
+  newSessionKimiGlobalThinking = String(settings.kimi_thinking || '').trim();
+  newSessionKimiGlobalPermissionMode = String(settings.kimi_permission_mode || 'manual').trim() || 'manual';
+  newSessionKimiGlobalPlanMode = !!settings.kimi_plan_mode;
+  newSessionKimiGlobalSwarmMode = !!settings.kimi_swarm_mode;
+  newSessionKimiGlobalAllowedTools = kimiAllowedToolsFromSettings(settings);
   const configuredCatalog = Array.isArray(settings.codex_models)
     ? settings.codex_models
       .map(entry => ({
@@ -323,6 +366,7 @@ function commandDefaultForNewSessionAgent(agentId) {
   return newSessionAgentCommands[agentId] || ({
     codex: 'codex',
     'claude-code': 'claude',
+    kimi: 'kimi',
   }[agentId] || '');
 }
 
@@ -399,8 +443,17 @@ function renderNewSessionAgentControls(options = {}) {
   const claudeModelInp = document.getElementById('new-session-claude-model');
   const claudeModeSel = document.getElementById('new-session-claude-permission-mode');
   const claudeEffortSel = document.getElementById('new-session-claude-effort');
+  const kimiModelSel = document.getElementById('new-session-kimi-model-select');
+  const kimiModelInp = document.getElementById('new-session-kimi-model');
+  const kimiThinkingSel = document.getElementById('new-session-kimi-thinking');
+  const kimiPermissionSel = document.getElementById('new-session-kimi-permission-mode');
+  const kimiPlanToggle = document.getElementById('new-session-kimi-plan-mode');
+  const kimiSwarmToggle = document.getElementById('new-session-kimi-swarm-mode');
+  const kimiToolsModeSel = document.getElementById('new-session-kimi-tools-mode');
+  const kimiToolsInput = document.getElementById('new-session-kimi-allowed-tools');
   const appliesToClaude = effectiveAgent === 'claude-code';
   const appliesToCodex = effectiveAgent === 'codex';
+  const appliesToKimi = effectiveAgent === 'kimi';
   if (codexModelSel) {
     codexModelSel.disabled = !appliesToCodex;
     if (!appliesToCodex) codexModelSel.value = '';
@@ -429,6 +482,43 @@ function renderNewSessionAgentControls(options = {}) {
   if (claudeEffortSel) {
     claudeEffortSel.disabled = !appliesToClaude;
     if (!appliesToClaude) claudeEffortSel.value = '';
+  }
+  if (kimiModelSel) {
+    kimiModelSel.disabled = !appliesToKimi;
+    if (!appliesToKimi) kimiModelSel.value = '';
+  }
+  if (kimiModelInp && !appliesToKimi) kimiModelInp.value = '';
+  updateNewSessionKimiCustomModelRow();
+  if (kimiThinkingSel) {
+    kimiThinkingSel.disabled = !appliesToKimi;
+    if (!appliesToKimi) kimiThinkingSel.value = '';
+  }
+  if (kimiPermissionSel) {
+    kimiPermissionSel.disabled = !appliesToKimi;
+    if (!appliesToKimi) kimiPermissionSel.value = '';
+  }
+  if (kimiPlanToggle) {
+    kimiPlanToggle.disabled = !appliesToKimi;
+    kimiPlanToggle.checked = appliesToKimi && !!newSessionKimiGlobalPlanMode;
+  }
+  if (kimiSwarmToggle) {
+    kimiSwarmToggle.disabled = !appliesToKimi;
+    kimiSwarmToggle.checked = appliesToKimi && !!newSessionKimiGlobalSwarmMode;
+  }
+  if (kimiToolsModeSel) {
+    kimiToolsModeSel.disabled = !appliesToKimi;
+    if (!appliesToKimi) kimiToolsModeSel.value = 'inherit';
+  }
+  if (kimiToolsInput) {
+    const mode = kimiToolsModeSel?.value || 'inherit';
+    kimiToolsInput.disabled = !appliesToKimi || mode !== 'exact';
+    if (!appliesToKimi) kimiToolsInput.value = '';
+    const globalTools = newSessionKimiGlobalAllowedTools;
+    kimiToolsInput.placeholder = globalTools === null
+      ? 'Global: Kimi profile default'
+      : (globalTools.length
+        ? `Global: ${globalTools.join(', ')}`
+        : 'Global: no optional tools');
   }
   if (managedContextSel) {
     managedContextSel.disabled = !appliesToCodex;
@@ -539,7 +629,7 @@ function newSessionAddKeysAction() {
 // link lands on that card); .env and vault leases stay as secondary paths.
 const NEW_SESSION_UNFUELED_MESSAGE =
   'No model credentials for the internal agent yet — add a key in Settings → API Keys (applies immediately, no restart). ' +
-  'A .env key on the daemon or a vault credential lease works too; external agents (Codex, Claude Code) sign in with their own accounts.';
+  'A .env key on the daemon or a vault credential lease works too; external agents (Codex, Claude Code, Kimi Code) sign in with their own accounts.';
 
 // ── Projectless preflight ──
 // A daemon launched outside any project reports project_root: null and has
@@ -1016,6 +1106,28 @@ async function startNewSession() {
       }
     }
   }
+  if (effectiveNewSessionAgentId() === 'kimi') {
+    const modelChoice = document.getElementById('new-session-kimi-model-select')?.value || '';
+    const model = modelChoice === '__custom__'
+      ? (document.getElementById('new-session-kimi-model')?.value.trim() || '')
+      : modelChoice;
+    if (model) msg.kimi_model = model;
+    const thinking = document.getElementById('new-session-kimi-thinking')?.value || '';
+    if (thinking) msg.kimi_thinking = thinking;
+    const permissionMode = document.getElementById('new-session-kimi-permission-mode')?.value || '';
+    if (permissionMode) msg.kimi_permission_mode = permissionMode;
+    msg.kimi_plan_mode = !!document.getElementById('new-session-kimi-plan-mode')?.checked;
+    msg.kimi_swarm_mode = !!document.getElementById('new-session-kimi-swarm-mode')?.checked;
+    const toolsMode = document.getElementById('new-session-kimi-tools-mode')?.value || 'inherit';
+    if (toolsMode === 'exact') {
+      const tools = normalizeKimiToolNames(
+        document.getElementById('new-session-kimi-allowed-tools')?.value || '',
+      );
+      msg.kimi_allowed_tools = tools.length ? tools.join(',') : 'none';
+    } else {
+      msg.kimi_allowed_tools = toolsMode;
+    }
+  }
   // Execution shape: an explicit per-launch choice beats the global Direct
   // toggle; Auto (or an external agent — the select is disabled and cleared
   // then) preserves the old behavior of the toggle forcing direct.
@@ -1052,6 +1164,10 @@ async function startNewSession() {
   updateNewSessionSpawnNotice('pending', 'Spawning new session...');
   showControlToast('info', 'Spawning new session...');
   resetNewSessionCodexFastModeToDefault();
+  const kimiToolsMode = document.getElementById('new-session-kimi-tools-mode');
+  const kimiToolsInput = document.getElementById('new-session-kimi-allowed-tools');
+  if (kimiToolsMode) kimiToolsMode.value = 'inherit';
+  if (kimiToolsInput) kimiToolsInput.value = '';
   renderNewSessionAgentControls();
   if (attachments.length > 0) {
     renderAttachmentReceipt(task, attachmentReceipt, 'Sent');

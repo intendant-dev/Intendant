@@ -2779,8 +2779,15 @@ mod tests {
             crate::access::iam::migrate_generated_browser_mtls_owner_root_at_startup(tmp.path())
                 .unwrap()
         );
-        let root =
-            http_access_context(tmp.path(), None, Some(&owner_fingerprint), true, true).unwrap();
+        let root = http_access_context(
+            tmp.path(),
+            None,
+            Some(&owner_fingerprint),
+            true,
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(root.principal.kind, "browser_certificate");
         assert_eq!(root.principal.source, "local_iam_state");
         assert_eq!(root.principal.role_id, "role:root");
@@ -2798,7 +2805,8 @@ mod tests {
                 .allowed
         );
 
-        let unknown = http_access_context(tmp.path(), None, Some("aabbccdd"), true, true).unwrap();
+        let unknown =
+            http_access_context(tmp.path(), None, Some("aabbccdd"), true, true, false).unwrap();
         assert_eq!(unknown.principal.role_id, "role:none");
         assert!(
             !unknown
@@ -2813,9 +2821,15 @@ mod tests {
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
             record: None,
         };
-        let peer =
-            http_access_context(tmp.path(), Some(&peer_identity), Some("abc123"), true, true)
-                .unwrap();
+        let peer = http_access_context(
+            tmp.path(),
+            Some(&peer_identity),
+            Some("abc123"),
+            true,
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(peer.principal.kind, "peer_daemon");
         assert_eq!(
             peer.principal.peer_profile.as_deref(),

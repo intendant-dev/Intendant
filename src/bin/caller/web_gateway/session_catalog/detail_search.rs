@@ -595,22 +595,32 @@ pub(crate) fn session_log_search_from_home_with_progress(
             continue;
         };
 
-        let session_path = session
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from);
-        let Some(search_path) =
+        let search_result = if source == kimi_history::KIMI_SOURCE {
+            search_kimi_session(
+                home,
+                session_id,
+                query,
+                &terms,
+                mode,
+                &deleted_external_sessions,
+            )
+        } else {
+            let session_path = session
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from);
             session_log_search_file_path(home, source, session_id, session_path.as_deref())
-        else {
-            continue;
+                .and_then(|search_path| {
+                    search_session_log_file(
+                        &search_path,
+                        query,
+                        &terms,
+                        mode,
+                        &deleted_external_sessions,
+                    )
+                })
         };
-        let Some((matches, snippets)) = search_session_log_file(
-            &search_path,
-            query,
-            &terms,
-            mode,
-            &deleted_external_sessions,
-        ) else {
+        let Some((matches, snippets)) = search_result else {
             continue;
         };
         searched += 1;
@@ -716,6 +726,10 @@ pub(crate) fn session_log_search_file_path(
         "codex" => find_codex_session_file(home, session_id),
         "claude-code" => find_claude_session_file(home, session_id),
         "gemini" => find_gemini_session_file(home, session_id),
+        "kimi" => {
+            let location = kimi_history::find_kimi_session_from_home(home, session_id)?;
+            Some(location.selected_agent(session_id)?.wire_path.clone())
+        }
         _ => None,
     }
 }
@@ -761,10 +775,60 @@ pub(crate) fn normalize_session_source_filter(source_filter: &str) -> String {
     match value.as_str() {
         "" | "all" => "all".to_string(),
         "external" => "external".to_string(),
-        "intendant" | "codex" | "claude-code" | "gemini" => value,
+        "intendant" | "codex" | "claude-code" | "gemini" | "kimi" => value,
+        "kimi-code" | "kimi code" => "kimi".to_string(),
         "claude" => "claude-code".to_string(),
         _ => "all".to_string(),
     }
+}
+
+fn search_kimi_session(
+    home: &Path,
+    session_id: &str,
+    query: &str,
+    terms: &[String],
+    mode: SessionLogSearchMode,
+    deleted_external_sessions: &HashSet<(String, String)>,
+) -> Option<(usize, Vec<serde_json::Value>)> {
+    let entries =
+        external_session_entries_from_home_arc(home, kimi_history::KIMI_SOURCE, session_id)?;
+    let candidates = entries.iter().map(|entry| SessionLogSearchCandidate {
+        ts: entry
+            .get("ts")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        source: entry
+            .get("source")
+            .and_then(|value| value.as_str())
+            .unwrap_or(kimi_history::KIMI_SOURCE)
+            .to_string(),
+        level: entry
+            .get("level")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        event: entry
+            .get("event")
+            .or_else(|| entry.get("kind"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        text: entry
+            .get("content")
+            .and_then(|value| value.as_str())
+            .or_else(|| entry.get("stdout").and_then(|value| value.as_str()))
+            .unwrap_or("")
+            .to_string(),
+        is_user: entry.get("source").and_then(|value| value.as_str()) == Some("user"),
+    });
+    Some(search_session_log_candidates(
+        candidates,
+        query,
+        terms,
+        mode,
+        deleted_external_sessions,
+    ))
 }
 
 pub(crate) fn session_source_matches_filter(source: &str, source_filter: &str) -> bool {

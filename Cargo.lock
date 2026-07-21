@@ -2921,6 +2921,7 @@ dependencies = [
  "image",
  "instant-acme",
  "intendant-core",
+ "intendant-custody",
  "intendant-display",
  "intendant-platform",
  "landlock",
@@ -2985,6 +2986,17 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "intendant-custody"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "security-framework",
+ "tempfile",
+ "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]

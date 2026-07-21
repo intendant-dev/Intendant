@@ -374,6 +374,12 @@ impl SessionSupervisor {
                 claude_model,
                 claude_permission_mode,
                 claude_effort,
+                kimi_model,
+                kimi_thinking,
+                kimi_permission_mode,
+                kimi_allowed_tools,
+                kimi_plan_mode,
+                kimi_swarm_mode,
                 codex_model,
                 codex_reasoning_effort,
                 codex_sandbox,
@@ -422,6 +428,12 @@ impl SessionSupervisor {
                                     None,
                                     None,
                                     None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
                                     codex_model,
                                     codex_reasoning_effort,
                                     codex_sandbox,
@@ -453,6 +465,12 @@ impl SessionSupervisor {
                         || claude_model.is_some()
                         || claude_permission_mode.is_some()
                         || claude_effort.is_some()
+                        || kimi_model.is_some()
+                        || kimi_thinking.is_some()
+                        || kimi_permission_mode.is_some()
+                        || kimi_allowed_tools.is_some()
+                        || kimi_plan_mode.is_some()
+                        || kimi_swarm_mode.is_some()
                         || codex_model.is_some()
                         || codex_reasoning_effort.is_some()
                         || codex_sandbox.is_some()
@@ -481,6 +499,12 @@ impl SessionSupervisor {
                         claude_model,
                         claude_permission_mode,
                         claude_effort,
+                        kimi_model,
+                        kimi_thinking,
+                        kimi_permission_mode,
+                        kimi_allowed_tools,
+                        kimi_plan_mode,
+                        kimi_swarm_mode,
                         codex_model,
                         codex_reasoning_effort,
                         codex_sandbox,
@@ -576,6 +600,12 @@ impl SessionSupervisor {
                                     None,
                                     None,
                                     None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
                                     orchestrate,
                                     direct,
                                     Vec::new(),
@@ -616,6 +646,12 @@ impl SessionSupervisor {
                 let started = self
                     .start_new_session(
                         task,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                         None,
                         None,
                         None,
@@ -749,6 +785,12 @@ impl SessionSupervisor {
                 claude_permission_mode,
                 claude_allowed_tools,
                 claude_effort,
+                kimi_model,
+                kimi_thinking,
+                kimi_permission_mode,
+                kimi_allowed_tools,
+                kimi_plan_mode,
+                kimi_swarm_mode,
             } => {
                 self.restart_session(
                     source,
@@ -768,6 +810,12 @@ impl SessionSupervisor {
                         claude_permission_mode,
                         claude_allowed_tools,
                         claude_effort,
+                        kimi_model,
+                        kimi_thinking,
+                        kimi_permission_mode,
+                        kimi_allowed_tools,
+                        kimi_plan_mode,
+                        kimi_swarm_mode,
                         ..Default::default()
                     },
                 )
@@ -900,6 +948,12 @@ impl SessionSupervisor {
                 claude_permission_mode,
                 claude_allowed_tools,
                 claude_effort,
+                kimi_model,
+                kimi_thinking,
+                kimi_permission_mode,
+                kimi_allowed_tools,
+                kimi_plan_mode,
+                kimi_swarm_mode,
             } => {
                 self.configure_session_agent(
                     session_id,
@@ -916,12 +970,29 @@ impl SessionSupervisor {
                         claude_permission_mode,
                         claude_allowed_tools,
                         claude_effort,
+                        kimi_model,
+                        kimi_thinking,
+                        kimi_permission_mode,
+                        kimi_allowed_tools,
+                        kimi_plan_mode,
+                        kimi_swarm_mode,
                         ..Default::default()
                     },
                 )
                 .await;
             }
-            event::ControlMsg::CodexThreadAction { session_id, op, .. } => {
+            event::ControlMsg::CodexThreadAction {
+                session_id,
+                op,
+                params,
+                origin,
+            } => {
+                if self
+                    .route_kimi_subagent_thread_action(session_id.as_deref(), &op, params, origin)
+                    .await
+                {
+                    return;
+                }
                 self.report_unattached_codex_thread_action(session_id, op)
                     .await;
             }
@@ -960,6 +1031,11 @@ impl SessionSupervisor {
             event::ControlMsg::SpawnSubAgent { .. } => true,
             event::ControlMsg::ResumeSession { .. } => true,
             event::ControlMsg::RestartSession { .. } => true,
+            // The foreground/headless resume listener does not register the
+            // startup session in its own supervisor state. Anchor forks are
+            // nevertheless self-resolving from persisted backend history and
+            // activate a fresh managed child, just like ResumeSession.
+            event::ControlMsg::ForkSessionAtAnchor { .. } => true,
             event::ControlMsg::StopSession { .. } => true,
             event::ControlMsg::RenameSession { .. } => true,
             event::ControlMsg::ConfigureSessionAgent { .. } => true,
@@ -1051,6 +1127,72 @@ impl SessionSupervisor {
             });
         }
     }
+
+    /// Direct dashboard/control-plane thread actions are first republished
+    /// with the child id as their event target. A Kimi native subagent is
+    /// not an independently drained session, so that event cannot reach
+    /// the parent-owned adapter. Re-emit the child-safe operation against
+    /// the managed parent with the child id embedded in params.
+    ///
+    /// Side threads are deliberately excluded: the external drain already
+    /// tracks them in its live side-thread map, so the original event is
+    /// routable and republishing it here would execute it twice.
+    async fn route_kimi_subagent_thread_action(
+        &self,
+        requested_id: Option<&str>,
+        op: &str,
+        params: serde_json::Value,
+        origin: Option<String>,
+    ) -> bool {
+        let Some(requested_id) = requested_id
+            .map(str::trim)
+            .filter(|requested_id| !requested_id.is_empty())
+        else {
+            return false;
+        };
+        let route = {
+            let state = self.state.lock().await;
+            let Some(relation) = state.related_sessions.get(requested_id) else {
+                return false;
+            };
+            if relation.relationship != "subagent" {
+                return false;
+            }
+            let Some(parent) = state.sessions.get(&relation.parent_session_id) else {
+                return false;
+            };
+            if external_agent::AgentBackend::from_str_loose(&parent.source)
+                != Some(external_agent::AgentBackend::Kimi)
+            {
+                return false;
+            }
+            relation.parent_session_id.clone()
+        };
+
+        if !kimi_child_thread_action_allowed(op, "subagent") {
+            self.config.bus.send(AppEvent::CodexThreadActionResult {
+                session_id: Some(requested_id.to_string()),
+                action: op.to_string(),
+                success: false,
+                message: format!(
+                    "Kimi subagent session {} does not support /{}; use the parent session instead",
+                    short_session(requested_id),
+                    op
+                ),
+                record_id: None,
+            });
+            return true;
+        }
+
+        self.config.bus.send(AppEvent::CodexThreadActionRequested {
+            request_id: uuid::Uuid::new_v4().simple().to_string(),
+            session_id: Some(route),
+            action: op.to_string(),
+            params: thread_action_params_with_thread_id(op, params, Some(requested_id)),
+            origin,
+        });
+        true
+    }
 }
 
 pub(crate) fn control_target_session_id(msg: &event::ControlMsg) -> Option<&str> {
@@ -1123,6 +1265,12 @@ mod tests {
             claude_model: None,
             claude_permission_mode: None,
             claude_effort: None,
+            kimi_model: None,
+            kimi_thinking: None,
+            kimi_permission_mode: None,
+            kimi_allowed_tools: None,
+            kimi_plan_mode: None,
+            kimi_swarm_mode: None,
             codex_model: None,
             codex_reasoning_effort: None,
             codex_sandbox: None,
@@ -1648,6 +1796,99 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn direct_kimi_subagent_action_retargets_parent_and_injects_child_id() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "kimi-parent".to_string(),
+                managed_session("kimi-parent", "kimi"),
+            );
+            assert!(state.apply_related_session("kimi-parent", "kimi-parent:agent-1", "subagent"));
+        }
+
+        supervisor
+            .handle_control_msg(event::ControlMsg::CodexThreadAction {
+                session_id: Some("kimi-parent:agent-1".to_string()),
+                op: "tools-set".to_string(),
+                params: serde_json::json!({ "names": ["ReadFile"] }),
+                origin: Some("dashboard".to_string()),
+            })
+            .await;
+
+        match rx.try_recv().expect("retargeted request") {
+            AppEvent::CodexThreadActionRequested {
+                request_id,
+                session_id,
+                action,
+                params,
+                origin,
+            } => {
+                assert!(!request_id.is_empty());
+                assert_eq!(session_id.as_deref(), Some("kimi-parent"));
+                assert_eq!(action, "tools-set");
+                assert_eq!(origin.as_deref(), Some("dashboard"));
+                assert_eq!(
+                    thread_id_from_action_params(&params).as_deref(),
+                    Some("kimi-parent:agent-1")
+                );
+                assert_eq!(params.get("names"), Some(&serde_json::json!(["ReadFile"])));
+            }
+            other => panic!("expected parent-targeted request, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "the supervisor must emit exactly one parent request"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_kimi_subagent_unsafe_action_reports_failure_without_parent_request() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "kimi-parent".to_string(),
+                managed_session("kimi-parent", "kimi"),
+            );
+            assert!(state.apply_related_session("kimi-parent", "kimi-parent:agent-1", "subagent"));
+        }
+
+        supervisor
+            .handle_control_msg(event::ControlMsg::CodexThreadAction {
+                session_id: Some("kimi-parent:agent-1".to_string()),
+                op: "goal-clear".to_string(),
+                params: serde_json::json!({}),
+                origin: None,
+            })
+            .await;
+
+        match rx.try_recv().expect("failure result") {
+            AppEvent::CodexThreadActionResult {
+                session_id,
+                action,
+                success,
+                message,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("kimi-parent:agent-1"));
+                assert_eq!(action, "goal-clear");
+                assert!(!success);
+                assert!(message.contains("use the parent session instead"));
+            }
+            other => panic!("expected child-scoped failure, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "an unsafe child op must not be republished to the parent"
+        );
+    }
+
     #[test]
     fn external_codex_edit_control_can_be_handled_before_attach() {
         let msg = event::ControlMsg::EditUserMessage {
@@ -1663,6 +1904,32 @@ mod tests {
             attachments: Vec::new(),
         };
         assert!(control_msg_can_attach_unmanaged_session(&msg));
+    }
+
+    #[tokio::test]
+    async fn anchor_fork_is_claimed_before_foreground_session_attach() {
+        let bus = EventBus::new();
+        let project_dir = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor(project_dir.path().to_path_buf(), bus);
+        let msg = event::ControlMsg::ForkSessionAtAnchor {
+            source: "kimi".to_string(),
+            session_id: "session_parent".to_string(),
+            resume_id: Some("session_parent".to_string()),
+            anchor: crate::session_fork::ForkAnchorSpec {
+                kind: "turn-boundary".to_string(),
+                turn: Some(2),
+                item_id: None,
+                position: None,
+                seq: None,
+                message_uuid: None,
+            },
+            name: None,
+            task: None,
+            project_root: Some(project_dir.path().to_string_lossy().into_owned()),
+            request_id: Some("fork-foreground".to_string()),
+        };
+
+        assert!(supervisor.should_handle_session_control(&msg).await);
     }
 
     fn delegated_start_task(delegation_id: &str) -> event::ControlMsg {

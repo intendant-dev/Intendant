@@ -51,7 +51,7 @@ pub(crate) use types::{
 #[cfg(test)]
 pub(crate) use ask::resolution_from_wire;
 #[cfg(test)]
-pub(crate) use types::AgendaAskResolution;
+pub(crate) use types::{AgendaAskResolution, AgendaKind};
 
 use std::path::{Path, PathBuf};
 

@@ -432,6 +432,32 @@ pub(crate) fn spawn_mode_web_gateway(
     // (see sandbox::seatbelt_loopback_guard_clause) — recorded here, the
     // one place every gateway-bearing startup shape passes through.
     crate::sandbox::record_gateway_loopback_port(web_port);
+    // Same chokepoint: persist this boot's loopback admission token for
+    // owner clients (ctl, rigs, the dashboard opener), and hand the
+    // owner their tokened URL on the controlling terminal only — the
+    // stderr `Dashboard:` line is tee'd into sandbox-readable logs and
+    // must stay tokenless.
+    if let Err(err) = crate::loopback_token::persist_for_instance(
+        &crate::platform::intendant_home(),
+        web_port,
+        web_tls_acceptor.is_some(),
+    ) {
+        // Loopback surfaces still enforce the in-memory token; the tty
+        // line below stays the owner's source when the root is unwritable.
+        eprintln!(
+            "loopback-token: could not persist the per-boot admission token: {err} — \
+             local clients (`intendant ctl`, the dashboard) will not auto-discover it"
+        );
+    }
+    let scheme = if web_tls_acceptor.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    crate::loopback_token::print_owner_url_to_tty(&format!(
+        "Dashboard (owner URL, rotates each boot): {}",
+        crate::loopback_token::tokened_dashboard_url(scheme, web_port)
+    ));
     // Loud-badges guardrail (ask↔agenda slice 2): re-announce every OPEN
     // agenda-backed ask on the question rail so the state-line cache, the
     // attention nudge, and every connecting rail repopulate on a fresh

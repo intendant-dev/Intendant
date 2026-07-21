@@ -56,7 +56,7 @@ async function runSessionWindowCodexAction(sessionId, op) {
     showControlToast('error', `/${op} is not available here: ${actionState.reason}`);
     return;
   }
-  const params = await promptCodexThreadActionParams(spec);
+  const params = await promptCodexThreadActionParams({ ...spec, sessionId: sid });
   if (params === null) return;
   if (dispatchCodexThreadAction(op, params, sid)) {
     markActionPending(op);
@@ -3323,8 +3323,8 @@ function updateStatusBar(d, opts = {}) {
   }
   if (d.external_agent !== undefined) {
     // Accept any of the serialization forms we might see on the wire:
-    //   short:      "codex" | "claude-code"
-    //   display:    "Codex" | "Claude Code"
+    //   short:      "codex" | "claude-code" | "kimi"
+    //   display:    "Codex" | "Claude Code" | "Kimi Code"
     //   serde enum: "claude_code"
     // Normalize to the canonical short form used by the dropdown
     // <option value> attributes, then derive a pretty label from that.
@@ -3358,6 +3358,8 @@ function normalizeAgentId(raw) {
   if (v === 'codex') return 'codex';
   if (v === 'claude-code' || v === 'claude_code' || v === 'claudecode' ||
       v === 'cc' || v === 'claude code') return 'claude-code';
+  if (v === 'kimi' || v === 'kimi-code' || v === 'kimi_code' ||
+      v === 'kimicode' || v === 'kimi code' || v === 'moonshot') return 'kimi';
   return '';
 }
 
@@ -3365,6 +3367,7 @@ function prettyAgentName(shortId) {
   return {
     'codex': 'Codex',
     'claude-code': 'Claude Code',
+    'kimi': 'Kimi Code',
   }[shortId] || shortId;
 }
 
@@ -4502,4 +4505,3 @@ function hideBadge(tab) {
   const badge = document.getElementById('badge-' + tab);
   if (badge) { badge.classList.remove('visible'); badge.textContent = ''; }
 }
-

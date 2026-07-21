@@ -4,7 +4,18 @@ description: Use when asking the user to choose between design or implementation
 compatibility: Requires a reachable Intendant daemon (supervised sessions have $INTENDANT and INTENDANT_MCP_URL injected).
 ---
 
-> If `$INTENDANT`/`INTENDANT_MCP_URL` is unset and no local Intendant daemon answers, this skill does not apply — say so and stop.
+> Resolve the CLI first:
+>
+> ```bash
+> INTENDANT="${INTENDANT:-$(command -v intendant || cat "${INTENDANT_HOME:-$HOME/.intendant}/cli-path" 2>/dev/null || echo intendant)}"
+> ```
+>
+> If that resolves nothing anywhere (no `$INTENDANT`, nothing on PATH, no
+> `cli-path` descriptor under the Intendant state root), Intendant likely
+> isn't on this machine — this skill does not apply; say so and stop. If
+> the CLI resolves but the daemon does not answer, that is a DIFFERENT
+> stop: say the daemon appears down — do not claim the skill doesn't
+> apply. (A running daemon refreshes the descriptor at boot.)
 
 # Show, then ask
 
@@ -20,17 +31,17 @@ question is automatically attached to your own session).
 
 ```bash
 # Pick between prototypes — write self-contained HTML files, then:
-"${INTENDANT:-intendant}" ctl ask "Which landing direction?" \
+"$INTENDANT" ctl ask "Which landing direction?" \
     --option "A:dense ops grid" --option "B:calm editorial" --wait 600 \
     --preview-html A=proto-a.html --preview-html B=proto-b.html
 
 # Before/after — screenshots of a change, before it lands:
-"${INTENDANT:-intendant}" ctl ask "Ship this restyle?" \
+"$INTENDANT" ctl ask "Ship this restyle?" \
     --option "Ship it" --option "Needs work" \
     --preview-image Before=before.png --preview-image After=after.png
 
 # Small text artifacts (diffs, copy, error messages) render preformatted:
-"${INTENDANT:-intendant}" ctl ask "Keep the new hero copy?" \
+"$INTENDANT" ctl ask "Keep the new hero copy?" \
     --preview-text "New=The house runs itself. It answers to you."
 ```
 
@@ -55,5 +66,5 @@ session log, so replays show exactly what the user saw when they chose.
 
 MCP-direct callers can pass the same cards inline via the `ask_user`
 tool's `previews` parameter, at context cost — prefer ctl for files.
-`"${INTENDANT:-intendant}" ctl ask --help` is the authoritative flag
+`"$INTENDANT" ctl ask --help` is the authoritative flag
 reference.

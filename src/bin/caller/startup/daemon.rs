@@ -1,68 +1,12 @@
-//! The daemon execution shape: run_daemon is main()'s
-//! web_daemon_requested branch (wiring + session supervisor), and
-//! run_daemon_loop/DaemonConfig is the fallback daemon loop the
-//! headless web-gateway path falls through to after its task ends.
+//! The daemon execution shape: `run_daemon` is main()'s
+//! `web_daemon_requested` branch (wiring + session supervisor). Foreground
+//! web sessions promote their already-subscribed supervisor in place when
+//! they fall through to daemon service.
 
 // Same entangled class as the drain (external_events.rs): keeps the
 // crate-root view it was written against. Narrowing to named imports
 // is the deferred cosmetic pass (see the god-file split design).
 use crate::*;
-
-/// Configuration for `run_daemon_loop`.
-pub(crate) struct DaemonConfig {
-    pub(crate) bus: EventBus,
-    /// `None` = projectless daemon: no default session project; every
-    /// CreateSession must carry an explicit `project_root` override.
-    pub(crate) project_root: Option<PathBuf>,
-    pub(crate) autonomy: SharedAutonomy,
-    pub(crate) shared_external_agent:
-        Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
-    pub(crate) shared_codex_config: control_plane::SharedCodexConfig,
-    pub(crate) shared_claude_config: control_plane::SharedClaudeConfig,
-    pub(crate) frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
-    pub(crate) session_registry: Option<display::SharedSessionRegistry>,
-    pub(crate) peer_registry: Option<peer::PeerRegistry>,
-    pub(crate) web_port: Option<u16>,
-    pub(crate) flags_direct: bool,
-    /// Optional shared session state for headless mode (cleared between tasks).
-    pub(crate) shared_session: Option<web_gateway::SharedActiveSession>,
-    /// Git-vitals target registry handed to the supervisor (see
-    /// `SessionSupervisorConfig::git_vitals_targets`).
-    pub(crate) git_vitals_targets: Option<session_vitals::GitVitalsTargets>,
-}
-
-/// Daemon loop the headless web-gateway path falls through to after its task ends.
-///
-/// Waits for `StartTask` and `SetExternalAgent` control messages from the web
-/// UI, spawning agent tasks in the background. Exits when the bus closes.
-///
-/// Ctrl+C is handled by the global signal handler installed in `main`, which
-/// writes `mark_interrupted` to the session meta and calls `exit(130)` — we
-/// deliberately do not also listen for it here because racing two handlers
-/// risked the loop `break`ing before the meta update ran.
-pub(crate) async fn run_daemon_loop(config: DaemonConfig) {
-    session_supervisor::SessionSupervisor::new(session_supervisor::SessionSupervisorConfig {
-        bus: config.bus,
-        project_root: config.project_root,
-        autonomy: config.autonomy,
-        shared_external_agent: config.shared_external_agent,
-        shared_codex_config: config.shared_codex_config,
-        shared_claude_config: config.shared_claude_config,
-        frame_registry: config.frame_registry,
-        session_registry: config.session_registry,
-        peer_registry: config.peer_registry,
-        web_port: config.web_port,
-        flags_direct: config.flags_direct,
-        shared_session: config.shared_session,
-        provider_factory: None,
-        logs_home_override: None,
-        git_vitals_targets: config.git_vitals_targets,
-        hosted_control_cert_dir: Some(crate::startup::installed_access_cert_dir()),
-        launch_gate_for_tests: None,
-    })
-    .run()
-    .await;
-}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_daemon(
@@ -176,6 +120,7 @@ pub(crate) async fn run_daemon(
 
     let shared_codex_config = shared_codex_config_from_project(project);
     let shared_claude_config = shared_claude_config_from_project(project);
+    let shared_kimi_config = shared_kimi_config_from_project(project);
     let settings_root = project_root
         .clone()
         .unwrap_or_else(project::daemon_settings_config_root);
@@ -184,6 +129,7 @@ pub(crate) async fn run_daemon(
         external_agent: shared_external_agent.clone(),
         codex_config: shared_codex_config.clone(),
         claude_config: shared_claude_config.clone(),
+        kimi_config: shared_kimi_config.clone(),
         bus: bus.clone(),
         project_root: Some(settings_root),
     });
@@ -232,6 +178,7 @@ pub(crate) async fn run_daemon(
             shared_external_agent,
             shared_codex_config,
             shared_claude_config,
+            shared_kimi_config,
             frame_registry,
             session_registry: Some(session_registry.clone()),
             peer_registry: Some(gateway.peer_registry.clone()),

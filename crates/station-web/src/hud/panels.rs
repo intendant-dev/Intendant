@@ -697,6 +697,7 @@ impl StationInner {
                 ("intendant", "internal"),
                 ("codex", "codex"),
                 ("claude", "claude-code"),
+                ("kimi", "kimi"),
             ]
             .into_iter()
             .map(|(label, id)| {
@@ -835,6 +836,163 @@ impl StationInner {
                     )
                 })
                 .collect(),
+            ));
+        }
+        if controls.backend == "kimi" || controls.launch_agent == "kimi" {
+            let model = controls.kimi_model.trim();
+            surface.rows.push(PanelRow::choices(
+                "model",
+                C_SKY_CSS,
+                [
+                    (
+                        "default".to_string(),
+                        model.is_empty(),
+                        HitAction::ControlsAction {
+                            action: "kimi-model:default".into(),
+                        },
+                    ),
+                    (
+                        "k2.7".to_string(),
+                        model == "kimi-code/kimi-for-coding",
+                        HitAction::ControlsAction {
+                            action: "kimi-model:k2.7".into(),
+                        },
+                    ),
+                    (
+                        "k2.7 fast".to_string(),
+                        model == "kimi-code/kimi-for-coding-highspeed",
+                        HitAction::ControlsAction {
+                            action: "kimi-model:k2.7-fast".into(),
+                        },
+                    ),
+                    (
+                        "k3".to_string(),
+                        model == "kimi-code/k3",
+                        HitAction::ControlsAction {
+                            action: "kimi-model:k3".into(),
+                        },
+                    ),
+                ]
+                .to_vec(),
+            ));
+            if !model.is_empty()
+                && ![
+                    "kimi-code/kimi-for-coding",
+                    "kimi-code/kimi-for-coding-highspeed",
+                    "kimi-code/k3",
+                ]
+                .contains(&model)
+            {
+                surface.rows.push(PanelRow::new(
+                    "model".to_string(),
+                    format!("custom: {model}"),
+                    C_SKY_CSS,
+                ));
+            }
+            let thinking = controls.kimi_thinking.trim();
+            surface.rows.push(PanelRow::choices(
+                "thinking",
+                C_IRIS2_CSS,
+                ["default", "off", "low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(|value| {
+                        (
+                            value.to_string(),
+                            (value == "default" && thinking.is_empty()) || thinking == value,
+                            HitAction::ControlsAction {
+                                action: format!("kimi-thinking:{value}"),
+                            },
+                        )
+                    })
+                    .collect(),
+            ));
+            surface.rows.push(PanelRow::choices(
+                "permissions",
+                C_AMBER_CSS,
+                ["manual", "auto", "yolo"]
+                    .into_iter()
+                    .map(|mode| {
+                        (
+                            mode.to_string(),
+                            controls.kimi_permission_mode == mode
+                                || (mode == "manual" && controls.kimi_permission_mode.is_empty()),
+                            HitAction::ControlsAction {
+                                action: format!("kimi-permission:{mode}"),
+                            },
+                        )
+                    })
+                    .collect(),
+            ));
+            surface.rows.push(PanelRow::choices(
+                "plan",
+                C_VIOLET_CSS,
+                [("off", false), ("on", true)]
+                    .into_iter()
+                    .map(|(label, enabled)| {
+                        (
+                            label.to_string(),
+                            controls.kimi_plan_mode == enabled,
+                            HitAction::ControlsAction {
+                                action: format!("kimi-plan:{label}"),
+                            },
+                        )
+                    })
+                    .collect(),
+            ));
+            surface.rows.push(PanelRow::choices(
+                "swarm",
+                C_GREEN_CSS,
+                [("off", false), ("on", true)]
+                    .into_iter()
+                    .map(|(label, enabled)| {
+                        (
+                            label.to_string(),
+                            controls.kimi_swarm_mode == enabled,
+                            HitAction::ControlsAction {
+                                action: format!("kimi-swarm:{label}"),
+                            },
+                        )
+                    })
+                    .collect(),
+            ));
+            let tool_count = controls
+                .kimi_allowed_tools
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or_default();
+            surface.rows.push(PanelRow::choices(
+                "tools",
+                C_SKY_CSS,
+                vec![
+                    (
+                        "profile".to_string(),
+                        controls.kimi_allowed_tools.is_none(),
+                        HitAction::ControlsAction {
+                            action: "kimi-tools:default".into(),
+                        },
+                    ),
+                    (
+                        "none".to_string(),
+                        controls
+                            .kimi_allowed_tools
+                            .as_ref()
+                            .is_some_and(Vec::is_empty),
+                        HitAction::ControlsAction {
+                            action: "kimi-tools:none".into(),
+                        },
+                    ),
+                    (
+                        if tool_count > 0 {
+                            format!("{tool_count} exact")
+                        } else {
+                            "edit…".to_string()
+                        },
+                        tool_count > 0,
+                        HitAction::ControlsAction {
+                            action: "kimi-tools:edit".into(),
+                        },
+                    ),
+                ],
             ));
         }
 

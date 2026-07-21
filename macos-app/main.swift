@@ -593,7 +593,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         dashboardActive = true
         lastWindowVisibleAt = Date()
         NSLog("Activating dashboard")
-        webView.load(URLRequest(url: intendantBackendURL()))
+        webView.load(URLRequest(url: intendantBackendURL(port: port)))
     }
 
     /// Crash-screen Restart button: relaunch the backend and re-enter the
@@ -751,7 +751,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         // was up would defeat the point of deferring it.
         NSLog("Web content process terminated — \(dashboardActive ? "reloading dashboard" : "restoring placeholder")")
         if dashboardActive {
-            webView.load(URLRequest(url: intendantBackendURL()))
+            webView.load(URLRequest(url: intendantBackendURL(port: port)))
         } else {
             showPlaceholder(paused: false)
         }
@@ -1025,10 +1025,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
 /// harness/smoke runs (see `docs/smoke-display.md` §9). Routes through
 /// the same `intendant://backend/` custom scheme so the WKWebView keeps
 /// its secure context (mic, custom URL scheme handler).
-func intendantBackendURL() -> URL {
+func intendantBackendURL(port: Int) -> URL {
     let diag = ProcessInfo.processInfo.environment["INTENDANT_DIAG"] == "1"
-    let raw = diag ? "intendant://backend/?diag=1" : "intendant://backend/"
+    var raw = diag ? "intendant://backend/?diag=1" : "intendant://backend/"
+    // The daemon refuses tokenless loopback on owner surfaces, and the
+    // page's direct WebSocket (which bypasses the mTLS scheme handler)
+    // needs the per-boot admission token. Hand it over the same `?token=`
+    // channel every other owner surface uses — the SPA stores it and
+    // strips it from the URL. The dashboard only loads after the backend
+    // readiness poll, so the boot's token file exists by the time this
+    // URL is built; if it is unreadable the SPA surfaces the daemon's
+    // named refusal rather than the app guessing.
+    if let token = loopbackAdmissionToken(port: port), !token.isEmpty {
+        let sep = raw.contains("?") ? "&" : "?"
+        let encoded = token.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? token
+        raw += "\(sep)token=\(encoded)"
+    }
     return URL(string: raw)!
+}
+
+/// This boot's loopback admission token, read from the daemon state root
+/// the way every owner process discovers it (`INTENDANT_HOME` override,
+/// else `~/.intendant`), keyed by the backend port the app supervises.
+func loopbackAdmissionToken(port: Int) -> String? {
+    let env = ProcessInfo.processInfo.environment
+    if let explicit = env["INTENDANT_LOOPBACK_TOKEN"], !explicit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return explicit.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    let root = env["INTENDANT_HOME"].map { URL(fileURLWithPath: $0) }
+        ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".intendant")
+    let tokenFile = root
+        .appendingPathComponent("loopback-tokens")
+        .appendingPathComponent("\(port).token")
+    guard let raw = try? String(contentsOf: tokenFile, encoding: .utf8) else {
+        return nil
+    }
+    let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return token.isEmpty ? nil : token
 }
 
 // MARK: - Main
