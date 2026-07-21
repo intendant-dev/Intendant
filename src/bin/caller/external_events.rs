@@ -2314,6 +2314,20 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     });
                 }
             }
+            external_agent::AgentEvent::VcsActivity { kind, cwd } => {
+                // The backend's own commit/push/merge/rebase notice — a
+                // freshness hint that wakes the git prober and tells an
+                // open Changes tab to refetch. Same primary-conversation
+                // gate as CwdAnnounced: a side thread's commit must not
+                // retarget or wake the supervising session's probes.
+                if event_is_primary {
+                    config.bus.send(AppEvent::SessionVcsActivity {
+                        session_id: config.session_id.clone(),
+                        kind,
+                        cwd,
+                    });
+                }
+            }
             external_agent::AgentEvent::FileApprovalRequest {
                 request_id,
                 path,

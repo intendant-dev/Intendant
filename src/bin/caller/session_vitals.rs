@@ -1393,8 +1393,10 @@ pub(crate) fn spawn_session_vitals_producer(
         registry.register(&session_id, cwd);
     }
     let hub = SessionVitalsHub::new(bus.clone());
+    let wake = Arc::new(tokio::sync::Notify::new());
     let _cache_listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
-    let _target_maintainer = spawn_git_target_maintainer(bus, registry.clone(), hub.clone());
+    let _target_maintainer =
+        spawn_git_target_maintainer(bus, registry.clone(), hub.clone(), wake.clone());
     let handle = tokio::spawn({
         let registry = registry.clone();
         async move {
@@ -1413,7 +1415,15 @@ pub(crate) fn spawn_session_vitals_producer(
                     }
                     hub.apply(&session_id, |vitals| vitals.git = probed);
                 }
-                tokio::time::sleep(PROBE_INTERVAL).await;
+                // Wait out the cadence, or probe immediately when the
+                // maintainer sees a backend VCS notice. `Notify` holds at
+                // most one stored permit, so a burst of notices (a merge
+                // announcing commit+merge back-to-back) coalesces into one
+                // early tick instead of queueing probe storms.
+                tokio::select! {
+                    _ = tokio::time::sleep(PROBE_INTERVAL) => {}
+                    _ = wake.notified() => {}
+                }
             }
         }
     });
@@ -1431,6 +1441,10 @@ pub(crate) fn spawn_session_vitals_producer(
 ///   working-directory statement (Claude Code's `system:init` echo, Codex/Kimi
 ///   applied thread settings) — authoritative, so it retargets
 ///   immediately (see [`GitTarget::seed_locus`]).
+/// - `SessionVcsActivity` (a backend's own commit/push/merge/rebase
+///   notice) seeds the locus the same first-hand way when it carries a
+///   cwd, then wakes the prober so the chip reflects the operation now
+///   instead of on the next cadence tick.
 ///
 /// Resolution runs through the hub's alias map both ways: resume lanes
 /// register the live (backend-native) id while events may carry the
@@ -1439,6 +1453,7 @@ fn spawn_git_target_maintainer(
     bus: EventBus,
     registry: GitVitalsTargets,
     hub: Arc<SessionVitalsHub>,
+    wake: Arc<tokio::sync::Notify>,
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = bus.subscribe();
     tokio::spawn(async move {
@@ -1474,6 +1489,24 @@ fn spawn_git_target_maintainer(
                             registry.seed_locus(&id, Path::new(&cwd));
                         }
                     }
+                }
+                Ok(AppEvent::SessionVcsActivity {
+                    session_id: Some(session_id),
+                    cwd,
+                    ..
+                }) => {
+                    // First-hand like SessionCwdAnnounced: the backend
+                    // states where it just committed/pushed, so the probe
+                    // follows even if no prior signal moved the locus.
+                    if let Some(cwd) = cwd.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+                        let canonical = hub.resolve(&session_id);
+                        for (id, _) in registry.snapshot() {
+                            if hub.resolve(&id) == canonical {
+                                registry.seed_locus(&id, Path::new(cwd));
+                            }
+                        }
+                    }
+                    wake.notify_one();
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -2558,6 +2591,75 @@ mod tests {
         .await
         .expect("restored session emits git vitals on the first tick");
         assert_eq!(vitals.git.expect("git section").branch, "main");
+    }
+
+    #[tokio::test]
+    async fn vcs_activity_seeds_locus_and_wakes_prober() {
+        // A backend's commit notice must retarget the probe to the
+        // checkout the backend named (first-hand, like
+        // SessionCwdAnnounced) and wake the producer immediately. The
+        // timing bound is what proves the wake: the cadence alone cannot
+        // deliver a second emission earlier than PROBE_INTERVAL after the
+        // first, so a re-probe well inside that window can only have come
+        // from the notice.
+        let repo_a = tempfile::tempdir().expect("tempdir");
+        git_cmd(repo_a.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repo_a.path().join("a.txt"), "one\n").unwrap();
+        git_cmd(repo_a.path(), &["add", "."]);
+        git_cmd(repo_a.path(), &["commit", "-qm", "base"]);
+        let repo_b = tempfile::tempdir().expect("tempdir");
+        git_cmd(repo_b.path(), &["init", "-q", "-b", "feature"]);
+        std::fs::write(repo_b.path().join("b.txt"), "two\n").unwrap();
+        git_cmd(repo_b.path(), &["add", "."]);
+        git_cmd(repo_b.path(), &["commit", "-qm", "base"]);
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (_targets, _producer) = spawn_session_vitals_producer(
+            bus.clone(),
+            vec![("vcs-session".to_string(), repo_a.path().to_path_buf())],
+        );
+
+        let deadline = std::time::Duration::from_secs(20);
+        let first = tokio::time::timeout(deadline, async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { vitals, .. }) = rx.recv().await {
+                    if let Some(git) = vitals.git {
+                        return git;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("registered session emits git vitals on the first tick");
+        assert_eq!(first.branch, "main");
+
+        let woke = std::time::Instant::now();
+        bus.send(AppEvent::SessionVcsActivity {
+            session_id: Some("vcs-session".to_string()),
+            kind: "commit".to_string(),
+            cwd: Some(repo_b.path().to_string_lossy().into_owned()),
+        });
+        let second = tokio::time::timeout(deadline, async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { vitals, .. }) = rx.recv().await {
+                    if let Some(git) = vitals.git {
+                        if git.branch == "feature" {
+                            return git;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the vcs notice retargets the probe to the announced checkout");
+        assert!(
+            woke.elapsed() < PROBE_INTERVAL,
+            "re-probe took {:?} — the notice must wake the prober instead of \
+             waiting out the cadence",
+            woke.elapsed()
+        );
+        assert_eq!(second.branch, "feature");
     }
 
     #[test]

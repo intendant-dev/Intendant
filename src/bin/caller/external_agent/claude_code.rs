@@ -1637,6 +1637,30 @@ impl CcReader {
             Some("task_progress") | Some("task_updated") | Some("background_tasks_changed") => {
                 return
             }
+            // The CLI's own notice of a commit/push/merge/rebase it
+            // performed (2.1.216). Forwarded as a freshness hint so the
+            // git chip and Changes tab refresh ahead of the vitals poll
+            // tick; git itself stays the source of truth, so a missing or
+            // bogus notice can never corrupt derived state.
+            Some("vcs_state_changed") => {
+                let kind = msg
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .map(str::trim)
+                    .filter(|k| !k.is_empty())
+                    .unwrap_or("unknown");
+                let cwd = msg
+                    .get("cwd")
+                    .and_then(|c| c.as_str())
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string);
+                out.events.push(AgentEvent::VcsActivity {
+                    kind: kind.to_string(),
+                    cwd,
+                });
+                return;
+            }
             _ => return,
         }
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
@@ -4210,6 +4234,37 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The 2.1.216 `vcs_state_changed` notice (wire shape captured live:
+    /// one message per detected commit/push/merge/rebase, `cwd` absolute)
+    /// becomes the `VcsActivity` freshness hint for git vitals and the
+    /// Changes tab, without opening a turn or logging noise.
+    #[test]
+    fn vcs_state_changed_emits_freshness_hint() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"vcs_state_changed","kind":"commit","cwd":"/repo/checkout","uuid":"4b799ce0-0d3d-4431-a977-182f5cb5d6f6","session_id":"add4f707"}"#,
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::VcsActivity { kind, cwd }
+                    if kind == "commit" && cwd.as_deref() == Some("/repo/checkout")
+            )),
+            "expected a VcsActivity hint, got {:?}",
+            out.events
+        );
+        assert!(log_rows(&out).is_empty(), "the hint must not log");
+
+        // Defensive shapes: a kind-free or cwd-free notice still hints —
+        // the consumers treat both fields as optional advice.
+        let out = reader
+            .process_line(r#"{"type":"system","subtype":"vcs_state_changed","session_id":"s1"}"#);
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::VcsActivity { kind, cwd } if kind == "unknown" && cwd.is_none()
+        )));
     }
 
     /// The background-task round trip, with the wire shapes captured live

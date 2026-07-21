@@ -596,6 +596,7 @@ impl AppEventUpcaster {
             | AppEvent::FileChanged { .. }
             | AppEvent::SessionFileActivity { .. }
             | AppEvent::SessionCwdAnnounced { .. }
+            | AppEvent::SessionVcsActivity { .. }
             | AppEvent::UploadReady { .. }
             | AppEvent::UploadDeleted { .. }
             | AppEvent::SnapshotCreated { .. }
@@ -2048,6 +2049,7 @@ impl WireEventUpcaster {
             | OutboundEvent::AgendaChanged { .. }
             | OutboundEvent::MemoryChanged { .. }
             | OutboundEvent::FileChanged { .. }
+            | OutboundEvent::SessionVcsChanged { .. }
             | OutboundEvent::UploadReady { .. }
             | OutboundEvent::UploadDeleted { .. }
             | OutboundEvent::SnapshotCreated { .. }

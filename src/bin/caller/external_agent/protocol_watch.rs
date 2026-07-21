@@ -54,7 +54,7 @@ const CLAUDE_ENVELOPE_TYPES: &[&str] = &[
     "transcript_mirror",
     "update_environment_variables",
 ];
-// Claude Code 2.1.210's stream-json SystemMessage vocabulary. Most are
+// Claude Code 2.1.216's stream-json SystemMessage vocabulary. Most are
 // intentionally ignored by the adapter; pinning them here prevents known
 // no-op messages from looking like upgrade drift.
 const CLAUDE_SYSTEM_SUBTYPES: &[&str] = &[
@@ -122,6 +122,17 @@ const CLAUDE_SYSTEM_SUBTYPES: &[&str] = &[
     "stream_mode",
     "response_length",
     "refusal_continuation",
+    // 2.1.211–2.1.216 additions. bridge_state/bridge_status/turn_starting
+    // ride the /remote-control bridge lane; local_command echoes local
+    // command output; vcs_state_changed announces a commit/push/merge/
+    // rebase the session performed; code_change_published announces a
+    // pull request the session was linked to.
+    "vcs_state_changed",
+    "code_change_published",
+    "turn_starting",
+    "local_command",
+    "bridge_state",
+    "bridge_status",
 ];
 const CLAUDE_CONTENT_BLOCK_TYPES: &[&str] = &[
     "text",
@@ -2067,6 +2078,31 @@ mod tests {
             let mut permissions = std::fs::metadata(path).unwrap().permissions();
             permissions.set_mode(0o755);
             std::fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    /// The system subtypes Claude Code 2.1.211–2.1.216 added over the
+    /// 2.1.210 vocabulary (captured live / from the CLI bundle's
+    /// constructor sites, 2026-07-21) are pinned: a stock CLI upgrade
+    /// must not read as protocol drift.
+    #[test]
+    fn cc_2_1_216_system_subtypes_are_pinned() {
+        for subtype in [
+            "vcs_state_changed",
+            "code_change_published",
+            "turn_starting",
+            "local_command",
+            "bridge_state",
+            "bridge_status",
+        ] {
+            let findings = claude_findings(&serde_json::json!({
+                "type": "system",
+                "subtype": subtype,
+            }));
+            assert!(
+                findings.is_empty(),
+                "{subtype} should be pinned vocabulary, got {findings:?}"
+            );
         }
     }
 

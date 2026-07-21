@@ -42,6 +42,11 @@ on **claude-haiku** — never a more expensive model.
   path would only deliver it at the next turn).
 - **Interrupt**: `interrupt` aborts a ~90s command well under its runtime,
   and the Claude Code process survives for follow-up turns.
+- **VCS freshness hint** (CC 2.1.216+): a commit the model performs emits
+  `system:vcs_state_changed`, which surfaces as the `session_vcs_changed`
+  broadcast (kind `commit`) and wakes the git prober — a clean
+  `session_vitals` git section arrives promptly after the hint rather than
+  on the 5s poll cadence.
 - **Thread actions**: capabilities advertise the universal
   `thread_actions: ["compact","fork"]`; `{"action":"thread_action",
   "op":"compact"}` performs a real in-place compaction (the session still

@@ -1819,6 +1819,20 @@ pub(crate) async fn run_with_presence(
                             bus.send(event);
                         }
                     }
+                    external_agent::AgentEvent::VcsActivity { kind, cwd } => {
+                        // Ambient like CwdAnnounced: an idle-lane VCS
+                        // notice freshens the git chip without implying a
+                        // turn.
+                        if let Some(event) = idle_external_vcs_event(
+                            &event_thread_id,
+                            &local_session_id,
+                            &persistent_thread_id,
+                            kind,
+                            cwd,
+                        ) {
+                            bus.send(event);
+                        }
+                    }
                     external_agent::AgentEvent::BackendError {
                         message,
                         code,

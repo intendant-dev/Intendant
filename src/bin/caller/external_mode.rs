@@ -50,6 +50,26 @@ pub(crate) fn idle_external_cwd_event(
     })
 }
 
+/// [`idle_external_cwd_event`]'s twin for a backend's idle VCS notice
+/// (commit/push/merge/rebase): same primary-conversation scoping, same
+/// no-turn semantics — the hint only freshens the git chip and Changes
+/// tab.
+pub(crate) fn idle_external_vcs_event(
+    event_thread_id: &Option<String>,
+    session_id: &Option<String>,
+    alias_session_id: &Option<String>,
+    kind: String,
+    cwd: Option<String>,
+) -> Option<AppEvent> {
+    scoped_event_targets_config(event_thread_id, session_id, alias_session_id).then(|| {
+        AppEvent::SessionVcsActivity {
+            session_id: session_id.clone(),
+            kind,
+            cwd,
+        }
+    })
+}
+
 /// In-place backend respawn for reload-credentials (the dashboard's
 /// "Reload credentials" chip after a Claude sign-in): cancel a live
 /// rate-limit park PRESERVING its pending re-send (unlike an interrupt,
@@ -832,6 +852,21 @@ pub(crate) async fn run_external_agent_mode(
                                             &event_thread_id,
                                             &live_session_id,
                                             &drain_config.alias_session_id,
+                                            cwd,
+                                        ) {
+                                            bus.send(event);
+                                        }
+                                    }
+                                    external_agent::AgentEvent::VcsActivity { kind, cwd } => {
+                                        // Ambient like CwdAnnounced: an
+                                        // idle-lane VCS notice freshens
+                                        // the git chip without implying a
+                                        // turn.
+                                        if let Some(event) = idle_external_vcs_event(
+                                            &event_thread_id,
+                                            &live_session_id,
+                                            &drain_config.alias_session_id,
+                                            kind,
                                             cwd,
                                         ) {
                                             bus.send(event);

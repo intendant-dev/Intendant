@@ -4248,6 +4248,11 @@ pub(crate) fn handle_idle_codex_subagent_event(
             // Same gating as FileActivity: a subagent thread's working
             // directory is not the supervising session's locus.
         }
+        external_agent::AgentEvent::VcsActivity { .. } => {
+            // Same gating as FileActivity: a subagent thread's commit
+            // must not retarget or wake the supervising session's git
+            // probes.
+        }
         external_agent::AgentEvent::ToolOutputDelta {
             item_id,
             text,

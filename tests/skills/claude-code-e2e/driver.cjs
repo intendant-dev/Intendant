@@ -212,22 +212,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const isTurnEnd = (e) => e.event === 'task_complete' || e.event === 'round_complete';
 const isApproval = (e) => e.event === 'approval_required';
 
-// Session list over the plain-HTTP dashboard (run1 passes --bind/--no-tls).
-async function listSessions(port) {
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/api/sessions`);
-    if (!res.ok) return [];
-    const body = await res.json();
-    const rows = Array.isArray(body?.sessions) ? body.sessions : (Array.isArray(body) ? body : []);
-    return rows.map((row) => ({
-      id: String(row.id || row.session_id || ''),
-      source: String(row.backend_source || row.source || ''),
-    })).filter((row) => row.id);
-  } catch {
-    return [];
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Scenario
 // ---------------------------------------------------------------------------
@@ -268,7 +252,8 @@ async function main() {
     // No --log-file override: --continue resolves the prior session through
     // the default per-project log index, which a custom log dir would hide.
     '--web', String(PORT),
-    // Plain HTTP on loopback so the fork phase can poll /api/sessions.
+    // Loopback HTTP kept for a human observer; the driver itself reads
+    // only the control socket (tokenless /api/* fails closed since #529).
     '--bind', '127.0.0.1',
     '--no-tls',
     '--control-socket',
@@ -374,6 +359,37 @@ async function main() {
     );
     check('process-survives-interrupt', Boolean(alive));
 
+    // Phase 5.5: vcs freshness hint (CC 2.1.216+ `vcs_state_changed`).
+    // The workdir is dirty from earlier phases (probe.txt, steered.txt);
+    // a commit the model performs must broadcast the session_vcs_changed
+    // refetch hint and wake the git prober, so a clean git section
+    // arrives promptly instead of on the 5s cadence. The commit must NOT
+    // be quiet: the CLI's detector parses the commit SHA from the
+    // command's output, so `git commit -q` emits no notice (verified
+    // against 2.1.216 — the poll cadence is the safety net for that).
+    // Pin to this run's own session: the shared state root can restore
+    // other (already-clean) sessions into this instance, and their vitals
+    // must not satisfy the freshness assertion.
+    const primarySessionId = (run.events.find((e) => e.event === 'status' && e.session_id) || {}).session_id;
+    const cleanGit = (e) => e.event === 'session_vitals'
+      && (!primarySessionId || e.session_id === primarySessionId)
+      && e.vitals && e.vitals.git && e.vitals.git.dirtyFiles === 0;
+    const cleanGitBefore = run.events.filter(cleanGit).length;
+    run.send({
+      action: 'follow_up',
+      text: 'Run exactly this bash command yourself with your Bash tool (do NOT delegate to the Agent tool): git add -A && git -c user.email=e2e@local -c user.name=e2e commit -m e2e-vcs-phase. Then reply VCSDONE.',
+    });
+    const vcsHint = await run.waitFor(
+      'session_vcs_changed broadcast',
+      (e) => e.event === 'session_vcs_changed' && e.kind === 'commit',
+      180000,
+    );
+    check('vcs-hint-broadcast', Boolean(vcsHint), `kind=${vcsHint.kind}`);
+    const vcsHintAt = Date.now();
+    await run.waitFor('git vitals reflect the commit', cleanGit, 30000, { skip: cleanGitBefore });
+    check('vcs-woken-git-probe', true,
+      `clean git section ${((Date.now() - vcsHintAt) / 1000).toFixed(1)}s after the hint`);
+
     // Phase 6: the universal thread-action vocabulary is advertised.
     const capsUniversal = run.events.find((e) => e.event === 'session_capabilities'
       && Array.isArray((e.capabilities || {}).thread_actions));
@@ -433,11 +449,13 @@ async function main() {
     // Phase 8: fork — a NEW wrapper session resumes this thread with
     // --fork-session. The child announces its own native id on its first
     // turn, which also emits the fork relationship.
-    const sessionsBefore = await listSessions(PORT);
-    // The parent's own aliases (its Intendant log id) can surface in the
-    // sessions list LATE — after this baseline — and masquerade as the
-    // fork child. Anything that already appeared as an event session_id
-    // belongs to the pre-fork world.
+    // The parent's own aliases (its Intendant log id) and any sessions the
+    // shared store restored at boot surface as event session_ids before the
+    // fork — anything already seen belongs to the pre-fork world. The fork
+    // child is detected from control-socket events (its own capabilities /
+    // vitals announce a fresh session id): the plain-HTTP /api/sessions
+    // lane fails closed without a loopback admission token since #529, so
+    // a tokenless poll would read forever-empty.
     const knownSessionIds = new Set(
       run.events.map((e) => e.session_id).filter(Boolean),
     );
@@ -449,33 +467,19 @@ async function main() {
     );
     check('fork-dispatched', forkResult.success === true, forkResult.message || '');
     let childWrapperId = null;
-    let lastRows = [];
     for (let i = 0; i < 90 && !childWrapperId; i++) {
       await sleep(1000);
-      lastRows = await listSessions(PORT);
-      const fresh = lastRows.filter((row) => /claude/.test(row.source)
-        && !sessionsBefore.some((old) => old.id === row.id)
-        && !knownSessionIds.has(row.id)
-        && row.id !== backendSessionId);
-      if (fresh.length) childWrapperId = fresh[0].id;
+      const fresh = run.events
+        .map((e) => e.session_id)
+        .filter((id) => id && !knownSessionIds.has(id) && id !== backendSessionId);
+      if (fresh.length) childWrapperId = fresh[0];
     }
     if (!childWrapperId) {
-      log('fork-debug', `before=${JSON.stringify(sessionsBefore)} after=${JSON.stringify(lastRows)}`);
-      // Second-level diagnosis: does the RAW body know the wrapper's log dir
-      // at all, and under what shape?
-      try {
-        const newestWrapper = execSync(
-          "ls -td ~/.intendant/logs/*/ | head -3 | xargs -I{} sh -c 'test -f {}session_agent_config.json && grep -l forked_from {}session_agent_config.json' 2>/dev/null | head -1",
-          { encoding: 'utf8', shell: '/bin/zsh' },
-        ).trim();
-        const wrapperId = newestWrapper.split('/').filter(Boolean).slice(-2, -1)[0] || '';
-        const raw = await (await fetch(`http://127.0.0.1:${PORT}/api/sessions`)).text();
-        const idx = wrapperId ? raw.indexOf(wrapperId) : -1;
-        log('fork-debug2', `wrapperDir=${newestWrapper} wrapperId=${wrapperId} rawMentions=${idx >= 0} ${idx >= 0 ? raw.slice(Math.max(0, idx - 300), idx + 200) : ''}`);
-      } catch (e) { log('fork-debug2', `probe failed: ${e}`); }
+      const seen = [...new Set(run.events.map((e) => e.session_id).filter(Boolean))];
+      log('fork-debug', `no fresh session id in events; seen=${JSON.stringify(seen)}`);
     }
     check('fork-creates-wrapper-session', Boolean(childWrapperId),
-      childWrapperId || 'no new claude-code session appeared in /api/sessions');
+      childWrapperId || 'no fresh session id announced on the control socket');
 
     // The fork's first prompt binds its native id + relationship, and must
     // recall the parent's pre-fork context.
