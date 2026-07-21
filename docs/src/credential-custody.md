@@ -501,6 +501,84 @@ thread-resume machinery), that re-reads the fresh store (a mid-turn
 session is interrupted first; a rate-limit park is cancelled with its
 pending re-send preserved). All three ceremonies are local-daemon only.
 
+## Local key custody: the daemon's own private keys
+
+Everything above moves *provider* credentials. The daemon also holds
+private keys of its own, and until the custody migration they were all
+plain `0600` files a same-uid process could read (`cat
+~/.intendant/access-certs/ca.key` mints root client certs). The opt-in
+**local key custody** machinery relocates them into OS-keystore-wrapped
+storage:
+
+| Estate | Files | What the keys do |
+|---|---|---|
+| `access-certs/` | `ca.key`, `server.key`, `client.key`, `client.p12` | the access CA (mints client certs), the dashboard TLS key, the daemon's peer-mTLS client identity, the browser-import bundle |
+| `daemon-identity/` | `ed25519.pk8` | signs browser-control sessions, hosted-control leases, doorbell caller-ID |
+| `access-certs/org/<handle>/` | `root.pk8`, `issuer.pk8` | org root/issuer keys — sign grant documents and revocation lists |
+| daemon `.env` | provider `*_API_KEY` lines | class-2 native provider keys (the dashboard-managed `.env` only; project and cwd `.env` files stay operator-owned) |
+
+`intendant custody migrate` (keyless, local, never run implicitly)
+relocates each present artifact: store into a sealed blob
+(ChaCha20-Poly1305, entry name as AAD) under the estate's `custody/`
+subdirectory, verify a byte-equal round trip, then atomically replace
+the file with a **tombstone** naming the custody entry (provider keys:
+the `.env` line becomes a comment marker). The wrapping key for the
+whole estate is one generic-password item in the platform keystore.
+Reads route by content at a single seam per class: a plain file serves
+as-is (labeled file mode, shown by `intendant custody status`), a
+tombstone routes to custody and **never** falls back to a file — a
+denied or failed retrieval is a named error plus a `key_custody_denied`
+trail event, and a stale plain copy reappearing next to a tombstone
+cannot silently win. Key regeneration (recert, forced setup) refreshes
+the custody entry instead of regressing it to a file. `intendant
+custody restore` is the full inverse. Availability checks (the settings
+key-status page, provider selection) answer from blob existence — pure
+path math — so nothing polls the keystore; material is unsealed only
+when a request or handshake actually needs it.
+
+Two labels from the Track K ruling are load-bearing and permanent until
+their conditions change:
+
+- **Bar-raising, not lane-sealing.** Before Intendant ships as a
+  Developer ID-signed, hardened-runtime binary, OS-keystore custody
+  defeats the *casual* same-uid file read — it does not stop a patient
+  same-uid attacker (who can, with effort, drive or impersonate the
+  trusted binary). Nothing in this chapter claims otherwise.
+- **Relocation, not rotation.** Migration moves the keys it finds;
+  copies made *before* migration are unaffected and stay valid. The
+  owner accepted this pre-migration copy risk on 2026-07-21; no guided
+  rotation flow ships in custody v1 (the manual ceremonies —
+  `intendant access setup --force`, org re-init — remain the rotation
+  path). Revisit triggers: evidence of an untrusted reader, or ahead of
+  federation growth.
+
+Per-platform honesty: **macOS** is the shipped backend — the wrapping
+key lives in the login keychain, and the item's ACL records the
+creating binary, so the migrating/daemon binary reads silently while a
+*different* binary gets a keychain prompt (GUI) or a named
+non-interactive deny (headless — proven by the crate's acceptance rig,
+which pins the deny class against a spawned unregistered binary; the
+interactive prompt arc is the `custody-keychain-prompt` operator
+skill). On source installs every rebuilt binary is a new identity, so
+expect re-prompts — which is why custody is *recommended by default on
+signed installs only*: the stable "Intendant Dev" signing identity
+makes the Always-Allow a once-ever event. **Windows and Linux have no
+custody backend yet**; their keys stay in labeled file mode, `intendant
+custody migrate` refuses by name, and this chapter deliberately asserts
+nothing about their future backends until each is verified on a real
+rig.
+
+One census row this migration *creates*: the **Intendant Dev signing
+identity is now load-bearing secret material**. The keychain ACLs that
+make custody livable are keyed to it, so its private key
+(`~/.intendant/signing.keychain-db`) and its PKCS#12 escrow
+(`~/.intendant/signing-identity.p12`, kept so rebuilds re-import the
+same identity instead of minting a new one) together constitute a
+custody-relevant secret: a same-uid attacker who obtains the identity
+can sign a binary the keychain trusts. The runtime sandbox read-denies
+both files alongside the trust store; treat any exported copy of the
+escrow like a private key, because it is one.
+
 ## Egress: whose network path
 
 Voice went client-direct because voice is client-shaped: realtime media,
@@ -641,6 +719,15 @@ create the missing cross-origin delivery bridge.
    shipping an incomplete certless key-auth protocol.
 7. ⏳ Independently trusted client bridge for transferring or spending a
    Connect-account vault in a daemon-origin session.
+8. ✅ Local key custody (Track K): per-request provider-key
+   re-resolution; the sealed-blob custody backend crate with the macOS
+   keychain wrapping-key provider and its caller-discrimination
+   acceptance rig; opt-in `intendant custody
+   <status|migrate|restore>` over the access-certs, daemon-identity,
+   org-key, and daemon-`.env` provider-key estates — relocation without
+   rotation by owner ruling, fail-closed tombstone reads, custody
+   events in the same trail. Windows/Linux backends unbuilt (labeled
+   file mode).
 
 ## V1 decisions
 

@@ -793,9 +793,14 @@ leaves the host and who today hold no TLS client identity; browsers
 never qualify (browser-origin markers are excluded, so they keep the
 426 and the printed https URL), remote surfaces are unchanged, and the
 dedicated session-MCP listener stays exactly its own `/mcp` ladder —
-the owner token never widens it. ctl-over-HTTPS was deliberately not
-built now: it arrives for free with the credential-custody migration,
-when TLS client identity gives the ceremony actual payoff.
+the owner token never widens it. ctl-over-HTTPS remains deliberately
+unbuilt even now that local key custody has shipped (the
+credential-custody chapter's "Local key custody" section): the ruled
+posture keeps `ctl` loopback-token local, and any future HTTPS ctl lane
+retrieves its custody-held client identity *interactively* — the
+keychain prompt is the ceremony — rather than minting a silent second
+authorized binary. That keeps this paragraph's promise honest instead
+of quietly widening the owner surface.
 
 The honest security envelope, per platform:
 
@@ -810,9 +815,13 @@ The honest security envelope, per platform:
   allowlist-only; restricted tokens do not filter loopback) nor a read
   deny under a granted tree, so a sandboxed shell that can read the
   home can read the token. The token still ends tokenless drive-by and
-  the weakest-daemon scavenge on these platforms; airtight same-uid
-  separation arrives with the credential-custody migration and
-  uid-separation work (both tracked separately).
+  the weakest-daemon scavenge on these platforms. The local
+  key-custody migration has since shipped for macOS (opt-in,
+  keychain-wrapped — see the credential-custody chapter), and by its
+  own binding label it is *bar-raising, not lane-sealing*: airtight
+  same-uid separation still waits on a signed hardened-runtime binary
+  plus the uid-separation work, and Linux/Windows custody backends are
+  unbuilt, so this limit stands accepted on all three platforms.
 - **Same-uid unsandboxed processes read the token by design.** That is
   the unchanged owner surface: an owner-launched script or unsupervised
   agent on the same account has always been, and remains, the owner.
