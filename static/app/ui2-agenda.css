@@ -224,6 +224,52 @@ html.ui-v2 .agenda-item-answer {
   border-left: 2px solid var(--green);
   padding-left: 9px;
 }
+/* Structured rich-ask archive: per-question "Header: answer" rows, the
+   picked option labels, follow-ups, and anchored preview notes — all
+   quoted data, in the item's question order. */
+html.ui-v2 .agenda-answer-structured {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  white-space: normal;
+}
+html.ui-v2 .agenda-answer-q {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+html.ui-v2 .agenda-answer-line {
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .agenda-answer-qname {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 .agenda-answer-picks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+html.ui-v2 .agenda-chip.pick {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green, #98c379) 12%, transparent);
+}
+html.ui-v2 .agenda-answer-extra {
+  font-size: 11.5px;
+  color: var(--text-3);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Dismissed-but-open questions: a quiet state marker, never an alarm —
+   the rails were cleared deliberately; the item stays open here. */
+html.ui-v2 .agenda-chip.dismissed {
+  color: var(--text-3);
+  background: none;
+  border: 1px dashed var(--line);
+}
 html.ui-v2 .agenda-card-q {
   font-family: var(--mono);
   font-size: 11px;

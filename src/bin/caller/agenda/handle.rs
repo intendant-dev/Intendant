@@ -418,13 +418,19 @@ impl AgendaHandle {
     /// without waiting for the Agenda tab's JS bootstrap. Parked form —
     /// no expiry, not held (a live waiter re-arms its own deadline by
     /// re-announcing); the attention nudge dedups by id, and same-id
-    /// re-shows are harmless on every rail. Returns how many were
-    /// announced.
+    /// re-shows are harmless on every rail. DISMISSED items stay off it:
+    /// the owner cleared those rails deliberately and a restart must not
+    /// undo the gesture — the Agenda card's open-panel affordance is the
+    /// way back, and answer/reopen clears the marker (the log keeps the
+    /// dismissal as history). Returns how many were announced.
     pub(crate) fn announce_open_asks(&self) -> usize {
         let (items, _, _) = self.snapshot();
         let mut announced = 0;
         for item in &items {
-            if item.status == super::types::AgendaStatus::Open && item.ask.is_some() {
+            if item.status == super::types::AgendaStatus::Open
+                && item.ask.is_some()
+                && item.dismissed.is_none()
+            {
                 let session = item.provenance.session_id.clone();
                 self.announce_ask(item, session);
                 announced += 1;
@@ -1129,7 +1135,8 @@ mod tests {
 
     /// Boot re-announcement: open ask-backed items re-emit the parked
     /// rail announcement once each (no expiry, not held, provenance
-    /// attribution); resolved items and plain questions do not.
+    /// attribution); resolved items, plain questions, and dismissed-but-
+    /// open asks do not — a restart must not undo the owner's dismissal.
     #[tokio::test]
     async fn announce_open_asks_reemits_open_items_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -1172,6 +1179,12 @@ mod tests {
                 },
                 None,
             )
+            .unwrap();
+        // A dismissed-but-open ask stays off the boot re-announce (the
+        // owner cleared the rails deliberately; the item stays open).
+        let dismissed = handle.apply(one_question_ask("Dismissed?"), None).unwrap();
+        handle
+            .dismiss_ask(dismissed.ask.as_ref().unwrap().ask_id, "skip")
             .unwrap();
 
         // Subscribe AFTER the setup churn: only the boot announcement.

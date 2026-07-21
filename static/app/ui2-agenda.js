@@ -58,9 +58,12 @@ async function agendaRefresh() {
 // state-line replay cache, and a parked question must not evaporate with
 // it. Dispatch the exact show_user_question path live asks ride; the
 // same-id re-show dedupe makes double delivery (state-line replay racing
-// this) harmless. Once per page load per ask id: an in-session dismissal
-// (the daemon's ApprovalResolved cleared the rail) stays dismissed until
-// the next load, while the item itself stays open on the agenda.
+// this) harmless. Once per page load per ask id — and never for a
+// DISMISSED item (`item.dismissed`, still open): the owner cleared it
+// from the rails deliberately, so it stays cleared across loads; the
+// card's "Open question panel" button is the deliberate way back, and
+// answering or reopening clears the marker (the log keeps the dismissal
+// as history).
 const agendaAnnouncedAsks = new Set();
 function agendaAnnounceParkedAsks() {
   if (!Array.isArray(agendaItems)) return;
@@ -74,7 +77,7 @@ function agendaAnnounceParkedAsks() {
   const open = agendaItems
     .filter((item) => item.status === 'open'
       && item.ask && item.ask.ask_id && Array.isArray(item.ask.questions)
-      && item.ask.questions.length)
+      && item.ask.questions.length && !item.dismissed)
     // Oldest first, so with several parked asks the panel lands on the
     // newest — the same "latest ask surfaces" behavior live asks have.
     .sort((a, b) => (a.id < b.id ? -1 : 1));
@@ -391,6 +394,78 @@ function agendaEffectBlock(item) {
       <span class="agenda-item-actions">${actions}</span>
     </div>
   </div>`;
+}
+
+// The dismissal chip's tooltip (marker on a still-open question whose
+// rail card was skipped/denied). Plain TEXT — the caller escapes.
+function agendaDismissedTip(dismissed) {
+  const when = dismissed.at_ms
+    ? new Date(dismissed.at_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+    : '';
+  const verb = dismissed.action ? `(${dismissed.action}) ` : '';
+  return `Dismissed ${verb}${when ? `on ${when} ` : ''}from the question rail — it stays open `
+    + 'and answerable here, but is not auto-announced again; Open question panel brings it back.';
+}
+
+// The recorded reply on a resolved question. Plain answers render the
+// joined text; rich (ask-backed) answers render the STRUCTURED breakdown
+// (`item.answer.structured` — maps keyed by question text), walked in the
+// ITEM's question order exactly like the daemon's text summary: a
+// "Header: answer" line per engaged question, the picked option labels,
+// follow-ups, and anchored preview notes. All of it is quoted data —
+// escaped, never executed, never instructions.
+function agendaAnswerBlock(item) {
+  const answer = item.answer;
+  const who = agendaActorLabel(answer);
+  const when = answer.at_ms
+    ? new Date(answer.at_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+    : '';
+  const meta = `<span class="agenda-item-meta">— ${escapeHtml([who && `by ${who}`, when].filter(Boolean).join(' · '))}</span>`;
+  const questions = (item.ask && Array.isArray(item.ask.questions)) ? item.ask.questions : [];
+  const rows = answer.structured
+    ? agendaStructuredAnswerRows(questions, answer.structured)
+    : [];
+  if (!rows.length) {
+    return `<div class="agenda-item-answer">↳ ${escapeHtml(answer.text || '')}
+      ${meta}</div>`;
+  }
+  return `<div class="agenda-item-answer agenda-answer-structured">${rows.join('')}
+    <div>${meta}</div></div>`;
+}
+
+// One row per engaged question of a structured resolution. A question is
+// engaged when any of the maps mention it; a follow-up may stand in for
+// an answer, so the answer text is optional on the line.
+function agendaStructuredAnswerRows(questions, s) {
+  const answers = s.answers || {};
+  const selections = s.selections || {};
+  const followups = s.followups || {};
+  const annotations = s.annotations || {};
+  const engaged = questions.filter((q) =>
+    q.question in answers || q.question in selections
+    || q.question in followups || q.question in annotations);
+  return engaged.map((q) => {
+    const name = q.header || q.question;
+    const answerText = answers[q.question];
+    const head = answerText !== undefined
+      ? `<span class="agenda-answer-qname" title="${escapeHtml(q.question)}">${escapeHtml(name)}:</span> ${escapeHtml(answerText)}`
+      : `<span class="agenda-answer-qname" title="${escapeHtml(q.question)}">${escapeHtml(name)}</span>`;
+    const picks = (selections[q.question] || [])
+      .map((label) => `<span class="agenda-chip pick">✓ ${escapeHtml(label)}</span>`)
+      .join(' ');
+    const extras = [];
+    if (followups[q.question] !== undefined) {
+      extras.push(`<div class="agenda-answer-extra">follow-up: ${escapeHtml(followups[q.question])}</div>`);
+    }
+    for (const note of annotations[q.question] || []) {
+      extras.push(`<div class="agenda-answer-extra">note on ${escapeHtml(note.preview)}: ${escapeHtml(note.note)}</div>`);
+    }
+    return `<div class="agenda-answer-q">
+      <div class="agenda-answer-line">${head}</div>
+      ${picks ? `<div class="agenda-answer-picks">${picks}</div>` : ''}
+      ${extras.join('')}
+    </div>`;
+  });
 }
 
 // The item's thread + gates (F2): annotations (capped with an expander),
@@ -1061,14 +1136,19 @@ function agendaRenderTab() {
     list.innerHTML = '<div class="ui-empty">Loading…</div>';
     return;
   }
+  // Questions is a KIND view, not a status: the open questions (rich
+  // parked asks lead with their panel button) plus the answered archive.
+  // Retired questions stay reachable under Retired / All.
   const filtered = agendaItems.filter((item) =>
     agendaFilter === 'all' ? true
       : agendaFilter === 'blocked' ? agendaItemIsBlocked(item)
-        : item.status === agendaFilter);
+        : agendaFilter === 'questions'
+          ? item.kind === 'question' && item.status !== 'retired'
+          : item.status === agendaFilter);
   if (!filtered.length) {
-    const what = agendaFilter === 'all' ? '' : `${agendaFilter} `;
-    list.innerHTML =
-      `<div class="ui-empty">No ${what}items — park one above, or run <code>intendant ctl agenda add</code>.</div>`;
+    list.innerHTML = agendaFilter === 'questions'
+      ? '<div class="ui-empty">No open or answered questions — park one with <code>intendant ctl ask --park</code>.</div>'
+      : `<div class="ui-empty">No ${agendaFilter === 'all' ? '' : `${agendaFilter} `}items — park one above, or run <code>intendant ctl agenda add</code>.</div>`;
     return;
   }
   // Newest first reads best in a review list; ULIDs sort by creation.
@@ -1100,24 +1180,26 @@ function agendaRenderTab() {
                placeholder="${richAsk ? 'Or type a plain-text answer…' : 'Answer this question…'}" aria-label="Answer" data-id="${escapeHtml(item.id)}" />
         <button type="button" class="agenda-btn agenda-answer-btn" data-id="${escapeHtml(item.id)}">Answer</button>
       </div>`;
-    } else if (item.answer && item.answer.text) {
-      const who = agendaActorLabel(item.answer);
-      const when = item.answer.at_ms
-        ? new Date(item.answer.at_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-        : '';
-      answerBlock = `<div class="agenda-item-answer">↳ ${escapeHtml(item.answer.text)}
-        <span class="agenda-item-meta">— ${escapeHtml([who && `by ${who}`, when].filter(Boolean).join(' · '))}</span>
-      </div>`;
+    } else if (item.answer && (item.answer.text || item.answer.structured)) {
+      // Answered: the archive keeps the full structured breakdown for
+      // rich asks, the joined text otherwise (agendaAnswerBlock).
+      answerBlock = agendaAnswerBlock(item);
     }
     const blockedChip = agendaItemIsBlocked(item)
       ? '<span class="agenda-chip blocked">blocked</span>'
+      : '';
+    // Dismissed-but-open questions wear a quiet marker: the rails were
+    // cleared deliberately and stay cleared (no auto re-announce); the
+    // item itself remains open and answerable right here.
+    const dismissedChip = item.status === 'open' && item.dismissed
+      ? `<span class="agenda-chip dismissed" title="${escapeHtml(agendaDismissedTip(item.dismissed))}">dismissed · still open</span>`
       : '';
     return `<div class="agenda-item" data-status="${escapeHtml(item.status)}">
       <div class="agenda-item-head">
         ${agendaGlyph(item.status, item.kind)}
         <span class="agenda-item-kind">${escapeHtml(item.kind)}</span>
         <span class="agenda-item-title">${escapeHtml(item.title)}</span>
-        ${blockedChip}${agendaDueChip(item)}${tags}
+        ${blockedChip}${dismissedChip}${agendaDueChip(item)}${tags}
       </div>
       ${body}${answerBlock}${agendaThreadBlock(item)}${agendaEffectBlock(item)}
       <div class="agenda-item-foot">
