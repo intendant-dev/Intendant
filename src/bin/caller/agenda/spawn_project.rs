@@ -46,16 +46,6 @@ pub(crate) enum SpawnProjectSource {
     DaemonDefault,
 }
 
-impl SpawnProjectSource {
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            Self::Explicit => "explicit",
-            Self::Provenance => "provenance",
-            Self::DaemonDefault => "daemon_default",
-        }
-    }
-}
-
 /// The recorded project root of one session id (native log dir or external
 /// wrapper), or `None` when nothing on this daemon resolves it. Reads the
 /// session's own `session_meta.json` first; a pruned wrapper log dir falls

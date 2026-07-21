@@ -65,10 +65,7 @@ const LOG_FILE: &str = "agenda.jsonl";
 /// confirm sheet's editable text replaces exactly this part; the mode coda
 /// below is appended either way.
 pub(crate) fn start_now_goal_statement(item: &AgendaItem) -> String {
-    let mut statement = format!(
-        "Agenda follow-through for item {}: {}",
-        item.id, item.title
-    );
+    let mut statement = format!("Agenda follow-through for item {}: {}", item.id, item.title);
     if !item.body.trim().is_empty() {
         statement.push_str("\n\nItem body (quoted):\n");
         statement.push_str(&item.body);
@@ -348,7 +345,7 @@ impl AgendaStore {
                 }
                 edited.to_string()
             }
-            None => start_now_goal_statement(&item),
+            None => start_now_goal_statement(item),
         };
         goal.push_str(if interactive {
             START_NOW_INTERACTIVE_CODA

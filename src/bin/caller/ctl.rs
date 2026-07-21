@@ -2236,8 +2236,7 @@ async fn run_agenda(
             // the autonomous shape. --project overrides the resolved
             // project (parking session's root, else the daemon default);
             // --goal replaces the default item statement.
-            let args =
-                parse_command_args(&raw[1..], &["--project", "--goal"], &["--goal-run"])?;
+            let args = parse_command_args(&raw[1..], &["--project", "--goal"], &["--goal-run"])?;
             let id = agenda_resolve_id(
                 client,
                 config,

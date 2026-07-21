@@ -1361,7 +1361,9 @@ mod tests {
             )
             .unwrap();
         let manifest = &confirmed.effects[0].manifest;
-        assert!(manifest.goal.starts_with("run the sweep exactly as rehearsed"));
+        assert!(manifest
+            .goal
+            .starts_with("run the sweep exactly as rehearsed"));
         assert!(manifest.goal.contains("written back"), "goal-run coda");
         assert!(!manifest.interactive);
         assert_eq!(
