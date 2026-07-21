@@ -131,6 +131,22 @@ pub struct SessionGoal {
     pub token_budget: Option<u64>,
 }
 
+/// A pull request a session's backend reported publishing (Claude Code
+/// `system:code_change_published`, 2.1.216+ — fires when the CLI links
+/// the session to a PR it created; GitHub/GHE only on the wire today).
+/// `url` is present only when the daemon-side revalidation accepted it
+/// (https + a host): the backend's URL is agent-adjacent data, so the
+/// dashboard must never hyperlink a value that wasn't checked here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPublishedPr {
+    pub provider: String,
+    pub repo: String,
+    /// PR number as the wire states it (a string — GHE shapes vary).
+    pub number: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
 // Session-vitals family: hoisted to intendant-core; re-exported here so
 // existing `crate::types::Session*Vitals` paths keep working.
 pub use intendant_core::vitals::{
@@ -532,6 +548,12 @@ pub enum OutboundEvent {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         goal: Option<SessionGoal>,
+    },
+    /// A session's backend published a pull request (sticky per-session
+    /// display state, like `SessionGoal`; replayed from the session log).
+    SessionPrPublished {
+        session_id: String,
+        pr: SessionPublishedPr,
     },
     SessionVitals {
         session_id: String,

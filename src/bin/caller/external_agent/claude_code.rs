@@ -1661,6 +1661,30 @@ impl CcReader {
                 });
                 return;
             }
+            // The CLI linked this session to a PR it published (2.1.216).
+            // Wire fields verbatim; the drain owns URL validation.
+            Some("code_change_published") => {
+                let field = |name: &str| {
+                    msg.get(name)
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let identifier = field("identifier");
+                // A linkage without even a PR number renders nothing —
+                // drop it here rather than shipping an empty chip.
+                if identifier.is_empty() {
+                    return;
+                }
+                out.events.push(AgentEvent::CodeChangePublished {
+                    provider: field("provider"),
+                    url: field("url"),
+                    repo: field("repo"),
+                    identifier,
+                });
+                return;
+            }
             _ => return,
         }
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
@@ -4265,6 +4289,38 @@ mod tests {
             e,
             AgentEvent::VcsActivity { kind, cwd } if kind == "unknown" && cwd.is_none()
         )));
+    }
+
+    /// The 2.1.216 `code_change_published` notice (wire shape from the
+    /// CLI bundle's constructor: emitted after session↔PR linking,
+    /// GitHub/GHE only) becomes the CodeChangePublished linkage event;
+    /// a notice with no PR number is dropped rather than shipped empty.
+    #[test]
+    fn code_change_published_emits_pr_linkage() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"code_change_published","provider":"github","url":"https://github.com/intendant-dev/Intendant/pull/544","repo":"intendant-dev/Intendant","identifier":"544","session_id":"s1"}"#,
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::CodeChangePublished { provider, url, repo, identifier }
+                    if provider == "github"
+                        && url == "https://github.com/intendant-dev/Intendant/pull/544"
+                        && repo == "intendant-dev/Intendant"
+                        && identifier == "544"
+            )),
+            "expected a CodeChangePublished linkage, got {:?}",
+            out.events
+        );
+
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"code_change_published","provider":"github","session_id":"s1"}"#,
+        );
+        assert!(
+            out.events.is_empty(),
+            "a linkage without a PR number must be dropped"
+        );
     }
 
     /// The background-task round trip, with the wire shapes captured live

@@ -609,6 +609,7 @@ async function main() {
           applySessionIdentitiesFromReplayEntries(filtered.entries);
           applyExternalIdentitiesFromLogEntries(filtered.entries);
           applySessionGoalsFromReplayEntries(filtered.entries);
+          applySessionPrsFromReplayEntries(filtered.entries);
           applySessionVitalsFromReplayEntries(filtered.entries);
           resetSessionWindowsForReplay(filtered.entries);
           const wasProcessingLogReplay = processingLogReplay;
@@ -689,6 +690,9 @@ async function main() {
       }
       if (d.event === 'session_goal') {
         serverMsgStep(d, 'session_goal', () => applySessionGoal(d));
+      }
+      if (d.event === 'session_pr_published') {
+        serverMsgStep(d, 'session_pr_published', () => applySessionPrPublished(d));
       }
       if (d.event === 'session_vitals') {
         serverMsgStep(d, 'session_vitals', () => applySessionVitals(d));

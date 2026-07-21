@@ -498,6 +498,32 @@ impl SessionLog {
         });
     }
 
+    /// Persist a PR the session's backend published (sticky chip state —
+    /// replay re-decorates the session header after reconnect).
+    pub fn session_pr_published(
+        &mut self,
+        session_id: &str,
+        pr: &crate::types::SessionPublishedPr,
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
+            turn: None,
+            event: "session_pr_published".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Session {} published PR #{} ({})",
+                session_id, pr.number, pr.repo
+            )),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "pr": pr,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Persist the latest visible Codex `/goal` state for a session.
     pub fn session_goal(&mut self, session_id: &str, goal: Option<&crate::types::SessionGoal>) {
         self.emit(LogEvent {
