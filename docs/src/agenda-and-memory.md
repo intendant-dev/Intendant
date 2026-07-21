@@ -296,15 +296,21 @@ branch, not ordinary edits in this repository. Product documentation should
 describe the integration without quietly amending that stamped specification.
 
 The D0-A specification is much broader than the current product surface. This
-build exposes only:
+build exposes:
 
 - `propose` one claim;
 - bounded lexical `search`;
-- `read` one claim by an unambiguous hexadecimal operation-hash prefix.
+- `read` one claim by an unambiguous hexadecimal operation-hash prefix;
+- `judge` one claim — the owner curation verbs `accept`, `dispute`,
+  `retire`, and `supersede` (see *Curation* below).
 
-It does **not** expose judgment, pinning, erase, export/import, or curation
-commands. Proposed claims therefore enter as `candidate`; the presence of
-other reducer status names does not mean their product workflows are shipped.
+It does **not** expose pinning, erase, export/import, retract-minting, or the
+classification judgments (`raise_class`/`declassify`). Pins in particular are
+**fail-closed at the stamped kernel boundary**: the vendored reducer
+dispatches no `m.pin`/`m.unpin` mechanism and the corpus carries no pin
+vectors, so no surface mints them — a service test pins the named
+`Unimplemented` outcome so a future kernel lift is loud. Proposed claims
+enter as `candidate`; only judgments move derived status.
 
 ### Claims and retrieval
 
@@ -335,10 +341,85 @@ Every view includes:
 
 Search is capped at 50 results. Candidates are excluded by default; callers
 must opt in with `include_candidates=true` or `--candidates`. The dashboard
-opts in because all claims in the current product slice begin as candidates.
-Nothing performs ambient recall or injects stored claims into a fresh model
-conversation. An agent receives only the bounded results it explicitly
-searches for.
+opts in because every claim begins as a candidate. Nothing performs ambient
+recall or injects stored claims into a fresh model conversation. An agent
+receives only the bounded results it explicitly searches for.
+
+Status is a **pure fold product** — the vendored reducer's §11.2 status fold
+derives `candidate` / `accepted` / `disputed` / `superseded` / `retired` from
+the judgment set at read time. Nothing stores a status field, and nothing but
+a judgment moves one.
+
+### Curation: judgments (owner acts)
+
+Judgments are **attributed, append-only plane operations, never edits**. The
+owner judges a claim from any owner surface; each judgment seals one signed
+`m.judge` operation citing the target space's bound status policy
+(`workflow-v1` — stamped server-side, never caller input), and the claim's
+status is re-derived by the kernel fold:
+
+```bash
+intendant ctl memory accept  9d7132319d99 --reason "verified on the bench box"
+intendant ctl memory dispute 9d7132319d99 --reason "authorship-in-fact differs"
+intendant ctl memory retire  9d7132319d99
+intendant ctl memory supersede 9d7132319d99 --with 75c10b00c41b --reason "TTL changed"
+```
+
+The same verbs exist on all four lanes (ctl, `POST /api/memory/judge`, its
+dashboard tunnel twin, and the `memory_judge` MCP tool). **They are
+owner-surface acts**: the dashboard and the owner's local shell pass; a
+supervised agent session, peer, or unattributed caller receives the named
+`actor-not-permitted` denial at the tenant edge on every lane — and even a
+hypothetical bypass would be inert, because the kernel gives a bare
+unattested non-human writer no actor class and no vote (D-201). The agent
+lane for disagreement is a **counter-proposal**: propose a countering or
+corrected claim, let the conflict surface, and the owner judges.
+
+An optional `reason` (≤ 2000 characters) is recorded verbatim in the sealed
+operation and rendered as quoted data. Judgment **history** — who judged
+what, when, under which policy — renders on single-claim views (ctl `read`,
+the claim API, the dashboard's expanded claim card); provenance uses the
+durable identity vocabulary `owner` / `session` / `peer` / `unattributed`,
+which is exactly what survives a restart. A deliberate consequence: the
+record does not distinguish the dashboard from the owner's shell — the
+closed kernel body cannot carry that distinction durably, so no surface
+pretends to it.
+
+Supersession **relates claims; it never hides the loser**. The fold holds
+`superseded` only while the replacement's own derived status is `accepted` —
+superseding with a still-candidate replacement records the judgment and moves
+nothing until the replacement is accepted (the surfaces say so rather than
+faking atomicity), and if the replacement is later retired the predecessor
+revives automatically. The dashboard renders a superseded claim's history
+with a navigable link to its successor. `retract` appears in views when
+present on a recovered plane (`retired` via the author's own retraction) but
+no current surface mints it; the owner's `retire` covers curation.
+
+**The honest trust envelope.** An "owner surface" is a same-account trust
+posture, not a proof of a human at the keyboard: the kernel's human-evidence
+model (O4/D-47) deliberately admits that software running as the owner's
+account on an owner surface acts as the owner — the same TCB the trust
+architecture admits per lane. The standing live demonstration is claim
+`cd8eceb2…`, proposed by an unsupervised local coding agent that presented
+the owner's shared client certificate. The remedy path is credential
+custody, not judgment policy: the per-boot loopback admission token and the
+Track K custody migration (keys out of same-account-readable files) narrow
+who can *reach* an owner surface; judgment authorization inherits exactly
+that boundary.
+
+**The attestation seam (documented, deliberately not built).** Owner
+judgments seal **unattested** because that is the spec-correct owner shape:
+kernel human evidence is a direct device signature with `attested_by`
+absent — attaching an attestation would demote the actor class to `session`.
+The kernel's session path to status influence exists (a controller-attested
+session counts under the built-in policies' session rows, e.g. workflow-space
+self-accepts), but this build does not seal `attested_by` on any session
+operation, and the home space's `personal` class carries no session counting
+rows in `workflow-v1` — so the path is doubly dormant. Opening it is a
+separate owner decision on this named seam, not a code path any surface can
+reach today. On non-macOS daemons judgments share the plane's ephemeral
+envelope: they work, and they vanish with the plane on restart, exactly as
+the durability label says.
 
 ### Storage and custody
 
@@ -383,18 +464,24 @@ replica, backup, or cross-machine synchronization guarantee is shipped.
 ### Surfaces and permissions
 
 Memory is available in the dashboard, through `intendant ctl memory`, through
-the `memory_search` / `memory_read` / `memory_propose` MCP tools, and through
-tunnel-twinned HTTP routes:
+the `memory_search` / `memory_read` / `memory_propose` / `memory_judge` MCP
+tools, and through tunnel-twinned HTTP routes:
 
 | Route | Permission | Purpose |
 |---|---|---|
 | `GET /api/memory/search` | `memory.read` | Bounded claim search |
 | `GET /api/memory/claim` | `memory.read` | Read by id prefix |
 | `POST /api/memory/propose` | `memory.write` | Author one candidate |
+| `POST /api/memory/judge` | `memory.write` | Owner curation verbs |
 
 All write paths funnel through one `MemoryHandle`, which maps the
 gate-resolved actor into the claim provenance and signed owner-plane envelope.
-Callers cannot supply their own principal through the request body.
+Callers cannot supply their own principal through the request body. The
+judgment verbs share the `memory.write` IAM operation; the owner-surface
+restriction is the tenant edge's own authorization (the named
+`actor-not-permitted` denial), not an IAM vocabulary of its own. The
+`memory_judge` tool is deliberately absent from the small supervised-agent
+tool profiles — agents are not advertised a verb policy refuses them.
 
 ### Legacy project memory
 
@@ -416,7 +503,9 @@ cargo clippy --workspace -- -D warnings
 ```
 
 The controller tests cover Agenda folding, reminder and scheduled-session
-crash behavior, Memory provenance/IAM, durable recovery, and the parity
-between declared gateway routes and the dashboard chapter. The owner-plane
+crash behavior, Memory provenance/IAM, judgment authorization (owner-surface
+sealing, ring-2 denial on every lane, restart-identical judgment history,
+the pin kernel-boundary pin), durable recovery, and the parity between
+declared gateway routes and the dashboard chapter. The owner-plane
 crate tests enforce the stamped corpus, differential reducer behavior, and
 vendored specification hash.
