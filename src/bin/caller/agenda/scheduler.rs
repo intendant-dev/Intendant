@@ -276,6 +276,12 @@ async fn run_pass(
 /// the task dispatcher's delegation-receipt lane. Nothing else — never raw
 /// actions: the session runs under its own agent-session principal, the
 /// daemon's autonomy/approval machinery, and the standard sandbox.
+///
+/// The project resolves FIRST (manifest pick → the parking session's
+/// recorded root → the daemon default): a spawn is never dispatched
+/// project-less — an unresolvable project is this occurrence's terminal
+/// `failed` outcome with the reason written back to the item, instead of
+/// the instantly-dead `no_project` session live QA hit 2026-07-21.
 fn dispatch_session(
     handle: &AgendaHandle,
     journal: &mut OccurrenceJournal,
@@ -283,16 +289,40 @@ fn dispatch_session(
     spawn: SpawnOccurrence,
     now: u64,
 ) {
+    let project_root = match super::spawn_project::resolve_spawn_project(
+        spawn.project_root.as_deref(),
+        spawn.provenance_session_id.as_deref(),
+        handle.spawn_ctx(),
+    ) {
+        Ok((root, _source)) => root,
+        Err(why) => {
+            resolve_spawnless(handle, journal, &spawn, OccurrenceState::Failed, now, &why);
+            return;
+        }
+    };
     if !session_record(journal, &spawn, now, OccurrenceState::Prepared, None) {
         return; // cannot journal ⇒ do not spawn what we cannot dedup
     }
+    // Interactive spawns mirror the composer's launch shape (Auto — the
+    // daemon's own execution heuristics, presence included): the goal is
+    // the opening user message and the session waits for the owner after
+    // it. Goal runs stay explicit: direct unless the manifest asked to
+    // orchestrate (`direct` outranks `orchestrate` at launch, so forcing
+    // it unconditionally made orchestrate manifests run Direct — the
+    // defect the agenda chapter documented).
+    let (orchestrate, direct) = if spawn.interactive {
+        (spawn.orchestrate.then_some(true), None)
+    } else {
+        (Some(spawn.orchestrate), Some(!spawn.orchestrate))
+    };
     handle
         .bus()
         .send(AppEvent::ControlCommand(ControlMsg::StartTask {
             session_id: None,
             task: spawn.goal.clone(),
-            orchestrate: Some(spawn.orchestrate),
-            direct: Some(true),
+            orchestrate,
+            direct,
+            project_root: Some(project_root.to_string_lossy().into_owned()),
             reference_frame_ids: Vec::new(),
             display_target: None,
             attachments: Vec::new(),
@@ -404,8 +434,9 @@ fn complete_running(
     );
 }
 
-/// Terminal resolution for occurrences that never spawned (missed window
-/// or pre-launch crash): journal + item write-back + owner notification.
+/// Terminal resolution for occurrences that never spawned (missed window,
+/// pre-launch crash, or an unresolvable project): journal + item
+/// write-back + owner notification.
 fn resolve_spawnless(
     handle: &AgendaHandle,
     journal: &mut OccurrenceJournal,
@@ -419,6 +450,7 @@ fn resolve_spawnless(
     }
     let state = match terminal {
         OccurrenceState::Missed => "missed",
+        OccurrenceState::Failed => "failed",
         _ => "unknown",
     };
     record_on_item(handle, spawn, state, None, Some(why.to_string()));
@@ -813,6 +845,25 @@ mod tests {
         })
     }
 
+    /// Handle whose spawn context resolves a daemon default project — the
+    /// dispatching tests' baseline (a spawn must always resolve a project;
+    /// the refusal arc is pinned by
+    /// `unresolvable_project_fails_the_occurrence_instead_of_spawning`).
+    fn handle_with_default_project(
+        dir: &std::path::Path,
+        default_project: &std::path::Path,
+    ) -> Arc<AgendaHandle> {
+        let bus = EventBus::new();
+        Arc::new(
+            AgendaHandle::new(AgendaStore::open(dir).unwrap(), bus, dir).with_spawn_context(
+                super::super::spawn_project::SessionSpawnContext {
+                    home: dir.to_path_buf(),
+                    default_project_root: Some(default_project.to_path_buf()),
+                },
+            ),
+        )
+    }
+
     fn approved_effect_item(handle: &AgendaHandle, fire_at_ms: u64) -> (String, String, String) {
         let item = handle
             .apply(
@@ -861,12 +912,8 @@ mod tests {
     #[tokio::test]
     async fn approved_manifest_spawns_once_and_records_result() {
         let dir = tempfile::tempdir().unwrap();
-        let bus = EventBus::new();
-        let handle = Arc::new(AgendaHandle::new(
-            AgendaStore::open(dir.path()).unwrap(),
-            bus,
-            dir.path(),
-        ));
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut state = SchedulerState::default();
         let (item_id, _, _) = approved_effect_item(&handle, now_ms() - 60_000);
@@ -907,10 +954,18 @@ mod tests {
                 task,
                 delegation_id: Some(delegation_id),
                 direct,
+                project_root,
                 ..
             }) = event
             {
                 assert_eq!(direct, Some(true));
+                // The spawn always carries its resolved project — the
+                // daemon default here (nothing recorded provenance).
+                assert_eq!(
+                    project_root.as_deref(),
+                    default_project.path().to_str(),
+                    "goal-run spawns carry the resolved project root"
+                );
                 assert!(delegation_id.starts_with(DELEGATION_PREFIX));
                 dispatched.push((task, delegation_id));
             }
@@ -1064,12 +1119,8 @@ mod tests {
     #[tokio::test]
     async fn start_now_dispatches_one_occurrence_through_the_standard_lane() {
         let dir = tempfile::tempdir().unwrap();
-        let bus = EventBus::new();
-        let handle = Arc::new(AgendaHandle::new(
-            AgendaStore::open(dir.path()).unwrap(),
-            bus,
-            dir.path(),
-        ));
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut state = SchedulerState::default();
         let item = handle
@@ -1089,6 +1140,9 @@ mod tests {
             .apply(
                 AgendaCommand::StartNow {
                     id: item.id.clone(),
+                    goal: None,
+                    project_root: None,
+                    interactive: None,
                 },
                 owner(),
             )
@@ -1101,9 +1155,18 @@ mod tests {
             if let AppEvent::ControlCommand(ControlMsg::StartTask {
                 task,
                 delegation_id: Some(delegation_id),
+                direct,
+                orchestrate,
+                project_root,
                 ..
             }) = event
             {
+                // Interactive default: the spawn mirrors the composer's
+                // launch shape (no forced direct, no forced orchestrate)
+                // and carries its resolved project.
+                assert_eq!(direct, None);
+                assert_eq!(orchestrate, None);
+                assert_eq!(project_root.as_deref(), default_project.path().to_str());
                 dispatched.push((task, delegation_id));
             }
         }
@@ -1168,12 +1231,8 @@ mod tests {
     #[tokio::test]
     async fn event_lag_resolves_awaiting_and_running_occurrences_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let bus = EventBus::new();
-        let handle = Arc::new(AgendaHandle::new(
-            AgendaStore::open(dir.path()).unwrap(),
-            bus,
-            dir.path(),
-        ));
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut state = SchedulerState::default();
         approved_effect_item(&handle, now_ms() - 60_000);
@@ -1256,12 +1315,8 @@ mod tests {
     #[tokio::test]
     async fn failure_and_missed_window_paths_record_honestly() {
         let dir = tempfile::tempdir().unwrap();
-        let bus = EventBus::new();
-        let handle = Arc::new(AgendaHandle::new(
-            AgendaStore::open(dir.path()).unwrap(),
-            bus,
-            dir.path(),
-        ));
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut state = SchedulerState::default();
         let (item_id, _, _) = approved_effect_item(&handle, now_ms() - 60_000);
@@ -1317,5 +1372,154 @@ mod tests {
         let (items, _, _) = handle.snapshot();
         let missed = items.iter().find(|i| i.id == missed_item).unwrap();
         assert_eq!(missed.effects[0].last_run.as_ref().unwrap().state, "missed");
+    }
+
+    /// Fire-time provenance inheritance: an approved manifest without a
+    /// project (the agent-proposal shape) spawns under the PARKING
+    /// session's recorded project root on a projectless daemon.
+    #[tokio::test]
+    async fn fire_time_resolution_inherits_the_parking_sessions_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let parked_project = tempfile::tempdir().unwrap();
+        let session_dir = crate::platform::intendant_home_in(home.path())
+            .join("logs")
+            .join("sess-parker");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "sess-parker",
+                "created_at": "now",
+                "project_root": parked_project.path().to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let bus = EventBus::new();
+        let handle = Arc::new(
+            AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+                .with_spawn_context(super::super::spawn_project::SessionSpawnContext {
+                    home: home.path().to_path_buf(),
+                    default_project_root: None,
+                }),
+        );
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Task,
+                    title: "parked with provenance".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                Some(super::super::types::AgendaActor {
+                    principal: None,
+                    session_id: Some("sess-parker".into()),
+                    kind: Some("agent_session".into()),
+                }),
+            )
+            .unwrap();
+        let proposed = handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    id: item.id.clone(),
+                    goal: "sweep it".into(),
+                    fire_at_ms: now_ms() - 30_000,
+                    orchestrate: false,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        handle
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: item.id.clone(),
+                    digest: proposed.effects[0].digest.clone(),
+                },
+                owner(),
+            )
+            .unwrap();
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut spawned_root = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask { project_root, .. }) = event {
+                spawned_root = project_root;
+            }
+        }
+        assert_eq!(
+            spawned_root.as_deref(),
+            parked_project.path().to_str(),
+            "the spawn inherits the parking session's recorded project root"
+        );
+    }
+
+    /// The refusal path: no manifest project, no provenance root, no
+    /// daemon default ⇒ NOTHING spawns — the occurrence resolves terminal
+    /// `failed` with the named reason on the item and a notification, and
+    /// a later pass does not retry it.
+    #[tokio::test]
+    async fn unresolvable_project_fails_the_occurrence_instead_of_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        // Deliberately NO spawn context: nothing resolves.
+        let handle = Arc::new(AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus,
+            dir.path(),
+        ));
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let (item_id, _, _) = approved_effect_item(&handle, now_ms() - 60_000);
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut saw_start = false;
+        let mut refusal_note = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::ControlCommand(ControlMsg::StartTask { .. }) => saw_start = true,
+                AppEvent::UserNotification { title, text, .. } => {
+                    if title.unwrap_or_default().contains("failed") {
+                        refusal_note = Some(text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(!saw_start, "an unresolvable project must never spawn");
+        let note = refusal_note.expect("the refusal notifies the owner");
+        assert!(note.contains("no project for the session"), "{note}");
+        assert!(state.awaiting.is_empty(), "nothing is left in flight");
+
+        let (items, _, _) = handle.snapshot();
+        let item = items.iter().find(|i| i.id == item_id).unwrap();
+        let run = item.effects[0].last_run.as_ref().unwrap();
+        assert_eq!(run.state, "failed");
+        assert!(run
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no project for the session"));
+
+        // Terminal: the next pass does not retry the spent occurrence.
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    AppEvent::ControlCommand(ControlMsg::StartTask { .. })
+                        | AppEvent::UserNotification { .. }
+                ),
+                "a failed occurrence must not re-fire or re-notify"
+            );
+        }
     }
 }

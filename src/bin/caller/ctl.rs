@@ -2231,8 +2231,13 @@ async fn run_agenda(
             // Owner start-now: an owner-shell act (local_process is an
             // owner surface). Mints the manifest from the item, approves
             // it in the same daemon-side act, and fires through the
-            // standard scheduled lane.
-            let args = parse_command_args(&raw[1..], &[], &[])?;
+            // standard scheduled lane. Defaults to an INTERACTIVE session
+            // (opens with the item, waits for the owner); --goal-run is
+            // the autonomous shape. --project overrides the resolved
+            // project (parking session's root, else the daemon default);
+            // --goal replaces the default item statement.
+            let args =
+                parse_command_args(&raw[1..], &["--project", "--goal"], &["--goal-run"])?;
             let id = agenda_resolve_id(
                 client,
                 config,
@@ -2243,12 +2248,24 @@ async fn run_agenda(
             let mut map = Map::new();
             map.insert("op".to_string(), Value::String("start_now".to_string()));
             map.insert("id".to_string(), Value::String(id));
+            insert_string(&mut map, "project_root", args.one("--project"));
+            insert_string(&mut map, "goal", args.one("--goal"));
+            let goal_run = args.has("--goal-run");
+            map.insert("interactive".to_string(), Value::Bool(!goal_run));
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
-            println!(
-                "started — the session fires through the scheduled lane; its outcome \
-                 writes back to the item (effects[].last_run)"
-            );
+            if goal_run {
+                println!(
+                    "started (goal run) — the session fires through the scheduled lane; \
+                     its outcome writes back to the item (effects[].last_run)"
+                );
+            } else {
+                println!(
+                    "started (interactive) — the session opens with the item as its \
+                     first message and waits for you; launch state writes back to the \
+                     item (effects[].last_run)"
+                );
+            }
         }
         "revoke-schedule" => {
             let args = parse_command_args(&raw[1..], &[], &[])?;
@@ -4135,7 +4152,7 @@ fn help_agenda() {
   intendant ctl agenda schedule ID_PREFIX --goal TEXT --at WHEN [--orchestrate] [--source LABEL]\n\
   intendant ctl agenda approve ID_PREFIX [--digest HEX]\n\
   intendant ctl agenda revoke-schedule ID_PREFIX\n\
-  intendant ctl agenda start ID_PREFIX\n\
+  intendant ctl agenda start ID_PREFIX [--project DIR] [--goal TEXT] [--goal-run]\n\
 \n\
 The agenda is this daemon's durable ledger of parked intent — tasks, notes,\n\
 questions, and deferred follow-ups that survive session and context death.\n\
@@ -4172,11 +4189,16 @@ approval binds the exact manifest digest, so any revision voids it.\n\
 re-run with --digest to bind exactly what you read. Results write back to\n\
 the item (state, session id, note).\n\
 \n\
-`start` is the owner's one-gesture act-on-item: the daemon mints a\n\
-manifest from the item (goal = title + body quoted, with the item id),\n\
-binds the approval to that exact manifest in the same act, and fires it\n\
-immediately through the SAME scheduled lane (occurrence journal +\n\
-supervised session) — never a bypass. Owner surfaces only (dashboard or\n\
+`start` is the owner's act-on-item: the daemon mints a manifest from the\n\
+item (goal = title + body quoted, with the item id; --goal replaces that\n\
+statement), binds the approval to that exact manifest in the same act,\n\
+and fires it immediately through the SAME scheduled lane (occurrence\n\
+journal + supervised session) — never a bypass. Default is INTERACTIVE:\n\
+the session opens with the item as its first message and waits for you;\n\
+--goal-run runs it autonomously with the outcome written back. The\n\
+project resolves --project, else the parking session's recorded project\n\
+root, else the daemon default — refused with a named error when none\n\
+exists (never a project-less spawn). Owner surfaces only (dashboard or\n\
 an owner shell); agent and peer callers are refused. Revises the item's\n\
 pending schedule if one exists (fresh digest, prior approval void)."
     );

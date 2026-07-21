@@ -130,6 +130,10 @@ impl Dispatcher {
                 display_target,
                 attachments,
                 follow_up_id,
+                // The legacy single-session dispatcher routes into an
+                // existing loop, so a create-time project root does not
+                // apply here.
+                project_root: _,
                 // The legacy single-session dispatcher deliberately does
                 // NOT acknowledge peer delegations: it routes into an
                 // existing loop (presence/task/follow-up channels), so
@@ -431,6 +435,7 @@ mod tests {
             task: "do thing".into(),
             orchestrate: None,
             direct: None,
+            project_root: None,
             reference_frame_ids: vec!["f1".into()],
             display_target: None,
             attachments: vec![],
@@ -471,6 +476,7 @@ mod tests {
             task: "chat with me".into(),
             orchestrate: None,
             direct: None,
+            project_root: None,
             reference_frame_ids: vec![],
             display_target: None,
             attachments: vec![],
@@ -506,6 +512,7 @@ mod tests {
             task: "code thing".into(),
             orchestrate: None,
             direct: Some(true),
+            project_root: None,
             reference_frame_ids: vec![],
             display_target: None,
             attachments: vec![],
@@ -600,6 +607,7 @@ mod tests {
             task: "continue there".into(),
             orchestrate: None,
             direct: Some(true),
+            project_root: None,
             reference_frame_ids: vec![],
             display_target: None,
             attachments: vec![],
@@ -641,6 +649,7 @@ mod tests {
                 task: task.into(),
                 orchestrate: None,
                 direct: Some(true),
+                project_root: None,
                 reference_frame_ids: vec![],
                 display_target: None,
                 attachments: vec![],
@@ -692,6 +701,7 @@ mod tests {
                 task: task.into(),
                 orchestrate: None,
                 direct: Some(true),
+                project_root: None,
                 reference_frame_ids: vec![],
                 display_target: None,
                 attachments: vec![],
@@ -740,6 +750,7 @@ mod tests {
             task: "legacy direct".into(),
             orchestrate: Some(false),
             direct: None,
+            project_root: None,
             reference_frame_ids: vec![],
             display_target: None,
             attachments: vec![],

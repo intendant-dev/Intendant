@@ -34,6 +34,7 @@ mod blobs;
 mod handle;
 mod reminders;
 mod scheduler;
+mod spawn_project;
 mod store;
 mod types;
 
@@ -42,6 +43,7 @@ pub(crate) use blobs::find_blob;
 pub(crate) use handle::AgendaHandle;
 pub(crate) use reminders::ReminderPolicyPatch;
 pub(crate) use scheduler::spawn_reminder_scheduler;
+pub(crate) use spawn_project::{recorded_session_project_root, SessionSpawnContext};
 pub(crate) use store::{AgendaError, AgendaStore};
 #[cfg(test)]
 pub(crate) use types::AgendaKind;

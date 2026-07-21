@@ -149,29 +149,60 @@ revoke them. Revising a manifest changes the digest and voids the previous
 approval. The spawned session gets ordinary session authority; the approval
 does not bypass its sandbox, IAM, autonomy policy, or action approvals.
 
-**Start now** (`start_now`, `ctl agenda start`, the card's button) is the
-owner's one-gesture act-on-item: the daemon mints a manifest from the item —
-goal is the title and body quoted as data, carrying the item id so the
-spawned session's own attributed `ctl` can annotate or complete it — and
-appends the propose and approve operations atomically, the approval binding
-the digest of exactly that minted manifest. With its fire time set to now,
-the ordinary scheduler pass journals the occurrence and dispatches through
-the same StartTask lane as any scheduled firing — start now is scheduled
-firing with a zero-length wait, never a bypass, and the outcome writes back
-to the item identically. It is owner-surface-only exactly like the approval
-it embeds, and it revises the item's single pending schedule if one exists
-(standing re-propose semantics). The dashboard additionally shows a
-**follow up** affordance when the item's recording conversation is still
-live and composer-targetable: it opens the composer aimed at that
-conversation with the item quoted — a pure navigation affordance, no daemon
-write; fresh-start is the primary path because items must outlive their
-sessions.
+**Start now** (`start_now`, `ctl agenda start`, the item's button) is the
+owner's act-on-item. On dashboard surfaces the button opens a **confirm
+sheet** (bottom sheet on coarse pointers and narrow viewports, anchored
+popover-card on desktop) whose content is the explanation: the editable
+goal text the session will receive, the resolved project directory, the
+config the spawn inherits (backend and execution — honest daemon
+defaults), and an **Interactive / Goal run** toggle. The one-click instant
+fire is retired on dashboard surfaces (owner ruling, 2026-07-21). On
+confirm, the daemon mints a manifest from the reviewed parameters — the
+goal statement (item title and body quoted as data, carrying the item id
+so the spawned session's own attributed `ctl` can annotate or complete it,
+or the sheet's edited text) plus a fixed mode coda — and appends the
+propose and approve operations atomically, the approval binding the digest
+of exactly that minted manifest. With its fire time set to now, the
+ordinary scheduler pass journals the occurrence and dispatches through the
+same StartTask lane as any scheduled firing — start now is scheduled
+firing with a zero-length wait, never a bypass.
 
-> **Current execution-shape defect:** the scheduler forwards the manifest's
-> `orchestrate` value but also sets `direct=true`; session launch gives
-> `direct` precedence. Approved scheduled sessions therefore run Direct today,
-> even when their manifest requested orchestration. Treat that field as
-> recorded intent until dispatch stops forcing Direct.
+**Interactive is the default** (`interactive`, additive on the manifest):
+the spawned session opens with the goal as its first user message and then
+waits for the owner, exactly like a session started from the composer
+(dispatch mirrors the composer's launch defaults). The goal run
+(`interactive: false`, `ctl agenda start --goal-run`) remains the
+autonomous shape: the session works the goal and the outcome writes back
+to the item.
+
+**A spawn is never project-less.** The session's project resolves in
+order: the manifest's explicit `project_root` (the sheet's pick /
+`--project`; recorded on the manifest, validated at mint), else the
+**parking session's** recorded project root (item provenance → session
+record, with the external-wrapper index covering pruned wrapper log dirs),
+else the daemon's default project. When none exists the daemon refuses
+with an error naming exactly what is missing — at mint for `start_now`,
+and at fire time (occurrence resolved `failed`, reason written back to the
+item, owner notified) for approved proposals. Before this, a scheduled
+spawn on a projectless daemon launched a session that died instantly with
+the structured `no_project` create failure.
+
+Start now is owner-surface-only exactly like the approval it embeds, and
+it revises the item's single pending schedule if one exists (standing
+re-propose semantics). The dashboard additionally shows a **follow up**
+affordance targeting the item's ORIGIN conversation: while the recording
+conversation is live and composer-targetable, it opens the composer aimed
+at it with the item quoted (a pure navigation affordance, no daemon
+write); when the conversation has ended but still resolves on this daemon,
+**Follow up (resumes session)** reopens it through the ordinary resume
+path — same conversation, its recorded project root — and then targets the
+composer. Neither ever silently starts an unrelated new session.
+
+The old execution-shape defect (dispatch forced `direct=true`, so
+orchestrate manifests ran Direct) is fixed: goal runs dispatch
+`direct = !orchestrate`, and interactive spawns leave both flags to the
+composer's defaults (the manifest's `orchestrate` still forces
+orchestration).
 
 Quiet hours do not delay scheduled sessions: approving a 03:00 run is an
 explicit decision distinct from reminder loudness. A launch that misses its
@@ -255,7 +286,9 @@ digest (or click Approve on the card). Each run ends by re-proposing the
 next pass — a fresh digest the owner approves in one click, so the
 recurrence is a standing series of explicit owner approvals rather than a
 timer with authority (recurrence machinery is deliberately out of scope).
-On-demand passes ride the same item's **Start now** button. Because the mandate lives in the goal, the daemon's ordinary
+On-demand passes ride the same item's **Start now** button — pick **Goal
+run** in its confirm sheet (the housekeeping pass is autonomous work, not
+a conversation; the sheet's default is Interactive). Because the mandate lives in the goal, the daemon's ordinary
 gates already enforce its hard edges: the session's `agenda.write` cannot
 approve effects or touch reminder policy regardless of what the text says —
 the mandate's propose-don't-dispose lines are conduct the owner audits in
