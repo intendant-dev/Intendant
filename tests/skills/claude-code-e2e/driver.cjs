@@ -374,6 +374,29 @@ async function main() {
     );
     check('process-survives-interrupt', Boolean(alive));
 
+    // Phase 5.5: vcs freshness hint (CC 2.1.216+ `vcs_state_changed`).
+    // The workdir is dirty from earlier phases (probe.txt, steered.txt);
+    // a commit the model performs must broadcast the session_vcs_changed
+    // refetch hint and wake the git prober, so a clean git section
+    // arrives promptly instead of on the 5s cadence.
+    const cleanGit = (e) => e.event === 'session_vitals'
+      && e.vitals && e.vitals.git && e.vitals.git.dirty_files === 0;
+    const cleanGitBefore = run.events.filter(cleanGit).length;
+    run.send({
+      action: 'follow_up',
+      text: 'Run exactly this bash command yourself with your Bash tool (do NOT delegate to the Agent tool): git add -A && git -c user.email=e2e@local -c user.name=e2e commit -qm e2e-vcs-phase. Then reply VCSDONE.',
+    });
+    const vcsHint = await run.waitFor(
+      'session_vcs_changed broadcast',
+      (e) => e.event === 'session_vcs_changed' && e.kind === 'commit',
+      180000,
+    );
+    check('vcs-hint-broadcast', Boolean(vcsHint), `kind=${vcsHint.kind}`);
+    const vcsHintAt = Date.now();
+    await run.waitFor('git vitals reflect the commit', cleanGit, 30000, { skip: cleanGitBefore });
+    check('vcs-woken-git-probe', true,
+      `clean git section ${((Date.now() - vcsHintAt) / 1000).toFixed(1)}s after the hint`);
+
     // Phase 6: the universal thread-action vocabulary is advertised.
     const capsUniversal = run.events.find((e) => e.event === 'session_capabilities'
       && Array.isArray((e.capabilities || {}).thread_actions));
