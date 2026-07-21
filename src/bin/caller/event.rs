@@ -1928,6 +1928,14 @@ pub enum ControlMsg {
         /// socket without a human on the other end.
         #[serde(default)]
         direct: Option<bool>,
+        /// Project root for the new session when this StartTask creates
+        /// one (additive; the agenda's scheduled-session lane resolves and
+        /// passes it explicitly so a projectless daemon never spawns a
+        /// dead session). Omitted: the daemon's default project, exactly
+        /// as before. Ignored when `session_id` targets an existing
+        /// session (the text routes as a follow-up).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<String>,
         /// When present, routes to the ephemeral CU task runner instead of the
         /// regular agent loop.
         #[serde(default)]
@@ -5022,6 +5030,7 @@ mod tests {
                 task: "fix bug".to_string(),
                 orchestrate: None,
                 direct: None,
+                project_root: None,
                 reference_frame_ids: vec![],
                 display_target: None,
                 attachments: vec![],
@@ -5674,6 +5683,7 @@ mod tests {
             task: "deploy app".to_string(),
             orchestrate: Some(true),
             direct: None,
+            project_root: Some("/work/project".to_string()),
             reference_frame_ids: vec!["display_99-f00001".to_string()],
             display_target: Some("user_session".to_string()),
             attachments: vec!["ann-recording-1".to_string(), "ann-recording-2".to_string()],
@@ -5686,6 +5696,7 @@ mod tests {
             ControlMsg::StartTask {
                 task,
                 orchestrate,
+                project_root,
                 reference_frame_ids,
                 display_target,
                 attachments,
@@ -5693,6 +5704,7 @@ mod tests {
             } => {
                 assert_eq!(task, "deploy app");
                 assert_eq!(orchestrate, Some(true));
+                assert_eq!(project_root.as_deref(), Some("/work/project"));
                 assert_eq!(reference_frame_ids.len(), 1);
                 assert_eq!(display_target.as_deref(), Some("user_session"));
                 assert_eq!(attachments.len(), 2);

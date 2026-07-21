@@ -190,6 +190,21 @@ pub struct SessionManifest {
     /// Orchestrate vs direct execution (defaults to direct).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) orchestrate: bool,
+    /// Additive: open the spawned session interactively — the goal is the
+    /// opening user message and the session then waits for the owner,
+    /// exactly like a session started from the composer. `false` (the
+    /// legacy default) runs the goal as an autonomous supervised task.
+    /// Absent-on-the-wire when false, so legacy manifest bytes — and the
+    /// digests their approvals bind — are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) interactive: bool,
+    /// Additive: the project root the spawned session runs under. `None`
+    /// (the legacy shape) resolves at fire time: the parking session's
+    /// recorded project root, else the daemon default — and the spawn is
+    /// refused with a named failure when neither exists, never launched
+    /// project-less.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) project_root: Option<String>,
 }
 
 /// An owner's approval of one manifest revision. `digest` is the bound
@@ -621,7 +636,28 @@ pub enum AgendaCommand {
     /// exactly the manifest minted under the same lock. Revises the item's
     /// single session effect if one exists (stable lineage, fresh digest,
     /// prior approval void — the standing re-propose semantics).
-    StartNow { id: String },
+    ///
+    /// The optional fields are the confirm sheet's reviewed parameters
+    /// (additive — a bare `{op, id}` keeps working):
+    /// - `goal`: replaces the default item-statement text. The daemon
+    ///   still appends the mode coda (interactive framing, or the
+    ///   goal-run follow-through/write-back instructions).
+    /// - `project_root`: explicit project directory for the spawned
+    ///   session. Absent: the parking session's recorded project root,
+    ///   else the daemon default — refused with a named error when
+    ///   neither exists (never a project-less spawn).
+    /// - `interactive`: absent defaults to **true** (owner-ratified): the
+    ///   session opens with the goal as its first user message and waits
+    ///   for the owner. `false` is the autonomous goal run.
+    StartNow {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interactive: Option<bool>,
+    },
 }
 
 impl AgendaItem {
@@ -1298,6 +1334,53 @@ mod tests {
             due_ms: None,
             ask: None,
         }
+    }
+
+    /// The manifest's additive fields are absent-on-the-wire at their
+    /// defaults: legacy manifest JSON round-trips byte-identically, so the
+    /// digests existing approvals bind are unchanged — and setting either
+    /// field mints a NEW digest, voiding any prior approval (the review
+    /// contract: an approval covers exactly the bytes reviewed).
+    #[test]
+    fn manifest_additive_fields_round_trip_and_revise_the_digest() {
+        let legacy_json = r#"{"goal":"run the sweep","fire_at_ms":1234}"#;
+        let legacy: SessionManifest = serde_json::from_str(legacy_json).unwrap();
+        assert!(!legacy.interactive);
+        assert_eq!(legacy.project_root, None);
+        assert_eq!(serde_json::to_string(&legacy).unwrap(), legacy_json);
+
+        let base_digest = manifest_digest("item-1", "ef-1", &legacy);
+        assert_eq!(
+            manifest_digest("item-1", "ef-1", &legacy),
+            base_digest,
+            "digesting is deterministic"
+        );
+
+        let interactive = SessionManifest {
+            interactive: true,
+            ..legacy.clone()
+        };
+        let with_project = SessionManifest {
+            project_root: Some("/work/project".into()),
+            ..legacy.clone()
+        };
+        let interactive_digest = manifest_digest("item-1", "ef-1", &interactive);
+        let project_digest = manifest_digest("item-1", "ef-1", &with_project);
+        assert_ne!(interactive_digest, base_digest);
+        assert_ne!(project_digest, base_digest);
+        assert_ne!(interactive_digest, project_digest);
+
+        // Full round-trip with both fields set preserves them.
+        let full = SessionManifest {
+            goal: "g".into(),
+            fire_at_ms: 9,
+            orchestrate: true,
+            interactive: true,
+            project_root: Some("/work/project".into()),
+        };
+        let round: SessionManifest =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(round, full);
     }
 
     #[test]

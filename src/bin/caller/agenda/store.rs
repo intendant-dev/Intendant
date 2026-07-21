@@ -60,6 +60,32 @@ const KNOWN_OPS: [&str; 16] = [
 
 const LOG_FILE: &str = "agenda.jsonl";
 
+/// Start-now's default goal statement: the item quoted as data with its id
+/// so the spawned session's own (attributed) `ctl` can act on it. The
+/// confirm sheet's editable text replaces exactly this part; the mode coda
+/// below is appended either way.
+pub(crate) fn start_now_goal_statement(item: &AgendaItem) -> String {
+    let mut statement = format!("Agenda follow-through for item {}: {}", item.id, item.title);
+    if !item.body.trim().is_empty() {
+        statement.push_str("\n\nItem body (quoted):\n");
+        statement.push_str(&item.body);
+    }
+    statement
+}
+
+/// Goal-run coda: the autonomous follow-through + write-back protocol.
+pub(crate) const START_NOW_GOAL_RUN_CODA: &str =
+    "\n\nWork the item, then state the outcome plainly — it is written back to \
+     the agenda item, and `intendant ctl agenda` from this session records \
+     attributed progress (annotate/complete) on it.";
+
+/// Interactive coda: the session opens like a composer session — take
+/// stock, then the owner directs the work.
+pub(crate) const START_NOW_INTERACTIVE_CODA: &str =
+    "\n\nThe owner opened this session interactively from the agenda: take stock \
+     of the item, then follow their direction — they are in the loop, so ask \
+     rather than assume.";
+
 pub(crate) struct AgendaStore {
     /// The agenda dir this store lives in (op log, blob store).
     dir: PathBuf,
@@ -241,8 +267,23 @@ impl AgendaStore {
         }
         // Owner start-now (F3): two ops appended under this same lock —
         // its own arm because one command maps to a propose+approve pair.
-        if let AgendaCommand::StartNow { id } = cmd {
-            return self.start_now(&id, actor, now_ms);
+        if let AgendaCommand::StartNow {
+            id,
+            goal,
+            project_root,
+            interactive,
+        } = cmd
+        {
+            return self.start_now(
+                &id,
+                goal.as_deref(),
+                project_root,
+                // Absent defaults to interactive (owner-ratified): the
+                // session opens with the item and waits for the owner.
+                interactive.unwrap_or(true),
+                actor,
+                now_ms,
+            );
         }
         let deletes_blobs = matches!(&cmd, AgendaCommand::Retire { .. });
         let op = self.command_to_op(cmd, now_ms)?;
@@ -270,11 +311,22 @@ impl AgendaStore {
     /// standing ones: an existing effect keeps its lineage, gets a fresh
     /// digest, and any prior approval is void.
     ///
+    /// `goal_override` is the confirm sheet's reviewed/edited statement —
+    /// it replaces the default item statement; the mode coda is appended
+    /// either way so the sheet's fixed caption stays the single honest
+    /// summary of what runs beyond the editable text. `project_root` is
+    /// recorded verbatim on the manifest (the handle resolves and
+    /// validates it before the store runs; `None` from a direct caller
+    /// falls back to fire-time resolution in the scheduler).
+    ///
     /// The caller (`AgendaHandle::apply`) has already enforced the
     /// owner-surface gate — this command embeds an approval.
     fn start_now(
         &mut self,
         id: &str,
+        goal_override: Option<&str>,
+        project_root: Option<String>,
+        interactive: bool,
         actor: Option<AgendaActor>,
         now_ms: u64,
     ) -> Result<AgendaItem, AgendaError> {
@@ -284,16 +336,22 @@ impl AgendaStore {
                 "{id} is not open — reopen it before starting work on it"
             )));
         }
-        let mut goal = format!("Agenda follow-through for item {id}: {}", item.title);
-        if !item.body.trim().is_empty() {
-            goal.push_str("\n\nItem body (quoted):\n");
-            goal.push_str(&item.body);
-        }
-        goal.push_str(
-            "\n\nWork the item, then state the outcome plainly — it is written back to \
-             the agenda item, and `intendant ctl agenda` from this session records \
-             attributed progress (annotate/complete) on it.",
-        );
+        let mut goal = match goal_override.map(str::trim).filter(|goal| !goal.is_empty()) {
+            Some(edited) => {
+                if edited.len() > MAX_BODY_BYTES {
+                    return Err(AgendaError::Invalid(format!(
+                        "goal exceeds {MAX_BODY_BYTES} bytes"
+                    )));
+                }
+                edited.to_string()
+            }
+            None => start_now_goal_statement(item),
+        };
+        goal.push_str(if interactive {
+            START_NOW_INTERACTIVE_CODA
+        } else {
+            START_NOW_GOAL_RUN_CODA
+        });
         // The item body is already capped, but the wrapper text must never
         // push the goal past the manifest bound the scheduled lane
         // enforces at propose time.
@@ -315,6 +373,8 @@ impl AgendaStore {
             goal,
             fire_at_ms: now_ms,
             orchestrate: false,
+            interactive,
+            project_root,
         };
         let digest = super::types::manifest_digest(id, &effect_id, &manifest);
         self.append_op(
@@ -695,6 +755,11 @@ impl AgendaStore {
                         goal,
                         fire_at_ms,
                         orchestrate,
+                        // Proposals keep the legacy autonomous shape; the
+                        // project resolves at fire time (provenance →
+                        // daemon default → named refusal).
+                        interactive: false,
+                        project_root: None,
                     },
                 })
             }

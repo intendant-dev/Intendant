@@ -9,6 +9,7 @@
 //! request/response surfaces already provide.
 
 use super::reminders::{ReminderPolicy, ReminderPolicyPatch, ReminderPolicyStore};
+use super::spawn_project::{resolve_spawn_project, SessionSpawnContext};
 use super::store::{AgendaError, AgendaStore, OccurrenceWriteBack};
 use super::types::{AgendaActor, AgendaCommand, AgendaCounts, AgendaItem};
 use crate::event::{AppEvent, EventBus};
@@ -25,6 +26,12 @@ pub(crate) struct AgendaHandle {
     /// Wakes the reminder scheduler after any change that can move the
     /// plan: an applied op (due patched, item completed) or a policy edit.
     reminder_nudge: tokio::sync::Notify,
+    /// Daemon-level spawn facts (state home + default project root) the
+    /// scheduled lane resolves projects against. `new` defaults to a
+    /// nothing-resolves context scoped to the agenda dir — hermetic for
+    /// tests; the wiring edge installs the real one via
+    /// [`Self::with_spawn_context`].
+    spawn_ctx: SessionSpawnContext,
 }
 
 impl AgendaHandle {
@@ -35,7 +42,25 @@ impl AgendaHandle {
             dir: dir.to_path_buf(),
             reminder_policy: Mutex::new(ReminderPolicyStore::open(dir)),
             reminder_nudge: tokio::sync::Notify::new(),
+            spawn_ctx: SessionSpawnContext {
+                // The agenda dir contains no session records, so the
+                // default context resolves no provenance and no default
+                // project — and never touches the real home.
+                home: dir.to_path_buf(),
+                default_project_root: None,
+            },
         }
+    }
+
+    /// Install the daemon's real spawn context (wiring edge; tests inject
+    /// tempdir-scoped ones to exercise resolution).
+    pub(crate) fn with_spawn_context(mut self, spawn_ctx: SessionSpawnContext) -> Self {
+        self.spawn_ctx = spawn_ctx;
+        self
+    }
+
+    pub(crate) fn spawn_ctx(&self) -> &SessionSpawnContext {
+        &self.spawn_ctx
     }
 
     pub(crate) fn dir(&self) -> &Path {
@@ -115,6 +140,40 @@ impl AgendaHandle {
         actor: Option<AgendaActor>,
     ) -> Result<AgendaItem, AgendaError> {
         Self::authorize_command(&cmd, actor.as_ref())?;
+        // Start-now resolves its project HERE, at the tenant edge where the
+        // daemon context lives: explicit pick → the parking session's
+        // recorded root → the daemon default — refused with a named error
+        // before anything is minted, so a projectless daemon can never
+        // launch (and instantly kill) a project-less session. The store
+        // then records the resolved root on the manifest verbatim.
+        let cmd = match cmd {
+            AgendaCommand::StartNow {
+                id,
+                goal,
+                project_root,
+                interactive,
+            } => {
+                let provenance_session = self
+                    .lock()
+                    .item(&id)
+                    .ok_or_else(|| AgendaError::NotFound(id.clone()))?
+                    .provenance
+                    .session_id;
+                let (resolved, _source) = resolve_spawn_project(
+                    project_root.as_deref(),
+                    provenance_session.as_deref(),
+                    &self.spawn_ctx,
+                )
+                .map_err(AgendaError::Invalid)?;
+                AgendaCommand::StartNow {
+                    id,
+                    goal,
+                    project_root: Some(resolved.to_string_lossy().into_owned()),
+                    interactive,
+                }
+            }
+            other => other,
+        };
         let asked = matches!(
             &cmd,
             AgendaCommand::Add {
@@ -359,13 +418,19 @@ impl AgendaHandle {
     /// without waiting for the Agenda tab's JS bootstrap. Parked form —
     /// no expiry, not held (a live waiter re-arms its own deadline by
     /// re-announcing); the attention nudge dedups by id, and same-id
-    /// re-shows are harmless on every rail. Returns how many were
-    /// announced.
+    /// re-shows are harmless on every rail. DISMISSED items stay off it:
+    /// the owner cleared those rails deliberately and a restart must not
+    /// undo the gesture — the Agenda card's open-panel affordance is the
+    /// way back, and answer/reopen clears the marker (the log keeps the
+    /// dismissal as history). Returns how many were announced.
     pub(crate) fn announce_open_asks(&self) -> usize {
         let (items, _, _) = self.snapshot();
         let mut announced = 0;
         for item in &items {
-            if item.status == super::types::AgendaStatus::Open && item.ask.is_some() {
+            if item.status == super::types::AgendaStatus::Open
+                && item.ask.is_some()
+                && item.dismissed.is_none()
+            {
                 let session = item.provenance.session_id.clone();
                 self.announce_ask(item, session);
                 announced += 1;
@@ -840,6 +905,16 @@ mod tests {
         assert!(super::super::ask::agenda_ask_pending(skipped_ask));
     }
 
+    /// A bare `{op, id}` start-now (older clients, ctl without flags).
+    fn bare_start_now(id: &str) -> AgendaCommand {
+        AgendaCommand::StartNow {
+            id: id.to_string(),
+            goal: None,
+            project_root: None,
+            interactive: None,
+        }
+    }
+
     fn one_question_ask(text: &str) -> AgendaCommand {
         AgendaCommand::Ask {
             questions: vec![crate::mcp::AskUserQuestionParams {
@@ -1060,7 +1135,8 @@ mod tests {
 
     /// Boot re-announcement: open ask-backed items re-emit the parked
     /// rail announcement once each (no expiry, not held, provenance
-    /// attribution); resolved items and plain questions do not.
+    /// attribution); resolved items, plain questions, and dismissed-but-
+    /// open asks do not — a restart must not undo the owner's dismissal.
     #[tokio::test]
     async fn announce_open_asks_reemits_open_items_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -1104,6 +1180,12 @@ mod tests {
                 None,
             )
             .unwrap();
+        // A dismissed-but-open ask stays off the boot re-announce (the
+        // owner cleared the rails deliberately; the item stays open).
+        let dismissed = handle.apply(one_question_ask("Dismissed?"), None).unwrap();
+        handle
+            .dismiss_ask(dismissed.ask.as_ref().unwrap().ask_id, "skip")
+            .unwrap();
 
         // Subscribe AFTER the setup churn: only the boot announcement.
         let mut rx = bus.subscribe();
@@ -1141,8 +1223,13 @@ mod tests {
     #[test]
     fn start_now_is_owner_surface_and_binds_its_own_digest() {
         let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(super::super::spawn_project::SessionSpawnContext {
+                home: dir.path().to_path_buf(),
+                default_project_root: Some(default_project.path().to_path_buf()),
+            });
         let item = handle
             .apply(
                 AgendaCommand::Add {
@@ -1162,12 +1249,7 @@ mod tests {
             ("peer", None),
             ("unattributed", None),
         ] {
-            match handle.apply(
-                AgendaCommand::StartNow {
-                    id: item.id.clone(),
-                },
-                actor(kind, session),
-            ) {
+            match handle.apply(bare_start_now(&item.id), actor(kind, session)) {
                 Err(AgendaError::NotPermitted { verb, actor }) => {
                     assert_eq!(verb, "start_now");
                     assert_eq!(actor, kind);
@@ -1176,23 +1258,13 @@ mod tests {
             }
         }
         assert!(matches!(
-            handle.apply(
-                AgendaCommand::StartNow {
-                    id: item.id.clone(),
-                },
-                None,
-            ),
+            handle.apply(bare_start_now(&item.id), None),
             Err(AgendaError::NotPermitted { .. })
         ));
 
         let before_ms = now_ms();
         let started = handle
-            .apply(
-                AgendaCommand::StartNow {
-                    id: item.id.clone(),
-                },
-                actor("dashboard", None),
-            )
+            .apply(bare_start_now(&item.id), actor("dashboard", None))
             .unwrap();
         let effect = &started.effects[0];
         let approval = effect
@@ -1205,21 +1277,142 @@ mod tests {
         assert!(effect.manifest.goal.contains(&item.id));
         assert!(effect.manifest.goal.contains("fix the flaky probe"));
         assert!(effect.manifest.goal.contains("details in the runbook"));
+        // Bare start-now defaults to the ratified interactive shape, and
+        // the manifest records the resolved project (the daemon default
+        // here — no provenance root exists under this hermetic home).
+        assert!(effect.manifest.interactive);
+        assert!(effect.manifest.goal.contains("interactively"));
+        assert_eq!(
+            effect.manifest.project_root.as_deref(),
+            Some(default_project.path().to_str().unwrap())
+        );
 
         // Start-now on an already-scheduled item revises the same lineage
         // (standing re-propose semantics) rather than growing a second
         // effect.
         let again = handle
-            .apply(
-                AgendaCommand::StartNow {
-                    id: item.id.clone(),
-                },
-                actor("local_process", None),
-            )
+            .apply(bare_start_now(&item.id), actor("local_process", None))
             .unwrap();
         assert_eq!(again.effects.len(), 1);
         assert_eq!(again.effects[0].effect_id, effect.effect_id);
         assert!(again.effects[0].approval.is_some());
+    }
+
+    /// The confirm sheet's reviewed parameters land on the minted
+    /// manifest: the edited goal replaces the item statement (mode coda
+    /// still appended), the explicit project pick is recorded verbatim,
+    /// and `interactive: false` composes the goal-run follow-through.
+    /// Provenance-recorded roots beat the daemon default when no explicit
+    /// pick is given; a projectless daemon with no provenance refuses
+    /// with the named error and mints NOTHING.
+    #[test]
+    fn start_now_confirmed_parameters_and_project_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let parked_project = tempfile::tempdir().unwrap();
+        let picked_project = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+
+        // The parking session's record under the hermetic home.
+        let session_dir = crate::platform::intendant_home_in(home.path())
+            .join("logs")
+            .join("sess-parker");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "sess-parker",
+                "created_at": "now",
+                "project_root": parked_project.path().to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(super::super::spawn_project::SessionSpawnContext {
+                home: home.path().to_path_buf(),
+                default_project_root: None,
+            });
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Task,
+                    title: "sweep the fixtures".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                actor("agent_session", Some("sess-parker")),
+            )
+            .unwrap();
+
+        // Provenance-inherited project on a projectless daemon.
+        let started = handle
+            .apply(bare_start_now(&item.id), actor("dashboard", None))
+            .unwrap();
+        assert_eq!(
+            started.effects[0].manifest.project_root.as_deref(),
+            Some(parked_project.path().to_str().unwrap())
+        );
+        assert!(started.effects[0].manifest.interactive);
+
+        // Confirmed sheet parameters: explicit pick + edited goal +
+        // goal-run mode. The revision voids the prior approval's digest
+        // (fresh digest binds the new manifest).
+        let first_digest = started.effects[0].digest.clone();
+        let confirmed = handle
+            .apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                    goal: Some("run the sweep exactly as rehearsed".into()),
+                    project_root: Some(picked_project.path().to_string_lossy().into_owned()),
+                    interactive: Some(false),
+                },
+                actor("dashboard", None),
+            )
+            .unwrap();
+        let manifest = &confirmed.effects[0].manifest;
+        assert!(manifest
+            .goal
+            .starts_with("run the sweep exactly as rehearsed"));
+        assert!(manifest.goal.contains("written back"), "goal-run coda");
+        assert!(!manifest.interactive);
+        assert_eq!(
+            manifest.project_root.as_deref(),
+            Some(picked_project.path().to_str().unwrap())
+        );
+        assert_ne!(confirmed.effects[0].digest, first_digest);
+        assert_eq!(
+            confirmed.effects[0].approval.as_ref().unwrap().digest,
+            confirmed.effects[0].digest
+        );
+
+        // Refusal: no pick, no provenance root, no daemon default —
+        // named error, and the item's effect state is untouched.
+        let orphan = handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Task,
+                    title: "orphan item".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        match handle.apply(bare_start_now(&orphan.id), actor("dashboard", None)) {
+            Err(AgendaError::Invalid(message)) => {
+                assert!(message.contains("no project for the session"), "{message}");
+            }
+            other => panic!("expected the named no-project refusal, got {other:?}"),
+        }
+        let (items, _, _) = handle.snapshot();
+        let orphan_now = items.iter().find(|i| i.id == orphan.id).unwrap();
+        assert!(orphan_now.effects.is_empty(), "refusal mints nothing");
     }
 
     /// Approval binds the digest: an edit (re-propose) voids it, and a

@@ -313,6 +313,10 @@ fn run_governed(
         &permit.name,
         permit.wait_ms,
     );
+    // Permit hold time for the compile-done line: acquisition (a moment
+    // ago) through the child's reap.
+    let held = std::time::Instant::now();
+    let permit_name = permit.name.clone();
 
     if classified.heavy {
         match linker::prepare_rustc(args) {
@@ -341,6 +345,13 @@ fn run_governed(
                 };
                 let status = wait_for_child(child);
                 drop(permit);
+                govlog::log_compile_done(
+                    &cfg.permit_dir,
+                    class.as_str(),
+                    classified.crate_name.as_deref(),
+                    &permit_name,
+                    held.elapsed().as_millis() as u64,
+                );
                 match status {
                     Ok(status) => exit_like_child(status),
                     Err(err) => {
@@ -365,6 +376,7 @@ fn run_governed(
                     &cfg,
                     class,
                     classified.crate_name.as_deref(),
+                    held,
                 );
             }
         }
@@ -376,6 +388,13 @@ fn run_governed(
     };
     let status = wait_for_child(child);
     drop(permit);
+    govlog::log_compile_done(
+        &cfg.permit_dir,
+        class.as_str(),
+        classified.crate_name.as_deref(),
+        &permit_name,
+        held.elapsed().as_millis() as u64,
+    );
     match status {
         Ok(status) => exit_like_child(status),
         Err(err) => {
@@ -400,7 +419,9 @@ fn run_whole_rustc_link(
     cfg: &config::Config,
     class: permits::Class,
     crate_name: Option<&str>,
+    held: std::time::Instant,
 ) -> ! {
+    let permit_name = permit.name.clone();
     let link_gate = permits::acquire_link_slot(cfg, config_path, crate_name);
     let disposition = match &link_gate {
         permits::LinkGate::Held(slot) => govlog::LinkDisposition::Gated {
@@ -438,6 +459,13 @@ fn run_whole_rustc_link(
         crate_name,
         started.elapsed().as_millis() as u64,
         "whole-rustc",
+    );
+    govlog::log_compile_done(
+        &cfg.permit_dir,
+        class.as_str(),
+        crate_name,
+        &permit_name,
+        held.elapsed().as_millis() as u64,
     );
     match status {
         Ok(status) => exit_like_child(status),
@@ -628,7 +656,7 @@ fn acquire_governed(
     }
     let classified = link::classify(lossy);
     let class = permits::classify(permits::current_username().as_deref(), &cfg);
-    let permit = permits::acquire(&cfg, class, config_path)?;
+    let permit = permits::acquire(&cfg, class, config_path, classified.crate_name.as_deref())?;
     Some(Governed {
         permit,
         cfg,

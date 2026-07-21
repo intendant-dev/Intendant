@@ -1,12 +1,14 @@
 //! `<permit_dir>/governor.log`: one compile-permit acquisition line per
-//! governed invocation, plus linker acquisition/completion lines for each
-//! heavyweight final artifact. Bypasses, probes, and fail-open runs are
-//! deliberately silent — the log answers which phase waited, for how long,
-//! and on which resource. The probe fast path must not pay even a log write.
+//! governed invocation and one `compile-done` hold-time line at its reap,
+//! plus linker acquisition/completion lines for each heavyweight final
+//! artifact. Bypasses, probes, and fail-open runs are deliberately silent
+//! — the log answers which phase waited, for how long, and on which
+//! resource, and (via `compile-done`) how long each permit was actually
+//! held. The probe fast path must not pay even a log write.
 //!
 //! Best-effort end to end: logging must never fail the build, so every I/O
-//! error here is swallowed. Rotation is truncate-in-place at 1MB keeping
-//! the last 256KB — the scripts/ci hooks/watchdog doctrine: governed
+//! error here is swallowed. Rotation is truncate-in-place at 8MB keeping
+//! the last 2MB — the scripts/ci hooks/watchdog doctrine: governed
 //! accounts can write the pre-created 0666 file but cannot create siblings
 //! in the root-owned permit dir, so tmp+rename is off the table. Racing
 //! rotators are serialized by a non-blocking flock on the log itself
@@ -21,8 +23,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::flock;
 
 pub(crate) const LOG_NAME: &str = "governor.log";
-const MAX_LOG_BYTES: u64 = 1024 * 1024;
-const KEEP_BYTES: u64 = 256 * 1024;
+// Sized for sizing decisions: permit/link tuning wants about a week of
+// history, and a busy agent box burns just under 1MB of governed lines a
+// day (measured 2026-07-21) — 8MB caps the file, 2MB is the floor a
+// rotation leaves behind.
+const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+const KEEP_BYTES: u64 = 2 * 1024 * 1024;
 
 /// How the link gate treated a heavyweight invocation (ordinary compiles
 /// carry `None` and log `kind=compile`).
@@ -82,6 +88,27 @@ pub(crate) fn log_link(
         permit_dir,
         &format!(
             "class={class} crate={} {kind} permit={permit_name} wait_ms={permit_wait_ms}",
+            printable_crate(crate_name),
+        ),
+    );
+}
+
+/// Completion line for every governed compile: `runtime_ms` is the permit
+/// HOLD time, spawn through reap — for a heavyweight that spans compile,
+/// codegen, link-slot wait, and the link itself. Paired with the
+/// acquisition line's `wait_ms`, it is the utilization datum permit-count
+/// sizing divides by wall clock.
+pub(crate) fn log_compile_done(
+    permit_dir: &Path,
+    class: &str,
+    crate_name: Option<&str>,
+    permit_name: &str,
+    runtime_ms: u64,
+) {
+    append_line(
+        permit_dir,
+        &format!(
+            "class={class} crate={} kind=compile-done permit={permit_name} runtime_ms={runtime_ms}",
             printable_crate(crate_name),
         ),
     );
@@ -301,6 +328,25 @@ mod tests {
     }
 
     #[test]
+    fn compile_done_carries_the_hold_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        log_compile_done(
+            dir.path(),
+            "local",
+            Some("intendant"),
+            "permit-local-0",
+            61_500,
+        );
+        let text = std::fs::read_to_string(dir.path().join(LOG_NAME)).unwrap();
+        assert!(
+            text.trim_end().ends_with(
+                "class=local crate=intendant kind=compile-done permit=permit-local-0 runtime_ms=61500"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn crate_names_stay_single_line_and_bounded() {
         assert_eq!(printable_crate(None), "-");
         assert_eq!(printable_crate(Some("")), "-");
@@ -314,8 +360,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LOG_NAME);
         {
-            let mut f = std::fs::File::create(&path).unwrap();
-            for i in 0..40_000 {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+            for i in 0..220_000 {
                 writeln!(f, "line {i:07} padding-padding-padding-padding").unwrap();
             }
         }

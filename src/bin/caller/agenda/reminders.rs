@@ -493,6 +493,15 @@ pub(crate) struct SpawnOccurrence {
     pub(crate) goal: String,
     pub(crate) orchestrate: bool,
     pub(crate) fire_at_ms: u64,
+    /// Interactive spawn (the manifest's additive flag): the session opens
+    /// with the goal as its first user message and waits for the owner —
+    /// composer parity — instead of running as an autonomous goal task.
+    pub(crate) interactive: bool,
+    /// The manifest's explicit project root, if the approval bound one.
+    pub(crate) project_root: Option<String>,
+    /// The parking session (item provenance) — the fallback the dispatcher
+    /// resolves a project from when the manifest carries none.
+    pub(crate) provenance_session_id: Option<String>,
 }
 
 /// Occurrence identity for a scheduled session: entry + effect + the
@@ -596,6 +605,9 @@ pub(crate) fn plan(
                 goal: effect.manifest.goal.clone(),
                 orchestrate: effect.manifest.orchestrate,
                 fire_at_ms: effect.manifest.fire_at_ms,
+                interactive: effect.manifest.interactive,
+                project_root: effect.manifest.project_root.clone(),
+                provenance_session_id: item.provenance.session_id.clone(),
             };
             if progress.prepared {
                 // Crash between prepare and launch confirmation: fail

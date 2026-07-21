@@ -1900,6 +1900,7 @@ impl IntendantServer {
                     task: params.task,
                     orchestrate: params.orchestrate,
                     direct: None,
+                    project_root: None,
                     reference_frame_ids: params.reference_frame_ids,
                     display_target: params.display_target,
                     attachments: vec![],
@@ -1933,6 +1934,7 @@ impl IntendantServer {
                     task: params.task,
                     orchestrate: params.orchestrate,
                     direct: None,
+                    project_root: None,
                     reference_frame_ids: params.reference_frame_ids,
                     display_target: params.display_target,
                     attachments: vec![],
@@ -3707,12 +3709,14 @@ pub(crate) mod tests {
                     task,
                     orchestrate,
                     direct,
+                    project_root,
                     reference_frame_ids,
                     display_target,
                     attachments,
                     follow_up_id,
                     delegation_id,
                 }))) => {
+                    assert!(project_root.is_none());
                     assert_eq!(session_id.as_deref(), Some("managed-session-1"));
                     assert_eq!(task, "continue existing managed session");
                     assert_eq!(orchestrate, None);

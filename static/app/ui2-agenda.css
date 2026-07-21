@@ -224,6 +224,52 @@ html.ui-v2 .agenda-item-answer {
   border-left: 2px solid var(--green);
   padding-left: 9px;
 }
+/* Structured rich-ask archive: per-question "Header: answer" rows, the
+   picked option labels, follow-ups, and anchored preview notes — all
+   quoted data, in the item's question order. */
+html.ui-v2 .agenda-answer-structured {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  white-space: normal;
+}
+html.ui-v2 .agenda-answer-q {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+html.ui-v2 .agenda-answer-line {
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .agenda-answer-qname {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 .agenda-answer-picks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+html.ui-v2 .agenda-chip.pick {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green, #98c379) 12%, transparent);
+}
+html.ui-v2 .agenda-answer-extra {
+  font-size: 11.5px;
+  color: var(--text-3);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Dismissed-but-open questions: a quiet state marker, never an alarm —
+   the rails were cleared deliberately; the item stays open here. */
+html.ui-v2 .agenda-chip.dismissed {
+  color: var(--text-3);
+  background: none;
+  border: 1px dashed var(--line);
+}
 html.ui-v2 .agenda-card-q {
   font-family: var(--mono);
   font-size: 11px;
@@ -555,3 +601,178 @@ html.ui-v2 .agenda-thread-add .agenda-thread-input:focus {
   outline: none;
   border-color: var(--iris);
 }
+
+/* ---- Start-now confirm sheet (owner ruling 2026-07-21) ----
+   The explanation IS the surface: goal text, project, inherited config,
+   Interactive/Goal-run toggle, Start + Cancel. Bottom sheet on coarse
+   pointers / narrow viewports, anchored popover-card on desktop — the
+   #vitals-explainer house mechanics, in the agenda's token vocabulary.
+   Nothing here depends on hover. */
+#agenda-start-sheet[hidden] { display: none; }
+#agenda-start-sheet .ags-backdrop { display: none; }
+#agenda-start-sheet.sheet .ags-backdrop {
+  display: block;
+  position: fixed;
+  inset: 0;
+  z-index: 940;
+  background: rgba(0, 0, 0, 0.45);
+}
+#agenda-start-sheet .ags-panel {
+  position: fixed;
+  z-index: 941;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  background: var(--surface, #14171F);
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+  padding: 12px 14px;
+  width: min(440px, calc(100vw - 16px));
+  max-height: min(78vh, 640px);
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+#agenda-start-sheet.sheet .ags-panel {
+  left: 0;
+  right: 0;
+  bottom: 0;
+  top: auto;
+  width: auto;
+  max-width: none;
+  border-radius: 16px 16px 0 0;
+  border-bottom: 0;
+  max-height: 78vh;
+  padding: 16px 18px calc(16px + env(safe-area-inset-bottom, 0px));
+}
+.ags-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+}
+.ags-title {
+  color: var(--text);
+  font-weight: 700;
+  font-size: 13px;
+}
+.ags-close {
+  background: none;
+  border: 0;
+  color: var(--text-3);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+.ags-close:hover { color: var(--text); }
+.ags-sub { color: var(--text-2); }
+.ags-item {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+  border-left: 2px solid var(--iris);
+  padding-left: 8px;
+  overflow-wrap: anywhere;
+}
+.ags-label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-3);
+  margin-top: 3px;
+}
+.ags-goal,
+.ags-project {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 6px 8px;
+}
+.ags-goal {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  resize: vertical;
+  min-height: 84px;
+}
+.ags-goal:focus,
+.ags-project:focus {
+  outline: none;
+  border-color: var(--iris);
+}
+.ags-hint {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+}
+.ags-hint.ags-hint-required { color: var(--amber); }
+.ags-config {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  border-top: 1px solid var(--line);
+  padding-top: 7px;
+}
+.ags-seg {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  align-self: flex-start;
+}
+.ags-seg-btn {
+  background: none;
+  border: 0;
+  color: var(--text-2);
+  font-size: 11.5px;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+.ags-seg-btn + .ags-seg-btn { border-left: 1px solid var(--line); }
+.ags-seg-btn.active {
+  background: rgba(var(--iris-rgb), 0.16);
+  color: var(--iris-2);
+}
+.ags-note { color: var(--text-2); font-size: 11.5px; }
+.ags-error {
+  color: var(--rose);
+  font-size: 11.5px;
+  border-left: 2px solid var(--rose);
+  padding-left: 8px;
+  overflow-wrap: anywhere;
+}
+.ags-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+.ags-btn {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text-2);
+  font-size: 12px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.ags-btn:hover {
+  border-color: var(--iris);
+  color: var(--iris);
+}
+.ags-btn:disabled { opacity: 0.5; cursor: default; }
+.ags-btn.ags-start {
+  background: var(--iris);
+  border-color: var(--iris);
+  color: var(--on-accent);
+  font-weight: 650;
+}
+.ags-btn.ags-start:hover { background: var(--iris-2); border-color: var(--iris-2); }

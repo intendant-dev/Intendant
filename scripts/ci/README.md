@@ -228,9 +228,18 @@ file for the whole wait and poll every eligible permit at 100ms
 Borrowing: before touching a foreign-class permit, probe that class's
 demand file with LOCK_EX|LOCK_NB — success (released immediately)
 means no waiters, so idle capacity is never wasted; failure means the
-class has waiters and its reservation is honored. Nothing is ever
-killed or signalled; borrowed permits return naturally when their
-holder exits.
+class has waiters and its reservation is honored. The same probe
+guards a class's own queue: a fresh arrival probes its OWN demand file
+before its first grab and, when waiters are registered, joins the
+queue (register, then poll sleeping-first) instead of racing the
+sleepers for a freed permit — without this, a cargo's back-to-back
+compile stream regrabs the permit within milliseconds of each release
+and can starve a parked waiter for minutes (measured at 194s,
+2026-07-21). A compile-permit waiter parked past ten seconds emits one
+concise stderr notice (crate, elapsed, class), the link queue's
+five-second diagnostic tuned for a queue where multi-second waits are
+routine. Nothing is ever killed or signalled; borrowed permits return
+naturally when their holder exits.
 
 ### The linker-phase gate: heavyweight final links serialize
 
@@ -313,20 +322,29 @@ deliberately isolated diagnostic invocation. Observability: one
 compile-permit acquisition line per governed invocation in
 `<permit_dir>/governor.log` — timestamp, pid, class, crate,
 `kind=compile` (plus `link=deferred` for a heavyweight), permit, and
-`wait_ms`. The linker shim adds
+`wait_ms` — and one `kind=compile-done runtime_ms=…` line at its reap:
+the permit HOLD time, which next to `wait_ms` is the utilization datum
+permit-count sizing divides by wall clock. The linker shim adds
 `kind=link link_slot=… link_wait_ms=… queue=… scope=linker` (or
 `kind=link-ungated reason=off|degraded`) and
 `kind=link-done runtime_ms=… scope=linker`. That runtime is actual linker
 wall time, no longer compile+codegen+link. Truncate-in-place rotation at
-1MB keeps the last 256K — the hooks-log doctrine, because governed
-accounts can write the pre-created log/ticket files but cannot create
-siblings in the root-owned dir.
+8MB keeps the last 2MB (about a week and a day-plus respectively at a
+busy agent box's measured burn) — the hooks-log doctrine, because
+governed accounts can write the pre-created log/ticket files but cannot
+create siblings in the root-owned dir.
 
 ### Sizing, install, rollout
 
 Per box: `local_reserved + ci_reserved` = the machine-wide ceiling of
 concurrent rustc processes; the per-account jobs cap still bounds any
 single cargo underneath it. The 24GB two-listener Mac runs 1 + 2.
+Ceilings sized before the link gate existed deserve a revisit: with
+heavyweight final links serialized separately, the ordinary ceiling no
+longer carries the link-RSS risk it originally defended against, and
+the `kind=compile-done` hold times against wall clock are the
+utilization data for that call (a 16GB box's single permit measured
+2.8h of cumulative queue wait in one 8.5h window, 2026-07-21).
 Don't set a class to 0 unless it truly never compiles — its members
 would then depend entirely on borrowing. `link_slots` (default 1 in the
 binary, so a binary upgrade turns the gate on with pre-gate configs)

@@ -774,6 +774,54 @@ pub fn conversation_for_wrapper(home: &Path, wrapper_session_id: &str) -> Option
     })
 }
 
+/// The recorded project root of a wrapper session id, resolved like
+/// [`conversation_for_wrapper`] — from the raw index, deliberately NOT
+/// requiring any log dir to still exist: provenance recorded at park time
+/// must keep resolving after the parking wrapper's dir is pruned. Prefers
+/// the named wrapper's own record; falls back to the best sibling record
+/// of the same conversation that carries a root.
+pub fn recorded_project_root_for_wrapper(home: &Path, wrapper_session_id: &str) -> Option<String> {
+    let wrapper_session_id = wrapper_session_id.trim();
+    if wrapper_session_id.is_empty() {
+        return None;
+    }
+    let _guard = INDEX_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    with_index_unlocked(home, |index| {
+        let own = index
+            .wrappers
+            .iter()
+            .find(|record| record.intendant_session_id == wrapper_session_id)?;
+        if let Some(root) = own
+            .project_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|root| !root.is_empty())
+        {
+            return Some(root.to_string());
+        }
+        let mut siblings: Vec<&ExternalWrapperRecord> = index
+            .wrappers
+            .iter()
+            .filter(|record| {
+                record.source == own.source
+                    && record.backend_session_id == own.backend_session_id
+                    && record
+                        .project_root
+                        .as_deref()
+                        .is_some_and(|root| !root.trim().is_empty())
+            })
+            .collect();
+        siblings.sort_by(|a, b| wrapper_preference(a, b));
+        siblings
+            .first()
+            .and_then(|record| record.project_root.as_deref())
+            .map(|root| root.trim().to_string())
+    })
+}
+
 pub fn wrappers_for_source(home: &Path, source: &str) -> Vec<ExternalWrapperRecord> {
     let source = crate::session_names::normalize_source(source);
     if source.is_empty() {

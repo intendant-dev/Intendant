@@ -225,6 +225,20 @@ Five visible views (the first retains the internal `log` id for compatibility):
   remain. Skip and Deny complete the set (`y` / `a` / `s` / `n`). A follow-up
   text input sends a message after a round completes.
 
+  The **question rail** is the approval card's sibling for requests of
+  *input*, never permission (`ask_user`, `ctl ask`): up to four structured
+  questions on one panel, each with options and pick bounds, optional free
+  text, a per-question follow-up input, and rendered **preview cards**
+  (show-then-ask: sandboxed HTML prototypes, images, text snippets) that
+  accept anchored notes. A blocking ask shows its expiry as a live
+  countdown the user can **hold** open; the panel can be tucked away and
+  restored from a chip. **Agenda-backed (parked) asks** ride the same panel
+  with no countdown: they never expire, dismissing one (skip/deny) clears
+  the rails but leaves the item open on the Agenda — where its card wears a
+  "dismissed · still open" chip and an **Open question panel** button
+  brings it back — and answers land on the item (and are delivered into
+  the asking session while it still lives).
+
   Pending requests also escalate beyond the open tab (the **attention
   center**, `static/app/57-attention-notifications.js`): every pending
   approval/question across sessions counts into a `(N)` document-title
@@ -360,11 +374,24 @@ after each pane action, thread-action result, session start, and usage update.
 
 A durable daemon ledger for intent that must outlive the current model context:
 tasks, notes, questions, and deferred follow-ups. The tab can add items, filter
-Open / Done / Retired / All, answer questions, complete, reopen, or retire
-entries, and tune due-reminder delivery (including quiet hours and per-item
-urgency). Bodies and answers are rendered as quoted data, never executed as
-instructions. The same cache feeds a compact Activity card and refreshes over
-the live `agenda_changed` lane.
+Open / Blocked / Questions / Done / Retired / All, answer questions, complete,
+reopen, or retire entries, and tune due-reminder delivery (including quiet
+hours and per-item urgency). Bodies and answers are rendered as quoted data,
+never executed as instructions. The same cache feeds a compact Activity card
+and refreshes over the live `agenda_changed` lane.
+
+**Questions** is a kind view: the open questions plus the answered archive.
+An open rich (ask-backed) question leads with its **Open question panel**
+button — options and previews live on the question rail — with the inline
+input as the explicit plain-text path; a dismissed-but-open one wears a
+quiet "dismissed · still open" chip and is not re-announced automatically
+(the button is the way back). An answered ask-backed item renders the full
+structured breakdown — per-question "Header: answer" lines, the picked
+option labels, follow-ups, and preview-anchored notes — not just the
+joined text. See the [Agenda chapter](./agenda-and-memory.md) for the
+park-vs-block doctrine and delivery semantics; **Start now**'s confirm
+sheet and the origin-conversation follow-up affordances are covered there
+too.
 
 Agenda also carries proposed scheduled-session effects. Agents may propose a
 goal and fire time, but no work runs until an owner surface approves the exact
