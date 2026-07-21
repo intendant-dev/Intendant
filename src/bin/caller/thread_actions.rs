@@ -4018,7 +4018,7 @@ pub(crate) fn emit_external_session_goal(
 /// renderable without a link).
 pub(crate) fn validated_pr_url(raw: &str) -> Option<String> {
     let parsed = url::Url::parse(raw.trim()).ok()?;
-    if parsed.scheme() != "https" || parsed.host_str().map_or(true, str::is_empty) {
+    if parsed.scheme() != "https" || parsed.host_str().is_none_or(str::is_empty) {
         return None;
     }
     Some(parsed.into())
