@@ -1506,6 +1506,7 @@ pub(crate) async fn handle_control_command_mcp(
                         task: task_text,
                         orchestrate: Some(false),
                         direct: None,
+                        project_root: None,
                         reference_frame_ids: vec![],
                         display_target: None,
                         attachments: vec![],

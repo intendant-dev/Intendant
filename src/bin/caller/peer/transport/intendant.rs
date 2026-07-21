@@ -627,6 +627,7 @@ impl PeerTransport for IntendantWsTransport {
                     task: task.instructions,
                     orchestrate: None,
                     direct: None,
+                    project_root: None,
                     reference_frame_ids: Vec::new(),
                     display_target: None,
                     attachments: Vec::new(),

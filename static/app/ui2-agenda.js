@@ -341,7 +341,11 @@ function agendaEffectBlock(item) {
     : '';
   const chips =
     (whenLabel ? `<span class="agenda-chip due">at ${escapeHtml(whenLabel)}</span>` : '')
-    + (manifest.orchestrate ? '<span class="agenda-chip">orchestrate</span>' : '');
+    + (manifest.orchestrate ? '<span class="agenda-chip">orchestrate</span>' : '')
+    + (manifest.interactive ? '<span class="agenda-chip" title="Opens the session with the goal as its first message, then waits for you">interactive</span>' : '')
+    + (manifest.project_root
+      ? `<span class="agenda-chip" title="${escapeHtml(`project: ${manifest.project_root}`)}">${escapeHtml(agendaShortPath(manifest.project_root))}</span>`
+      : '');
   const proposer = agendaActorLabel({
     kind: effect.proposed_kind,
     session_id: effect.proposed_session_id,
@@ -489,19 +493,402 @@ function agendaFollowUpSid(item) {
   return null;
 }
 
-// Open the composer targeted at the recorder's conversation with the item
-// quoted as data. No daemon write happens here.
+// The ORIGIN conversation when it is not live but still resolvable on this
+// daemon (the list response's sessions join): ended-but-resumable. The
+// follow-up then rides the EXISTING resume path — never an unrelated new
+// session (owner ruling, 2026-07-21).
+function agendaFollowUpResumable(item) {
+  const recorded = item.provenance && item.provenance.session_id;
+  if (!recorded) return null;
+  const info = agendaSessionInfo(recorded);
+  if (!info || !info.conversation_id) return null;
+  if (typeof resumeSession !== 'function') return null;
+  return info;
+}
+
+// Prefill the activity composer with the item quoted as data. No daemon
+// write happens here; the user sends when ready.
+function agendaQuoteIntoComposer(item) {
+  const input = document.getElementById('activity-task-input');
+  if (!input) return;
+  const body = item.body ? `\n> ${String(item.body).split('\n').join('\n> ')}` : '';
+  input.value =
+    `Following up on agenda item ${item.id} (quoted):\n> ${item.title}${body}\n\n`;
+  input.focus();
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
+// Open the composer targeted at the recorder's LIVE conversation with the
+// item quoted as data. No daemon write happens here.
 function agendaFollowUpWithRecorder(item, sid) {
   routeTo('activity');
   if (typeof focusSessionWindow === 'function') focusSessionWindow(sid);
-  const input = document.getElementById('activity-task-input');
-  if (input) {
-    const body = item.body ? `\n> ${String(item.body).split('\n').join('\n> ')}` : '';
-    input.value =
-      `Following up on agenda item ${item.id} (quoted):\n> ${item.title}${body}\n\n`;
-    input.focus();
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.setSelectionRange(input.value.length, input.value.length);
+  agendaQuoteIntoComposer(item);
+}
+
+// Follow up on an ENDED origin conversation: resume it through the same
+// path the Sessions tab uses (the daemon applies the session's persisted
+// launch config; the recorded project root rides along for external
+// CLIs), then target the composer at it with the item quoted. The resume
+// attaches to the SAME conversation — never a fresh unrelated session.
+function agendaFollowUpResume(item) {
+  const recorded = item.provenance && item.provenance.session_id;
+  const info = agendaSessionInfo(recorded);
+  if (!info || typeof resumeSession !== 'function') return;
+  const conversationId = info.conversation_id || recorded;
+  resumeSession({
+    session_id: conversationId,
+    source: info.source || 'intendant',
+    backend_session_id: conversationId,
+    project_root: info.project_root || null,
+  });
+  agendaQuoteIntoComposer(item);
+}
+
+// Leading-component path truncation for chips (the tail is the
+// informative part). Reuses the vitals helper when loaded.
+function agendaShortPath(path) {
+  if (typeof vitalsLeadingTruncatedPath === 'function') {
+    return vitalsLeadingTruncatedPath(path, 28);
+  }
+  const raw = String(path || '');
+  return raw.length > 28 ? `…${raw.slice(-27)}` : raw;
+}
+
+// ---- Start-now confirm sheet ----
+// The explanation IS the surface (owner ruling 2026-07-21): before anything
+// runs, the sheet shows what will run — editable goal text, the resolved
+// project, the config the spawn inherits — with an Interactive/Goal-run
+// toggle defaulting to Interactive. Bottom sheet on coarse pointers /
+// narrow viewports, anchored popover-card on desktop (the #vitals-explainer
+// house mechanics); tooltips may remain but nothing DEPENDS on hover.
+
+let agendaStartSheetItemId = null;
+let agendaStartSheetMode = 'interactive';
+let agendaStartSheetGoalDirty = false;
+// Daemon default project root: null = not fetched yet, '' = projectless
+// daemon, non-empty = the default. Same source the New Session pane uses
+// (api_project_root via fetchProjectRoot).
+let agendaDaemonDefaultProject = null;
+
+const AGENDA_START_MODES = [
+  {
+    value: 'interactive',
+    label: 'Interactive',
+    note: 'Opens the session with this text as its first message, then waits for you — like a session started from the composer.',
+  },
+  {
+    value: 'goal',
+    label: 'Goal run',
+    note: 'Runs the text autonomously as a supervised goal; follow-through instructions are appended and the outcome is written back to this item.',
+  },
+];
+
+function agendaSheetFormFactor() {
+  if (typeof vitalsExplainerUsesSheet === 'function') return vitalsExplainerUsesSheet();
+  return window.matchMedia('(max-width: 720px)').matches
+    || window.matchMedia('(pointer: coarse)').matches;
+}
+
+// The sheet's default goal statement: the item quoted as data with its id
+// (the daemon composes the same statement for parameterless callers; the
+// sheet always SENDS its editable text, so what you read is what runs —
+// plus the selected mode's fixed coda, named by the mode note).
+function agendaStartGoalStatement(item) {
+  let statement = `Agenda follow-through for item ${item.id}: ${item.title}`;
+  if (item.body && item.body.trim()) {
+    statement += `\n\nItem body (quoted):\n${item.body}`;
+  }
+  return statement;
+}
+
+// Project prefill resolution, mirroring the daemon's ratified order:
+// the parking session's recorded root (from the list response's sessions
+// join) → the daemon default → an explicit pick is REQUIRED.
+function agendaStartProjectResolution(item) {
+  const recorded = item.provenance && item.provenance.session_id;
+  const info = agendaSessionInfo(recorded);
+  if (info && info.project_root) {
+    return { value: info.project_root, source: 'provenance' };
+  }
+  if (agendaDaemonDefaultProject) {
+    return { value: agendaDaemonDefaultProject, source: 'daemon_default' };
+  }
+  return { value: '', source: agendaDaemonDefaultProject === null ? 'unknown' : 'none' };
+}
+
+function agendaStartProjectHint(source) {
+  if (source === 'provenance') return 'from the parking session';
+  if (source === 'daemon_default') return 'daemon default';
+  if (source === 'none') {
+    return 'required — this daemon runs without a default project';
+  }
+  return 'checking the daemon default…';
+}
+
+function agendaEnsureStartSheet() {
+  let host = document.getElementById('agenda-start-sheet');
+  if (host) return host;
+  host = document.createElement('div');
+  host.id = 'agenda-start-sheet';
+  host.hidden = true;
+  const backdrop = document.createElement('div');
+  backdrop.className = 'ags-backdrop';
+  backdrop.addEventListener('click', agendaCloseStartSheet);
+  const panel = document.createElement('div');
+  panel.className = 'ags-panel';
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-label', 'Start a session from this agenda item');
+  host.appendChild(backdrop);
+  host.appendChild(panel);
+  document.body.appendChild(host);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !host.hidden) agendaCloseStartSheet();
+  });
+  // Capture phase, mirroring the vitals explainer: any outside press
+  // dismisses; a press on another item's Start now re-opens fresh.
+  document.addEventListener('pointerdown', (event) => {
+    if (host.hidden) return;
+    if (event.target.closest?.('#agenda-start-sheet .ags-panel, .agenda-start-now')) return;
+    agendaCloseStartSheet();
+  }, true);
+  return host;
+}
+
+function agendaCloseStartSheet() {
+  const host = document.getElementById('agenda-start-sheet');
+  if (!host) return;
+  host.hidden = true;
+  host.classList.remove('sheet', 'popover');
+  agendaStartSheetItemId = null;
+}
+
+function agendaStartSheetEl(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+// The config summary the spawn inherits, from the same client-held sources
+// the New Session pane reads (settings' configured agent; honest daemon
+// defaults — nothing here is a second catalog).
+function agendaStartConfigSummary(mode) {
+  const configured = (typeof newSessionConfiguredAgent !== 'undefined' && newSessionConfiguredAgent)
+    ? newSessionConfiguredAgent : '';
+  const backend = configured
+    ? ((typeof prettyAgentName === 'function' && prettyAgentName(configured)) || configured)
+    : 'Internal agent';
+  const execution = mode === 'interactive'
+    ? 'composer defaults (waits for you after opening)'
+    : 'direct goal run';
+  return `${backend} (daemon default) · ${execution} · supervised, normal approvals`;
+}
+
+function agendaPresentStartSheet(host, panel, anchor) {
+  const sheet = agendaSheetFormFactor();
+  host.hidden = false;
+  host.classList.toggle('sheet', sheet);
+  host.classList.toggle('popover', !sheet);
+  panel.style.left = '';
+  panel.style.top = '';
+  if (sheet || !anchor?.getBoundingClientRect) return;
+  const rect = anchor.getBoundingClientRect();
+  const pw = Math.min(panel.offsetWidth || 380, window.innerWidth - 16);
+  const ph = panel.offsetHeight || 300;
+  const left = Math.max(8, Math.min(rect.left, window.innerWidth - pw - 8));
+  let top = rect.bottom + 6;
+  if (top + ph > window.innerHeight - 8) top = Math.max(8, rect.top - ph - 6);
+  panel.style.left = `${Math.round(left)}px`;
+  panel.style.top = `${Math.round(top)}px`;
+}
+
+function agendaOpenStartSheet(itemId, anchor) {
+  const item = agendaFindItem(itemId);
+  if (!item || item.status !== 'open') return;
+  const host = agendaEnsureStartSheet();
+  const panel = host.querySelector('.ags-panel');
+  panel.textContent = '';
+  agendaStartSheetItemId = itemId;
+  agendaStartSheetMode = 'interactive';
+  agendaStartSheetGoalDirty = false;
+
+  // Header: the explanation leads.
+  const head = agendaStartSheetEl('div', 'ags-head');
+  head.appendChild(agendaStartSheetEl('span', 'ags-title', 'Start a session'));
+  const close = agendaStartSheetEl('button', 'ags-close', '×');
+  close.type = 'button';
+  close.setAttribute('aria-label', 'Cancel');
+  close.addEventListener('click', agendaCloseStartSheet);
+  head.appendChild(close);
+  panel.appendChild(head);
+  panel.appendChild(agendaStartSheetEl('div', 'ags-sub',
+    'Runs a supervised session to work this item.'));
+  panel.appendChild(agendaStartSheetEl('div', 'ags-item',
+    `${item.kind}: ${item.title}`));
+
+  // Editable goal text (what the session receives).
+  const goalLabel = agendaStartSheetEl('label', 'ags-label', 'Goal — the session’s opening text');
+  goalLabel.setAttribute('for', 'ags-goal');
+  panel.appendChild(goalLabel);
+  const goal = document.createElement('textarea');
+  goal.id = 'ags-goal';
+  goal.className = 'ags-goal';
+  goal.rows = 5;
+  goal.value = agendaStartGoalStatement(item);
+  goal.addEventListener('input', () => { agendaStartSheetGoalDirty = true; });
+  panel.appendChild(goal);
+
+  // Project row: prefilled by the ratified resolution, always editable.
+  const projLabel = agendaStartSheetEl('label', 'ags-label', 'Project directory');
+  projLabel.setAttribute('for', 'ags-project');
+  panel.appendChild(projLabel);
+  const project = document.createElement('input');
+  project.type = 'text';
+  project.id = 'ags-project';
+  project.className = 'ags-project';
+  project.placeholder = 'Absolute path, e.g. /home/you/projects/thing';
+  project.autocomplete = 'off';
+  project.spellcheck = false;
+  panel.appendChild(project);
+  const projHint = agendaStartSheetEl('div', 'ags-hint', '');
+  panel.appendChild(projHint);
+  const applyResolution = () => {
+    const resolved = agendaStartProjectResolution(item);
+    // Never clobber a user edit; only fill while untouched.
+    if (!project.dataset.touched && !project.value) {
+      project.value = resolved.value;
+    }
+    // An empty box means "let the daemon resolve" (provenance → default),
+    // so its hint honestly names that fallback; a typed value is an
+    // explicit pick the manifest records verbatim.
+    const source = project.value
+      ? (project.dataset.touched ? 'explicit' : resolved.source)
+      : resolved.source;
+    projHint.textContent = source === 'explicit'
+      ? 'explicit pick — recorded on the manifest'
+      : agendaStartProjectHint(source);
+    projHint.classList.toggle('ags-hint-required', !project.value && source === 'none');
+  };
+  project.addEventListener('input', () => {
+    project.dataset.touched = '1';
+    applyResolution();
+  });
+  applyResolution();
+  // The daemon default arrives async on first open — same source as the
+  // New Session pane (api_project_root); re-resolve when it lands.
+  if (agendaDaemonDefaultProject === null && typeof fetchProjectRoot === 'function') {
+    fetchProjectRoot()
+      .then((d) => { agendaDaemonDefaultProject = (d && d.project_root) || ''; })
+      .catch(() => { agendaDaemonDefaultProject = ''; })
+      .finally(() => {
+        if (agendaStartSheetItemId === itemId) applyResolution();
+      });
+  }
+
+  // Config the spawn inherits (honest daemon defaults; same sources the
+  // New Session pane reads).
+  const config = agendaStartSheetEl('div', 'ags-config', agendaStartConfigSummary('interactive'));
+  panel.appendChild(config);
+
+  // Interactive / Goal-run toggle (Interactive is the ratified default).
+  const seg = agendaStartSheetEl('div', 'ags-seg');
+  seg.setAttribute('role', 'group');
+  seg.setAttribute('aria-label', 'Session mode');
+  const note = agendaStartSheetEl('div', 'ags-note', AGENDA_START_MODES[0].note);
+  const syncSeg = () => {
+    for (const btn of seg.querySelectorAll('button[data-mode]')) {
+      const active = btn.dataset.mode === agendaStartSheetMode;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    }
+    const choice = AGENDA_START_MODES.find((m) => m.value === agendaStartSheetMode)
+      || AGENDA_START_MODES[0];
+    note.textContent = choice.note;
+    config.textContent = agendaStartConfigSummary(agendaStartSheetMode);
+  };
+  for (const choice of AGENDA_START_MODES) {
+    const btn = agendaStartSheetEl('button', 'ags-seg-btn', choice.label);
+    btn.type = 'button';
+    btn.dataset.mode = choice.value;
+    btn.addEventListener('click', () => {
+      agendaStartSheetMode = choice.value;
+      syncSeg();
+    });
+    seg.appendChild(btn);
+  }
+  panel.appendChild(seg);
+  panel.appendChild(note);
+
+  // Errors render inline — the sheet is the surface, not a toast race.
+  const error = agendaStartSheetEl('div', 'ags-error', '');
+  error.hidden = true;
+  panel.appendChild(error);
+
+  const foot = agendaStartSheetEl('div', 'ags-foot');
+  const cancel = agendaStartSheetEl('button', 'ags-btn', 'Cancel');
+  cancel.type = 'button';
+  cancel.addEventListener('click', agendaCloseStartSheet);
+  const start = agendaStartSheetEl('button', 'ags-btn ags-start', 'Start session');
+  start.type = 'button';
+  start.addEventListener('click', () =>
+    agendaStartSheetSubmit(item, goal, project, error, start));
+  foot.appendChild(cancel);
+  foot.appendChild(start);
+  panel.appendChild(foot);
+
+  syncSeg();
+  agendaPresentStartSheet(host, panel, anchor);
+  goal.focus();
+}
+
+async function agendaStartSheetSubmit(item, goal, project, error, startBtn) {
+  const goalText = (goal.value || '').trim();
+  const projectText = (project.value || '').trim();
+  const showError = (message) => {
+    error.textContent = message;
+    error.hidden = false;
+  };
+  error.hidden = true;
+  if (!goalText) {
+    showError('The goal text must not be empty.');
+    goal.focus();
+    return;
+  }
+  if (!projectText && agendaDaemonDefaultProject === '') {
+    // Known-projectless with nothing resolved: the daemon would refuse —
+    // say so here, pointing at the field (the daemon's named refusal
+    // remains the backstop for every other caller).
+    showError('Pick a project directory — this daemon runs without a default project.');
+    project.focus();
+    return;
+  }
+  const params = {
+    op: 'start_now',
+    id: item.id,
+    goal: goalText,
+    interactive: agendaStartSheetMode === 'interactive',
+  };
+  if (projectText) params.project_root = projectText;
+  startBtn.disabled = true;
+  try {
+    const resp = await daemonApi.request('api_agenda_op', params);
+    if (resp.ok && resp.body && resp.body.item) {
+      agendaObserveServerMessage({ item: resp.body.item });
+      agendaCloseStartSheet();
+      if (typeof showControlToast === 'function') {
+        showControlToast('success', params.interactive
+          ? 'Session starting — it opens with the item and waits for you.'
+          : 'Goal run starting — the outcome writes back to the item.');
+      }
+      return;
+    }
+    showError((resp.body && resp.body.error) || `start failed (${resp.status})`);
+  } catch (e) {
+    showError(String(e && e.message || e));
+  } finally {
+    startBtn.disabled = false;
   }
 }
 
@@ -512,10 +899,13 @@ function agendaActionButtons(item) {
   else actions.push(['reopen', 'Reopen']);
   let extra = '';
   if (item.status === 'open') {
-    // Owner start-now: ONE gesture — the daemon mints the manifest from
-    // this item, the gesture is the approval (digest bound server-side
-    // under the same lock), and it fires through the ordinary scheduled
-    // lane. Owner surface = this dashboard; agents get NotPermitted.
+    // Owner start-now: opens the CONFIRM SHEET (bottom sheet on coarse
+    // pointers, popover on desktop) — what will run (goal, project,
+    // config, Interactive/Goal-run) is reviewed there; the daemon mints
+    // + approves the manifest from the confirmed parameters and fires
+    // through the ordinary scheduled lane. The one-click instant fire is
+    // retired on dashboard surfaces (owner ruling, 2026-07-21). Owner
+    // surface = this dashboard; agents get NotPermitted.
     // NOT on rich parked asks: those await the owner's ANSWER — spawning
     // a follow-through session on one just re-reads the question at the
     // owner (live-QA footgun 2026-07-20). Answering is the primary act;
@@ -523,11 +913,16 @@ function agendaActionButtons(item) {
     const richAsk = item.kind === 'question'
       && item.ask && Array.isArray(item.ask.questions) && item.ask.questions.length;
     if (!richAsk) {
-      extra += `<button type="button" class="agenda-btn agenda-start-now" data-id="${escapeHtml(item.id)}" title="Mint + approve a session from this item and start it now (runs through the standard scheduled lane)">Start now</button>`;
+      extra += `<button type="button" class="agenda-btn agenda-start-now" data-id="${escapeHtml(item.id)}" title="Review and start a supervised session from this item">Start now</button>`;
     }
+    // Follow-up targets the ORIGIN conversation: live window → composer;
+    // ended but resumable → the existing resume path. Never a silent
+    // unrelated new session.
     const sid = agendaFollowUpSid(item);
     if (sid) {
       extra += `<button type="button" class="agenda-btn agenda-follow-up" data-id="${escapeHtml(item.id)}" data-sid="${escapeHtml(sid)}" title="The recording conversation is live — open the composer targeted at it with this item quoted">Follow up</button>`;
+    } else if (agendaFollowUpResumable(item)) {
+      extra += `<button type="button" class="agenda-btn agenda-follow-up-resume" data-id="${escapeHtml(item.id)}" title="The recording conversation has ended — resume it (same conversation, its recorded project) and open the composer with this item quoted">Follow up (resumes session)</button>`;
     }
   }
   const buttons = extra + actions
@@ -753,15 +1148,21 @@ function agendaRenderTab() {
     sel.addEventListener('change', () =>
       agendaSetItemUrgency(sel.dataset.id, sel.value, sel));
   });
-  // F3 act-on-item wiring.
+  // F3 act-on-item wiring: Start now opens the confirm sheet (never an
+  // instant fire); follow-up routes to the origin conversation.
   list.querySelectorAll('button.agenda-start-now').forEach((btn) => {
-    btn.addEventListener('click', () =>
-      agendaSendOp({ op: 'start_now', id: btn.dataset.id }, btn));
+    btn.addEventListener('click', () => agendaOpenStartSheet(btn.dataset.id, btn));
   });
   list.querySelectorAll('button.agenda-follow-up').forEach((btn) => {
     btn.addEventListener('click', () => {
       const item = agendaFindItem(btn.dataset.id);
       if (item) agendaFollowUpWithRecorder(item, btn.dataset.sid);
+    });
+  });
+  list.querySelectorAll('button.agenda-follow-up-resume').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const item = agendaFindItem(btn.dataset.id);
+      if (item) agendaFollowUpResume(item);
     });
   });
   // F2 thread + gates wiring.

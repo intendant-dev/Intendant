@@ -316,11 +316,18 @@ pub(crate) fn spawn_mode_web_gateway(
     let agenda_dir = crate::agenda::agenda_dir();
     mcp_http_state.agenda = match crate::agenda::AgendaStore::open(&agenda_dir) {
         Ok(store) => {
-            let handle = Arc::new(crate::agenda::AgendaHandle::new(
-                store,
-                bus.clone(),
-                &agenda_dir,
-            ));
+            let handle = Arc::new(
+                crate::agenda::AgendaHandle::new(store, bus.clone(), &agenda_dir)
+                    // The scheduled lane resolves spawn projects against the
+                    // real state home (parking-session records) and this
+                    // daemon's default project — `None` here keeps the lane
+                    // fail-closed on a projectless daemon (named refusal,
+                    // never a dead project-less session).
+                    .with_spawn_context(crate::agenda::SessionSpawnContext {
+                        home: crate::platform::home_dir(),
+                        default_project_root: project_root.clone(),
+                    }),
+            );
             // Detaches on drop like the mode listeners; one per daemon.
             let _scheduler = crate::agenda::spawn_reminder_scheduler(handle.clone());
             // Resolves rail answers/dismissals for parked (agenda-backed)

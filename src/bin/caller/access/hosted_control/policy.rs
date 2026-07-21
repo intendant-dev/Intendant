@@ -403,6 +403,7 @@ pub fn hosted_control_msg_allowed(
             task,
             orchestrate,
             direct,
+            project_root,
             reference_frame_ids,
             display_target,
             attachments,
@@ -415,6 +416,7 @@ pub fn hosted_control_msg_allowed(
                 && !task.trim_start().starts_with('/')
                 && orchestrate.is_none()
                 && direct.is_none()
+                && project_root.is_none()
                 && reference_frame_ids.is_empty()
                 && display_target.is_none()
                 && attachments.is_empty()

@@ -58,11 +58,15 @@ fn agenda_sessions_join(
 }
 
 /// One recorded session id → its display identity, or `None` when nothing
-/// on this daemon resolves it anymore.
+/// on this daemon resolves it anymore. `project_root` (additive) is the
+/// session's recorded project root — the Start-now sheet's provenance
+/// prefill and the follow-up resume's launch root derive from it.
 fn agenda_session_join_entry(
     home: &std::path::Path,
     recorded_id: &str,
 ) -> Option<serde_json::Value> {
+    let project_root = crate::agenda::recorded_session_project_root(home, recorded_id)
+        .map(|root| root.to_string_lossy().into_owned());
     // External wrapper (any incarnation) → its backend conversation, which
     // is what the Sessions tab keys rows by.
     if let Some((source, conversation_id)) =
@@ -74,6 +78,7 @@ fn agenda_session_join_entry(
             "conversation_id": conversation_id,
             "key": format!("{source}\u{1f}{conversation_id}"),
             "name": name,
+            "project_root": project_root,
         }));
     }
     // Native session: the id itself is the conversation.
@@ -83,6 +88,7 @@ fn agenda_session_join_entry(
         "conversation_id": recorded_id,
         "key": format!("intendant\u{1f}{recorded_id}"),
         "name": name,
+        "project_root": project_root,
     }))
 }
 
@@ -200,6 +206,7 @@ mod tests {
         // index stores each record under its log dir's identity, so the
         // dirs are NAMED by their wrapper session ids, as real wrapper log
         // dirs are.
+        let wrap_project = tempfile::tempdir().unwrap();
         let wrap_a = home.join("wrappers").join("sess-wrapper-a");
         let wrap_b = home.join("wrappers").join("sess-wrapper-b");
         std::fs::create_dir_all(&wrap_a).unwrap();
@@ -210,7 +217,7 @@ mod tests {
             "conv-backend-1",
             "sess-wrapper-a",
             &wrap_a,
-            None,
+            Some(wrap_project.path()),
         )
         .unwrap();
         crate::external_wrapper_index::upsert(
@@ -239,6 +246,12 @@ mod tests {
         assert_eq!(entry["conversation_id"], "conv-backend-1");
         assert_eq!(entry["key"], "claude-code\u{1f}conv-backend-1");
         assert_eq!(entry["name"], "cert sweep planning");
+        // The recorded project root survives the pruned log dir via the
+        // index record — the Start-now sheet's provenance prefill.
+        assert_eq!(
+            entry["project_root"],
+            wrap_project.path().to_string_lossy().as_ref()
+        );
 
         // Native session: id resolves via its log dir + metadata name.
         let native_dir = crate::platform::intendant_home_in(home)
@@ -247,13 +260,14 @@ mod tests {
         std::fs::create_dir_all(&native_dir).unwrap();
         std::fs::write(
             native_dir.join("session_meta.json"),
-            r#"{"session_id":"sess-native-1","name":"tidy the fixtures"}"#,
+            r#"{"session_id":"sess-native-1","name":"tidy the fixtures","project_root":"/work/native-project"}"#,
         )
         .unwrap();
         let native = agenda_session_join_entry(home, "sess-native-1").expect("native resolves");
         assert_eq!(native["source"], "intendant");
         assert_eq!(native["key"], "intendant\u{1f}sess-native-1");
         assert_eq!(native["name"], "tidy the fixtures");
+        assert_eq!(native["project_root"], "/work/native-project");
 
         // Unknown ids produce no entry (raw-id fallback), and the join map
         // carries exactly the resolvable ids of the items it serves.
