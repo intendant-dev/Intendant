@@ -151,6 +151,12 @@ pub(crate) fn seatbelt_credential_deny_clause() -> Result<String, String> {
     let mut deny_files: Vec<PathBuf> = vec![
         state_root.join("custody-audit.jsonl"),
         state_root.join("connect.toml"),
+        // The Intendant Dev signing identity (bundle-macos.sh) is
+        // load-bearing secret material once custody keychain ACLs key
+        // to it: a same-uid reader who obtains the key or its escrow
+        // can sign a binary the keystore trusts (Track K Q1 rider).
+        state_root.join("signing.keychain-db"),
+        state_root.join("signing-identity.p12"),
     ];
     let env_files: Vec<PathBuf> = std::env::current_dir()
         .map(|cwd| env_file_candidates(&canonicalize_for_profile(&cwd)))
