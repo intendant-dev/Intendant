@@ -550,8 +550,11 @@ pub(crate) fn spawn_attention_nudge_monitor(bus: EventBus) {
     if MONITOR_SPAWNED.swap(true, Ordering::SeqCst) {
         return;
     }
+    // Subscribe BEFORE the task spawns (the supervisor's convention) so
+    // events emitted right after this returns — the agenda's boot
+    // re-announcement of open parked asks — are already in the queue.
+    let mut events = bus.subscribe();
     tokio::spawn(async move {
-        let mut events = bus.subscribe();
         let mut state = MonitorState::new();
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(MONITOR_TICK_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

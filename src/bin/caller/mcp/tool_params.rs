@@ -209,6 +209,14 @@ pub struct AskUserParams {
     /// timeout result telling the agent to proceed on its best judgment.
     #[serde(default)]
     pub wait_seconds: Option<u64>,
+    /// Park instead of blocking: file the question as a durable agenda
+    /// item and return {status:"parked", item_id, ask_id} immediately.
+    /// The question stays on the rail and the agenda until answered; the
+    /// reply lands on the item and, while the asking session lives, is
+    /// delivered back into it as a user message. Don't combine with
+    /// wait_seconds.
+    #[serde(default)]
+    pub park: bool,
     /// Optional target session id. Omit to ask as the calling session.
     #[serde(default, alias = "sessionId")]
     pub session_id: Option<String>,

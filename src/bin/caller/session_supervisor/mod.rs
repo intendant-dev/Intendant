@@ -572,6 +572,18 @@ impl SessionSupervisor {
             AppEvent::SessionEnded { session_id, .. } => {
                 self.remove_session_alias(&session_id).await;
             }
+            // A recorded outcome on an agenda-backed ask: deliver it into
+            // the still-live asking session as ordinary follow-up input
+            // (queued mid-turn, injected at the boundary). Rides the
+            // lossless lane — losing one silently drops the owner's reply.
+            AppEvent::AgendaAskOutcome {
+                item,
+                action,
+                inline_waiter,
+            } => {
+                self.deliver_agenda_ask_outcome(item, &action, inline_waiter)
+                    .await;
+            }
             _ => {}
         }
     }

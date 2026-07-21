@@ -1180,6 +1180,86 @@ impl SessionSupervisor {
         );
     }
 
+    /// Deliver a recorded agenda-ask outcome into the still-live ASKING
+    /// session (ask↔agenda unification, slice 2).
+    ///
+    /// The delivered text is user INPUT — it rides the exact follow-up
+    /// lane user messages ride (the session's `follow_up_tx`, drained at
+    /// turn boundaries: a busy session queues it, an idle session starts
+    /// its next turn with it) under the same addressing resolution
+    /// `route_follow_up` uses. Nothing here widens autonomy.
+    ///
+    /// Quiet by design on every miss: a live blocking waiter returns the
+    /// outcome inline (`inline_waiter`), an unattributed item has no
+    /// asker, and a GONE session gets nothing — the item holds the
+    /// answer and the session-start agenda ritual reads it. Only the
+    /// daemon log records the skip; no dashboard warning, no
+    /// FollowUpStatus, because an answer arriving after its asker ended
+    /// is a normal outcome, not an error.
+    pub(crate) async fn deliver_agenda_ask_outcome(
+        &self,
+        item: crate::agenda::AgendaItem,
+        action: &str,
+        inline_waiter: bool,
+    ) {
+        if inline_waiter {
+            return;
+        }
+        let Some(asker) = item.provenance.session_id.clone() else {
+            return;
+        };
+        let Some(text) = crate::agenda::ask_outcome_delivery_text(&item, action) else {
+            return;
+        };
+        // The same live-session resolution route_follow_up performs:
+        // alias-aware lookup, then the persisted-external re-resolution
+        // for an external asker whose live wrapper re-registered.
+        let lookup = |state: &SupervisorState, requested: &str| {
+            let target = state
+                .resolve_session_id(requested)
+                .unwrap_or_else(|| requested.to_string());
+            state
+                .sessions
+                .get(&target)
+                .map(|s| (target.clone(), s.source.clone(), s.follow_up_tx.clone()))
+        };
+        let entry = { lookup(&*self.state.lock().await, &asker) };
+        let entry = match entry {
+            Some(entry) => Some(entry),
+            None => match self.resolve_persisted_external_managed_id(&asker).await {
+                Some(live_id) => lookup(&*self.state.lock().await, &live_id),
+                None => None,
+            },
+        };
+        let Some((managed_id, source, tx)) = entry else {
+            eprintln!(
+                "[supervisor] agenda ask {} resolved ({action}); asking session {} is gone — \
+                 nothing delivered (the item holds the outcome)",
+                item.id,
+                short_session(&asker),
+            );
+            return;
+        };
+        let msg = FollowUpMessage::text(text).for_target(Some(managed_id.clone()));
+        if tx.send(msg).await.is_err() {
+            eprintln!(
+                "[supervisor] agenda ask {} resolved ({action}); {} session {} is not \
+                 accepting input — nothing delivered (the item holds the outcome)",
+                item.id,
+                source,
+                short_session(&managed_id),
+            );
+        } else {
+            eprintln!(
+                "[supervisor] agenda ask {} outcome ({action}) queued for {} session {} \
+                 (delivers at the next turn boundary)",
+                item.id,
+                source,
+                short_session(&managed_id),
+            );
+        }
+    }
+
     pub(crate) async fn resolve_approval(
         &self,
         session_id: Option<String>,
@@ -1625,6 +1705,262 @@ mod tests {
         parse_codex_slash_command(text)
             .expect("recognized slash command")
             .expect("valid slash command")
+    }
+
+    /// An agenda over a tempdir sharing the supervisor's bus, so real
+    /// handle-side resolutions drive the supervisor's delivery arm.
+    fn test_agenda(dir: &std::path::Path, bus: &EventBus) -> Arc<crate::agenda::AgendaHandle> {
+        Arc::new(crate::agenda::AgendaHandle::new(
+            crate::agenda::AgendaStore::open(dir).unwrap(),
+            bus.clone(),
+            dir,
+        ))
+    }
+
+    fn park_one(
+        agenda: &crate::agenda::AgendaHandle,
+        question: &str,
+        session: Option<&str>,
+    ) -> crate::agenda::AgendaItem {
+        let actor = session.map(|session| {
+            crate::agenda::AgendaActor::from_binding(
+                &crate::access::actor::ActorBinding::agent_session(None, session.to_string()),
+            )
+            .expect("session actor")
+        });
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::Ask {
+                    questions: vec![crate::mcp::AskUserQuestionParams {
+                        question: question.to_string(),
+                        header: Some("Grid".into()),
+                        options: Vec::new(),
+                        previews: Vec::new(),
+                        pick_min: None,
+                        pick_max: None,
+                        free_text: None,
+                    }],
+                },
+                actor,
+            )
+            .unwrap()
+    }
+
+    fn answer_resolution(question: &str, answer: &str) -> crate::agenda::AgendaAskResolution {
+        crate::agenda::resolution_from_wire(
+            std::collections::HashMap::from([(question.to_string(), answer.to_string())]),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+    }
+
+    /// Slice 2 delivery: a recorded answer to a parked ask reaches the
+    /// still-live ASKING session through its follow-up channel — the same
+    /// boundary queue user follow-ups ride (a busy session drains it at
+    /// the next turn boundary) — and NEVER any other session.
+    #[tokio::test]
+    async fn agenda_answer_delivers_to_live_asker_only() {
+        let bus = EventBus::new();
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let (asker_tx, mut asker_rx) = mpsc::channel(4);
+        let (other_tx, mut other_rx) = mpsc::channel(4);
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut asker = managed_session("sess-asker", "intendant");
+            asker.follow_up_tx = asker_tx;
+            state.sessions.insert("sess-asker".to_string(), asker);
+            let mut other = managed_session("sess-other", "intendant");
+            other.follow_up_tx = other_tx;
+            state.sessions.insert("sess-other".to_string(), other);
+        }
+        let _loop_handle = supervisor.clone().spawn();
+
+        let agenda = test_agenda(dir.path(), &bus);
+        let item = park_one(&agenda, "Which grid?", Some("sess-asker"));
+        let ask_id = item.ask.as_ref().unwrap().ask_id;
+
+        // A user follow-up queued FIRST proves the delivery rides the same
+        // ordered lane (boundary queue) user messages ride.
+        bus.send(AppEvent::ControlCommand(event::ControlMsg::FollowUp {
+            session_id: Some("sess-asker".to_string()),
+            text: "user message first".to_string(),
+            direct: None,
+            follow_up_id: None,
+        }));
+
+        // The rail answer lands via the real single writer.
+        agenda
+            .answer_ask(ask_id, answer_resolution("Which grid?", "A"))
+            .unwrap();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), asker_rx.recv())
+            .await
+            .expect("user follow-up delivered")
+            .expect("channel open");
+        assert_eq!(first.text, "user message first");
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), asker_rx.recv())
+            .await
+            .expect("agenda answer delivered")
+            .expect("channel open");
+        assert!(
+            delivered.text.starts_with(&format!(
+                "Answer to your parked question \"Which grid?\" (agenda {})",
+                item.id
+            )),
+            "{}",
+            delivered.text
+        );
+        assert!(delivered.text.contains(": A"), "{}", delivered.text);
+        assert_eq!(delivered.target_session_id.as_deref(), Some("sess-asker"));
+        // Never a different session than the asker.
+        assert!(other_rx.try_recv().is_err());
+    }
+
+    /// A dead asking session gets NOTHING — no delivery, no dashboard
+    /// warning, no follow-up status; the item holds the answer. Ordering
+    /// is proven by a live sentinel follow-up processed after the outcome.
+    #[tokio::test]
+    async fn agenda_answer_for_dead_session_delivers_nothing() {
+        let bus = EventBus::new();
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let (live_tx, mut live_rx) = mpsc::channel(4);
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut live = managed_session("sess-live", "intendant");
+            live.follow_up_tx = live_tx;
+            state.sessions.insert("sess-live".to_string(), live);
+        }
+        let mut bus_rx = bus.subscribe();
+        let _loop_handle = supervisor.clone().spawn();
+
+        let agenda = test_agenda(dir.path(), &bus);
+        let item = park_one(&agenda, "Anyone home?", Some("sess-gone"));
+        agenda
+            .answer_ask(
+                item.ask.as_ref().unwrap().ask_id,
+                answer_resolution("Anyone home?", "no"),
+            )
+            .unwrap();
+
+        // Sentinel AFTER the outcome: the intent lane is ordered, so once
+        // it lands the outcome has been fully handled.
+        bus.send(AppEvent::ControlCommand(event::ControlMsg::FollowUp {
+            session_id: Some("sess-live".to_string()),
+            text: "sentinel".to_string(),
+            direct: None,
+            follow_up_id: None,
+        }));
+        let sentinel = tokio::time::timeout(std::time::Duration::from_secs(10), live_rx.recv())
+            .await
+            .expect("sentinel delivered")
+            .expect("channel open");
+        assert_eq!(sentinel.text, "sentinel");
+        assert!(
+            live_rx.try_recv().is_err(),
+            "the dead asker's answer must not reroute to another session"
+        );
+        // Quiet by design: no dashboard warning, no follow-up status.
+        while let Ok(event) = bus_rx.try_recv() {
+            match event {
+                AppEvent::FollowUpStatus { text, .. } => {
+                    assert_eq!(text.as_deref(), Some("sentinel"), "unexpected status");
+                }
+                AppEvent::LogEntry { content, .. } => {
+                    assert!(
+                        !content.contains("Anyone home?") && !content.contains(&item.id),
+                        "delivery misses must stay off the dashboards: {content}"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// An outcome recorded while a live blocking waiter holds the ask is
+    /// returned inline by that waiter — the supervisor must not deliver a
+    /// duplicate into the session.
+    #[tokio::test]
+    async fn inline_waiter_outcome_is_not_delivered_twice() {
+        let bus = EventBus::new();
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let (asker_tx, mut asker_rx) = mpsc::channel(4);
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut asker = managed_session("sess-held", "intendant");
+            asker.follow_up_tx = asker_tx;
+            state.sessions.insert("sess-held".to_string(), asker);
+        }
+        let _loop_handle = supervisor.clone().spawn();
+
+        let agenda = test_agenda(dir.path(), &bus);
+        let item = park_one(&agenda, "Held ask?", Some("sess-held"));
+        let ask_id = item.ask.as_ref().unwrap().ask_id;
+        crate::mcp::register_pending_ask(ask_id);
+        agenda
+            .answer_ask(ask_id, answer_resolution("Held ask?", "yes"))
+            .unwrap();
+        crate::mcp::unregister_pending_ask(ask_id);
+
+        // Sentinel proves the outcome was processed; nothing else arrives.
+        bus.send(AppEvent::ControlCommand(event::ControlMsg::FollowUp {
+            session_id: Some("sess-held".to_string()),
+            text: "sentinel".to_string(),
+            direct: None,
+            follow_up_id: None,
+        }));
+        let sentinel = tokio::time::timeout(std::time::Duration::from_secs(10), asker_rx.recv())
+            .await
+            .expect("sentinel delivered")
+            .expect("channel open");
+        assert_eq!(sentinel.text, "sentinel");
+        assert!(
+            asker_rx.try_recv().is_err(),
+            "an inline-waiter outcome must not also arrive as a follow-up"
+        );
+    }
+
+    /// Dismissals of a parked ask reach the live asker too (skip/deny keep
+    /// the item open and say so).
+    #[tokio::test]
+    async fn agenda_dismissal_delivers_note_to_live_asker() {
+        let bus = EventBus::new();
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let (asker_tx, mut asker_rx) = mpsc::channel(4);
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut asker = managed_session("sess-dis", "intendant");
+            asker.follow_up_tx = asker_tx;
+            state.sessions.insert("sess-dis".to_string(), asker);
+        }
+        let _loop_handle = supervisor.clone().spawn();
+
+        let agenda = test_agenda(dir.path(), &bus);
+        let item = park_one(&agenda, "Skippable?", Some("sess-dis"));
+        agenda
+            .dismiss_ask(item.ask.as_ref().unwrap().ask_id, "skip")
+            .unwrap();
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), asker_rx.recv())
+            .await
+            .expect("dismissal note delivered")
+            .expect("channel open");
+        assert!(
+            delivered
+                .text
+                .contains("was dismissed on the question rail (skip)"),
+            "{}",
+            delivered.text
+        );
+        assert!(
+            delivered.text.contains("remains open on the agenda"),
+            "{}",
+            delivered.text
+        );
     }
 
     #[tokio::test]

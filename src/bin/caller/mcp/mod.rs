@@ -60,11 +60,16 @@ pub(crate) use tool_params::*;
 // probe the session supervisor's approval routing consults.
 mod tools_ask;
 pub(crate) use tools_ask::{
-    ask_user_question_pending, build_ask_user_questions, DecodedPreviewSource,
-    ASK_USER_DEFAULT_WAIT_SECS, ASK_USER_MAX_HTML_BYTES, ASK_USER_MAX_OPTIONS,
-    ASK_USER_MAX_PREVIEWS, ASK_USER_MAX_QUESTIONS, ASK_USER_MAX_TEXT_PREVIEW_BYTES,
-    ASK_USER_MAX_WAIT_SECS, NOTIFY_USER_MAX_TEXT_BYTES,
+    ask_user_question_pending, build_ask_user_questions, register_pending_ask,
+    DecodedPreviewSource, ASK_USER_DEFAULT_WAIT_SECS, ASK_USER_MAX_HTML_BYTES,
+    ASK_USER_MAX_OPTIONS, ASK_USER_MAX_PREVIEWS, ASK_USER_MAX_QUESTIONS,
+    ASK_USER_MAX_TEXT_PREVIEW_BYTES, ASK_USER_MAX_WAIT_SECS, NOTIFY_USER_MAX_TEXT_BYTES,
 };
+// Test-support seam: production unregistration lives inside the waiter
+// guards; cross-module tests (the agenda handle's inline-waiter stamps)
+// clean the process-global registry through this.
+#[cfg(test)]
+pub(crate) use tools_ask::unregister_pending_ask;
 mod tools_display;
 mod tools_managed;
 mod tools_notes;
@@ -504,7 +509,11 @@ impl IntendantServer {
             "ask_user" => {
                 let Parameters(params) =
                     parse_params::<AskUserParams>(with_default_mcp_session_id(args, session_id))?;
-                Ok(match self.ask_user_inner(params).await {
+                // The gate-resolved binding rides along so a parked (or
+                // agenda-backed blocking) question records its provenance
+                // — the asking session is what late-answer delivery
+                // targets.
+                Ok(match self.ask_user_inner_as_actor(params, &actor).await {
                     Ok(value) => text_tool_result(value.to_string()),
                     Err(message) => text_tool_error(format!("ask_user failed: {message}")),
                 })

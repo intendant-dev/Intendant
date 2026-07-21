@@ -62,13 +62,101 @@ fn pending_asks() -> &'static std::sync::Mutex<HashSet<u64>> {
 
 /// Whether `id` is an `ask_user` question still waiting for its answer.
 /// Consulted by the session supervisor before warning about an approval id
-/// it does not know: the ask's own waiter resolves it and emits
-/// `ApprovalResolved`.
+/// it does not know (the ask's own waiter resolves it and emits
+/// `ApprovalResolved`), and by the agenda handle to stamp `inline_waiter`
+/// on ask outcomes — a live waiter returns the outcome inline, so the
+/// supervisor must not also deliver it into the asking session.
 pub(crate) fn ask_user_question_pending(id: u64) -> bool {
     pending_asks()
         .lock()
         .map(|set| set.contains(&id))
         .unwrap_or(false)
+}
+
+/// Register a blocking waiter for `id`. The agenda handle calls this from
+/// `park_ask_for_waiter` UNDER the store lock, before the parked item is
+/// broadcast — so every outcome recorded on the item sees the waiter and
+/// stamps `inline_waiter: true` until the waiter deregisters.
+pub(crate) fn register_pending_ask(id: u64) {
+    if let Ok(mut set) = pending_asks().lock() {
+        set.insert(id);
+    }
+}
+
+/// Drop a blocking waiter's registration (idempotent).
+pub(crate) fn unregister_pending_ask(id: u64) {
+    if let Ok(mut set) = pending_asks().lock() {
+        set.remove(&id);
+    }
+}
+
+/// Waiter-side bookkeeping for one agenda-backed blocking ask
+/// (blocking-as-sugar). Unlike [`PendingAskGuard`], resolution ordering is
+/// owned by the AGENDA — the handle records outcomes and emits
+/// `ApprovalResolved`/`AgendaAskOutcome`; this guard never clears the rail.
+/// Its two jobs:
+/// - drop the pending-registry entry exactly once, and
+/// - when the waiter ABANDONS the wait (timeout, transport dropping the
+///   future mid-wait), convert the rail card into its parked form (same
+///   id, no expiry, not held) — the question is durable now and must not
+///   evaporate with the waiter.
+struct AgendaAskGuard {
+    id: u64,
+    session_id: Option<String>,
+    questions: Vec<crate::types::UserQuestion>,
+    bus: EventBus,
+    resolved: bool,
+}
+
+impl AgendaAskGuard {
+    /// Adopt the registration `park_ask_for_waiter` already made.
+    fn adopt(
+        id: u64,
+        session_id: Option<String>,
+        questions: Vec<crate::types::UserQuestion>,
+        bus: EventBus,
+    ) -> Self {
+        Self {
+            id,
+            session_id,
+            questions,
+            bus,
+            resolved: false,
+        }
+    }
+
+    /// The item resolved (answer/dismissal observed): deregister only —
+    /// the agenda handle already cleared the rails.
+    fn resolve(&mut self) {
+        if std::mem::replace(&mut self.resolved, true) {
+            return;
+        }
+        unregister_pending_ask(self.id);
+    }
+
+    /// The waiter stops waiting on a still-open question: deregister and
+    /// re-announce the card in parked form so every rail (and the
+    /// reconnect state-line cache) shows a durable question instead of a
+    /// dead countdown.
+    fn abandon_to_parked(&mut self) {
+        if std::mem::replace(&mut self.resolved, true) {
+            return;
+        }
+        unregister_pending_ask(self.id);
+        self.bus.send(AppEvent::UserQuestionRequired {
+            session_id: self.session_id.clone(),
+            id: self.id,
+            questions: self.questions.clone(),
+            expires_at_ms: None,
+            held: false,
+        });
+    }
+}
+
+impl Drop for AgendaAskGuard {
+    fn drop(&mut self) {
+        self.abandon_to_parked();
+    }
 }
 
 /// Registration + cleanup for one blocked ask. Whatever way the tool
@@ -518,6 +606,56 @@ pub(crate) fn build_ask_user_questions(
     Ok((built, wait_seconds))
 }
 
+/// The agenda actor recorded on an `ask_user`-created item: the caller's
+/// gate-resolved binding, with the ASKING session stamped as the acting
+/// session. `ask_user` acts as the session it asks for (explicit
+/// parameter → URL-injected id → single-session fallback — the same
+/// resolution that attributes the rail card), and that session is what
+/// late-answer delivery targets; the binding's principal/kind ride along
+/// as recorded by the gate.
+fn park_actor(
+    binding: &crate::access::actor::ActorBinding,
+    session_id: &str,
+) -> crate::agenda::AgendaActor {
+    let mut actor = crate::agenda::AgendaActor::from_binding(binding).unwrap_or_default();
+    actor.session_id = Some(session_id.to_string());
+    if actor.kind.is_none() {
+        actor.kind = Some("agent_session".to_string());
+    }
+    actor
+}
+
+/// Map `ask_user` parameters (flat or multi form) into the per-question
+/// park vocabulary the agenda's `Ask` command speaks — the same mapping
+/// `intendant ctl ask --park` performs client-side (`ask_park_command`):
+/// call-level fields are dropped and the flat form's `multi_select` sugar
+/// becomes explicit pick bounds, because the park wire speaks the precise
+/// per-question vocabulary only.
+pub(crate) fn park_questions(params: &AskUserParams) -> Result<Vec<AskUserQuestionParams>, String> {
+    let flat = !params.question.trim().is_empty();
+    if flat && !params.questions.is_empty() {
+        return Err("provide either question or questions, not both".to_string());
+    }
+    if !params.questions.is_empty() {
+        return Ok(params.questions.clone());
+    }
+    let mut pick_min = params.pick_min;
+    let mut pick_max = params.pick_max;
+    if params.multi_select.unwrap_or(false) && pick_max.is_none() && !params.options.is_empty() {
+        pick_min = pick_min.or(Some(1));
+        pick_max = Some(params.options.len().min(u8::MAX as usize) as u8);
+    }
+    Ok(vec![AskUserQuestionParams {
+        question: params.question.clone(),
+        header: params.header.clone(),
+        options: params.options.clone(),
+        previews: params.previews.clone(),
+        pick_min,
+        pick_max,
+        free_text: params.free_text,
+    }])
+}
+
 /// One `ask_user` outcome, shaped for both the returning tool result and
 /// the guidance-filled answers map agents read. The legacy top-level
 /// `question`/`answer` name the FIRST question; `questions` carries the
@@ -611,9 +749,66 @@ fn guidance_answers(question: &str, guidance: &str) -> std::collections::HashMap
     std::collections::HashMap::from([(question.to_string(), guidance.to_string())])
 }
 
+/// The "answered" result of an agenda-backed ask, built from the ITEM's
+/// recorded answer (the resolver is the single writer; the waiter observes
+/// what was durably recorded). A structured resolution expands into the
+/// full per-question breakdown; a plain text answer (typed on the Agenda
+/// tab) rides as the first question's answer.
+fn ask_result_from_item_answer(
+    id: u64,
+    session_id: &str,
+    questions: &[crate::types::UserQuestion],
+    answer: &crate::agenda::AgendaAnswer,
+) -> serde_json::Value {
+    match &answer.structured {
+        Some(resolution) => {
+            let answers: std::collections::HashMap<String, String> =
+                resolution.answers.clone().into_iter().collect();
+            let selections: std::collections::HashMap<String, Vec<String>> =
+                resolution.selections.clone().into_iter().collect();
+            let followups: std::collections::HashMap<String, String> =
+                resolution.followups.clone().into_iter().collect();
+            let annotations: std::collections::HashMap<
+                String,
+                Vec<crate::types::QuestionAnnotation>,
+            > = resolution.annotations.clone().into_iter().collect();
+            ask_result_with_followups(
+                "answered",
+                id,
+                session_id,
+                questions,
+                answers,
+                Some(&selections),
+                &followups,
+                &annotations,
+            )
+        }
+        None => {
+            let first = questions.first().map(|q| q.question.as_str()).unwrap_or("");
+            ask_result(
+                "answered",
+                id,
+                session_id,
+                questions,
+                guidance_answers(first, &answer.text),
+                None,
+                None,
+            )
+        }
+    }
+}
+
+/// Stamp the agenda item id onto an agenda-backed ask result so agents can
+/// reference the durable question (`agenda_list`, `ctl agenda`) from every
+/// outcome shape.
+fn with_item_id(mut result: serde_json::Value, item_id: &str) -> serde_json::Value {
+    result["item_id"] = serde_json::Value::String(item_id.to_string());
+    result
+}
+
 impl IntendantServer {
     #[tool(
-        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total per ask. Or ask up to 4 questions on ONE panel via questions: [{question, header?, options?, pick_min?, pick_max?, free_text?, previews?}] — pick_min/pick_max bound how many options may be selected (minimum 0 = optional question; default exactly one), free_text: false disables typed answers, and every answer returns together. The user can also attach a follow-up per question and anchored preview notes; a follow-up may STAND IN for an answer — address it (reply in conversation or raise a narrowed re-ask) before treating that part as settled. Returns {status, answer, answers, questions: [{question, header, answer, selected?, followup?, annotations?: [{preview, note}]}]}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900; the dashboard shows the expiry as a live countdown, and the user may hold the question open — a held ask blocks past the wait until answered or dismissed. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
+        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total per ask. Or ask up to 4 questions on ONE panel via questions: [{question, header?, options?, pick_min?, pick_max?, free_text?, previews?}] — pick_min/pick_max bound how many options may be selected (minimum 0 = optional question; default exactly one), free_text: false disables typed answers, and every answer returns together. The user can also attach a follow-up per question and anchored preview notes; a follow-up may STAND IN for an answer — address it (reply in conversation or raise a narrowed re-ask) before treating that part as settled. Returns {status, answer, answers, questions: [{question, header, answer, selected?, followup?, annotations?: [{preview, note}]}]}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900; the dashboard shows the expiry as a live countdown, and the user may hold the question open — a held ask blocks past the wait until answered or dismissed. On a daemon with the durable agenda (the default daemon shape), a timed-out or abandoned question does NOT evaporate: it stays open on the agenda — the result carries its item_id — and a later answer is delivered back into this session as a user message at a turn boundary. Set park: true to skip blocking entirely: the question files as a durable agenda item and {status:\"parked\", item_id, ask_id} returns immediately (don't combine with wait_seconds); the reply lands on the item and is delivered the same way. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
     )]
     pub(crate) async fn ask_user(&self, Parameters(params): Parameters<AskUserParams>) -> String {
         match self.ask_user_inner(params).await {
@@ -622,22 +817,37 @@ impl IntendantServer {
         }
     }
 
-    /// Core of `ask_user`, shared by the stdio `#[tool]` method and the
-    /// HTTP dispatch arm (which maps `Err` to an `isError` tool result).
+    /// Core of `ask_user`, shared by the stdio `#[tool]` method (which has
+    /// no gate-resolved actor) and the HTTP dispatch arm (which passes the
+    /// caller's binding via [`Self::ask_user_inner_as_actor`] and maps
+    /// `Err` to an `isError` tool result).
     pub(crate) async fn ask_user_inner(
         &self,
         params: AskUserParams,
     ) -> Result<serde_json::Value, String> {
-        let (built, wait_seconds) = build_ask_user_questions(&params)?;
-        let question_text = built
-            .first()
-            .map(|(q, _)| q.question.clone())
-            .unwrap_or_default();
+        self.ask_user_inner_as_actor(params, &crate::access::actor::ActorBinding::unattributed())
+            .await
+    }
+
+    pub(crate) async fn ask_user_inner_as_actor(
+        &self,
+        params: AskUserParams,
+        actor: &crate::access::actor::ActorBinding,
+    ) -> Result<serde_json::Value, String> {
+        if params.park && params.wait_seconds.is_some() {
+            return Err(
+                "park doesn't wait — drop wait_seconds (parked questions never expire)".to_string(),
+            );
+        }
+        let wait_seconds = params
+            .wait_seconds
+            .unwrap_or(ASK_USER_DEFAULT_WAIT_SECS)
+            .clamp(1, ASK_USER_MAX_WAIT_SECS);
 
         // Same session resolution as post_session_note: the HTTP dispatch
         // injects the URL-bound session id (`with_default_mcp_session_id`),
         // an explicit argument wins, then the single-session state fallback.
-        let (session_id, interactive_frontends, project_root, log_dir) = {
+        let (session_id, interactive_frontends, project_root, log_dir, agenda) = {
             let state = self.state.read().await;
             let session_id = params
                 .session_id
@@ -658,6 +868,7 @@ impl IntendantServer {
                 state.interactive_frontends,
                 state.project_root.clone(),
                 state.log_dir.clone(),
+                state.agenda.clone(),
             )
         };
         let Some(session_id) = session_id else {
@@ -668,12 +879,45 @@ impl IntendantServer {
             );
         };
 
-        let id = crate::event::next_approval_id();
+        // park: file the question on the durable agenda INSTEAD of
+        // blocking — the same item, blob custody, and rail pipeline as
+        // `intendant ctl ask --park`. The reply lands on the item; while
+        // the asking session lives it is also delivered back as ordinary
+        // follow-up input at a turn boundary.
+        if params.park {
+            let Some(agenda) = agenda else {
+                return Err(
+                    "cannot park: agenda unavailable on this daemon (no durable agenda \
+                     store in this server shape)"
+                        .to_string(),
+                );
+            };
+            let questions = park_questions(&params)?;
+            let item = agenda
+                .apply(
+                    crate::agenda::AgendaCommand::Ask { questions },
+                    Some(park_actor(actor, &session_id)),
+                )
+                .map_err(|e| e.to_string())?;
+            let ask_id = item.ask.as_ref().map(|ask| ask.ask_id).unwrap_or_default();
+            return Ok(serde_json::json!({
+                "status": "parked",
+                "item_id": item.id,
+                "ask_id": ask_id,
+                "session_id": session_id,
+            }));
+        }
 
         // No frontend can ever answer in this shape (headless without a web
         // gateway): tell the model to proceed instead of blocking on nobody
         // — the same semantic supervised Claude Code gets headless.
         if !interactive_frontends {
+            let (built, _) = build_ask_user_questions(&params)?;
+            let question_text = built
+                .first()
+                .map(|(q, _)| q.question.clone())
+                .unwrap_or_default();
+            let id = crate::event::next_approval_id();
             let content = format!("No user available to answer: {question_text}");
             self.bus.send(AppEvent::LogEntry {
                 session_id: Some(session_id.clone()),
@@ -694,6 +938,26 @@ impl IntendantServer {
                 Some(NO_ANSWER_GUIDANCE),
             ));
         }
+
+        // Blocking-as-sugar: with a durable agenda available, a blocking
+        // ask IS a parked agenda item plus a live waiter on its outcome —
+        // the question survives timeouts and dropped transports instead of
+        // evaporating with the waiter.
+        if let Some(agenda) = agenda {
+            return self
+                .ask_user_blocking_agenda(agenda, &params, session_id, wait_seconds, actor)
+                .await;
+        }
+
+        // Legacy ephemeral blocking ask: no agenda store in this server
+        // shape (stdio MCP), so the question lives and dies with this
+        // waiter exactly as before.
+        let (built, _) = build_ask_user_questions(&params)?;
+        let question_text = built
+            .first()
+            .map(|(q, _)| q.question.clone())
+            .unwrap_or_default();
+        let id = crate::event::next_approval_id();
 
         // Commit blob previews into the calling session's upload store —
         // references only from here on (mirrors post_session_note): the
@@ -915,6 +1179,200 @@ impl IntendantServer {
                         None,
                         Some(DISMISSED_GUIDANCE),
                     ));
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Agenda-backed blocking ask (blocking-as-sugar over a parked item).
+    ///
+    /// The item is created exactly like a park — same validation, blob
+    /// custody in the agenda store, minted item + rail ids — then this
+    /// waiter announces the question WITH its deadline and waits for the
+    /// ITEM's outcome. Resolution ordering has one owner: the daemon-side
+    /// resolver (`agenda/ask.rs`) and the Agenda surfaces write outcomes
+    /// onto the item; this waiter only OBSERVES the resulting
+    /// `AgendaAskOutcome` — so a rail answer, an Agenda-tab answer, and a
+    /// complete/retire all resolve the wait identically, and the waiter
+    /// can never double-record. On timeout the question does not
+    /// evaporate: the item stays open, the rail card converts to its
+    /// parked (non-expiring) form, and a later answer flows back into the
+    /// still-live session through the supervisor's follow-up delivery.
+    async fn ask_user_blocking_agenda(
+        &self,
+        agenda: std::sync::Arc<crate::agenda::AgendaHandle>,
+        params: &AskUserParams,
+        session_id: String,
+        wait_seconds: u64,
+        actor: &crate::access::actor::ActorBinding,
+    ) -> Result<serde_json::Value, String> {
+        let park = park_questions(params)?;
+        let item = agenda
+            .park_ask_for_waiter(park, Some(park_actor(actor, &session_id)))
+            .map_err(|e| e.to_string())?;
+        let ask = item
+            .ask
+            .clone()
+            .ok_or_else(|| "internal: parked item carries no ask payload".to_string())?;
+        let id = ask.ask_id;
+        let questions = ask.questions;
+        let item_id = item.id.clone();
+        let question_text = questions
+            .first()
+            .map(|q| q.question.clone())
+            .unwrap_or_default();
+
+        // Subscribe BEFORE announcing (same race discipline as approvals:
+        // an instant outcome must find the waiter listening). The waiter
+        // itself was registered by `park_ask_for_waiter` before the item
+        // became visible.
+        let mut events = self.bus.subscribe();
+        let mut guard = AgendaAskGuard::adopt(
+            id,
+            Some(session_id.clone()),
+            questions.clone(),
+            self.bus.clone(),
+        );
+        let mut ask_deadline = AskDeadline::new(
+            tokio::time::Instant::now(),
+            std::time::Duration::from_secs(wait_seconds),
+        );
+        self.bus.send(AppEvent::UserQuestionRequired {
+            session_id: Some(session_id.clone()),
+            id,
+            questions: questions.clone(),
+            expires_at_ms: ask_deadline
+                .expires_at_unix_ms(tokio::time::Instant::now(), now_unix_ms()),
+            held: false,
+        });
+
+        let dismissed_result = |item_id: &str| {
+            with_item_id(
+                ask_result(
+                    "dismissed",
+                    id,
+                    &session_id,
+                    &questions,
+                    guidance_answers(&question_text, DISMISSED_GUIDANCE),
+                    None,
+                    Some(DISMISSED_GUIDANCE),
+                ),
+                item_id,
+            )
+        };
+
+        loop {
+            let wake_at = ask_deadline.wake_at(tokio::time::Instant::now());
+            let event = match tokio::time::timeout_at(wake_at, events.recv()).await {
+                Err(_) => {
+                    // The wait lapsed. Heal a lagged broadcast first: an
+                    // outcome recorded moments ago is read back from the
+                    // ledger instead of being reported as a timeout.
+                    if let Some(current) = agenda.item_by_id(&item_id) {
+                        if current.status != crate::agenda::AgendaStatus::Open {
+                            guard.resolve();
+                            if let Some(answer) = &current.answer {
+                                return Ok(with_item_id(
+                                    ask_result_from_item_answer(
+                                        id,
+                                        &session_id,
+                                        &questions,
+                                        answer,
+                                    ),
+                                    &item_id,
+                                ));
+                            }
+                            return Ok(dismissed_result(&item_id));
+                        }
+                    }
+                    // Genuine timeout: stop waiting, keep the question.
+                    // The guard converts the rail card to its parked form.
+                    guard.abandon_to_parked();
+                    let guidance = format!(
+                        "No answer arrived within {wait_seconds}s, so you stopped waiting — \
+                         but the question did not expire: it stays OPEN on the agenda as \
+                         item {item_id}, and the owner can still answer it from the question \
+                         rail or the Agenda tab. A later answer will be delivered into this \
+                         session as a user message while the session is running. If you \
+                         proceed provisionally, say so in the conversation; you can note \
+                         the provisional choice on the item with `intendant ctl agenda \
+                         patch`."
+                    );
+                    return Ok(with_item_id(
+                        ask_result(
+                            "timeout",
+                            id,
+                            &session_id,
+                            &questions,
+                            guidance_answers(&question_text, &guidance),
+                            None,
+                            Some(&guidance),
+                        ),
+                        &item_id,
+                    ));
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    // Bus gone (shutdown): nothing left to announce to.
+                    guard.resolve();
+                    return Ok(dismissed_result(&item_id));
+                }
+                Ok(Ok(event)) => event,
+            };
+            match event {
+                // Hold flip: suspend or resume the countdown, then
+                // re-announce with the same id so every frontend (and the
+                // reconnect state-line cache) carries the current state.
+                AppEvent::ControlCommand(ControlMsg::HoldQuestion {
+                    id: verb_id, held, ..
+                }) if verb_id == id => {
+                    let now = tokio::time::Instant::now();
+                    if ask_deadline.set_held(held, now) {
+                        self.bus.send(AppEvent::UserQuestionRequired {
+                            session_id: Some(session_id.clone()),
+                            id,
+                            questions: questions.clone(),
+                            expires_at_ms: ask_deadline.expires_at_unix_ms(now, now_unix_ms()),
+                            held: ask_deadline.held(),
+                        });
+                    }
+                }
+                // The item's recorded outcome — the single source of
+                // resolution, whatever surface wrote it.
+                AppEvent::AgendaAskOutcome {
+                    item: outcome,
+                    action,
+                    ..
+                } if outcome.id == item_id => {
+                    guard.resolve();
+                    return Ok(match action.as_str() {
+                        "answer" => match &outcome.answer {
+                            Some(answer) => with_item_id(
+                                ask_result_from_item_answer(id, &session_id, &questions, answer),
+                                &item_id,
+                            ),
+                            None => dismissed_result(&item_id),
+                        },
+                        // A bare approve carries no choice — proceed on
+                        // best judgment (never widens autonomy).
+                        "approve" | "approve_all" => with_item_id(
+                            ask_result(
+                                "pass",
+                                id,
+                                &session_id,
+                                &questions,
+                                guidance_answers(&question_text, PASS_GUIDANCE),
+                                None,
+                                Some(PASS_GUIDANCE),
+                            ),
+                            &item_id,
+                        ),
+                        // skip/deny (item stays open, dismissal marker
+                        // recorded) and complete/retire (closed without an
+                        // answer) all read as a dismissal to the agent.
+                        _ => dismissed_result(&item_id),
+                    });
                 }
                 _ => continue,
             }
@@ -1353,6 +1811,7 @@ mod tests {
             free_text: None,
             questions: vec![],
             wait_seconds: None,
+            park: false,
             session_id: None,
         }
     }
@@ -2160,5 +2619,371 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.is_error, Some(true));
+    }
+
+    // ---- agenda-backed asks (ask↔agenda unification, slice 2) ----
+
+    fn test_server_with_agenda(
+        session_id: &str,
+    ) -> (
+        IntendantServer,
+        EventBus,
+        Arc<crate::agenda::AgendaHandle>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let agenda = Arc::new(crate::agenda::AgendaHandle::new(
+            crate::agenda::AgendaStore::open(dir.path()).unwrap(),
+            bus.clone(),
+            dir.path(),
+        ));
+        let mut state = McpAppState::new(
+            "test".into(),
+            "test".into(),
+            crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        state.session_id = session_id.to_string();
+        state.interactive_frontends = true;
+        state.agenda = Some(agenda.clone());
+        let server = IntendantServer::new(Arc::new(RwLock::new(state)), bus.clone());
+        (server, bus, agenda, dir)
+    }
+
+    /// Skip to the next rail announcement (the agenda lanes interleave
+    /// AgendaChanged and notification events on the same bus).
+    async fn next_user_question(
+        rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+    ) -> (
+        Option<String>,
+        u64,
+        Vec<crate::types::UserQuestion>,
+        Option<u64>,
+        bool,
+    ) {
+        loop {
+            if let AppEvent::UserQuestionRequired {
+                session_id,
+                id,
+                questions,
+                expires_at_ms,
+                held,
+            } = next_event(rx, "UserQuestionRequired").await
+            {
+                return (session_id, id, questions, expires_at_ms, held);
+            }
+        }
+    }
+
+    /// Blocking-as-sugar end to end: the blocking ask creates the agenda
+    /// item (park semantics), announces WITH a deadline, and the rail
+    /// answer resolves waiter and item exactly once — the resolver writes,
+    /// the waiter observes the recorded outcome.
+    #[tokio::test]
+    async fn agenda_blocking_ask_answers_via_the_item() {
+        let (server, bus, agenda, _dir) = test_server_with_agenda("sess-agenda");
+        let _resolver = crate::agenda::spawn_ask_resolver(agenda.clone());
+        let mut rx = bus.subscribe();
+
+        let ask_server = server.clone();
+        let mut params = ask_params("Which color?");
+        params.options = vec![AskUserOptionParams {
+            label: "blue".into(),
+            description: None,
+        }];
+        let ask = tokio::spawn(async move { ask_server.ask_user_inner(params).await });
+
+        let (session, id, questions, expires_at_ms, held) = next_user_question(&mut rx).await;
+        assert_eq!(session.as_deref(), Some("sess-agenda"));
+        assert!(expires_at_ms.is_some(), "blocking asks arm a deadline");
+        assert!(!held);
+        assert_eq!(questions[0].question, "Which color?");
+        // The item exists, open, attributed to the asking session; both
+        // registries know the id.
+        assert!(ask_user_question_pending(id));
+        assert!(crate::agenda::agenda_ask_pending(id));
+        let item = agenda.open_ask_item(id).expect("open item backs the ask");
+        assert_eq!(item.provenance.session_id.as_deref(), Some("sess-agenda"));
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::AnswerQuestion {
+            session_id: Some("sess-agenda".into()),
+            id,
+            answers: std::collections::HashMap::from([(
+                "Which color?".to_string(),
+                "blue".to_string(),
+            )]),
+            selections: std::collections::HashMap::from([(
+                "Which color?".to_string(),
+                vec!["blue".to_string()],
+            )]),
+            followups: Default::default(),
+            annotations: Default::default(),
+        }));
+
+        let result = ask.await.expect("join").expect("ask_user result");
+        assert_eq!(result["status"], "answered", "{result}");
+        assert_eq!(result["answer"], "blue");
+        assert_eq!(result["item_id"], item.id, "{result}");
+        assert_eq!(result["questions"][0]["selected"][0], "blue");
+        assert!(!ask_user_question_pending(id), "waiter deregistered");
+        assert!(
+            !crate::agenda::agenda_ask_pending(id),
+            "answered item left the open-ask registry"
+        );
+
+        // The item completed exactly once, with both answer forms.
+        let done = agenda.item_by_id(&item.id).unwrap();
+        assert_eq!(done.status, crate::agenda::AgendaStatus::Done);
+        let recorded = done.answer.as_ref().expect("answer recorded");
+        assert_eq!(recorded.text, "blue");
+        assert!(recorded
+            .structured
+            .as_ref()
+            .is_some_and(|s| s.answers["Which color?"] == "blue"));
+
+        // The single writer cleared the rails (waiter emits nothing).
+        // Bounded by a sentinel: everything before it is already queued.
+        bus.send(AppEvent::ControlCommand(ControlMsg::Skip {
+            session_id: None,
+            id: 0,
+        }));
+        let mut resolved = 0;
+        loop {
+            match next_event(&mut rx, "rail clear before the sentinel").await {
+                AppEvent::ApprovalResolved {
+                    id: rid, action, ..
+                } if rid == id => {
+                    assert_eq!(action, "answer");
+                    resolved += 1;
+                }
+                AppEvent::ControlCommand(ControlMsg::Skip { id: 0, .. }) => break,
+                _ => continue,
+            }
+        }
+        assert_eq!(resolved, 1, "exactly one rail clear for the answer");
+    }
+
+    /// Timeout no longer evaporates the question: the waiter returns
+    /// "timeout" naming the agenda item, the item stays OPEN, and the
+    /// rail card converts to its parked (non-expiring) form. A later
+    /// answer is recorded by the resolver with no inline waiter — the
+    /// supervisor's delivery signal.
+    #[tokio::test(start_paused = true)]
+    async fn agenda_blocking_timeout_keeps_item_open_then_late_answer_records() {
+        let (server, bus, agenda, _dir) = test_server_with_agenda("sess-late");
+        let _resolver = crate::agenda::spawn_ask_resolver(agenda.clone());
+        let mut rx = bus.subscribe();
+
+        let ask_server = server.clone();
+        let mut params = ask_params("Grid A or B?");
+        params.wait_seconds = Some(5);
+        let ask = tokio::spawn(async move { ask_server.ask_user_inner(params).await });
+
+        let result = ask.await.expect("join").expect("ask_user result");
+        assert_eq!(result["status"], "timeout", "{result}");
+        let item_id = result["item_id"].as_str().expect("item id on timeout");
+        let guidance = result["guidance"].as_str().unwrap_or_default();
+        assert!(
+            guidance.contains(item_id),
+            "guidance names the item: {guidance}"
+        );
+        assert!(guidance.contains("stays OPEN on the agenda"), "{guidance}");
+        assert!(guidance.contains("ctl agenda patch"), "{guidance}");
+
+        // Item open; waiter gone; open-ask registry still holds the id.
+        let item = agenda.item_by_id(item_id).unwrap();
+        assert_eq!(item.status, crate::agenda::AgendaStatus::Open);
+        let ask_id = item.ask.as_ref().unwrap().ask_id;
+        assert!(!ask_user_question_pending(ask_id));
+        assert!(crate::agenda::agenda_ask_pending(ask_id));
+
+        // The rail card converted to parked form (same id, no expiry).
+        let mut saw_deadline = false;
+        let mut saw_parked = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::UserQuestionRequired {
+                id, expires_at_ms, ..
+            } = event
+            {
+                if id == ask_id {
+                    match expires_at_ms {
+                        Some(_) => saw_deadline = true,
+                        None => {
+                            assert!(saw_deadline, "deadline announcement precedes the park");
+                            saw_parked = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_parked, "timeout re-announces the parked card");
+
+        // Post-timeout answer: the resolver records it; the outcome event
+        // carries inline_waiter=false, so the supervisor delivers it.
+        bus.send(AppEvent::ControlCommand(ControlMsg::AnswerQuestion {
+            session_id: None,
+            id: ask_id,
+            answers: std::collections::HashMap::from([(
+                "Grid A or B?".to_string(),
+                "B".to_string(),
+            )]),
+            selections: Default::default(),
+            followups: Default::default(),
+            annotations: Default::default(),
+        }));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(AppEvent::AgendaAskOutcome {
+                    item,
+                    action,
+                    inline_waiter,
+                })) if item.id == item_id => {
+                    assert_eq!(action, "answer");
+                    assert!(!inline_waiter, "no waiter holds a timed-out ask");
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                other => panic!("no outcome for the late answer: {other:?}"),
+            }
+        }
+        let done = agenda.item_by_id(item_id).unwrap();
+        assert_eq!(done.status, crate::agenda::AgendaStatus::Done);
+        assert_eq!(done.answer.as_ref().unwrap().text, "B");
+    }
+
+    /// An Agenda-tab answer (the `answer` op, no rail ControlMsg at all)
+    /// resolves a live blocking waiter — the waiter observes the ITEM.
+    #[tokio::test]
+    async fn agenda_tab_answer_resolves_blocking_waiter() {
+        let (server, bus, agenda, _dir) = test_server_with_agenda("sess-tab");
+        let mut rx = bus.subscribe();
+
+        let ask_server = server.clone();
+        let ask =
+            tokio::spawn(async move { ask_server.ask_user_inner(ask_params("Tab ok?")).await });
+        let (_, id, _, _, _) = next_user_question(&mut rx).await;
+        let item = agenda.open_ask_item(id).unwrap();
+
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::Answer {
+                    id: item.id.clone(),
+                    text: "yes — from the tab".into(),
+                    structured: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        let result = ask.await.expect("join").expect("ask_user result");
+        assert_eq!(result["status"], "answered", "{result}");
+        assert_eq!(result["answer"], "yes — from the tab");
+        assert_eq!(result["item_id"], item.id);
+        assert!(!ask_user_question_pending(id));
+    }
+
+    /// Rail dismissal while blocked: "dismissed" to the agent, the item
+    /// stays OPEN with the dismissal marker (slice 1 semantics).
+    #[tokio::test]
+    async fn agenda_blocking_dismissal_keeps_item_open() {
+        let (server, bus, agenda, _dir) = test_server_with_agenda("sess-skip");
+        let _resolver = crate::agenda::spawn_ask_resolver(agenda.clone());
+        let mut rx = bus.subscribe();
+
+        let ask_server = server.clone();
+        let ask =
+            tokio::spawn(async move { ask_server.ask_user_inner(ask_params("Skippable?")).await });
+        let (_, id, _, _, _) = next_user_question(&mut rx).await;
+        let item = agenda.open_ask_item(id).unwrap();
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::Skip {
+            session_id: None,
+            id,
+        }));
+        let result = ask.await.expect("join").expect("ask_user result");
+        assert_eq!(result["status"], "dismissed", "{result}");
+        assert_eq!(result["item_id"], item.id);
+
+        let after = agenda.item_by_id(&item.id).unwrap();
+        assert_eq!(after.status, crate::agenda::AgendaStatus::Open);
+        assert_eq!(after.dismissed.as_ref().unwrap().action, "skip");
+        assert!(!ask_user_question_pending(id));
+        assert!(crate::agenda::agenda_ask_pending(id), "still answerable");
+    }
+
+    /// MCP park parity: park=true files the item and returns immediately
+    /// with the ctl-shaped {status:"parked", item_id, ask_id}; the parked
+    /// rail announcement (no deadline) goes out; no waiter registers.
+    #[tokio::test]
+    async fn ask_user_park_files_the_item_and_returns() {
+        let (server, bus, agenda, _dir) = test_server_with_agenda("sess-park");
+        let mut rx = bus.subscribe();
+        let mut params = ask_params("Park me?");
+        params.park = true;
+        let result = server.ask_user_inner(params).await.expect("park result");
+        assert_eq!(result["status"], "parked", "{result}");
+        let item_id = result["item_id"].as_str().expect("item id");
+        let ask_id = result["ask_id"].as_u64().expect("ask id");
+
+        let item = agenda.item_by_id(item_id).unwrap();
+        assert_eq!(item.status, crate::agenda::AgendaStatus::Open);
+        assert_eq!(item.provenance.session_id.as_deref(), Some("sess-park"));
+        assert_eq!(item.ask.as_ref().unwrap().ask_id, ask_id);
+        assert!(!ask_user_question_pending(ask_id), "park never waits");
+        assert!(crate::agenda::agenda_ask_pending(ask_id));
+
+        let (_, id, _, expires_at_ms, held) = next_user_question(&mut rx).await;
+        assert_eq!(id, ask_id);
+        assert_eq!(expires_at_ms, None, "parked asks never expire");
+        assert!(!held);
+    }
+
+    /// park + wait_seconds is a contradiction and refuses (ctl parity);
+    /// park without an agenda store names the limitation.
+    #[tokio::test]
+    async fn ask_user_park_validates_shape_and_availability() {
+        let (server, _bus, _agenda, _dir) = test_server_with_agenda("sess-parkval");
+        let mut params = ask_params("Park me?");
+        params.park = true;
+        params.wait_seconds = Some(60);
+        let err = server.ask_user_inner(params).await.unwrap_err();
+        assert!(err.contains("park doesn't wait"), "{err}");
+
+        // No agenda store (stdio shape): park is refused honestly.
+        let (server, _bus) = test_server("sess-noagenda", true);
+        let mut params = ask_params("Park me?");
+        params.park = true;
+        let err = server.ask_user_inner(params).await.unwrap_err();
+        assert!(err.contains("agenda unavailable"), "{err}");
+    }
+
+    /// The flat form's multi_select sugar becomes explicit pick bounds in
+    /// the park vocabulary (ctl's ask_park_command mapping, server-side).
+    #[test]
+    fn park_questions_maps_flat_multi_select_sugar() {
+        let mut params = ask_params("Pick some");
+        params.options = labeled_options(&["A", "B", "C"]);
+        params.multi_select = Some(true);
+        let questions = park_questions(&params).unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].pick_min, Some(1));
+        assert_eq!(questions[0].pick_max, Some(3));
+
+        // Explicit bounds win over the sugar.
+        params.pick_min = Some(0);
+        params.pick_max = Some(2);
+        let questions = park_questions(&params).unwrap();
+        assert_eq!(questions[0].pick_min, Some(0));
+        assert_eq!(questions[0].pick_max, Some(2));
+
+        // The multi form passes through verbatim; both forms refuse.
+        let mut params = ask_params("");
+        params.questions = vec![question_param("q1"), question_param("q2")];
+        assert_eq!(park_questions(&params).unwrap().len(), 2);
+        let mut params = ask_params("flat");
+        params.questions = vec![question_param("also")];
+        assert!(park_questions(&params).unwrap_err().contains("not both"));
     }
 }

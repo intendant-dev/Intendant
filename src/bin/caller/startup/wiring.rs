@@ -337,6 +337,11 @@ pub(crate) fn spawn_mode_web_gateway(
             None
         }
     };
+    // Boot re-announcement happens AFTER the gateway spawns (below): the
+    // bootstrap-cache maintainer and the attention-nudge monitor subscribe
+    // inside spawn_web_gateway, and an emission before those subscriptions
+    // would miss both.
+    let agenda_boot_announce = mcp_http_state.agenda.clone();
     // The P1 Memory service. The durable plane runs on the
     // proven-custody OS (macOS);
     // multi-platform custody stays full Gate B, so other OSes run
@@ -427,6 +432,18 @@ pub(crate) fn spawn_mode_web_gateway(
     // (see sandbox::seatbelt_loopback_guard_clause) — recorded here, the
     // one place every gateway-bearing startup shape passes through.
     crate::sandbox::record_gateway_loopback_port(web_port);
+    // Loud-badges guardrail (ask↔agenda slice 2): re-announce every OPEN
+    // agenda-backed ask on the question rail so the state-line cache, the
+    // attention nudge, and every connecting rail repopulate on a fresh
+    // daemon without waiting for the Agenda tab's JS bootstrap. Emitted
+    // after spawn_web_gateway so both consumers are already subscribed;
+    // the nudge dedups by id and same-id re-shows are harmless.
+    if let Some(agenda) = agenda_boot_announce {
+        let announced = agenda.announce_open_asks();
+        if announced > 0 {
+            eprintln!("[agenda] re-announced {announced} open parked ask(s) on the question rail");
+        }
+    }
     Ok(GatewaySpawn {
         _handle: handle,
         shared_session,
