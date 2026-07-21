@@ -1340,7 +1340,11 @@ pub enum AgentEvent {
     /// locus (first-hand, like [`AgentEvent::CwdAnnounced`]) and wakes
     /// the prober so the git chip and Changes tab refresh ahead of the
     /// poll tick. Git itself stays the source of truth: the payload is
-    /// never folded into state. Ambient bookkeeping — implies no turn.
+    /// never folded into state. Best-effort by construction — the CLI
+    /// detects operations by parsing the Bash command's output (a quiet
+    /// `git commit -q` emits no notice; verified on 2.1.216), so the poll
+    /// cadence remains the safety net. Ambient bookkeeping — implies no
+    /// turn.
     VcsActivity { kind: String, cwd: Option<String> },
     /// Incremental output from a running tool.
     ToolOutputDelta {
