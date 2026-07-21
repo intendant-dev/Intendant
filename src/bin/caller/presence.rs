@@ -1054,6 +1054,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SessionDirChanged { .. }
         | AppEvent::SessionFileActivity { .. }
         | AppEvent::SessionCwdAnnounced { .. }
+        | AppEvent::SessionVcsActivity { .. }
         | AppEvent::PresenceUsageUpdate { .. }
         | AppEvent::PresenceLog { .. }
         | AppEvent::PresenceReady

@@ -1096,6 +1096,24 @@ pub enum AppEvent {
         cwd: String,
     },
 
+    /// The session's backend reported performing a version-control
+    /// operation — Claude Code's `system:vcs_state_changed` (2.1.216+):
+    /// `kind` is the backend's verb (commit / push / merge / rebase, open
+    /// vocabulary), `cwd` its own statement of the checkout involved. A
+    /// freshness hint with two consumers: the git-vitals maintainer seeds
+    /// the probe locus from `cwd` (first-hand, like `SessionCwdAnnounced`)
+    /// and wakes the prober so the git chip updates ahead of the poll
+    /// tick, and the broadcast twin (`OutboundEvent::SessionVcsChanged`)
+    /// lets an open Changes tab refetch — the only push invalidation an
+    /// external session working outside the daemon's watched project root
+    /// gets. Git itself remains the source of truth; the payload is never
+    /// folded into state.
+    SessionVcsActivity {
+        session_id: Option<String>,
+        kind: String,
+        cwd: Option<String>,
+    },
+
     /// A user-uploaded file was committed to the upload store. Emitted by
     /// the `POST /api/upload` handler after the bytes land on disk. The
     /// dashboard keeps a list of these to let the user attach one or more
@@ -3405,6 +3423,16 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 lines_removed: *lines_removed,
             })
         }
+        // The daemon-side consumer (git-vitals wakeup) subscribes to the
+        // bus directly; the broadcast twin only tells an open Changes tab
+        // to refetch. `cwd` stays daemon-side — the frontend re-asks the
+        // API for its current target rather than trusting a backend path.
+        AppEvent::SessionVcsActivity {
+            session_id, kind, ..
+        } => Some(OutboundEvent::SessionVcsChanged {
+            session_id: session_id.clone(),
+            kind: kind.clone(),
+        }),
         AppEvent::SnapshotCreated { round_id } => Some(OutboundEvent::SnapshotCreated {
             round_id: *round_id,
         }),
@@ -6100,6 +6128,23 @@ mod tests {
     #[test]
     fn outbound_skips_tick() {
         assert!(app_event_to_outbound(&AppEvent::Tick).is_none());
+    }
+
+    #[test]
+    fn outbound_session_vcs_changed_pins_wire_shape_and_keeps_cwd_local() {
+        let event = AppEvent::SessionVcsActivity {
+            session_id: Some("sess-1".to_string()),
+            kind: "commit".to_string(),
+            cwd: Some("/private/checkout".to_string()),
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"session_vcs_changed\""));
+        assert!(json.contains("\"session_id\":\"sess-1\""));
+        assert!(json.contains("\"kind\":\"commit\""));
+        // The backend-stated path stays daemon-side: the frontend re-asks
+        // the API for its current target instead of trusting a wire path.
+        assert!(!json.contains("checkout"));
     }
 
     fn sample_cu_action_event() -> AppEvent {

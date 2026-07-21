@@ -154,6 +154,9 @@ function processCommands(cmds) {
           quiet: true,
         });
         break;
+      case 'session_vcs_changed':
+        onSessionVcsChanged(c);
+        break;
       case 'claude_config_changed':
         applyClaudeConfigChanged(c);
         break;
@@ -303,6 +306,35 @@ let changesRefreshTimer = null;
 let changesRefreshSeq = 0;
 let changesRenderFrame = null;
 let pendingChangesAutoSelect = null;
+
+// A session's backend reported a commit/push/merge/rebase. The daemon
+// side already woke the git prober (the chip arrives via session_vitals);
+// here only the Changes file list goes stale — a commit typically empties
+// the dirty set — and only file_watcher-covered roots get fs events, so
+// external sessions in other checkouts rely on this push to refetch.
+function onSessionVcsChanged(c) {
+  const eventSid = String((c && c.session_id) || '').trim();
+  if (eventSid && !sessionIdTargetsCurrentChanges(eventSid)) return;
+  refreshChangesList({
+    selectFirst: activeActivitySubtab === 'changes',
+    refreshActive: !!activeChangesFile,
+    quiet: true,
+  });
+}
+
+// Whether an event stamped with this session id concerns the session the
+// Changes pane currently targets (the selected session or its backend /
+// intendant aliases — events may carry either member of the identity
+// group).
+function sessionIdTargetsCurrentChanges(eventSid) {
+  const sid = String(currentSessionFullId || foregroundSessionFullId || '').trim();
+  if (!sid) return false;
+  if (eventSid === sid) return true;
+  const meta = sessionMetadataById.get(sid) || {};
+  const backendId = String(meta.backendSessionId || meta.backend_session_id || '').trim();
+  const intendantId = String(meta.intendantSessionId || meta.intendant_session_id || '').trim();
+  return (!!backendId && eventSid === backendId) || (!!intendantId && eventSid === intendantId);
+}
 
 function onFileChanged(path, kind, linesAdded, linesRemoved) {
   changedFiles.set(path, { kind, lines_added: linesAdded, lines_removed: linesRemoved });

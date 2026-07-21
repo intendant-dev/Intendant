@@ -1331,6 +1331,17 @@ pub enum AgentEvent {
     /// [`AgentEvent::FileActivity`] write-path heuristic. Ambient
     /// bookkeeping: implies no turn.
     CwdAnnounced { cwd: String },
+    /// The backend's own notice that it performed a version-control
+    /// operation (Claude Code's `system:vcs_state_changed`, 2.1.216+):
+    /// `kind` is the backend's verb (`commit` / `push` / `merge` /
+    /// `rebase`, open vocabulary), `cwd` the checkout it says the
+    /// operation happened in. A freshness hint only — the drain forwards
+    /// it as `AppEvent::SessionVcsActivity`, which seeds the git-vitals
+    /// locus (first-hand, like [`AgentEvent::CwdAnnounced`]) and wakes
+    /// the prober so the git chip and Changes tab refresh ahead of the
+    /// poll tick. Git itself stays the source of truth: the payload is
+    /// never folded into state. Ambient bookkeeping — implies no turn.
+    VcsActivity { kind: String, cwd: Option<String> },
     /// Incremental output from a running tool.
     ToolOutputDelta {
         item_id: String,

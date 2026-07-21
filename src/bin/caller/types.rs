@@ -1090,6 +1090,14 @@ pub enum OutboundEvent {
         lines_added: u32,
         lines_removed: u32,
     },
+    /// A session's backend reported a version-control operation (commit /
+    /// push / merge / rebase — `kind` is open vocabulary). Refetch hint
+    /// for the Changes tab and git chip; carries no repository state.
+    SessionVcsChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        kind: String,
+    },
     /// A user-uploaded file is available for attachment. Mirror of the
     /// `AppEvent::UploadReady` emitted after `POST /api/upload` finishes.
     UploadReady {
