@@ -534,15 +534,19 @@ mod tests {
         };
         let certificate =
             rcgen::generate_simple_self_signed(vec!["box.fleet.example.test".to_string()]).unwrap();
-        std::fs::write(
-            dir.path().join("custom-domain-cert.pem"),
-            certificate.cert.pem(),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("custom-domain-key.pem"),
-            certificate.signing_key.serialize_pem(),
-        )
+        let seeded_domain = ValidatedCustomDomain {
+            name: "box.fleet.example.test".to_string(),
+            rp_id: "box.fleet.example.test".to_string(),
+            origin: "https://box.fleet.example.test".to_string(),
+        };
+        crate::access::authority_store::with_lock(dir.path(), || {
+            cert::write_certificate_pair_locked(
+                dir.path(),
+                &seeded_domain,
+                &certificate.cert.pem(),
+                &certificate.signing_key.serialize_pem(),
+            )
+        })
         .unwrap();
         let hosted = || {
             Arc::new(HostedControlRuntime::new(
