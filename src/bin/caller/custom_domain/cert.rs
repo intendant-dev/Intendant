@@ -9,8 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use super::CertificateStatus;
 
-const CERT_FILE: &str = "custom-domain-cert.pem";
-const KEY_FILE: &str = "custom-domain-key.pem";
+/// The two-file layout that predated the atomic pair record. No writer has
+/// existed for it in the current tree and the read fallback is retired
+/// (Track K Q8): a successful generation write deletes any leftover copy so
+/// superseded key material does not linger on disk.
+const LEGACY_CERT_FILE: &str = "custom-domain-cert.pem";
+const LEGACY_KEY_FILE: &str = "custom-domain-key.pem";
 const CERT_PAIR_FILE: &str = "custom-domain-certificate-pair.json";
 const CERT_PAIR_SCHEMA_VERSION: u32 = 1;
 const CERT_PAIR_MAX_BYTES: u64 = 512 * 1024;
@@ -120,46 +124,9 @@ fn read_stored_certificate_pair(cert_dir: &Path) -> Result<Option<(String, Strin
     crate::access::authority_store::with_lock(cert_dir, || {
         let pair_path = cert_dir.join(CERT_PAIR_FILE);
         match read_certificate_pair_record_locked(&pair_path) {
-            Ok(Some(record)) => {
-                return Ok(Some((record.certificate_chain_pem, record.private_key_pem)));
-            }
-            Ok(None) => {}
-            Err(error) => return Err(crate::access::AccessError(error)),
-        }
-
-        // Compatibility with the original two-file layout. Every new commit
-        // uses the single atomic record above; a valid legacy pair is still
-        // accepted until the next issuance writes a generation record.
-        let cert_path = cert_dir.join(CERT_FILE);
-        let key_path = cert_dir.join(KEY_FILE);
-        match (
-            std::fs::read_to_string(&cert_path),
-            std::fs::read_to_string(&key_path),
-        ) {
-            (Ok(cert), Ok(key)) => Ok(Some((cert, key))),
-            (Err(cert_error), Err(key_error))
-                if cert_error.kind() == std::io::ErrorKind::NotFound
-                    && key_error.kind() == std::io::ErrorKind::NotFound =>
-            {
-                Ok(None)
-            }
-            (Ok(_), Err(error)) | (Err(error), Ok(_))
-                if error.kind() == std::io::ErrorKind::NotFound =>
-            {
-                // The original layout committed key and certificate as two
-                // independent replacements. A missing sibling is an
-                // incomplete legacy generation, not durable authority; the
-                // guarded issuance path may atomically replace it.
-                Ok(None)
-            }
-            (Err(error), _) => Err(crate::access::AccessError(format!(
-                "read {}: {error}",
-                cert_path.display()
-            ))),
-            (_, Err(error)) => Err(crate::access::AccessError(format!(
-                "read {}: {error}",
-                key_path.display()
-            ))),
+            Ok(Some(record)) => Ok(Some((record.certificate_chain_pem, record.private_key_pem))),
+            Ok(None) => Ok(None),
+            Err(error) => Err(crate::access::AccessError(error)),
         }
     })
     .map_err(|error| error.to_string())
@@ -201,7 +168,7 @@ fn read_certificate_pair_record_locked(
     Ok(Some(record))
 }
 
-fn write_certificate_pair_locked(
+pub(super) fn write_certificate_pair_locked(
     cert_dir: &Path,
     domain: &ValidatedCustomDomain,
     certificate_chain_pem: &str,
@@ -224,7 +191,14 @@ fn write_certificate_pair_locked(
     crate::access::authority_store::atomic_write_private_locked(
         &cert_dir.join(CERT_PAIR_FILE),
         &bytes,
-    )
+    )?;
+    // Best-effort retirement of the pre-record two-file layout: the read
+    // path no longer accepts it, so a leftover key file is only a stale
+    // copy of superseded material.
+    for legacy in [LEGACY_CERT_FILE, LEGACY_KEY_FILE] {
+        let _ = std::fs::remove_file(cert_dir.join(legacy));
+    }
+    Ok(())
 }
 
 fn issuance_lease_path(cert_dir: &Path) -> PathBuf {
@@ -1090,13 +1064,20 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["box.example.test".to_string()]).unwrap();
         let other =
             rcgen::generate_simple_self_signed(vec!["other.example.test".to_string()]).unwrap();
-        std::fs::write(dir.path().join(CERT_FILE), certificate.cert.pem()).unwrap();
-        std::fs::write(dir.path().join(KEY_FILE), other.signing_key.serialize_pem()).unwrap();
         let domain = ValidatedCustomDomain {
             name: "box.example.test".to_string(),
             rp_id: "box.example.test".to_string(),
             origin: "https://box.example.test".to_string(),
         };
+        crate::access::authority_store::with_lock(dir.path(), || {
+            write_certificate_pair_locked(
+                dir.path(),
+                &domain,
+                &certificate.cert.pem(),
+                &other.signing_key.serialize_pem(),
+            )
+        })
+        .unwrap();
         let status = Arc::new(RwLock::new(CertificateStatus::default()));
 
         let error = restore(&domain, dir.path(), &status).unwrap_err();
@@ -1114,13 +1095,15 @@ mod tests {
     #[test]
     fn stored_pair_read_waits_for_the_atomic_writer_transaction() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(CERT_FILE), b"old certificate").unwrap();
-        std::fs::write(dir.path().join(KEY_FILE), b"old key").unwrap();
         let domain = ValidatedCustomDomain {
             name: "box.example.test".to_string(),
             rp_id: "box.example.test".to_string(),
             origin: "https://box.example.test".to_string(),
         };
+        crate::access::authority_store::with_lock(dir.path(), || {
+            write_certificate_pair_locked(dir.path(), &domain, "old certificate", "old key")
+        })
+        .unwrap();
 
         let (writer_locked_tx, writer_locked_rx) = std::sync::mpsc::channel();
         let (finish_tx, finish_rx) = std::sync::mpsc::channel();
@@ -1166,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_pair_repairs_a_mismatched_legacy_generation() {
+    fn refresh_repairs_a_mismatched_stored_pair() {
         let dir = tempfile::tempdir().unwrap();
         let domain = ValidatedCustomDomain {
             name: "box.example.test".to_string(),
@@ -1176,8 +1159,15 @@ mod tests {
         let certificate = rcgen::generate_simple_self_signed(vec![domain.name.clone()]).unwrap();
         let other =
             rcgen::generate_simple_self_signed(vec!["other.example.test".to_string()]).unwrap();
-        std::fs::write(dir.path().join(CERT_FILE), certificate.cert.pem()).unwrap();
-        std::fs::write(dir.path().join(KEY_FILE), other.signing_key.serialize_pem()).unwrap();
+        crate::access::authority_store::with_lock(dir.path(), || {
+            write_certificate_pair_locked(
+                dir.path(),
+                &domain,
+                &certificate.cert.pem(),
+                &other.signing_key.serialize_pem(),
+            )
+        })
+        .unwrap();
         let status = Arc::new(RwLock::new(CertificateStatus::default()));
 
         assert_eq!(
@@ -1239,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_legacy_pair_is_repairable() {
+    fn leftover_legacy_two_file_layout_is_ignored_and_retired() {
         let dir = tempfile::tempdir().unwrap();
         let domain = ValidatedCustomDomain {
             name: "box.example.test".to_string(),
@@ -1247,32 +1237,15 @@ mod tests {
             origin: "https://box.example.test".to_string(),
         };
         let certificate = rcgen::generate_simple_self_signed(vec![domain.name.clone()]).unwrap();
+        std::fs::write(dir.path().join(LEGACY_CERT_FILE), certificate.cert.pem()).unwrap();
         std::fs::write(
-            dir.path().join(KEY_FILE),
+            dir.path().join(LEGACY_KEY_FILE),
             certificate.signing_key.serialize_pem(),
         )
         .unwrap();
-        let status = Arc::new(RwLock::new(CertificateStatus {
-            state: "valid".to_string(),
-            not_after_unix_ms: Some(u64::MAX),
-            restore_error: Some("stale restore error".to_string()),
-            ..Default::default()
-        }));
-
-        assert_eq!(
-            refresh_shared_certificate_status(&domain, dir.path(), &status).unwrap(),
-            None
-        );
-        {
-            let status = status.read().unwrap();
-            assert_eq!(status.state, "pending");
-            assert_eq!(status.not_after_unix_ms, None);
-            assert_eq!(status.restore_error, None);
-        }
-        let guard = match IssuanceLeaseGuard::begin(&domain, dir.path()).unwrap() {
-            IssuanceClaim::Acquired(guard) => *guard,
-            IssuanceClaim::CertificateCurrent => panic!("the legacy pair is incomplete"),
-        };
+        // The retired layout confers nothing, even complete and valid.
+        assert_eq!(read_stored_certificate_pair(dir.path()).unwrap(), None);
+        // The next generation write deletes the leftover key material.
         crate::access::authority_store::with_lock(dir.path(), || {
             write_certificate_pair_locked(
                 dir.path(),
@@ -1282,12 +1255,9 @@ mod tests {
             )
         })
         .unwrap();
-        guard.finish().unwrap();
-        assert!(
-            refresh_shared_certificate_status(&domain, dir.path(), &status)
-                .unwrap()
-                .is_some()
-        );
+        assert!(!dir.path().join(LEGACY_CERT_FILE).exists());
+        assert!(!dir.path().join(LEGACY_KEY_FILE).exists());
+        assert!(read_stored_certificate_pair(dir.path()).unwrap().is_some());
     }
 
     #[test]

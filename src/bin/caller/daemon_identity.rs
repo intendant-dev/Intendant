@@ -26,12 +26,15 @@ impl DaemonIdentity {
     pub fn load_or_create(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
         let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
+            Ok(bytes) => {
+                tighten_identity_dir(path);
+                bytes
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let parent = path
                     .parent()
                     .ok_or_else(|| format!("identity path has no parent: {}", path.display()))?;
-                std::fs::create_dir_all(parent)
+                intendant_core::state_paths::create_private_dir_all(parent)
                     .map_err(|e| format!("create identity dir {}: {e}", parent.display()))?;
                 let rng = ring::rand::SystemRandom::new();
                 let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
@@ -86,6 +89,25 @@ pub fn b64u(bytes: &[u8]) -> String {
 
 fn b64u_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)
+}
+
+/// Installs that predate the private-dir convention created the identity
+/// directory with umask defaults (0755 — group/other-listable, unlike the
+/// state-root convention). The key file itself has always been 0600; this
+/// tightens the existing directory on load so listings stop leaking.
+/// Best-effort: a failure never blocks identity load.
+fn tighten_identity_dir(key_path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = key_path.parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Ok(metadata) = std::fs::metadata(parent) {
+            if metadata.permissions().mode() & 0o077 != 0 {
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = key_path;
 }
 
 /// The daemon-identity state directory — also home to small identity-

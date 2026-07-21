@@ -1511,20 +1511,36 @@ fn write_store_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
+    intendant_core::state_paths::create_private_dir_all(parent)
         .map_err(|e| format!("create Connect state dir {}: {e}", parent.display()))?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".intendant-connect-state-")
-        .suffix(".tmp")
-        .tempfile_in(parent)
-        .map_err(|e| format!("create Connect state tempfile in {}: {e}", parent.display()))?;
-    tmp.write_all(bytes)
-        .map_err(|e| format!("write Connect state tempfile {}: {e}", tmp.path().display()))?;
-    tmp.as_file_mut()
-        .sync_all()
-        .map_err(|e| format!("sync Connect state tempfile {}: {e}", tmp.path().display()))?;
-    tmp.persist(path)
-        .map_err(|e| format!("replace Connect state {}: {}", path.display(), e.error))?;
+    // Std-only staged replace — never the tempfile crate on a persist seam.
+    // The store carries the service's VAPID and transparency-log signing
+    // keys, so the staged file is 0600 on Unix from the moment it exists,
+    // then atomically renamed over the live store. Every save runs under
+    // the global store lock, so the fixed stage name cannot collide; a
+    // stale stage from a crashed run is cleared first.
+    let staged = path.with_extension("staged");
+    match std::fs::remove_file(&staged) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "clear stale Connect state stage {}: {e}",
+                staged.display()
+            ))
+        }
+    }
+    let mut file = intendant_core::state_paths::private_file_options()
+        .create_new(true)
+        .open(&staged)
+        .map_err(|e| format!("create Connect state stage {}: {e}", staged.display()))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("write Connect state stage {}: {e}", staged.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("sync Connect state stage {}: {e}", staged.display()))?;
+    drop(file);
+    std::fs::rename(&staged, path)
+        .map_err(|e| format!("replace Connect state {}: {e}", path.display()))?;
     fsync_parent_dir(parent)
 }
 
@@ -1551,7 +1567,7 @@ fn fsync_parent_dir(parent: &Path) -> Result<(), String> {
 /// dirty flag is cleared on success (marks only ever happen under the same
 /// lock, so none can slip between the write and the clear).
 ///
-/// The serialize happens under the lock; the blocking file I/O (tempfile
+/// The serialize happens under the lock; the blocking file I/O (staged
 /// write + fsync + rename + parent-dir fsync) runs on `spawn_blocking` so
 /// it never parks an async worker — with the store lock still HELD across
 /// the await. That lock-across-write is deliberate, not an oversight: as
