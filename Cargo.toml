@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/app-html-assembler",
     "crates/intendant-core",
+    "crates/intendant-custody",
     "crates/intendant-display",
     "crates/intendant-platform",
     "crates/owner-plane-core",

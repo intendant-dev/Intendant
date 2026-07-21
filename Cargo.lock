@@ -2988,6 +2988,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "intendant-custody"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "security-framework",
+ "tempfile",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "intendant-display"
 version = "0.1.0"
 dependencies = [

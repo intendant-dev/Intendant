@@ -332,7 +332,7 @@ jobs:
         if: github.event_name != 'merge_group' && runner.os != 'Linux' && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: |
           cargo check -p intendant --bins --locked --target ${{ matrix.target }}
-          cargo check -p intendant-core -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --tests --locked --target ${{ matrix.target }}
+          cargo check -p intendant-core -p intendant-custody -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --tests --locked --target ${{ matrix.target }}
 
       # Build and run the unit tests of the whole `intendant` package — all
       # three binaries (`intendant`, `intendant-runtime`, and
@@ -353,7 +353,7 @@ jobs:
           # how the core/display lib tests went dark after extraction.
           # owner-plane-core/-reducer carry the vendored D0-A kernel and
           # its §D corpus conformance gate (170 stamped vectors).
-          cargo test -p intendant-core -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --locked --target ${{ matrix.target }}
+          cargo test -p intendant-core -p intendant-custody -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --locked --target ${{ matrix.target }}
 
       # ── Quality gate: clippy (Linux leg; baseline zeroed 2026-07-11) ──
       # clippy is cfg-sensitive: the macOS-cut baseline left the Linux-only
