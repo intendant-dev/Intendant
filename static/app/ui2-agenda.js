@@ -1165,8 +1165,10 @@ function agendaRenderTab() {
     // live there; the inline input stays as an explicit plain-text path,
     // never the only door.
     let answerBlock = '';
+    const openRichAsk = item.kind === 'question' && item.status === 'open'
+      && item.ask && Array.isArray(item.ask.questions) && item.ask.questions.length;
     if (item.kind === 'question' && item.status === 'open') {
-      const richAsk = item.ask && Array.isArray(item.ask.questions) && item.ask.questions.length;
+      const richAsk = openRichAsk;
       const openBtn = richAsk
         ? `<div class="agenda-answer-row agenda-ask-open-row">
             <button type="button" class="agenda-btn agenda-open-ask-btn" data-id="${escapeHtml(item.id)}">Open question panel</button>
@@ -1194,8 +1196,15 @@ function agendaRenderTab() {
     const dismissedChip = item.status === 'open' && item.dismissed
       ? `<span class="agenda-chip dismissed" title="${escapeHtml(agendaDismissedTip(item.dismissed))}">dismissed · still open</span>`
       : '';
+    // Open rich asks: the whole head is the affordance — clicking the
+    // question opens its panel (the obvious gesture; the explicit button
+    // below remains for discoverability). role/tabindex make it a real
+    // control for keyboard and assistive tech.
+    const headOpenAttrs = openRichAsk
+      ? ` agenda-item-head-openable" data-open-ask="${escapeHtml(item.id)}" role="button" tabindex="0" title="Open the question panel`
+      : '';
     return `<div class="agenda-item" data-status="${escapeHtml(item.status)}">
-      <div class="agenda-item-head">
+      <div class="agenda-item-head${headOpenAttrs}">
         ${agendaGlyph(item.status, item.kind)}
         <span class="agenda-item-kind">${escapeHtml(item.kind)}</span>
         <span class="agenda-item-title">${escapeHtml(item.title)}</span>
@@ -1217,6 +1226,18 @@ function agendaRenderTab() {
   });
   list.querySelectorAll('.agenda-open-ask-btn').forEach((btn) => {
     btn.addEventListener('click', () => agendaOpenParkedAsk(btn.dataset.id));
+  });
+  list.querySelectorAll('.agenda-item-head-openable').forEach((head) => {
+    const open = (e) => {
+      // Chips/links inside the head keep their own behavior.
+      if (e.target.closest('button, a, input, select')) return;
+      e.preventDefault();
+      agendaOpenParkedAsk(head.dataset.openAsk);
+    };
+    head.addEventListener('click', open);
+    head.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') open(e);
+    });
   });
   list.querySelectorAll('button[data-op]').forEach((btn) => {
     btn.addEventListener('click', () => {
