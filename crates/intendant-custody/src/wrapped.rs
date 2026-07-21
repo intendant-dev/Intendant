@@ -12,7 +12,7 @@ use ring::rand::SystemRandom;
 use zeroize::Zeroizing;
 
 use crate::file_backend::{create_private_dir_all, write_private_file};
-use crate::names::{file_stem_for, validate_entry_name};
+use crate::names::sealed_blob_file_name;
 use crate::seal::{seal, unseal};
 use crate::{BackendKind, CustodyBackend, CustodyError, Secret};
 
@@ -53,8 +53,7 @@ impl WrappedBlobBackend {
     }
 
     fn blob_path(&self, name: &str) -> Result<PathBuf, CustodyError> {
-        validate_entry_name(name)?;
-        Ok(self.dir.join(format!("{}.sealed", file_stem_for(name))))
+        Ok(self.dir.join(sealed_blob_file_name(name)?))
     }
 }
 

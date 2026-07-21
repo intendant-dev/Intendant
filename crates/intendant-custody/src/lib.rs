@@ -22,7 +22,7 @@ mod wrapped;
 pub mod mac_keychain;
 
 pub use file_backend::PlainFileBackend;
-pub use names::validate_entry_name;
+pub use names::{sealed_blob_file_name, validate_entry_name};
 pub use wrapped::{WrappedBlobBackend, WrappingKeyProvider};
 
 /// Exit codes for the `custody-probe` helper binary (the acceptance
