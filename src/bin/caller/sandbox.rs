@@ -142,6 +142,12 @@ pub(crate) fn seatbelt_credential_deny_clause() -> Result<String, String> {
     // shell would re-open the loopback owner surface the port guard
     // closes (loopback_token.rs documents the envelope).
     deny_dirs.push(state_root.join(crate::loopback_token::LOOPBACK_TOKEN_DIR));
+    // The daemon-identity signing key (class 3: browser-control,
+    // hosted-control, doorbell caller-ID) lives outside the state root;
+    // it deserves the same read wall as the trust store.
+    deny_dirs.push(canonicalize_for_profile(
+        &crate::daemon_identity::default_identity_dir(),
+    ));
     let mut deny_files: Vec<PathBuf> = vec![
         state_root.join("custody-audit.jsonl"),
         state_root.join("connect.toml"),

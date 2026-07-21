@@ -46,6 +46,15 @@ pub(crate) fn file_stem_for(name: &str) -> String {
     name.replace('/', "__")
 }
 
+/// File name of a [`crate::WrappedBlobBackend`] entry's sealed blob.
+/// Exported so callers can *observe* custody state (status listings)
+/// with pure path math — constructing a backend would create its blob
+/// directory as a side effect.
+pub fn sealed_blob_file_name(name: &str) -> Result<String, CustodyError> {
+    validate_entry_name(name)?;
+    Ok(format!("{}.sealed", file_stem_for(name)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

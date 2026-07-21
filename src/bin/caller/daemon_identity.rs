@@ -25,12 +25,18 @@ impl DaemonIdentity {
 
     pub fn load_or_create(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => {
+        // Custody-routed (class 3): a migrated key file is a tombstone
+        // naming a sealed custody entry; a plain file serves as-is. The
+        // create branch always writes a plain file — custody is entered
+        // only through the opt-in `intendant custody migrate` verb.
+        match crate::key_custody::read_key_material_opt(path)
+            .map_err(|e| format!("daemon identity: {e}"))?
+        {
+            Some(material) => {
                 tighten_identity_dir(path);
-                bytes
+                Self::from_pkcs8(material.as_bytes())
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            None => {
                 let parent = path
                     .parent()
                     .ok_or_else(|| format!("identity path has no parent: {}", path.display()))?;
@@ -40,11 +46,9 @@ impl DaemonIdentity {
                 let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
                     .map_err(|_| "generate daemon identity key".to_string())?;
                 write_private_key(path, pkcs8.as_ref())?;
-                pkcs8.as_ref().to_vec()
+                Self::from_pkcs8(pkcs8.as_ref())
             }
-            Err(e) => return Err(format!("read daemon identity {}: {e}", path.display())),
-        };
-        Self::from_pkcs8(&bytes)
+        }
     }
 
     pub fn from_pkcs8(pkcs8: &[u8]) -> Result<Self, String> {
