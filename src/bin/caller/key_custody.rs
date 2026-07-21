@@ -351,6 +351,278 @@ fn replace_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+// ── Provider keys (class 2 native) ─────────────────────────────────────
+//
+// Provider API keys are strings resolved per request through
+// `credential_leases::provider_api_key` (lease → env → alias env →
+// custody). Custody here means: the key's line moves out of the
+// daemon-global `.env` (`<config_dir>/intendant/.env` — the file the
+// dashboard save surface writes; project and cwd `.env` files stay
+// operator-owned and first-class per ruling Q3) into a sealed blob under
+// `<config_dir>/intendant/custody/`, and a comment marker takes the
+// line's place. Availability checks answer from blob existence — pure
+// path math — so dashboard polls never touch the keystore; material is
+// unsealed only when a request actually needs the key.
+
+/// The daemon-global provider-key estate root (`<config_dir>/intendant`).
+fn provider_estate_root() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("intendant"))
+}
+
+fn provider_entry(env_name: &str) -> String {
+    format!("provider/{env_name}")
+}
+
+fn provider_blob_path(root: &Path, env_name: &str) -> Option<PathBuf> {
+    intendant_custody::sealed_blob_file_name(&provider_entry(env_name))
+        .ok()
+        .map(|name| root.join(CUSTODY_SUBDIR).join(name))
+}
+
+/// Whether this provider key is custody-held — blob existence only, no
+/// keystore access (safe for availability polls).
+pub fn provider_key_in_custody(env_name: &str) -> bool {
+    provider_estate_root()
+        .and_then(|root| provider_blob_path(&root, env_name))
+        .is_some_and(|blob| blob.is_file())
+}
+
+/// Retrieve a custody-held provider key, or `None` when the key is not
+/// custody-held. A custody *failure* for a held key is also `None` —
+/// fail-closed, never a stale value — but it is audited and logged by
+/// name first; the caller's "no key" error stays generic while the
+/// custody trail carries the specific deny.
+pub fn provider_key_from_custody(env_name: &str) -> Option<String> {
+    let root = provider_estate_root()?;
+    let entry = provider_entry(env_name);
+    // Blob first: unconfigured keys never touch the keystore.
+    if !provider_blob_path(&root, env_name)?.is_file() {
+        return None;
+    }
+    let env_path = root.join(".env");
+    let backend = match platform_backend(&root) {
+        Some(Ok(backend)) => backend,
+        Some(Err(error)) => {
+            audit_denied(&entry, &env_path, &error);
+            eprintln!("!! provider key {env_name}: {error}");
+            return None;
+        }
+        None => return None,
+    };
+    match backend.retrieve(&entry) {
+        Ok(secret) => String::from_utf8(secret.as_bytes().to_vec())
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        Err(error) => {
+            let error = error.to_string();
+            audit_denied(&entry, &env_path, &error);
+            eprintln!("!! provider key {env_name}: {error}");
+            None
+        }
+    }
+}
+
+/// Store (or refresh) a custody-held provider key — the dashboard save
+/// surface calls this for keys already in custody so a save never
+/// regresses them to the `.env`.
+pub fn store_provider_key(env_name: &str, value: &str) -> Result<(), String> {
+    let root = provider_estate_root().ok_or("cannot determine config directory")?;
+    let entry = provider_entry(env_name);
+    let env_path = root.join(".env");
+    let backend = match platform_backend(&root) {
+        Some(Ok(backend)) => backend,
+        Some(Err(error)) => {
+            audit_denied(&entry, &env_path, &error);
+            return Err(error);
+        }
+        None => return Err(NO_BACKEND_MESSAGE.to_string()),
+    };
+    backend.store(&entry, value.as_bytes()).map_err(|error| {
+        let error = error.to_string();
+        audit_denied(&entry, &env_path, &error);
+        format!("custody store {entry}: {error}")
+    })?;
+    credential_audit::record(
+        credential_audit::EVENT_KEY_STORED,
+        &entry,
+        &env_path.display().to_string(),
+        "daemon",
+        "provider key replaced in custody".to_string(),
+    );
+    Ok(())
+}
+
+/// The comment marker left in the `.env` where a migrated key's line
+/// stood.
+fn provider_marker(env_name: &str) -> String {
+    format!("# {env_name} is in OS-keystore custody (`intendant custody restore` returns it)")
+}
+
+/// Split one `.env` line into a `NAME=value` pair when it is an
+/// assignment of `name`.
+fn env_assignment<'line>(line: &'line str, name: &str) -> Option<&'line str> {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#') {
+        return None;
+    }
+    let (var, value) = trimmed.split_once('=')?;
+    (var.trim() == name).then_some(value)
+}
+
+/// Relocate every configured provider key out of the daemon `.env` into
+/// custody. All selected keys are stored and verified first; the `.env`
+/// is rewritten once at the end, so a failure leaves it untouched (env
+/// resolution still precedes custody, making leftover blobs inert until
+/// the rewrite lands on a re-run).
+fn migrate_provider_keys(
+    root: &Path,
+    backend: &dyn CustodyBackend,
+    mut report: impl FnMut(&str, &Outcome),
+) -> Result<(), String> {
+    let env_path = root.join(".env");
+    let text = match std::fs::read_to_string(&env_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            for name in crate::provider::PROVIDER_KEY_ENV_VARS {
+                report(name, &Outcome::Skipped("not in daemon .env"));
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(format!("read {}: {error}", env_path.display())),
+    };
+
+    let mut migrated: Vec<&str> = Vec::new();
+    for name in crate::provider::PROVIDER_KEY_ENV_VARS {
+        let Some(value) = text.lines().find_map(|line| env_assignment(line, name)) else {
+            let reason = match backend.contains(&provider_entry(name)) {
+                Ok(true) => "already in custody",
+                _ => "not in daemon .env",
+            };
+            report(name, &Outcome::Skipped(reason));
+            continue;
+        };
+        let entry = provider_entry(name);
+        backend
+            .store(&entry, value.as_bytes())
+            .map_err(|error| format!("store {entry}: {error}"))?;
+        let sealed = backend
+            .retrieve(&entry)
+            .map_err(|error| format!("verify {entry}: {error}"))?;
+        if sealed.as_bytes() != value.as_bytes() {
+            return Err(format!(
+                "verify {entry}: round-trip mismatch — .env left untouched"
+            ));
+        }
+        migrated.push(name);
+    }
+    if migrated.is_empty() {
+        return Ok(());
+    }
+
+    let rewritten: Vec<String> = text
+        .lines()
+        .map(|line| {
+            match migrated
+                .iter()
+                .find(|name| env_assignment(line, name).is_some())
+            {
+                Some(name) => provider_marker(name),
+                None => line.to_string(),
+            }
+        })
+        .collect();
+    replace_file_atomic(&env_path, (rewritten.join("\n") + "\n").as_bytes())?;
+    for name in migrated {
+        credential_audit::record(
+            credential_audit::EVENT_KEY_MIGRATED,
+            &provider_entry(name),
+            &env_path.display().to_string(),
+            "operator",
+            format!(
+                "relocated into {} custody (relocation, not rotation — pre-migration copies \
+                 unaffected)",
+                backend.kind()
+            ),
+        );
+        report(name, &Outcome::Done);
+    }
+    Ok(())
+}
+
+/// Return custody-held provider keys to the daemon `.env`: rewrite the
+/// file first (marker lines replaced, missing lines appended), then
+/// delete the blobs — a failed delete leaves an inert blob behind an
+/// `.env` line that wins resolution.
+fn restore_provider_keys(
+    root: &Path,
+    backend: &dyn CustodyBackend,
+    mut report: impl FnMut(&str, &Outcome),
+) -> Result<(), String> {
+    let env_path = root.join(".env");
+    let mut restored: Vec<(&str, String)> = Vec::new();
+    for name in crate::provider::PROVIDER_KEY_ENV_VARS {
+        if !matches!(backend.contains(&provider_entry(name)), Ok(true)) {
+            report(name, &Outcome::Skipped("not in custody"));
+            continue;
+        }
+        let entry = provider_entry(name);
+        let secret = backend
+            .retrieve(&entry)
+            .map_err(|error| format!("retrieve {entry}: {error}"))?;
+        let value = String::from_utf8(secret.as_bytes().to_vec())
+            .map_err(|_| format!("custody entry {entry} is not UTF-8"))?;
+        restored.push((name, value));
+    }
+    if restored.is_empty() {
+        return Ok(());
+    }
+
+    let text = std::fs::read_to_string(&env_path).unwrap_or_default();
+    let mut lines: Vec<String> = text.lines().map(|line| line.to_string()).collect();
+    for (name, value) in &restored {
+        let assignment = format!("{name}={value}");
+        let marker = provider_marker(name);
+        match lines.iter_mut().find(|line| line.trim() == marker) {
+            Some(line) => *line = assignment,
+            None => lines.push(assignment),
+        }
+    }
+    if let Some(parent) = env_path.parent() {
+        intendant_core::state_paths::create_private_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    }
+    replace_file_atomic(&env_path, (lines.join("\n") + "\n").as_bytes())?;
+    for (name, _) in restored {
+        let entry = provider_entry(name);
+        if let Err(error) = backend.delete(&entry) {
+            eprintln!("!! blob delete for {entry} failed ({error}) — the restored .env line wins; the leftover sealed blob is inert");
+        }
+        credential_audit::record(
+            credential_audit::EVENT_KEY_RESTORED,
+            &entry,
+            &env_path.display().to_string(),
+            "operator",
+            "returned from custody to the daemon .env".to_string(),
+        );
+        report(name, &Outcome::Done);
+    }
+    Ok(())
+}
+
+fn provider_status_line(root: &Path, env_text: Option<&str>, name: &str) -> &'static str {
+    let in_env = env_text.is_some_and(|text| {
+        text.lines()
+            .any(|line| env_assignment(line, name).is_some())
+    });
+    let in_custody = provider_blob_path(root, name).is_some_and(|blob| blob.is_file());
+    match (in_custody, in_env) {
+        (true, true) => "custody + .env line (the .env value wins until it migrates)",
+        (true, false) => "custody (sealed blob present)",
+        (false, true) => ".env (file mode)",
+        (false, false) => "not configured in the daemon .env",
+    }
+}
+
 /// One artifact's outcome in a migrate/restore run.
 enum Outcome {
     Done,
@@ -500,6 +772,11 @@ pub fn run_cli(args: Vec<String>) -> Result<(), String> {
                 let backend = cli_backend(&estate.root)?;
                 migrate_estate(estate, backend.as_ref(), print_outcome)?;
             }
+            if let Some(root) = provider_estate_root() {
+                println!("   provider keys ({})", root.join(".env").display());
+                let backend = cli_backend(&root)?;
+                migrate_provider_keys(&root, backend.as_ref(), print_outcome)?;
+            }
             println!();
             println!(":: done — sealed blobs live beside each estate; reads route through custody");
             println!(
@@ -523,6 +800,11 @@ pub fn run_cli(args: Vec<String>) -> Result<(), String> {
                 }
                 let backend = cli_backend(&estate.root)?;
                 restore_estate(estate, backend.as_ref(), print_outcome)?;
+            }
+            if let Some(root) = provider_estate_root() {
+                println!("   provider keys ({})", root.join(".env").display());
+                let backend = cli_backend(&root)?;
+                restore_provider_keys(&root, backend.as_ref(), print_outcome)?;
             }
             println!(":: done — keys are plain files again (labeled file mode)");
             Ok(())
@@ -564,6 +846,15 @@ fn print_status(estates: &[Estate]) {
         for file in &estate.files {
             let line = status_line(estate, file);
             println!("      {:<12} {line}", file.name);
+        }
+    }
+    if let Some(root) = provider_estate_root() {
+        println!();
+        println!("   provider keys ({})", root.join(".env").display());
+        let env_text = std::fs::read_to_string(root.join(".env")).ok();
+        for name in crate::provider::PROVIDER_KEY_ENV_VARS {
+            let line = provider_status_line(&root, env_text.as_deref(), name);
+            println!("      {name:<20} {line}");
         }
     }
 }
@@ -938,6 +1229,139 @@ mod tests {
         assert_eq!(
             std::fs::read(org_dir.join("root.pk8")).unwrap(),
             b"ORG ROOT PKCS8"
+        );
+    }
+
+    /// Provider keys: migration moves configured keys out of the daemon
+    /// `.env` into custody (markers in their place, unrelated lines
+    /// byte-preserved), status reads honestly, restore round-trips, and
+    /// both directions are idempotent and audited.
+    #[test]
+    fn provider_keys_migrate_and_restore_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let env_path = root.join(".env");
+        let backend = backend_in(root);
+        std::fs::write(
+            &env_path,
+            "# daemon env\nANTHROPIC_API_KEY=sk-ant-test-123\nUNRELATED=keepme\n\nOPENAI_API_KEY=sk-oai-test-456\n",
+        )
+        .unwrap();
+
+        let mut outcomes = Vec::new();
+        migrate_provider_keys(root, &backend, |name, outcome| {
+            outcomes.push((name.to_string(), matches!(outcome, Outcome::Done)));
+        })
+        .unwrap();
+        assert!(outcomes.contains(&("ANTHROPIC_API_KEY".to_string(), true)));
+        assert!(outcomes.contains(&("OPENAI_API_KEY".to_string(), true)));
+        assert!(outcomes.contains(&("GEMINI_API_KEY".to_string(), false)));
+
+        let text = std::fs::read_to_string(&env_path).unwrap();
+        assert!(text.contains("# daemon env"), "{text}");
+        assert!(text.contains("UNRELATED=keepme"), "{text}");
+        assert!(
+            !text.contains("sk-ant-test-123"),
+            "material must leave the .env: {text}"
+        );
+        assert!(
+            text.contains(&provider_marker("ANTHROPIC_API_KEY")),
+            "{text}"
+        );
+        assert_eq!(
+            backend
+                .retrieve("provider/ANTHROPIC_API_KEY")
+                .unwrap()
+                .as_bytes(),
+            b"sk-ant-test-123"
+        );
+
+        // Second migrate run: everything skips (already in custody).
+        let mut second = Vec::new();
+        migrate_provider_keys(root, &backend, |name, outcome| {
+            second.push((name.to_string(), matches!(outcome, Outcome::Done)));
+        })
+        .unwrap();
+        assert!(second.iter().all(|(_, done)| !done));
+
+        // Restore returns the lines (marker replaced in place) and
+        // deletes the blobs.
+        restore_provider_keys(root, &backend, |_, _| {}).unwrap();
+        let text = std::fs::read_to_string(&env_path).unwrap();
+        assert!(text.contains("ANTHROPIC_API_KEY=sk-ant-test-123"), "{text}");
+        assert!(text.contains("OPENAI_API_KEY=sk-oai-test-456"), "{text}");
+        assert!(text.contains("UNRELATED=keepme"), "{text}");
+        assert!(
+            !text.contains(&provider_marker("ANTHROPIC_API_KEY")),
+            "{text}"
+        );
+        assert!(!backend.contains("provider/ANTHROPIC_API_KEY").unwrap());
+
+        let events = credential_audit::recent(100);
+        assert!(events.iter().any(|event| {
+            event.event == credential_audit::EVENT_KEY_MIGRATED
+                && event.kind == "provider/ANTHROPIC_API_KEY"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == credential_audit::EVENT_KEY_RESTORED
+                && event.kind == "provider/OPENAI_API_KEY"
+        }));
+    }
+
+    /// Status rows are pure path math against the platform (sealed-blob)
+    /// layout — no backend construction, no keystore.
+    #[test]
+    fn provider_status_reads_the_sealed_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let env_text = "OPENAI_API_KEY=sk-live\n";
+        assert_eq!(
+            provider_status_line(root, Some(env_text), "OPENAI_API_KEY"),
+            ".env (file mode)"
+        );
+        assert_eq!(
+            provider_status_line(root, Some(env_text), "GEMINI_API_KEY"),
+            "not configured in the daemon .env"
+        );
+        // A sealed blob at the platform layout flips the row to custody.
+        let custody_dir = root.join(CUSTODY_SUBDIR);
+        std::fs::create_dir_all(&custody_dir).unwrap();
+        let blob = custody_dir
+            .join(intendant_custody::sealed_blob_file_name("provider/ANTHROPIC_API_KEY").unwrap());
+        std::fs::write(&blob, b"sealed").unwrap();
+        assert_eq!(
+            provider_status_line(root, Some(env_text), "ANTHROPIC_API_KEY"),
+            "custody (sealed blob present)"
+        );
+        assert_eq!(
+            provider_status_line(root, Some("ANTHROPIC_API_KEY=x\n"), "ANTHROPIC_API_KEY"),
+            "custody + .env line (the .env value wins until it migrates)"
+        );
+    }
+
+    /// `.env` assignment parsing: comments and markers never match,
+    /// spacing tolerated, other names never bleed.
+    #[test]
+    fn env_assignment_parses_only_real_assignments() {
+        assert_eq!(
+            env_assignment("ANTHROPIC_API_KEY=abc", "ANTHROPIC_API_KEY"),
+            Some("abc")
+        );
+        assert_eq!(
+            env_assignment("  ANTHROPIC_API_KEY = abc ", "ANTHROPIC_API_KEY"),
+            Some(" abc")
+        );
+        assert_eq!(
+            env_assignment("# ANTHROPIC_API_KEY=abc", "ANTHROPIC_API_KEY"),
+            None
+        );
+        assert_eq!(
+            env_assignment("OPENAI_API_KEY=abc", "ANTHROPIC_API_KEY"),
+            None
+        );
+        assert_eq!(
+            env_assignment("no assignment here", "ANTHROPIC_API_KEY"),
+            None
         );
     }
 

@@ -2240,6 +2240,15 @@ pub fn provider_api_key(env_name: &str) -> Option<String> {
             return Some(secret);
         }
     }
+    // Custody is last: an explicit environment key stays the operator
+    // override, matching the pre-custody precedence where the daemon
+    // `.env` reached this chain through the process environment.
+    provider_env_value(env_name).or_else(|| crate::key_custody::provider_key_from_custody(env_name))
+}
+
+/// The environment leg of the resolution chain (primary name, then the
+/// bare alias), blank-filtered.
+fn provider_env_value(env_name: &str) -> Option<String> {
     let alias = match env_name {
         "OPENAI_API_KEY" => Some("OPENAI"),
         "ANTHROPIC_API_KEY" => Some("ANTHROPIC"),
@@ -2250,6 +2259,21 @@ pub fn provider_api_key(env_name: &str) -> Option<String> {
         .ok()
         .or_else(|| alias.and_then(|name| std::env::var(name).ok()))
         .filter(|value| !value.trim().is_empty())
+}
+
+/// Whether [`provider_api_key`] would serve this key, *without* touching
+/// the keystore: leases and the environment are checked directly, and
+/// the custody leg answers from sealed-blob existence (pure path math).
+/// Availability polls (settings page, agent card) use this so an open
+/// dashboard never generates keychain traffic — material is unsealed
+/// only when a request needs the key.
+pub fn provider_key_available(env_name: &str) -> bool {
+    if let Some(kind) = env_kind(env_name) {
+        if leased_secret(kind).is_some() {
+            return true;
+        }
+    }
+    provider_env_value(env_name).is_some() || crate::key_custody::provider_key_in_custody(env_name)
 }
 
 /// A distinct "went dry" note when a lease expired and nothing replaced
