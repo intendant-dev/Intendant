@@ -30,6 +30,12 @@
 //!   the class has waiters ⇒ its reservation is honored. A failed probe can
 //!   also mean another borrower's probe won the same instant — a transient,
 //!   conservative false "has waiters" (we skip borrowing for one poll tick).
+//! - A fresh arrival runs the same probe against its OWN class's demand
+//!   file before its first grab: registered waiters mean it joins the
+//!   queue — register, then poll sleeping-first — instead of racing the
+//!   sleepers for a freed permit. Without it, a cargo's back-to-back
+//!   compile stream regrabs the permit within milliseconds of each
+//!   release and can starve a parked waiter for minutes.
 //! - Waiting is a 100ms LOCK_EX|LOCK_NB poll over every eligible permit —
 //!   never a blocking flock on a permit: blocking flock has no timeout, and
 //!   parking inside the kernel on a foreign permit would bypass the demand
@@ -66,6 +72,7 @@ use crate::flock;
 
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LINK_WAIT_NOTICE: Duration = Duration::from_secs(5);
+const COMPILE_WAIT_NOTICE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Class {
@@ -268,9 +275,12 @@ fn try_take(pool: &mut Vec<(String, File)>) -> Option<(String, File)> {
     Some(pool.swap_remove(idx))
 }
 
-/// Probe the foreign class's demand gate. Success ⇒ no registered waiters
-/// ⇒ borrowing its spare permits is allowed right now.
-fn foreign_has_no_waiters(demand: &File) -> bool {
+/// Probe a class's demand gate. Success ⇒ no waiters are registered on
+/// that class right now — a foreign borrower may take its spare permits,
+/// and a fresh own-class arrival may grab ahead of the (empty) queue. A
+/// failed probe can also mean another probe won the same instant — a
+/// transient, conservative false "has waiters" costing one poll tick.
+fn no_registered_waiters(demand: &File) -> bool {
     if flock::try_lock_exclusive(demand) {
         flock::unlock(demand);
         true
@@ -422,6 +432,22 @@ fn live_config_enabled(config_path: &Path) -> bool {
     matches!(config::load(config_path), Some(live) if live.enabled)
 }
 
+/// Crate names come from argv: bound and sanitize them before the
+/// one-line stderr diagnostics (`-` when absent or unusable).
+fn stderr_crate(crate_name: Option<&str>) -> String {
+    let name: String = crate_name
+        .unwrap_or("-")
+        .chars()
+        .filter(|c| c.is_ascii_graphic())
+        .take(64)
+        .collect();
+    if name.is_empty() {
+        "-".to_string()
+    } else {
+        name
+    }
+}
+
 fn maybe_report_link_wait(
     start: Instant,
     reported: &mut bool,
@@ -429,16 +455,32 @@ fn maybe_report_link_wait(
     queue: &str,
 ) {
     if !*reported && start.elapsed() >= LINK_WAIT_NOTICE {
-        let name: String = crate_name
-            .unwrap_or("-")
-            .chars()
-            .filter(|c| c.is_ascii_graphic())
-            .take(64)
-            .collect();
         eprintln!(
             "rustc-governor: {} waiting for the machine-wide linker slot ({:.1}s, queue={queue})",
-            if name.is_empty() { "-" } else { &name },
+            stderr_crate(crate_name),
             start.elapsed().as_secs_f64(),
+        );
+        *reported = true;
+    }
+}
+
+/// One concise stderr line after ten seconds parked in the compile-permit
+/// queue. The threshold sits above the link notice's five: multi-second
+/// permit waits are routine under concurrent agent builds, and the notice
+/// exists for the starved outlier — a build that looks hung should
+/// explain itself.
+fn maybe_report_compile_wait(
+    start: Instant,
+    reported: &mut bool,
+    crate_name: Option<&str>,
+    class: Class,
+) {
+    if !*reported && start.elapsed() >= COMPILE_WAIT_NOTICE {
+        eprintln!(
+            "rustc-governor: {} waiting for a machine-wide compile permit ({:.1}s, class={})",
+            stderr_crate(crate_name),
+            start.elapsed().as_secs_f64(),
+            class.as_str(),
         );
         *reported = true;
     }
@@ -517,8 +559,14 @@ pub(crate) fn acquire_link_slot(
 /// Acquire one machine-wide compile permit for `class`, waiting as long as
 /// it takes. `None` always means FAIL OPEN (run ungoverned): zero configured
 /// permits, an unusable permit dir, an unregisterable wait, or the kill
-/// switch flipping mid-wait — never "denied".
-pub(crate) fn acquire(cfg: &Config, class: Class, config_path: &Path) -> Option<AcquiredPermit> {
+/// switch flipping mid-wait — never "denied". `crate_name` feeds the
+/// long-wait stderr notice only.
+pub(crate) fn acquire(
+    cfg: &Config,
+    class: Class,
+    config_path: &Path,
+    crate_name: Option<&str>,
+) -> Option<AcquiredPermit> {
     if cfg.local_reserved == 0 && cfg.ci_reserved == 0 {
         return None;
     }
@@ -548,42 +596,65 @@ pub(crate) fn acquire(cfg: &Config, class: Class, config_path: &Path) -> Option<
         })
     };
 
-    // Own-class reservation first.
-    if let Some(p) = try_take(&mut own) {
-        return acquired(start, p);
-    }
+    // A registered queue outranks a fresh arrival: probe the own-class
+    // demand gate — the same probe foreign borrowers use — and skip the
+    // immediate grabs when waiters are parked on it. Without this, a
+    // cargo's compile stream regrabbing the permit within milliseconds of
+    // each release starves sleeping pollers (a waiter measured 194s parked
+    // behind 20 overtakes, 2026-07-21). A failed probe can also be a
+    // colliding probe: transient, conservative, costs one poll tick. An
+    // unopenable own demand file cannot be probed — grab-first then,
+    // matching the fail-open registration below.
+    let own_demand = open_lock_file(&dir.join(demand_name(class)));
+    let join_queue = own_demand
+        .as_ref()
+        .is_some_and(|gate| !no_registered_waiters(gate));
 
-    // Borrow the other class's spare capacity — but only through its demand
-    // gate. An unopenable foreign demand file means the gate cannot be
-    // probed: never borrow blind.
+    // The other class's gate, opened up front: the immediate borrow and
+    // the poll loop both consult it. An unopenable foreign demand file
+    // means the gate cannot be probed: never borrow blind.
     let foreign_demand = open_lock_file(&dir.join(demand_name(class.other())));
-    if !foreign.is_empty() {
-        if let Some(gate) = &foreign_demand {
-            if foreign_has_no_waiters(gate) {
-                if let Some(p) = try_take(&mut foreign) {
-                    return acquired(start, p);
+
+    if !join_queue {
+        // Own-class reservation first.
+        if let Some(p) = try_take(&mut own) {
+            return acquired(start, p);
+        }
+        // Then the other class's spare capacity, through its demand gate.
+        if !foreign.is_empty() {
+            if let Some(gate) = &foreign_demand {
+                if no_registered_waiters(gate) {
+                    if let Some(p) = try_take(&mut foreign) {
+                        return acquired(start, p);
+                    }
                 }
             }
         }
     }
 
-    // Nothing free: register demand — LOCK_SH held for the entire wait so
-    // foreign borrowers keep their hands off this class's reservation —
-    // then poll. If demand can't be registered, fail open rather than wait
-    // unregistered: borrowers couldn't see us, and we could starve behind
-    // them indefinitely.
-    let own_demand = open_lock_file(&dir.join(demand_name(class)))?;
+    // Nothing free (or the class has a queue this arrival must join):
+    // register demand — LOCK_SH held for the entire wait so foreign
+    // borrowers keep their hands off this class's reservation — then poll,
+    // sleeping BEFORE each round: an immediate first retry would hand a
+    // just-freed permit to the newest arrival ahead of every sleeping
+    // waiter, reopening the overtake the demand probe above closes. If
+    // demand can't be registered, fail open rather than wait unregistered:
+    // borrowers couldn't see us, and we could starve behind them
+    // indefinitely.
+    let own_demand = own_demand?;
     if !flock::lock_shared_blocking(&own_demand) {
         return None;
     }
+    let mut reported = false;
     loop {
+        std::thread::sleep(POLL_INTERVAL);
         if let Some(p) = try_take(&mut own) {
             flock::unlock(&own_demand);
             return acquired(start, p);
         }
         if !foreign.is_empty() {
             if let Some(gate) = &foreign_demand {
-                if foreign_has_no_waiters(gate) {
+                if no_registered_waiters(gate) {
                     if let Some(p) = try_take(&mut foreign) {
                         flock::unlock(&own_demand);
                         return acquired(start, p);
@@ -602,7 +673,7 @@ pub(crate) fn acquire(cfg: &Config, class: Class, config_path: &Path) -> Option<
                 return None;
             }
         }
-        std::thread::sleep(POLL_INTERVAL);
+        maybe_report_compile_wait(start, &mut reported, crate_name, class);
     }
 }
 
@@ -654,21 +725,21 @@ mod tests {
     #[test]
     fn acquire_prefers_own_class_then_borrows_idle_foreign() {
         let (_tmp, cfg, path) = rig(1, 1);
-        let a = acquire(&cfg, Class::Local, &path).unwrap();
+        let a = acquire(&cfg, Class::Local, &path, None).unwrap();
         assert_eq!(a.name, "permit-local-0");
         // Own class exhausted, no CI demand registered: borrow.
-        let b = acquire(&cfg, Class::Local, &path).unwrap();
+        let b = acquire(&cfg, Class::Local, &path, None).unwrap();
         assert_eq!(b.name, "permit-ci-0");
         drop(a);
         // Own reservation is free again and preferred.
-        let c = acquire(&cfg, Class::Local, &path).unwrap();
+        let c = acquire(&cfg, Class::Local, &path, None).unwrap();
         assert_eq!(c.name, "permit-local-0");
     }
 
     #[test]
     fn zero_permits_fails_open() {
         let (_tmp, cfg, path) = rig(0, 0);
-        assert!(acquire(&cfg, Class::Local, &path).is_none());
+        assert!(acquire(&cfg, Class::Local, &path, None).is_none());
     }
 
     #[test]
@@ -730,14 +801,14 @@ mod tests {
     #[test]
     fn waiter_respects_foreign_demand_then_takes_own_release() {
         let (_tmp, cfg, path) = rig(1, 1);
-        let held = acquire(&cfg, Class::Local, &path).unwrap();
+        let held = acquire(&cfg, Class::Local, &path, None).unwrap();
         assert_eq!(held.name, "permit-local-0");
         // Register CI demand so Local may not borrow the idle CI permit.
         let demand_ci = open_lock_file(&cfg.permit_dir.join("demand-ci")).unwrap();
         assert!(flock::lock_shared_blocking(&demand_ci));
 
         let (cfg2, path2) = (cfg.clone(), path.clone());
-        let waiter = std::thread::spawn(move || acquire(&cfg2, Class::Local, &path2));
+        let waiter = std::thread::spawn(move || acquire(&cfg2, Class::Local, &path2, None));
         // Generous settle time; the waiter must still be polling (the CI
         // permit is free but demand-gated).
         std::thread::sleep(Duration::from_millis(400));
@@ -753,5 +824,42 @@ mod tests {
             .expect("waiter must acquire after release");
         assert_eq!(got.name, "permit-local-0");
         flock::unlock(&demand_ci);
+    }
+
+    /// The 2026-07-21 starvation shape: the permit is FREE but the class
+    /// has a registered waiter — the pre-fix governor handed the permit
+    /// to the newcomer instantly (wait_ms=0) while the waiter slept out
+    /// its poll tick. A newcomer must join the queue instead: it
+    /// registers and sleeps at least one tick before its first take.
+    #[test]
+    fn newcomer_joins_a_registered_queue_instead_of_overtaking() {
+        let (_tmp, cfg, path) = rig(1, 0);
+        std::fs::create_dir_all(&cfg.permit_dir).unwrap();
+        let waiter = open_lock_file(&cfg.permit_dir.join("demand-local")).unwrap();
+        assert!(flock::lock_shared_blocking(&waiter));
+        let got = acquire(&cfg, Class::Local, &path, Some("newcomer")).unwrap();
+        assert_eq!(got.name, "permit-local-0");
+        assert!(
+            got.wait_ms >= POLL_INTERVAL.as_millis() as u64,
+            "a newcomer must queue behind registered demand, not overtake \
+             (waited {}ms)",
+            got.wait_ms
+        );
+        flock::unlock(&waiter);
+    }
+
+    /// The queue probe must not tax the uncontended path: no registered
+    /// demand ⇒ a free permit is still taken immediately, no poll tick.
+    #[test]
+    fn empty_queue_keeps_the_grab_first_fast_path() {
+        let (_tmp, cfg, path) = rig(1, 0);
+        let got = acquire(&cfg, Class::Local, &path, None).unwrap();
+        assert_eq!(got.name, "permit-local-0");
+        assert!(
+            got.wait_ms < POLL_INTERVAL.as_millis() as u64,
+            "no registered demand: the free permit is taken immediately \
+             (waited {}ms)",
+            got.wait_ms
+        );
     }
 }

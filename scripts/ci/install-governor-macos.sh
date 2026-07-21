@@ -197,6 +197,7 @@ Notes:
   heavyweight-link gate; `link_queue_slots = 0` keeps the gate but turns
   off FIFO ordering.
 - Watch it: tail -f /usr/local/var/intendant-governor/governor.log
-  (kind=link lines carry link_wait_ms + queue; kind=link-done is actual
-  linker runtime — the link-gate soak data.)
+  (kind=compile/compile-done pair wait_ms with permit hold runtime_ms —
+  the permit-sizing data; kind=link lines carry link_wait_ms + queue;
+  kind=link-done is actual linker runtime — the link-gate soak data.)
 NEXT_EOF
