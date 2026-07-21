@@ -1019,7 +1019,7 @@ pub(crate) fn get_api_key_status_json() -> String {
         let short = name.trim_end_matches("_API_KEY").to_ascii_lowercase();
         map.insert(
             short,
-            serde_json::Value::Bool(crate::credential_leases::provider_api_key(name).is_some()),
+            serde_json::Value::Bool(crate::credential_leases::provider_key_available(name)),
         );
     }
     serde_json::Value::Object(map).to_string()
@@ -1034,7 +1034,7 @@ pub(crate) fn api_key_status_response_body() -> String {
 pub(crate) fn any_provider_credential_usable() -> bool {
     crate::provider::PROVIDER_KEY_ENV_VARS
         .iter()
-        .any(|name| crate::credential_leases::provider_api_key(name).is_some())
+        .any(|name| crate::credential_leases::provider_key_available(name))
 }
 
 pub(crate) fn project_root_response_body(project_root: Option<&Path>) -> String {
@@ -1115,6 +1115,21 @@ pub(crate) fn set_api_keys_result(
         return serde_json::json!({"error": "Cannot determine config directory"}).to_string();
     };
 
+    // Custody-held keys are refreshed in custody — a save must never
+    // regress a migrated key back into the `.env`. The rest take the
+    // `.env` path below, exactly as before migration.
+    let mut env_keys = std::collections::BTreeMap::new();
+    for (key, val) in &payload.keys {
+        if crate::key_custody::provider_key_in_custody(key) {
+            if let Err(e) = crate::key_custody::store_provider_key(key, val) {
+                return serde_json::json!({"error": format!("custody save failed: {}", e)})
+                    .to_string();
+            }
+        } else {
+            env_keys.insert(key.clone(), val.clone());
+        }
+    }
+
     // Ensure the directory exists.
     if let Some(config_dir) = env_path.parent() {
         if let Err(e) = std::fs::create_dir_all(config_dir) {
@@ -1127,6 +1142,7 @@ pub(crate) fn set_api_keys_result(
     let existing = std::fs::read_to_string(env_path).unwrap_or_default();
 
     // Build updated content: replace existing lines, append new ones.
+    // Only non-custody keys touch the file.
     let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
     let mut written_keys = std::collections::HashSet::new();
 
@@ -1137,7 +1153,7 @@ pub(crate) fn set_api_keys_result(
         }
         if let Some(eq_pos) = trimmed.find('=') {
             let var_name = trimmed[..eq_pos].trim().to_string();
-            if let Some(new_val) = payload.keys.get(&var_name) {
+            if let Some(new_val) = env_keys.get(&var_name) {
                 *line = format!("{}={}", var_name, new_val);
                 written_keys.insert(var_name);
             }
@@ -1145,14 +1161,13 @@ pub(crate) fn set_api_keys_result(
     }
 
     // Append keys that weren't already in the file.
-    for (key, val) in &payload.keys {
+    for (key, val) in &env_keys {
         if !written_keys.contains(key.as_str()) {
             lines.push(format!("{}={}", key, val));
         }
     }
 
     let new_content = lines.join("\n") + "\n";
-
     if let Err(e) = crate::file_watcher::atomic_write(env_path, new_content.as_bytes()) {
         return serde_json::json!({"error": format!("Write failed: {}", e)}).to_string();
     }
@@ -1166,16 +1181,26 @@ pub(crate) fn set_api_keys_result(
     if !payload.keys.is_empty() {
         let mut names: Vec<&str> = payload.keys.keys().map(String::as_str).collect();
         names.sort_unstable();
+        let custody_count = payload.keys.len() - env_keys.len();
+        let detail = if custody_count == 0 {
+            format!(
+                "{} provider key(s) replaced in the daemon .env",
+                payload.keys.len()
+            )
+        } else {
+            format!(
+                "{} provider key(s) replaced ({custody_count} in custody, {} in the daemon .env)",
+                payload.keys.len(),
+                env_keys.len()
+            )
+        };
         crate::credential_audit::record_with_origin(
             crate::credential_audit::EVENT_PROVIDER_KEYS_WRITTEN,
             "provider_env",
             &names.join(", "),
             audit_actor,
             audit_origin,
-            format!(
-                "{} provider key(s) replaced in the daemon .env",
-                payload.keys.len()
-            ),
+            detail,
         );
     }
 

@@ -212,7 +212,7 @@ impl ProviderAuth {
                     .unwrap_or_default();
                 Err(CallerError::Config(format!(
                     "{env_name} went dry mid-session: no credential lease, environment \
-                     key, or project key currently serves it{note}"
+                     key, custody entry, or project key currently serves it{note}"
                 )))
             }
             ProviderAuth::ClientEgress { kind } => Err(CallerError::Config(format!(
@@ -235,7 +235,9 @@ fn provider_auth_with_project(
     project_keys: &ProjectEnvKeys,
 ) -> Option<ProviderAuth> {
     let project_key = project_keys.get(env_name);
-    if crate::credential_leases::provider_api_key(env_name).is_some() {
+    // Availability only — the keystore is not consulted at selection
+    // time; `PerRequest` unseals when a request actually goes out.
+    if crate::credential_leases::provider_key_available(env_name) {
         return Some(ProviderAuth::PerRequest {
             env_name,
             project_key,
