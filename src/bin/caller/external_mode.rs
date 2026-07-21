@@ -70,6 +70,32 @@ pub(crate) fn idle_external_vcs_event(
     })
 }
 
+/// [`idle_external_cwd_event`]'s twin for an idle-lane PR-publication
+/// notice: same scoping, same no-turn semantics; URL validation is the
+/// same daemon-side gate the in-turn drain applies.
+pub(crate) fn idle_external_pr_published_event(
+    event_thread_id: &Option<String>,
+    session_id: &Option<String>,
+    alias_session_id: &Option<String>,
+    provider: String,
+    url: String,
+    repo: String,
+    identifier: String,
+) -> Option<AppEvent> {
+    let concrete = session_id.clone()?;
+    (!identifier.is_empty()
+        && scoped_event_targets_config(event_thread_id, session_id, alias_session_id))
+    .then(|| AppEvent::SessionPrPublished {
+        session_id: concrete,
+        pr: crate::types::SessionPublishedPr {
+            provider,
+            repo,
+            number: identifier,
+            url: crate::thread_actions::validated_pr_url(&url),
+        },
+    })
+}
+
 /// In-place backend respawn for reload-credentials (the dashboard's
 /// "Reload credentials" chip after a Claude sign-in): cancel a live
 /// rate-limit park PRESERVING its pending re-send (unlike an interrupt,
@@ -868,6 +894,24 @@ pub(crate) async fn run_external_agent_mode(
                                             &drain_config.alias_session_id,
                                             kind,
                                             cwd,
+                                        ) {
+                                            bus.send(event);
+                                        }
+                                    }
+                                    external_agent::AgentEvent::CodeChangePublished {
+                                        provider,
+                                        url,
+                                        repo,
+                                        identifier,
+                                    } => {
+                                        if let Some(event) = idle_external_pr_published_event(
+                                            &event_thread_id,
+                                            &live_session_id,
+                                            &drain_config.alias_session_id,
+                                            provider,
+                                            url,
+                                            repo,
+                                            identifier,
                                         ) {
                                             bus.send(event);
                                         }

@@ -709,6 +709,11 @@ pub struct SessionInfo {
     pub needs_approval: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<crate::types::SessionGoal>,
+    /// Pull requests the session's backend reported publishing, in
+    /// arrival order (deduped by repo+number; URLs pre-validated on the
+    /// origin daemon).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub published_prs: Vec<crate::types::SessionPublishedPr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vitals: Option<crate::types::SessionVitals>,
 }
@@ -937,6 +942,7 @@ mod tests {
             "ephemeral",
             "tokens_used",
             "parent_session_id",
+            "published_prs",
         ] {
             assert!(
                 !json.contains(absent),
@@ -968,6 +974,12 @@ mod tests {
                     tokens_used: None,
                     token_budget: Some(50_000),
                 }),
+                published_prs: vec![crate::types::SessionPublishedPr {
+                    provider: "github".into(),
+                    repo: "o/r".into(),
+                    number: "7".into(),
+                    url: Some("https://github.com/o/r/pull/7".into()),
+                }],
                 vitals: None,
             },
         };

@@ -1833,6 +1833,24 @@ pub(crate) async fn run_with_presence(
                             bus.send(event);
                         }
                     }
+                    external_agent::AgentEvent::CodeChangePublished {
+                        provider,
+                        url,
+                        repo,
+                        identifier,
+                    } => {
+                        if let Some(event) = idle_external_pr_published_event(
+                            &event_thread_id,
+                            &local_session_id,
+                            &persistent_thread_id,
+                            provider,
+                            url,
+                            repo,
+                            identifier,
+                        ) {
+                            bus.send(event);
+                        }
+                    }
                     external_agent::AgentEvent::BackendError {
                         message,
                         code,

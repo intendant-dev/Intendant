@@ -251,6 +251,7 @@ pub fn spawn_event_listener(
                     | AppEvent::SessionForkResult { .. }
                     | AppEvent::TaskReceived { .. }
                     | AppEvent::SessionGoal { .. }
+                    | AppEvent::SessionPrPublished { .. }
                     | AppEvent::SessionVitals { .. }
                     | AppEvent::SessionActivity { .. }
                     | AppEvent::SessionRateLimits { .. }

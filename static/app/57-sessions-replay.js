@@ -1450,6 +1450,7 @@ function openSessionDetail(sessionOrId, taskArg) {
       const entries = data.entries || [];
       applySessionIdentitiesFromReplayEntries(entries);
       applySessionGoalsFromReplayEntries(entries);
+      applySessionPrsFromReplayEntries(entries);
       renderSessionDetailLogs(entries, logsEl, {
         sessionId: detailSessionId,
         source: detailSource,
@@ -2591,6 +2592,7 @@ function loadOlderRemoteSessionDetailRows(view) {
       if (entries.length) {
         applySessionIdentitiesFromReplayEntries(entries);
         applySessionGoalsFromReplayEntries(entries);
+        applySessionPrsFromReplayEntries(entries);
         mergeSessionDetailEntries(view, entries, true);
       }
       rebuildSessionDetailViewRows(view);

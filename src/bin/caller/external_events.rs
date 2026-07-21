@@ -1476,6 +1476,26 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
             external_agent::AgentEvent::GoalUpdated { goal } => {
                 emit_external_session_goal(config, event_thread_id.clone(), Some(goal));
             }
+            external_agent::AgentEvent::CodeChangePublished {
+                provider,
+                url,
+                repo,
+                identifier,
+            } => {
+                // Primary conversation only, like the other sticky
+                // session-state signals: a side thread's PR must not
+                // decorate the supervising session's chip.
+                if event_is_primary {
+                    crate::thread_actions::emit_external_pr_published(
+                        config,
+                        event_thread_id.clone(),
+                        provider,
+                        url,
+                        repo,
+                        identifier,
+                    );
+                }
+            }
             external_agent::AgentEvent::GoalCleared => {
                 emit_external_session_goal(config, event_thread_id.clone(), None);
             }

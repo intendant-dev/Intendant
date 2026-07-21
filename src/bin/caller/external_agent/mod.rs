@@ -1346,6 +1346,20 @@ pub enum AgentEvent {
     /// cadence remains the safety net. Ambient bookkeeping — implies no
     /// turn.
     VcsActivity { kind: String, cwd: Option<String> },
+    /// The backend linked this session to a pull request it published
+    /// (Claude Code's `system:code_change_published`, 2.1.216+ — emitted
+    /// after the CLI's session↔PR linking; GitHub/GHE URLs only on the
+    /// wire today). Fields are verbatim wire values; the drain validates
+    /// `url` before anything user-facing may hyperlink it and forwards
+    /// the result as `AppEvent::SessionPrPublished` (sticky per-session
+    /// display state, the `SessionGoal` shape). Ambient bookkeeping —
+    /// implies no turn.
+    CodeChangePublished {
+        provider: String,
+        url: String,
+        repo: String,
+        identifier: String,
+    },
     /// Incremental output from a running tool.
     ToolOutputDelta {
         item_id: String,
