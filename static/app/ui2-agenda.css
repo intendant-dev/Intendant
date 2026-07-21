@@ -146,6 +146,20 @@ html.ui-v2 .agenda-glyph.open { color: var(--iris); }
 html.ui-v2 .agenda-glyph.done { color: var(--green); }
 html.ui-v2 .agenda-glyph.retired { color: var(--text-3); }
 html.ui-v2 .agenda-glyph.question { color: var(--amber); font-weight: 700; }
+html.ui-v2 .agenda-open-ask-btn {
+  border-color: rgba(var(--iris-rgb), .4);
+  color: var(--iris-2);
+  font-weight: 650;
+}
+html.ui-v2 .agenda-open-ask-btn:hover {
+  background: rgba(var(--iris-rgb), .1);
+  border-color: rgba(var(--iris-rgb), .55);
+}
+html.ui-v2 .agenda-ask-hint {
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 .agenda-ask-open-row { margin-bottom: 4px; }
 html.ui-v2 .agenda-item-kind {
   font-family: var(--mono);
   font-size: 9.5px;

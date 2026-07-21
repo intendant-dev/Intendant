@@ -86,6 +86,32 @@ function agendaAnnounceParkedAsks() {
   }
 }
 
+// Explicit "open the question panel" from an agenda item card. Unlike the
+// once-per-load announce this is a user act: it re-surfaces even a tucked
+// or previously-dismissed panel, and it navigates to the Activity tab
+// where the panel lives (opening invisibly confused live QA 2026-07-20 —
+// the item card only offered the blind plain-text input).
+function agendaOpenParkedAsk(itemId) {
+  const item = (agendaItems || []).find((candidate) => candidate.id === itemId);
+  if (!item || !item.ask || !Array.isArray(item.ask.questions) || !item.ask.questions.length) {
+    return;
+  }
+  if (typeof showUserQuestion !== 'function') return;
+  const askId = item.ask.ask_id;
+  if (typeof switchTab === 'function') switchTab('activity');
+  agendaAnnouncedAsks.add(askId);
+  if (typeof pendingQuestion !== 'undefined' && pendingQuestion?.id === askId) {
+    // Already the pending panel (maybe tucked): an explicit open always
+    // brings it back.
+    setQuestionMinimized(false);
+    return;
+  }
+  showUserQuestion(askId, item.ask.questions, '', undefined, false, { agendaBacked: true });
+  // A rebuild after dismissal starts untucked; make sure a stale tucked
+  // state never survives an explicit open.
+  if (typeof setQuestionMinimized === 'function') setQuestionMinimized(false);
+}
+
 // Live update from the event lane: merge the changed item, adopt counts.
 function agendaObserveServerMessage(d) {
   if (!d || !d.item || !d.item.id) return;
@@ -490,7 +516,15 @@ function agendaActionButtons(item) {
     // this item, the gesture is the approval (digest bound server-side
     // under the same lock), and it fires through the ordinary scheduled
     // lane. Owner surface = this dashboard; agents get NotPermitted.
-    extra += `<button type="button" class="agenda-btn agenda-start-now" data-id="${escapeHtml(item.id)}" title="Mint + approve a session from this item and start it now (runs through the standard scheduled lane)">Start now</button>`;
+    // NOT on rich parked asks: those await the owner's ANSWER — spawning
+    // a follow-through session on one just re-reads the question at the
+    // owner (live-QA footgun 2026-07-20). Answering is the primary act;
+    // Open question panel is the affordance.
+    const richAsk = item.kind === 'question'
+      && item.ask && Array.isArray(item.ask.questions) && item.ask.questions.length;
+    if (!richAsk) {
+      extra += `<button type="button" class="agenda-btn agenda-start-now" data-id="${escapeHtml(item.id)}" title="Mint + approve a session from this item and start it now (runs through the standard scheduled lane)">Start now</button>`;
+    }
     const sid = agendaFollowUpSid(item);
     if (sid) {
       extra += `<button type="button" class="agenda-btn agenda-follow-up" data-id="${escapeHtml(item.id)}" data-sid="${escapeHtml(sid)}" title="The recording conversation is live — open the composer targeted at it with this item quoted">Follow up</button>`;
@@ -651,12 +685,24 @@ function agendaRenderTab() {
       ? `<div class="agenda-item-body">${escapeHtml(item.body)}</div>`
       : '';
     // The ask-seam reply affordance: open questions take a durable reply
-    // right here; answered ones show it (data, rendered escaped).
+    // right here; answered ones show it (data, rendered escaped). Rich
+    // (ask-backed) questions lead with the panel — options and previews
+    // live there; the inline input stays as an explicit plain-text path,
+    // never the only door.
     let answerBlock = '';
     if (item.kind === 'question' && item.status === 'open') {
-      answerBlock = `<div class="agenda-answer-row">
+      const richAsk = item.ask && Array.isArray(item.ask.questions) && item.ask.questions.length;
+      const openBtn = richAsk
+        ? `<div class="agenda-answer-row agenda-ask-open-row">
+            <button type="button" class="agenda-btn agenda-open-ask-btn" data-id="${escapeHtml(item.id)}">Open question panel</button>
+            <span class="agenda-ask-hint">${item.ask.questions.length > 1
+    ? `${item.ask.questions.length} structured questions`
+    : 'structured question'} with options${item.ask.questions.some((q) => (q.previews || []).length) ? ' + previews' : ''}</span>
+          </div>`
+        : '';
+      answerBlock = `${openBtn}<div class="agenda-answer-row">
         <input type="text" class="agenda-answer-input" maxlength="4000"
-               placeholder="Answer this question…" aria-label="Answer" data-id="${escapeHtml(item.id)}" />
+               placeholder="${richAsk ? 'Or type a plain-text answer…' : 'Answer this question…'}" aria-label="Answer" data-id="${escapeHtml(item.id)}" />
         <button type="button" class="agenda-btn agenda-answer-btn" data-id="${escapeHtml(item.id)}">Answer</button>
       </div>`;
     } else if (item.answer && item.answer.text) {
@@ -691,6 +737,9 @@ function agendaRenderTab() {
       e.preventDefault();
       agendaJumpToSession(link.dataset.sessionKey);
     });
+  });
+  list.querySelectorAll('.agenda-open-ask-btn').forEach((btn) => {
+    btn.addEventListener('click', () => agendaOpenParkedAsk(btn.dataset.id));
   });
   list.querySelectorAll('button[data-op]').forEach((btn) => {
     btn.addEventListener('click', () => {
