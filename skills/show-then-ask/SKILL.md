@@ -1,6 +1,6 @@
 ---
 name: show-then-ask
-description: Use when asking the user to choose between design or implementation variants, judge a before/after, or approve a visual change — show rendered previews on the dashboard question rail instead of describing them. Attach prototype HTML pages (interactive, sandboxed), images, or text snippets to a blocking `intendant ctl ask`; the user's choice or free-text reply returns as the command's stdout.
+description: Use when asking the user to choose between design or implementation variants, judge a before/after, or approve a visual change — show rendered previews on the dashboard question rail instead of describing them. Attach prototype HTML pages (interactive, sandboxed), images, or text snippets to `intendant ctl ask` — blocking (the choice returns as the command's stdout) or parked with `--park` (returns immediately; the answer lands on the durable agenda item).
 compatibility: Requires a reachable Intendant daemon (supervised sessions have $INTENDANT and INTENDANT_MCP_URL injected).
 ---
 
@@ -43,12 +43,24 @@ question is automatically attached to your own session).
 # Small text artifacts (diffs, copy, error messages) render preformatted:
 "$INTENDANT" ctl ask "Keep the new hero copy?" \
     --preview-text "New=The house runs itself. It answers to you."
+
+# Not gated on the answer? Park it — same cards, durable, returns at once;
+# the choice lands on the agenda item and is delivered back while your
+# session lives:
+"$INTENDANT" ctl ask --park "Which landing direction?" \
+    --option A --option B --preview-html A=proto-a.html --preview-html B=proto-b.html
 ```
 
-The command exits 0 with the answer ("A", "Ship it", or whatever the
-user typed — free text is always accepted on top of options) and
-nonzero on timeout with best-judgment guidance. Cards persist in the
-session log, so replays show exactly what the user saw when they chose.
+The blocking form exits 0 with the answer ("A", "Ship it", or whatever
+the user typed — free text is always accepted on top of options) and
+nonzero on timeout with best-judgment guidance. **Timeout is not
+expiry**: on a durable-agenda daemon the timed-out question stays open
+as an agenda item (the `--json` result carries `item_id`) — proceed on
+best judgment, note the provisional choice, and reconcile if the late
+answer arrives. Prefer `--park` when the choice is direction/preference
+rather than a gate: block only when you cannot proceed without the
+answer. Cards persist in the session log, so replays show exactly what
+the user saw when they chose.
 
 ## Constraints
 

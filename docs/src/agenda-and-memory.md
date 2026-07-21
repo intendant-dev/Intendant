@@ -61,7 +61,9 @@ open or done ──retire──► retired
 The supported commands are:
 
 - `add`, `patch`, `complete`, `reopen`, and `retire`;
-- `answer` for an open question (answering also resolves it);
+- `ask` — park a rich multi-question ask as a durable question item (below);
+- `answer` for an open question (answering also resolves it; `structured`
+  optionally carries a rich-ask breakdown);
 - `annotate`, `set_blocker`, `clear_blocker`, `add_relies_on`, and
   `remove_relies_on` — the item's thread and gates (below);
 - `propose_effect`, `approve_effect`, and `revoke_effect` for a scheduled
@@ -76,6 +78,69 @@ A question is the durable, non-blocking counterpart to `ask_user`. Parking it
 does not stop a session. The owner can answer later, and a future session can
 read the reply from the item. Reopening an answered question clears the
 current reply view but not the historical operation.
+
+### Rich asks: park by default, block when gated
+
+A **rich ask** is the full Ask v2 question payload — up to four structured
+questions with options, pick bounds, free-text policy, and rendered preview
+cards — parked as a durable agenda question item instead of (or in addition
+to) a blocking wait. Three surfaces speak it: the `ask` agenda command,
+`intendant ctl ask --park`, and the `ask_user` MCP tool's `park: true`. The
+daemon validates the payload, commits preview bytes into the agenda blob
+store (`GET /api/agenda/blobs/...`), and mints both the item id and a rail
+`ask_id`; the questions surface on every dashboard's question rail through
+the exact `UserQuestionRequired` pipeline live asks use — same panel, same
+previews — but nothing blocks and nothing expires.
+
+The working doctrine:
+
+- **Park by default** for direction, preference, and design questions — the
+  agent can proceed on other work, and the answer arrives when the owner
+  gets to it. Parking returns `{status: "parked", item_id, ask_id}`
+  immediately.
+- **Blocking stays first-class** for gating or destructive decisions the
+  agent cannot proceed without (`ctl ask` without `--park`, `ask_user`
+  without `park`): schema changes, force-pushes, deleting data.
+- **A timeout is not an expiry.** On a daemon with the durable agenda, a
+  blocking ask is *backed by* the same parked item (blocking-as-sugar): if
+  the wait lapses or the waiter is abandoned mid-wait, the agent stops
+  waiting — the result carries best-judgment guidance plus the `item_id` —
+  but the question stays open and answerable on the agenda, and the rail
+  card converts to its parked (no-countdown) form. An agent that proceeds
+  on its own judgment should note the provisional choice so the late answer
+  can be reconciled.
+- **Approvals never ride the agenda.** A question requests *input*, never
+  permission: it is never auto-approved, an answer never widens autonomy,
+  and permission requests belong on the approval lane, not parked as
+  questions.
+
+**Answer delivery.** Resolving an ask-backed item — a structured rail
+answer, a plain-text answer typed on the Agenda tab, or a `complete`/
+`retire` that closes it unanswered — broadcasts the outcome. A live
+blocking waiter returns it inline; otherwise, if the asking session is
+still alive, the daemon delivers the outcome **into that session as a user
+message at a turn boundary** (the follow-up lane — plain input text, never
+an instruction channel). Either way the item keeps the durable record: the
+joined text summary every text surface reads, plus the structured
+resolution (`answer.structured` — per-question answers, selected option
+labels, follow-ups, and preview-anchored notes). A session that parked a
+question and died reads the reply from the item next time.
+
+**Dismissal is not resolution.** Skipping or denying the rail card records
+a dismissal marker (`dismissed`: verb, time, actor) and clears every
+connected rail *now*, but the item stays **open** — only an answer resolves
+a question. Dismissed items are deliberately excluded from re-announcement
+(the dashboard's page-load announce and the daemon's boot re-announce both
+skip them); the item card shows a quiet "dismissed · still open" chip, and
+its **Open question panel** button is the deliberate way back. Answering or
+reopening clears the marker view; the log keeps every dismissal as history
+(append-only, like everything else here).
+
+**The archive.** The dashboard Agenda tab's **Questions** filter shows the
+open questions and the answered ones together; answered ask-backed items
+render the full structured breakdown, not just the joined text. Everything
+— question text, answers, follow-ups, notes — renders escaped and quoted:
+data, never instructions.
 
 ### Threads, blockers, and dependencies
 

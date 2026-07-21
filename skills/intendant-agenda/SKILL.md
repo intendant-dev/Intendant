@@ -41,6 +41,7 @@ dashboard, attributed to your session.
 "$INTENDANT" ctl agenda add "Renew the TLS cert" --task --body "Expires Aug 1; renew by Jul 20." --tag infra --due 2026-07-20
 "$INTENDANT" ctl agenda add "Idea: unify the two transfer pumps" --note --tag arch
 "$INTENDANT" ctl agenda ask "OK to drop the v1 shim next week?" --body "qa.transportShimHits()==0 for 2 days now."
+"$INTENDANT" ctl ask --park "Which grid layout?" --option Dense --option Airy   # RICH parked ask: options/previews on the rail, durable on the agenda
 "$INTENDANT" ctl agenda list            # open items (--all / --done / --retired)
 "$INTENDANT" ctl agenda answer 01KX "yes — after the soak window"   # owner replies
 "$INTENDANT" ctl agenda complete 01KX   # any unique id prefix
@@ -54,13 +55,24 @@ dashboard, attributed to your session.
 "$INTENDANT" ctl agenda list --blocked         # open items with uncleared blockers / unmet deps
 ```
 
-- **Questions**: `ask` parks a durable, non-blocking question — it badges
-  the owner's attention rail, nothing waits, and the reply lands on the
-  item (`answer` field in `list --json`). Ask when you need the owner's
-  call but can proceed on other work; use `ctl ask` (the blocking rail)
-  only when you cannot proceed without the answer. **Check for answers at
-  session start** — an answered question is how yesterday's you hears
-  back.
+- **Questions — park by default.** For direction, preference, and design
+  questions, park instead of blocking: `ctl agenda ask` for a plain
+  title/body question, `ctl ask --park` (or the `ask_user` tool with
+  `park: true`) when options, pick bounds, or preview cards help the owner
+  answer at a glance — the full question renders on the dashboard question
+  rail, returns `{status:"parked", item_id, ask_id}` immediately, and the
+  reply lands on the item (`answer` in `list --json`; rich asks also carry
+  `answer.structured`). While your session still lives, the owner's answer
+  is delivered back to you as a user message — otherwise read it from the
+  item. **Blocking stays first-class** for gating or destructive decisions
+  you cannot proceed without (`ctl ask` without `--park`). **Timeout is
+  not expiry**: on this daemon a timed-out blocking ask stays open on the
+  agenda (the result carries its `item_id`) — proceed on best judgment,
+  note the provisional choice, and reconcile when the late answer arrives.
+  **Approvals never ride the agenda**: a question requests input, never
+  permission — never park a permission request as a question. **Check for
+  answers at session start** — an answered question is how yesterday's
+  you hears back.
 
 - **Scheduled sessions**: `schedule` proposes a session manifest on an
   item — at `--at`, the daemon spawns a normal supervised session with
