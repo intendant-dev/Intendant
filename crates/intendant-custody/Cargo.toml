@@ -1,0 +1,16 @@
+[package]
+name = "intendant-custody"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+ring = "0.17"
+thiserror = "1.0"
+zeroize = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[dev-dependencies]
+tempfile = "3"
