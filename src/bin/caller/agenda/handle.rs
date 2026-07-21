@@ -153,14 +153,12 @@ impl AgendaHandle {
                 project_root,
                 interactive,
             } => {
-                let provenance_session = {
-                    let mut store = self.lock();
-                    store.refresh_if_stale()?;
-                    let item = store
-                        .item(&id)
-                        .ok_or_else(|| AgendaError::NotFound(id.clone()))?;
-                    item.provenance.session_id.clone()
-                };
+                let provenance_session = self
+                    .lock()
+                    .item(&id)
+                    .ok_or_else(|| AgendaError::NotFound(id.clone()))?
+                    .provenance
+                    .session_id;
                 let (resolved, _source) = resolve_spawn_project(
                     project_root.as_deref(),
                     provenance_session.as_deref(),
@@ -185,11 +183,16 @@ impl AgendaHandle {
         );
         let parked_ask = matches!(&cmd, AgendaCommand::Ask { .. });
         let reopened = matches!(&cmd, AgendaCommand::Reopen { .. });
+        // (rail-clear action for ApprovalResolved, true verb for the
+        // outcome event). Intake refuses repeat transitions (re-answer,
+        // complete-on-done), so an accepted closing op left Open exactly
+        // once — the outcome event fires exactly once per resolution.
         let closing = match &cmd {
-            AgendaCommand::Answer { .. } => Some("answer"),
+            AgendaCommand::Answer { .. } => Some(("answer", "answer")),
             // Complete/Retire from another surface (the Agenda tab, ctl)
             // still clears every rail holding the ask.
-            AgendaCommand::Complete { .. } | AgendaCommand::Retire { .. } => Some("skip"),
+            AgendaCommand::Complete { .. } => Some(("skip", "complete")),
+            AgendaCommand::Retire { .. } => Some(("skip", "retire")),
             _ => None,
         };
         let proposed = matches!(&cmd, AgendaCommand::ProposeEffect { .. });
@@ -231,15 +234,19 @@ impl AgendaHandle {
         }
         // Any resolution of an ask-backed item — a rail answer recorded by
         // the resolver, a text answer typed on the Agenda tab, a
-        // complete/retire — clears every connected rail.
-        if let Some(action) = closing {
+        // complete/retire — clears every connected rail, then broadcasts
+        // the outcome so a live blocking waiter returns it and (when no
+        // waiter holds the ask) the supervisor delivers it into the
+        // still-live asking session.
+        if let Some((rail_action, outcome_action)) = closing {
             if item.status != super::types::AgendaStatus::Open {
                 if let Some(ask) = &item.ask {
                     self.bus.send(AppEvent::ApprovalResolved {
                         session_id: item.provenance.session_id.clone(),
                         id: ask.ask_id,
-                        action: action.to_string(),
+                        action: rail_action.to_string(),
                     });
+                    self.emit_ask_outcome(&item, outcome_action);
                 }
             }
         }
@@ -342,6 +349,52 @@ impl AgendaHandle {
             id: ask_id,
             action: action.to_string(),
         });
+        self.emit_ask_outcome(&item, action);
+        self.reminder_nudge.notify_waiters();
+        Ok(item)
+    }
+
+    /// Broadcast the recorded outcome of an agenda-backed ask. Fired
+    /// exactly once per accepted op — command intake refuses re-answers
+    /// and repeat transitions. `inline_waiter` is stamped HERE, by the
+    /// item's single writer: a live blocking waiter deregisters from the
+    /// pending registry only after observing this event, so the stamp
+    /// cannot race the waiter's return (see `mcp/tools_ask.rs`).
+    fn emit_ask_outcome(&self, item: &AgendaItem, action: &str) {
+        let Some(ask) = &item.ask else { return };
+        self.bus.send(AppEvent::AgendaAskOutcome {
+            item: item.clone(),
+            action: action.to_string(),
+            inline_waiter: crate::mcp::ask_user_question_pending(ask.ask_id),
+        });
+    }
+
+    /// Park a rich ask on behalf of a live blocking `ask_user` waiter
+    /// (blocking-as-sugar): the item is created exactly like a park —
+    /// same validation, blob custody into the agenda store, minted item
+    /// and rail ids — but the rail announcement is left to the waiter
+    /// (which stamps its deadline and hold state), and the waiter is
+    /// registered in the pending-ask registry BEFORE the item becomes
+    /// visible to any other surface, so no outcome recorded after this
+    /// call can miss the `inline_waiter` stamp.
+    pub(crate) fn park_ask_for_waiter(
+        &self,
+        questions: Vec<crate::mcp::AskUserQuestionParams>,
+        actor: Option<AgendaActor>,
+    ) -> Result<AgendaItem, AgendaError> {
+        let (item, counts) = {
+            let mut store = self.lock();
+            let item = store.apply_command(AgendaCommand::Ask { questions }, actor, now_ms())?;
+            if let Some(ask) = &item.ask {
+                crate::mcp::register_pending_ask(ask.ask_id);
+            }
+            let counts = store.counts();
+            (item, counts)
+        };
+        self.bus.send(AppEvent::AgendaChanged {
+            item: item.clone(),
+            counts,
+        });
         self.reminder_nudge.notify_waiters();
         Ok(item)
     }
@@ -349,6 +402,35 @@ impl AgendaHandle {
     /// The item currently holding `ask_id` as an OPEN rich ask, if any.
     pub(crate) fn open_ask_item(&self, ask_id: u64) -> Option<AgendaItem> {
         self.lock().open_ask(ask_id)
+    }
+
+    /// The item with `item_id`, whatever its status (fresh fold). The
+    /// blocking waiter's timeout path uses it to heal a lagged broadcast:
+    /// an outcome recorded moments before the wait lapsed is read back
+    /// from the ledger instead of being lost.
+    pub(crate) fn item_by_id(&self, item_id: &str) -> Option<AgendaItem> {
+        self.lock().item(item_id)
+    }
+
+    /// Boot re-announcement (loud-badges guardrail): re-emit the rail
+    /// announcement for every OPEN agenda-backed ask so the state-line
+    /// cache, the attention nudge, and every connecting rail repopulate
+    /// without waiting for the Agenda tab's JS bootstrap. Parked form —
+    /// no expiry, not held (a live waiter re-arms its own deadline by
+    /// re-announcing); the attention nudge dedups by id, and same-id
+    /// re-shows are harmless on every rail. Returns how many were
+    /// announced.
+    pub(crate) fn announce_open_asks(&self) -> usize {
+        let (items, _, _) = self.snapshot();
+        let mut announced = 0;
+        for item in &items {
+            if item.status == super::types::AgendaStatus::Open && item.ask.is_some() {
+                let session = item.provenance.session_id.clone();
+                self.announce_ask(item, session);
+                announced += 1;
+            }
+        }
+        announced
     }
 
     /// Daemon-internal occurrence write-back (scheduler only): appends the
@@ -825,6 +907,299 @@ mod tests {
             project_root: None,
             interactive: None,
         }
+    }
+
+    fn one_question_ask(text: &str) -> AgendaCommand {
+        AgendaCommand::Ask {
+            questions: vec![crate::mcp::AskUserQuestionParams {
+                question: text.to_string(),
+                header: None,
+                options: Vec::new(),
+                previews: Vec::new(),
+                pick_min: None,
+                pick_max: None,
+                free_text: None,
+            }],
+        }
+    }
+
+    fn outcome_events(events: &[AppEvent]) -> Vec<(String, String, bool)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::AgendaAskOutcome {
+                    item,
+                    action,
+                    inline_waiter,
+                } => Some((item.id.clone(), action.clone(), *inline_waiter)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Slice 2: every resolution of an ask-backed item — rail answer,
+    /// Agenda-tab answer, dismissal, complete/retire — emits exactly one
+    /// `AgendaAskOutcome` carrying the true verb; non-resolutions emit
+    /// none.
+    #[tokio::test]
+    async fn ask_resolutions_emit_exactly_one_outcome_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+
+        let parked = handle
+            .apply(
+                one_question_ask("Ship it?"),
+                actor("agent_session", Some("sess-1")),
+            )
+            .unwrap();
+        let ask_id = parked.ask.as_ref().unwrap().ask_id;
+        assert!(
+            outcome_events(&drain_events(&mut rx)).is_empty(),
+            "parking is not an outcome"
+        );
+
+        // Rail dismissal: outcome with the rail verb, item stays open.
+        handle.dismiss_ask(ask_id, "skip").unwrap();
+        assert_eq!(
+            outcome_events(&drain_events(&mut rx)),
+            vec![(parked.id.clone(), "skip".to_string(), false)]
+        );
+
+        // Agenda-tab text answer: outcome "answer", exactly once.
+        handle
+            .apply(
+                AgendaCommand::Answer {
+                    id: parked.id.clone(),
+                    text: "yes — ship it".into(),
+                    structured: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome_events(&drain_events(&mut rx)),
+            vec![(parked.id.clone(), "answer".to_string(), false)]
+        );
+
+        // Reopen (not an outcome), then complete: outcome "complete".
+        handle
+            .apply(
+                AgendaCommand::Reopen {
+                    id: parked.id.clone(),
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert!(outcome_events(&drain_events(&mut rx)).is_empty());
+        handle
+            .apply(
+                AgendaCommand::Complete {
+                    id: parked.id.clone(),
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome_events(&drain_events(&mut rx)),
+            vec![(parked.id.clone(), "complete".to_string(), false)]
+        );
+
+        // Repeat complete is refused at intake — no second outcome.
+        assert!(handle
+            .apply(
+                AgendaCommand::Complete {
+                    id: parked.id.clone(),
+                    source: None,
+                },
+                None,
+            )
+            .is_err());
+        assert!(outcome_events(&drain_events(&mut rx)).is_empty());
+
+        // Plain (non-ask) questions resolve without outcome events.
+        let plain = handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Question,
+                    title: "plain?".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        handle
+            .apply(
+                AgendaCommand::Answer {
+                    id: plain.id.clone(),
+                    text: "sure".into(),
+                    structured: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert!(outcome_events(&drain_events(&mut rx)).is_empty());
+    }
+
+    /// The single-writer stamp: an outcome recorded while a blocking
+    /// waiter holds the ask carries `inline_waiter: true` (the waiter
+    /// returns it inline; the supervisor must not double-deliver).
+    #[tokio::test]
+    async fn outcome_stamps_inline_waiter_while_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let parked = handle.apply(one_question_ask("Held?"), None).unwrap();
+        let ask_id = parked.ask.as_ref().unwrap().ask_id;
+        drain_events(&mut rx);
+
+        crate::mcp::register_pending_ask(ask_id);
+        let resolution = super::super::ask::resolution_from_wire(
+            std::collections::HashMap::from([("Held?".to_string(), "yes".to_string())]),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        handle.answer_ask(ask_id, resolution).unwrap();
+        let outcomes = outcome_events(&drain_events(&mut rx));
+        assert_eq!(
+            outcomes,
+            vec![(parked.id.clone(), "answer".to_string(), true)]
+        );
+        // The waiter (not the store) drops its own registration.
+        assert!(crate::mcp::ask_user_question_pending(ask_id));
+        crate::mcp::unregister_pending_ask(ask_id);
+        assert!(!crate::mcp::ask_user_question_pending(ask_id));
+    }
+
+    /// Blocking-as-sugar's park: same item as a park, no rail
+    /// announcement (the waiter announces with its deadline), and the
+    /// waiter registration exists before any other surface can see the
+    /// item.
+    #[tokio::test]
+    async fn park_ask_for_waiter_is_quiet_and_preregistered() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+
+        let item = handle
+            .park_ask_for_waiter(
+                vec![crate::mcp::AskUserQuestionParams {
+                    question: "Blocking?".into(),
+                    header: None,
+                    options: Vec::new(),
+                    previews: Vec::new(),
+                    pick_min: None,
+                    pick_max: None,
+                    free_text: None,
+                }],
+                actor("agent_session", Some("sess-block")),
+            )
+            .unwrap();
+        let ask_id = item.ask.as_ref().unwrap().ask_id;
+        assert!(crate::mcp::ask_user_question_pending(ask_id));
+        assert_eq!(item.provenance.session_id.as_deref(), Some("sess-block"));
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AppEvent::AgendaChanged { .. })),
+            "the agenda surfaces still update live"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AppEvent::UserQuestionRequired { .. } | AppEvent::UserNotification { .. }
+            )),
+            "the waiter owns the announcement: {events:?}"
+        );
+        crate::mcp::unregister_pending_ask(ask_id);
+    }
+
+    /// Boot re-announcement: open ask-backed items re-emit the parked
+    /// rail announcement once each (no expiry, not held, provenance
+    /// attribution); resolved items and plain questions do not.
+    #[tokio::test]
+    async fn announce_open_asks_reemits_open_items_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus.clone(),
+            dir.path(),
+        );
+
+        let open = handle
+            .apply(
+                one_question_ask("Still open?"),
+                actor("agent_session", Some("sess-open")),
+            )
+            .unwrap();
+        let answered = handle.apply(one_question_ask("Answered?"), None).unwrap();
+        let answered_ask = answered.ask.as_ref().unwrap().ask_id;
+        handle
+            .answer_ask(
+                answered_ask,
+                super::super::ask::resolution_from_wire(
+                    std::collections::HashMap::from([("Answered?".to_string(), "yes".into())]),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                ),
+            )
+            .unwrap();
+        // A plain (non-ask) open question never rides the rail.
+        handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Question,
+                    title: "plain open".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        // Subscribe AFTER the setup churn: only the boot announcement.
+        let mut rx = bus.subscribe();
+        assert_eq!(handle.announce_open_asks(), 1);
+        let events = drain_events(&mut rx);
+        let announced: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::UserQuestionRequired {
+                    session_id,
+                    id,
+                    expires_at_ms,
+                    held,
+                    ..
+                } => Some((session_id.clone(), *id, *expires_at_ms, *held)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            announced,
+            vec![(
+                Some("sess-open".to_string()),
+                open.ask.as_ref().unwrap().ask_id,
+                None,
+                false
+            )]
+        );
     }
 
     /// F3's combined mint+approve gesture is owner-surface only, exactly

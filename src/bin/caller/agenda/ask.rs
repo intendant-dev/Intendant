@@ -111,6 +111,55 @@ pub(crate) fn answer_summary(
     lines.join("\n")
 }
 
+/// The follow-up text delivered into the still-live ASKING session when an
+/// agenda-backed ask resolves (slice 2: late-answer delivery). Plain user
+/// INPUT text — it rides the same follow-up lane user messages ride and
+/// never widens autonomy. `None` for actions that carry nothing to deliver.
+///
+/// Answer form (per the ratified brief): a readable summary — the
+/// per-question `Header: answer` lines plus the follow-up/annotation lines
+/// exactly as [`answer_summary`] builds them — and one trailing line noting
+/// the full structure lives on the agenda item.
+pub(crate) fn ask_outcome_delivery_text(
+    item: &super::types::AgendaItem,
+    action: &str,
+) -> Option<String> {
+    let title = &item.title;
+    let id = &item.id;
+    match action {
+        "answer" => {
+            let answer = item.answer.as_ref()?;
+            let questions = item
+                .ask
+                .as_ref()
+                .map(|ask| ask.questions.as_slice())
+                .unwrap_or_default();
+            let summary = answer
+                .structured
+                .as_ref()
+                .map(|resolution| answer_summary(questions, resolution))
+                .filter(|summary| !summary.trim().is_empty())
+                .unwrap_or_else(|| answer.text.clone());
+            let joint = if summary.contains('\n') { ":\n" } else { ": " };
+            Some(format!(
+                "Answer to your parked question \"{title}\" (agenda {id}){joint}{summary}\n\n\
+                 The full structured answer (selections, follow-ups, preview notes) is on \
+                 agenda item {id}."
+            ))
+        }
+        "skip" | "deny" | "approve" | "approve_all" => Some(format!(
+            "Your parked question \"{title}\" (agenda {id}) was dismissed on the question \
+             rail ({action}) without an answer. It remains open on the agenda; the owner \
+             can still answer it later."
+        )),
+        "complete" | "retire" => Some(format!(
+            "Your parked question \"{title}\" (agenda {id}) was closed on the agenda \
+             ({action}) without an answer."
+        )),
+        _ => None,
+    }
+}
+
 /// Map the `AnswerQuestion` wire maps into the durable resolution shape
 /// (BTreeMaps for byte-deterministic log lines).
 pub(crate) fn resolution_from_wire(
@@ -261,5 +310,162 @@ mod tests {
             answer_summary(&questions, &resolution),
             "follow-up (Grid): neither — rethink"
         );
+    }
+
+    fn answered_item(
+        questions: Vec<crate::types::UserQuestion>,
+        answer: AgendaAnswer,
+    ) -> AgendaItem {
+        use super::super::types::*;
+        AgendaItem {
+            id: "01ITEM".into(),
+            kind: AgendaKind::Question,
+            title: "Which grid?".into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            provenance: AgendaProvenance {
+                principal: None,
+                session_id: Some("sess-ask".into()),
+                kind: Some("agent_session".into()),
+                source: None,
+                created_ms: 1,
+            },
+            status: AgendaStatus::Done,
+            updated_ms: 2,
+            completed_ms: Some(2),
+            answer: Some(answer),
+            effects: Vec::new(),
+            ask: Some(AgendaAsk {
+                ask_id: 7,
+                questions,
+            }),
+            dismissed: None,
+            annotations: Vec::new(),
+            blockers: Vec::new(),
+            relies_on: Vec::new(),
+        }
+    }
+
+    fn plain_answer(text: &str, structured: Option<AgendaAskResolution>) -> AgendaAnswer {
+        AgendaAnswer {
+            text: text.into(),
+            at_ms: 2,
+            principal: None,
+            session_id: None,
+            kind: None,
+            structured,
+        }
+    }
+
+    use super::super::types::{AgendaAnswer, AgendaItem};
+
+    /// Delivery text for a single-question answer: one line, title +
+    /// item id + the bare answer, plus the trailing structure pointer.
+    #[test]
+    fn delivery_text_single_answer_is_one_line_summary() {
+        let item = answered_item(
+            vec![question("Which grid?", "Grid")],
+            plain_answer(
+                "A",
+                Some(resolution_from_wire(
+                    HashMap::from([("Which grid?".to_string(), "A".to_string())]),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                )),
+            ),
+        );
+        assert_eq!(
+            ask_outcome_delivery_text(&item, "answer").unwrap(),
+            "Answer to your parked question \"Which grid?\" (agenda 01ITEM): A\n\n\
+             The full structured answer (selections, follow-ups, preview notes) is on \
+             agenda item 01ITEM."
+        );
+    }
+
+    /// Multi-question answers deliver the per-question `Header: answer`
+    /// lines with follow-up and annotation lines, exactly as the summary
+    /// builder (and ctl) print them.
+    #[test]
+    fn delivery_text_multi_answer_carries_followup_and_annotation_lines() {
+        let questions = vec![
+            question("Which grid?", "Grid"),
+            question("Keep the sidebar?", ""),
+        ];
+        let resolution = resolution_from_wire(
+            HashMap::from([
+                ("Which grid?".to_string(), "A".to_string()),
+                ("Keep the sidebar?".to_string(), "yes".to_string()),
+            ]),
+            HashMap::new(),
+            HashMap::from([("Which grid?".to_string(), "can B keep it?".to_string())]),
+            HashMap::from([(
+                "Keep the sidebar?".to_string(),
+                vec![crate::types::QuestionAnnotation {
+                    preview: "B".into(),
+                    note: "too faint".into(),
+                }],
+            )]),
+        );
+        let item = answered_item(questions, plain_answer("joined", Some(resolution)));
+        let text = ask_outcome_delivery_text(&item, "answer").unwrap();
+        assert!(
+            text.starts_with(
+                "Answer to your parked question \"Which grid?\" (agenda 01ITEM):\n\
+                 Grid: A\n\
+                 follow-up (Grid): can B keep it?\n\
+                 Keep the sidebar?: yes\n\
+                 note on B (Keep the sidebar?): too faint"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("is on agenda item 01ITEM."),
+            "trailing structure pointer missing: {text}"
+        );
+    }
+
+    /// A plain text answer (Agenda tab, no structured breakdown) delivers
+    /// the recorded text itself.
+    #[test]
+    fn delivery_text_plain_text_answer_uses_answer_text() {
+        let item = answered_item(
+            vec![question("Which grid?", "Grid")],
+            plain_answer("go with A, but darker rails", None),
+        );
+        let text = ask_outcome_delivery_text(&item, "answer").unwrap();
+        assert!(
+            text.contains("(agenda 01ITEM): go with A, but darker rails"),
+            "{text}"
+        );
+    }
+
+    /// Dismissals say the question stays open; administrative closes say
+    /// closed; unknown actions and answerless answers deliver nothing.
+    #[test]
+    fn delivery_text_dismissals_and_closes() {
+        let mut item = answered_item(
+            vec![question("Which grid?", "Grid")],
+            plain_answer("A", None),
+        );
+        item.answer = None;
+        for action in ["skip", "deny", "approve", "approve_all"] {
+            let text = ask_outcome_delivery_text(&item, action).unwrap();
+            assert!(
+                text.contains(&format!("dismissed on the question rail ({action})")),
+                "{text}"
+            );
+            assert!(text.contains("remains open on the agenda"), "{text}");
+        }
+        for action in ["complete", "retire"] {
+            let text = ask_outcome_delivery_text(&item, action).unwrap();
+            assert!(
+                text.contains(&format!("closed on the agenda ({action})")),
+                "{text}"
+            );
+        }
+        assert!(ask_outcome_delivery_text(&item, "answer").is_none());
+        assert!(ask_outcome_delivery_text(&item, "reopen").is_none());
     }
 }

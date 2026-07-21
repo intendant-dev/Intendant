@@ -264,6 +264,7 @@ pub fn spawn_event_listener(
                     | AppEvent::DisplayRequestResolved { .. }
                     | AppEvent::BrowserWorkspaceChanged { .. }
                     | AppEvent::AgendaChanged { .. }
+                    | AppEvent::AgendaAskOutcome { .. }
                     | AppEvent::MemoryChanged { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::CodexConfigChanged {
                         managed_context, ..

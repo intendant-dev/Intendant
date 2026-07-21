@@ -291,8 +291,8 @@ pub(crate) fn build_config_inner(
     }
 
     // Fall back to usable-key detection (leases shadow env vars).
-    if crate::credential_leases::provider_api_key("OPENAI_API_KEY").is_some()
-        && crate::credential_leases::provider_api_key("GEMINI_API_KEY").is_none()
+    if crate::credential_leases::provider_key_available("OPENAI_API_KEY")
+        && !crate::credential_leases::provider_key_available("GEMINI_API_KEY")
     {
         WebGatewayConfig {
             provider: "openai".to_string(),

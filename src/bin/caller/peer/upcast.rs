@@ -605,8 +605,10 @@ impl AppEventUpcaster {
             | AppEvent::ConversationRollbackRequested { .. }
             | AppEvent::ConversationRolledBack { .. }
             // The agenda is home-scoped daemon state; the peer rail does
-            // not carry another daemon's ledger (ratified v1 scope).
+            // not carry another daemon's ledger (ratified v1 scope) —
+            // nor its ask outcomes (delivery is a local-supervisor act).
             | AppEvent::AgendaChanged { .. }
+            | AppEvent::AgendaAskOutcome { .. }
             | AppEvent::MemoryChanged { .. } => vec![],
 
             AppEvent::UserMessageEditStatus {

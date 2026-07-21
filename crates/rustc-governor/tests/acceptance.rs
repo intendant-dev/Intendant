@@ -477,10 +477,21 @@ fn waiter_acquires_promptly_after_release() {
     let status = wait_deadline(&mut child, GENEROUS).expect("waiter starved");
     assert!(status.success());
     let log = rig.log();
-    let line = log.lines().last().unwrap_or_default();
+    let compile = log
+        .lines()
+        .rfind(|line| line.contains("kind=compile "))
+        .unwrap_or_default();
     assert!(
-        line.contains("wait_ms="),
-        "log must carry the wait: {line:?}"
+        compile.contains("wait_ms="),
+        "log must carry the wait: {compile:?}"
+    );
+    let done = log
+        .lines()
+        .rfind(|line| line.contains("kind=compile-done "))
+        .unwrap_or_default();
+    assert!(
+        done.contains("runtime_ms="),
+        "reap must log the permit hold time: {done:?}"
     );
 }
 

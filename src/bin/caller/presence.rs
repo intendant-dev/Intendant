@@ -1077,6 +1077,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::FollowUpStatus { .. }
         | AppEvent::ExternalFollowUpRequested { .. }
         | AppEvent::AgendaChanged { .. }
+        | AppEvent::AgendaAskOutcome { .. }
         | AppEvent::MemoryChanged { .. }
         | AppEvent::ExternalAgentChanged { .. }
         | AppEvent::AutonomyChanged { .. }

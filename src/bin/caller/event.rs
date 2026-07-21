@@ -1196,6 +1196,32 @@ pub enum AppEvent {
         counts: crate::agenda::AgendaCounts,
     },
 
+    /// A recorded outcome on an agenda-backed rich ask: an answer resolved
+    /// the item, or a dismissal/administrative close marked it. Emitted
+    /// exactly once per accepted op by the agenda handle (the item's single
+    /// writer) — command intake refuses re-answers and repeat transitions,
+    /// so consumers may treat each event as a fresh outcome. The session
+    /// supervisor consumes it on the lossless intent lane to deliver the
+    /// outcome into the still-live asking session as ordinary follow-up
+    /// input at a turn boundary.
+    AgendaAskOutcome {
+        /// The item as it stands after the op (carries the ask payload,
+        /// the asking session in `provenance`, and the answer when
+        /// `action` is `"answer"`).
+        item: crate::agenda::AgendaItem,
+        /// `"answer"`, a rail dismissal verb (`"skip"`, `"deny"`,
+        /// `"approve"`, `"approve_all"`), or an administrative close
+        /// (`"complete"`, `"retire"`).
+        action: String,
+        /// A live blocking `ask_user` waiter held the ask when the outcome
+        /// was recorded: that waiter returns the outcome inline as its tool
+        /// result, so session delivery must not duplicate it. Stamped by
+        /// the handle at emission time — the waiter deregisters only after
+        /// observing the outcome, so the stamp cannot race the waiter's
+        /// return.
+        inline_waiter: bool,
+    },
+
     /// The Memory plane admitted a write (a claim was proposed). Carries
     /// the provenance-labeled view so frontends update live without
     /// refetching. The view is quoted DATA for rendering (§6.5), never
@@ -2524,6 +2550,10 @@ pub fn app_event_rides_intent_lane(event: &AppEvent) -> bool {
             | AppEvent::SharedView { .. }
             | AppEvent::DisplayReady { .. }
             | AppEvent::TaskComplete { .. }
+            // A recorded answer to a parked ask is a user action: losing it
+            // silently drops the owner's reply to the asking session. Rare
+            // by nature (one per resolved ask).
+            | AppEvent::AgendaAskOutcome { .. }
     )
 }
 
@@ -3420,6 +3450,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             item: item.clone(),
             counts: *counts,
         }),
+        // Supervisor-internal delivery signal: browsers already see the
+        // resolution via AgendaChanged + ApprovalResolved.
+        AppEvent::AgendaAskOutcome { .. } => None,
         AppEvent::MemoryChanged { claim } => Some(OutboundEvent::MemoryChanged {
             claim: claim.clone(),
         }),
