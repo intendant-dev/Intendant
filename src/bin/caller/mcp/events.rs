@@ -1745,9 +1745,52 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
     changed
 }
 
+fn apply_http_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> bool {
+    let mut changed = apply_observed_event_to_mcp_state(s, event);
+    match event {
+        AppEvent::ApprovalRequired {
+            session_id,
+            id,
+            command_preview,
+            category,
+        } => {
+            s.pending_approvals.insert(
+                *id,
+                PendingApprovalState {
+                    id: *id,
+                    command_preview: command_preview.clone(),
+                    category: category.to_string(),
+                    session_id: session_id.clone(),
+                },
+            );
+            s.push_log(
+                LogLevel::Info,
+                format!("Approval required [{}]: {}", category, command_preview),
+            );
+            changed = true;
+        }
+        AppEvent::ApprovalResolved { id, action, .. } => {
+            s.pending_approvals.remove(id);
+            if !s.pending_approvals.is_empty() {
+                s.set_phase(Phase::WaitingApproval);
+            } else if action == "deny" {
+                s.set_phase(Phase::Done);
+            } else {
+                s.set_phase(Phase::RunningAgent);
+            }
+            s.push_log(LogLevel::Info, format!("Approval {} (turn {})", action, id));
+            changed = true;
+        }
+        _ => {}
+    }
+    changed
+}
+
 /// Lightweight event mirror for the stateless HTTP MCP endpoint used by
-/// external agents. It intentionally observes state only; it does not dispatch
-/// `ControlMsg`s, because the normal control plane remains the single writer.
+/// external agents and `intendant ctl`. It observes pending approval identity
+/// as well as status: decisions are dispatched by the HTTP server as
+/// session-targeted `ControlMsg`s, while the normal control plane remains the
+/// single writer and owns the real responder registry.
 pub fn spawn_http_observation_listener(
     state: SharedMcpState,
     mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
@@ -1760,7 +1803,7 @@ pub fn spawn_http_observation_listener(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
             let mut s = state.write().await;
-            apply_observed_event_to_mcp_state(&mut s, &event);
+            apply_http_observed_event_to_mcp_state(&mut s, &event);
         }
     })
 }
