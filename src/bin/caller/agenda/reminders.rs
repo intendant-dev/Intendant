@@ -492,7 +492,13 @@ pub(crate) struct SpawnOccurrence {
     pub(crate) effect_id: String,
     pub(crate) goal: String,
     pub(crate) orchestrate: bool,
+    /// This occurrence's own instant — for a standing series (G3-pre),
+    /// the series/requested instant, not the manifest's first fire.
     pub(crate) fire_at_ms: u64,
+    /// Standing-series occurrence (G3-pre): a missed instant resolves
+    /// without the one-shot's "re-approve to reschedule" tail — the next
+    /// instant needs no ceremony.
+    pub(crate) recurring: bool,
     /// Interactive spawn (the manifest's additive flag): the session opens
     /// with the goal as its first user message and waits for the owner —
     /// composer parity — instead of running as an autonomous goal task.
@@ -565,7 +571,8 @@ pub(crate) struct Plan {
 /// driver owns the local-timezone math so this stays clock-free.
 /// `in_flight` names session occurrences this process has dispatched but
 /// not yet seen acknowledged (they must not be re-planned or declared
-/// crashed while the receipt is in transit).
+/// crashed while the receipt is in transit); `in_flight_effects` names
+/// their effects, for the standing no-overlap rule (G3-pre).
 pub(crate) fn plan(
     items: &[AgendaItem],
     journal: &OccurrenceJournal,
@@ -573,6 +580,7 @@ pub(crate) fn plan(
     now_ms: u64,
     quiet_until_ms: Option<u64>,
     in_flight: &std::collections::HashSet<String>,
+    in_flight_effects: &std::collections::HashSet<String>,
 ) -> Plan {
     let mut plan = Plan::default();
     let staleness_ms = policy.staleness_ms();
@@ -580,8 +588,9 @@ pub(crate) fn plan(
         plan.next_wake_ms = Some(plan.next_wake_ms.map_or(instant, |cur| cur.min(instant)));
     };
 
-    // Scheduled sessions (A5): independent of the reminder switch and of
-    // quiet hours — an approved manifest is its own owner decision.
+    // Scheduled sessions (A5 + the G3-pre standing series): independent of
+    // the reminder switch and of quiet hours — an approved manifest is its
+    // own owner decision.
     for item in items {
         if item.status != AgendaStatus::Open {
             continue;
@@ -590,44 +599,97 @@ pub(crate) fn plan(
             let Some(approval) = &effect.approval else {
                 continue;
             };
-            let occurrence_id = session_occurrence_id(
-                &item.id,
-                &effect.effect_id,
-                &approval.digest,
-                effect.manifest.fire_at_ms,
-            );
-            if in_flight.contains(&occurrence_id) {
+            // Suspended standing effect (failure streak at threshold):
+            // plan NOTHING — never silent re-fire; the owner re-arms with
+            // one re-approval. Surfacing happened at the trip.
+            if effect.suspended() {
                 continue;
             }
-            let progress = journal.progress(&occurrence_id);
-            if progress.terminal.is_some() || progress.started.is_some() {
-                continue;
+            // Candidate instants. One-shot: exactly the manifest instant
+            // (the pre-G3-pre path, byte-for-byte semantics). Standing:
+            // the LATEST due series instant only (a wake after downtime
+            // fires one catch-up, never a burst; skipped older instants
+            // get no journal rows — downtime stays visible as journal
+            // silence) plus any owner-requested instants; the next future
+            // series instant registers the wake.
+            let mut candidates: Vec<(u64, bool)> = Vec::new();
+            match &effect.manifest.recurrence {
+                None => candidates.push((effect.manifest.fire_at_ms, false)),
+                Some(rec) => {
+                    let fire = effect.manifest.fire_at_ms;
+                    let every = rec.every_ms.max(1);
+                    // The series' last index, when bounded (instants are
+                    // time-defined: unspent ones consume their indices).
+                    let k_last: Option<u64> = {
+                        let by_max = rec.max_occurrences.map(|m| u64::from(m).saturating_sub(1));
+                        let by_until = rec.until_ms.map(|until| until.saturating_sub(fire) / every);
+                        match (by_max, by_until) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        }
+                    };
+                    if now_ms < fire {
+                        consider_wake(fire, &mut plan);
+                    } else {
+                        let k_now = (now_ms - fire) / every;
+                        let k_due = k_last.map_or(k_now, |last| k_now.min(last));
+                        candidates.push((fire + k_due * every, true));
+                        let k_next = k_due + 1;
+                        if k_last.is_none_or(|last| k_next <= last) && k_due == k_now {
+                            consider_wake(fire + k_next * every, &mut plan);
+                        }
+                    }
+                    for req in &effect.requested {
+                        candidates.push((req.at_ms, true));
+                    }
+                }
             }
-            let spawn = SpawnOccurrence {
-                occurrence_id,
-                item_id: item.id.clone(),
-                effect_id: effect.effect_id.clone(),
-                goal: effect.manifest.goal.clone(),
-                orchestrate: effect.manifest.orchestrate,
-                fire_at_ms: effect.manifest.fire_at_ms,
-                interactive: effect.manifest.interactive,
-                project_root: effect.manifest.project_root.clone(),
-                agent_config: effect.manifest.agent_config.clone(),
-                provenance_session_id: item.provenance.session_id.clone(),
-            };
-            if progress.prepared {
-                // Crash between prepare and launch confirmation: fail
-                // closed — a session is high-impact work (RFC §7.5).
-                plan.crashed.push(spawn);
-                continue;
-            }
-            let fire_at = effect.manifest.fire_at_ms;
-            if fire_at > now_ms {
-                consider_wake(fire_at, &mut plan);
-            } else if now_ms.saturating_sub(fire_at) > staleness_ms {
-                plan.missed_sessions.push(spawn);
-            } else {
-                plan.spawn.push(spawn);
+            // No-overlap (G3-pre): while any occurrence of this effect is
+            // dispatched or running, fire nothing new — the write-back
+            // nudge replans when it settles.
+            let overlap = in_flight_effects.contains(&effect.effect_id)
+                || effect
+                    .last_run
+                    .as_ref()
+                    .is_some_and(|run| run.state == "started");
+            for (instant, recurring) in candidates {
+                let occurrence_id =
+                    session_occurrence_id(&item.id, &effect.effect_id, &approval.digest, instant);
+                if in_flight.contains(&occurrence_id) {
+                    continue;
+                }
+                let progress = journal.progress(&occurrence_id);
+                if progress.terminal.is_some() || progress.started.is_some() {
+                    continue;
+                }
+                let spawn = SpawnOccurrence {
+                    occurrence_id,
+                    item_id: item.id.clone(),
+                    effect_id: effect.effect_id.clone(),
+                    goal: effect.manifest.goal.clone(),
+                    orchestrate: effect.manifest.orchestrate,
+                    fire_at_ms: instant,
+                    recurring,
+                    interactive: effect.manifest.interactive,
+                    project_root: effect.manifest.project_root.clone(),
+                    agent_config: effect.manifest.agent_config.clone(),
+                    provenance_session_id: item.provenance.session_id.clone(),
+                };
+                if progress.prepared {
+                    // Crash between prepare and launch confirmation: fail
+                    // closed — a session is high-impact work (RFC §7.5).
+                    plan.crashed.push(spawn);
+                    continue;
+                }
+                if instant > now_ms {
+                    consider_wake(instant, &mut plan);
+                } else if now_ms.saturating_sub(instant) > staleness_ms {
+                    plan.missed_sessions.push(spawn);
+                } else if !overlap {
+                    plan.spawn.push(spawn);
+                }
             }
         }
     }
@@ -755,7 +817,15 @@ mod tests {
             item("no-due", AgendaStatus::Open, None),
         ];
 
-        let plan_now = plan(&items, &journal, &policy, 2_000, None, &Default::default());
+        let plan_now = plan(
+            &items,
+            &journal,
+            &policy,
+            2_000,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
         assert_eq!(plan_now.deliver.len(), 1);
         assert_eq!(plan_now.deliver[0].item_id, "a");
         assert!(plan_now.digest.is_empty());
@@ -788,7 +858,15 @@ mod tests {
                 session_id: None,
             })
             .unwrap();
-        let again = plan(&items, &journal, &policy, 2_500, None, &Default::default());
+        let again = plan(
+            &items,
+            &journal,
+            &policy,
+            2_500,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
         assert!(again.deliver.is_empty());
         assert_eq!(again.next_wake_ms, Some(5_000));
     }
@@ -837,7 +915,15 @@ mod tests {
         }
         let journal = journal(dir.path());
         assert_eq!(journal.unresolved(), vec![occurrence_id("torn-one", 1_000)]);
-        let replanned = plan(&items, &journal, &policy, 2_000, None, &Default::default());
+        let replanned = plan(
+            &items,
+            &journal,
+            &policy,
+            2_000,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
         assert_eq!(replanned.deliver.len(), 1);
         assert_eq!(replanned.deliver[0].item_id, "torn-one");
     }
@@ -855,11 +941,20 @@ mod tests {
             2_000,
             Some(9_000),
             &Default::default(),
+            &Default::default(),
         );
         assert!(deferred.deliver.is_empty());
         assert_eq!(deferred.next_wake_ms, Some(9_000));
         // At the window's end the delivery proceeds.
-        let fired = plan(&items, &journal, &policy, 9_000, None, &Default::default());
+        let fired = plan(
+            &items,
+            &journal,
+            &policy,
+            9_000,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
         assert_eq!(fired.deliver.len(), 1);
     }
 
@@ -876,7 +971,15 @@ mod tests {
             // Over the 12h window: degrades to the digest.
             item("stale", AgendaStatus::Open, Some(now - twelve_h - 60_000)),
         ];
-        let planned = plan(&items, &journal, &policy, now, None, &Default::default());
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
         assert_eq!(planned.deliver.len(), 1);
         assert_eq!(planned.deliver[0].item_id, "fresh");
         assert_eq!(planned.digest.len(), 1);
@@ -899,7 +1002,15 @@ mod tests {
             item("quiet", AgendaStatus::Open, Some(1_000)),
             item("plain", AgendaStatus::Open, Some(1_000)),
         ];
-        let planned = plan(&items, &journal, &policy, 2_000, None, &Default::default());
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            2_000,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
         let urgency_of = |id: &str| {
             planned
                 .deliver
@@ -912,7 +1023,15 @@ mod tests {
         assert_eq!(urgency_of("plain"), Some(ReminderUrgency::Attention));
 
         policy.enabled = false;
-        let disabled = plan(&items, &journal, &policy, 2_000, None, &Default::default());
+        let disabled = plan(
+            &items,
+            &journal,
+            &policy,
+            2_000,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
         assert_eq!(disabled, Plan::default());
     }
 
@@ -947,6 +1066,7 @@ mod tests {
             &policy,
             2_000,
             None,
+            &Default::default(),
             &Default::default()
         )
         .deliver
@@ -959,6 +1079,7 @@ mod tests {
             &policy,
             4_000,
             None,
+            &Default::default(),
             &Default::default(),
         );
         assert_eq!(planned.deliver.len(), 1);
@@ -1000,5 +1121,370 @@ mod tests {
         assert_eq!(store.policy().quiet_hours, None);
         assert_eq!(store.policy().urgency_for("x"), ReminderUrgency::Info);
         assert_eq!(store.policy().urgency_for("y"), ReminderUrgency::Mute);
+    }
+
+    // ---- G3-pre: the standing series ----
+
+    use super::super::types::{
+        AgendaApproval, AgendaEffect, AgendaRequestedRun, AgendaRun, RecurrenceSpec,
+        SessionManifest,
+    };
+
+    const EVERY: u64 = 3_600_000; // 1h cadence for the mocked instants
+
+    fn standing_item(id: &str, fire_at: u64, rec: RecurrenceSpec) -> AgendaItem {
+        let mut base = item(id, AgendaStatus::Open, None);
+        let manifest = SessionManifest {
+            goal: "standing run".into(),
+            fire_at_ms: fire_at,
+            orchestrate: false,
+            interactive: false,
+            project_root: None,
+            agent_config: None,
+            recurrence: Some(rec),
+        };
+        let digest = super::super::types::manifest_digest(id, "ef-1", &manifest);
+        base.effects.push(AgendaEffect {
+            effect_id: "ef-1".into(),
+            digest: digest.clone(),
+            manifest,
+            proposed_ms: 1,
+            proposed_principal: None,
+            proposed_session_id: None,
+            proposed_kind: None,
+            approval: Some(AgendaApproval {
+                digest,
+                at_ms: 2,
+                principal: Some("owner".into()),
+                kind: Some("dashboard".into()),
+            }),
+            last_run: None,
+            consecutive_failures: 0,
+            requested: Vec::new(),
+        });
+        base
+    }
+
+    fn spend(journal: &mut OccurrenceJournal, occ: &SpawnOccurrence, state: OccurrenceState) {
+        for s in [OccurrenceState::Prepared, state] {
+            journal
+                .append(&OccurrenceRecord {
+                    v: 1,
+                    at_ms: occ.fire_at_ms,
+                    occurrence_id: occ.occurrence_id.clone(),
+                    item_id: occ.item_id.clone(),
+                    due_ms: occ.fire_at_ms,
+                    state: s,
+                    urgency: None,
+                    session_id: None,
+                })
+                .unwrap();
+        }
+    }
+
+    /// The ratified core: ONE approval covers N series occurrences —
+    /// distinct per-instant identities under one digest, journaled and
+    /// deduped exactly like one-shots, with the next wake at the next
+    /// instant.
+    #[test]
+    fn g3pre_one_approval_covers_the_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let rec = RecurrenceSpec {
+            every_ms: EVERY,
+            until_ms: None,
+            max_occurrences: None,
+            suspend_after_failures: None,
+        };
+        let items = vec![standing_item("st", 10_000, rec)];
+
+        let mut seen = std::collections::HashSet::new();
+        for k in 0..3u64 {
+            let now = 10_000 + k * EVERY + 5;
+            let planned = plan(
+                &items,
+                &journal,
+                &policy,
+                now,
+                None,
+                &Default::default(),
+                &Default::default(),
+            );
+            assert_eq!(planned.spawn.len(), 1, "instant k={k} fires");
+            let occ = &planned.spawn[0];
+            assert_eq!(occ.fire_at_ms, 10_000 + k * EVERY);
+            assert!(occ.recurring);
+            assert!(seen.insert(occ.occurrence_id.clone()), "distinct identity");
+            // Next wake is the next series instant.
+            assert_eq!(planned.next_wake_ms, Some(10_000 + (k + 1) * EVERY));
+            spend(&mut journal, occ, OccurrenceState::Completed);
+            // Spent: replanning the same instant is silent.
+            let again = plan(
+                &items,
+                &journal,
+                &policy,
+                now,
+                None,
+                &Default::default(),
+                &Default::default(),
+            );
+            assert!(again.spawn.is_empty(), "instant k={k} never refires");
+        }
+    }
+
+    /// Catch-up after downtime is the LATEST due instant only: skipped
+    /// older instants get no journal rows, a stale latest resolves missed
+    /// (with the recurring flag), and a fresh latest fires.
+    #[test]
+    fn g3pre_downtime_fires_one_catch_up_never_a_burst() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let policy = ReminderPolicy::default(); // 12h staleness
+        let rec = RecurrenceSpec {
+            every_ms: EVERY,
+            until_ms: None,
+            max_occurrences: None,
+            suspend_after_failures: None,
+        };
+        let items = vec![standing_item("st", 10_000, rec)];
+
+        // Daemon slept through five instants; the newest is fresh.
+        let now = 10_000 + 5 * EVERY + 60_000;
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(planned.spawn.len(), 1, "one catch-up, never a burst");
+        assert_eq!(planned.spawn[0].fire_at_ms, 10_000 + 5 * EVERY);
+        assert!(
+            planned.missed_sessions.is_empty(),
+            "skipped instants get no rows"
+        );
+
+        // Slept far past staleness: the latest instant resolves missed.
+        let rec_old = RecurrenceSpec {
+            every_ms: EVERY,
+            until_ms: Some(10_000 + 2 * EVERY),
+            max_occurrences: None,
+            suspend_after_failures: None,
+        };
+        let ended = vec![standing_item("old", 10_000, rec_old)];
+        let much_later = 10_000 + 100 * EVERY;
+        let planned = plan(
+            &ended,
+            &journal,
+            &policy,
+            much_later,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(planned.spawn.is_empty());
+        assert_eq!(planned.missed_sessions.len(), 1);
+        assert!(planned.missed_sessions[0].recurring);
+        assert_eq!(planned.missed_sessions[0].fire_at_ms, 10_000 + 2 * EVERY);
+        assert_eq!(planned.next_wake_ms, None, "ended series never wakes");
+    }
+
+    /// Expiry and max-occurrences end the series (instants are
+    /// time-defined); suspension plans nothing; overlap defers.
+    #[test]
+    fn g3pre_bounds_suspension_and_overlap_gate_the_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        // max_occurrences: exactly 2 instants exist (k=0,1).
+        let rec = RecurrenceSpec {
+            every_ms: EVERY,
+            until_ms: None,
+            max_occurrences: Some(2),
+            suspend_after_failures: None,
+        };
+        let items = vec![standing_item("st", 10_000, rec)];
+        let k1 = 10_000 + EVERY;
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            k1 + 5,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(planned.spawn.len(), 1);
+        assert_eq!(planned.spawn[0].fire_at_ms, k1);
+        assert_eq!(planned.next_wake_ms, None, "k=2 does not exist");
+        spend(&mut journal, &planned.spawn[0], OccurrenceState::Completed);
+        let after = plan(
+            &items,
+            &journal,
+            &policy,
+            k1 + EVERY + 5,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(after.spawn.is_empty(), "series exhausted");
+        assert_eq!(after.next_wake_ms, None);
+
+        // Suspension: streak at threshold plans NOTHING (never silent
+        // re-fire); re-approval (streak reset) resumes.
+        let mut suspended = items.clone();
+        suspended[0].effects[0].consecutive_failures = 3;
+        let quiet = plan(
+            &suspended,
+            &journal,
+            &policy,
+            k1 + 5,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(quiet.spawn.is_empty() && quiet.missed_sessions.is_empty());
+        assert_eq!(quiet.next_wake_ms, None, "suspended effects do not wake");
+
+        // Overlap: a started run defers new instants (no spawn, no missed).
+        let mut busy = items.clone();
+        busy[0].effects[0].last_run = Some(AgendaRun {
+            occurrence_id: "occ-live".into(),
+            state: "started".into(),
+            session_id: Some("sess-live".into()),
+            at_ms: 1,
+            note: None,
+        });
+        let dir2 = tempfile::tempdir().unwrap();
+        let empty_journal = journal_at(dir2.path());
+        let deferred = plan(
+            &busy,
+            &empty_journal,
+            &policy,
+            10_000 + 5,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(deferred.spawn.is_empty(), "one occurrence at a time");
+        // In-flight receipt window (dispatched, not yet started): same.
+        let mut effects_in_flight = std::collections::HashSet::new();
+        effects_in_flight.insert("ef-1".to_string());
+        let held = plan(
+            &items,
+            &empty_journal,
+            &policy,
+            10_000 + 5,
+            None,
+            &Default::default(),
+            &effects_in_flight,
+        );
+        assert!(held.spawn.is_empty());
+    }
+
+    fn journal_at(dir: &Path) -> OccurrenceJournal {
+        OccurrenceJournal::open(dir).unwrap()
+    }
+
+    /// Owner-requested instants ride the same identity/journal lanes; the
+    /// one-shot path is byte-for-byte the pre-G3-pre semantics
+    /// (regression pin: single instant, re-approve message class).
+    #[test]
+    fn g3pre_requested_instants_and_one_shot_regression() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let rec = RecurrenceSpec {
+            every_ms: EVERY,
+            until_ms: None,
+            max_occurrences: None,
+            suspend_after_failures: None,
+        };
+        let mut items = vec![standing_item("st", 10_000, rec)];
+        // An owner-requested instant between cadence points.
+        items[0].effects[0].requested.push(AgendaRequestedRun {
+            at_ms: 10_000 + EVERY / 2,
+            principal: Some("owner".into()),
+            kind: Some("dashboard".into()),
+        });
+        let now = 10_000 + EVERY / 2 + 5;
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        // Series k=0 is due AND the requested instant: both are candidates,
+        // spent independently by identity.
+        let mut instants: Vec<u64> = planned.spawn.iter().map(|s| s.fire_at_ms).collect();
+        instants.sort_unstable();
+        assert_eq!(instants, vec![10_000, 10_000 + EVERY / 2]);
+        for occ in &planned.spawn {
+            spend(&mut journal, occ, OccurrenceState::Completed);
+        }
+        assert!(plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &Default::default(),
+            &Default::default(),
+        )
+        .spawn
+        .is_empty());
+
+        // One-shot regression: no recurrence → exactly one instant, no
+        // series wake, `recurring: false` (the pre-G3-pre message class).
+        let one_shot = {
+            let mut base = item("os", AgendaStatus::Open, None);
+            let manifest = SessionManifest {
+                goal: "one shot".into(),
+                fire_at_ms: 50_000,
+                orchestrate: false,
+                interactive: false,
+                project_root: None,
+                agent_config: None,
+                recurrence: None,
+            };
+            let digest = super::super::types::manifest_digest("os", "ef-os", &manifest);
+            base.effects.push(AgendaEffect {
+                effect_id: "ef-os".into(),
+                digest: digest.clone(),
+                manifest,
+                proposed_ms: 1,
+                proposed_principal: None,
+                proposed_session_id: None,
+                proposed_kind: None,
+                approval: Some(AgendaApproval {
+                    digest,
+                    at_ms: 2,
+                    principal: None,
+                    kind: None,
+                }),
+                last_run: None,
+                consecutive_failures: 0,
+                requested: Vec::new(),
+            });
+            base
+        };
+        let planned = plan(
+            &[one_shot],
+            &journal,
+            &policy,
+            50_005,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(planned.spawn.len(), 1);
+        assert!(!planned.spawn[0].recurring);
+        assert_eq!(planned.next_wake_ms, None);
     }
 }

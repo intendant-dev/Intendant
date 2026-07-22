@@ -2154,7 +2154,15 @@ async fn run_agenda(
         "schedule" => {
             let args = parse_command_args(
                 &raw[1..],
-                &["--goal", "--at", "--source"],
+                &[
+                    "--goal",
+                    "--at",
+                    "--every",
+                    "--until",
+                    "--max-occurrences",
+                    "--suspend-after",
+                    "--source",
+                ],
                 &["--orchestrate"],
             )?;
             let id = agenda_resolve_id(
@@ -2183,13 +2191,55 @@ async fn run_agenda(
             if args.has("--orchestrate") {
                 map.insert("orchestrate".to_string(), Value::Bool(true));
             }
+            // Standing cadence (G3-pre): declared INSIDE the digest-bound
+            // manifest, so one approval covers the series.
+            if let Some(every) = args.one("--every") {
+                let mut rec = Map::new();
+                rec.insert(
+                    "every_ms".to_string(),
+                    Value::from(parse_duration_ms(every)?),
+                );
+                if let Some(until) = args.one("--until") {
+                    rec.insert("until_ms".to_string(), Value::from(parse_due_ms(until)?));
+                }
+                if let Some(max) = args.one("--max-occurrences") {
+                    let max: u32 = max
+                        .parse()
+                        .map_err(|_| format!("--max-occurrences {max:?} is not a number"))?;
+                    rec.insert("max_occurrences".to_string(), Value::from(max));
+                }
+                if let Some(n) = args.one("--suspend-after") {
+                    let n: u32 = n
+                        .parse()
+                        .map_err(|_| format!("--suspend-after {n:?} is not a number"))?;
+                    rec.insert("suspend_after_failures".to_string(), Value::from(n));
+                }
+                map.insert("recurrence".to_string(), Value::Object(rec));
+            } else if args.one("--until").is_some()
+                || args.one("--max-occurrences").is_some()
+                || args.one("--suspend-after").is_some()
+            {
+                return Err(
+                    "--until/--max-occurrences/--suspend-after describe a standing cadence: \
+                     pass --every too"
+                        .to_string(),
+                );
+            }
             insert_string(&mut map, "source", args.one("--source"));
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
-            println!(
-                "proposed — nothing fires until the owner approves the digest \
-                 (dashboard Agenda tab, or `agenda approve <id>` from an owner shell)"
-            );
+            if args.one("--every").is_some() {
+                println!(
+                    "proposed as a STANDING manifest — one owner approval covers every \
+                     occurrence until revoked, expired, or suspended by failures \
+                     (dashboard Agenda tab, or `agenda approve <id>` from an owner shell)"
+                );
+            } else {
+                println!(
+                    "proposed — nothing fires until the owner approves the digest \
+                     (dashboard Agenda tab, or `agenda approve <id>` from an owner shell)"
+                );
+            }
         }
         "approve" => {
             // Review-then-bind: without --digest this PRINTS the manifest
@@ -2271,8 +2321,14 @@ async fn run_agenda(
             map.insert("id".to_string(), Value::String(id));
             insert_string(&mut map, "project_root", args.one("--project"));
             insert_string(&mut map, "goal", args.one("--goal"));
+            // Absent-on-the-wire unless --goal-run: the daemon defaults a
+            // minted manifest to interactive, and on a STANDING approved
+            // manifest (G3-pre) an absent mode means "fire as approved" —
+            // an explicit value would read as a revision request there.
             let goal_run = args.has("--goal-run");
-            map.insert("interactive".to_string(), Value::Bool(!goal_run));
+            if goal_run {
+                map.insert("interactive".to_string(), Value::Bool(false));
+            }
             let mut agent_config = Map::new();
             insert_string(&mut agent_config, "agent", args.one("--agent"));
             insert_string(
@@ -2692,9 +2748,17 @@ async fn run_agenda_list(
     let args = parse_command_args(
         raw,
         &["--under"],
-        &["--all", "--open", "--done", "--retired", "--blocked"],
+        &[
+            "--all",
+            "--open",
+            "--done",
+            "--retired",
+            "--blocked",
+            "--frontier",
+        ],
     )?;
     let blocked_only = args.has("--blocked");
+    let frontier_only = args.has("--frontier");
     let status = if args.has("--all") {
         None
     } else if args.has("--done") {
@@ -2708,7 +2772,7 @@ async fn run_agenda_list(
     };
     let mut tool_args = Map::new();
     insert_string(&mut tool_args, "status", status);
-    if (config.json || config.raw) && args.one("--under").is_none() {
+    if (config.json || config.raw) && args.one("--under").is_none() && !frontier_only {
         let response = call_tool(client, config, "agenda_list", Value::Object(tool_args)).await?;
         return print_tool_response(response, config, None);
     }
@@ -2743,6 +2807,51 @@ async fn run_agenda_list(
             Some(subtree)
         }
     };
+    // The un-triaged frontier (G3, render-time, never stored): open items
+    // newer than the newest `triage:summary` item, plus open items lacking
+    // both a placement and a triage annotation. Summary items are excluded
+    // BY DEFINITION (one of the two loop-prevention pins; the mandate's
+    // never-list is the other). Markers ride existing vocabulary — the tag
+    // and the self-described `--source triage` label — UNVERIFIED data
+    // gating nothing, same trust class as the overdue chip.
+    let summary_tagged = |item: &Value| {
+        item.get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| tags.iter().any(|t| t.as_str() == Some("triage:summary")))
+    };
+    let triage_watermark: u64 = all_items
+        .iter()
+        .filter(|item| summary_tagged(item))
+        .filter_map(|item| {
+            item.get("provenance")
+                .and_then(|p| p.get("created_ms"))
+                .and_then(Value::as_u64)
+        })
+        .max()
+        .unwrap_or(0);
+    let in_frontier = |item: &Value| {
+        if item.get("status").and_then(Value::as_str) != Some("open") || summary_tagged(item) {
+            return false;
+        }
+        let created = item
+            .get("provenance")
+            .and_then(|p| p.get("created_ms"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if created > triage_watermark {
+            return true;
+        }
+        let placed = item.get("part_of").is_some_and(|p| !p.is_null());
+        let triaged = item
+            .get("annotations")
+            .and_then(Value::as_array)
+            .is_some_and(|notes| {
+                notes
+                    .iter()
+                    .any(|n| n.get("source").and_then(Value::as_str) == Some("triage"))
+            });
+        !placed && !triaged
+    };
     let items: Vec<&Value> = all_items
         .iter()
         .filter(|item| {
@@ -2750,6 +2859,7 @@ async fn run_agenda_list(
             let id = item.get("id").and_then(Value::as_str).unwrap_or("");
             status.is_none_or(|s| item_status == s)
                 && (!blocked_only || agenda_item_is_blocked(&all_items, item))
+                && (!frontier_only || in_frontier(item))
                 && under_subtree.as_ref().is_none_or(|s| s.contains(id))
         })
         .collect();
@@ -2762,10 +2872,14 @@ async fn run_agenda_list(
         return Ok(());
     }
     if items.is_empty() {
-        match (blocked_only, status) {
-            (true, _) => println!("no blocked agenda items"),
-            (false, Some(status)) => println!("no {status} agenda items"),
-            (false, None) => println!("agenda is empty"),
+        if frontier_only {
+            println!("frontier empty — nothing awaits triage");
+        } else {
+            match (blocked_only, status) {
+                (true, _) => println!("no blocked agenda items"),
+                (false, Some(status)) => println!("no {status} agenda items"),
+                (false, None) => println!("agenda is empty"),
+            }
         }
     }
     for item in &items {
@@ -3078,6 +3192,34 @@ fn parse_due_ms(raw: &str) -> Result<u64, String> {
     Err(format!(
         "could not parse due '{raw}': use +45m/+2h/+3d/+1w, epoch ms, RFC3339, YYYY-MM-DD, or 'YYYY-MM-DD HH:MM'"
     ))
+}
+
+/// A cadence INTERVAL (`--every`): `45m`, `2h`, `7d`, `1w` (leading `+`
+/// tolerated), or raw milliseconds. Distinct from [`parse_due_ms`], which
+/// resolves an instant.
+fn parse_duration_ms(raw: &str) -> Result<u64, String> {
+    let raw = raw.trim();
+    let body = raw.strip_prefix('+').unwrap_or(raw);
+    if let Some(unit_pos) = body.find(|c: char| !c.is_ascii_digit()) {
+        let (amount, unit) = body.split_at(unit_pos);
+        let amount: u64 = amount
+            .parse()
+            .map_err(|_| format!("invalid interval '{raw}' (try 45m, 2h, 7d, 1w)"))?;
+        let ms_per = match unit {
+            "m" => 60_000,
+            "h" => 3_600_000,
+            "d" => 86_400_000,
+            "w" => 7 * 86_400_000,
+            _ => {
+                return Err(format!(
+                    "invalid interval unit in '{raw}' (try 45m, 2h, 7d, 1w)"
+                ))
+            }
+        };
+        return Ok(amount * ms_per);
+    }
+    body.parse()
+        .map_err(|_| format!("invalid interval '{raw}' (try 45m, 2h, 7d, 1w, or ms)"))
 }
 
 async fn run_controller(
@@ -4469,11 +4611,13 @@ fn help_agenda() {
   intendant ctl agenda place ID_PREFIX HUB_PREFIX|--under HUB [--remove] [--source LABEL]\n\
   intendant ctl agenda relates ID_PREFIX TARGET_PREFIX [--remove] [--source LABEL]\n\
   intendant ctl agenda list --under HUB_PREFIX   # the hub's placed subtree\n\
+  intendant ctl agenda list --frontier           # the un-triaged frontier (triage mandate's scope)\n\
   intendant ctl agenda complete ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda reopen ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda retire ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda patch ID_PREFIX [--title TEXT] [--body TEXT] [--tag TAG]... [--clear-tags] [--due WHEN|--clear-due] [--source LABEL]\n\
-  intendant ctl agenda schedule ID_PREFIX --goal TEXT --at WHEN [--orchestrate] [--source LABEL]\n\
+  intendant ctl agenda schedule ID_PREFIX --goal TEXT --at WHEN [--orchestrate]\n\
+      [--every INTERVAL [--until WHEN] [--max-occurrences N] [--suspend-after N]] [--source LABEL]\n\
   intendant ctl agenda approve ID_PREFIX [--digest HEX]\n\
   intendant ctl agenda revoke-schedule ID_PREFIX\n\
   intendant ctl agenda start ID_PREFIX [--project DIR] [--goal TEXT] [--goal-run]\n\
@@ -4525,7 +4669,14 @@ draws an untyped see-also edge, deduped in both directions; `list\n\
 derived at print time.\n\
 \n\
 `schedule` proposes a session manifest on an item: at WHEN, spawn a normal\n\
-supervised session with that goal (never raw actions). Nothing fires until\n\
+supervised session with that goal (never raw actions). --every INTERVAL\n\
+(45m/2h/7d/1w; floor 15m) declares a STANDING cadence inside the\n\
+digest-bound manifest: ONE approval covers every occurrence until revoked,\n\
+--until/--max-occurrences end the series, and --suspend-after N (default 3)\n\
+suspends after N consecutive failed runs — surfaced, never silent; the\n\
+owner re-arms by re-approving the unchanged digest (one click). On a\n\
+standing approved item, `start` fires one extra occurrence of the approved\n\
+manifest immediately without touching the approval. Nothing fires until\n\
 the owner approves; approval is an owner-surface act (dashboard or an\n\
 owner shell) — agent and peer callers may propose but never approve, and\n\
 approval binds the exact manifest digest, so any revision voids it.\n\

@@ -1384,6 +1384,7 @@ mod tests {
                     "remove_relates_to",
                     "remove_relies_on",
                     "reopen",
+                    "request_occurrence",
                     "retire",
                     "revoke_effect",
                     "set_blocker",

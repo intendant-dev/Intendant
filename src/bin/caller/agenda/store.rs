@@ -42,7 +42,7 @@ pub(crate) enum AgendaError {
 /// preserved on disk but skipped at load (forward compatibility: a newer
 /// build's vocabulary — effects, journal curation — must not brick an older
 /// daemon's ledger).
-const KNOWN_OPS: [&str; 23] = [
+const KNOWN_OPS: [&str; 24] = [
     "add",
     "patch",
     "complete",
@@ -64,6 +64,7 @@ const KNOWN_OPS: [&str; 23] = [
     "propose_effect",
     "approve_effect",
     "revoke_effect",
+    "request_occurrence",
     "record_occurrence",
     "record_ask_delivery",
 ];
@@ -302,6 +303,20 @@ impl AgendaStore {
         {
             return self.apply_place(&id, &under, actor, source, now_ms);
         }
+        // Owner "run the standing manifest now" (G3-pre): resolves the
+        // item's single effect and validates against the approved digest.
+        if let AgendaCommand::RequestOccurrence { id } = cmd {
+            let (effect_id, digest) = {
+                let item = self.require(&id)?;
+                let Some(effect) = item.effects.first() else {
+                    return Err(AgendaError::NotFound(format!(
+                        "{id} has no scheduled session"
+                    )));
+                };
+                (effect.effect_id.clone(), effect.digest.clone())
+            };
+            return self.request_occurrence_of(&id, &effect_id, &digest, actor, now_ms);
+        }
         // Owner start-now (F3): two ops appended under this same lock —
         // its own arm because one command maps to a propose+approve pair.
         if let AgendaCommand::StartNow {
@@ -312,13 +327,14 @@ impl AgendaStore {
             agent_config,
         } = cmd
         {
+            // The raw Option travels: the standing route (G3-pre) must
+            // distinguish "absent" from an explicit mode override before
+            // the owner-ratified interactive default applies to the mint.
             return self.start_now(
                 &id,
                 goal.as_deref(),
                 project_root,
-                // Absent defaults to interactive (owner-ratified): the
-                // session opens with the item and waits for the owner.
-                interactive.unwrap_or(true),
+                interactive,
                 agent_config,
                 actor,
                 now_ms,
@@ -371,7 +387,7 @@ impl AgendaStore {
         id: &str,
         goal_override: Option<&str>,
         project_root: Option<String>,
-        interactive: bool,
+        interactive: Option<bool>,
         agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
         actor: Option<AgendaActor>,
         now_ms: u64,
@@ -382,6 +398,35 @@ impl AgendaStore {
                 "{id} is not open — reopen it before starting work on it"
             )));
         }
+        // Standing manifests (G3-pre): the button beside an APPROVED
+        // recurring manifest fires one extra occurrence of the approved
+        // digest instead of revising it — start_now's mint+approve would
+        // void the very standing approval it decorates. Overrides mean
+        // the owner wants DIFFERENT bytes: that is an explicit revision,
+        // named here so the sheet's edit path stays honest (`schedule`
+        // revises; approval voids as always).
+        if let Some(effect) = item
+            .effects
+            .first()
+            .filter(|e| e.manifest.recurrence.is_some() && e.approval.is_some())
+        {
+            let overridden = goal_override.is_some()
+                || agent_config.as_ref().is_some_and(|c| !c.is_empty())
+                || interactive.is_some_and(|mode| mode != effect.manifest.interactive);
+            if overridden {
+                return Err(AgendaError::Transition(format!(
+                    "{id} runs a standing approved manifest — Run now fires it exactly \
+                     as approved; to change what runs, revise via schedule (which voids \
+                     the standing approval for re-review)"
+                )));
+            }
+            let effect_id = effect.effect_id.clone();
+            let digest = effect.digest.clone();
+            return self.request_occurrence_of(id, &effect_id, &digest, actor, now_ms);
+        }
+        // Absent defaults to interactive (owner-ratified): the session
+        // opens with the item and waits for the owner.
+        let interactive = interactive.unwrap_or(true);
         let mut goal = match goal_override.map(str::trim).filter(|goal| !goal.is_empty()) {
             Some(edited) => {
                 if edited.len() > MAX_BODY_BYTES {
@@ -422,6 +467,7 @@ impl AgendaStore {
             interactive,
             project_root,
             agent_config: agent_config.filter(|config| !config.is_empty()),
+            recurrence: None,
         };
         let digest = super::types::manifest_digest(id, &effect_id, &manifest);
         self.append_op(
@@ -439,6 +485,88 @@ impl AgendaStore {
                 id: id.to_string(),
                 effect_id,
                 digest,
+            },
+            actor,
+            None,
+            now_ms,
+        )
+    }
+
+    /// One extra occurrence of an approved standing manifest (G3-pre):
+    /// validate the request against the approved digest and the run
+    /// state, then append the attributed `request_occurrence` op with the
+    /// instant minted HERE (replay reads it from the line). Shared by the
+    /// `request_occurrence` command and start_now's standing routing —
+    /// the owner-surface gate ran at the handle either way.
+    fn request_occurrence_of(
+        &mut self,
+        id: &str,
+        effect_id: &str,
+        digest: &str,
+        actor: Option<AgendaActor>,
+        now_ms: u64,
+    ) -> Result<AgendaItem, AgendaError> {
+        let item = self.require(id)?;
+        let Some(effect) = item.effects.iter().find(|e| e.effect_id == effect_id) else {
+            return Err(AgendaError::NotFound(format!(
+                "{id} has no scheduled session"
+            )));
+        };
+        let Some(rec) = &effect.manifest.recurrence else {
+            return Err(AgendaError::Transition(format!(
+                "{id}'s manifest is one-shot — run it again via start (which re-reviews \
+                 and re-approves)"
+            )));
+        };
+        let Some(approval) = &effect.approval else {
+            return Err(AgendaError::Transition(format!(
+                "{id}'s standing manifest is not approved — nothing may fire"
+            )));
+        };
+        if approval.digest != digest || effect.digest != digest {
+            return Err(AgendaError::Invalid(format!(
+                "digest mismatch: the manifest was revised since it was reviewed \
+                 (current digest {})",
+                effect.digest
+            )));
+        }
+        if effect.consecutive_failures >= rec.suspend_threshold() {
+            return Err(AgendaError::Transition(format!(
+                "{id}'s standing session is suspended after {} consecutive failures — \
+                 re-approve the manifest to re-arm it, or revoke it",
+                effect.consecutive_failures
+            )));
+        }
+        if effect
+            .last_run
+            .as_ref()
+            .is_some_and(|run| run.state == "started")
+        {
+            return Err(AgendaError::Transition(format!(
+                "a run of {id}'s manifest is in flight — one occurrence at a time"
+            )));
+        }
+        // At most one pending request: pending = no occurrence write-back
+        // has landed since the newest request (both facts fold from the
+        // log, so the judgment is replay-pure).
+        if let Some(newest) = effect.requested.last() {
+            let settled = effect
+                .last_run
+                .as_ref()
+                .is_some_and(|run| run.at_ms >= newest.at_ms);
+            if !settled {
+                return Err(AgendaError::Transition(format!(
+                    "{id} already has a requested run pending — it fires on the next \
+                     scheduler pass"
+                )));
+            }
+        }
+        self.append_op(
+            AgendaOp::RequestOccurrence {
+                id: id.to_string(),
+                effect_id: effect_id.to_string(),
+                digest: digest.to_string(),
+                at_ms: now_ms,
             },
             actor,
             None,
@@ -951,6 +1079,7 @@ impl AgendaStore {
                 goal,
                 fire_at_ms,
                 orchestrate,
+                recurrence,
                 source: _,
             } => {
                 let item = self.require(&id)?;
@@ -961,6 +1090,29 @@ impl AgendaStore {
                 }
                 if fire_at_ms == 0 {
                     return Err(AgendaError::Invalid("fire_at_ms must be set".into()));
+                }
+                if let Some(rec) = &recurrence {
+                    if rec.every_ms < super::types::RECURRENCE_MIN_EVERY_MS {
+                        return Err(AgendaError::Invalid(format!(
+                            "recurrence cadence floors at {} minutes",
+                            super::types::RECURRENCE_MIN_EVERY_MS / 60_000
+                        )));
+                    }
+                    if rec.until_ms.is_some_and(|until| until <= fire_at_ms) {
+                        return Err(AgendaError::Invalid(
+                            "recurrence until_ms must be after fire_at_ms".into(),
+                        ));
+                    }
+                    if rec.max_occurrences.is_some_and(|max| max == 0) {
+                        return Err(AgendaError::Invalid(
+                            "recurrence max_occurrences must be at least 1".into(),
+                        ));
+                    }
+                    if rec.suspend_after_failures.is_some_and(|n| n == 0) {
+                        return Err(AgendaError::Invalid(
+                            "recurrence suspend_after_failures must be at least 1".into(),
+                        ));
+                    }
                 }
                 let goal = {
                     let goal = goal.trim();
@@ -1000,8 +1152,17 @@ impl AgendaStore {
                         interactive: false,
                         project_root: None,
                         agent_config: None,
+                        recurrence,
                     },
                 })
+            }
+            AgendaCommand::RequestOccurrence { id } => {
+                // Validation and the op append live in the dedicated arm
+                // (`request_occurrence_of`) so start_now's standing route
+                // shares it; reaching here is a daemon bug.
+                Err(AgendaError::Invalid(format!(
+                    "internal: request_occurrence for {id} must route through apply_command"
+                )))
             }
             AgendaCommand::Annotate {
                 id,
@@ -1319,7 +1480,11 @@ impl AgendaStore {
                         "{id} has no proposed scheduled session"
                     )));
                 };
-                if effect.approval.is_some() {
+                // Plain double-approve stays refused; the ONE exception is
+                // the suspended standing effect (G3-pre), where re-approving
+                // the unchanged digest is the ratified one-click re-arm
+                // (the approve op resets the failure streak in the fold).
+                if effect.approval.is_some() && !effect.suspended() {
                     return Err(AgendaError::Transition(format!(
                         "{id}'s scheduled session is already approved — revoke first to re-review"
                     )));
@@ -3350,6 +3515,358 @@ mod tests {
         let before = store.item(&child).unwrap();
         let mut reopened = AgendaStore::open(dir.path()).unwrap();
         assert_eq!(reopened.item(&child).unwrap(), before);
+    }
+
+    fn recurrence(every_ms: u64) -> super::super::types::RecurrenceSpec {
+        super::super::types::RecurrenceSpec {
+            every_ms,
+            until_ms: None,
+            max_occurrences: None,
+            suspend_after_failures: None,
+        }
+    }
+
+    fn propose_recurring(id: &str, every_ms: u64) -> AgendaCommand {
+        AgendaCommand::ProposeEffect {
+            id: id.to_string(),
+            goal: "standing sweep".into(),
+            fire_at_ms: 1_000_000,
+            orchestrate: false,
+            recurrence: Some(recurrence(every_ms)),
+            source: None,
+        }
+    }
+
+    fn owner_kind() -> Option<AgendaActor> {
+        Some(AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        })
+    }
+
+    /// The G3-pre intake omnibus: cadence floor + bound validation, the
+    /// failure streak deriving from write-backs, suspension refusing new
+    /// requests, re-approval of the UNCHANGED digest as the one-click
+    /// re-arm (plain double-approve stays refused), and revocation
+    /// clearing pending requests.
+    #[test]
+    fn g3pre_recurrence_intake_streak_and_rearm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let id = store
+            .apply_command(add_cmd("standing"), owner(), 1000)
+            .unwrap()
+            .id;
+
+        // Cadence floor + bound sanity, named.
+        for (cmd, needle) in [
+            (propose_recurring(&id, 60_000), "floors at 15 minutes"),
+            (
+                AgendaCommand::ProposeEffect {
+                    id: id.clone(),
+                    goal: "g".into(),
+                    fire_at_ms: 1_000_000,
+                    orchestrate: false,
+                    recurrence: Some(super::super::types::RecurrenceSpec {
+                        until_ms: Some(999_999),
+                        ..recurrence(3_600_000)
+                    }),
+                    source: None,
+                },
+                "until_ms must be after",
+            ),
+            (
+                AgendaCommand::ProposeEffect {
+                    id: id.clone(),
+                    goal: "g".into(),
+                    fire_at_ms: 1_000_000,
+                    orchestrate: false,
+                    recurrence: Some(super::super::types::RecurrenceSpec {
+                        max_occurrences: Some(0),
+                        ..recurrence(3_600_000)
+                    }),
+                    source: None,
+                },
+                "at least 1",
+            ),
+        ] {
+            let err = store.apply_command(cmd, owner(), 1001).unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "expected {needle:?} in {err}"
+            );
+        }
+
+        // Propose + approve a standing hourly manifest.
+        let proposed = store
+            .apply_command(propose_recurring(&id, 3_600_000), owner(), 1002)
+            .unwrap();
+        let digest = proposed.effects[0].digest.clone();
+        let effect_id = proposed.effects[0].effect_id.clone();
+        store
+            .apply_command(
+                AgendaCommand::ApproveEffect {
+                    id: id.clone(),
+                    digest: digest.clone(),
+                },
+                owner_kind(),
+                1003,
+            )
+            .unwrap();
+
+        // A request before any run: accepted once, second refused pending.
+        store
+            .apply_command(
+                AgendaCommand::RequestOccurrence { id: id.clone() },
+                owner_kind(),
+                1004,
+            )
+            .unwrap();
+        let err = store
+            .apply_command(
+                AgendaCommand::RequestOccurrence { id: id.clone() },
+                owner_kind(),
+                1005,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("pending"));
+
+        // Streak: failed/unknown accrue, started/missed neutral, the
+        // write-back after the request also unblocks the next request.
+        let fail = |store: &mut AgendaStore, occ: &str, state: &str, at: u64| {
+            store
+                .record_occurrence(
+                    OccurrenceWriteBack {
+                        item_id: &id,
+                        effect_id: &effect_id,
+                        occurrence_id: occ,
+                        state,
+                        session_id: None,
+                        note: None,
+                    },
+                    at,
+                )
+                .unwrap()
+        };
+        fail(&mut store, "occ-1", "started", 2001);
+        fail(&mut store, "occ-1", "failed", 2002);
+        fail(&mut store, "occ-2", "missed", 2003);
+        let item = fail(&mut store, "occ-3", "unknown", 2004);
+        assert_eq!(item.effects[0].consecutive_failures, 2);
+        assert!(!item.effects[0].suspended(), "threshold defaults to 3");
+        let item = fail(&mut store, "occ-4", "failed", 2005);
+        assert_eq!(item.effects[0].consecutive_failures, 3);
+        assert!(item.effects[0].suspended());
+
+        // Suspended: new requests refused, named.
+        let err = store
+            .apply_command(
+                AgendaCommand::RequestOccurrence { id: id.clone() },
+                owner_kind(),
+                2006,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("suspended"));
+
+        // Re-approving the UNCHANGED digest is the re-arm: allowed exactly
+        // in the suspended state, streak resets to zero.
+        let item = store
+            .apply_command(
+                AgendaCommand::ApproveEffect {
+                    id: id.clone(),
+                    digest: digest.clone(),
+                },
+                owner_kind(),
+                2007,
+            )
+            .unwrap();
+        assert_eq!(item.effects[0].consecutive_failures, 0);
+        assert!(item.effects[0].approval.is_some());
+        // Plain double-approve (not suspended) stays refused.
+        let err = store
+            .apply_command(
+                AgendaCommand::ApproveEffect {
+                    id: id.clone(),
+                    digest: digest.clone(),
+                },
+                owner_kind(),
+                2008,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("already approved"));
+
+        // A completed run resets the streak from any depth.
+        fail(&mut store, "occ-5", "failed", 2009);
+        let item = fail(&mut store, "occ-6", "completed", 2010);
+        assert_eq!(item.effects[0].consecutive_failures, 0);
+
+        // Revocation is instant and clears pending requests.
+        store
+            .apply_command(
+                AgendaCommand::RequestOccurrence { id: id.clone() },
+                owner_kind(),
+                2011,
+            )
+            .unwrap();
+        let item = store
+            .apply_command(
+                AgendaCommand::RevokeEffect { id: id.clone() },
+                owner_kind(),
+                2012,
+            )
+            .unwrap();
+        assert!(item.effects[0].approval.is_none());
+        assert!(item.effects[0].requested.is_empty());
+        let err = store
+            .apply_command(
+                AgendaCommand::RequestOccurrence { id: id.clone() },
+                owner_kind(),
+                2013,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("not approved"));
+
+        // Replay converges (request/streak state included).
+        let before = store.item(&id).unwrap();
+        let mut reopened = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.item(&id).unwrap(), before);
+    }
+
+    /// Start-now beside a standing approval fires the approved digest
+    /// (request_occurrence) instead of revising it; explicit overrides
+    /// are a named refusal pointing at the honest revise path; a one-shot
+    /// item keeps the classic mint+approve pair (regression).
+    #[test]
+    fn g3pre_start_now_routes_standing_manifests_to_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let id = store
+            .apply_command(add_cmd("standing"), owner(), 1000)
+            .unwrap()
+            .id;
+        let proposed = store
+            .apply_command(propose_recurring(&id, 3_600_000), owner(), 1001)
+            .unwrap();
+        let digest = proposed.effects[0].digest.clone();
+        store
+            .apply_command(
+                AgendaCommand::ApproveEffect {
+                    id: id.clone(),
+                    digest: digest.clone(),
+                },
+                owner_kind(),
+                1002,
+            )
+            .unwrap();
+
+        // Bare start_now (mode absent): one request op, approval intact,
+        // digest unchanged — the standing manifest is never revised.
+        let ops_before = store.ops();
+        let item = store
+            .apply_command(
+                AgendaCommand::StartNow {
+                    id: id.clone(),
+                    goal: None,
+                    project_root: None,
+                    interactive: None,
+                    agent_config: None,
+                },
+                owner_kind(),
+                1003,
+            )
+            .unwrap();
+        assert_eq!(
+            store.ops(),
+            ops_before + 1,
+            "one request op, no propose/approve"
+        );
+        assert_eq!(item.effects[0].digest, digest);
+        assert!(item.effects[0].approval.is_some());
+        assert_eq!(item.effects[0].requested.len(), 1);
+        assert_eq!(item.effects[0].requested[0].at_ms, 1003);
+
+        // An explicit override is a named refusal: edits go through the
+        // revise ceremony, never silently voiding the standing approval.
+        let err = store
+            .apply_command(
+                AgendaCommand::StartNow {
+                    id: id.clone(),
+                    goal: Some("different bytes".into()),
+                    project_root: None,
+                    interactive: None,
+                    agent_config: None,
+                },
+                owner_kind(),
+                1004,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("standing approved manifest"));
+
+        // One-shot regression: no recurrence → the classic two-op pair.
+        let plain = store
+            .apply_command(add_cmd("one shot"), owner(), 2000)
+            .unwrap()
+            .id;
+        let ops_before = store.ops();
+        let item = store
+            .apply_command(
+                AgendaCommand::StartNow {
+                    id: plain.clone(),
+                    goal: None,
+                    project_root: Some(dir.path().to_string_lossy().into_owned()),
+                    interactive: None,
+                    agent_config: None,
+                },
+                owner_kind(),
+                2001,
+            )
+            .unwrap();
+        assert_eq!(store.ops(), ops_before + 2, "propose + approve, as ever");
+        assert!(item.effects[0].approval.is_some());
+        assert!(item.effects[0].manifest.recurrence.is_none());
+    }
+
+    /// The steward's cross-build rider, pinned: a recurrence-bearing
+    /// manifest's digest DIFFERS from the recurrence-stripped
+    /// re-serialization an older build would derive — the premise that
+    /// makes old daemons fail closed (approval mismatch → never fires) —
+    /// while a recurrence-less manifest is byte-identical to the legacy
+    /// shape, so every legacy digest and approval is unchanged.
+    #[test]
+    fn g3pre_cross_build_digest_degrades_fail_closed() {
+        let with = super::super::types::SessionManifest {
+            goal: "standing".into(),
+            fire_at_ms: 1_000_000,
+            orchestrate: false,
+            interactive: false,
+            project_root: None,
+            agent_config: None,
+            recurrence: Some(recurrence(3_600_000)),
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert!(
+            json.get("recurrence").is_some(),
+            "the field reaches the wire"
+        );
+        // An older build deserializes-without then re-serializes-without:
+        let mut stripped_json = json.clone();
+        stripped_json.as_object_mut().unwrap().remove("recurrence");
+        let stripped: super::super::types::SessionManifest =
+            serde_json::from_value(stripped_json).unwrap();
+        assert_ne!(
+            super::super::types::manifest_digest("i", "e", &with),
+            super::super::types::manifest_digest("i", "e", &stripped),
+            "recurrence must be digest-visible or old builds would fire it as a one-shot"
+        );
+        // And the recurrence-less shape is the legacy bytes exactly.
+        let legacy = super::super::types::SessionManifest {
+            recurrence: None,
+            ..stripped
+        };
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("recurrence"));
     }
 
     /// A future ref type inside a known op name degrades exactly like an
