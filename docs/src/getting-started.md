@@ -360,6 +360,13 @@ ChatGPT Codex Responses service with the account header, SSE wire shape,
 encrypted reasoning continuity, and a stable session prompt-cache key. The
 runtime subprocess never receives either credential.
 
+The ChatGPT service accepts Intendant's ordinary function tools but not the
+metered Responses API's native `computer` tool. Regular native sessions
+therefore omit that one tool on the subscription transport instead of failing
+the model turn. A dedicated OpenAI computer-use provider still requires
+`OPENAI_AUTH_MODE=api-key`; automatic CU selection can fall through to a
+configured Anthropic or Gemini provider.
+
 ## API keys (.env)
 
 Two ways to give a daemon credentials, by trust posture:

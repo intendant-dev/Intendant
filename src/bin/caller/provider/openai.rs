@@ -706,7 +706,12 @@ impl ChatProvider for OpenAIProvider {
     }
 
     fn set_cu_enabled(&mut self, enabled: bool) {
-        self.cu_enabled = enabled;
+        // The ChatGPT Codex Responses service accepts the ordinary function
+        // tool surface, but rejects the platform API's native `computer`
+        // tool. Regular native sessions request CU opportunistically, so
+        // degrade that transport to function tools instead of failing the
+        // entire first model turn.
+        self.cu_enabled = enabled && !self.is_chatgpt_transport();
     }
 
     fn cu_display(&self) -> Option<(u32, u32)> {
@@ -1549,6 +1554,48 @@ mod tests {
         // Should have only the function_call_output, no user image message
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"].as_str(), Some("function_call_output"));
+    }
+
+    #[test]
+    fn native_computer_enablement_is_transport_aware() {
+        let tool = crate::tools::escalate_to_agent_tool();
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: "inspect the screen".to_string(),
+            ..Default::default()
+        }];
+
+        let mut api_provider = OpenAIProvider::new_with_tools(
+            "key".to_string(),
+            "gpt-5.4-mini".to_string(),
+            400_000,
+            128_000,
+            vec![tool.clone()],
+        );
+        api_provider.set_cu_enabled(true);
+        assert!(api_provider.cu_enabled());
+        let (_, _, _, api_tools) = build_openai_request_parts(&messages, &api_provider);
+        let api_tools = api_tools.unwrap();
+        assert!(api_tools.iter().any(|entry| entry["type"] == "function"));
+        assert!(api_tools.iter().any(|entry| entry["type"] == "computer"));
+
+        let mut chatgpt_provider = OpenAIProvider::new_with_tools(
+            OpenAIAuth::ChatGpt,
+            "gpt-5.6-sol".to_string(),
+            272_000,
+            128_000,
+            vec![tool],
+        );
+        chatgpt_provider.set_cu_enabled(true);
+        assert!(!chatgpt_provider.cu_enabled());
+        let (_, _, _, chatgpt_tools) = build_openai_request_parts(&messages, &chatgpt_provider);
+        let chatgpt_tools = chatgpt_tools.unwrap();
+        assert!(chatgpt_tools
+            .iter()
+            .any(|entry| entry["type"] == "function"));
+        assert!(!chatgpt_tools
+            .iter()
+            .any(|entry| entry["type"] == "computer"));
     }
 
     // --- PreparedRequest: one build feeds wire and snapshot ---

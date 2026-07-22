@@ -324,6 +324,13 @@ fn missing_openai_auth_error(scope: &str) -> CallerError {
     CallerError::Config(format!("{scope} provider=openai but {detail}."))
 }
 
+fn chatgpt_native_cu_error() -> CallerError {
+    CallerError::Config(
+        "CU provider=openai requires the metered API-key transport because the ChatGPT Codex Responses service does not accept OpenAI's native `computer` tool. Set OPENAI_AUTH_MODE=api-key with OPENAI_API_KEY, or choose anthropic/gemini."
+            .into(),
+    )
+}
+
 /// The provider API-key environment variables — the single authoritative
 /// list. The credential-custody save endpoint (`POST /api/api-keys`,
 /// CredentialsManage-gated), the key-status endpoint, the `fueled`
@@ -1073,12 +1080,15 @@ pub fn select_cu_provider(
         }
         Some("openai") => {
             let key = openai_key.ok_or_else(|| missing_openai_auth_error("CU"))?;
+            if matches!(key, OpenAIAuth::ChatGpt) {
+                return Err(chatgpt_native_cu_error());
+            }
             let model = model_str.unwrap_or_else(|| "gpt-5.4-mini".to_string());
             let display = crate::vision::display_config_for_provider("openai");
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
             let mut p = OpenAIProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
-            p.cu_enabled = true;
+            p.set_cu_enabled(true);
             p.cu_display = Some((display.width, display.height));
             Ok(Box::new(p))
         }
@@ -1091,14 +1101,20 @@ pub fn select_cu_provider(
             // Gemini goes LAST: its CU arm is de-facto unmaintained (kept
             // runnable, not preferred), so keyed deployments land on the
             // maintained OpenAI/Anthropic paths first.
-            if let Some(key) = openai_key {
+            let chatgpt_openai_only = matches!(&openai_key, Some(OpenAIAuth::ChatGpt));
+            if let Some(OpenAIAuth::ApiKey(key)) = openai_key {
                 let model = model_str.unwrap_or_else(|| "gpt-5.4-mini".to_string());
                 let display = crate::vision::display_config_for_provider("openai");
                 let ctx = resolve_context_window(&model);
                 let max_out = resolve_max_output_tokens(&model);
-                let mut p =
-                    OpenAIProvider::new_with_tools(key, model, ctx, max_out, escalate_tools);
-                p.cu_enabled = true;
+                let mut p = OpenAIProvider::new_with_tools(
+                    OpenAIAuth::ApiKey(key),
+                    model,
+                    ctx,
+                    max_out,
+                    escalate_tools,
+                );
+                p.set_cu_enabled(true);
                 p.cu_display = Some((display.width, display.height));
                 Ok(Box::new(p))
             } else if let Some(key) = anthropic_key {
@@ -1122,9 +1138,13 @@ pub fn select_cu_provider(
                 p.cu_display = Some((display.width, display.height));
                 Ok(Box::new(p))
             } else {
-                Err(CallerError::Config(
-                    "No API key found for CU provider. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY.".into(),
-                ))
+                if chatgpt_openai_only {
+                    Err(chatgpt_native_cu_error())
+                } else {
+                    Err(CallerError::Config(
+                        "No API key found for CU provider. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY.".into(),
+                    ))
+                }
             }
         }
     }
