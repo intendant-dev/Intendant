@@ -116,6 +116,10 @@ pub(crate) fn tool_allowed_for_profile(
                     // `ctl notify`).
                     | "ask_user"
                     | "notify_user"
+                    // Self-identity for provenance: memory and agenda
+                    // writes cite the ids whoami reports (also reachable
+                    // as `intendant ctl whoami`).
+                    | "whoami"
                     // Parking intent on the agenda is a core collaboration
                     // primitive: "I'll also…" must survive context death
                     // for every supervised backend (also reachable as
@@ -214,8 +218,11 @@ pub(crate) fn tool_allowed_for_profile(
 pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::PeerOperation {
     use crate::peer::access_policy::PeerOperation;
     match name {
-        // Daemon/agent status summaries.
+        // Daemon/agent status summaries. whoami rides here: it discloses
+        // only the caller's own gate-resolved identity — strictly less than
+        // get_status already reveals.
         "get_status"
+        | "whoami"
         | "get_restart_status"
         | "get_controller_loop_status"
         | "browser_workspace_providers"
@@ -503,6 +510,14 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
             "notify_user",
             "Send the user a fire-and-forget notification and return immediately (never blocks, never enters model context). urgency escalates delivery: \"info\" (default) renders a dashboard toast + transcript row; \"attention\" additionally badges the tab and raises a browser notification when the tab is hidden; \"urgent\" additionally pushes an immediate content-free nudge to the owner's opted-in browsers via the rendezvous — reserve urgent for being blocked or something requiring prompt human action. Caps: 4 KB text. Use ask_user instead when you need an answer.",
             NotifyUserParams
+        ),
+    );
+    push(
+        "whoami",
+        manual_http_tool_definition!(
+            "whoami",
+            "Report your own gate-resolved identity — daemon session id, backend harness (claude-code/codex/kimi/native) with its harness session id, wrapper aliases, project root, log dir; unsupervised callers get supervised:false plus their principal id — cite these when writing memory or agenda entries; takes no arguments.",
+            EmptyToolParams
         ),
     );
     push(
@@ -952,6 +967,33 @@ mod tests {
     }
 
     #[test]
+    fn whoami_is_advertised_to_supervised_profiles() {
+        // Self-identity provenance exists for supervised session-scoped
+        // callers (and `intendant ctl whoami` on their behalf): it must
+        // ride the small `core` profile and the permissive default/full
+        // lists.
+        for profile in [
+            None,
+            Some("full"),
+            Some("core"),
+            Some("codex-core"),
+            Some("cli"),
+            Some("minimal"),
+        ] {
+            assert!(
+                tool_allowed_for_profile("whoami", false, profile),
+                "whoami must be listed for profile {profile:?}"
+            );
+        }
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, false, Some("core"));
+        assert!(
+            manual.iter().any(|tool| tool["name"] == "whoami"),
+            "core-profile manual definitions must include whoami"
+        );
+    }
+
+    #[test]
     fn fission_tool_profile_gating_matrix() {
         for name in [
             "fission_spawn",
@@ -1000,6 +1042,7 @@ mod tests {
         use crate::peer::access_policy::PeerOperation;
 
         assert_eq!(mcp_tool_operation("get_status"), PeerOperation::StatsRead);
+        assert_eq!(mcp_tool_operation("whoami"), PeerOperation::StatsRead);
         assert_eq!(
             mcp_tool_operation("get_logs"),
             PeerOperation::SessionInspect
