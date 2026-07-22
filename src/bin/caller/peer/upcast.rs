@@ -1582,6 +1582,8 @@ impl AppEventUpcaster {
             AppEvent::ClaudeConfigChanged {
                 model,
                 model_cleared,
+                effort,
+                effort_cleared,
                 permission_mode,
                 allowed_tools,
             } => {
@@ -1590,6 +1592,11 @@ impl AppEventUpcaster {
                     parts.push(format!("model={v}"));
                 } else if *model_cleared {
                     parts.push("model=<default>".to_string());
+                }
+                if let Some(v) = effort {
+                    parts.push(format!("effort={v}"));
+                } else if *effort_cleared {
+                    parts.push("effort=<default>".to_string());
                 }
                 if let Some(v) = permission_mode {
                     parts.push(format!("permission_mode={v}"));
@@ -3030,6 +3037,8 @@ impl WireEventUpcaster {
             OutboundEvent::ClaudeConfigChanged {
                 model,
                 model_cleared,
+                effort,
+                effort_cleared,
                 permission_mode,
                 allowed_tools,
             } => {
@@ -3038,6 +3047,11 @@ impl WireEventUpcaster {
                     parts.push(format!("model={v}"));
                 } else if *model_cleared {
                     parts.push("model=<default>".to_string());
+                }
+                if let Some(v) = effort {
+                    parts.push(format!("effort={v}"));
+                } else if *effort_cleared {
+                    parts.push("effort=<default>".to_string());
                 }
                 if let Some(v) = permission_mode {
                     parts.push(format!("permission_mode={v}"));

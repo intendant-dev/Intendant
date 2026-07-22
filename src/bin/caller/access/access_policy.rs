@@ -970,6 +970,7 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::SetCodexContextArchive { .. }
         | ControlMsg::ConfigureSessionAgent { .. }
         | ControlMsg::SetClaudeModel { .. }
+        | ControlMsg::SetClaudeEffort { .. }
         | ControlMsg::SetClaudePermissionMode { .. }
         | ControlMsg::SetClaudeAllowedTools { .. }
         | ControlMsg::SetKimiModel { .. }
@@ -1733,6 +1734,7 @@ mod tests {
             attachments: Vec::new(),
             follow_up_id: None,
             delegation_id: None,
+            launch_config: Default::default(),
         };
         let approval = ControlMsg::Approve {
             session_id: None,

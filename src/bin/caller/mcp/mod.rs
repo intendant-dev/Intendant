@@ -1906,6 +1906,7 @@ impl IntendantServer {
                     attachments: vec![],
                     follow_up_id: None,
                     delegation_id: None,
+                    launch_config: Default::default(),
                 }));
             if target_phase
                 .as_ref()
@@ -1940,6 +1941,7 @@ impl IntendantServer {
                     attachments: vec![],
                     follow_up_id: None,
                     delegation_id: None,
+                    launch_config: Default::default(),
                 }));
             return "ok (CU task dispatched)".to_string();
         }
@@ -3715,6 +3717,7 @@ pub(crate) mod tests {
                     attachments,
                     follow_up_id,
                     delegation_id,
+                    launch_config,
                 }))) => {
                     assert!(project_root.is_none());
                     assert_eq!(session_id.as_deref(), Some("managed-session-1"));
@@ -3726,6 +3729,7 @@ pub(crate) mod tests {
                     assert!(attachments.is_empty());
                     assert!(follow_up_id.is_none());
                     assert!(delegation_id.is_none());
+                    assert!(launch_config.is_empty());
                 }
                 other => panic!("expected targeted StartTask control event, got {other:?}"),
             }

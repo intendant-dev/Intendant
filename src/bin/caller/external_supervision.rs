@@ -360,6 +360,7 @@ pub(crate) fn claude_runtime_config_equal(
     b: &control_plane::ClaudeRuntimeConfig,
 ) -> bool {
     a.model == b.model
+        && a.effort == b.effort
         && a.permission_mode == b.permission_mode
         && a.allowed_tools == b.allowed_tools
 }
@@ -1372,6 +1373,7 @@ pub(crate) fn shared_claude_config_from_project(
     Arc::new(tokio::sync::RwLock::new(
         control_plane::ClaudeRuntimeConfig {
             model: cfg.model.clone(),
+            effort: project::normalize_claude_effort(cfg.effort.as_deref()),
             permission_mode: project::normalize_claude_permission_mode(&cfg.permission_mode),
             allowed_tools: cfg.allowed_tools.clone(),
         },

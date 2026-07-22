@@ -142,6 +142,10 @@ impl Dispatcher {
                 // path exactly as against a pre-receipt build — see the
                 // compatibility matrix in peer::transport::intendant.
                 delegation_id: _,
+                // Launch config is create-time only; this dispatcher
+                // routes into an already-running loop whose config
+                // latched at spawn (same reasoning as project_root).
+                launch_config: _,
             } => {
                 let is_direct = direct.unwrap_or(false) || orchestrate == Some(false);
                 let has_metadata = !reference_frame_ids.is_empty()
@@ -441,6 +445,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: None,
+            launch_config: Default::default(),
         }));
 
         let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
@@ -482,6 +487,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: None,
+            launch_config: Default::default(),
         }));
 
         let text = tokio::time::timeout(std::time::Duration::from_millis(200), presence_rx.recv())
@@ -518,6 +524,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: None,
+            launch_config: Default::default(),
         }));
 
         let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
@@ -613,6 +620,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: None,
+            launch_config: Default::default(),
         }));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(follow_up_rx.try_recv().is_err());
@@ -655,6 +663,7 @@ mod tests {
                 attachments: vec![],
                 follow_up_id: None,
                 delegation_id: None,
+                launch_config: Default::default(),
             })
         };
 
@@ -707,6 +716,7 @@ mod tests {
                 attachments: vec![],
                 follow_up_id: None,
                 delegation_id: None,
+                launch_config: Default::default(),
             })
         };
         bus.send(start_task("before cutover"));
@@ -756,6 +766,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: None,
+            launch_config: Default::default(),
         }));
 
         let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())

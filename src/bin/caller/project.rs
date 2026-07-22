@@ -535,16 +535,25 @@ fn default_claude_code_permission_mode() -> String {
     "default".to_string()
 }
 
-/// Canonicalize a Claude Code reasoning-effort level. The CLI accepts
-/// low / medium / high / xhigh / max / ultracode (2.1.203+); empty and
-/// "default" mean "don't pass the flag". Unknown values pass through
-/// trimmed for forward compatibility with newer CLIs.
+/// Canonical Claude Code reasoning-effort vocabulary (the CLI's `--effort`
+/// levels, 2.1.203+), in escalation order. Single source of truth: the
+/// settings payload's `claude_efforts` list, the daemon-default "Claude
+/// reasoning" rows, the New Session pane's effort select, and the
+/// session-config dialog all derive from or are pinned to this list by
+/// `claude_effort_mirrors_carry_the_canonical_vocabulary` — extend the list
+/// and every mirror in the same change.
+pub const CLAUDE_EFFORTS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultracode"];
+
+/// Canonicalize a Claude Code reasoning-effort level. The CLI accepts the
+/// [`CLAUDE_EFFORTS`] vocabulary; empty and "default" mean "don't pass the
+/// flag". Unknown values pass through trimmed for forward compatibility
+/// with newer CLIs.
 pub fn normalize_claude_effort(effort: Option<&str>) -> Option<String> {
     let trimmed = effort.map(str::trim).filter(|s| !s.is_empty())?;
     let lowered = trimmed.to_ascii_lowercase();
     match lowered.as_str() {
         "default" | "inherit" => None,
-        "low" | "medium" | "high" | "xhigh" | "max" | "ultracode" => Some(lowered),
+        level if CLAUDE_EFFORTS.contains(&level) => Some(lowered),
         _ => Some(trimmed.to_string()),
     }
 }
@@ -2020,6 +2029,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn claude_effort_mirrors_carry_the_canonical_vocabulary() {
+        // The canonical list is the normalizer's own output set…
+        for effort in CLAUDE_EFFORTS {
+            assert_eq!(
+                normalize_claude_effort(Some(effort)).as_deref(),
+                Some(effort),
+                "canonical effort {effort} must survive normalization"
+            );
+        }
+        // …and every static frontend mirror must carry all of it: the New
+        // Session pane select, the session-config dialog select, and the
+        // Settings "Claude reasoning" row. An effort added to the
+        // vocabulary without extending a mirror fails here instead of
+        // shipping as silent frontend drift. (Dynamic consumers — the
+        // settings payload's `claude_efforts`, the agenda start sheet —
+        // derive from the served vocabulary and need no pin.)
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+        };
+        let shell = read("static/app/20-shell.html");
+        let dialogs = read("static/app/21-access-dialogs.html");
+        let new_session = section(
+            &shell,
+            "id=\"new-session-claude-effort\"",
+            "</select>",
+            "static/app/20-shell.html new-session-claude-effort",
+        );
+        let control_row = section(
+            &shell,
+            "id=\"control-claude-effort\"",
+            "</select>",
+            "static/app/20-shell.html control-claude-effort",
+        );
+        let session_config = section(
+            &dialogs,
+            "id=\"session-config-claude-effort\"",
+            "</select>",
+            "static/app/21-access-dialogs.html session-config-claude-effort",
+        );
+        let settings_row = section(
+            &dialogs,
+            "id=\"set-claude-effort\"",
+            "</select>",
+            "static/app/21-access-dialogs.html set-claude-effort",
+        );
+        for effort in CLAUDE_EFFORTS {
+            for (name, hay) in [
+                ("new-session-claude-effort", new_session),
+                ("control-claude-effort", control_row),
+                ("session-config-claude-effort", session_config),
+                ("set-claude-effort", settings_row),
+            ] {
+                assert!(
+                    hay.contains(&format!("value=\"{effort}\"")),
+                    "the {name} select is missing effort {effort}; \
+                     extend the mirror alongside CLAUDE_EFFORTS"
+                );
+            }
+        }
+    }
+
+    /// Slice `hay` to the region between `start` and `end` (exclusive), so
+    /// per-select option assertions can't be satisfied by another control's
+    /// markup (kimi thinking shares most of the effort words).
+    fn section<'a>(hay: &'a str, start: &str, end: &str, what: &str) -> &'a str {
+        hay.split_once(start)
+            .and_then(|(_, rest)| rest.split_once(end).map(|(body, _)| body))
+            .unwrap_or_else(|| panic!("missing markup section {what} ({start:?} .. {end:?})"))
     }
 
     #[test]

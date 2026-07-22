@@ -499,6 +499,10 @@ pub(crate) struct SpawnOccurrence {
     pub(crate) interactive: bool,
     /// The manifest's explicit project root, if the approval bound one.
     pub(crate) project_root: Option<String>,
+    /// The manifest's owner-approved agent-launch pins, forwarded verbatim
+    /// onto the spawn's StartTask. `None` = the legacy manifest shape
+    /// (every launch field inherits the daemon default).
+    pub(crate) agent_config: Option<crate::event::AgentLaunchConfig>,
     /// The parking session (item provenance) — the fallback the dispatcher
     /// resolves a project from when the manifest carries none.
     pub(crate) provenance_session_id: Option<String>,
@@ -607,6 +611,7 @@ pub(crate) fn plan(
                 fire_at_ms: effect.manifest.fire_at_ms,
                 interactive: effect.manifest.interactive,
                 project_root: effect.manifest.project_root.clone(),
+                agent_config: effect.manifest.agent_config.clone(),
                 provenance_session_id: item.provenance.session_id.clone(),
             };
             if progress.prepared {

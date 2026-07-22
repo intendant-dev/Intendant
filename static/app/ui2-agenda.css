@@ -726,12 +726,38 @@ html.ui-v2 .agenda-thread-add .agenda-thread-input:focus {
 }
 .ags-hint.ags-hint-required { color: var(--amber); }
 .ags-config {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  color: var(--text-3);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   border-top: 1px solid var(--line);
   padding-top: 7px;
 }
+.ags-config-line {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.ags-config-row {
+  display: grid;
+  grid-template-columns: minmax(64px, auto) 1fr;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 2px;
+}
+.ags-config-row select {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 11.5px;
+  padding: 4px 6px;
+  min-width: 0;
+}
+.ags-config-row select:focus {
+  outline: none;
+  border-color: var(--iris);
+}
+.ags-config-row .ags-hint { grid-column: 2; }
 .ags-seg {
   display: inline-flex;
   border: 1px solid var(--line);

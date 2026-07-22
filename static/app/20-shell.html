@@ -832,6 +832,21 @@
                 <div class="control-hint">
                   Sent as <code>claude --model</code>. Empty = let the claude CLI pick its configured default. Applies to the next task (the model latches when the process spawns).
                 </div>
+                <div class="control-row">
+                  <label for="control-claude-effort">Reasoning effort</label>
+                  <select id="control-claude-effort">
+                    <option value="">(model default)</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                    <option value="xhigh">xhigh</option>
+                    <option value="max">max</option>
+                    <option value="ultracode">ultracode</option>
+                  </select>
+                </div>
+                <div class="control-hint">
+                  Sent as <code>claude --effort</code> — the daemon default for every launch lane (New Session, scheduled agenda spawns, ctl); per-session picks override it. Applies to the next task.
+                </div>
               </fieldset>
               <fieldset class="control-group">
                 <legend>Permission mode</legend>

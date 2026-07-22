@@ -152,6 +152,7 @@ impl AgendaHandle {
                 goal,
                 project_root,
                 interactive,
+                agent_config,
             } => {
                 let provenance_session = self
                     .lock()
@@ -170,6 +171,7 @@ impl AgendaHandle {
                     goal,
                     project_root: Some(resolved.to_string_lossy().into_owned()),
                     interactive,
+                    agent_config,
                 }
             }
             other => other,
@@ -936,6 +938,7 @@ mod tests {
             goal: None,
             project_root: None,
             interactive: None,
+            agent_config: None,
         }
     }
 
@@ -1393,6 +1396,7 @@ mod tests {
                     goal: Some("run the sweep exactly as rehearsed".into()),
                     project_root: Some(picked_project.path().to_string_lossy().into_owned()),
                     interactive: Some(false),
+                    agent_config: None,
                 },
                 actor("dashboard", None),
             )

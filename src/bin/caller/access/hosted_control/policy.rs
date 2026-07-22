@@ -409,6 +409,7 @@ pub fn hosted_control_msg_allowed(
             attachments,
             follow_up_id: _,
             delegation_id,
+            launch_config,
         } => {
             preset >= HostedPreset::Tasks
                 && eligible(session_id)
@@ -421,6 +422,12 @@ pub fn hosted_control_msg_allowed(
                 && display_target.is_none()
                 && attachments.is_empty()
                 && delegation_id.is_none()
+                // Fail-closed like CreateSession's per-field pins: a hosted
+                // caller may not select backends, models, efforts, or any
+                // other launch pin. `is_empty` destructures exhaustively,
+                // so a future config field extends this pin at compile
+                // time.
+                && launch_config.is_empty()
         }
         ControlMsg::FollowUp {
             session_id,
@@ -545,6 +552,7 @@ pub fn hosted_control_msg_allowed(
         | ControlMsg::ConfigureSessionAgent { .. }
         | ControlMsg::ReloadCredentials { .. }
         | ControlMsg::SetClaudeModel { .. }
+        | ControlMsg::SetClaudeEffort { .. }
         | ControlMsg::SetClaudePermissionMode { .. }
         | ControlMsg::SetClaudeAllowedTools { .. }
         | ControlMsg::SetKimiCommand { .. }
@@ -1034,6 +1042,27 @@ mod tests {
                 "task": "implicit target"
             }))
         ));
+        // The launch-config vocabulary is pinned closed like CreateSession's
+        // per-field pins: a hosted caller may not select backends, models,
+        // or efforts.
+        for (key, value) in [
+            ("agent", serde_json::json!("claude-code")),
+            ("claude_effort", serde_json::json!("max")),
+            ("claude_model", serde_json::json!("haiku")),
+            ("codex_reasoning_effort", serde_json::json!("xhigh")),
+            ("agent_command", serde_json::json!("/tmp/evil")),
+        ] {
+            let mut msg = serde_json::json!({
+                "action": "start_task",
+                "session_id": "session-eligible",
+                "task": "continue",
+            });
+            msg[key] = value;
+            assert!(
+                !hosted_control_msg_allowed(&state, HostedPreset::Tasks, &control(msg)),
+                "start_task with {key} must be refused behind the hosted action wall"
+            );
+        }
         assert!(!hosted_control_msg_allowed(
             &state,
             HostedPreset::Operate,

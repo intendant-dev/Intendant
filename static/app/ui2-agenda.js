@@ -646,6 +646,10 @@ let agendaStartSheetGoalDirty = false;
 // daemon, non-empty = the default. Same source the New Session pane uses
 // (api_project_root via fetchProjectRoot).
 let agendaDaemonDefaultProject = null;
+// Daemon settings snapshot for the start sheet's config controls: null =
+// not fetched yet. Refetched on every sheet open so the daemon defaults
+// shown (backend, model, effort) are current, not boot-time stale.
+let agendaStartSheetSettings = null;
 
 const AGENDA_START_MODES = [
   {
@@ -746,19 +750,65 @@ function agendaStartSheetEl(tag, cls, text) {
   return node;
 }
 
-// The config summary the spawn inherits, from the same client-held sources
-// the New Session pane reads (settings' configured agent; honest daemon
-// defaults — nothing here is a second catalog).
-function agendaStartConfigSummary(mode) {
-  const configured = (typeof newSessionConfiguredAgent !== 'undefined' && newSessionConfiguredAgent)
-    ? newSessionConfiguredAgent : '';
-  const backend = configured
-    ? ((typeof prettyAgentName === 'function' && prettyAgentName(configured)) || configured)
-    : 'Internal agent';
+// The execution line under the config block (the backend/model/effort rows
+// above it are live controls, not a summary).
+function agendaStartExecutionSummary(mode) {
   const execution = mode === 'interactive'
     ? 'composer defaults (waits for you after opening)'
     : 'direct goal run';
-  return `${backend} (daemon default) · ${execution} · supervised, normal approvals`;
+  return `${execution} · supervised, normal approvals`;
+}
+
+// The sheet's per-backend config vocabulary, from the daemon's served
+// settings (derive-don't-mirror: models and efforts come from the settings
+// payload where the daemon serves them; the static kimi/claude-alias lists
+// mirror the pinned settings-pane markup). `model`/`effort` are the daemon
+// DEFAULTS the selects inherit when left untouched.
+function agendaStartBackendConfig(settings) {
+  const d = settings || {};
+  const backend = (typeof normalizeAgentId === 'function')
+    ? normalizeAgentId(d.external_agent) : (d.external_agent || '');
+  if (backend === 'claude-code') {
+    return {
+      backend,
+      label: 'Claude Code',
+      modelKey: 'claude_model',
+      effortKey: 'claude_effort',
+      effortLabel: 'Reasoning',
+      model: String(d.claude_model || ''),
+      models: ['fable', 'opus', 'sonnet', 'haiku'],
+      effort: String(d.claude_effort || ''),
+      efforts: Array.isArray(d.claude_efforts) ? d.claude_efforts : [],
+    };
+  }
+  if (backend === 'codex') {
+    const models = Array.isArray(d.codex_models) ? d.codex_models.map(m => m.id) : [];
+    return {
+      backend,
+      label: 'Codex',
+      modelKey: 'codex_model',
+      effortKey: 'codex_reasoning_effort',
+      effortLabel: 'Reasoning',
+      model: String(d.codex_model || ''),
+      models,
+      effort: String(d.codex_reasoning_effort || ''),
+      efforts: Array.isArray(d.codex_reasoning_efforts) ? d.codex_reasoning_efforts : [],
+    };
+  }
+  if (backend === 'kimi') {
+    return {
+      backend,
+      label: 'Kimi Code',
+      modelKey: 'kimi_model',
+      effortKey: 'kimi_thinking',
+      effortLabel: 'Thinking',
+      model: String(d.kimi_model || ''),
+      models: ['kimi-code/kimi-for-coding', 'kimi-code/kimi-for-coding-highspeed', 'kimi-code/k3'],
+      effort: String(d.kimi_thinking || ''),
+      efforts: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
+    };
+  }
+  return { backend: '', label: 'Internal agent' };
 }
 
 function agendaPresentStartSheet(host, panel, anchor) {
@@ -862,16 +912,88 @@ function agendaOpenStartSheet(itemId, anchor) {
       });
   }
 
-  // Config the spawn inherits (honest daemon defaults; same sources the
-  // New Session pane reads).
-  const config = agendaStartSheetEl('div', 'ags-config', agendaStartConfigSummary('interactive'));
+  // Config the spawn runs with: editable controls prefilled from the
+  // DAEMON defaults (fetched fresh on open), with honest provenance —
+  // an untouched select inherits ("daemon default (max)") and sends
+  // nothing; an explicit pick is recorded on the manifest and applied.
+  const config = agendaStartSheetEl('div', 'ags-config');
   panel.appendChild(config);
+  const configState = { spec: null, modelSel: null, effortSel: null };
+  const renderConfigControls = () => {
+    config.textContent = '';
+    configState.modelSel = null;
+    configState.effortSel = null;
+    if (agendaStartSheetSettings === null) {
+      config.appendChild(agendaStartSheetEl('div', 'ags-config-line',
+        'Loading the daemon’s launch defaults…'));
+      return;
+    }
+    const spec = agendaStartBackendConfig(agendaStartSheetSettings);
+    configState.spec = spec;
+    const backendLine = agendaStartSheetEl('div', 'ags-config-line',
+      `${spec.label} · daemon default backend`);
+    config.appendChild(backendLine);
+    if (!spec.backend) {
+      config.appendChild(agendaStartSheetEl('div', 'ags-hint',
+        'Model and provider follow the daemon’s native configuration.'));
+      return;
+    }
+    const addSelect = (labelText, id, defaultValue, options) => {
+      const row = agendaStartSheetEl('div', 'ags-config-row');
+      const label = agendaStartSheetEl('label', 'ags-label', labelText);
+      label.setAttribute('for', id);
+      row.appendChild(label);
+      const select = document.createElement('select');
+      select.id = id;
+      const inherit = document.createElement('option');
+      inherit.value = '';
+      inherit.textContent = defaultValue
+        ? `Daemon default (${defaultValue})`
+        : 'Daemon default (backend default)';
+      select.appendChild(inherit);
+      const values = [...options];
+      if (defaultValue && !values.includes(defaultValue)) values.push(defaultValue);
+      for (const value of values) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = value;
+        select.appendChild(option);
+      }
+      row.appendChild(select);
+      const hint = agendaStartSheetEl('div', 'ags-hint', 'daemon default');
+      row.appendChild(hint);
+      select.addEventListener('change', () => {
+        hint.textContent = select.value
+          ? 'explicit — recorded on the manifest'
+          : 'daemon default';
+      });
+      config.appendChild(row);
+      return select;
+    };
+    configState.modelSel = addSelect('Model', 'ags-config-model', spec.model, spec.models);
+    configState.effortSel = addSelect(
+      spec.effortLabel, 'ags-config-effort', spec.effort, spec.efforts);
+  };
+  renderConfigControls();
+  // Fetch fresh daemon defaults on every open (the settings snapshot ages
+  // while the tab sits); re-render when they land if the sheet is still
+  // showing this item.
+  if (typeof fetchDashboardSettings === 'function') {
+    fetchDashboardSettings()
+      .then((d) => { if (d && !d.error) agendaStartSheetSettings = d; })
+      .catch(() => {})
+      .finally(() => {
+        if (agendaStartSheetItemId === itemId) renderConfigControls();
+      });
+  }
 
   // Interactive / Goal-run toggle (Interactive is the ratified default).
   const seg = agendaStartSheetEl('div', 'ags-seg');
   seg.setAttribute('role', 'group');
   seg.setAttribute('aria-label', 'Session mode');
   const note = agendaStartSheetEl('div', 'ags-note', AGENDA_START_MODES[0].note);
+  const execution = agendaStartSheetEl('div', 'ags-config-line ags-execution',
+    agendaStartExecutionSummary('interactive'));
   const syncSeg = () => {
     for (const btn of seg.querySelectorAll('button[data-mode]')) {
       const active = btn.dataset.mode === agendaStartSheetMode;
@@ -881,7 +1003,7 @@ function agendaOpenStartSheet(itemId, anchor) {
     const choice = AGENDA_START_MODES.find((m) => m.value === agendaStartSheetMode)
       || AGENDA_START_MODES[0];
     note.textContent = choice.note;
-    config.textContent = agendaStartConfigSummary(agendaStartSheetMode);
+    execution.textContent = agendaStartExecutionSummary(agendaStartSheetMode);
   };
   for (const choice of AGENDA_START_MODES) {
     const btn = agendaStartSheetEl('button', 'ags-seg-btn', choice.label);
@@ -895,6 +1017,7 @@ function agendaOpenStartSheet(itemId, anchor) {
   }
   panel.appendChild(seg);
   panel.appendChild(note);
+  panel.appendChild(execution);
 
   // Errors render inline — the sheet is the surface, not a toast race.
   const error = agendaStartSheetEl('div', 'ags-error', '');
@@ -908,7 +1031,7 @@ function agendaOpenStartSheet(itemId, anchor) {
   const start = agendaStartSheetEl('button', 'ags-btn ags-start', 'Start session');
   start.type = 'button';
   start.addEventListener('click', () =>
-    agendaStartSheetSubmit(item, goal, project, error, start));
+    agendaStartSheetSubmit(item, goal, project, error, start, configState));
   foot.appendChild(cancel);
   foot.appendChild(start);
   panel.appendChild(foot);
@@ -918,7 +1041,7 @@ function agendaOpenStartSheet(itemId, anchor) {
   goal.focus();
 }
 
-async function agendaStartSheetSubmit(item, goal, project, error, startBtn) {
+async function agendaStartSheetSubmit(item, goal, project, error, startBtn, configState) {
   const goalText = (goal.value || '').trim();
   const projectText = (project.value || '').trim();
   const showError = (message) => {
@@ -946,6 +1069,22 @@ async function agendaStartSheetSubmit(item, goal, project, error, startBtn) {
     interactive: agendaStartSheetMode === 'interactive',
   };
   if (projectText) params.project_root = projectText;
+  // Explicit config picks bind on the manifest; untouched selects send
+  // NOTHING so the daemon's resolution chain fills them (honest inherit).
+  // An explicit pick also pins the reviewed backend — the approved config
+  // must not silently re-target if the daemon default changes.
+  const spec = configState && configState.spec;
+  if (spec && spec.backend) {
+    const agentConfig = {};
+    const model = configState.modelSel ? configState.modelSel.value : '';
+    const effort = configState.effortSel ? configState.effortSel.value : '';
+    if (model) agentConfig[spec.modelKey] = model;
+    if (effort) agentConfig[spec.effortKey] = effort;
+    if (Object.keys(agentConfig).length) {
+      agentConfig.agent = spec.backend;
+      params.agent_config = agentConfig;
+    }
+  }
   startBtn.disabled = true;
   try {
     const resp = await daemonApi.request('api_agenda_op', params);

@@ -2235,8 +2235,25 @@ async fn run_agenda(
             // (opens with the item, waits for the owner); --goal-run is
             // the autonomous shape. --project overrides the resolved
             // project (parking session's root, else the daemon default);
-            // --goal replaces the default item statement.
-            let args = parse_command_args(&raw[1..], &["--project", "--goal"], &["--goal-run"])?;
+            // --goal replaces the default item statement. The launch
+            // flags mirror the dashboard confirm sheet: explicit pins
+            // recorded on the manifest; omitted fields inherit the daemon
+            // defaults through the standard resolution chain.
+            let args = parse_command_args(
+                &raw[1..],
+                &[
+                    "--project",
+                    "--goal",
+                    "--agent",
+                    "--claude-model",
+                    "--claude-effort",
+                    "--codex-model",
+                    "--codex-reasoning-effort",
+                    "--kimi-model",
+                    "--kimi-thinking",
+                ],
+                &["--goal-run"],
+            )?;
             let id = agenda_resolve_id(
                 client,
                 config,
@@ -2251,6 +2268,29 @@ async fn run_agenda(
             insert_string(&mut map, "goal", args.one("--goal"));
             let goal_run = args.has("--goal-run");
             map.insert("interactive".to_string(), Value::Bool(!goal_run));
+            let mut agent_config = Map::new();
+            insert_string(&mut agent_config, "agent", args.one("--agent"));
+            insert_string(&mut agent_config, "claude_model", args.one("--claude-model"));
+            insert_string(
+                &mut agent_config,
+                "claude_effort",
+                args.one("--claude-effort"),
+            );
+            insert_string(&mut agent_config, "codex_model", args.one("--codex-model"));
+            insert_string(
+                &mut agent_config,
+                "codex_reasoning_effort",
+                args.one("--codex-reasoning-effort"),
+            );
+            insert_string(&mut agent_config, "kimi_model", args.one("--kimi-model"));
+            insert_string(
+                &mut agent_config,
+                "kimi_thinking",
+                args.one("--kimi-thinking"),
+            );
+            if !agent_config.is_empty() {
+                map.insert("agent_config".to_string(), Value::Object(agent_config));
+            }
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
             if goal_run {
@@ -4152,6 +4192,8 @@ fn help_agenda() {
   intendant ctl agenda approve ID_PREFIX [--digest HEX]\n\
   intendant ctl agenda revoke-schedule ID_PREFIX\n\
   intendant ctl agenda start ID_PREFIX [--project DIR] [--goal TEXT] [--goal-run]\n\
+      [--agent BACKEND] [--claude-model M] [--claude-effort E]\n\
+      [--codex-model M] [--codex-reasoning-effort E] [--kimi-model M] [--kimi-thinking T]\n\
 \n\
 The agenda is this daemon's durable ledger of parked intent — tasks, notes,\n\
 questions, and deferred follow-ups that survive session and context death.\n\
@@ -4197,7 +4239,11 @@ the session opens with the item as its first message and waits for you;\n\
 --goal-run runs it autonomously with the outcome written back. The\n\
 project resolves --project, else the parking session's recorded project\n\
 root, else the daemon default — refused with a named error when none\n\
-exists (never a project-less spawn). Owner surfaces only (dashboard or\n\
+exists (never a project-less spawn). The launch flags (--agent,\n\
+--claude-model/--claude-effort, --codex-model/--codex-reasoning-effort,\n\
+--kimi-model/--kimi-thinking) pin the spawn's agent config on the\n\
+manifest; omitted fields inherit the daemon defaults (explicit pin →\n\
+daemon default → backend default). Owner surfaces only (dashboard or\n\
 an owner shell); agent and peer callers are refused. Revises the item's\n\
 pending schedule if one exists (fresh digest, prior approval void)."
     );
