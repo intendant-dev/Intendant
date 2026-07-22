@@ -377,9 +377,17 @@ function refreshSessionWindowPathElement(el, expanded) {
 
 function refreshSessionWindowPathLabels(win) {
   if (!win) return;
-  const expanded = !win.headerCollapsed && !win.minimized;
-  refreshSessionWindowPathElement(win.project, expanded);
-  refreshSessionWindowPathElement(win.cwd, expanded);
+  // Uniform row discipline (grid redesign): the path line always shows
+  // the compact form — full paths live in the tooltips — and the project
+  // cell hides when it merely repeats the cwd.
+  refreshSessionWindowPathElement(win.project, false);
+  refreshSessionWindowPathElement(win.cwd, false);
+  if (win.project && win.cwd) {
+    // Rendered-text comparison so "unknown · from unknown" collapses too.
+    const dup = !!win.project.textContent
+      && win.project.textContent === win.cwd.textContent;
+    win.project.classList.toggle('path-dup', dup);
+  }
 }
 
 function refreshSessionIdentityLabels(sessionId) {
@@ -1012,6 +1020,48 @@ function vitalsModelShortName(model) {
   return short || raw;
 }
 
+// ── Monoline icon set for the header fact line (grid redesign) ─────────
+// 24×24 stroke paths in the nav-icon language (20-shell.html): stroke
+// currentColor, fill none, round caps/joins — sizing and stroke width
+// come from CSS (.vit-icon). Static trusted markup only; dynamic text
+// never rides through these strings.
+const VITALS_ICON_PATHS = {
+  clock: '<circle cx="12" cy="12" r="8.2"/><path d="M12 7.8V12l3.2 1.9"/>',
+  hexagon: '<path d="M12 3l7.4 4.3v8.4L12 20l-7.4-4.3V7.7Z"/>',
+  shield: '<path d="M12 3.5 19 6v5.2c0 4.6-3 7.6-7 9.3-4-1.7-7-4.7-7-9.3V6Z"/>',
+  bolt: '<path d="M13 3 5 13.5h5.5L10 21l8-10.5h-5.5Z"/>',
+  updown: '<path d="M8 18V6.5"/><path d="M4.8 9.7 8 6.5l3.2 3.2"/><path d="M16 6v11.5"/><path d="M12.8 14.3 16 17.5l3.2-3.2"/>',
+  check: '<path d="M4.5 12.5l5 5L19.5 7.5"/>',
+  triangle: '<path d="M12 3 22 20H2Z"/><path d="M12 10v4.5"/><path d="M12 17.5v.5"/>',
+  push: '<path d="M12 19V7"/><path d="M7.5 11.5 12 7l4.5 4.5"/><path d="M6 3.5h12"/>',
+  gauge: '<path d="M4.5 15.5a8 8 0 1 1 15 0"/><path d="M12 15l4-4.4"/>',
+  branch: '<path d="M6 4v11"/><circle cx="6" cy="19" r="2.4"/><circle cx="18" cy="6" r="2.4"/><path d="M18 8.4v2.2a4 4 0 0 1-4 4H10"/>',
+  folder: '<rect x="4" y="4" width="12" height="12" rx="2.5"/><path d="M20 9v8.5A2.5 2.5 0 0 1 17.5 20H9"/>',
+  pencil: '<path d="M14.5 5.5l4 4"/><path d="M4 20l1-4.5L15.5 5a2.12 2.12 0 0 1 3 3L8 18.5Z"/>',
+  spark: '<path d="M12 4l1.7 4.3L18 10l-4.3 1.7L12 16l-1.7-4.3L6 10l4.3-1.7Z"/><path d="M18.5 15.5l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9Z"/>',
+  lines: '<path d="M5 7h14"/><path d="M5 12h14"/><path d="M5 17h9"/>',
+  terminal: '<path d="M5 8l4 4-4 4"/><path d="M12 16h7"/>',
+  pause: '<path d="M9 5.5v13"/><path d="M15 5.5v13"/>',
+  slash: '<circle cx="12" cy="12" r="8.2"/><path d="M6.5 6.5l11 11"/>',
+  dots: '<circle cx="5.5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="18.5" cy="12" r="1.4"/>',
+};
+
+function vitalsIconSvg(iconId) {
+  const path = VITALS_ICON_PATHS[iconId];
+  if (!path) return '';
+  return `<svg class="vit-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${path}</svg>`;
+}
+
+// The fact-line text is the chip text minus its leading glyph — the
+// monoline icon replaces the glyph, everything else (grammar, counts,
+// countdowns) stays byte-identical with the legacy chip string that the
+// Focus rail and Station rows keep consuming.
+const VITALS_CHIP_GLYPH_PREFIX =
+  /^(?:[\u{1F9E0}\u{1F5D2}\u{1F527}\u{1F6E1}]️?|[⏸⚠⛔⬡⧉⎇●⇡⚡⏳✗✓▮⋯])️?\s*/u;
+function vitalsChipFactTextFromChip(text) {
+  return String(text || '').replace(VITALS_CHIP_GLYPH_PREFIX, '').trim();
+}
+
 const VITALS_SYMBOLS = {
   health: {
     label: 'Session health',
@@ -1037,6 +1087,15 @@ const VITALS_SYMBOLS = {
     label: 'Model activity',
     priority: 95,
     quiet: 'The model is idle — no turn is running right now.',
+    icon: (v) => ({
+      reasoning: 'spark',
+      responding: 'lines',
+      'tool-running': 'terminal',
+      'awaiting-api': 'dots',
+      'parked-on-tasks': 'pause',
+      stalled: 'clock',
+      'rate-limited': 'slash',
+    }[v.state] || 'clock'),
     chip: (v) => {
       if (v.state === 'reasoning') return `🧠 Thinking${v.effort ? ` · ${v.effort}` : ''} · ${v.elapsedText}`;
       if (v.state === 'responding') return `🗒 Responding · ${v.elapsedText}`;
@@ -1110,6 +1169,7 @@ const VITALS_SYMBOLS = {
     label: 'Model',
     priority: 28,
     unavailable: 'Not reported yet — appears once the agent names its model (or its launch settings do).',
+    icon: 'hexagon',
     chip: (v) => (v.shortName
       ? `⬡ ${v.shortName}${v.effort ? ` · ${v.effort}` : ''}`
       : `⬡ ${v.effort} effort`),
@@ -1128,6 +1188,7 @@ const VITALS_SYMBOLS = {
     label: 'Permissions',
     priority: 55,
     unavailable: 'Not reported yet — appears once the agent (or its launch settings) states a permission mode.',
+    icon: 'shield',
     chip: (v) => `🛡 ${v.label}`,
     explain: (v) => {
       const lines = [...v.lines];
@@ -1142,7 +1203,9 @@ const VITALS_SYMBOLS = {
     label: 'Worktree',
     priority: 20,
     unavailable: 'Working directly in the project folder (its main checkout) — not in an isolated worktree copy.',
+    icon: 'folder',
     chip: () => '⧉',
+    factText: () => 'worktree',
     explain: (v) => {
       const lines = [
         'This agent works in its own copy of the project (a git worktree), so agents working in parallel never disturb each other.',
@@ -1157,6 +1220,7 @@ const VITALS_SYMBOLS = {
   branch: {
     label: 'Branch',
     priority: 30,
+    icon: 'branch',
     chip: (v) => `⎇ ${v.branch}`,
     explain: (v) => [`“${v.branch}” is the git branch this agent is working on.`],
     action: (v) => ({ label: 'Copy branch name', run: () => vitalsCopyText(v.branch) }),
@@ -1165,7 +1229,9 @@ const VITALS_SYMBOLS = {
     label: 'Uncommitted changes',
     priority: 60,
     quiet: 'Nothing uncommitted — the working folder is clean.',
+    icon: 'pencil',
     chip: (v) => `●${v.count}`,
+    factText: (v) => `${v.count} dirty`,
     explain: (v) => [
       `${v.count} file${v.count === 1 ? ' has' : 's have'} changes that aren't committed to git yet.`,
       'Normal while the agent works — they become permanent history once committed.',
@@ -1176,6 +1242,7 @@ const VITALS_SYMBOLS = {
     label: 'Ahead / behind',
     priority: 40,
     quiet: 'No primary branch to compare with.',
+    icon: 'updown',
     chip: (v) => `+${v.ahead}/−${v.behind}`,
     explain: (v) => {
       const lines = [
@@ -1192,7 +1259,9 @@ const VITALS_SYMBOLS = {
     label: 'Merge readiness',
     priority: 90,
     quiet: 'No merge check needed — this branch is not diverged from the primary.',
+    icon: (v) => (v.conflict ? 'triangle' : 'check'),
     chip: (v) => (v.conflict ? '⚠' : '✓'),
+    factText: (v) => (v.conflict ? 'conflict' : 'clean'),
     explain: (v) => (v.conflict
       ? [`Merging this work into ${v.primaryRef} would CONFLICT — overlapping edits need a decision before it can land.`]
       : [`Merging this work into ${v.primaryRef} would apply cleanly right now.`]),
@@ -1205,7 +1274,9 @@ const VITALS_SYMBOLS = {
     label: 'Unpushed commits',
     priority: 35,
     quiet: 'Nothing waiting to be pushed (or no upstream is configured).',
+    icon: 'push',
     chip: (v) => `⇡${v.count}`,
+    factText: (v) => `${v.count} unpushed`,
     explain: (v) => [
       `${v.count} commit${v.count === 1 ? '' : 's'} on this branch exist${v.count === 1 ? 's' : ''} only on this machine — not pushed to the shared repository yet.`,
     ],
@@ -1214,6 +1285,7 @@ const VITALS_SYMBOLS = {
     label: 'Unpushed on primary',
     priority: 25,
     quiet: 'Nothing unpushed on the primary branch.',
+    icon: 'push',
     chip: (v) => `${v.primaryName}⇡${v.count}`,
     explain: (v) => [
       `The primary branch ${v.primaryName} has ${v.count} commit${v.count === 1 ? '' : 's'} that ${v.count === 1 ? 'hasn’t' : 'haven’t'} been pushed yet.`,
@@ -1223,6 +1295,7 @@ const VITALS_SYMBOLS = {
     label: 'Prompt cache',
     priority: 15,
     quiet: 'No cache reading on the last request.',
+    icon: 'bolt',
     chip: (v) => `⚡${v.hitPct}%`,
     explain: (v) => [
       `${v.hitPct}% of the last request was answered from the provider's prompt cache.`,
@@ -1233,7 +1306,9 @@ const VITALS_SYMBOLS = {
     label: 'Cache freshness',
     priority: 45,
     quiet: "This provider doesn't report how long its cache stays warm.",
+    icon: 'clock',
     chip: (v) => (v.cold ? '✗' : `⏳${v.countdown}`),
+    factText: (v) => (v.cold ? 'cache cold' : v.countdown),
     explain: (v) => (v.cold
       ? [
         'The prompt cache went cold — the next request rebuilds it.',
@@ -1260,6 +1335,7 @@ const VITALS_SYMBOLS = {
     // window) until the next report. Chips always speak the SHORT window
     // grammar ("▮95% 7d-overage · ↻6:12:03") — a full provider sentence
     // in a header chip is the failure mode; the pane keeps the full name.
+    icon: 'gauge',
     chip: (v) => {
       const label = vitalsLimitLabelShort(v.label);
       if (v.rolled) return `${label} reset`;
@@ -1267,6 +1343,16 @@ const VITALS_SYMBOLS = {
       if (v.usedPct !== null) return `▮${v.usedPct}% ${label}${reset}`;
       const mark = v.severity === 'crit' ? '⛔' : v.severity === 'warn' ? '⚠' : v.statusWord;
       return `${label} ${mark}${reset}`;
+    },
+    // Fact-line twin of the chip grammar: the gauge icon plus severity
+    // color carry what the ⛔/⚠/▮ glyphs said, so the mark is always the
+    // provider's word.
+    factText: (v) => {
+      const label = vitalsLimitLabelShort(v.label);
+      if (v.rolled) return `${label} reset`;
+      const reset = v.reset ? ` · ↻${v.reset}` : '';
+      if (v.usedPct !== null) return `${v.usedPct}% ${label}${reset}`;
+      return `${label} ${v.statusWord}${reset}`;
     },
     explain: (v) => {
       const lines = [];
@@ -1406,12 +1492,18 @@ function vitalsChipModels(vitals, meta, sessionId) {
     // expensive (red TEXT) but not wrong (never a red health dot).
     const severity = extra.severity || '';
     const tone = extra.tone !== undefined ? extra.tone : severity;
+    const chipText = def.chip(value);
     models.push({
       id: id || key,
       key,
       label: def.label,
       priority: def.priority,
-      text: def.chip(value),
+      text: chipText,
+      // Header fact-line rendering (grid redesign): a monoline stroke
+      // icon plus the glyph-free text. `text` stays the legacy glyph
+      // grammar for the Focus rail / Station segment consumers.
+      icon: typeof def.icon === 'function' ? def.icon(value) : (def.icon || ''),
+      factText: def.factText ? def.factText(value) : vitalsChipFactTextFromChip(chipText),
       severity,
       tone,
       elevated: severity === 'warn' || severity === 'crit',
@@ -1606,6 +1698,8 @@ function vitalsChipModels(vitals, meta, sessionId) {
     label: healthDef.label,
     priority: healthDef.priority,
     text: '',
+    icon: '',
+    factText: '',
     severity: worst === 'ok' ? '' : worst,
     tone: worst === 'ok' ? '' : worst,
     elevated: true,
@@ -1697,6 +1791,7 @@ function vitalsAttentionSummary(models) {
     extra,
     aggregate: extra > 0,
     text: extra > 0 ? `${top.text} +${extra}` : top.text,
+    factText: extra > 0 ? `${top.factText || top.text} +${extra}` : (top.factText || top.text),
   };
 }
 
@@ -1710,6 +1805,19 @@ function vitalsAttentionSummary(models) {
 // symbol plus a "+N" count for the rest (CSS keys off .vit-attn /
 // .header-collapsed / .minimized). Severity-first: a red dot's culprit is
 // always on screen, in short grammar, never as a full sentence.
+// Two mount points, one derivation: the health dot (and the compact
+// states' single attention chip) renders into win.healthSlot on the
+// identity line; every other symbol renders into win.vitals — the quiet
+// icon fact line. Chips are icon + glyph-free text (m.icon / m.factText);
+// the legacy glyph string (m.text) survives for the rail/Station
+// segments and as the factText fallback.
+function vitalsChipTextSpan(text) {
+  const span = document.createElement('span');
+  span.className = 'vit-txt';
+  span.textContent = text;
+  return span;
+}
+
 function renderSessionWindowVitals(win, vitals) {
   if (!win?.vitals) return false;
   const meta = sessionMetadataById.get(win.sessionId) || {};
@@ -1721,6 +1829,7 @@ function renderSessionWindowVitals(win, vitals) {
     win.vitals.replaceChildren();
     win.vitals.removeAttribute('title');
     delete win.vitals.dataset.vitSig;
+    if (win.healthSlot) win.healthSlot.replaceChildren();
     return false;
   }
   wireVitalsChipRow(win);
@@ -1729,7 +1838,7 @@ function renderSessionWindowVitals(win, vitals) {
   // moved (cache countdown, activity elapsed/quiet), update those chips'
   // text in place — ticking chips carry a `sig` that excludes it.
   const signature = models
-    .map((m) => `${m.id}${m.key === 'cache-ttl' ? (m.text === '✗' ? 'cold' : 'warm') : (m.sig ?? m.text)}${m.tone}${m.elevated ? 1 : 0}`)
+    .map((m) => `${m.id}${m.key === 'cache-ttl' ? (m.text === '✗' ? 'cold' : 'warm') : (m.sig ?? m.text)}${m.tone}${m.elevated ? 1 : 0}`)
     .join('|');
   if (win.vitals.dataset.vitSig === signature) {
     // Every ticking model updates in place by id — cache-ttl, activity,
@@ -1739,17 +1848,19 @@ function renderSessionWindowVitals(win, vitals) {
       for (const chip of win.vitals.querySelectorAll('.vit-chip')) {
         const model = tickingById.get(chip.dataset.chip || '');
         if (!model) continue;
-        chip.textContent = model.text;
+        const txt = chip.querySelector('.vit-txt');
+        if (txt) txt.textContent = model.factText || model.text;
         chip.title = model.explainLines[0] || model.label;
       }
     }
     // The attention chip mirrors its top model's text (elapsed/quiet
     // countdowns tick) — same in-place update, never a rebuild.
-    const attnChip = win.vitals.querySelector('.vit-attn');
+    const attnChip = win.healthSlot?.querySelector('.vit-attn');
     if (attnChip) {
       const attention = vitalsAttentionSummary(models);
-      if (attention && attnChip.textContent !== attention.text) {
-        attnChip.textContent = attention.text;
+      const attnTxt = attnChip.querySelector('.vit-txt');
+      if (attention && attnTxt && attnTxt.textContent !== attention.factText) {
+        attnTxt.textContent = attention.factText;
       }
     }
     return models.some((m) => m.ticking);
@@ -1759,6 +1870,7 @@ function renderSessionWindowVitals(win, vitals) {
   win.vitals.setAttribute('role', 'group');
   win.vitals.setAttribute('aria-label', 'Session vitals — select a symbol for its meaning');
   win.vitals.removeAttribute('title');
+  const healthNodes = [];
   const nodes = [];
   let foldedWhenCollapsed = 0;
   for (const m of models) {
@@ -1770,14 +1882,21 @@ function renderSessionWindowVitals(win, vitals) {
     const elevated = m.key === 'health' || m.elevated;
     if (elevated) chip.dataset.elevated = '1';
     else foldedWhenCollapsed++;
-    chip.textContent = m.text;
+    const factText = m.factText || m.text;
+    if (m.key !== 'health') {
+      const iconMarkup = vitalsIconSvg(m.icon);
+      if (iconMarkup) chip.insertAdjacentHTML('beforeend', iconMarkup);
+      chip.appendChild(vitalsChipTextSpan(factText));
+    }
     chip.title = m.explainLines[0] || m.label;
-    chip.setAttribute('aria-label', m.text ? `${m.label}: ${m.text}` : m.label);
-    nodes.push(chip);
+    chip.setAttribute('aria-label', factText ? `${m.label}: ${factText}` : m.label);
+    if (m.key === 'health') healthNodes.push(chip);
+    else nodes.push(chip);
   }
-  // The compact states' single attention chip, right after the health dot
-  // (next to the status pill in the collapsed one-liner). Hidden while the
-  // header is expanded — the full chips are on screen there.
+  // The compact states' single attention chip rides beside the health dot
+  // on the identity line (next to the status pill in the collapsed
+  // one-liner). Hidden while the header is expanded — the full chips are
+  // on screen there.
   const attention = vitalsAttentionSummary(models);
   if (attention) {
     const attn = document.createElement('button');
@@ -1788,14 +1907,16 @@ function renderSessionWindowVitals(win, vitals) {
     attn.dataset.chip = attention.aggregate ? 'attention' : attention.top.id;
     if (attention.top.severity) attn.dataset.severity = attention.top.severity;
     attn.dataset.elevated = '1';
-    attn.textContent = attention.text;
+    const attnIcon = vitalsIconSvg(attention.top.icon);
+    if (attnIcon) attn.insertAdjacentHTML('beforeend', attnIcon);
+    attn.appendChild(vitalsChipTextSpan(attention.factText));
     attn.title = attention.aggregate
       ? 'Needs attention — show all vitals'
       : (attention.top.explainLines[0] || attention.top.label);
     attn.setAttribute('aria-label', attention.aggregate
-      ? `${attention.top.label}: ${attention.top.text}, plus ${attention.extra} more — show all vitals`
-      : `${attention.top.label}: ${attention.top.text}`);
-    nodes.splice(1, 0, attn);
+      ? `${attention.top.label}: ${attention.top.factText || attention.top.text}, plus ${attention.extra} more — show all vitals`
+      : `${attention.top.label}: ${attention.top.factText || attention.top.text}`);
+    healthNodes.push(attn);
   }
   if (foldedWhenCollapsed > 0) {
     const more = document.createElement('button');
@@ -1808,17 +1929,19 @@ function renderSessionWindowVitals(win, vitals) {
     more.setAttribute('aria-label', `${foldedWhenCollapsed} more vitals — show all`);
     nodes.push(more);
   }
+  if (win.healthSlot) win.healthSlot.replaceChildren(...healthNodes);
+  else nodes.unshift(...healthNodes);
   win.vitals.replaceChildren(...nodes);
   return models.some((m) => m.ticking);
 }
 
-// One delegated listener per window (chips are rebuilt every render).
+// One delegated listener per container (chips are rebuilt every render).
 // Chips are buttons, so the header's collapse-on-click guard already
 // ignores them — stopPropagation only spares the focus/menu side effects.
 function wireVitalsChipRow(win) {
   if (!win?.vitals || win.vitals.dataset.vitWired) return;
   win.vitals.dataset.vitWired = '1';
-  win.vitals.addEventListener('click', (event) => {
+  const onChipClick = (event) => {
     const chip = event.target.closest?.('.vit-chip');
     if (!chip) return;
     event.preventDefault();
@@ -1826,7 +1949,9 @@ function wireVitalsChipRow(win) {
     const id = chip.dataset.chip || '';
     if (id === 'health' || id === 'overflow' || id === 'attention') openVitalsGlossary(win.sessionId, chip);
     else openVitalsExplainer(win.sessionId, id, chip);
-  });
+  };
+  win.vitals.addEventListener('click', onChipClick);
+  win.healthSlot?.addEventListener('click', onChipClick);
 }
 
 // ── Tap-to-explain: popover on fine pointers, bottom sheet on coarse /
@@ -4885,16 +5010,12 @@ function measureSessionWindowGridNaturalHeight() {
   const previousHeight = grid.style.height;
   const previousMaxHeight = grid.style.maxHeight;
   const wasResized = grid.classList.contains('resized');
-  const overlay = grid.querySelector(':scope > .session-relationship-wires');
-  const previousOverlayDisplay = overlay?.style.display || '';
 
   grid.classList.remove('resized');
   grid.style.height = 'auto';
   grid.style.maxHeight = 'none';
-  if (overlay) overlay.style.display = 'none';
   const naturalHeight = grid.scrollHeight;
 
-  if (overlay) overlay.style.display = previousOverlayDisplay;
   grid.style.height = previousHeight;
   grid.style.maxHeight = previousMaxHeight;
   grid.classList.toggle('resized', wasResized);

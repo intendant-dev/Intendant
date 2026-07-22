@@ -2690,7 +2690,7 @@ function scheduleSessionRelationshipRender() {
   if (sessionRelationshipRenderHandle) return;
   sessionRelationshipRenderHandle = requestAnimationFrame(() => {
     sessionRelationshipRenderHandle = 0;
-    renderSessionRelationships();
+    renderSessionLanes();
     // Grid membership / minimize / maximize changes all schedule this
     // pass — piggyback the "Minimize done" pill recount (cheap sweep of
     // sessionWindows) so it stays fresh without per-call-site wiring.
@@ -2698,138 +2698,232 @@ function scheduleSessionRelationshipRender() {
   });
 }
 
-function ensureSessionRelationshipOverlay(grid) {
-  let svg = grid.querySelector(':scope > svg.session-relationship-wires');
-  if (!svg) {
-    svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.classList.add('session-relationship-wires');
-    svg.setAttribute('aria-hidden', 'true');
-    grid.prepend(svg);
-  }
-  return svg;
+// ── Lineage lanes (grid redesign, ratified 2026-07-21) ─────────────────
+// The SVG wire overlay retired for the grid surface: lineage is now
+// STRUCTURAL — each top-level session owns a lane and its descendants
+// nest beneath it with in-flow elbow connectors (CSS pseudo-elements on
+// the kid wrappers), which can never be occluded, clipped, or z-fought.
+// This pass derives the family forest from sessionRelationships (via the
+// per-window parent metadata), reparents window elements into lane DOM
+// only when the structure actually changed, and refreshes the derived
+// chrome (relation badges, lane row classes, focus-family highlight, the
+// legend) on every pass.
+
+function sessionLaneKindClass(sid) {
+  const meta = sessionMetadataById.get(sid) || {};
+  const kind = normalizeSessionRelationshipKind(meta.relationshipKind || '');
+  return kind === 'fork' ? 'k-fork' : kind === 'side' ? 'k-side' : 'k-sub';
 }
 
-function sessionWindowAnchor(rect, side) {
-  switch (side) {
-    case 'left': return { x: rect.left, y: rect.top + rect.height / 2 };
-    case 'right': return { x: rect.right, y: rect.top + rect.height / 2 };
-    case 'bottom': return { x: rect.left + rect.width / 2, y: rect.bottom };
-    case 'top': return { x: rect.left + rect.width / 2, y: rect.top };
-    default: return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+// The family forest over the OPEN windows, in creation (map insertion)
+// order — lane order stays stable as sessions come and go. A child whose
+// parent has no window renders as a lane root (its relation chip still
+// names the parent), and a metadata cycle demotes its members to roots
+// rather than recursing forever.
+function sessionLaneForest() {
+  const roots = [];
+  const childrenByParent = new Map();
+  const parentOf = new Map();
+  for (const sid of sessionWindows.keys()) {
+    parentOf.set(sid, sessionWindowLaneParentId(sid));
   }
+  for (const sid of sessionWindows.keys()) {
+    let parentId = parentOf.get(sid) || '';
+    if (parentId) {
+      const seen = new Set([sid]);
+      let cursor = parentId;
+      while (cursor) {
+        if (seen.has(cursor)) { parentId = ''; break; }
+        seen.add(cursor);
+        cursor = parentOf.get(cursor) || '';
+      }
+    }
+    if (!parentId) {
+      roots.push(sid);
+    } else {
+      const list = childrenByParent.get(parentId) || [];
+      list.push(sid);
+      childrenByParent.set(parentId, list);
+    }
+  }
+  return { roots, childrenByParent };
 }
 
-function sessionWindowRectInGrid(grid, win) {
-  const gridRect = grid.getBoundingClientRect();
-  const rect = win.el.getBoundingClientRect();
-  return {
-    left: rect.left - gridRect.left + grid.scrollLeft,
-    top: rect.top - gridRect.top + grid.scrollTop,
-    right: rect.right - gridRect.left + grid.scrollLeft,
-    bottom: rect.bottom - gridRect.top + grid.scrollTop,
-    width: rect.width,
-    height: rect.height,
+function sessionLaneStructureSignature(roots, childrenByParent) {
+  const parts = [];
+  const describe = (sid, depth) => {
+    parts.push(`${depth}:${sessionLaneKindClass(sid)}:${sid}`);
+    for (const child of childrenByParent.get(sid) || []) describe(child, depth + 1);
   };
+  for (const root of roots) describe(root, 0);
+  return parts.join('|');
 }
 
-function relationshipPath(parentRect, childRect, kind, direction, trunkValue) {
-  if (kind === 'subagent') {
-    const parent = sessionWindowAnchor(parentRect, 'bottom');
-    const child = sessionWindowAnchor(childRect, 'top');
-    const trunkY = trunkValue ?? ((parent.y + child.y) / 2);
-    return `M ${parent.x} ${parent.y} V ${trunkY} H ${child.x} V ${child.y}`;
+// Moving a window element resets its transcript scroller in every engine;
+// the rebuild captures and restores scroll around the reparent so a
+// structural change (new sibling, relationship arriving late) never yanks
+// a reader off their place.
+function reparentSessionLanes(grid, roots, childrenByParent) {
+  const scrollState = new Map();
+  for (const [sid, win] of sessionWindows) {
+    if (!win.log) continue;
+    scrollState.set(sid, {
+      top: win.log.scrollTop,
+      follow: sessionWindowShouldFollowNextOutput(win),
+    });
   }
-  const childIsRight = direction === 'right';
-  const parent = sessionWindowAnchor(parentRect, childIsRight ? 'right' : 'left');
-  const child = sessionWindowAnchor(childRect, childIsRight ? 'left' : 'right');
-  const trunkX = trunkValue ?? ((parent.x + child.x) / 2);
-  return `M ${parent.x} ${parent.y} H ${trunkX} V ${child.y} H ${child.x}`;
+  const buildKids = (children) => {
+    const kids = document.createElement('div');
+    kids.className = 'session-lane-kids';
+    for (const child of children) {
+      const kid = document.createElement('div');
+      kid.className = `session-lane-kid ${sessionLaneKindClass(child)}`;
+      kid.dataset.laneKid = child;
+      const dot = document.createElement('span');
+      dot.className = 'session-lane-kdot';
+      kid.appendChild(dot);
+      const win = sessionWindows.get(child);
+      if (win) kid.appendChild(win.el);
+      const grandchildren = childrenByParent.get(child) || [];
+      if (grandchildren.length) kid.appendChild(buildKids(grandchildren));
+      kids.appendChild(kid);
+    }
+    return kids;
+  };
+  const lanes = [];
+  for (const rootSid of roots) {
+    const win = sessionWindows.get(rootSid);
+    if (!win) continue;
+    const lane = document.createElement('div');
+    lane.className = 'session-lane';
+    lane.dataset.laneRoot = rootSid;
+    lane.appendChild(win.el);
+    const children = childrenByParent.get(rootSid) || [];
+    if (children.length) lane.appendChild(buildKids(children));
+    lanes.push(lane);
+  }
+  grid.replaceChildren(...lanes);
+  for (const [sid, win] of sessionWindows) {
+    const state = scrollState.get(sid);
+    if (!state || !win.log) continue;
+    if (state.follow) scheduleSessionWindowScrollToBottom(win);
+    else win.log.scrollTop = state.top;
+  }
 }
 
-function relationshipEndpointForChild(childRect, kind, direction) {
-  if (kind === 'subagent') return sessionWindowAnchor(childRect, 'top');
-  return sessionWindowAnchor(childRect, direction === 'right' ? 'left' : 'right');
+function updateSessionLaneLegend(grid, roots) {
+  const legend = document.getElementById('session-lane-legend');
+  if (!legend) return;
+  const total = sessionWindows.size;
+  const show = total > 0 && !grid.classList.contains('hidden');
+  legend.classList.toggle('hidden', !show);
+  const count = document.getElementById('session-lane-legend-count');
+  if (!show || !count) return;
+  let running = 0;
+  for (const win of sessionWindows.values()) {
+    if (!win.ended && isAgentActivePhase(normalizeSessionPhase(win.phase || ''))) running += 1;
+  }
+  const lanes = roots.length;
+  count.textContent =
+    `${lanes} ${lanes === 1 ? 'lane' : 'lanes'} · ${total} ${total === 1 ? 'session' : 'sessions'} · ${running} running`;
 }
 
-function renderSessionRelationships() {
+function renderSessionLanes() {
   const grid = document.getElementById('session-window-grid');
   if (!grid) return;
-  const svg = ensureSessionRelationshipOverlay(grid);
-  svg.replaceChildren();
-  const previousDisplay = svg.style.display || '';
-  svg.style.display = 'none';
-  const overlayWidth = Math.max(grid.scrollWidth, grid.clientWidth);
-  const overlayHeight = Math.max(grid.scrollHeight, grid.clientHeight);
-  svg.style.display = previousDisplay;
-  svg.setAttribute('width', overlayWidth);
-  svg.setAttribute('height', overlayHeight);
-  svg.setAttribute('viewBox', `0 0 ${overlayWidth} ${overlayHeight}`);
 
   for (const [sid, win] of sessionWindows) {
     win.el.classList.remove('relationship-parent-highlight', 'relationship-child-highlight');
     updateSessionRelationshipBadges(sid);
+    updateSessionWindowLaneState(sid);
   }
 
   const active = activeSessionRelationshipIds();
   for (const sid of active.parents) sessionWindows.get(sid)?.el.classList.add('relationship-parent-highlight');
   for (const sid of active.children) sessionWindows.get(sid)?.el.classList.add('relationship-child-highlight');
 
-  const rects = new Map();
-  for (const [sid, win] of sessionWindows) {
-    if (win.minimized && win.el.offsetParent === null) continue;
-    rects.set(sid, sessionWindowRectInGrid(grid, win));
+  const { roots, childrenByParent } = sessionLaneForest();
+  const signature = sessionLaneStructureSignature(roots, childrenByParent);
+  if (grid.dataset.laneSig !== signature) {
+    grid.dataset.laneSig = signature;
+    reparentSessionLanes(grid, roots, childrenByParent);
+    // The structure under the cursor may have changed — recompute the
+    // hover-family classes rather than leaving a stale lit set behind.
+    refreshSessionLaneHover();
   }
+  updateSessionLaneLegend(grid, roots);
+}
 
-  const visible = Array.from(sessionRelationships.entries())
-    .filter(([, rel]) => rects.has(rel.parentId) && rects.has(rel.childId));
-  const trunkByGroup = new Map();
-  for (const [, rel] of visible) {
-    const parentRect = rects.get(rel.parentId);
-    const childRect = rects.get(rel.childId);
-    const kind = rel.kind;
-    const direction = kind === 'subagent'
-      ? 'down'
-      : ((childRect.left + childRect.width / 2) >= (parentRect.left + parentRect.width / 2) ? 'right' : 'left');
-    const groupKey = `${rel.parentId}\u001f${kind}\u001f${direction}`;
-    if (kind === 'subagent') {
-      const candidate = Math.min(childRect.top - 14, parentRect.bottom + 22);
-      trunkByGroup.set(groupKey, Math.max(parentRect.bottom + 12, candidate));
-    } else if (direction === 'right') {
-      const candidate = Math.min(childRect.left - 14, parentRect.right + 28);
-      const current = trunkByGroup.get(groupKey);
-      trunkByGroup.set(groupKey, current === undefined ? Math.max(parentRect.right + 12, candidate) : Math.min(current, Math.max(parentRect.right + 12, candidate)));
-    } else {
-      const candidate = Math.max(childRect.right + 14, parentRect.left - 28);
-      const current = trunkByGroup.get(groupKey);
-      trunkByGroup.set(groupKey, current === undefined ? Math.min(parentRect.left - 12, candidate) : Math.max(current, Math.min(parentRect.left - 12, candidate)));
+// ── Hover-family (fold-in from candidate A) ────────────────────────────
+// Hovering any card or row lights its ancestors + descendants and dims
+// unrelated lanes. Pure class flips derived from sessionRelationships /
+// the parent metadata — no layout, no measurement.
+let sessionLaneHoverSid = '';
+
+function sessionFamilyIds(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const family = new Set([sid]);
+  const seen = new Set([sid]);
+  let cursor = sid;
+  while (cursor) {
+    const meta = sessionMetadataById.get(cursor) || {};
+    const parent = String(meta.parentId || '').trim();
+    if (!parent || seen.has(parent)) break;
+    seen.add(parent);
+    if (sessionWindows.has(parent)) family.add(parent);
+    cursor = parent;
+  }
+  const queue = [sid];
+  while (queue.length) {
+    const current = queue.shift();
+    for (const rel of sessionRelationships.values()) {
+      if (rel.parentId !== current) continue;
+      if (family.has(rel.childId) || !sessionWindows.has(rel.childId)) continue;
+      family.add(rel.childId);
+      queue.push(rel.childId);
     }
   }
+  return family;
+}
 
-  for (const [key, rel] of visible) {
-    const parentRect = rects.get(rel.parentId);
-    const childRect = rects.get(rel.childId);
-    const kind = rel.kind;
-    const direction = kind === 'subagent'
-      ? 'down'
-      : ((childRect.left + childRect.width / 2) >= (parentRect.left + parentRect.width / 2) ? 'right' : 'left');
-    const groupKey = `${rel.parentId}\u001f${kind}\u001f${direction}`;
-    const activeClass = active.activeKeys.has(key) ? ' active' : '';
-    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    path.classList.add('session-relationship-wire', kind);
-    if (activeClass) path.classList.add('active');
-    path.setAttribute('d', relationshipPath(parentRect, childRect, kind, direction, trunkByGroup.get(groupKey)));
-    svg.appendChild(path);
-
-    const endpoint = relationshipEndpointForChild(childRect, kind, direction);
-    const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-    dot.classList.add('session-relationship-endpoint', kind);
-    if (activeClass) dot.classList.add('active');
-    dot.setAttribute('cx', endpoint.x);
-    dot.setAttribute('cy', endpoint.y);
-    dot.setAttribute('r', kind === 'side' ? '3.5' : '4');
-    svg.appendChild(dot);
+function applySessionLaneHover(sessionId) {
+  const grid = document.getElementById('session-window-grid');
+  if (!grid) return;
+  const next = String(sessionId || '').trim();
+  if (sessionLaneHoverSid === next) return;
+  sessionLaneHoverSid = next;
+  const family = next ? sessionFamilyIds(next) : null;
+  grid.classList.toggle('family-hover', !!family);
+  for (const [sid, win] of sessionWindows) {
+    const lit = !!family && family.has(sid);
+    win.el.classList.toggle('family-lit', lit);
+    const kid = win.el.parentElement;
+    if (kid?.classList?.contains('session-lane-kid')) kid.classList.toggle('family-lit', lit);
+  }
+  for (const lane of grid.querySelectorAll(':scope > .session-lane')) {
+    lane.classList.toggle(
+      'family-lit-lane',
+      !!family && !!lane.querySelector('.session-window.family-lit')
+    );
   }
 }
+
+function refreshSessionLaneHover() {
+  const sid = sessionLaneHoverSid;
+  sessionLaneHoverSid = '';
+  applySessionLaneHover(sid);
+}
+
+(() => {
+  const grid = document.getElementById('session-window-grid');
+  if (!grid) return;
+  grid.addEventListener('mouseover', (e) => {
+    const winEl = e.target.closest?.('.session-window');
+    applySessionLaneHover(winEl?.dataset?.sessionId || '');
+  });
+  grid.addEventListener('mouseleave', () => applySessionLaneHover(''));
+})();
 
 function sessionWindowExternalActionContext(sessionId) {
   const sid = String(sessionId || '').trim();
