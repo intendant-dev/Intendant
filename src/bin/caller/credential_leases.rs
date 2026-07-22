@@ -58,6 +58,15 @@ pub struct CredentialLease {
     pub use_count: u64,
 }
 
+/// One request-boundary copy of an active lease. The lease id is the
+/// compare-and-swap generation used when a provider rotates OAuth material:
+/// a refresh that raced expiry, revocation, or a replacement grant must not
+/// write its newly minted authority into the successor lease.
+pub(crate) struct LeasedSecretSnapshot {
+    pub(crate) lease_id: String,
+    pub(crate) material: String,
+}
+
 impl CredentialLease {
     /// A lease lives `ttl_ms` past the last renewal while a fueling
     /// session keeps renewing, and — because the offline window extends
@@ -407,6 +416,7 @@ pub fn known_kind(kind: &str) -> bool {
             | "oauth:codex"
             | "oauth:claude-code"
             | "oauth:kimi"
+            | "oauth:openai-chatgpt"
     )
 }
 
@@ -1897,6 +1907,13 @@ fn access_token_material_error(kind: &str, material: &str) -> Option<String> {
         ],
         "oauth:claude-code" => &[("/claudeAiOauth/refreshToken", "a refresh token")],
         "oauth:kimi" => &[("/refresh_token", "a refresh token")],
+        // The native account-level schema is top-level. Accept the Codex
+        // nesting at the lease/import edge too, but never let either shape
+        // smuggle durable refresh authority into access-token mode.
+        "oauth:openai-chatgpt" => &[
+            ("/refresh_token", "a refresh token"),
+            ("/tokens/refresh_token", "a refresh token"),
+        ],
         _ => &[],
     };
     for (pointer, what) in durable {
@@ -2217,18 +2234,67 @@ pub fn status_entries() -> Vec<LeaseStatusEntry> {
 /// The secret for an active lease of `kind`, or None. Bumps the usage
 /// counter (surfaced in lease status for the audit trail).
 pub fn leased_secret(kind: &str) -> Option<String> {
+    leased_secret_snapshot(kind).map(|snapshot| snapshot.material)
+}
+
+/// The secret and stable generation of an active lease. Like
+/// [`leased_secret`], this is a request-boundary use and increments the audit
+/// counter. Native OAuth transports retain the generation only for the
+/// duration of a provider refresh.
+pub(crate) fn leased_secret_snapshot(kind: &str) -> Option<LeasedSecretSnapshot> {
     let now = now_unix_ms();
     let (secret, cleanup) = {
         let mut leases = store().write().expect("lease store poisoned");
         let cleanup = sweep_locked(&mut leases, now, &materialization_root());
         let secret = leases.get_mut(kind).map(|lease| {
             lease.use_count += 1;
-            lease.secret_string()
+            LeasedSecretSnapshot {
+                lease_id: lease.lease_id.clone(),
+                material: lease.secret_string(),
+            }
         });
         (secret, cleanup)
     };
     run_deferred_cleanup(cleanup);
     secret
+}
+
+/// Rotate an OAuth lease's in-memory material iff it is still the exact
+/// grant observed before the provider refresh. Returns `false` when the lease
+/// expired, was revoked, or was replaced while the HTTP request was in
+/// flight. The old buffer is zeroized before release.
+pub(crate) fn rotate_leased_secret_if_current(
+    kind: &str,
+    lease_id: &str,
+    replacement: String,
+) -> Result<bool, String> {
+    if replacement.is_empty() {
+        return Err("refuse empty rotated credential material".to_string());
+    }
+    if replacement.len() > MAX_MATERIAL_BYTES {
+        return Err(format!(
+            "rotated credential material exceeds {MAX_MATERIAL_BYTES} bytes"
+        ));
+    }
+
+    let now = now_unix_ms();
+    let (rotated, cleanup) = {
+        let mut leases = store().write().expect("lease store poisoned");
+        let cleanup = sweep_locked(&mut leases, now, &materialization_root());
+        let rotated = leases
+            .get_mut(kind)
+            .filter(|lease| lease.lease_id == lease_id)
+            .map(|lease| {
+                let replacement = replacement.into_bytes().into_boxed_slice();
+                let mut previous = std::mem::replace(&mut lease.material, replacement);
+                previous.fill(0);
+                true
+            })
+            .unwrap_or(false);
+        (rotated, cleanup)
+    };
+    run_deferred_cleanup(cleanup);
+    Ok(rotated)
 }
 
 /// Lease-first key lookup for the native providers: an active leased
@@ -2920,6 +2986,82 @@ mod tests {
     }
 
     #[test]
+    fn oauth_rotation_is_scoped_to_the_observed_lease_generation() {
+        let _guard = lock();
+        reset();
+        let first = grant(
+            "oauth:openai-chatgpt",
+            "ChatGPT",
+            r#"{"access_token":"old","refresh_token":"refresh-old"}"#,
+            Some("full_credential"),
+            "root",
+            "local",
+            None,
+            None,
+        )
+        .unwrap();
+        let snapshot = leased_secret_snapshot("oauth:openai-chatgpt").unwrap();
+        assert_eq!(snapshot.lease_id, first.lease_id);
+        assert!(rotate_leased_secret_if_current(
+            "oauth:openai-chatgpt",
+            &snapshot.lease_id,
+            "rotated".to_string(),
+        )
+        .unwrap());
+        assert_eq!(
+            leased_secret("oauth:openai-chatgpt").as_deref(),
+            Some("rotated")
+        );
+
+        // A replacement grant is a new generation even when a refresh that
+        // began under the old lease completes later.
+        let second = grant(
+            "oauth:openai-chatgpt",
+            "ChatGPT replacement",
+            "successor",
+            Some("full_credential"),
+            "root",
+            "local",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(second.replaced);
+        assert_ne!(second.lease_id, snapshot.lease_id);
+        assert!(!rotate_leased_secret_if_current(
+            "oauth:openai-chatgpt",
+            &snapshot.lease_id,
+            "stale-refresh-result".to_string(),
+        )
+        .unwrap());
+        assert_eq!(
+            leased_secret("oauth:openai-chatgpt").as_deref(),
+            Some("successor")
+        );
+        reset();
+    }
+
+    #[test]
+    fn dashboard_oauth_catalog_covers_every_shipped_lease_kind() {
+        let dashboard = include_str!("../../../static/app/32-vault-custody.js");
+        for kind in [
+            "oauth:openai-chatgpt",
+            "oauth:codex",
+            "oauth:claude-code",
+            "oauth:kimi",
+        ] {
+            assert!(
+                known_kind(kind),
+                "test catalog contains unknown lease kind {kind}"
+            );
+            assert!(
+                dashboard.contains(&format!("'{kind}'")),
+                "dashboard OAuth provider table is missing {kind}"
+            );
+        }
+    }
+
+    #[test]
     fn regrant_replaces_and_unknown_kinds_are_refused() {
         let _guard = lock();
         reset();
@@ -3388,6 +3530,23 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("refresh token"), "{err}");
+        for material in [
+            r#"{"access_token":"at","refresh_token":"rt"}"#,
+            r#"{"tokens":{"access_token":"at","refresh_token":"rt"}}"#,
+        ] {
+            let err = grant(
+                "oauth:openai-chatgpt",
+                "ChatGPT",
+                material,
+                Some("access_token"),
+                "root",
+                "local",
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(err.contains("refresh token"), "{err}");
+        }
         // A durable API key riding in the codex auth file is refused too.
         let err = grant(
             "oauth:codex",
@@ -3450,6 +3609,14 @@ mod tests {
                 "oauth:kimi",
                 Some("access_token"),
                 r#"{"access_token":"at","refresh_token":""}"#,
+            ),
+            Ok(LeaseMode::OauthAccessToken)
+        );
+        assert_eq!(
+            resolve_mode(
+                "oauth:openai-chatgpt",
+                Some("access_token"),
+                r#"{"access_token":"at","account_id":"account","expires_at_unix_ms":9999999999999}"#,
             ),
             Ok(LeaseMode::OauthAccessToken)
         );

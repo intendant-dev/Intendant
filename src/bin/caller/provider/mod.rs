@@ -260,10 +260,68 @@ fn provider_auth_for(env_name: &'static str, egress_kind: &'static str) -> Optio
     provider_auth_with_project(env_name, Some(egress_kind), &ProjectEnvKeys::none())
 }
 
-/// Per-request OpenAI auth for the selectors that carry no session
-/// project overlay (OpenAI has no egress lane today).
-fn openai_auth() -> Option<ProviderAuth> {
-    provider_auth_with_project("OPENAI_API_KEY", None, &ProjectEnvKeys::none())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAIAuthMode {
+    Auto,
+    ApiKey,
+    ChatGpt,
+}
+
+impl OpenAIAuthMode {
+    fn from_env() -> Result<Self, CallerError> {
+        let raw = env::var("OPENAI_AUTH_MODE").ok();
+        Self::parse(raw.as_deref())
+    }
+
+    fn parse(raw: Option<&str>) -> Result<Self, CallerError> {
+        let normalized = raw.map(|value| value.trim().to_ascii_lowercase());
+        match normalized.as_deref() {
+            None | Some("") | Some("auto") => Ok(Self::Auto),
+            Some("api-key") | Some("api_key") | Some("apikey") => Ok(Self::ApiKey),
+            Some("chatgpt") | Some("oauth") => Ok(Self::ChatGpt),
+            Some(other) => Err(CallerError::Config(format!(
+                "Unknown OPENAI_AUTH_MODE value: '{other}'. Expected 'auto', 'api-key', or 'chatgpt'."
+            ))),
+        }
+    }
+}
+
+/// Resolve the OpenAI transport independently from the provider identity.
+/// Auto preserves the historical billing choice when a key exists, then
+/// falls back to Intendant-owned ChatGPT OAuth. An explicit mode never falls
+/// across to the other billing authority.
+fn openai_auth_with_project(
+    project_keys: &ProjectEnvKeys,
+) -> Result<Option<OpenAIAuth>, CallerError> {
+    let api_key = provider_auth_with_project("OPENAI_API_KEY", None, project_keys);
+    match OpenAIAuthMode::from_env()? {
+        OpenAIAuthMode::Auto => Ok(api_key
+            .map(OpenAIAuth::ApiKey)
+            .or_else(|| crate::openai_chatgpt_auth::available().then_some(OpenAIAuth::ChatGpt))),
+        OpenAIAuthMode::ApiKey => Ok(api_key.map(OpenAIAuth::ApiKey)),
+        OpenAIAuthMode::ChatGpt => {
+            Ok(crate::openai_chatgpt_auth::available().then_some(OpenAIAuth::ChatGpt))
+        }
+    }
+}
+
+/// OpenAI auth for selectors that carry no session project overlay.
+fn openai_auth() -> Result<Option<OpenAIAuth>, CallerError> {
+    openai_auth_with_project(&ProjectEnvKeys::none())
+}
+
+fn missing_openai_auth_error(scope: &str) -> CallerError {
+    let requested = OpenAIAuthMode::from_env().unwrap_or(OpenAIAuthMode::Auto);
+    let detail = match requested {
+        OpenAIAuthMode::ApiKey => "no OPENAI_API_KEY was found",
+        OpenAIAuthMode::ChatGpt => {
+            "ChatGPT OAuth is not signed in; run `intendant auth chatgpt login`"
+        }
+        OpenAIAuthMode::Auto => {
+            "no OPENAI_API_KEY or ChatGPT OAuth login was found; set a key or run `intendant auth chatgpt login`"
+        }
+    };
+    CallerError::Config(format!("{scope} provider=openai but {detail}."))
 }
 
 /// The provider API-key environment variables — the single authoritative
@@ -741,7 +799,7 @@ pub fn select_provider_for_project(
 fn select_provider_with_project_keys(
     project_keys: &ProjectEnvKeys,
 ) -> Result<Box<dyn ChatProvider>, CallerError> {
-    let openai_key = provider_auth_with_project("OPENAI_API_KEY", None, project_keys);
+    let openai_auth = openai_auth_with_project(project_keys)?;
     let anthropic_key = provider_auth_with_project(
         "ANTHROPIC_API_KEY",
         Some(crate::credential_egress::KIND_ANTHROPIC),
@@ -773,7 +831,11 @@ fn select_provider_with_project_keys(
         return Ok(Box::new(GeminiProvider::new(key, model, ctx, max_out)));
     }
 
-    match (openai_key, anthropic_key, preferred.as_deref()) {
+    if preferred.as_deref() == Some("openai") && openai_auth.is_none() {
+        return Err(missing_openai_auth_error("Native"));
+    }
+
+    match (openai_auth, anthropic_key, preferred.as_deref()) {
         // Both available, check PROVIDER preference
         (Some(oai), Some(ant), Some("anthropic")) => {
             let _ = oai;
@@ -818,8 +880,8 @@ fn select_provider_with_project_keys(
     }
 }
 
-/// The daemon is unfueled: no leased credential, no browser relay, no
-/// local key. Name the places that were actually consulted — under a
+/// The daemon is unfueled: no leased credential, no browser relay, no local
+/// API key, and no usable native ChatGPT login. Name the places that were actually consulted — under a
 /// daemon, "your project root" would read as the project a session was
 /// created with, which is only consulted for the whitelisted keys in
 /// [`ProjectEnvKeys`] — and point at the remediations that work without a
@@ -827,8 +889,9 @@ fn select_provider_with_project_keys(
 /// session" is the fix, not editing .env. The opening sentence is stable:
 /// automation greps stderr for it.
 fn unfueled_error_text(project_keys: &ProjectEnvKeys) -> String {
-    let mut text =
-        String::from("No API key found. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY.");
+    let mut text = String::from(
+        "No API key found for the selected provider/auth mode. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY, or sign in with `intendant auth chatgpt login`.",
+    );
     let mut checked: Vec<String> =
         vec!["credential leases and browser relays (none active)".to_string()];
     if let Some(report) = ENV_SEARCH.get() {
@@ -870,7 +933,8 @@ fn unfueled_error_text(project_keys: &ProjectEnvKeys) -> String {
     text.push_str(&format!(" Checked: {}.", checked.join("; ")));
     text.push_str(
         " Fix: Dashboard \u{2192} Settings \u{2192} API Keys (applies immediately, no restart), \
-         add the key to ~/.config/intendant/.env, or grant a credential lease from your vault.",
+         add the key to ~/.config/intendant/.env, sign in with `intendant auth chatgpt login`, \
+         or grant a credential lease from your vault.",
     );
     match crate::credential_leases::expired_lease_note() {
         Some(note) => format!("Unfueled: {note}. {text}"),
@@ -895,7 +959,7 @@ pub fn select_provider_with_overrides(
         .map(|s| s.to_string())
         .or_else(|| env::var("PRESENCE_MODEL").ok());
 
-    let openai_key = openai_auth();
+    let openai_key = openai_auth()?;
     let anthropic_key = provider_auth_for(
         "ANTHROPIC_API_KEY",
         crate::credential_egress::KIND_ANTHROPIC,
@@ -924,9 +988,7 @@ pub fn select_provider_with_overrides(
             Ok(Box::new(AnthropicProvider::new(key, model, ctx, max_out)))
         }
         Some("openai") => {
-            let key = openai_key.ok_or_else(|| {
-                CallerError::Config("Presence provider=openai but no OPENAI_API_KEY found.".into())
-            })?;
+            let key = openai_key.ok_or_else(|| missing_openai_auth_error("Presence"))?;
             let model = model_str.unwrap_or_else(|| "gpt-5.2-codex".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
@@ -972,7 +1034,7 @@ pub fn select_cu_provider(
         .map(String::from)
         .or_else(|| env::var("CU_MODEL").ok());
 
-    let openai_key = openai_auth();
+    let openai_key = openai_auth()?;
     let anthropic_key = provider_auth_for(
         "ANTHROPIC_API_KEY",
         crate::credential_egress::KIND_ANTHROPIC,
@@ -1010,9 +1072,7 @@ pub fn select_cu_provider(
             Ok(Box::new(p))
         }
         Some("openai") => {
-            let key = openai_key.ok_or_else(|| {
-                CallerError::Config("CU provider=openai but no OPENAI_API_KEY found.".into())
-            })?;
+            let key = openai_key.ok_or_else(|| missing_openai_auth_error("CU"))?;
             let model = model_str.unwrap_or_else(|| "gpt-5.4-mini".to_string());
             let display = crate::vision::display_config_for_provider("openai");
             let ctx = resolve_context_window(&model);
@@ -1092,7 +1152,7 @@ pub fn select_presence_provider(
         .map(|s| s.to_string())
         .or_else(|| env::var("PRESENCE_MODEL").ok());
 
-    let openai_key = openai_auth();
+    let openai_key = openai_auth()?;
     let anthropic_key = provider_auth_for(
         "ANTHROPIC_API_KEY",
         crate::credential_egress::KIND_ANTHROPIC,
@@ -1127,9 +1187,7 @@ pub fn select_presence_provider(
             )))
         }
         Some("openai") => {
-            let key = openai_key.ok_or_else(|| {
-                CallerError::Config("Presence provider=openai but no OPENAI_API_KEY found.".into())
-            })?;
+            let key = openai_key.ok_or_else(|| missing_openai_auth_error("Presence"))?;
             let model = model_str.unwrap_or_else(|| "gpt-4.1-mini".to_string());
             let ctx = resolve_context_window(&model);
             let max_out = resolve_max_output_tokens(&model);
@@ -1343,6 +1401,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn openai_auth_mode_is_orthogonal_and_fail_closed() {
+        assert_eq!(OpenAIAuthMode::parse(None).unwrap(), OpenAIAuthMode::Auto);
+        assert_eq!(
+            OpenAIAuthMode::parse(Some(" api-key ")).unwrap(),
+            OpenAIAuthMode::ApiKey
+        );
+        assert_eq!(
+            OpenAIAuthMode::parse(Some("chatgpt")).unwrap(),
+            OpenAIAuthMode::ChatGpt
+        );
+        let error = OpenAIAuthMode::parse(Some("codex-file"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("OPENAI_AUTH_MODE"), "{error}");
+        assert!(error.contains("auto"), "{error}");
+    }
+
+    #[test]
     fn request_key_static_and_egress_shapes() {
         let auth = ProviderAuth::Key("sk-static".to_string());
         assert_eq!(auth.request_key().unwrap(), "sk-static");
@@ -1427,6 +1503,7 @@ mod tests {
         assert!(text.contains("missing"), "{text}");
         assert!(text.contains("Settings"), "{text}");
         assert!(text.contains("~/.config/intendant/.env"), "{text}");
+        assert!(text.contains("auth chatgpt login"), "{text}");
     }
 
     #[test]

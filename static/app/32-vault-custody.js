@@ -1194,6 +1194,11 @@ function vaultSetOauthLeasesEnabled(enabled) {
    browser CORS (Anthropic's currently does; OpenAI's allows any origin). */
 
 const VAULT_OAUTH_PROVIDERS = {
+  'oauth:openai-chatgpt': {
+    tokenUrl: 'https://auth.openai.com/oauth/token',
+    // OpenAI's public Codex OAuth client, used here by Intendant Native.
+    clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+  },
   'oauth:codex': {
     tokenUrl: 'https://auth.openai.com/oauth/token',
     // The Codex CLI's public OAuth client id (a PKCE public client, not a secret).
@@ -1221,6 +1226,9 @@ const VAULT_OAUTH_REFRESH_MARGIN_MS = 10 * 60 * 1000;
 const vaultOauthEndpointOverrides = {}; // validator-only (debug handle)
 
 function vaultOauthRefreshTokenOf(kind, secretJson) {
+  if (kind === 'oauth:openai-chatgpt') {
+    return String(secretJson?.refresh_token || secretJson?.tokens?.refresh_token || '');
+  }
   if (kind === 'oauth:codex') return String(secretJson?.tokens?.refresh_token || '');
   if (kind === 'oauth:claude-code') return String(secretJson?.claudeAiOauth?.refreshToken || '');
   if (kind === 'oauth:kimi') return String(secretJson?.refresh_token || '');
@@ -1232,11 +1240,17 @@ function vaultOauthRefreshTokenOf(kind, secretJson) {
 function vaultOauthExpiryMs(kind, secretJson) {
   if (kind === 'oauth:claude-code') return Number(secretJson?.claudeAiOauth?.expiresAt) || 0;
   if (kind === 'oauth:kimi') return (Number(secretJson?.expires_at) || 0) * 1000;
-  if (kind === 'oauth:codex') {
+  if (kind === 'oauth:openai-chatgpt' && Number(secretJson?.expires_at_unix_ms) > 0) {
+    return Number(secretJson.expires_at_unix_ms);
+  }
+  if (kind === 'oauth:codex' || kind === 'oauth:openai-chatgpt') {
     try {
       // ChatGPT-plan access tokens are JWTs; exp is authoritative and
       // survives page reloads (unlike a refresh-time bookkeeping map).
-      const payload = String(secretJson.tokens.access_token).split('.')[1];
+      const accessToken = kind === 'oauth:codex'
+        ? secretJson?.tokens?.access_token
+        : secretJson?.access_token || secretJson?.tokens?.access_token;
+      const payload = String(accessToken).split('.')[1];
       const claims = JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')));
       return (Number(claims.exp) || 0) * 1000;
     } catch {
@@ -1252,6 +1266,11 @@ function vaultOauthExpiryMs(kind, secretJson) {
    the result before accepting the grant. */
 function vaultOauthAccessMaterial(kind, secretJson) {
   const copy = JSON.parse(JSON.stringify(secretJson));
+  if (kind === 'oauth:openai-chatgpt') {
+    copy.refresh_token = '';
+    if (copy.tokens) copy.tokens.refresh_token = '';
+    if (typeof copy.OPENAI_API_KEY === 'string') copy.OPENAI_API_KEY = null;
+  }
   if (kind === 'oauth:codex') {
     if (copy.tokens) copy.tokens.refresh_token = '';
     if (typeof copy.OPENAI_API_KEY === 'string') copy.OPENAI_API_KEY = null;
@@ -1304,7 +1323,18 @@ async function vaultOauthRefresh(kind, entry) {
   const fresh = await response.json();
   if (!fresh?.access_token) throw new Error('token refresh returned no access token');
   const nowMs = Date.now();
-  if (kind === 'oauth:codex') {
+  if (kind === 'oauth:openai-chatgpt') {
+    secretJson.access_token = String(fresh.access_token);
+    if (fresh.refresh_token) secretJson.refresh_token = String(fresh.refresh_token);
+    if (fresh.expires_in) {
+      secretJson.expires_at_unix_ms = nowMs + Number(fresh.expires_in) * 1000;
+    } else {
+      // Let the JWT exp claim become authoritative instead of retaining a
+      // stale explicit expiry from the previous token.
+      delete secretJson.expires_at_unix_ms;
+    }
+    secretJson.updated_at_unix_ms = nowMs;
+  } else if (kind === 'oauth:codex') {
     secretJson.tokens = secretJson.tokens || {};
     secretJson.tokens.access_token = String(fresh.access_token);
     if (fresh.id_token) secretJson.tokens.id_token = String(fresh.id_token);
@@ -1405,7 +1435,10 @@ function vaultEntryLeaseKind(entry) {
   if (entry.kind === 'api_key' && entry.provider === 'rfc2136-dns') {
     return 'dns:rfc2136';
   }
-  if (entry.kind === 'oauth' && ['codex', 'claude-code', 'kimi'].includes(entry.provider)) {
+  if (
+    entry.kind === 'oauth' &&
+    ['openai-chatgpt', 'codex', 'claude-code', 'kimi'].includes(entry.provider)
+  ) {
     return `oauth:${entry.provider}`;
   }
   return null;
@@ -2692,6 +2725,7 @@ function vaultProviderLabel(provider) {
   if (provider === 'anthropic') return 'Anthropic';
   if (provider === 'openai') return 'OpenAI';
   if (provider === 'gemini') return 'Gemini';
+  if (provider === 'openai-chatgpt') return 'Intendant Native (ChatGPT subscription)';
   if (provider === 'codex') return 'Codex (subscription)';
   if (provider === 'claude-code') return 'Claude Code (subscription)';
   if (provider === 'kimi') return 'Kimi Code (subscription)';
@@ -2906,7 +2940,7 @@ function vaultRenderAddForm(card) {
   const fillProviders = () => {
     providerSelect.innerHTML = '';
     const providers = kindSelect.value === 'oauth'
-      ? ['codex', 'claude-code', 'kimi']
+      ? ['openai-chatgpt', 'codex', 'claude-code', 'kimi']
       : ['anthropic', 'openai', 'gemini', 'cloudflare-dns', 'rfc2136-dns'];
     for (const provider of providers) {
       const option = document.createElement('option');
@@ -2931,7 +2965,7 @@ function vaultRenderAddForm(card) {
   const secretArea = document.createElement('textarea');
   secretArea.className = 'vault-phrase-input';
   secretArea.rows = 4;
-  secretArea.placeholder = 'Paste the agent auth file JSON (Codex: ~/.codex/auth.json · Claude Code: ~/.claude/.credentials.json · Kimi: ~/.kimi-code/credentials/kimi-code.json)';
+  secretArea.placeholder = 'Paste the auth JSON (Intendant Native: <state-root>/auth/openai-chatgpt.json · Codex: ~/.codex/auth.json · Claude Code: ~/.claude/.credentials.json · Kimi: ~/.kimi-code/credentials/kimi-code.json)';
   secretArea.style.display = 'none';
   kindSelect.addEventListener('change', () => {
     fillProviders();
