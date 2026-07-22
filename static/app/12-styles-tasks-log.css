@@ -3250,6 +3250,78 @@ body.context-focus-active {
   color: var(--subtext0);
 }
 
+/* ── Answered-ask record (question panel archive mode) ──
+   The read-only view of a resolved agenda ask: the recorded picks stay
+   highlighted while everything inert reads inert — disabled options keep
+   no hover invitation and unpicked ones recede. */
+.question-archive-banner {
+  width: fit-content;
+  max-width: 100%;
+  margin: 6px 0 10px;
+  padding: 3px 12px;
+  border: 1px solid color-mix(in srgb, var(--green) 40%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--green) 10%, transparent);
+  color: var(--green);
+  font-size: 11px;
+  font-weight: 600;
+}
+/* The recorded plain-text reply (no structured maps) and per-question
+   recorded follow-ups / orphaned preview notes: quoted data, never inputs. */
+.question-archive-plain,
+.question-followup-recorded {
+  margin: 2px 0 8px;
+  padding: 4px 10px;
+  border-left: 2px solid color-mix(in srgb, var(--green) 45%, transparent);
+  color: var(--text);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.question-followup-recorded { color: var(--subtext0); font-size: 11.5px; }
+#question-panel.question-archive .question-option:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+#question-panel.question-archive .question-option:disabled:hover {
+  background: var(--surface0);
+  border-color: var(--surface1);
+}
+#question-panel.question-archive .question-option:disabled.selected {
+  opacity: 1;
+  border-color: var(--blue);
+}
+#question-panel.question-archive .question-option:disabled.selected:hover {
+  background: color-mix(in srgb, var(--blue) 14%, transparent);
+  border-color: var(--blue);
+}
+#question-panel.question-archive .question-free-text:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
+#question-panel.question-archive .question-index-chip { cursor: pointer; }
+/* "✓ picked" chip on the preview card the recorded answer chose. */
+.question-preview-picked {
+  display: inline-block;
+  padding: 1px 10px;
+  border: 1px solid color-mix(in srgb, var(--green) 50%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--green) 14%, transparent);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+}
+/* A recorded note anchored to its preview card. */
+.question-preview-note-recorded {
+  margin: 4px 8px;
+  padding: 3px 8px;
+  border-left: 2px solid color-mix(in srgb, var(--green) 45%, transparent);
+  color: var(--subtext0);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* Input / Follow-up */
 .input-question {
   padding: 4px 0 8px;

@@ -1728,6 +1728,33 @@ html.ui-v2 #question-panel .question-index-chip.answered {
 }
 html.ui-v2 #question-panel .question-progress { color: var(--text-3); font-size: 11px; font-weight: 650; }
 
+/* — answered-ask record (archive mode): the same sky card wearing the
+   green record grammar; inert affordances stay visually inert — */
+html.ui-v2 #question-panel.question-archive .approval-card {
+  border-color: rgba(var(--green-rgb), .26);
+  background: linear-gradient(180deg, rgba(var(--green-rgb), .05), rgba(var(--green-rgb), .01)), var(--surface);
+}
+html.ui-v2 #question-panel .question-archive-banner {
+  border-color: rgba(var(--green-rgb), .32);
+  background: rgba(var(--green-rgb), .1);
+  color: var(--green);
+  font-weight: 650;
+}
+html.ui-v2 #question-panel.question-archive .question-option:disabled:hover {
+  background: var(--bg-1);
+  border-color: var(--line);
+}
+html.ui-v2 #question-panel.question-archive .question-option:disabled.selected,
+html.ui-v2 #question-panel.question-archive .question-option:disabled.selected:hover {
+  border-color: rgba(var(--iris-rgb), .5);
+  background: rgba(var(--iris-rgb), .1);
+}
+html.ui-v2 #question-panel .question-archive-plain,
+html.ui-v2 #question-panel .question-followup-recorded,
+html.ui-v2 #question-panel .question-preview-note-recorded {
+  border-left-color: rgba(var(--green-rgb), .4);
+}
+
 /* — display-request panel: violet grammar — */
 html.ui-v2 #display-request-panel .approval-card {
   border: 1px solid rgba(var(--violet-rgb), .32);
