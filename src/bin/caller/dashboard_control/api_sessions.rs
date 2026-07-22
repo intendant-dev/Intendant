@@ -249,6 +249,7 @@ pub(crate) async fn control_request_frame(
         }
         "api_agenda_list" => api_agenda_list_response(id, &runtime).await,
         "api_agenda_op" => api_agenda_op_response(id, params.as_ref(), &runtime).await,
+        "api_agenda_ref_drift" => api_agenda_ref_drift_response(id, params.as_ref(), &runtime).await,
         "api_agenda_reminder_policy" => {
             api_agenda_reminder_policy_response(id, params.as_ref(), &runtime).await
         }
@@ -1293,6 +1294,26 @@ pub(crate) async fn api_agenda_list_response(
         id,
         crate::web_gateway::agenda_list_api_response(runtime.mcp_server.as_ref()).await,
         "agenda list",
+    )
+}
+
+/// Tunnel twin of `GET /api/agenda/items/{item_id}/refs/drift` — the item
+/// id rides `params.item_id`; reuses the transport-neutral core.
+pub(crate) async fn api_agenda_ref_drift_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let item_id = params
+        .and_then(|p| p.get("item_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    frame_api_response(
+        id,
+        crate::web_gateway::agenda_ref_drift_api_response(&item_id, runtime.mcp_server.as_ref())
+            .await,
+        "agenda ref drift",
     )
 }
 
