@@ -6,6 +6,28 @@ use super::*;
 
 // --- OpenAI (Responses API) ---
 
+const OPENAI_RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
+pub(crate) const CHATGPT_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+const INTENDANT_USER_AGENT: &str = concat!("intendant/", env!("CARGO_PKG_VERSION"));
+
+#[derive(Clone)]
+pub(crate) enum OpenAIAuth {
+    ApiKey(ProviderAuth),
+    ChatGpt,
+}
+
+impl From<ProviderAuth> for OpenAIAuth {
+    fn from(auth: ProviderAuth) -> Self {
+        Self::ApiKey(auth)
+    }
+}
+
+impl From<String> for OpenAIAuth {
+    fn from(api_key: String) -> Self {
+        Self::ApiKey(ProviderAuth::Key(api_key))
+    }
+}
+
 #[derive(Serialize)]
 pub(crate) struct OpenAIResponsesRequest {
     model: String,
@@ -22,6 +44,26 @@ pub(crate) struct OpenAIResponsesRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+}
+
+/// Fields required by the ChatGPT Codex Responses transport but not by the
+/// metered platform API. Keeping a distinct wire wrapper makes the old API-key
+/// serialization byte-for-byte stable.
+#[derive(Serialize)]
+struct OpenAIChatGptResponsesRequest {
+    #[serde(flatten)]
+    base: OpenAIResponsesRequest,
+    tool_choice: &'static str,
+    parallel_tool_calls: bool,
+    store: bool,
+    include: Vec<&'static str>,
+    prompt_cache_key: String,
+}
+
+#[derive(Clone, Copy)]
+enum OpenAIWireAuth<'a> {
+    ApiKey(&'a str),
+    ChatGpt(&'a crate::openai_chatgpt_auth::ChatGptRequestAuth),
 }
 
 #[derive(Serialize, Clone)]
@@ -221,7 +263,7 @@ impl ResponsesUsage {
 
 pub struct OpenAIProvider {
     client: Client,
-    auth: ProviderAuth,
+    auth: OpenAIAuth,
     model: String,
     context_window: u64,
     max_output_tokens: u64,
@@ -233,11 +275,15 @@ pub struct OpenAIProvider {
     pub cu_enabled: bool,
     /// Display dimensions for CU (width, height).
     pub cu_display: Option<(u32, u32)>,
+    /// Stable request identities for ChatGPT routing and explicit prompt
+    /// caching. They are transport metadata, not provider conversation ids.
+    request_session_id: String,
+    request_thread_id: String,
 }
 
 impl OpenAIProvider {
     pub fn new(
-        api_key: impl Into<ProviderAuth>,
+        auth: impl Into<OpenAIAuth>,
         model: String,
         context_window: u64,
         max_output_tokens: u64,
@@ -248,7 +294,7 @@ impl OpenAIProvider {
 
         Self {
             client: api_client(),
-            auth: api_key.into(),
+            auth: auth.into(),
             model,
             context_window,
             max_output_tokens,
@@ -258,19 +304,21 @@ impl OpenAIProvider {
             custom_tools: None,
             cu_enabled: false,
             cu_display: None,
+            request_session_id: uuid::Uuid::new_v4().to_string(),
+            request_thread_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
     #[allow(dead_code)]
     pub fn new_plain(
-        api_key: impl Into<ProviderAuth>,
+        auth: impl Into<OpenAIAuth>,
         model: String,
         context_window: u64,
         max_output_tokens: u64,
     ) -> Self {
         Self {
             client: api_client(),
-            auth: api_key.into(),
+            auth: auth.into(),
             model,
             context_window,
             max_output_tokens,
@@ -280,11 +328,13 @@ impl OpenAIProvider {
             custom_tools: None,
             cu_enabled: false,
             cu_display: None,
+            request_session_id: uuid::Uuid::new_v4().to_string(),
+            request_thread_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
     pub fn new_with_tools(
-        api_key: impl Into<ProviderAuth>,
+        auth: impl Into<OpenAIAuth>,
         model: String,
         context_window: u64,
         max_output_tokens: u64,
@@ -292,7 +342,7 @@ impl OpenAIProvider {
     ) -> Self {
         Self {
             client: api_client(),
-            auth: api_key.into(),
+            auth: auth.into(),
             model,
             context_window,
             max_output_tokens,
@@ -302,6 +352,106 @@ impl OpenAIProvider {
             custom_tools: Some(tools),
             cu_enabled: false,
             cu_display: None,
+            request_session_id: uuid::Uuid::new_v4().to_string(),
+            request_thread_id: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
+    fn is_chatgpt_transport(&self) -> bool {
+        matches!(self.auth, OpenAIAuth::ChatGpt)
+    }
+
+    fn request_builder(
+        &self,
+        prepared: &PreparedRequest,
+        auth: OpenAIWireAuth<'_>,
+        streaming: bool,
+    ) -> reqwest::RequestBuilder {
+        let builder = match auth {
+            OpenAIWireAuth::ApiKey(api_key) => self
+                .client
+                .post(OPENAI_RESPONSES_URL)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("content-type", "application/json"),
+            OpenAIWireAuth::ChatGpt(auth) => self
+                .client
+                .post(CHATGPT_RESPONSES_URL)
+                .bearer_auth(&auth.access_token)
+                .header("ChatGPT-Account-Id", &auth.account_id)
+                .header("originator", "intendant")
+                .header("User-Agent", INTENDANT_USER_AGENT)
+                .header("session-id", &self.request_session_id)
+                .header("thread-id", &self.request_thread_id)
+                .header("x-client-request-id", &self.request_thread_id)
+                .header("accept", "text/event-stream")
+                .header("content-type", "application/json"),
+        };
+        let builder = if streaming {
+            builder.timeout(STREAM_TIMEOUT)
+        } else {
+            builder
+        };
+        builder.body(prepared.body.clone())
+    }
+
+    async fn send_prepared(
+        &self,
+        prepared: &PreparedRequest,
+        streaming: bool,
+    ) -> Result<reqwest::Response, CallerError> {
+        match &self.auth {
+            OpenAIAuth::ApiKey(auth) => {
+                let api_key = auth.request_key()?;
+                send_with_retry(
+                    &self.client,
+                    || {
+                        self.request_builder(
+                            prepared,
+                            OpenAIWireAuth::ApiKey(api_key.as_ref()),
+                            streaming,
+                        )
+                    },
+                    MAX_RETRIES,
+                )
+                .await
+            }
+            OpenAIAuth::ChatGpt => {
+                let auth = crate::openai_chatgpt_auth::request_auth().await?;
+                let response = send_with_retry(
+                    &self.client,
+                    || {
+                        self.request_builder(
+                            prepared,
+                            OpenAIWireAuth::ChatGpt(&auth),
+                            /*streaming*/ true,
+                        )
+                    },
+                    MAX_RETRIES,
+                )
+                .await?;
+                if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+                    return Ok(response);
+                }
+
+                // Match the native Codex recovery shape: a 401 gets one
+                // forced refresh and one replay. Access-token-only custody
+                // leases fail closed here and ask the custodian to reconnect.
+                let refreshed =
+                    crate::openai_chatgpt_auth::request_auth_after_unauthorized(&auth.access_token)
+                        .await?;
+                send_with_retry(
+                    &self.client,
+                    || {
+                        self.request_builder(
+                            prepared,
+                            OpenAIWireAuth::ChatGpt(&refreshed),
+                            /*streaming*/ true,
+                        )
+                    },
+                    MAX_RETRIES,
+                )
+                .await
+            }
         }
     }
 }
@@ -316,21 +466,55 @@ impl ChatProvider for OpenAIProvider {
         messages: &[Message],
         stream: bool,
     ) -> Result<PreparedRequest, CallerError> {
-        let (instructions, input, text, tools) = build_openai_request_parts(messages, self);
+        let (instructions, mut input, text, tools) = build_openai_request_parts(messages, self);
+        let chatgpt = self.is_chatgpt_transport();
+        if chatgpt {
+            // ChatGPT requests are explicitly `store:false`; provider-issued
+            // response item ids therefore are not durable references. Keep
+            // call_id and encrypted reasoning content, but clear top-level
+            // item ids exactly as Codex does before echo-back.
+            for item in &mut input {
+                if let Some(object) = item.as_object_mut() {
+                    object.remove("id");
+                }
+            }
+        }
+        let parallel_tool_calls = tools.as_ref().is_some_and(|tools| !tools.is_empty());
         let request = OpenAIResponsesRequest {
             model: self.model.clone(),
             input,
             instructions,
-            max_output_tokens: Some(self.max_output_tokens),
+            // The ChatGPT Codex endpoint chooses the model's subscription
+            // ceiling; sending the metered API cap changes model behavior.
+            max_output_tokens: (!chatgpt).then_some(self.max_output_tokens),
             reasoning: self.reasoning.clone(),
             text,
             tools,
-            stream,
+            // The ChatGPT Codex Responses service is an SSE transport.
+            stream: stream || chatgpt,
         };
-        Ok(PreparedRequest::new(
-            "openai.responses.request.v1",
-            serde_json::to_vec(&request).map_err(CallerError::Json)?,
-        ))
+        let (format, body) = if chatgpt {
+            let request = OpenAIChatGptResponsesRequest {
+                base: request,
+                tool_choice: "auto",
+                parallel_tool_calls,
+                store: false,
+                include: vec!["reasoning.encrypted_content"],
+                // Codex scopes prompt caching to the session while the
+                // x-client-request-id follows the thread id.
+                prompt_cache_key: self.request_session_id.clone(),
+            };
+            (
+                "openai.chatgpt.responses.request.v1",
+                serde_json::to_vec(&request).map_err(CallerError::Json)?,
+            )
+        } else {
+            (
+                "openai.responses.request.v1",
+                serde_json::to_vec(&request).map_err(CallerError::Json)?,
+            )
+        };
+        Ok(PreparedRequest::new(format, body))
     }
 
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
@@ -338,21 +522,13 @@ impl ChatProvider for OpenAIProvider {
         // longer than 1024 tokens. No explicit API changes are needed — caching
         // is applied server-side and reported via usage.prompt_tokens_details.
         let prepared = self.prepare_request(messages, false)?;
-        let client = &self.client;
-        let api_key = self.auth.request_key()?;
-        let response = send_with_retry(
-            client,
-            || {
-                client
-                    .post("https://api.openai.com/v1/responses")
-                    .header("Authorization", format!("Bearer {}", api_key))
-                    .header("content-type", "application/json")
-                    // Bytes clone: every attempt reuses the one allocation.
-                    .body(prepared.body.clone())
-            },
-            MAX_RETRIES,
-        )
-        .await?;
+        if self.is_chatgpt_transport() {
+            // Presence/probe callers use `chat()` rather than the streaming
+            // trait method. The subscription endpoint still speaks SSE, so
+            // fold it silently into the same ChatResponse.
+            return self.chat_stream_prepared(&prepared, &|_| {}).await;
+        }
+        let response = self.send_prepared(&prepared, /*streaming*/ false).await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -530,7 +706,12 @@ impl ChatProvider for OpenAIProvider {
     }
 
     fn set_cu_enabled(&mut self, enabled: bool) {
-        self.cu_enabled = enabled;
+        // The ChatGPT Codex Responses service accepts the ordinary function
+        // tool surface, but rejects the platform API's native `computer`
+        // tool. Regular native sessions request CU opportunistically, so
+        // degrade that transport to function tools instead of failing the
+        // entire first model turn.
+        self.cu_enabled = enabled && !self.is_chatgpt_transport();
     }
 
     fn cu_display(&self) -> Option<(u32, u32)> {
@@ -565,26 +746,10 @@ impl ChatProvider for OpenAIProvider {
         prepared: &PreparedRequest,
         on_event: &(dyn Fn(StreamEvent) + Send + Sync),
     ) -> Result<ChatResponse, CallerError> {
-        let client = &self.client;
-        let api_key = self.auth.request_key()?;
-
         // Same retry policy as non-streaming: the status is known before any
         // body bytes stream, so a 429/5xx at request-open retries with
         // backoff instead of killing the session turn.
-        let response = send_with_retry(
-            client,
-            || {
-                client
-                    .post("https://api.openai.com/v1/responses")
-                    .header("Authorization", format!("Bearer {}", api_key))
-                    .header("content-type", "application/json")
-                    .timeout(STREAM_TIMEOUT)
-                    // Bytes clone: every attempt reuses the one allocation.
-                    .body(prepared.body.clone())
-            },
-            MAX_RETRIES,
-        )
-        .await?;
+        let response = self.send_prepared(prepared, /*streaming*/ true).await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1391,6 +1556,48 @@ mod tests {
         assert_eq!(input[0]["type"].as_str(), Some("function_call_output"));
     }
 
+    #[test]
+    fn native_computer_enablement_is_transport_aware() {
+        let tool = crate::tools::escalate_to_agent_tool();
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: "inspect the screen".to_string(),
+            ..Default::default()
+        }];
+
+        let mut api_provider = OpenAIProvider::new_with_tools(
+            "key".to_string(),
+            "gpt-5.4-mini".to_string(),
+            400_000,
+            128_000,
+            vec![tool.clone()],
+        );
+        api_provider.set_cu_enabled(true);
+        assert!(api_provider.cu_enabled());
+        let (_, _, _, api_tools) = build_openai_request_parts(&messages, &api_provider);
+        let api_tools = api_tools.unwrap();
+        assert!(api_tools.iter().any(|entry| entry["type"] == "function"));
+        assert!(api_tools.iter().any(|entry| entry["type"] == "computer"));
+
+        let mut chatgpt_provider = OpenAIProvider::new_with_tools(
+            OpenAIAuth::ChatGpt,
+            "gpt-5.6-sol".to_string(),
+            272_000,
+            128_000,
+            vec![tool],
+        );
+        chatgpt_provider.set_cu_enabled(true);
+        assert!(!chatgpt_provider.cu_enabled());
+        let (_, _, _, chatgpt_tools) = build_openai_request_parts(&messages, &chatgpt_provider);
+        let chatgpt_tools = chatgpt_tools.unwrap();
+        assert!(chatgpt_tools
+            .iter()
+            .any(|entry| entry["type"] == "function"));
+        assert!(!chatgpt_tools
+            .iter()
+            .any(|entry| entry["type"] == "computer"));
+    }
+
     // --- PreparedRequest: one build feeds wire and snapshot ---
 
     #[test]
@@ -1458,6 +1665,80 @@ mod tests {
         // Non-streaming build omits the stream field entirely (serde skip).
         let non_stream = provider.prepare_request(&messages, false).unwrap();
         assert!(non_stream.snapshot_value().unwrap().get("stream").is_none());
+    }
+
+    #[test]
+    fn chatgpt_transport_pins_subscription_wire_shape_and_headers() {
+        let provider = OpenAIProvider::new_plain(
+            OpenAIAuth::ChatGpt,
+            "gpt-5.6-sol".to_string(),
+            1_000_000,
+            128_000,
+        );
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "system instructions".to_string(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: String::new(),
+                tool_calls: Some(Vec::new()),
+                raw_output: Some(vec![serde_json::json!({
+                    "type": "reasoning",
+                    "id": "rs_old",
+                    "encrypted_content": "opaque"
+                })]),
+                ..Default::default()
+            },
+            Message {
+                role: "user".to_string(),
+                content: "continue".to_string(),
+                ..Default::default()
+            },
+        ];
+        // Even a non-streaming caller gets the endpoint's required SSE wire.
+        let prepared = provider.prepare_request(&messages, false).unwrap();
+        assert_eq!(prepared.format, "openai.chatgpt.responses.request.v1");
+        let snapshot = prepared.snapshot_value().unwrap();
+        assert_eq!(snapshot["model"], "gpt-5.6-sol");
+        assert_eq!(snapshot["stream"], true);
+        assert_eq!(snapshot["store"], false);
+        assert_eq!(snapshot["tool_choice"], "auto");
+        assert_eq!(snapshot["parallel_tool_calls"], false);
+        assert_eq!(snapshot["include"][0], "reasoning.encrypted_content");
+        assert!(snapshot.get("max_output_tokens").is_none());
+        assert_eq!(
+            snapshot["prompt_cache_key"],
+            provider.request_session_id.as_str()
+        );
+        assert_eq!(snapshot["input"][0]["encrypted_content"], "opaque");
+        assert!(snapshot["input"][0].get("id").is_none());
+
+        let auth = crate::openai_chatgpt_auth::ChatGptRequestAuth {
+            access_token: "access-fixture".to_string(),
+            account_id: "account-fixture".to_string(),
+        };
+        let request = provider
+            .request_builder(
+                &prepared,
+                OpenAIWireAuth::ChatGpt(&auth),
+                /*streaming*/ true,
+            )
+            .build()
+            .unwrap();
+        assert_eq!(request.url().as_str(), CHATGPT_RESPONSES_URL);
+        assert_eq!(request.headers()["authorization"], "Bearer access-fixture");
+        assert_eq!(request.headers()["chatgpt-account-id"], "account-fixture");
+        assert_eq!(request.headers()["originator"], "intendant");
+        assert_eq!(request.headers()["session-id"], provider.request_session_id);
+        assert_eq!(request.headers()["thread-id"], provider.request_thread_id);
+        assert_eq!(request.headers()["accept"], "text/event-stream");
+        assert_eq!(
+            request.body().and_then(reqwest::Body::as_bytes).unwrap(),
+            prepared.body.as_ref()
+        );
     }
 
     // --- Stream fold (the OpenAI arm of the shared SSE driver) ---

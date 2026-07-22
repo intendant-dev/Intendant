@@ -202,7 +202,7 @@ Full MCP tool groups:
 |------------------------|-------------|--------|
 | `get_status`           | Provider, model, turn, budget %, phase, autonomy, verbosity, tokens. | — |
 | `whoami`               | The caller's own gate-resolved identity, for provenance in memory/agenda writes: supervised callers get their daemon session id, backend harness (`claude-code`/`codex`/`kimi`/`native`) with its harness session id, wrapper aliases (restart/resume rotations of the same conversation), project root, and log dir; unsupervised callers get `supervised:false` plus their principal id. Claims a session only when the call authenticated with that session's token — never from request fields. Also `intendant ctl whoami`. | — |
-| `get_logs`             | Log entries, cursor-paginated, level-filterable. | `since_id?`, `level_filter?`, `limit?` |
+| `get_logs`             | Log entries, cursor-paginated and level-filterable. Without `session_id`, HTTP/ctl reads the daemon's currently observed session. | `session_id?`, `since_id?`, `level_filter?`, `limit?` |
 | `get_pending_approval` | The current pending approval request (or null). | — |
 | `get_pending_input`    | The current pending `askHuman` question (or null). | — |
 
@@ -210,10 +210,10 @@ Full MCP tool groups:
 
 | Tool            | Description | Params |
 |-----------------|-------------|--------|
-| `approve`       | Approve a pending command. Agent-session callers may only resolve their own session's approvals. | `id` |
-| `deny`          | Deny and stop. Agent-session callers may only resolve their own session's approvals. | `id` |
-| `skip`          | Skip, continue with the next command. Agent-session callers may only resolve their own session's approvals. | `id` |
-| `approve_all`   | Approve and set autonomy to Full. Denied to agent-session callers (daemon-global autonomy escalation). | `id` |
+| `approve`       | Approve a pending command. Owner surfaces only; HTTP/ctl routes the exact prompt id and owning session through the daemon control plane. | `id` |
+| `deny`          | Deny and stop. Owner surfaces only; HTTP/ctl routes through the daemon control plane. | `id` |
+| `skip`          | Decline this command and let the agent continue. Owner surfaces only; HTTP/ctl routes through the daemon control plane. | `id` |
+| `approve_all`   | Approve and set autonomy to Full. Owner surfaces only (daemon-global autonomy escalation). | `id` |
 | `respond`       | Answer an `askHuman` question. | `text` |
 | `post_session_note` | Post a **display-only note** into the session transcript — rendered live in the dashboard and persisted for replay, never added to any model's context. Optional base64 images are committed to the session upload store and rendered as clickable thumbnails. Caps: 16 KB text, 6 images, 4 MB per image, 8 MB total; raster types only (`image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/bmp`). Session-scoped callers post into their own session by default. | `text`, `images?` (`[{media_type, data, name?}]`), `session_id?`, `source?` |
 | `ask_user`      | Ask the user one **structured question** on the dashboard question rail and **block** until answered or the wait expires. A question requests *input*, never permission: it is never auto-approved and answering it never widens autonomy. 0–4 options; free-text answers are always accepted (zero options = free-text only). Up to 4 **preview cards** render above the options (show, then ask — prototype variants, before/after states): `html` must be one self-contained document, rendered only inside a sandboxed opaque-origin iframe (scripts run; external fetches and daemon APIs do not resolve); `image` is base64 raster (session-note MIME allowlist); `text` renders preformatted. Blob kinds commit to the session upload store and travel as references. Caps: 2 MB/html, 4 MB/image, 4 KB/text, 8 MB total. Returns `{status, answer, answers}` — `answered` carries the choice(s); `timeout`/`dismissed`/`pass` carry best-judgment guidance; shapes with no answerable frontend auto-answer immediately with the same guidance. Session-scoped callers ask as their own session. Also `intendant ctl ask` (whose `--preview-html/-image LABEL=FILE` flags read the files ctl-side, under the caller's own sandbox). | `question`, `options?` (`[{label, description?}]`), `previews?` (`[{label, html \| image+media_type \| text}]`), `header?`, `multi_select?`, `wait_seconds?` (default 300, max 900), `session_id?` |

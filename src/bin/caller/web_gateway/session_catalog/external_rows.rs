@@ -181,6 +181,9 @@ pub(crate) fn merge_intendant_wrapper_into_external_session(
         ("kimi_plan_mode", "kimi_plan_mode"),
         ("kimi_swarm_mode", "kimi_swarm_mode"),
         ("kimi_home", "kimi_home"),
+        ("pi_model", "pi_model"),
+        ("pi_thinking", "pi_thinking"),
+        ("pi_allowed_tools", "pi_allowed_tools"),
     ] {
         if let Some(value) = wrapper_obj.get(wrapper_key) {
             obj.insert(target_key.to_string(), value.clone());

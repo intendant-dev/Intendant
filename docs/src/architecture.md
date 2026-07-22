@@ -46,7 +46,7 @@ $INTENDANT_LOG_DIR/           │             ▼            ▼             ▼
                               │     Memory plane · Agenda · Peer federation (A2A) │
                               │     Cost accounting · Session logging            │
         ┌─────────────────────┴───────────────────────────────────────────────┘
-        ▼ model APIs (OpenAI Responses · Anthropic Messages · Gemini)  ── streaming SSE
+        ▼ model APIs (OpenAI API/ChatGPT Responses · Anthropic Messages · Gemini) ── streaming SSE
 ```
 
 Two facts about this diagram drive everything below:
@@ -85,7 +85,7 @@ The runtime/controller split is a deliberate security boundary:
 
 - **intendant-runtime** executes arbitrary shell commands but runs under
   OS filesystem restrictions (Landlock on Linux, Seatbelt on macOS, restricted
-  tokens on Windows) and **never holds API keys**. At the controller→runtime
+  tokens on Windows) and **never holds provider credentials**. At the controller→runtime
   spawn boundary, the inherited environment is cleared and rebuilt from an
   explicit, case-insensitive allowlist of OS/process essentials and non-secret
   toolchain controls. Runtime control variables are injected individually
@@ -112,19 +112,20 @@ The runtime/controller split is a deliberate security boundary:
   credential-custody migration) is the tracked fix, and the destructive-command
   classifier is best-effort UX on top of these boundaries, not a boundary
   itself.
-- **intendant** (the controller) holds API keys and manages model conversations
+- **intendant** (the controller) holds API keys or OAuth bearer/refresh
+  authority and manages model conversations
   but **never executes user-requested shell commands directly** — it pipes them
   to the runtime subprocess.
 - **intendant-connect** is the hosted rendezvous/account metadata service. It is
   outside the runtime/controller command-execution boundary, holds no daemon
-  API keys, cannot mint daemon-local IAM, and exposes no hosted daemon-control
+  provider credentials, cannot mint daemon-local IAM, and exposes no hosted daemon-control
   session in the default build. It is still trusted for account, route, fleet,
   and availability metadata plus the browser code and installers it serves.
   Malicious served code can lie about or exfiltrate Connect-visible account,
   route, or unlocked vault/fleet state, while a malicious installer can
   compromise what it installs; neither is a path to a hosted control session.
 
-A compromised model conversation therefore cannot read keys out of the
+A compromised model conversation therefore cannot read provider credentials out of the
 controller's memory, and the runtime process cannot exfiltrate data through a
 model API — but as long as keys live in `.env` files, the process split alone
 does not keep an injected command from reading them where the OS layer cannot
@@ -240,11 +241,16 @@ The Direct-Mode loop is the canonical agent loop; the other modes wrap or
 delegate it. Verified against `run_modes.rs`, `agent_loop.rs`, and the provider
 modules:
 
-1. Loads `.env` and selects the provider. OpenAI uses the Responses API
-   (`/v1/responses`), Anthropic the Messages API, Gemini `generateContent`. All
-   three stream via SSE.
+1. Loads `.env` and selects the provider independently from its authority.
+   OpenAI API-key auth uses the metered Responses API (`/v1/responses`);
+   Intendant-owned ChatGPT OAuth uses the ChatGPT Codex Responses service.
+   Anthropic uses Messages and Gemini `generateContent`. All three provider
+   implementations stream via SSE.
 2. Configures structured output, reasoning controls, native tool calling,
    prompt caching, and max output tokens from model capabilities and env vars.
+   The ChatGPT transport keeps the local budget but omits
+   `max_output_tokens` on the wire so the subscription service applies the
+   model ceiling.
 3. Detects the project root (`git rev-parse --show-toplevel`, falling back to
    cwd).
 4. Resolves the role-appropriate system prompt via a cascade: project root →
@@ -263,7 +269,8 @@ modules:
    `turns/turn_NNN_messages.json` only under
    `INTENDANT_LOG_MESSAGES_JSON=1`, or as a fallback when the provider
    cannot produce a request snapshot.
-9. Sends the task via `chat_stream()` with `max_tokens`/`max_output_tokens`,
+9. Sends the task via `chat_stream()` with `max_tokens`/`max_output_tokens`
+   where the selected wire supports it,
    optional reasoning, optional JSON format, and native tool definitions.
    The exact serialized request is built once per turn and reused for the
    Context snapshot and retries. HTTP establishment retries up to five times
@@ -337,7 +344,9 @@ All three providers stream via `chat_stream()` on the `ChatProvider` trait:
 - **Anthropic**: `stream: true` on Messages; parses `content_block_delta`,
   `content_block_start/stop`, `message_delta`.
 - **OpenAI**: `stream: true` on Responses; parses `response.output_text.delta`,
-  `response.function_call_arguments.delta`, `response.completed`.
+  `response.function_call_arguments.delta`, `response.completed`. The ChatGPT
+  transport is SSE-only, so even callers of the non-streaming trait method
+  fold this stream internally.
 - **Gemini**: `streamGenerateContent?alt=sse`; parses chunked JSON candidates.
 
 Text deltas forward to frontends via `AppEvent::ModelResponseDelta` and
@@ -352,6 +361,10 @@ API requests use `send_with_retry()` with exponential backoff
 (400, 401, …) and timeouts fail immediately. Once an SSE response has begun, a
 separate agent-loop retry covers mid-stream chunk failures (three retries).
 API keys in error messages are masked via `mask_api_keys()`.
+ChatGPT OAuth adds one auth-specific recovery outside that general retry
+policy: a 401 forces one refresh and replays the request once. An
+access-token-only lease cannot refresh and fails closed with reconnection
+guidance instead.
 
 ## Prompt Caching
 
@@ -359,8 +372,11 @@ API keys in error messages are masked via `mask_api_keys()`.
   computer-use beta when needed). An ephemeral breakpoint covers the system
   prefix, and two rolling turn-tail breakpoints preserve continuity with the
   previous request — three of Anthropic's four-breakpoint budget.
-- **OpenAI**: automatic server-side caching for prompts over ~1024 tokens (no API
-  changes).
+- **OpenAI API key**: automatic server-side caching for prompts over ~1024
+  tokens (no API changes).
+- **OpenAI ChatGPT OAuth**: an explicit prompt-cache key remains stable for
+  the provider session, matching the subscription Responses contract; request
+  and thread identifiers travel separately in headers.
 - **Gemini**: implicit context caching (no API changes).
 
 ## Auto-Compaction

@@ -6,7 +6,7 @@
 //! which models subordinate coding-CLI processes that Intendant supervises:
 //!
 //! - `external_agent` = "I spawn a process and give it a task." Master/worker.
-//!   ACP-shaped. Right for Codex / Claude Code / Kimi Code / Aider / goose.
+//!   harness-shaped. Right for Codex / Claude Code / Kimi Code / Pi / Aider / goose.
 //! - `peer`           = "I federate with a peer daemon." Peer/peer.
 //!   A2A-shaped. Right for OpenClaw / Hermes / Letta / another Intendant.
 //!

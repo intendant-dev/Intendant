@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 pub mod claude_code;
 pub mod codex;
 pub mod kimi_code;
+pub mod pi;
 pub(crate) mod protocol_watch;
 pub(crate) mod transcript_text;
 
@@ -255,6 +256,8 @@ const EXTERNAL_CHILD_BASE_ENV: &[&str] = &[
     "CODEX_HOME",
     "CLAUDE_CONFIG_DIR",
     "KIMI_CODE_HOME",
+    "PI_CODING_AGENT_DIR",
+    "PI_PACKAGE_DIR",
 ];
 
 /// True when a controller env var named `name` may be copied onto a
@@ -303,8 +306,8 @@ fn external_child_env_allowed(name: &str, passthrough: &HashSet<String>) -> bool
 ///
 /// Call this BEFORE a spawn site's deliberate `.env()` injections:
 /// explicit sets made after `env_clear()` survive it (the `INTENDANT_*`
-/// bootstrap env, leased `CODEX_HOME`/`CLAUDE_CONFIG_DIR`/`KIMI_CODE_HOME`, the Linux GUI
-/// env, trace roots).
+/// bootstrap env, leased `CODEX_HOME`/`CLAUDE_CONFIG_DIR`/`KIMI_CODE_HOME`/
+/// `PI_CODING_AGENT_DIR`, the Linux GUI env, trace roots).
 pub(super) fn apply_external_child_env_policy(command: &mut tokio::process::Command) {
     let passthrough = intendant_core::env_scrub::env_passthrough_set(
         std::env::var(intendant_core::env_scrub::ENV_PASSTHROUGH_VAR)
@@ -959,6 +962,8 @@ pub enum AgentBackend {
         alias = "kimicode"
     )]
     Kimi,
+    #[serde(rename = "pi", alias = "pi-coding-agent", alias = "pi_coding_agent")]
+    Pi,
 }
 
 impl AgentBackend {
@@ -976,6 +981,7 @@ impl AgentBackend {
                 Some(Self::ClaudeCode)
             }
             "kimi" | "kimi-code" | "kimi_code" | "kimicode" | "kimi code" => Some(Self::Kimi),
+            "pi" | "pi-coding-agent" | "pi_coding_agent" | "pi coding agent" => Some(Self::Pi),
             _ => None,
         }
     }
@@ -989,6 +995,7 @@ impl AgentBackend {
             AgentBackend::Codex => "codex",
             AgentBackend::ClaudeCode => "claude-code",
             AgentBackend::Kimi => "kimi",
+            AgentBackend::Pi => "pi",
         }
     }
 
@@ -1004,6 +1011,7 @@ impl AgentBackend {
             // reports a usable native id.
             AgentBackend::ClaudeCode => thread_id != "claude-code-session",
             AgentBackend::Kimi => true,
+            AgentBackend::Pi => true,
         }
     }
 
@@ -1029,6 +1037,7 @@ impl std::fmt::Display for AgentBackend {
             AgentBackend::Codex => write!(f, "Codex"),
             AgentBackend::ClaudeCode => write!(f, "Claude Code"),
             AgentBackend::Kimi => write!(f, "Kimi"),
+            AgentBackend::Pi => write!(f, "Pi"),
         }
     }
 }
@@ -1038,7 +1047,7 @@ impl std::fmt::Display for AgentBackend {
 /// supervised a session with it. External agents authenticate with their
 /// own accounts, independent of provider fueling — the dashboard pairs
 /// this with the `fueled` flag so an unfueled daemon that can still run
-/// Codex, Claude Code, or Kimi Code doesn't read as dead.
+/// Codex, Claude Code, Kimi Code, or Pi doesn't read as dead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendAvailability {
     pub backend: AgentBackend,
@@ -1104,6 +1113,19 @@ fn kimi_local_login_in(env_kimi_home: Option<std::ffi::OsString>, home: &Path) -
     )
 }
 
+fn pi_local_login(home: &Path) -> Option<bool> {
+    pi_local_login_in(std::env::var_os("PI_CODING_AGENT_DIR"), home)
+}
+
+/// `PI_CODING_AGENT_DIR` injected for hermetic tests.
+fn pi_local_login_in(env_pi_home: Option<std::ffi::OsString>, home: &Path) -> Option<bool> {
+    let pi_home = env_pi_home
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| home.join(".pi").join("agent"));
+    Some(pi_home.join("auth.json").is_file())
+}
+
 /// Probe every supported backend. Stat-based (never executes the CLIs),
 /// so it is cheap enough to answer a dashboard request directly. Reads
 /// the persisted project config only — a runtime `set_codex_command`
@@ -1117,6 +1139,7 @@ pub fn backend_availability(
         AgentBackend::Codex,
         AgentBackend::ClaudeCode,
         AgentBackend::Kimi,
+        AgentBackend::Pi,
     ]
     .into_iter()
     .map(|backend| {
@@ -1124,6 +1147,7 @@ pub fn backend_availability(
             AgentBackend::Codex => agent_config.codex.command.clone(),
             AgentBackend::ClaudeCode => agent_config.claude_code.command.clone(),
             AgentBackend::Kimi => agent_config.kimi.command.clone(),
+            AgentBackend::Pi => agent_config.pi.command.clone(),
         };
         let mut installed = crate::platform::resolve_command_path(&command).is_some();
         if !installed && backend == AgentBackend::Codex {
@@ -1147,6 +1171,7 @@ pub fn backend_availability(
             AgentBackend::Codex => codex_local_login(home),
             AgentBackend::ClaudeCode => claude_code_local_login(home),
             AgentBackend::Kimi => kimi_local_login(home),
+            AgentBackend::Pi => pi_local_login(home),
         };
         let (compatibility_command, compatibility_profile) = match backend {
             AgentBackend::Codex => {
@@ -1160,6 +1185,7 @@ pub fn backend_availability(
             }
             AgentBackend::ClaudeCode => (command.clone(), "default"),
             AgentBackend::Kimi => (command.clone(), "server-v1"),
+            AgentBackend::Pi => (command.clone(), "rpc"),
         };
         let compatibility = protocol_watch::passive_status_in(
             &state_root,
@@ -2440,6 +2466,7 @@ mod tests {
         config.codex.command = "intendant-test-absent-codex".to_string();
         config.claude_code.command = "intendant-test-absent-claude".to_string();
         config.kimi.command = "intendant-test-absent-kimi".to_string();
+        config.pi.command = "intendant-test-absent-pi".to_string();
 
         // One recorded Codex session: its log-dir mtime becomes last_used.
         crate::external_wrapper_index::upsert(
@@ -2453,7 +2480,7 @@ mod tests {
         .unwrap();
 
         let availability = backend_availability(&config, home.path());
-        assert_eq!(availability.len(), 3);
+        assert_eq!(availability.len(), 4);
         assert_eq!(availability[0].backend, AgentBackend::Codex);
         assert!(!availability[0].installed);
         assert!(availability[0].last_used_secs.is_some());
@@ -2463,10 +2490,14 @@ mod tests {
         assert_eq!(availability[2].backend, AgentBackend::Kimi);
         assert!(!availability[2].installed);
         assert_eq!(availability[2].last_used_secs, None);
+        assert_eq!(availability[3].backend, AgentBackend::Pi);
+        assert!(!availability[3].installed);
+        assert_eq!(availability[3].last_used_secs, None);
         // A unit-test process holds no vault leases.
         assert!(!availability[0].leased);
         assert!(!availability[1].leased);
         assert!(!availability[2].leased);
+        assert!(!availability[3].leased);
     }
 
     #[test]
@@ -2477,6 +2508,7 @@ mod tests {
         // unknowable on macOS (keychain) and signed out elsewhere.
         assert_eq!(codex_local_login_in(None, home.path()), Some(false));
         assert_eq!(kimi_local_login_in(None, home.path()), Some(false));
+        assert_eq!(pi_local_login_in(None, home.path()), Some(false));
         if cfg!(target_os = "macos") {
             assert_eq!(claude_code_local_login(home.path()), None);
         } else {
@@ -2493,10 +2525,18 @@ mod tests {
             b"{}",
         )
         .unwrap();
+        std::fs::create_dir_all(home.path().join(".pi/agent")).unwrap();
+        std::fs::write(home.path().join(".pi/agent/auth.json"), b"{}").unwrap();
 
         assert_eq!(codex_local_login_in(None, home.path()), Some(true));
         assert_eq!(claude_code_local_login(home.path()), Some(true));
         assert_eq!(kimi_local_login_in(None, home.path()), Some(true));
+        assert_eq!(pi_local_login_in(None, home.path()), Some(true));
+        assert_eq!(
+            pi_local_login_in(Some(std::ffi::OsString::new()), home.path()),
+            Some(true),
+            "an empty PI_CODING_AGENT_DIR has Pi's upstream default semantics"
+        );
 
         // CODEX_HOME redirects the codex probe wholesale.
         let alt = tempfile::tempdir().unwrap();
@@ -2506,6 +2546,10 @@ mod tests {
         );
         assert_eq!(
             kimi_local_login_in(Some(alt.path().as_os_str().to_os_string()), home.path()),
+            Some(false)
+        );
+        assert_eq!(
+            pi_local_login_in(Some(alt.path().as_os_str().to_os_string()), home.path()),
             Some(false)
         );
     }
@@ -2531,6 +2575,7 @@ mod tests {
         config.codex.managed_command = Some(fork.to_string_lossy().to_string());
         config.claude_code.command = "intendant-test-absent-claude".to_string();
         config.kimi.command = "intendant-test-absent-kimi".to_string();
+        config.pi.command = "intendant-test-absent-pi".to_string();
 
         let availability = backend_availability(&config, home.path());
         assert!(
@@ -2539,6 +2584,7 @@ mod tests {
         );
         assert!(!availability[1].installed);
         assert!(!availability[2].installed);
+        assert!(!availability[3].installed);
     }
 
     #[test]
@@ -2549,13 +2595,14 @@ mod tests {
         config.codex.managed_command = None;
         config.claude_code.command = "intendant-test-absent-claude".to_string();
         config.kimi.command = "intendant-test-absent-kimi".to_string();
+        config.pi.command = "intendant-test-absent-pi".to_string();
         let value = backend_availability_json(&config, home.path());
         let entries = value.as_array().unwrap();
         let ids: Vec<&str> = entries
             .iter()
             .map(|entry| entry.get("id").and_then(|id| id.as_str()).unwrap())
             .collect();
-        assert_eq!(ids, vec!["codex", "claude-code", "kimi"]);
+        assert_eq!(ids, vec!["codex", "claude-code", "kimi", "pi"]);
         for entry in entries {
             assert!(entry
                 .get("installed")
@@ -2642,7 +2689,7 @@ mod tests {
 
     #[test]
     fn from_str_loose_accepts_display_forms() {
-        // The Display impl produces "Codex" / "Claude Code" / "Kimi Code". `from_str_loose`
+        // The Display impl produces "Codex" / "Claude Code" / "Kimi" / "Pi". `from_str_loose`
         // must accept those (lowercased) so TOML files written in the
         // Display form by earlier code don't break startup.
         assert_eq!(
@@ -2653,6 +2700,7 @@ mod tests {
             AgentBackend::from_str_loose("Kimi"),
             Some(AgentBackend::Kimi)
         );
+        assert_eq!(AgentBackend::from_str_loose("Pi"), Some(AgentBackend::Pi));
     }
 
     #[test]
@@ -2662,11 +2710,13 @@ mod tests {
         assert_eq!(AgentBackend::Codex.as_short_str(), "codex");
         assert_eq!(AgentBackend::ClaudeCode.as_short_str(), "claude-code");
         assert_eq!(AgentBackend::Kimi.as_short_str(), "kimi");
+        assert_eq!(AgentBackend::Pi.as_short_str(), "pi");
         // And from_str_loose must round-trip every as_short_str output.
         for v in [
             AgentBackend::Codex,
             AgentBackend::ClaudeCode,
             AgentBackend::Kimi,
+            AgentBackend::Pi,
         ] {
             assert_eq!(AgentBackend::from_str_loose(v.as_short_str()), Some(v));
         }
@@ -2678,6 +2728,7 @@ mod tests {
         assert!(!AgentBackend::ClaudeCode.thread_id_is_canonical("claude-code-session"));
         assert!(AgentBackend::ClaudeCode.thread_id_is_canonical("real-claude-session"));
         assert!(AgentBackend::Kimi.thread_id_is_canonical("019-kimi-session"));
+        assert!(AgentBackend::Pi.thread_id_is_canonical("pi-session"));
         assert!(!source_session_id_is_canonical("unknown", "abc"));
         assert!(source_session_id_is_canonical("codex", "019abc"));
     }
@@ -2687,6 +2738,7 @@ mod tests {
         assert!(AgentBackend::Codex.supports_user_message_rewind());
         assert!(!AgentBackend::ClaudeCode.supports_user_message_rewind());
         assert!(AgentBackend::Kimi.supports_user_message_rewind());
+        assert!(!AgentBackend::Pi.supports_user_message_rewind());
     }
 
     #[test]
@@ -2694,6 +2746,7 @@ mod tests {
         assert!(AgentBackend::Codex.supports_item_anchor_rewind());
         assert!(!AgentBackend::ClaudeCode.supports_item_anchor_rewind());
         assert!(!AgentBackend::Kimi.supports_item_anchor_rewind());
+        assert!(!AgentBackend::Pi.supports_item_anchor_rewind());
     }
 
     #[test]
@@ -2712,6 +2765,7 @@ mod tests {
         assert_eq!(format!("{}", AgentBackend::Codex), "Codex");
         assert_eq!(format!("{}", AgentBackend::ClaudeCode), "Claude Code");
         assert_eq!(format!("{}", AgentBackend::Kimi), "Kimi");
+        assert_eq!(format!("{}", AgentBackend::Pi), "Pi");
     }
 
     #[test]
@@ -2737,6 +2791,11 @@ mod tests {
         assert_eq!(json, r#""kimi""#);
         let parsed: AgentBackend = serde_json::from_str(r#""kimi-code""#).unwrap();
         assert_eq!(parsed, AgentBackend::Kimi);
+
+        let json = serde_json::to_string(&AgentBackend::Pi).unwrap();
+        assert_eq!(json, r#""pi""#);
+        let parsed: AgentBackend = serde_json::from_str(r#""pi-coding-agent""#).unwrap();
+        assert_eq!(parsed, AgentBackend::Pi);
     }
 
     /// Minimal backend that only implements the required trait methods, so

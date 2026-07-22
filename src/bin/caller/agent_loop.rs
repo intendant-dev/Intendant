@@ -38,6 +38,22 @@ pub(crate) enum LoopExitReason {
     Interrupted,
 }
 
+impl LoopExitReason {
+    /// Session-summary outcome for exits that cannot accept another round.
+    /// Recoverable round boundaries deliberately return `None`: the enclosing
+    /// loop may still receive a follow-up before the session completes.
+    fn terminal_outcome(&self) -> Option<&'static str> {
+        match self {
+            Self::DoneSignal | Self::TaskComplete => None,
+            Self::BudgetExhausted => Some("budget exhausted"),
+            Self::SafetyCapReached => Some("safety cap reached"),
+            Self::Denied => Some("denied"),
+            Self::Error => Some("agent loop error"),
+            Self::Interrupted => Some("interrupted"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LoopStats {
     pub(crate) turns: usize,
@@ -355,9 +371,12 @@ pub(crate) async fn handle_spawn_sub_agent_call(
         "codex" => Some(external_agent::AgentBackend::Codex),
         "claude-code" | "claude_code" => Some(external_agent::AgentBackend::ClaudeCode),
         "kimi" | "kimi-code" | "kimi_code" => Some(external_agent::AgentBackend::Kimi),
+        "pi" | "pi-coding-agent" | "pi_coding_agent" | "pi coding agent" => {
+            Some(external_agent::AgentBackend::Pi)
+        }
         other => {
             return format!(
-                "Error: unknown sub-agent backend `{other}`; use internal, codex, claude-code, or kimi."
+                "Error: unknown sub-agent backend `{other}`; use internal, codex, claude-code, kimi, or pi."
             );
         }
     };
@@ -3523,6 +3542,9 @@ pub(crate) async fn run_round_loop(
         if stats.terminal_outcome.is_some() {
             cumulative_stats.terminal_outcome = stats.terminal_outcome.clone();
         }
+        if cumulative_stats.terminal_outcome.is_none() {
+            cumulative_stats.terminal_outcome = exit_reason.terminal_outcome().map(str::to_string);
+        }
 
         // Sub-agent mode: never wait for follow-up
         if sub_agent_mode.is_some() {
@@ -4171,6 +4193,30 @@ fn budget_tail_index(
     tool_results
         .iter()
         .rposition(|(call_id, _, _)| !handled_call_ids.contains(call_id))
+}
+
+#[cfg(test)]
+mod terminal_outcome {
+    use super::LoopExitReason;
+
+    #[test]
+    fn terminal_exits_never_fall_through_to_completed_summary() {
+        assert_eq!(LoopExitReason::Denied.terminal_outcome(), Some("denied"));
+        assert_eq!(
+            LoopExitReason::BudgetExhausted.terminal_outcome(),
+            Some("budget exhausted")
+        );
+        assert_eq!(
+            LoopExitReason::SafetyCapReached.terminal_outcome(),
+            Some("safety cap reached")
+        );
+        assert_eq!(
+            LoopExitReason::Interrupted.terminal_outcome(),
+            Some("interrupted")
+        );
+        assert_eq!(LoopExitReason::DoneSignal.terminal_outcome(), None);
+        assert_eq!(LoopExitReason::TaskComplete.terminal_outcome(), None);
+    }
 }
 
 #[cfg(test)]

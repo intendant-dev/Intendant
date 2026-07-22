@@ -990,6 +990,60 @@ pub(crate) async fn create_external_agent(
             };
             (agent, config)
         }
+        AgentBackend::Pi => {
+            let cfg = &project.config.agent.pi;
+            let thinking = project::normalize_pi_thinking(cfg.thinking.as_deref());
+            let protocol_watch = external_agent::protocol_watch::ProtocolWatchHandle::new_in(
+                crate::platform::intendant_home(),
+                AgentBackend::Pi,
+                "rpc",
+                &cfg.command,
+            );
+            let launch = external_agent::pi::PiLaunchConfig {
+                model: cfg.model.clone(),
+                thinking: thinking.clone(),
+                allowed_tools: cfg
+                    .allowed_tools
+                    .as_deref()
+                    .map(project::normalize_pi_allowed_tools),
+            };
+            let agent = Box::new(external_agent::pi::PiAgent::new(
+                cfg.command.clone(),
+                launch,
+                web_port,
+            ));
+            let config = AgentConfig {
+                model: cfg.model.clone(),
+                working_dir: project.root.clone(),
+                request_trace_dir: None,
+                request_trace_temporary: false,
+                context_archive: "off".to_string(),
+                approval_policy: "on-request".to_string(),
+                sandbox: String::new(),
+                reasoning_effort: thinking,
+                service_tier: None,
+                web_search: false,
+                network_access: false,
+                writable_roots: Vec::new(),
+                codex_managed_context: false,
+                web_port,
+                mcp_auth_token: mcp_auth_token.clone(),
+                dns_credential_env: crate::credential_leases::configured_dns_credential_child_scrub(
+                ),
+                dns_credential_store,
+                mcp_session_id: mcp_session_id.clone(),
+                resume_session: resume_session.clone(),
+                fork_resume,
+                fork_from_rollout_path: None,
+                fork_cut: None,
+                kimi_fork_rollback_turns: None,
+                kimi_fork_expected_horizon: None,
+                kimi_allowed_tools: None,
+                codex_home: None,
+                protocol_watch,
+            };
+            (agent, config)
+        }
     };
 
     let event_rx = crate::credential_leases::scope_leased_home_for_external_startup(

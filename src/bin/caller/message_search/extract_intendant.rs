@@ -27,7 +27,7 @@
 //!
 //! Wrapper sessions (any `session_identity` event) are skipped entirely:
 //! their `model_response` events mirror messages that are canonical in
-//! the external backend's own log (the Codex/Claude/Kimi extractors' lane) —
+//! the external backend's own log (the Codex/Claude/Kimi/Pi extractors' lane) —
 //! extracting them here would double every wrapped message.
 
 use super::cursor::{for_each_complete_line_from, SourceCursor};

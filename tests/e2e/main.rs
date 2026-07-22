@@ -444,16 +444,23 @@ async fn spawn_daemon_on_rig(
 /// the request binds the root-capable `local_process` default on a fresh,
 /// grant-less HOME.
 async fn ctl(daemon: &DaemonRig, args: &[&str]) -> std::process::Output {
-    let mut cmd = daemon.rig.command();
+    ctl_on_rig(&daemon.rig, daemon.port, args).await
+}
+
+/// [`ctl`] for the few tests that hand-spawn a daemon before wrapping it in
+/// `DaemonRig` (fixed-port approval/display fixtures). Authentication and env
+/// isolation must stay identical to the normal helper.
+async fn ctl_on_rig(rig: &TestRig, port: u16, args: &[&str]) -> std::process::Output {
+    let mut cmd = rig.command();
     cmd.env_remove("INTENDANT_MCP_URL")
         .env_remove("INTENDANT_PORT")
         .env_remove("INTENDANT_SESSION_ID")
         .env_remove("INTENDANT_MANAGED_CONTEXT");
     cmd.arg("ctl")
         .arg("--port")
-        .arg(daemon.port.to_string())
+        .arg(port.to_string())
         .args(args);
-    daemon.rig.run(cmd).await
+    rig.run(cmd).await
 }
 
 /// The loopback admission token a daemon booted against `rig`'s home
@@ -672,6 +679,65 @@ async fn tls_daemon_admits_tokened_cleartext_ctl_round_trip() {
         "agenda write must round-trip over token'd cleartext:\n{}",
         text_of(&listed)
     );
+}
+
+/// The daemon's HTTP/ctl MCP facade has no in-process `TaskLauncher`; new
+/// work must ride `ControlMsg::StartTask` to the session supervisor. This
+/// pins the public CLI seam that previously returned "no task launcher
+/// configured" from an otherwise healthy idle daemon.
+#[tokio::test]
+async fn ctl_task_start_dispatches_a_new_managed_session() {
+    let client = reqwest::Client::new();
+    let script = serde_json::json!({
+        "profiles": [{
+            "steps": [{
+                "content": "ctl task start reached the model",
+                "tool_calls": [{
+                    "name": "signal_done",
+                    "arguments": { "message": "ctl task start complete" }
+                }]
+            }]
+        }]
+    });
+    let daemon = spawn_daemon(&client, &script).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{}/ws?token={}",
+        daemon.port,
+        rig_loopback_token(&daemon.rig, daemon.port)
+    ))
+    .await
+    .expect("connect dashboard websocket");
+
+    let output = ctl(
+        &daemon,
+        &["task", "start", "--task", "exercise ctl task dispatch"],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "ctl task start failed:\n{}",
+        text_of(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ok (new session dispatched)"),
+        "ctl returned a non-dispatch acknowledgment: {stdout}"
+    );
+
+    let started = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(serde_json::Value::as_str) == Some("session_started")
+            && json.get("task").and_then(serde_json::Value::as_str)
+                == Some("exercise ctl task dispatch")
+    })
+    .await
+    .unwrap_or_else(|| panic!("ctl task never started a session:\n{}", daemon.log_tail()));
+    let session_id = started
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("started session id")
+        .to_string();
+
+    complete_and_stop_session(&mut ws, &session_id, || daemon.log_tail()).await;
 }
 
 /// The same-home sibling-token handoff (ratified follow-up to the
@@ -3819,9 +3885,11 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
 /// gated commands with "Approval required in headless mode" even though
 /// the dispatch table routes Approve/Deny/Skip into the session's own
 /// approval registry — and the spawn_sub_agent contract documents children
-/// as having "their own approvals". Pin the whole loop: the approval event
-/// arrives tagged with the session id, an `approve` over /ws releases it,
-/// and the gated command really runs (the seeded marker file disappears).
+/// as having "their own approvals". Pin the whole loop and both owner rails:
+/// the approval event arrives tagged with the session id, `ctl approval
+/// pending` observes the exact prompt, `ctl approval approve` routes it back
+/// to that session's registry, and the gated command really runs (the seeded
+/// marker file disappears).
 #[tokio::test]
 async fn supervised_session_surfaces_approvals_on_the_dashboard() {
     use futures_util::SinkExt;
@@ -3923,17 +3991,39 @@ async fn supervised_session_surfaces_approvals_on_the_dashboard() {
         .and_then(|v| v.as_u64())
         .unwrap_or_else(|| panic!("approval event must carry an id, got {approval}"));
 
-    ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::json!({
-            "action": "approve",
-            "session_id": session_id,
-            "id": approval_id,
-        })
-        .to_string()
-        .into(),
-    ))
-    .await
-    .expect("send approve");
+    let pending = ctl_on_rig(&rig, port, &["approval", "pending", "--json"]).await;
+    assert!(
+        pending.status.success(),
+        "ctl approval pending failed:\n{}",
+        String::from_utf8_lossy(&pending.stderr)
+    );
+    let pending = stdout_json(&pending);
+    assert_eq!(
+        pending.get("id").and_then(serde_json::Value::as_u64),
+        Some(approval_id),
+        "ctl must observe the exact dashboard prompt: {pending}"
+    );
+    assert_eq!(
+        pending
+            .get("command_preview")
+            .and_then(serde_json::Value::as_str),
+        approval.get("command").and_then(serde_json::Value::as_str),
+        "ctl and dashboard must describe the same prompt"
+    );
+
+    let approval_id_arg = approval_id.to_string();
+    let approved = ctl_on_rig(
+        &rig,
+        port,
+        &["approval", "approve", approval_id_arg.as_str()],
+    )
+    .await;
+    assert!(
+        approved.status.success(),
+        "ctl approval approve failed:\n{}\n{}",
+        String::from_utf8_lossy(&approved.stdout),
+        String::from_utf8_lossy(&approved.stderr)
+    );
 
     // The released command really runs: the seeded marker disappears.
     let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
@@ -5043,15 +5133,16 @@ async fn headless_rollback_writes_a_conversation_rewound_cut() {
     use futures_util::SinkExt;
 
     let rig = TestRig::new();
+    let client_attached = rig.home.path().join("rollback-client-attached");
     let script = rig.write_script(&serde_json::json!({
         "profiles": [{
             "steps": [
                 // The boot task starts before any websocket can connect,
                 // and rail events do not replay to late joiners — the
-                // scripted think-time holds the question back until this
-                // test's connection is up.
+                // file barrier holds the question back until this test's
+                // connection is up, without a scheduler-dependent sleep.
                 { "content": "Need input before charting.",
-                  "delay_ms": 8_000,
+                  "wait_for_file": client_attached,
                   "tool_calls": [{ "name": "ask_human",
                                    "arguments": { "nonce": 1, "question": "Which payload?" } }] },
                 { "content": "Round one done, payload chosen.",
@@ -5105,6 +5196,7 @@ async fn headless_rollback_writes_a_conversation_rewound_cut() {
     ))
     .await
     .expect("connect /ws");
+    std::fs::write(&client_attached, b"ready").expect("release mock provider barrier");
 
     let question = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
         json.get("event").and_then(|v| v.as_str()) == Some("user_question")

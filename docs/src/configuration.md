@@ -13,7 +13,8 @@ Intendant is configured through three layers, in increasing specificity:
    [Getting Started](./getting-started.md#cli-flag-reference)).
 
 CLI flags win over env vars where they overlap (`--provider` sets `PROVIDER`,
-`--model` sets `MODEL_NAME`). `intendant.toml` and `.env` are both git-ignored.
+`--openai-auth` sets `OPENAI_AUTH_MODE`, and `--model` sets `MODEL_NAME`).
+`intendant.toml` and `.env` are both git-ignored.
 
 ## Environment variables
 
@@ -28,13 +29,33 @@ see [Getting Started](./getting-started.md#api-keys-env) for the search order).
 | `ANTHROPIC_API_KEY` | `ANTHROPIC` | — | Anthropic key |
 | `GEMINI_API_KEY` | `GEMINI` | — | Google AI (Gemini) key |
 | `PROVIDER` | — | auto-detect | `openai`, `anthropic`, or `gemini` — which provider to use when multiple keys are set |
+| `OPENAI_AUTH_MODE` | — | `auto` | OpenAI authority and wire transport: `auto`, `api-key`, or `chatgpt`. This is orthogonal to `PROVIDER`: use `PROVIDER=openai` to force OpenAI, then this setting to choose metered API-key billing or ChatGPT subscription OAuth |
 | `MODEL_NAME` | — | per-provider | Main model name |
 | `ANTHROPIC_ENDPOINT` | — | `https://api.anthropic.com` | Anthropic API base URL override for self-hosted API-compatible gateways and proxies |
 | `GEMINI_ENDPOINT` | — | `https://generativelanguage.googleapis.com` | Gemini API base URL override for self-hosted API-compatible gateways and proxies |
 
-**Auto-detection** (when `PROVIDER` is unset): if an OpenAI key is present it is
-used first, then Anthropic, then Gemini. Setting `PROVIDER` explicitly forces
-that provider (and errors if its key is missing).
+**Auto-detection** (when `PROVIDER` is unset): OpenAI is available when its
+selected auth mode has authority. In `OPENAI_AUTH_MODE=auto`, an OpenAI API key
+wins to preserve the historical billing choice; with no key, an active
+`oauth:openai-chatgpt` lease or Intendant's local ChatGPT login makes OpenAI
+available. Provider selection then prefers OpenAI, followed by Anthropic and
+Gemini. Setting `PROVIDER` explicitly forces that provider and errors when its
+selected authority is unavailable. An explicit `api-key` or `chatgpt` mode
+never falls across to the other OpenAI billing source.
+
+Native ChatGPT sign-in is managed with `intendant auth chatgpt
+login|status|logout`. It uses OpenAI's device-code flow and a private,
+Intendant-owned store at
+`<INTENDANT_HOME>/auth/openai-chatgpt.json`; it neither reads nor writes
+Codex's `~/.codex/auth.json`. Requests use the ChatGPT Codex Responses service,
+whereas API-key auth keeps using `https://api.openai.com/v1/responses`.
+The mode applies to the native Responses providers used by the main agent,
+text presence, and computer use; OpenAI Realtime and transcription have their
+own credential paths and still require their documented API-key authority.
+Intendant deliberately provides no environment override for the OAuth issuer,
+token endpoints, or subscription Responses endpoint: redirecting bearer and
+refresh tokens through an agent-writable configuration value would turn a
+model setting into a credential-exfiltration seam.
 
 `PROVIDER=mock` selects the keyless scripted provider (no network calls; built
 for the headless `tests/e2e/` suite and demos) and requires
@@ -53,7 +74,7 @@ for the headless `tests/e2e/` suite and demos) and requires
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. On macOS/Linux it also holds `access-certs/`; Windows keeps that store under the OS data directory instead. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`, `~/.kimi-code`), the Windows access-cert store, the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves), and the current macOS durable Memory plane at `~/.intendant/memory-plane` (which does not yet honor `INTENDANT_HOME`). |
+| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, the optional native ChatGPT store (`auth/openai-chatgpt.json`), the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. On macOS/Linux it also holds `access-certs/`; Windows keeps that store under the OS data directory instead. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`, `~/.kimi-code`, `~/.pi/agent`), the Windows access-cert store, the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves), and the current macOS durable Memory plane at `~/.intendant/memory-plane` (which does not yet honor `INTENDANT_HOME`). |
 | `INTENDANT_MEMORY_EPHEMERAL` | unset | Set to `1` to force the owner-plane Memory service to use an in-memory plane. With the variable unset, macOS attempts durable storage at `~/.intendant/memory-plane` and falls back softly to an honestly labeled ephemeral plane if bootstrap fails; Linux and Windows currently use the ephemeral plane. |
 | `INTENDANT_LOOPBACK_TOKEN` | unset | **Client-side only.** Explicit loopback admission token for `intendant ctl` and harnesses, overriding the automatic per-port file discovery (`<state root>/loopback-tokens/<port>.token`). Every daemon boot mints and persists that per-instance token (0600) and refuses tokenless loopback requests to owner-posture surfaces; see the trust-architecture chapter's "Loopback trust vs. the runtime sandbox". The daemon itself never reads this variable — a daemon-side env intake would leak into child processes — and the runtime child-environment allowlist never passes it to model-driven code. |
 
@@ -76,7 +97,11 @@ for the headless `tests/e2e/` suite and demos) and requires
 
 `[model] context_window` / `max_output_tokens` from `intendant.toml` are applied
 into `MODEL_CONTEXT_WINDOW` / `MAX_OUTPUT_TOKENS` only when those env vars are
-not already set, so env/CLI always win.
+not already set, so env/CLI always win. The ChatGPT subscription Responses
+transport intentionally omits `max_output_tokens` from its wire request and
+lets that service apply the subscribed model's ceiling; the value still
+governs Intendant's local budgeting. API-key OpenAI requests continue sending
+the field.
 
 ### Presence and computer-use overrides
 
@@ -297,7 +322,7 @@ Routes coding tasks to an external CLI agent instead of the native loop (see
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `default_backend` | string | unset (use native) | `codex`, `claude-code`, or `kimi` |
+| `default_backend` | string | unset (use native) | `codex`, `claude-code`, `kimi`, or `pi` |
 
 `[agent.codex]`:
 
@@ -356,6 +381,26 @@ beneath a per-session bridge home, so concurrent Kimi sessions do not contend
 for the primary home's server lock and Intendant never edits the user's
 `~/.kimi-code/mcp.json`.
 
+`[agent.pi]`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `command` | string | `pi` | Path or command name for the Pi binary |
+| `model` | string | unset | Pi model pattern or `provider/model` id. Blank inherits Pi's configured profile |
+| `thinking` | string | unset | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; blank/`inherit` leaves the selected model's Pi default in control. Unknown non-empty values are retained for forward compatibility and rejected visibly by Pi if unsupported |
+| `allowed_tools` | array or unset | unset | Exact active Pi tool names at process launch. Unset keeps Pi's profile, `[]` deliberately starts with no tools, and a non-empty array replaces the active set |
+
+All four Pi fields can be pinned per session. An exact model id (optionally
+`provider/model`) and thinking level apply live to an attached session and are
+persisted back into that session's launch overlay; launch-only model patterns,
+command, and tools require restart. Global Settings writes `[agent.pi]`
+directly rather than maintaining a daemon-wide Pi-shaped runtime mirror: new
+sessions load TOML, reattached sessions load it as their base and reapply their
+persisted overlay, while active ones use Pi RPC. Supervision
+disables discovered extensions, loads one private approval extension, preserves
+normal `AGENTS.md`/`CLAUDE.md` context, and uses `$INTENDANT ctl` for platform
+capabilities because upstream Pi has no built-in MCP.
+
 Unknown or empty values for authority-shaped fields such as Codex
 `approval_policy`/`sandbox` and Kimi `permission_mode` are normalized to their
 safe defaults so a config typo cannot silently escalate privileges.
@@ -407,8 +452,9 @@ closed. One controller-edge caveat remains: if startup cannot encode the
 write-grant environment, it currently logs the error, removes the sandbox
 variable, and continues; a Windows ACE-stamping failure instead leaves the
 restricted runtime unable to write. Reads stay open except the credential
-carve-outs (macOS denies `~/.ssh`, `~/.gnupg`, the intendant config home, and
-the `.env` search path at the OS layer; on Linux, Landlock cannot express read
+carve-outs (macOS denies `~/.ssh`, `~/.gnupg`, the intendant config home, the
+`.env` search path, and the native ChatGPT `auth/` store at the OS layer; on
+Linux, Landlock cannot express read
 carve-outs under a broad read grant, so project/config `.env` files remain
 readable — credential custody is the tracked fix).
 
@@ -1105,6 +1151,12 @@ permission_mode = "manual"
 plan_mode = false
 swarm_mode = false
 # allowed_tools = ["AskUserQuestion", "Write"]
+
+[agent.pi]
+command = "pi"
+# model = "openai-codex/gpt-5.6-sol"
+# thinking = "high"
+# allowed_tools = ["read", "grep", "find", "ls", "bash"]
 
 [live_audio]
 enabled = false

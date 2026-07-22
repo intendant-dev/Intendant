@@ -497,7 +497,7 @@ fn build_built_in_tools() -> Vec<ToolDefinition> {
                 },
                 "backend": {
                     "type": "string",
-                    "enum": ["internal", "codex", "claude-code", "kimi"],
+                    "enum": ["internal", "codex", "claude-code", "kimi", "pi"],
                     "description": "Which agent runs the task: the internal native loop (default), or a supervised external coding agent."
                 },
                 "worktree": {

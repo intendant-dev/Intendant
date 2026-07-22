@@ -84,6 +84,7 @@ pub(crate) fn parse_sources(raw: &str) -> Option<Vec<Source>> {
             "codex" => Some(Source::Codex),
             "claude-code" => Some(Source::ClaudeCode),
             "kimi" | "kimi-code" => Some(Source::Kimi),
+            "pi" | "pi-coding-agent" | "pi_coding_agent" | "pi coding agent" => Some(Source::Pi),
             _ => None,
         })
         .collect();
@@ -373,6 +374,7 @@ fn source_of_key(session_key: &str) -> Option<Source> {
         "codex" => Some(Source::Codex),
         "claude-code" => Some(Source::ClaudeCode),
         "kimi" => Some(Source::Kimi),
+        "pi" => Some(Source::Pi),
         _ => None,
     }
 }
@@ -960,6 +962,19 @@ mod tests {
             source_of_key("kimi:session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
             Some(Source::Kimi)
         );
+    }
+
+    #[test]
+    fn pi_source_filter_aliases_use_the_canonical_source() {
+        for alias in [
+            "pi",
+            "pi-coding-agent",
+            "pi_coding_agent",
+            "pi coding agent",
+        ] {
+            assert_eq!(parse_sources(alias), Some(vec![Source::Pi]));
+        }
+        assert_eq!(source_of_key("pi:session-id"), Some(Source::Pi));
     }
 
     #[test]

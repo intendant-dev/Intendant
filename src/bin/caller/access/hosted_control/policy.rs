@@ -352,6 +352,9 @@ pub fn hosted_control_msg_allowed(
             kimi_plan_mode,
             kimi_swarm_mode,
             kimi_allowed_tools,
+            pi_model,
+            pi_thinking,
+            pi_allowed_tools,
             codex_model,
             codex_reasoning_effort,
             codex_sandbox,
@@ -383,6 +386,9 @@ pub fn hosted_control_msg_allowed(
                 && kimi_plan_mode.is_none()
                 && kimi_swarm_mode.is_none()
                 && kimi_allowed_tools.is_none()
+                && pi_model.is_none()
+                && pi_thinking.is_none()
+                && pi_allowed_tools.is_none()
                 && codex_model.is_none()
                 && codex_reasoning_effort.is_none()
                 && codex_sandbox.is_none()
@@ -495,6 +501,9 @@ pub fn hosted_control_msg_allowed(
             kimi_plan_mode,
             kimi_swarm_mode,
             kimi_allowed_tools,
+            pi_model,
+            pi_thinking,
+            pi_allowed_tools,
         } => {
             preset == HostedPreset::Operate
                 && session_is_hosted_eligible(state, session_id)
@@ -518,6 +527,9 @@ pub fn hosted_control_msg_allowed(
                 && kimi_plan_mode.is_none()
                 && kimi_swarm_mode.is_none()
                 && kimi_allowed_tools.is_none()
+                && pi_model.is_none()
+                && pi_thinking.is_none()
+                && pi_allowed_tools.is_none()
         }
         ControlMsg::RequestDisplayInputAuthority { display_id: _ }
         | ControlMsg::ReleaseDisplayInputAuthority { display_id: _ }

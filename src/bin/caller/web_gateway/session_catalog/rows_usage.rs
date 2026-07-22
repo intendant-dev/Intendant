@@ -330,8 +330,8 @@ pub(crate) fn truncate_sessions_preserving_sources_to(
 
     let mut out = Vec::with_capacity(limit);
     let mut seen = HashSet::new();
-    let source_floor = SESSION_SOURCE_FLOOR.min((limit / 5).max(1));
-    for source in ["intendant", "codex", "claude-code", "gemini", "kimi"] {
+    let source_floor = SESSION_SOURCE_FLOOR.min((limit / 6).max(1));
+    for source in ["intendant", "codex", "claude-code", "gemini", "kimi", "pi"] {
         for session in sessions
             .iter()
             .filter(|session| session_source(session) == source)
