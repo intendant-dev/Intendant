@@ -93,7 +93,7 @@ function openSessionConfigModal(sessionOrId) {
   if (title) title.textContent = `${prettyAgentName(source)} launch config`;
   const description = document.getElementById('session-config-description');
   if (description) {
-    description.textContent = 'Save changes for future attaches, or save and immediately restart this external backend with the new binary and mode.';
+    description.textContent = 'Per-session agent settings — model, reasoning effort, permissions, tools, and binary, depending on the agent. Saved settings apply on the next attach or resume; Save & restart applies them now.';
   }
   const sessionInput = document.getElementById('session-config-session');
   if (sessionInput) {
@@ -913,7 +913,7 @@ const SESSION_WINDOW_GENERIC_ACTIONS = [
   { op: 'copy-session-id', label: 'Copy full session ID', title: 'Copy the full session ID' },
   { op: 'rename-session', label: 'Rename session...', title: 'Rename this session' },
   { op: 'delegate-sub-agent', label: 'Delegate...', title: 'Spawn a supervised sub-agent under this session' },
-  { op: 'configure-launch', label: 'Launch config...', title: 'Configure the binary and managed-context mode used on next attach/resume' },
+  { op: 'configure-launch', label: 'Launch config: model, effort, permissions...', title: 'Change this session’s agent settings — model, reasoning effort, permission mode, tools, managed context, or binary (options vary by agent). Saved settings apply on the next attach, resume, or restart.' },
   { op: 'attach-session', label: 'Attach session', title: 'Attach this backend without sending a prompt' },
   { op: 'restart-session', label: 'Restart with saved config', title: 'Stop this backend and resume it with saved launch config' },
   { op: 'stop-session', label: 'Stop session...', title: 'Stop the live backend and remove it from active dashboards', danger: true },
