@@ -1623,9 +1623,27 @@ body.context-focus-active {
   align-self: center;
   margin-right: 6px;
 }
-.vfc-fact[data-tone="ok"] .vfc-text { color: var(--green); }
-.vfc-fact[data-tone="warn"] .vfc-text { color: var(--yellow); }
-.vfc-fact[data-tone="crit"] .vfc-text { color: var(--red); }
+/* The same VITALS_ICON_PATHS monoline stroke set the header chips use —
+   card tokens carry icon + glyph-free fact text, never emoji glyphs. */
+.vfc-fact .vit-icon {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  align-self: center;
+  margin-right: 4px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.85;
+}
+.vfc-fact[data-tone="ok"] .vfc-text,
+.vfc-fact[data-tone="ok"] .vit-icon { color: var(--green); }
+.vfc-fact[data-tone="warn"] .vfc-text,
+.vfc-fact[data-tone="warn"] .vit-icon { color: var(--yellow); }
+.vfc-fact[data-tone="crit"] .vfc-text,
+.vfc-fact[data-tone="crit"] .vit-icon { color: var(--red); }
 .vfc-fact[data-tone="warn"] .vfc-dot { background: var(--yellow); }
 .vfc-fact[data-tone="crit"] .vfc-dot { background: var(--red); }
 /* — The explainer region: the pane's only scroller. */
