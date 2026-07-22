@@ -51,11 +51,14 @@ What happens next is the whole story in four steps:
    that turns it into a control client.
 4. **Fuel and work.** Open the trusted dashboard: it greets you with *"This daemon
    has no fuel yet"* and a **Fuel from your vault** button. Grant a time-boxed
-   API-key lease (or relay provider calls through your browser). API-key leases
-   are memory-only, but this is not a blanket disk guarantee: `.env` is still
-   supported and a full-credential OAuth lease temporarily materializes a
-   private auth home under `<state-root>/leased-auth`
-   (`~/.intendant/leased-auth` by default) until cleanup.
+   API-key lease (or relay provider calls through your browser), configure a
+   local key, or run `intendant auth chatgpt login` for Intendant Native.
+   API-key and native ChatGPT leases are memory-only, but this is not a blanket
+   disk guarantee: `.env` and the optional private native ChatGPT login store
+   are durable, while a full-credential OAuth lease for an external CLI
+   temporarily materializes a private auth home under
+   `<state-root>/leased-auth` (`~/.intendant/leased-auth` by default) until
+   cleanup.
    [Credential Custody](./credential-custody.md) is the
    full story.
    Then send the first task from the composer, watch it in Activity, and dial
@@ -84,8 +87,9 @@ Intendant is a Rust workspace. At minimum you need:
   auto-rebuilds stale browser WASM, see [WASM](#wasm-builds-automatically))
 - **ffmpeg** — display recording and software H.264 encoding
 - Provider **credentials** — an API key in `.env` for at least one of OpenAI,
-  Anthropic, or Gemini, *or* nothing on disk at all: an authorized daemon can run
-  keyless on [vault leases](./credential-custody.md)
+  Anthropic, or Gemini; an Intendant-owned ChatGPT login; or nothing on disk at
+  all, because an authorized daemon can run on
+  [vault leases](./credential-custody.md)
 
 Platform-specific runtime dependencies (display capture, input injection, audio
 routing) are best installed with the setup script for your OS.
@@ -320,6 +324,42 @@ and materializes the `.p8` only for the run. To sign a build by hand instead,
 `INTENDANT_ARTIFACT_DIR` (versioned zip + checksum), and
 `INTENDANT_APP_VERSION` (version override; defaults to `git describe`).
 
+## Native ChatGPT OAuth
+
+Intendant Native can call OpenAI through a ChatGPT subscription without
+delegating the agent loop to Codex and without copying Codex's auth file:
+
+```bash
+intendant auth chatgpt login       # OpenAI device-code sign-in
+intendant auth chatgpt status      # source, masked account, and expiry
+intendant auth chatgpt logout      # best-effort remote revoke + local removal
+
+intendant --provider openai --openai-auth chatgpt "Inspect this repository"
+```
+
+The login belongs to Intendant and lives at
+`<INTENDANT_HOME>/auth/openai-chatgpt.json` (0600 on Unix and owner-private on
+Windows). Intendant does not read or mutate `~/.codex/auth.json`. The store is
+atomically replaced under a cross-process lock when OpenAI rotates tokens; the
+ID token is used only to derive the account identifier and is not persisted.
+`logout` removes the local credential even if the best-effort provider revoke
+fails. This is durable on-box subscription authority, so use a lease instead
+when the box should go dry automatically.
+
+`--openai-auth` (or `OPENAI_AUTH_MODE`) is deliberately separate from
+`--provider`:
+
+- `auto` (default) preserves existing cost behavior: an OpenAI API key wins;
+  otherwise an active native ChatGPT lease or local login is used.
+- `api-key` requires metered `OPENAI_API_KEY` authority.
+- `chatgpt` requires subscription OAuth authority and never falls back to an
+  API key.
+
+The API-key lane uses `api.openai.com/v1/responses`; the ChatGPT lane uses the
+ChatGPT Codex Responses service with the account header, SSE wire shape,
+encrypted reasoning continuity, and a stable session prompt-cache key. The
+runtime subprocess never receives either credential.
+
 ## API keys (.env)
 
 Two ways to give a daemon credentials, by trust posture:
@@ -358,7 +398,8 @@ MODEL_NAME=gpt-5.5         # optional; a provider default is used if omitted
 
 `OPENAI`, `ANTHROPIC`, and `GEMINI` are accepted as aliases for the
 corresponding `*_API_KEY` variables. Provider auto-detection (when `PROVIDER` is
-unset) prefers **OpenAI** when an OpenAI key is present, then Anthropic, then
+unset) prefers **OpenAI** when the selected OpenAI auth mode has authority
+(API key first, then native ChatGPT OAuth in `auto` mode), then Anthropic, then
 Gemini. See [Configuration](./configuration.md) for the full environment
 reference and per-provider default models.
 
@@ -468,6 +509,7 @@ value is missing.
 | Flag | Argument | Description |
 |------|----------|-------------|
 | `--provider` | `<name>` | Force provider: `openai`, `anthropic`, or `gemini` (sets `PROVIDER`) |
+| `--openai-auth` | `<mode>` | Select OpenAI authority/transport: `auto`, `api-key`, or `chatgpt` (sets `OPENAI_AUTH_MODE`; independent of `--provider`) |
 | `--model` | `<name>` | Override the model (sets `MODEL_NAME`) |
 | `--task-file` | `<path>` | Read the initial task from a file instead of argv |
 | `--autonomy` | `<level>` | Autonomy level: `low`, `medium`, `high`, `full` (loose parse; unknown → `medium`) |
@@ -507,6 +549,11 @@ value is missing.
 
 A non-flag token (one that does not start with `-`) is collected into the task
 string; an unknown flag is an error.
+
+Native provider authentication is a keyless administrative subcommand:
+`intendant auth chatgpt login|status|logout`. It is intercepted before project
+and provider initialization, so status, login, and logout work even when the
+daemon has no current model authority.
 
 ## Dashboard access over TLS
 

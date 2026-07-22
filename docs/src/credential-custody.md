@@ -20,8 +20,9 @@
 > explicit `mode: "access_token"`) are now the browser OAuth default.
 > Raw dashboard-control callers must send that mode explicitly; omitted
 > OAuth mode remains the legacy full-credential grant. Reach caveat:
-> OpenAI's and Kimi's token endpoints serve browser origins, so Codex, Pi's
-> `openai-codex` login, and Kimi work out of the box; Anthropic's
+> OpenAI's and Kimi's token endpoints serve browser origins, so Intendant
+> Native, Codex, Pi's `openai-codex` login, and Kimi work out of the box;
+> Anthropic's
 > origin-allowlists browsers away, so
 > Claude Code still needs the full-credential opt-in until that changes.
 > Coverage: `scripts/validate-vault.cjs` exercises vault custody;
@@ -36,9 +37,10 @@
 
 ## The problem
 
-Every Intendant daemon today reads its provider credentials from a plain
-`.env` file (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`) or,
-for the external agents, from their own on-disk auth stores (Codex:
+Durable on-box provider authority can come from a plain `.env` file
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`), Intendant Native's
+optional ChatGPT store (`<state-root>/auth/openai-chatgpt.json`), or, for the
+external agents, their own on-disk auth stores (Codex:
 `auth.json` under `CODEX_HOME`; Claude Code: its credentials file or the
 macOS keychain; Kimi Code: `credentials/kimi-code.json` under
 `KIMI_CODE_HOME`; Pi: `auth.json` under `PI_CODING_AGENT_DIR`, normally
@@ -52,9 +54,9 @@ macOS keychain; Kimi Code: `credentials/kimi-code.json` under
   enrollment, and a key-verified tunnel), and the step that keeps casual
   "spin up a box for the
   afternoon" out of reach.
-- The user's *subscription* identities (ChatGPT plan auth for Codex,
-  ChatGPT plan auth through Pi's `openai-codex` provider, Claude plan auth for
-  Claude Code, Kimi plan auth for Kimi Code — all
+- The user's *subscription* identities (ChatGPT plan auth for Intendant
+  Native, Codex, or Pi's `openai-codex` provider; Claude plan auth for Claude
+  Code; Kimi plan auth for Kimi Code — all
   permitted for programmatic
   use under their current terms) are duplicated onto every machine, with
   no central place to see or withdraw them.
@@ -77,8 +79,9 @@ to every server.
 
 **Contents (v1 tenants).** Provider API keys (Anthropic, OpenAI, Gemini,
 plus voice keys migrating in from today's per-origin `localStorage`), and
-subscription OAuth credential sets for the external agents (Codex,
-Claude Code, Kimi Code, Pi). Each entry carries a kind, a label, provider metadata, and
+subscription OAuth credential sets for Intendant Native and the external
+agents (Codex, Claude Code, Kimi Code, Pi). Each entry carries a kind, a label,
+provider metadata, and
 optional per-daemon scoping rules (below).
 
 Entries may also carry an **unseal policy** (`unseal_policy:
@@ -248,8 +251,10 @@ variant.
 ## Authority transport: credential leases
 
 In the lease path, a daemon **borrows** credentials instead of configuring
-them durably. This is optional: `.env` remains supported, and full-credential
-OAuth leases temporarily materialize private auth files as documented below.
+them durably. This is optional: `.env` and Intendant Native's private local
+ChatGPT store remain supported. Full-credential OAuth leases for external CLIs
+temporarily materialize private auth files as documented below; native
+ChatGPT OAuth leases remain in controller memory.
 
 When an **authorized trusted loopback/direct-mTLS browser session** opens over an
 E2E-verified dashboard channel (the binding the browser verifies and the
@@ -315,17 +320,18 @@ with a distinct "lease expired — reconnect a fueling session" error, and
 the presence layer can push an E2E-encrypted notification (the Web Push
 lane) telling the user which daemon went dry.
 
-Honest boundary on "start failing": the store refuses to serve **new**
-copies the moment a lease lapses (`leased_secret`/`provider_api_key` sweep
-on every call), but a native session constructed while the lease was
-active captured the key into its provider instance and keeps using that
-copy until the session ends — expiry and revocation cannot claw back
-copies already served. Ending the session is the lever that cuts a
-running consumer off today.
+Honest boundary on "start failing": the store refuses to serve **new** copies
+the moment a lease lapses (`leased_secret`/`provider_api_key` sweep on every
+call). Native API-key and ChatGPT transports re-resolve authority at each
+request boundary, so an existing provider instance does not retain a key or
+refresh token after revocation. Expiry still cannot claw back the short-lived
+copy already attached to an in-flight HTTP request; the next request fails
+closed. External CLI processes remain the separately documented weakening
+below.
 
-**The OAuth split (Codex, Claude Code, Kimi Code, Pi).** Subscription OAuth is *better*
-suited to leasing than raw keys, because the protocol already separates
-durable from ephemeral authority:
+**The OAuth split (Intendant Native, Codex, Claude Code, Kimi Code, Pi).**
+Subscription OAuth is *better* suited to leasing than raw keys, because the
+protocol already separates durable from ephemeral authority:
 
 - **Access-token lease (the browser UX default):** the browser keeps the **refresh
   token** in the vault and never leases it. It performs token refresh
@@ -337,15 +343,16 @@ durable from ephemeral authority:
   this path; omitting `mode` on an OAuth grant is the compatibility path
   for a legacy full-credential lease.
   The daemon re-verifies the material is refresh-free before accepting —
-  fail-closed against custodian bugs — and re-materializes on every
-  re-grant; the granting tab's renewal tick re-grants freshly refreshed
-  material whenever the current token nears expiry. The daemon's maximum
+  fail-closed against custodian bugs — and, for external CLIs, re-materializes
+  on every re-grant. Intendant Native consumes its access-token material
+  directly from memory. The granting tab's renewal tick re-grants freshly
+  refreshed material whenever the current token nears expiry. The daemon's maximum
   authority horizon is the provider's own access TTL (typically ≤1h)
   past the last re-grant, no matter what an attacker does. Reach: this
   needs the token endpoint to answer browser CORS. OpenAI's
   (`auth.openai.com`) and Kimi's (`auth.kimi.com`) serve browser origins, so
-  **Codex, Pi's `openai-codex` entry, and Kimi fuel this way out of the
-  box**; Anthropic's
+  **Intendant Native, Codex, Pi's `openai-codex` entry, and Kimi fuel this way
+  out of the box**; Anthropic's
   (`console.anthropic.com`) allowlists origins and refuses others, so
   **Claude Code cannot refresh in the browser today** and stays behind
   the full-credential opt-in (the UI says exactly that).
@@ -355,7 +362,27 @@ durable from ephemeral authority:
   token included) is leased with a TTL we enforce. Honest note in the
   UI: during that window the daemon holds durable authority; revocation
   then depends on our lease discipline (and, worst case, the provider's
-  session-revocation page).
+  session-revocation page). Native ChatGPT refreshes atomically rotate the
+  active in-memory lease only when its lease id still matches; expiry,
+  revocation, or replacement racing the refresh discards the result. There is
+  intentionally no copy in `<state-root>/leased-auth`. The honest remaining
+  edge is reverse synchronization: a full-credential refresh can rotate the
+  provider token inside the live lease, but no daemon→browser secret-return
+  lane writes that rotation back into the originating vault entry. A provider
+  that invalidates the old refresh token can therefore leave that entry stale
+  after the lease ends. Browser-refreshed access-token mode avoids this class
+  and remains the default.
+
+**Native ChatGPT OAuth (no child materialization).** The lease kind is
+`oauth:openai-chatgpt`. Access-token material may use Intendant's top-level
+schema or Codex-compatible `tokens` nesting at the import edge; access-token
+mode rejects refresh tokens in either shape. On each model request the
+controller obtains the current lease, derives the ChatGPT account id and token
+expiry from reviewed claims when necessary, and sends the bearer only from the
+controller. A 401 triggers one forced refresh/replay for a full-credential
+lease; access-token leases instead fail with a request to reconnect fresh
+material. Nothing is written to disk, and `intendant-runtime` never receives
+the credential.
 
 Pi's `auth.json` is a provider-keyed map rather than a single fixed OAuth
 shape. An OAuth entry is `{type:"oauth", access, refresh, expires}`; API-key
@@ -449,7 +476,24 @@ daemon with no local keys and no lease reports "unfueled" in the
 dashboard rather than erroring opaquely — the same graceful state the
 no-API-key path shows today.
 
-## On-box sign-in: the guided ceremonies
+## On-box sign-in
+
+**Intendant Native ChatGPT** (`intendant auth chatgpt
+login|status|logout`) owns a separate OpenAI device-code flow. It deliberately
+does not import or modify Codex's `~/.codex/auth.json`. A successful login
+writes the minimal account-level credential to
+`<state-root>/auth/openai-chatgpt.json`: access token, refresh token, derived
+account id, and expiry (not the ID token). The parent directory is private,
+the file is 0600 on Unix / owner-private on Windows, replacement is atomic,
+and a process plus file lock serializes refresh with login/logout. Symlink,
+reparse-point, non-regular, oversized, and unknown-version stores fail closed.
+The OAuth issuer and token endpoints are fixed reviewed constants rather than
+environment overrides. `logout` attempts provider revocation but removes local
+authority even when that network call fails. This is a deliberate durable
+on-box custody choice; use `oauth:openai-chatgpt` leases when authority should
+expire automatically.
+
+### External-agent guided ceremonies
 
 The deliberate counterpoint to leases: the Vault tab's **Agent
 accounts** section drives each agent CLI's own login ceremony on a

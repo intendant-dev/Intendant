@@ -66,6 +66,7 @@ mod mcp;
 mod mcp_client;
 mod memory;
 mod message_search;
+mod openai_chatgpt_auth;
 mod peer;
 mod peer_file_transfer;
 pub(crate) use intendant_platform::platform;
@@ -266,6 +267,9 @@ struct CliFlags {
     /// --task-file <PATH>: Read the initial task from a file instead of argv.
     task_file: Option<String>,
     provider: Option<String>,
+    /// --openai-auth <MODE>: OpenAI credential/transport selection
+    /// (`auto`, `api-key`, or `chatgpt`).
+    openai_auth: Option<String>,
     model: Option<String>,
     verbose: bool,
     /// --no-tui: accepted for compatibility (the terminal TUI was removed);
@@ -352,6 +356,7 @@ fn print_help() {
     println!();
     println!("OPTIONS:");
     println!("    --provider <NAME>     API provider (openai, anthropic, or gemini)");
+    println!("    --openai-auth <MODE>  OpenAI auth transport (auto, api-key, or chatgpt)");
     println!("    --model <NAME>        Model name to use");
     println!("    --task-file <PATH>    Read initial task from file instead of argv");
     println!("    --autonomy <LEVEL>    Autonomy level: low, medium, high, full");
@@ -409,6 +414,7 @@ fn print_help() {
     println!("    peer                  Pair and configure federated Intendant peers");
     println!("    service               Install, remove, inspect, or run the boot service");
     println!("    setup                 Install or verify host-level Intendant dependencies");
+    println!("    auth                  Manage native provider authentication");
     println!();
     println!("SESSION LOGS:");
     println!("    Default: $INTENDANT_HOME/logs/<uuid>/ when INTENDANT_HOME is non-empty;");
@@ -424,6 +430,7 @@ fn print_help() {
     println!();
     println!("ENVIRONMENT:");
     println!("    OPENAI_API_KEY        OpenAI API key (for openai provider)");
+    println!("    OPENAI_AUTH_MODE      OpenAI auth transport (auto, api-key, or chatgpt)");
     println!("    ANTHROPIC_API_KEY     Anthropic API key (for anthropic provider)");
     println!("    GEMINI_API_KEY        Google AI API key (for gemini provider)");
     println!("    PROVIDER              Default provider (openai, anthropic, or gemini)");
@@ -463,6 +470,7 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
         task: None,
         task_file: None,
         provider: None,
+        openai_auth: None,
         model: None,
         verbose: false,
         no_tui: false,
@@ -515,6 +523,16 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
                 } else {
                     return Err(CallerError::Config(
                         "Missing value for --provider".to_string(),
+                    ));
+                }
+            }
+            "--openai-auth" => {
+                if i + 1 < args.len() {
+                    flags.openai_auth = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    return Err(CallerError::Config(
+                        "Missing value for --openai-auth".to_string(),
                     ));
                 }
             }
@@ -1734,6 +1752,7 @@ Also: {"source": "bare"}"#;
             task: None,
             task_file: None,
             provider: None,
+            openai_auth: None,
             model: None,
             verbose: false,
             no_tui: false,
@@ -1888,6 +1907,27 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
+    fn parse_cli_flags_openai_auth_is_independent_of_provider() {
+        let flags = parse_cli_flags_from(cli(&[
+            "--provider",
+            "openai",
+            "--openai-auth",
+            "chatgpt",
+            "task",
+        ]))
+        .unwrap();
+        assert_eq!(flags.provider.as_deref(), Some("openai"));
+        assert_eq!(flags.openai_auth.as_deref(), Some("chatgpt"));
+        assert_eq!(flags.task.as_deref(), Some("task"));
+
+        let error = match parse_cli_flags_from(cli(&["--openai-auth"])) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("missing --openai-auth value must fail"),
+        };
+        assert!(error.contains("Missing value for --openai-auth"), "{error}");
+    }
+
+    #[test]
     fn parse_cli_flags_resume_takes_id_but_yields_to_flags() {
         // A hex-leading id (UUIDs — the only resume-id mints) is captured…
         let flags =
@@ -1967,6 +2007,7 @@ Also: {"source": "bare"}"#;
             task: None,
             task_file: None,
             provider: None,
+            openai_auth: None,
             model: None,
             verbose: false,
             no_tui: false,
@@ -2023,6 +2064,7 @@ Also: {"source": "bare"}"#;
             task: None,
             task_file: None,
             provider: None,
+            openai_auth: None,
             model: None,
             verbose: false,
             no_tui: false,
@@ -2066,6 +2108,7 @@ Also: {"source": "bare"}"#;
             task: None,
             task_file: None,
             provider: None,
+            openai_auth: None,
             model: None,
             verbose: false,
             no_tui: false,
@@ -3169,6 +3212,20 @@ async fn main() -> Result<(), CallerError> {
         };
     }
 
+    // Intercept `intendant auth chatgpt <action>` before project and
+    // provider initialization. Native ChatGPT OAuth owns its own account
+    // store; this path must remain runnable on an otherwise unfueled daemon.
+    if env::args().nth(1).as_deref() == Some("auth") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        return match openai_chatgpt_auth::run_cli(argv).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+        };
+    }
+
     // Intercept `intendant hosted-verify` — the out-of-band code-transparency
     // check against a rendezvous (docs/src/self-hosted-rendezvous.md). Like
     // `org`, a local path with no project or provider setup: deliberately
@@ -3280,6 +3337,9 @@ async fn main() -> Result<(), CallerError> {
     let flags = parse_cli_flags()?;
     if let Some(ref p) = flags.provider {
         env::set_var("PROVIDER", p);
+    }
+    if let Some(ref mode) = flags.openai_auth {
+        env::set_var("OPENAI_AUTH_MODE", mode);
     }
     if let Some(ref m) = flags.model {
         env::set_var("MODEL_NAME", m);
