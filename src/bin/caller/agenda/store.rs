@@ -6,10 +6,11 @@
 use super::types::{
     apply_op, counts, AgendaActor, AgendaCommand, AgendaCounts, AgendaItem, AgendaOp,
     AgendaOpRecord, AgendaPatch, AgendaRefType, AgendaStatus, AGENDA_LOG_VERSION,
-    MAX_ANNOTATIONS_PER_ITEM, MAX_BODY_BYTES, MAX_CRITERION_CHARS, MAX_REFS_PER_ITEM,
-    MAX_REF_FILE_HASH_BYTES, MAX_REF_FILE_LOCATOR_CHARS, MAX_REF_ID_LOCATOR_CHARS,
-    MAX_REF_LABEL_CHARS, MAX_REF_URL_LOCATOR_CHARS, MAX_RELIES_ON_PER_ITEM, MAX_SOURCE_CHARS,
-    MAX_TAGS, MAX_TAG_CHARS, MAX_TITLE_CHARS, MAX_UNCLEARED_BLOCKERS_PER_ITEM,
+    MAX_ANNOTATIONS_PER_ITEM, MAX_BODY_BYTES, MAX_CHILDREN_PER_HUB, MAX_CRITERION_CHARS,
+    MAX_PART_OF_DEPTH, MAX_REFS_PER_ITEM, MAX_REF_FILE_HASH_BYTES, MAX_REF_FILE_LOCATOR_CHARS,
+    MAX_REF_ID_LOCATOR_CHARS, MAX_REF_LABEL_CHARS, MAX_REF_URL_LOCATOR_CHARS,
+    MAX_RELATES_TO_PER_ITEM, MAX_RELIES_ON_PER_ITEM, MAX_SOURCE_CHARS, MAX_TAGS, MAX_TAG_CHARS,
+    MAX_TITLE_CHARS, MAX_UNCLEARED_BLOCKERS_PER_ITEM,
 };
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -41,7 +42,7 @@ pub(crate) enum AgendaError {
 /// preserved on disk but skipped at load (forward compatibility: a newer
 /// build's vocabulary — effects, journal curation — must not brick an older
 /// daemon's ledger).
-const KNOWN_OPS: [&str; 19] = [
+const KNOWN_OPS: [&str; 23] = [
     "add",
     "patch",
     "complete",
@@ -56,6 +57,10 @@ const KNOWN_OPS: [&str; 19] = [
     "remove_relies_on",
     "add_ref",
     "remove_ref",
+    "add_part_of",
+    "remove_part_of",
+    "add_relates_to",
+    "remove_relates_to",
     "propose_effect",
     "approve_effect",
     "revoke_effect",
@@ -285,6 +290,18 @@ impl AgendaStore {
         {
             return self.apply_add(kind, title, body, tags, due_ms, refs, actor, source, now_ms);
         }
+        // Re-parent gesture (G2, steward override): the NEW placement is
+        // validated in full BEFORE the current one is touched, then the
+        // primitive remove+add pair appends under this same lock — a
+        // refused target never destroys a live placement.
+        if let AgendaCommand::Place {
+            id,
+            under,
+            source: _,
+        } = cmd
+        {
+            return self.apply_place(&id, &under, actor, source, now_ms);
+        }
         // Owner start-now (F3): two ops appended under this same lock —
         // its own arm because one command maps to a propose+approve pair.
         if let AgendaCommand::StartNow {
@@ -425,6 +442,135 @@ impl AgendaStore {
             },
             actor,
             None,
+            now_ms,
+        )
+    }
+
+    /// Would placing `id` under `parent_id` keep the tree lawful? Checks
+    /// self-placement, the ancestry cycle (walking the parent's live
+    /// ancestor chain — bounded, so a foreign-log cycle terminates as a
+    /// depth rejection), the depth cap counting the moving subtree's own
+    /// height, and the parent's live-children rail. Pure read over the
+    /// current fold; every rejection is named.
+    fn validate_placement(&self, id: &str, parent_id: &str) -> Result<(), AgendaError> {
+        if parent_id == id {
+            return Err(AgendaError::Invalid(
+                "an item cannot be placed under itself".into(),
+            ));
+        }
+        // Ancestor walk from the proposed parent: finding `id` means the
+        // placement would close a cycle; running past the bound means the
+        // tree would exceed the depth rail either way.
+        let mut ancestors = 1usize; // the parent itself
+        let mut cursor = parent_id;
+        while let Some(placement) = self.items.get(cursor).and_then(|p| p.part_of.as_ref()) {
+            if placement.parent_id == id {
+                return Err(AgendaError::Invalid(format!(
+                    "placement cycle via {cursor} — {id} is already an ancestor of {parent_id}"
+                )));
+            }
+            ancestors += 1;
+            if ancestors > MAX_PART_OF_DEPTH {
+                return Err(AgendaError::Invalid(format!(
+                    "placement exceeds the depth rail ({MAX_PART_OF_DEPTH})"
+                )));
+            }
+            cursor = &placement.parent_id;
+        }
+        // Depth after placement = the parent's chain + this item + its own
+        // subtree height (children move with their parent).
+        if ancestors + 1 + self.subtree_height(id) > MAX_PART_OF_DEPTH {
+            return Err(AgendaError::Invalid(format!(
+                "placement exceeds the depth rail ({MAX_PART_OF_DEPTH})"
+            )));
+        }
+        let children = self
+            .items
+            .values()
+            .filter(|item| {
+                item.part_of
+                    .as_ref()
+                    .is_some_and(|p| p.parent_id == parent_id)
+            })
+            .count();
+        if children >= MAX_CHILDREN_PER_HUB {
+            return Err(AgendaError::Invalid(format!(
+                "{parent_id} already has {MAX_CHILDREN_PER_HUB} children — a hub \
+                 this size is a filing pathology, not an agenda"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Height of `id`'s placed subtree (0 = no children), bounded by the
+    /// item count. Intake-only arithmetic over the fold.
+    fn subtree_height(&self, id: &str) -> usize {
+        let mut frontier: Vec<&str> = vec![id];
+        let mut height = 0usize;
+        while height <= MAX_PART_OF_DEPTH {
+            let next: Vec<&str> = self
+                .items
+                .values()
+                .filter(|item| {
+                    item.part_of
+                        .as_ref()
+                        .is_some_and(|p| frontier.iter().any(|f| *f == p.parent_id))
+                })
+                .map(|item| item.id.as_str())
+                .collect();
+            if next.is_empty() {
+                return height;
+            }
+            height += 1;
+            frontier = next;
+        }
+        height
+    }
+
+    /// The re-parent gesture (G2): validate the new placement first, then
+    /// append `remove_part_of` (when placed) + `add_part_of` under the
+    /// caller's lock. Op vocabulary unchanged — the log carries the two
+    /// primitive lines.
+    fn apply_place(
+        &mut self,
+        id: &str,
+        under: &str,
+        actor: Option<AgendaActor>,
+        source: Option<String>,
+        now_ms: u64,
+    ) -> Result<AgendaItem, AgendaError> {
+        let under = under.trim().to_string();
+        self.require(id)?;
+        self.require(&under)?;
+        let current = self
+            .require(id)?
+            .part_of
+            .as_ref()
+            .map(|p| p.parent_id.clone());
+        if current.as_deref() == Some(under.as_str()) {
+            return Err(AgendaError::Transition(format!(
+                "{id} is already placed under {under}"
+            )));
+        }
+        self.validate_placement(id, &under)?;
+        if let Some(current) = current {
+            self.append_op(
+                AgendaOp::RemovePartOf {
+                    id: id.to_string(),
+                    parent_id: current,
+                },
+                actor.clone(),
+                source.clone(),
+                now_ms,
+            )?;
+        }
+        self.append_op(
+            AgendaOp::AddPartOf {
+                id: id.to_string(),
+                parent_id: under,
+            },
+            actor,
+            source,
             now_ms,
         )
     }
@@ -1003,6 +1149,105 @@ impl AgendaStore {
                     )));
                 }
                 Ok(AgendaOp::RemoveReliesOn { id, target_id })
+            }
+            // Placement/adjacency intake (G2): any item status — organizing
+            // done/retired history is bookkeeping (the clear_blocker
+            // precedent, ruled call 4). `Place` never reaches here (its
+            // apply_command arm owns the remove+add pair).
+            AgendaCommand::Place { .. } => Err(AgendaError::Invalid(
+                "internal: place must route through apply_command".into(),
+            )),
+            AgendaCommand::AddPartOf {
+                id,
+                parent_id,
+                source: _,
+            } => {
+                let parent_id = parent_id.trim().to_string();
+                let item = self.require(&id)?;
+                if let Some(placement) = &item.part_of {
+                    return Err(AgendaError::Transition(format!(
+                        "{id} is already placed under {} — re-parent with place, or \
+                         remove that placement first",
+                        placement.parent_id
+                    )));
+                }
+                self.require(&parent_id)?;
+                self.validate_placement(&id, &parent_id)?;
+                Ok(AgendaOp::AddPartOf { id, parent_id })
+            }
+            AgendaCommand::RemovePartOf {
+                id,
+                parent_id,
+                source: _,
+            } => {
+                let parent_id = parent_id.trim().to_string();
+                let item = self.require(&id)?;
+                match &item.part_of {
+                    Some(placement) if placement.parent_id == parent_id => {
+                        Ok(AgendaOp::RemovePartOf { id, parent_id })
+                    }
+                    Some(placement) => Err(AgendaError::NotFound(format!(
+                        "{id} is placed under {}, not {parent_id}",
+                        placement.parent_id
+                    ))),
+                    None => Err(AgendaError::NotFound(format!("{id} is not placed"))),
+                }
+            }
+            AgendaCommand::AddRelatesTo {
+                id,
+                target_id,
+                source: _,
+            } => {
+                let target_id = target_id.trim().to_string();
+                let item = self.require(&id)?;
+                if target_id == id {
+                    return Err(AgendaError::Invalid(
+                        "an item cannot relate to itself".into(),
+                    ));
+                }
+                let target = self.require(&target_id)?;
+                // Undirected dedup at intake: either stored direction is
+                // the same adjacency.
+                if item.relates_to.iter().any(|e| e.target_id == target_id)
+                    || target.relates_to.iter().any(|e| e.target_id == id)
+                {
+                    return Err(AgendaError::Transition(format!(
+                        "{id} and {target_id} are already related"
+                    )));
+                }
+                if item.relates_to.len() >= MAX_RELATES_TO_PER_ITEM {
+                    return Err(AgendaError::Invalid(format!(
+                        "more than {MAX_RELATES_TO_PER_ITEM} relations"
+                    )));
+                }
+                Ok(AgendaOp::AddRelatesTo { id, target_id })
+            }
+            AgendaCommand::RemoveRelatesTo {
+                id,
+                target_id,
+                source: _,
+            } => {
+                let target_id = target_id.trim().to_string();
+                let item = self.require(&id)?;
+                // Resolve which side stores the edge — callers name the
+                // pair in either order; the op names the storing item.
+                if item.relates_to.iter().any(|e| e.target_id == target_id) {
+                    Ok(AgendaOp::RemoveRelatesTo { id, target_id })
+                } else if self
+                    .require(&target_id)?
+                    .relates_to
+                    .iter()
+                    .any(|e| e.target_id == id)
+                {
+                    Ok(AgendaOp::RemoveRelatesTo {
+                        id: target_id,
+                        target_id: id,
+                    })
+                } else {
+                    Err(AgendaError::NotFound(format!(
+                        "{id} and {target_id} are not related"
+                    )))
+                }
             }
             AgendaCommand::AddRef {
                 id,
@@ -2934,6 +3179,177 @@ mod tests {
         assert_eq!(file_ref_drift(&loc, &attach), "changed");
         std::fs::remove_file(&path).unwrap();
         assert_eq!(file_ref_drift(&loc, &attach), "missing");
+    }
+
+    /// The G2 intake omnibus: placement strictness (cycle, self, depth,
+    /// double-place, children rail), Place's validate-first override (a
+    /// refused target never destroys the live placement), adjacency
+    /// either-direction dedup + storing-side removal resolution, and
+    /// replay round-trips.
+    #[test]
+    fn g2_graph_intake_is_strict_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let hub = store
+            .apply_command(add_cmd("Track G"), owner(), 1000)
+            .unwrap()
+            .id;
+        let hub2 = store
+            .apply_command(add_cmd("Track H"), owner(), 1001)
+            .unwrap()
+            .id;
+        let child = store
+            .apply_command(add_cmd("G1 slice"), owner(), 1002)
+            .unwrap()
+            .id;
+        let grand = store
+            .apply_command(add_cmd("G1 docs"), owner(), 1003)
+            .unwrap()
+            .id;
+
+        let place = |id: &str, under: &str| AgendaCommand::Place {
+            id: id.to_string(),
+            under: under.to_string(),
+            source: None,
+        };
+
+        // Place + nest; the placement carries attribution.
+        let placed = store
+            .apply_command(place(&child, &hub), owner(), 1100)
+            .unwrap();
+        assert_eq!(placed.part_of.as_ref().unwrap().parent_id, hub);
+        assert_eq!(
+            placed.part_of.as_ref().unwrap().principal.as_deref(),
+            Some("owner")
+        );
+        store
+            .apply_command(place(&grand, &child), owner(), 1101)
+            .unwrap();
+
+        // Named rejections, nothing appended.
+        let ops_before = store.ops();
+        for (cmd, needle) in [
+            (place(&hub, &hub), "under itself"),
+            // hub → child would close hub → child → … → hub.
+            (place(&hub, &grand), "placement cycle"),
+            (
+                AgendaCommand::AddPartOf {
+                    id: child.clone(),
+                    parent_id: hub2.clone(),
+                    source: None,
+                },
+                "already placed",
+            ),
+            (
+                AgendaCommand::RemovePartOf {
+                    id: child.clone(),
+                    parent_id: hub2.clone(),
+                    source: None,
+                },
+                "not",
+            ),
+        ] {
+            let err = store.apply_command(cmd, owner(), 1200).unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "expected {needle:?} in {err}"
+            );
+        }
+        assert_eq!(store.ops(), ops_before, "rejections never append");
+
+        // The override's motivating case: a refused re-parent target
+        // leaves the CURRENT placement intact (validate-first).
+        assert!(store
+            .apply_command(place(&hub, &grand), owner(), 1201)
+            .is_err());
+        assert!(
+            store.item(&hub).unwrap().part_of.is_none(),
+            "hub stays a root"
+        );
+        assert_eq!(
+            store
+                .item(&child)
+                .unwrap()
+                .part_of
+                .as_ref()
+                .unwrap()
+                .parent_id,
+            hub,
+            "failed gesture must not strand or move the child"
+        );
+
+        // Re-parent round trip: remove+add pair under one gesture.
+        let moved = store
+            .apply_command(place(&child, &hub2), owner(), 1300)
+            .unwrap();
+        assert_eq!(moved.part_of.as_ref().unwrap().parent_id, hub2);
+        assert_eq!(store.ops(), ops_before + 2, "one remove + one add");
+
+        // Adjacency: either-direction dedup, storing-side removal.
+        store
+            .apply_command(
+                AgendaCommand::AddRelatesTo {
+                    id: child.clone(),
+                    target_id: grand.clone(),
+                    source: None,
+                },
+                owner(),
+                1400,
+            )
+            .unwrap();
+        let err = store
+            .apply_command(
+                AgendaCommand::AddRelatesTo {
+                    id: grand.clone(),
+                    target_id: child.clone(),
+                    source: None,
+                },
+                owner(),
+                1401,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("already related"));
+        // Removal named in the OPPOSITE order still resolves the stored
+        // side; the view edge disappears from the storing item.
+        store
+            .apply_command(
+                AgendaCommand::RemoveRelatesTo {
+                    id: grand.clone(),
+                    target_id: child.clone(),
+                    source: None,
+                },
+                owner(),
+                1402,
+            )
+            .unwrap();
+        assert!(store.item(&child).unwrap().relates_to.is_empty());
+
+        // Depth rail: a chain of exactly MAX_PART_OF_DEPTH nodes is legal;
+        // the link that would make it deeper refuses, named.
+        let mut chain: Vec<String> = vec![hub2.clone()];
+        for i in 0..(MAX_PART_OF_DEPTH - 1) {
+            let next = store
+                .apply_command(add_cmd(&format!("depth {i}")), owner(), 2000)
+                .unwrap()
+                .id;
+            store
+                .apply_command(place(&next, chain.last().unwrap()), owner(), 2001)
+                .unwrap();
+            chain.push(next);
+        }
+        let too_deep = store
+            .apply_command(add_cmd("too deep"), owner(), 2002)
+            .unwrap()
+            .id;
+        let err = store
+            .apply_command(place(&too_deep, chain.last().unwrap()), owner(), 2003)
+            .unwrap_err();
+        assert!(err.to_string().contains("depth rail"));
+
+        // Replay converges.
+        let before = store.item(&child).unwrap();
+        let mut reopened = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.item(&child).unwrap(), before);
     }
 
     /// A future ref type inside a known op name degrades exactly like an
