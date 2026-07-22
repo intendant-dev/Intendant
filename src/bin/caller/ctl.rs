@@ -2422,6 +2422,79 @@ async fn run_agenda(
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
         }
+        "place" => {
+            let args = parse_command_args(&raw[1..], &["--under", "--source"], &["--remove"])?;
+            let id = agenda_resolve_id(
+                client,
+                config,
+                &args,
+                "agenda place requires an item id first (a unique prefix is enough)",
+            )
+            .await?;
+            let mut map = Map::new();
+            if args.has("--remove") {
+                // Removing a placement names the current parent: resolve it
+                // from the ledger so the gesture stays one command.
+                let (all_items, _) =
+                    agenda_fetch(client, config, Value::Object(Map::new())).await?;
+                let parent = all_items
+                    .iter()
+                    .find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str()))
+                    .and_then(|item| item.get("part_of"))
+                    .and_then(|p| p.get("parent_id"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("{id} is not placed under anything"))?
+                    .to_string();
+                map.insert(
+                    "op".to_string(),
+                    Value::String("remove_part_of".to_string()),
+                );
+                map.insert("id".to_string(), Value::String(id));
+                map.insert("parent_id".to_string(), Value::String(parent));
+            } else {
+                let under_raw = args
+                    .one("--under")
+                    .map(str::to_string)
+                    .or_else(|| args.positional.get(1).cloned())
+                    .ok_or_else(|| {
+                        "agenda place requires the hub second (or --under HUB); --remove unplaces"
+                            .to_string()
+                    })?;
+                let under = agenda_resolve_id_str(client, config, &under_raw).await?;
+                map.insert("op".to_string(), Value::String("place".to_string()));
+                map.insert("id".to_string(), Value::String(id));
+                map.insert("under".to_string(), Value::String(under));
+            }
+            insert_string(&mut map, "source", args.one("--source"));
+            let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
+        "relates" | "relates-to" => {
+            let args = parse_command_args(&raw[1..], &["--source"], &["--remove"])?;
+            let id = agenda_resolve_id(
+                client,
+                config,
+                &args,
+                "agenda relates requires an item id first",
+            )
+            .await?;
+            let Some(target_raw) = args.positional.get(1) else {
+                return Err("agenda relates requires the related item id second".to_string());
+            };
+            let target = agenda_resolve_id_str(client, config, target_raw).await?;
+            let op = if args.has("--remove") {
+                "remove_relates_to"
+            } else {
+                "add_relates_to"
+            };
+            let mut map = Map::new();
+            map.insert("op".to_string(), Value::String(op.to_string()));
+            map.insert("id".to_string(), Value::String(id));
+            map.insert("target_id".to_string(), Value::String(target));
+            insert_string(&mut map, "source", args.one("--source"));
+            let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
         "ref" => {
             let args = parse_command_args(
                 &raw[1..],
@@ -2618,7 +2691,7 @@ async fn run_agenda_list(
 ) -> Result<(), String> {
     let args = parse_command_args(
         raw,
-        &[],
+        &["--under"],
         &["--all", "--open", "--done", "--retired", "--blocked"],
     )?;
     let blocked_only = args.has("--blocked");
@@ -2635,7 +2708,7 @@ async fn run_agenda_list(
     };
     let mut tool_args = Map::new();
     insert_string(&mut tool_args, "status", status);
-    if config.json || config.raw {
+    if (config.json || config.raw) && args.one("--under").is_none() {
         let response = call_tool(client, config, "agenda_list", Value::Object(tool_args)).await?;
         return print_tool_response(response, config, None);
     }
@@ -2643,14 +2716,51 @@ async fn run_agenda_list(
     // derived at print time (never stored, never wired) and judging a
     // dependency needs its target's status whatever the display filter.
     let (all_items, counts) = agenda_fetch(client, config, Value::Object(Map::new())).await?;
+    // `--under HUB` scopes to the hub's placed subtree (children move with
+    // their parents) — derived here at print time like every graph view.
+    let under_subtree: Option<std::collections::HashSet<String>> = match args.one("--under") {
+        None => None,
+        Some(prefix) => {
+            let hub = agenda_resolve_id_str(client, config, prefix).await?;
+            let mut subtree: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut frontier = vec![hub];
+            while let Some(parent) = frontier.pop() {
+                for item in &all_items {
+                    let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                    if subtree.contains(id) {
+                        continue;
+                    }
+                    let placed_under = item
+                        .get("part_of")
+                        .and_then(|p| p.get("parent_id"))
+                        .and_then(Value::as_str);
+                    if placed_under == Some(parent.as_str()) {
+                        subtree.insert(id.to_string());
+                        frontier.push(id.to_string());
+                    }
+                }
+            }
+            Some(subtree)
+        }
+    };
     let items: Vec<&Value> = all_items
         .iter()
         .filter(|item| {
             let item_status = item.get("status").and_then(Value::as_str).unwrap_or("");
+            let id = item.get("id").and_then(Value::as_str).unwrap_or("");
             status.is_none_or(|s| item_status == s)
                 && (!blocked_only || agenda_item_is_blocked(&all_items, item))
+                && under_subtree.as_ref().is_none_or(|s| s.contains(id))
         })
         .collect();
+    if config.json || config.raw {
+        // --under with --json: the scoped subset, locally filtered.
+        println!(
+            "{}",
+            serde_json::json!({ "items": items, "counts": counts })
+        );
+        return Ok(());
+    }
     if items.is_empty() {
         match (blocked_only, status) {
             (true, _) => println!("no blocked agenda items"),
@@ -2660,7 +2770,7 @@ async fn run_agenda_list(
     }
     for item in &items {
         let blocked = agenda_item_is_blocked(&all_items, item);
-        println!("{}", agenda_render_row(item, blocked));
+        println!("{}", agenda_render_row(item, blocked, &all_items));
     }
     let open = counts.get("open").and_then(Value::as_u64).unwrap_or(0);
     let done = counts.get("done").and_then(Value::as_u64).unwrap_or(0);
@@ -2701,7 +2811,7 @@ fn agenda_item_is_blocked(all_items: &[Value], item: &Value) -> bool {
         })
 }
 
-fn agenda_render_row(item: &Value, blocked: bool) -> String {
+fn agenda_render_row(item: &Value, blocked: bool, all_items: &[Value]) -> String {
     let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("");
     let glyph = match (field("status"), field("kind")) {
         ("open", "question") => "?",
@@ -2758,6 +2868,27 @@ fn agenda_render_row(item: &Value, blocked: bool) -> String {
             "awaiting approval".to_string()
         };
         row.push_str(&format!("  ⏵ session {state}"));
+    }
+    // Hub roll-up: children counts derived at print time, never stored.
+    let id = field("id");
+    if !id.is_empty() {
+        let children: Vec<&Value> = all_items
+            .iter()
+            .filter(|other| {
+                other
+                    .get("part_of")
+                    .and_then(|p| p.get("parent_id"))
+                    .and_then(Value::as_str)
+                    == Some(id)
+            })
+            .collect();
+        if !children.is_empty() {
+            let open = children
+                .iter()
+                .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
+                .count();
+            row.push_str(&format!("  [hub: {open}/{} open]", children.len()));
+        }
     }
     if let Some(refs) = item
         .get("refs")
@@ -4335,6 +4466,9 @@ fn help_agenda() {
   intendant ctl agenda relies-on ID_PREFIX TARGET_PREFIX [--remove] [--source LABEL]\n\
   intendant ctl agenda ref ID_PREFIX [TYPE:]LOCATOR [--type file|memory|session|url]\n\
       [--must-read] [--label TEXT] [--remove] [--source LABEL]\n\
+  intendant ctl agenda place ID_PREFIX HUB_PREFIX|--under HUB [--remove] [--source LABEL]\n\
+  intendant ctl agenda relates ID_PREFIX TARGET_PREFIX [--remove] [--source LABEL]\n\
+  intendant ctl agenda list --under HUB_PREFIX   # the hub's placed subtree\n\
   intendant ctl agenda complete ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda reopen ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda retire ID_PREFIX [--source LABEL]\n\
@@ -4379,6 +4513,16 @@ existing paths) or explicit via TYPE: prefix / --type; --must-read marks\n\
 it prominent for whoever picks the item up (a pointer they weigh, not an\n\
 order); --remove drops it (history stays). On `add`, repeat --ref to\n\
 attach at park time — one item, its context, one gesture.\n\
+\n\
+`place` files an item under a hub — a hub is just an item with children\n\
+(projects are hubs by convention, not a schema kind). One live parent;\n\
+`place` re-parents atomically (the new target is validated before the\n\
+old placement is touched); --remove unplaces. Placement is pure\n\
+navigation: it NEVER propagates blocking, completion never cascades, and\n\
+a placed item still appears in the flat list (nothing hides). `relates`\n\
+draws an untyped see-also edge, deduped in both directions; `list\n\
+--under` scopes to a hub's subtree; hub rows show open-children roll-ups\n\
+derived at print time.\n\
 \n\
 `schedule` proposes a session manifest on an item: at WHEN, spawn a normal\n\
 supervised session with that goal (never raw actions). Nothing fires until\n\
