@@ -249,7 +249,9 @@ pub(crate) async fn control_request_frame(
         }
         "api_agenda_list" => api_agenda_list_response(id, &runtime).await,
         "api_agenda_op" => api_agenda_op_response(id, params.as_ref(), &runtime).await,
-        "api_agenda_ref_drift" => api_agenda_ref_drift_response(id, params.as_ref(), &runtime).await,
+        "api_agenda_ref_drift" => {
+            api_agenda_ref_drift_response(id, params.as_ref(), &runtime).await
+        }
         "api_agenda_reminder_policy" => {
             api_agenda_reminder_policy_response(id, params.as_ref(), &runtime).await
         }

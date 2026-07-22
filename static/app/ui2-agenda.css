@@ -613,6 +613,69 @@ html.ui-v2 .agenda-thread-add .agenda-thread-input:focus {
   border-color: var(--iris);
 }
 
+/* G1 typed references: pointer chips + rows. Locators and labels are
+   escaped data; must-reads render prominent (a pointer to weigh, not an
+   order); drift badges land only after the on-demand Verify fetch. */
+html.ui-v2 .agenda-chip.refs { color: var(--text-2); }
+html.ui-v2 .agenda-chip.refs.must {
+  color: var(--iris);
+  border: 1px solid color-mix(in srgb, var(--iris) 45%, transparent);
+}
+html.ui-v2 .agenda-refs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin: 4px 0 2px 22px;
+}
+html.ui-v2 .agenda-ref {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  border-radius: 999px;
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  color: var(--text-2);
+  max-width: 100%;
+}
+html.ui-v2 .agenda-ref.must {
+  border-color: color-mix(in srgb, var(--iris) 55%, transparent);
+}
+html.ui-v2 .agenda-ref a {
+  color: var(--iris);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .agenda-ref a:hover { text-decoration: underline; }
+html.ui-v2 .agenda-ref-type {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+}
+html.ui-v2 .agenda-ref-must {
+  font-size: 9.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--iris);
+}
+html.ui-v2 .agenda-ref-drift[data-status="unchanged"] { color: var(--green, #98c379); }
+html.ui-v2 .agenda-ref-drift[data-status="changed"] { color: var(--peach, #e5a06c); }
+html.ui-v2 .agenda-ref-drift[data-status="missing"] { color: var(--red, #e06c75); }
+html.ui-v2 .agenda-ref-remove {
+  background: none;
+  border: none;
+  padding: 0 0 0 2px;
+  color: var(--text-3);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+html.ui-v2 .agenda-ref-remove:hover { color: var(--red, #e06c75); }
+html.ui-v2 .agenda-refs-verify { flex-shrink: 0; }
+
 /* ---- Start-now confirm sheet (owner ruling 2026-07-21) ----
    The explanation IS the surface: goal text, project, inherited config,
    Interactive/Goal-run toggle, Start + Cancel. Bottom sheet on coarse

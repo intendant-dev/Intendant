@@ -2635,7 +2635,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let files = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
-        let id = store.apply_command(add_cmd("carry the brief"), owner(), 1000).unwrap().id;
+        let id = store
+            .apply_command(add_cmd("carry the brief"), owner(), 1000)
+            .unwrap()
+            .id;
 
         // File ref: digest minted at intake, full sha256 hex, recorded.
         let brief = files.path().join("brief.md");
@@ -2793,7 +2796,10 @@ mod tests {
         assert_eq!(reopened.item(&id).unwrap(), before);
 
         // The ref cap is enforced against live refs with a named error.
-        let small = store.apply_command(add_cmd("cap me"), owner(), 2000).unwrap().id;
+        let small = store
+            .apply_command(add_cmd("cap me"), owner(), 2000)
+            .unwrap()
+            .id;
         for i in 0..MAX_REFS_PER_ITEM {
             store
                 .apply_command(
@@ -2885,7 +2891,7 @@ mod tests {
                     locator: "https://example.com/pr/9".into(),
                     must_read: true,
                     label: Some("the PR".into()),
-                    },
+                },
                 super::super::types::AgendaRefSpec {
                     ref_type: AgendaRefType::Session,
                     locator: "sess-parent".into(),

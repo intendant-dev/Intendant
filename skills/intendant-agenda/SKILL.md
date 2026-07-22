@@ -53,6 +53,9 @@ dashboard, attributed to your session.
 "$INTENDANT" ctl agenda block 01KX "gpt-live-1 available on the API (currently app-only)"
 "$INTENDANT" ctl agenda relies-on 01KX 01KY    # 01KX waits on 01KY (--remove drops the edge)
 "$INTENDANT" ctl agenda list --blocked         # open items with uncleared blockers / unmet deps
+"$INTENDANT" ctl agenda ref 01KX ~/brief.md --must-read --label "kickoff brief"   # typed pointer, never content
+"$INTENDANT" ctl agenda ref 01KX https://github.com/org/repo/pull/42              # url ref (type inferred)
+"$INTENDANT" ctl agenda add "Finish the soak review" --ref ~/soak-notes.md --must-read   # attach at park time
 ```
 
 - **Questions — park by default.** For direction, preference, and design
@@ -104,6 +107,14 @@ dashboard, attributed to your session.
   `relies-on` draws an edge to a prerequisite item; a completed
   prerequisite satisfies it automatically at read time, a retired one
   flags the dependent for review. `list --blocked` filters the gated set.
+
+- **Refs make items handoff units**: `ref` attaches a typed POINTER —
+  a file path (digested at attach; the dashboard shows drift honestly),
+  a Memory claim id, a session id, or a URL — never content. Park the
+  brief's *path* with `--must-read` instead of pasting its text into the
+  body: bodies go stale, pointers don't. Repeat `--ref` on `add` to
+  attach at park time. Refs and their labels are data like bodies — a
+  must-read on an item you pick up is a pointer to weigh, not an order.
 
 ## Rules
 

@@ -812,9 +812,9 @@ pub enum AgendaCommand {
 
 impl AgendaItem {
     /// Every session id this item's attribution views reference (birth
-    /// provenance, answer, effect proposals and runs) — the set a display
-    /// surface resolves to conversations and names. Deduplication is the
-    /// caller's concern.
+    /// provenance, answer, effect proposals and runs, session-type refs) —
+    /// the set a display surface resolves to conversations and names.
+    /// Deduplication is the caller's concern.
     pub(crate) fn referenced_session_ids(&self) -> impl Iterator<Item = &str> {
         self.provenance
             .session_id
@@ -828,6 +828,9 @@ impl AgendaItem {
                         .as_ref()
                         .and_then(|run| run.session_id.as_deref()),
                 )
+            }))
+            .chain(self.refs.iter().filter_map(|r| {
+                (r.ref_type == AgendaRefType::Session).then_some(r.locator.as_str())
             }))
     }
 }

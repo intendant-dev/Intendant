@@ -546,6 +546,87 @@ function agendaThreadBlock(item) {
   return parts.length ? `<div class="agenda-item-thread">${parts.join('')}</div>` : '';
 }
 
+// ---- G1 typed references: chips + per-ref rows. Refs are POINTERS —
+// labels and locators are data, rendered escaped, never followed by
+// machinery. A must-read is rendered prominent for whoever picks the item
+// up (a pointer they weigh, not an order). File drift is fetched ON
+// DEMAND per item (the Verify button) — never on list render.
+
+function agendaRefsChip(item) {
+  const refs = item.refs || [];
+  if (!refs.length) return '';
+  const must = refs.filter((r) => r.must_read).length;
+  const label = refs.length === 1 ? '1 ref' : `${refs.length} refs`;
+  return `<span class="agenda-chip refs${must ? ' must' : ''}"${must ? ` title="${must} must-read"` : ''}>⛉ ${label}</span>`;
+}
+
+function agendaRefFileName(locator) {
+  const parts = String(locator).split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : locator;
+}
+
+function agendaRefsBlock(item) {
+  const refs = item.refs || [];
+  if (!refs.length) return '';
+  let hasFile = false;
+  const rows = refs.map((ref) => {
+    const label = ref.label || '';
+    let target = '';
+    if (ref.ref_type === 'url') {
+      target = `<a href="${escapeHtml(ref.locator)}" target="_blank" rel="noopener noreferrer nofollow">${escapeHtml(label || ref.locator)}</a>`;
+    } else if (ref.ref_type === 'session') {
+      const s = agendaSessionInfo(ref.locator);
+      const text = label || (s && s.name) || `session ${String(ref.locator).slice(0, 12)}`;
+      target = s && s.key
+        ? `<a href="#sessions" class="agenda-session-link" data-session-key="${escapeHtml(s.key)}" title="${escapeHtml(ref.locator)}">${escapeHtml(text)}</a>`
+        : `<span title="${escapeHtml(ref.locator)}">${escapeHtml(text)}</span>`;
+    } else if (ref.ref_type === 'memory') {
+      target = `<a href="#memory" class="agenda-ref-claim" data-claim="${escapeHtml(ref.locator)}" title="${escapeHtml(ref.locator)}">${escapeHtml(label || `claim ${String(ref.locator).slice(0, 12)}`)}</a>`;
+    } else {
+      hasFile = true;
+      const drift = ref.digest
+        ? `<span class="agenda-ref-drift" data-item="${escapeHtml(item.id)}" data-locator="${escapeHtml(ref.locator)}"></span>`
+        : '';
+      target = `<span title="${escapeHtml(ref.locator)}">${escapeHtml(label || agendaRefFileName(ref.locator))}</span>${drift}`;
+    }
+    const must = ref.must_read
+      ? '<span class="agenda-ref-must" title="Marked must-read by whoever attached it — weigh it before working the item">must-read</span>'
+      : '';
+    const remove = `<button type="button" class="agenda-ref-remove" data-id="${escapeHtml(item.id)}" data-type="${escapeHtml(ref.ref_type)}" data-locator="${escapeHtml(ref.locator)}" aria-label="Remove reference" title="Remove reference (history stays in the log)">×</button>`;
+    return `<span class="agenda-ref ${escapeHtml(ref.ref_type)}${ref.must_read ? ' must' : ''}">
+      <span class="agenda-ref-type">${escapeHtml(ref.ref_type)}</span>${must}${target}${remove}</span>`;
+  });
+  const verify = hasFile
+    ? `<button type="button" class="agenda-btn agenda-refs-verify" data-id="${escapeHtml(item.id)}" title="Re-hash the attached files against their attach-time digests">Verify files</button>`
+    : '';
+  return `<div class="agenda-refs">${rows.join('')}${verify}</div>`;
+}
+
+// On-demand drift check (G1): one fetch per gesture, per item — the
+// expand-time rehash lane. Badges land on the matching rows; a missing
+// file renders as missing, never an error.
+async function agendaVerifyRefs(itemId, button) {
+  if (button) button.disabled = true;
+  try {
+    const resp = await daemonApi.request('api_agenda_ref_drift', { item_id: itemId });
+    const body = resp && resp.body ? resp.body : resp;
+    const rows = (body && body.refs) || [];
+    rows.forEach((row) => {
+      const selector = `.agenda-ref-drift[data-item="${CSS.escape(itemId)}"][data-locator="${CSS.escape(row.locator)}"]`;
+      const el = document.querySelector(selector);
+      if (!el) return;
+      el.dataset.status = row.status;
+      el.textContent = row.status === 'unchanged' ? '✓ unchanged'
+        : row.status === 'missing' ? 'missing'
+          : 'changed since attached';
+    });
+  } catch (err) {
+    console.warn('agenda ref drift check failed', err);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
 // F3 follow-up affordance: the live, composer-targetable session window
 // carrying the item's recorded conversation, if one exists RIGHT NOW.
 // Purely a navigation affordance — sessions die, so items must stand
@@ -1355,9 +1436,9 @@ function agendaRenderTab() {
         ${agendaGlyph(item.status, item.kind)}
         <span class="agenda-item-kind">${escapeHtml(item.kind)}</span>
         <span class="agenda-item-title">${escapeHtml(item.title)}</span>
-        ${blockedChip}${dismissedChip}${pickupChip}${agendaDueChip(item)}${tags}
+        ${blockedChip}${dismissedChip}${pickupChip}${agendaDueChip(item)}${agendaRefsChip(item)}${tags}
       </div>
-      ${body}${answerBlock}${agendaThreadBlock(item)}${agendaEffectBlock(item)}
+      ${body}${answerBlock}${agendaRefsBlock(item)}${agendaThreadBlock(item)}${agendaEffectBlock(item)}
       <div class="agenda-item-foot">
         <span class="agenda-item-meta">${agendaProvenanceLine(item)}</span>
         <span class="agenda-item-actions">${agendaActionButtons(item)}</span>
@@ -1429,6 +1510,24 @@ function agendaRenderTab() {
   list.querySelectorAll('button.agenda-edge-remove').forEach((btn) => {
     btn.addEventListener('click', () =>
       agendaSendOp({ op: 'remove_relies_on', id: btn.dataset.id, target_id: btn.dataset.target }, btn));
+  });
+  // G1 refs wiring: remove, on-demand drift verify, Memory claim jumps.
+  list.querySelectorAll('button.agenda-ref-remove').forEach((btn) => {
+    btn.addEventListener('click', () =>
+      agendaSendOp({
+        op: 'remove_ref', id: btn.dataset.id,
+        ref_type: btn.dataset.type, locator: btn.dataset.locator,
+      }, btn));
+  });
+  list.querySelectorAll('button.agenda-refs-verify').forEach((btn) => {
+    btn.addEventListener('click', () => agendaVerifyRefs(btn.dataset.id, btn));
+  });
+  list.querySelectorAll('a.agenda-ref-claim').forEach((link) => {
+    link.addEventListener('click', (e) => {
+      e.preventDefault();
+      routeTo('memory');
+      if (typeof memoryGotoClaim === 'function') memoryGotoClaim(link.dataset.claim);
+    });
   });
   const submitThread = async (id, input, op, control) => {
     const text = (input.value || '').trim();
