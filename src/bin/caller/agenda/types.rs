@@ -18,6 +18,16 @@ pub(crate) const MAX_ANNOTATIONS_PER_ITEM: usize = 500;
 pub(crate) const MAX_UNCLEARED_BLOCKERS_PER_ITEM: usize = 32;
 pub(crate) const MAX_RELIES_ON_PER_ITEM: usize = 32;
 pub(crate) const MAX_CRITERION_CHARS: usize = 1000;
+/// G1 caps (steward-ruled 2026-07-22). Refs follow the blockers/edges
+/// idiom; locator bounds are per-type (paths, opaque ids, urls).
+pub(crate) const MAX_REFS_PER_ITEM: usize = 32;
+pub(crate) const MAX_REF_LABEL_CHARS: usize = 100;
+pub(crate) const MAX_REF_FILE_LOCATOR_CHARS: usize = 1000;
+pub(crate) const MAX_REF_ID_LOCATOR_CHARS: usize = 200;
+pub(crate) const MAX_REF_URL_LOCATOR_CHARS: usize = 2000;
+/// Largest file the intake digest (and the expand-time drift rehash)
+/// will hash. Refs point at working artifacts, not archives.
+pub(crate) const MAX_REF_FILE_HASH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What an agenda entry is. Kinds and effects are orthogonal: no kind
 /// implies any delivery or execution behavior. `Question` (slice A4) is a
@@ -384,6 +394,12 @@ pub struct AgendaItem {
     /// wired.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) relies_on: Vec<AgendaDependency>,
+    /// Live typed references (G1 `add_ref`). Removal drops the ref from
+    /// this view; the log keeps history. File drift is derived at
+    /// expand time against the recorded attach digest — never stored,
+    /// never on list render.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) refs: Vec<AgendaRef>,
 }
 
 /// One attributed note on an item (F2 `annotate` fold view). Attribution
@@ -466,6 +482,83 @@ pub struct AgendaDependency {
     pub(crate) source: Option<String>,
 }
 
+/// What a typed reference points at (G1). The discriminator mirrors the
+/// kernel's Appendix A.5 `evref` spirit (scheme + locator + digest) so the
+/// future D0-Agenda-Data migration maps refs mechanically: `file`→`file`,
+/// `session`→`session-log`, `url`→`url`, `memory`→plane claim ref. A
+/// ref type this build does not know fails the typed parse, so the whole
+/// line degrades to preserved-skipped — future types are op-vocabulary
+/// additions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgendaRefType {
+    File,
+    Memory,
+    Session,
+    Url,
+}
+
+impl AgendaRefType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            AgendaRefType::File => "file",
+            AgendaRefType::Memory => "memory",
+            AgendaRefType::Session => "session",
+            AgendaRefType::Url => "url",
+        }
+    }
+}
+
+/// One live typed reference (G1 `add_ref` fold view): a TYPED POINTER,
+/// never content — no blobs, no copies, no uploads; the agenda points, it
+/// does not store. Addressed by `(ref_type, locator)` — no minted id,
+/// exactly as `relies_on` edges are addressed by `target_id`; changing
+/// `must_read` or `label` is remove+add (history honest). Locators and
+/// labels are data, never instructions to whoever reads them; a
+/// `must_read` is a pointer the reading agent weighs, not a standing
+/// order. Item-to-item links are NOT refs — that is G2's edge vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaRef {
+    pub(crate) ref_type: AgendaRefType,
+    /// `file`: absolute path; `memory`: claim id; `session`: conversation
+    /// id; `url`: http(s) URL. Stored verbatim as intake validated it.
+    pub(crate) locator: String,
+    /// File refs only: full sha256 hex of the file as it stood at attach —
+    /// intake-minted and recorded in the op (replay never hashes). The
+    /// detail view re-hashes on expand to render drift honestly; nothing
+    /// re-derives this durable fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) digest: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) must_read: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) label: Option<String>,
+    pub(crate) added_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
+}
+
+/// One ref as the `add` command's attach-time sugar carries it (G1: refs
+/// ride the parking gesture). Validated exactly like `AddRef`; the daemon
+/// appends the `add` op and then one `add_ref` per spec under the same
+/// lock, all-or-nothing (any invalid spec refuses the whole park).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgendaRefSpec {
+    pub ref_type: AgendaRefType,
+    pub locator: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub must_read: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 /// Field-level patch of presentation state (umbrella RFC §7.2: `Patch`
 /// carries non-effectful presentation metadata only). Wire semantics follow
 /// JSON merge-patch for `due_ms`: absent = keep, `null` = clear.
@@ -543,6 +636,11 @@ pub enum AgendaCommand {
         /// gate-resolved actor, never as attribution.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        /// Refs attached at park time (G1 sugar): validated like `AddRef`,
+        /// appended as `add_ref` ops after the `add` under one lock,
+        /// all-or-nothing.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        refs: Vec<AgendaRefSpec>,
     },
     Patch {
         id: String,
@@ -643,6 +741,29 @@ pub enum AgendaCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
+    /// Attach a typed reference (G1): a pointer, never content. For file
+    /// refs the daemon digests the file at intake and records the digest
+    /// in the op — the command carries none.
+    AddRef {
+        id: String,
+        ref_type: AgendaRefType,
+        locator: String,
+        #[serde(default)]
+        must_read: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    /// Remove a live ref by its full address (an op; the log keeps
+    /// history).
+    RemoveRef {
+        id: String,
+        ref_type: AgendaRefType,
+        locator: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
     /// Approve the current manifest revision by its digest. **An
     /// owner-surface act** — the tenant edge refuses agent-session, peer,
     /// and unattributed actors with a named denial.
@@ -691,9 +812,9 @@ pub enum AgendaCommand {
 
 impl AgendaItem {
     /// Every session id this item's attribution views reference (birth
-    /// provenance, answer, effect proposals and runs) — the set a display
-    /// surface resolves to conversations and names. Deduplication is the
-    /// caller's concern.
+    /// provenance, answer, effect proposals and runs, session-type refs) —
+    /// the set a display surface resolves to conversations and names.
+    /// Deduplication is the caller's concern.
     pub(crate) fn referenced_session_ids(&self) -> impl Iterator<Item = &str> {
         self.provenance
             .session_id
@@ -707,6 +828,9 @@ impl AgendaItem {
                         .as_ref()
                         .and_then(|run| run.session_id.as_deref()),
                 )
+            }))
+            .chain(self.refs.iter().filter_map(|r| {
+                (r.ref_type == AgendaRefType::Session).then_some(r.locator.as_str())
             }))
     }
 }
@@ -727,7 +851,9 @@ impl AgendaCommand {
             | AgendaCommand::SetBlocker { source, .. }
             | AgendaCommand::ClearBlocker { source, .. }
             | AgendaCommand::AddReliesOn { source, .. }
-            | AgendaCommand::RemoveReliesOn { source, .. } => source.take(),
+            | AgendaCommand::RemoveReliesOn { source, .. }
+            | AgendaCommand::AddRef { source, .. }
+            | AgendaCommand::RemoveRef { source, .. } => source.take(),
             AgendaCommand::Ask { .. }
             | AgendaCommand::ApproveEffect { .. }
             | AgendaCommand::RevokeEffect { .. }
@@ -819,6 +945,25 @@ pub(crate) enum AgendaOp {
         id: String,
         target_id: String,
     },
+    /// Typed reference attached (G1). `digest` (file refs) was minted at
+    /// intake and is recorded here — replay never hashes (§7 purity).
+    AddRef {
+        id: String,
+        ref_type: AgendaRefType,
+        locator: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        must_read: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// Typed reference removed (G1): drops the view ref; history stays.
+    RemoveRef {
+        id: String,
+        ref_type: AgendaRefType,
+        locator: String,
+    },
     ProposeEffect {
         id: String,
         effect_id: String,
@@ -876,6 +1021,8 @@ impl AgendaOp {
             | AgendaOp::ClearBlocker { id, .. }
             | AgendaOp::AddReliesOn { id, .. }
             | AgendaOp::RemoveReliesOn { id, .. }
+            | AgendaOp::AddRef { id, .. }
+            | AgendaOp::RemoveRef { id, .. }
             | AgendaOp::ProposeEffect { id, .. }
             | AgendaOp::ApproveEffect { id, .. }
             | AgendaOp::RevokeEffect { id, .. }
@@ -966,6 +1113,7 @@ pub(crate) fn apply_op(
                     annotations: Vec::new(),
                     blockers: Vec::new(),
                     relies_on: Vec::new(),
+                    refs: Vec::new(),
                 },
             );
             None
@@ -1071,6 +1219,63 @@ pub(crate) fn apply_op(
             if item.relies_on.len() == before {
                 return Some(format!(
                     "remove_relies_on for absent edge {id}→{target_id} ignored"
+                ));
+            }
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::AddRef {
+            id,
+            ref_type,
+            locator,
+            digest,
+            must_read,
+            label,
+        } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("add_ref for unknown {id} ignored"));
+            };
+            if item
+                .refs
+                .iter()
+                .any(|r| r.ref_type == *ref_type && r.locator == *locator)
+            {
+                return Some(format!(
+                    "duplicate {} ref on {id} ignored",
+                    ref_type.as_str()
+                ));
+            }
+            let actor = rec.actor.clone().unwrap_or_default();
+            item.refs.push(AgendaRef {
+                ref_type: *ref_type,
+                locator: locator.clone(),
+                digest: digest.clone(),
+                must_read: *must_read,
+                label: label.clone(),
+                added_ms: at_ms,
+                principal: actor.principal,
+                session_id: actor.session_id,
+                kind: actor.kind,
+                source: rec.source.clone(),
+            });
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::RemoveRef {
+            id,
+            ref_type,
+            locator,
+        } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("remove_ref for unknown {id} ignored"));
+            };
+            let before = item.refs.len();
+            item.refs
+                .retain(|r| !(r.ref_type == *ref_type && r.locator == *locator));
+            if item.refs.len() == before {
+                return Some(format!(
+                    "remove_ref for absent {} ref on {id} ignored",
+                    ref_type.as_str()
                 ));
             }
             item.updated_ms = at_ms;
@@ -2715,5 +2920,231 @@ mod tests {
                 .is_err(),
             "unknown command fields stay rejected at intake"
         );
+    }
+
+    /// G1 fold: refs attach with envelope attribution, duplicates and
+    /// unknown items warn-ignore, removal drops the view ref only.
+    #[test]
+    fn g1_fold_refs_add_remove_and_tolerance() {
+        let mut items = BTreeMap::new();
+        apply_op(
+            &mut items,
+            &rec(
+                1,
+                AgendaOp::Add {
+                    id: "01X".into(),
+                    kind: AgendaKind::Task,
+                    title: "host".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    ask: None,
+                },
+            ),
+        );
+        let add_ref = AgendaOpRecord {
+            v: 1,
+            at_ms: 2,
+            actor: Some(AgendaActor {
+                principal: None,
+                session_id: Some("sess-7".into()),
+                kind: Some("agent_session".into()),
+            }),
+            source: Some("track-g".into()),
+            op: AgendaOp::AddRef {
+                id: "01X".into(),
+                ref_type: AgendaRefType::File,
+                locator: "/work/brief.md".into(),
+                digest: Some("ab".repeat(32)),
+                must_read: true,
+                label: Some("brief".into()),
+            },
+        };
+        assert!(apply_op(&mut items, &add_ref).is_none());
+        let item = &items["01X"];
+        assert_eq!(item.refs.len(), 1);
+        assert_eq!(item.refs[0].session_id.as_deref(), Some("sess-7"));
+        assert_eq!(item.refs[0].source.as_deref(), Some("track-g"));
+        assert!(item.refs[0].must_read);
+        assert_eq!(item.updated_ms, 2);
+
+        // Duplicate address warns and keeps the first; a different type
+        // with the same locator is a different address.
+        assert!(apply_op(&mut items, &add_ref).is_some());
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                3,
+                AgendaOp::AddRef {
+                    id: "01X".into(),
+                    ref_type: AgendaRefType::Url,
+                    locator: "/work/brief.md".into(),
+                    digest: None,
+                    must_read: false,
+                    label: None,
+                },
+            ),
+        )
+        .is_none());
+        assert_eq!(items["01X"].refs.len(), 2);
+
+        // Unknown item and absent ref warn-ignore (foreign log tolerance).
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                4,
+                AgendaOp::AddRef {
+                    id: "01GONE".into(),
+                    ref_type: AgendaRefType::Memory,
+                    locator: "mem-1".into(),
+                    digest: None,
+                    must_read: false,
+                    label: None,
+                },
+            ),
+        )
+        .is_some());
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                5,
+                AgendaOp::RemoveRef {
+                    id: "01X".into(),
+                    ref_type: AgendaRefType::Memory,
+                    locator: "never-attached".into(),
+                },
+            ),
+        )
+        .is_some());
+
+        // Removal drops exactly the addressed ref from the view.
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                6,
+                AgendaOp::RemoveRef {
+                    id: "01X".into(),
+                    ref_type: AgendaRefType::File,
+                    locator: "/work/brief.md".into(),
+                },
+            ),
+        )
+        .is_none());
+        let item = &items["01X"];
+        assert_eq!(item.refs.len(), 1);
+        assert_eq!(item.refs[0].ref_type, AgendaRefType::Url);
+    }
+
+    /// G1 op-line bytes are pinned (the F2 pin's sibling): what these ops
+    /// serialize to is what every future build must keep folding.
+    #[test]
+    fn g1_op_line_formats_are_pinned() {
+        for (record, expected) in [
+            (
+                AgendaOpRecord {
+                    v: 1,
+                    at_ms: 30,
+                    actor: None,
+                    source: None,
+                    op: AgendaOp::AddRef {
+                        id: "01X".into(),
+                        ref_type: AgendaRefType::File,
+                        locator: "/work/brief.md".into(),
+                        digest: Some("0a1b".into()),
+                        must_read: true,
+                        label: Some("brief".into()),
+                    },
+                },
+                r#"{"v":1,"at_ms":30,"op":{"type":"add_ref","id":"01X","ref_type":"file","locator":"/work/brief.md","digest":"0a1b","must_read":true,"label":"brief"}}"#,
+            ),
+            (
+                AgendaOpRecord {
+                    v: 1,
+                    at_ms: 31,
+                    actor: None,
+                    source: None,
+                    op: AgendaOp::AddRef {
+                        id: "01X".into(),
+                        ref_type: AgendaRefType::Url,
+                        locator: "https://example.com/pr/7".into(),
+                        digest: None,
+                        must_read: false,
+                        label: None,
+                    },
+                },
+                r#"{"v":1,"at_ms":31,"op":{"type":"add_ref","id":"01X","ref_type":"url","locator":"https://example.com/pr/7"}}"#,
+            ),
+            (
+                AgendaOpRecord {
+                    v: 1,
+                    at_ms: 32,
+                    actor: None,
+                    source: None,
+                    op: AgendaOp::RemoveRef {
+                        id: "01X".into(),
+                        ref_type: AgendaRefType::Session,
+                        locator: "sess-1".into(),
+                    },
+                },
+                r#"{"v":1,"at_ms":32,"op":{"type":"remove_ref","id":"01X","ref_type":"session","locator":"sess-1"}}"#,
+            ),
+        ] {
+            let line = serde_json::to_string(&record).unwrap();
+            assert_eq!(line, expected);
+            assert_eq!(
+                serde_json::from_str::<AgendaOpRecord>(&line).unwrap(),
+                record
+            );
+        }
+    }
+
+    /// G1 wire commands parse; clients never mint digests; pre-G1 item
+    /// JSON (no `refs`) still deserializes (additive DTO).
+    #[test]
+    fn g1_command_wire_shapes_parse() {
+        for (json, ok) in [
+            (
+                r#"{"op":"add_ref","id":"01X","ref_type":"url","locator":"https://x.dev/pr/1"}"#,
+                true,
+            ),
+            (
+                r#"{"op":"add_ref","id":"01X","ref_type":"file","locator":"/a/b.md","must_read":true,"label":"brief","source":"hook"}"#,
+                true,
+            ),
+            (
+                r#"{"op":"remove_ref","id":"01X","ref_type":"file","locator":"/a/b.md"}"#,
+                true,
+            ),
+            (
+                r#"{"op":"add","kind":"task","title":"t","refs":[{"ref_type":"url","locator":"https://x.dev","must_read":true}]}"#,
+                true,
+            ),
+            // Clients never mint digests — on the command or the spec.
+            (
+                r#"{"op":"add_ref","id":"01X","ref_type":"file","locator":"/a/b.md","digest":"forged"}"#,
+                false,
+            ),
+            (
+                r#"{"op":"add","kind":"task","title":"t","refs":[{"ref_type":"file","locator":"/a","digest":"forged"}]}"#,
+                false,
+            ),
+            // Unknown ref types are rejected at intake (and degrade to a
+            // preserved-skipped line when folded from a foreign log).
+            (
+                r#"{"op":"add_ref","id":"01X","ref_type":"sigil","locator":"x"}"#,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<AgendaCommand>(json).is_ok(),
+                ok,
+                "{json}"
+            );
+        }
+        let legacy_item = r#"{"id":"01X","kind":"task","title":"t","body":"","tags":[],"provenance":{"created_ms":1},"status":"open","updated_ms":1}"#;
+        assert!(serde_json::from_str::<AgendaItem>(legacy_item)
+            .unwrap()
+            .refs
+            .is_empty());
     }
 }

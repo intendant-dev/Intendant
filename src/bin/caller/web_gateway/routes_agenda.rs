@@ -283,6 +283,7 @@ mod tests {
             store
                 .apply_command(
                     crate::agenda::AgendaCommand::Add {
+                        refs: Vec::new(),
                         kind: crate::agenda::AgendaKind::Task,
                         title: format!("item {id}"),
                         body: String::new(),
@@ -370,6 +371,52 @@ pub(crate) async fn agenda_blob_raw_api_response(
         bytes: BytesPayload::InMemory(bytes),
         meta,
     }
+}
+
+/// Transport-neutral core of `GET /api/agenda/items/{item_id}/refs/drift`
+/// (tunnel twin `api_agenda_ref_drift`): re-hash the item's file refs
+/// against their recorded attach digests, on demand. This is the detail
+/// view's expand-time honesty check (G1) — deliberately never computed on
+/// list render, and nothing is stored: the attach-time digest in the log
+/// stays the only durable fact. Digest-less file refs (foreign logs) get
+/// no row — absent data claims nothing.
+pub(crate) async fn agenda_ref_drift_api_response(
+    item_id: &str,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+) -> ApiResponse {
+    let Some(agenda) = agenda_handle(mcp_server).await else {
+        return ApiResponse::json_error(503, "agenda unavailable on this daemon");
+    };
+    let Some(item) = agenda.item_by_id(item_id) else {
+        return ApiResponse::json_error(404, "agenda item not found");
+    };
+    let refs: Vec<serde_json::Value> = item
+        .refs
+        .iter()
+        .filter_map(|r| {
+            let digest = r.digest.as_deref()?;
+            Some(serde_json::json!({
+                "ref_type": r.ref_type.as_str(),
+                "locator": r.locator,
+                "status": crate::agenda::file_ref_drift(&r.locator, digest),
+            }))
+        })
+        .collect();
+    ApiResponse::json(
+        200,
+        JsonBody::Value(serde_json::json!({ "item_id": item.id, "refs": refs })),
+    )
+}
+
+pub(crate) async fn handle_agenda_ref_drift(
+    stream: DemuxStream,
+    item_id: String,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = agenda_ref_drift_api_response(&item_id, mcp_server.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_agenda_blob_raw(

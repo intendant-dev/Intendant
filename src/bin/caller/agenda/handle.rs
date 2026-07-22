@@ -536,6 +536,7 @@ mod tests {
         let item = handle
             .apply(
                 AgendaCommand::Add {
+                    refs: Vec::new(),
                     kind: AgendaKind::Task,
                     title: "park me".into(),
                     body: String::new(),
@@ -595,6 +596,7 @@ mod tests {
         let item = handle
             .apply(
                 AgendaCommand::Add {
+                    refs: Vec::new(),
                     kind: AgendaKind::Task,
                     title: "nightly cert sweep".into(),
                     body: String::new(),
@@ -1058,6 +1060,7 @@ mod tests {
         let plain = handle
             .apply(
                 AgendaCommand::Add {
+                    refs: Vec::new(),
                     kind: AgendaKind::Question,
                     title: "plain?".into(),
                     body: String::new(),
@@ -1197,6 +1200,7 @@ mod tests {
         handle
             .apply(
                 AgendaCommand::Add {
+                    refs: Vec::new(),
                     kind: AgendaKind::Question,
                     title: "plain open".into(),
                     body: String::new(),
@@ -1260,6 +1264,7 @@ mod tests {
         let item = handle
             .apply(
                 AgendaCommand::Add {
+                    refs: Vec::new(),
                     kind: AgendaKind::Task,
                     title: "fix the flaky probe".into(),
                     body: "details in the runbook".into(),
@@ -1364,6 +1369,7 @@ mod tests {
         let item = handle
             .apply(
                 AgendaCommand::Add {
+                    refs: Vec::new(),
                     kind: AgendaKind::Task,
                     title: "sweep the fixtures".into(),
                     body: String::new(),
@@ -1422,6 +1428,7 @@ mod tests {
         let orphan = handle
             .apply(
                 AgendaCommand::Add {
+                    refs: Vec::new(),
                     kind: AgendaKind::Task,
                     title: "orphan item".into(),
                     body: String::new(),
@@ -1453,6 +1460,7 @@ mod tests {
         let item = handle
             .apply(
                 AgendaCommand::Add {
+                    refs: Vec::new(),
                     kind: AgendaKind::Task,
                     title: "weekly digest".into(),
                     body: String::new(),

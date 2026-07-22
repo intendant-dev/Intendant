@@ -1366,6 +1366,7 @@ mod tests {
                 ops,
                 [
                     "add",
+                    "add_ref",
                     "add_relies_on",
                     "annotate",
                     "answer",
@@ -1375,6 +1376,7 @@ mod tests {
                     "complete",
                     "patch",
                     "propose_effect",
+                    "remove_ref",
                     "remove_relies_on",
                     "reopen",
                     "retire",

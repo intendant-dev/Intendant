@@ -705,6 +705,7 @@ mod tests {
             annotations: Vec::new(),
             blockers: Vec::new(),
             relies_on: Vec::new(),
+            refs: Vec::new(),
         }
     }
 
