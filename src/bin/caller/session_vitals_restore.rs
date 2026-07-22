@@ -64,7 +64,7 @@ use crate::types::{
 /// `AppEvent::SessionRecoveredFacts`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RecoveredSessionFacts {
-    /// Backend source ("claude-code", "codex", "kimi") when known — the
+    /// Backend source ("claude-code", "codex", "kimi", "pi") when known — the
     /// membership key that lets a restored session inherit the account's
     /// persisted rate-limit windows.
     pub source: Option<String>,
@@ -547,6 +547,9 @@ pub(crate) fn recovered_facts_from_layers(
             config.kimi_thinking.as_ref(),
             config.kimi_permission_mode.as_ref(),
         ),
+        (AgentBackend::Pi, Some(config)) => {
+            (config.pi_model.as_ref(), config.pi_thinking.as_ref(), None)
+        }
         (_, None) => (None, None, None),
     };
 
@@ -615,6 +618,16 @@ pub(crate) fn recovered_facts_from_layers(
                 config.permission_recovered_at_epoch = stamp_for(true);
             }
         }
+        AgentBackend::Pi => {
+            // Pi's provider/tool process is always supervised through
+            // Intendant's approval extension; unlike the other external
+            // engines this permission vocabulary is an adapter invariant,
+            // not a user-selectable launch field.
+            config.permission_mode =
+                Some(crate::external_agent::pi::PI_PERMISSION_MODE.to_string());
+            config.permission_kind = Some(intendant_core::vitals::PERMISSION_KIND_ASK.to_string());
+            config.permission_recovered_at_epoch = launch_config_as_of_epoch.or(recorded_as_of);
+        }
     }
 
     // Cache + context from the transcript's last usage record.
@@ -642,6 +655,7 @@ fn backend_source_name(backend: &AgentBackend) -> &'static str {
         AgentBackend::ClaudeCode => "claude-code",
         AgentBackend::Codex => "codex",
         AgentBackend::Kimi => "kimi",
+        AgentBackend::Pi => "pi",
     }
 }
 
@@ -903,7 +917,7 @@ pub(crate) fn hydrate_resumed_session_vitals(
                         .and_then(|transcript| latest_recorded_session_facts(&transcript))
                 }
             }
-            // Codex/Kimi: launch-config layer only (transcript extractors
+            // Codex/Kimi/Pi: launch-config layer only (transcript extractors
             // are a flagged follow-up).
             _ => None,
         };
@@ -1192,11 +1206,12 @@ mod tests {
         assert!((context.usage_pct - 25.0).abs() < 0.01);
     }
 
-    /// Codex/Kimi launch-config layers map their own vocabulary
-    /// (sandbox·approval join, kimi thinking-as-effort) with recovered
-    /// stamps; no transcript layer exists for them yet.
+    /// Codex/Kimi/Pi launch-config layers map their own vocabulary
+    /// (sandbox·approval join, thinking-as-effort, Pi's fixed Intendant
+    /// approval gate) with recovered stamps; no transcript layer exists
+    /// for them yet.
     #[test]
-    fn layer_merge_codex_and_kimi_config_layers() {
+    fn layer_merge_codex_kimi_and_pi_config_layers() {
         let config = SessionAgentConfig {
             codex_model: Some("gpt-5.5-codex".into()),
             codex_reasoning_effort: Some("high".into()),
@@ -1234,6 +1249,30 @@ mod tests {
             facts.config.permission_kind.as_deref(),
             Some(intendant_core::vitals::PERMISSION_KIND_BYPASS)
         );
+
+        let config = SessionAgentConfig {
+            pi_model: Some("openai-codex/gpt-5.6-sol".into()),
+            pi_thinking: Some("high".into()),
+            ..Default::default()
+        };
+        let facts = recovered_facts_from_layers(&AgentBackend::Pi, Some(&config), Some(11), None);
+        assert_eq!(facts.source.as_deref(), Some("pi"));
+        assert_eq!(
+            facts.config.model.as_deref(),
+            Some("openai-codex/gpt-5.6-sol")
+        );
+        assert_eq!(facts.config.effort.as_deref(), Some("high"));
+        assert_eq!(
+            facts.config.permission_mode.as_deref(),
+            Some(crate::external_agent::pi::PI_PERMISSION_MODE)
+        );
+        assert_eq!(
+            facts.config.permission_kind.as_deref(),
+            Some(intendant_core::vitals::PERMISSION_KIND_ASK)
+        );
+        assert!(!facts.config.permission_echoed);
+        assert_eq!(facts.config.model_recovered_at_epoch, Some(11));
+        assert_eq!(facts.config.permission_recovered_at_epoch, Some(11));
 
         // No layers at all: only the source remains, and the emission is
         // still useful (account-limit membership).

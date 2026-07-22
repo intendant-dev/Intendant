@@ -36,6 +36,7 @@ const APPROVE_ONCE: &str = "Approve once";
 const APPROVE_SESSION: &str = "Approve this tool for session";
 const DENY: &str = "Deny";
 const MAX_PREVIEW_CHARS: usize = 2_000;
+pub(crate) const PI_PERMISSION_MODE: &str = "intendant-gated";
 
 /// The only extension admitted into a supervised Pi process. Extension
 /// discovery is disabled on argv, so neither a project checkout nor the
@@ -322,9 +323,10 @@ impl PiAgent {
                         .thinking
                         .clone()
                         .or_else(|| self.launch.thinking.clone()),
-                    permission_mode: Some("intendant-gated".to_string()),
+                    permission_mode: Some(PI_PERMISSION_MODE.to_string()),
                     permission_kind: Some(intendant_core::vitals::PERMISSION_KIND_ASK.to_string()),
                     permission_echoed: echoed,
+                    ..Default::default()
                 },
             });
         }
@@ -1071,11 +1073,12 @@ impl PiReader {
                         facts: crate::types::SessionConfigVitals {
                             model: state.model.clone(),
                             effort: state.thinking.clone(),
-                            permission_mode: Some("intendant-gated".to_string()),
+                            permission_mode: Some(PI_PERMISSION_MODE.to_string()),
                             permission_kind: Some(
                                 intendant_core::vitals::PERMISSION_KIND_ASK.to_string(),
                             ),
                             permission_echoed: true,
+                            ..Default::default()
                         },
                     });
                 }
