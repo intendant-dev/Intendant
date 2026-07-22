@@ -83,6 +83,13 @@ pub struct SessionSupervisorConfig {
     /// in-flight while asserting what the intake still serves. None in
     /// production (zero cost).
     pub launch_gate_for_tests: Option<tokio::sync::watch::Receiver<bool>>,
+    /// The daemon's agenda authority, when this process runs one (the
+    /// gateway shapes wire it through). The ask-delivery arm records
+    /// whether a recorded answer reached a live asking session
+    /// (`record_ask_delivery` — the "answered · awaiting pickup" marker).
+    /// `None` (hermetic tests, shapes without an agenda) skips the marker
+    /// write-back, never the delivery itself.
+    pub agenda: Option<Arc<crate::agenda::AgendaHandle>>,
 }
 
 #[derive(Clone)]
@@ -865,6 +872,7 @@ mod tests {
             git_vitals_targets: None,
             hosted_control_cert_dir: None,
             launch_gate_for_tests: None,
+            agenda: None,
         })
     }
 

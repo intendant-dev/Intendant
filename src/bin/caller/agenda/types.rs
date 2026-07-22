@@ -107,6 +107,15 @@ pub struct AgendaAnswer {
     /// in logs written by older builds, which skip it on read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) structured: Option<AgendaAskResolution>,
+    /// Whether this answer's delivery attempt reached a live asking
+    /// session (fold view of the daemon-authored `record_ask_delivery`
+    /// op; ask-backed items only). `Some(false)` marks an answer nobody
+    /// heard — surfaces render it "answered · awaiting pickup"; a later
+    /// successful successor delivery flips it true. Additive: `None` on
+    /// answers that predate the marker and in logs written by older
+    /// builds (no chip either way — absent data claims nothing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) delivered: Option<bool>,
 }
 
 /// The full Ask v2 payload carried by a parked rich question: the wire
@@ -816,6 +825,19 @@ pub(crate) enum AgendaOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+    /// Daemon-authored ask-delivery write-back (the session supervisor's
+    /// delivery arm only — no command twin, like `record_occurrence`):
+    /// whether the recorded answer reached a live asking session (or its
+    /// resume-lineage successor). `session_id` is the receiving session
+    /// when delivered — history for the log; the fold keeps only the
+    /// boolean on [`AgendaAnswer::delivered`]. Older builds skip the whole
+    /// line by the usual forward-compat rule.
+    RecordAskDelivery {
+        id: String,
+        delivered: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
 }
 
 impl AgendaOp {
@@ -837,7 +859,8 @@ impl AgendaOp {
             | AgendaOp::ProposeEffect { id, .. }
             | AgendaOp::ApproveEffect { id, .. }
             | AgendaOp::RevokeEffect { id, .. }
-            | AgendaOp::RecordOccurrence { id, .. } => id,
+            | AgendaOp::RecordOccurrence { id, .. }
+            | AgendaOp::RecordAskDelivery { id, .. } => id,
         }
     }
 }
@@ -1213,6 +1236,9 @@ pub(crate) fn apply_op(
                         session_id: actor.session_id,
                         kind: actor.kind,
                         structured: structured.clone(),
+                        // Delivery is a later fact: the supervisor's
+                        // delivery arm records it as its own op.
+                        delivered: None,
                     });
                     // A reply resolves the question (an earlier dismissal
                     // is history the answer supersedes).
@@ -1226,6 +1252,22 @@ pub(crate) fn apply_op(
                     Some(format!("answer on resolved {id} ignored"))
                 }
             }
+        }
+        AgendaOp::RecordAskDelivery { id, delivered, .. } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("record_ask_delivery for unknown {id} ignored"));
+            };
+            // The marker annotates the CURRENT answer. Reopen cleared the
+            // answer view (the log keeps both as history), so a marker
+            // arriving after a reopen has nothing to annotate.
+            let Some(answer) = item.answer.as_mut() else {
+                return Some(format!(
+                    "record_ask_delivery on {id} without a current answer ignored"
+                ));
+            };
+            answer.delivered = Some(*delivered);
+            item.updated_ms = at_ms;
+            None
         }
         AgendaOp::Dismiss { id, action } => {
             let Some(item) = items.get_mut(id) else {
@@ -1695,6 +1737,159 @@ mod tests {
         );
         let back: AgendaOpRecord = serde_json::from_str(&line).unwrap();
         assert_eq!(back, record);
+    }
+
+    /// The ask-delivery marker fold: a `record_ask_delivery` op annotates
+    /// the CURRENT answer (`Some(false)` = recorded but unheard), a later
+    /// op flips it (a successor delivery succeeding), and the marker never
+    /// applies without an answer to annotate — unknown items, unanswered
+    /// questions, and post-reopen items all warn-and-skip. Reopen clears
+    /// the marker with the answer view it rides on.
+    #[test]
+    fn ask_delivery_marker_folds_flips_and_requires_an_answer() {
+        let delivery = |at_ms: u64, delivered: bool, session: Option<&str>| {
+            rec(
+                at_ms,
+                AgendaOp::RecordAskDelivery {
+                    id: "q".into(),
+                    delivered,
+                    session_id: session.map(str::to_string),
+                },
+            )
+        };
+        let mut items = BTreeMap::new();
+        // Unknown item: warn, nothing applied.
+        assert!(apply_op(&mut items, &delivery(1, false, None)).is_some());
+
+        apply_op(
+            &mut items,
+            &rec(
+                2,
+                AgendaOp::Add {
+                    id: "q".into(),
+                    kind: AgendaKind::Question,
+                    title: "Which grid?".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    ask: None,
+                },
+            ),
+        );
+        // No answer yet: warn, nothing applied.
+        assert!(apply_op(&mut items, &delivery(3, false, None)).is_some());
+
+        apply_op(
+            &mut items,
+            &rec(
+                4,
+                AgendaOp::Answer {
+                    id: "q".into(),
+                    text: "A".into(),
+                    structured: None,
+                },
+            ),
+        );
+        assert_eq!(
+            items["q"].answer.as_ref().unwrap().delivered,
+            None,
+            "an answer claims nothing about delivery until the write-back"
+        );
+        assert!(apply_op(&mut items, &delivery(5, false, None)).is_none());
+        assert_eq!(items["q"].answer.as_ref().unwrap().delivered, Some(false));
+        assert_eq!(items["q"].updated_ms, 5);
+
+        // A later successful successor delivery flips the marker.
+        assert!(apply_op(&mut items, &delivery(6, true, Some("sess-successor"))).is_none());
+        assert_eq!(items["q"].answer.as_ref().unwrap().delivered, Some(true));
+
+        // Reopen clears the marker with the answer it annotates; a stale
+        // marker arriving afterwards has nothing to annotate.
+        apply_op(&mut items, &rec(7, AgendaOp::Reopen { id: "q".into() }));
+        assert!(items["q"].answer.is_none());
+        assert!(apply_op(&mut items, &delivery(8, true, None)).is_some());
+    }
+
+    /// Pins the ask-delivery op's durable line format (additive to v1;
+    /// older builds skip the line, newer answers without the marker fold
+    /// `delivered: None`).
+    #[test]
+    fn record_ask_delivery_line_format_is_pinned() {
+        let record = AgendaOpRecord {
+            v: 1,
+            at_ms: 9,
+            actor: None,
+            source: None,
+            op: AgendaOp::RecordAskDelivery {
+                id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                delivered: true,
+                session_id: Some("sess-successor".into()),
+            },
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        assert_eq!(
+            line,
+            r#"{"v":1,"at_ms":9,"op":{"type":"record_ask_delivery","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","delivered":true,"session_id":"sess-successor"}}"#
+        );
+        let back: AgendaOpRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, record);
+
+        // The undelivered form omits the absent session (additive field).
+        let undelivered = AgendaOpRecord {
+            op: AgendaOp::RecordAskDelivery {
+                id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                delivered: false,
+                session_id: None,
+            },
+            ..record
+        };
+        assert_eq!(
+            serde_json::to_string(&undelivered).unwrap(),
+            r#"{"v":1,"at_ms":9,"op":{"type":"record_ask_delivery","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","delivered":false}}"#
+        );
+    }
+
+    /// DTO forward-compat for the marker: an answer serialized by an older
+    /// build (no `delivered` field) deserializes to `None`, and a `None`
+    /// marker stays off the wire (the answered-item pin above carries no
+    /// `delivered` key).
+    #[test]
+    fn answer_without_delivered_field_deserializes_to_none() {
+        let answer: AgendaAnswer =
+            serde_json::from_str(r#"{"text":"A","at_ms":2}"#).unwrap();
+        assert_eq!(answer.delivered, None);
+        assert!(!serde_json::to_string(&answer).unwrap().contains("delivered"));
+
+        let marked = AgendaAnswer {
+            delivered: Some(false),
+            ..answer
+        };
+        let wire = serde_json::to_string(&marked).unwrap();
+        assert!(wire.contains(r#""delivered":false"#), "{wire}");
+        let back: AgendaAnswer = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.delivered, Some(false));
+    }
+
+    /// The dashboard's "answered · awaiting pickup" chip renders from
+    /// exactly this DTO contract: a DONE, ask-backed item whose answer
+    /// carries `delivered === false` (absent = pre-marker history = no
+    /// chip). Pinned against the built SPA so a vocabulary change that
+    /// forgets the frontend fails here instead of shipping as drift (the
+    /// derive-don't-mirror parity pattern).
+    #[test]
+    fn awaiting_pickup_chip_condition_is_pinned_in_app_html() {
+        let app = include_str!("../../../../static/app.html");
+        for marker in [
+            "item.status === 'done' && item.ask && item.answer",
+            "item.answer.delivered === false",
+            "answered · awaiting pickup",
+            "agenda-chip pickup",
+        ] {
+            assert!(
+                app.contains(marker),
+                "app.html lost the awaiting-pickup chip marker {marker:?}"
+            );
+        }
     }
 
     /// Pins the `--source` envelope field (additive to v1): recorded

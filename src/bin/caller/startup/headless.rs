@@ -404,6 +404,7 @@ pub(crate) async fn run_headless_mode(
     // presence is disabled, agent_state is a fresh empty snapshot (no
     // live updates), but context_injection is still wired through.
     let mut headless_peer_registry: Option<peer::PeerRegistry> = None;
+    let mut headless_agenda: Option<Arc<crate::agenda::AgendaHandle>> = None;
     let headless_shared_session: Option<web_gateway::SharedActiveSession> = if use_web {
         let (transcriber, transcriber_err) =
             startup::wiring::build_transcriber(&project.config.transcription);
@@ -444,6 +445,7 @@ pub(crate) async fn run_headless_mode(
         )?;
         eprintln!("{}", gateway.log_line);
         headless_peer_registry = Some(gateway.peer_registry.clone());
+        headless_agenda = gateway.agenda.clone();
         Some(gateway.shared_session)
     } else {
         None
@@ -531,6 +533,7 @@ pub(crate) async fn run_headless_mode(
                     git_vitals_targets: vitals_git_targets.clone(),
                     hosted_control_cert_dir: Some(crate::startup::installed_access_cert_dir()),
                     launch_gate_for_tests: None,
+                    agenda: headless_agenda.clone(),
                 },
             )
             .spawn_foreground_listener(session_id.clone()),

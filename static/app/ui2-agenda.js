@@ -1194,12 +1194,20 @@ function agendaRenderTab() {
     const dismissedChip = item.status === 'open' && item.dismissed
       ? `<span class="agenda-chip dismissed" title="${escapeHtml(agendaDismissedTip(item.dismissed))}">dismissed · still open</span>`
       : '';
+    // Answered ask whose delivery reached no session (the daemon recorded
+    // `answer.delivered: false`): a quiet marker that the reply sits here
+    // unheard — the next session's agenda check is the pickup path.
+    // Pre-marker history (no `delivered` field) claims nothing.
+    const pickupChip = item.status === 'done' && item.ask && item.answer
+      && item.answer.delivered === false
+      ? '<span class="agenda-chip pickup" title="The answer was recorded, but the asking session was gone and no successor was live. The next session’s agenda check picks it up.">answered · awaiting pickup</span>'
+      : '';
     return `<div class="agenda-item" data-status="${escapeHtml(item.status)}">
       <div class="agenda-item-head">
         ${agendaGlyph(item.status, item.kind)}
         <span class="agenda-item-kind">${escapeHtml(item.kind)}</span>
         <span class="agenda-item-title">${escapeHtml(item.title)}</span>
-        ${blockedChip}${dismissedChip}${agendaDueChip(item)}${tags}
+        ${blockedChip}${dismissedChip}${pickupChip}${agendaDueChip(item)}${tags}
       </div>
       ${body}${answerBlock}${agendaThreadBlock(item)}${agendaEffectBlock(item)}
       <div class="agenda-item-foot">

@@ -1256,15 +1256,21 @@ impl SessionSupervisor {
     /// lane user messages ride (the session's `follow_up_tx`, drained at
     /// turn boundaries: a busy session queues it, an idle session starts
     /// its next turn with it) under the same addressing resolution
-    /// `route_follow_up` uses. Nothing here widens autonomy.
+    /// `route_follow_up` uses, extended across the asker's RESUME LINEAGE
+    /// ([`Self::resolve_ask_delivery_entry`]) so a daemon restart between
+    /// park and answer does not orphan the delivery. Nothing here widens
+    /// autonomy, and nothing ever delivers to a session that is not the
+    /// asker's identity-successor.
     ///
-    /// Quiet by design on every miss: a live blocking waiter returns the
-    /// outcome inline (`inline_waiter`), an unattributed item has no
-    /// asker, and a GONE session gets nothing — the item holds the
-    /// answer and the session-start agenda ritual reads it. Only the
-    /// daemon log records the skip; no dashboard warning, no
-    /// FollowUpStatus, because an answer arriving after its asker ended
-    /// is a normal outcome, not an error.
+    /// Misses stay off the dashboards' warning surfaces (no LogEntry, no
+    /// FollowUpStatus — an answer arriving after its asker ended is a
+    /// normal outcome, not an error), but an ANSWER that reached no
+    /// session is not silent either: the item's answer is marked
+    /// undelivered (`record_ask_delivery` — the "answered · awaiting
+    /// pickup" chip) and one info-urgency notification tells the owner it
+    /// was recorded unheard. The session-start agenda ritual remains the
+    /// pickup path. A live blocking waiter returns the outcome inline
+    /// (`inline_waiter`) — that IS delivery, recorded as such.
     pub(crate) async fn deliver_agenda_ask_outcome(
         &self,
         item: crate::agenda::AgendaItem,
@@ -1272,41 +1278,32 @@ impl SessionSupervisor {
         inline_waiter: bool,
     ) {
         if inline_waiter {
+            if action == "answer" {
+                self.record_ask_delivery(&item, true, item.provenance.session_id.clone());
+            }
             return;
         }
-        let Some(asker) = item.provenance.session_id.clone() else {
-            return;
-        };
         let Some(text) = crate::agenda::ask_outcome_delivery_text(&item, action) else {
             return;
         };
-        // The same live-session resolution route_follow_up performs:
-        // alias-aware lookup, then the persisted-external re-resolution
-        // for an external asker whose live wrapper re-registered.
-        let lookup = |state: &SupervisorState, requested: &str| {
-            let target = state
-                .resolve_session_id(requested)
-                .unwrap_or_else(|| requested.to_string());
-            state
-                .sessions
-                .get(&target)
-                .map(|s| (target.clone(), s.source.clone(), s.follow_up_tx.clone()))
-        };
-        let entry = { lookup(&*self.state.lock().await, &asker) };
-        let entry = match entry {
-            Some(entry) => Some(entry),
-            None => match self.resolve_persisted_external_managed_id(&asker).await {
-                Some(live_id) => lookup(&*self.state.lock().await, &live_id),
-                None => None,
-            },
+        let asker = item.provenance.session_id.clone();
+        let entry = match asker.as_deref() {
+            Some(asker) => self.resolve_ask_delivery_entry(asker).await,
+            // An unattributed item has no asker (parked without a session
+            // binding): nothing to deliver to, by construction.
+            None => None,
         };
         let Some((managed_id, source, tx)) = entry else {
             eprintln!(
-                "[supervisor] agenda ask {} resolved ({action}); asking session {} is gone — \
-                 nothing delivered (the item holds the outcome)",
+                "[supervisor] agenda ask {} resolved ({action}); asking session {} has no \
+                 live successor — nothing delivered (the item holds the outcome)",
                 item.id,
-                short_session(&asker),
+                asker
+                    .as_deref()
+                    .map(short_session)
+                    .unwrap_or_else(|| "<unattributed>".to_string()),
             );
+            self.surface_undelivered_answer(&item, action);
             return;
         };
         let msg = FollowUpMessage::text(text).for_target(Some(managed_id.clone()));
@@ -1318,6 +1315,7 @@ impl SessionSupervisor {
                 source,
                 short_session(&managed_id),
             );
+            self.surface_undelivered_answer(&item, action);
         } else {
             eprintln!(
                 "[supervisor] agenda ask {} outcome ({action}) queued for {} session {} \
@@ -1325,6 +1323,130 @@ impl SessionSupervisor {
                 item.id,
                 source,
                 short_session(&managed_id),
+            );
+            if action == "answer" {
+                self.record_ask_delivery(&item, true, Some(managed_id));
+            }
+        }
+    }
+
+    /// The live managed session an agenda-ask outcome for `asker` delivers
+    /// to, in preference order:
+    ///
+    /// 1. the asker itself under this daemon's alias groups (the exact
+    ///    resolution steers and follow-ups use);
+    /// 2. the persisted-external re-resolution (`route_follow_up`'s second
+    ///    pass): the asker's own dir names its backend conversation, whose
+    ///    live wrapper re-registered under an alias;
+    /// 3. the resume lineage: every backend conversation the asker's OWN
+    ///    records tie it to ([`recorded_backend_conversations_in_home`]),
+    ///    resolved to the newest LIVE wrapper of that conversation via the
+    ///    wrapper index (preference order: active first, most recent
+    ///    first) — the successor pass that survives a daemon restart.
+    ///
+    /// Never an unrelated session: every candidate derives from the
+    /// asker's own aliases, its own session dir's identity facts, or
+    /// wrapper-index records of its backend conversation, and successor
+    /// candidates must match the recorded source and accept input.
+    async fn resolve_ask_delivery_entry(
+        &self,
+        asker: &str,
+    ) -> Option<(String, String, mpsc::Sender<FollowUpMessage>)> {
+        let lookup = |state: &SupervisorState, requested: &str| {
+            let target = state
+                .resolve_session_id(requested)
+                .unwrap_or_else(|| requested.to_string());
+            state
+                .sessions
+                .get(&target)
+                .map(|s| (target.clone(), s.source.clone(), s.follow_up_tx.clone()))
+        };
+        if let Some(entry) = lookup(&*self.state.lock().await, asker) {
+            return Some(entry);
+        }
+        if let Some(live_id) = self.resolve_persisted_external_managed_id(asker).await {
+            if let Some(entry) = lookup(&*self.state.lock().await, &live_id) {
+                return Some(entry);
+            }
+        }
+        let home = self.logs_home();
+        // Candidate ids per conversation: the backend id itself (a live
+        // successor is aliased or keyed under it once it announces), then
+        // every indexed wrapper of the conversation, newest first.
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for (source, backend_id) in recorded_backend_conversations_in_home(&home, asker) {
+            candidates.push((source.clone(), backend_id.clone()));
+            for record in crate::external_wrapper_index::wrappers_for(&home, &source, &backend_id)
+            {
+                candidates.push((source.clone(), record.intendant_session_id));
+            }
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        let state = self.state.lock().await;
+        for (source, candidate) in candidates {
+            let Some(target) = state.resolve_session_id(&candidate) else {
+                continue;
+            };
+            let Some(session) = state.sessions.get(&target) else {
+                continue;
+            };
+            if session.source == source && managed_session_accepts_external_input(session) {
+                return Some((target, session.source.clone(), session.follow_up_tx.clone()));
+            }
+        }
+        None
+    }
+
+    /// Gap-2 surfacing for an answer that reached no session: mark the
+    /// item's answer undelivered (the "answered · awaiting pickup" chip)
+    /// and tell the owner once, at info urgency, content-free-ish — the
+    /// item title rides, the answer text never does. Non-answer outcomes
+    /// (dismissals, administrative closes) carry nothing awaiting pickup
+    /// and stay daemon-log-only as before.
+    fn surface_undelivered_answer(&self, item: &crate::agenda::AgendaItem, action: &str) {
+        if action != "answer" {
+            return;
+        }
+        self.record_ask_delivery(item, false, None);
+        self.config.bus.send(AppEvent::UserNotification {
+            session_id: None,
+            id: format!("agenda-answer-pickup-{}", item.id),
+            title: Some("Answer recorded — awaiting pickup".to_string()),
+            text: format!(
+                "\"{}\": no session was listening; the answer is saved on agenda item {} \
+                 and the next session's agenda check will find it.",
+                item.title, item.id
+            ),
+            urgency: crate::types::NotificationUrgency::Info,
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        });
+    }
+
+    /// Record the delivery write-back on an answered ask-backed item
+    /// (`answer.delivered`), when this process holds the agenda
+    /// authority. Best-effort: a failed write logs and never blocks
+    /// delivery.
+    fn record_ask_delivery(
+        &self,
+        item: &crate::agenda::AgendaItem,
+        delivered: bool,
+        session_id: Option<String>,
+    ) {
+        let Some(agenda) = self.config.agenda.as_ref() else {
+            return;
+        };
+        if item.ask.is_none() {
+            return;
+        }
+        if let Err(err) = agenda.record_ask_delivery(&item.id, delivered, session_id) {
+            eprintln!(
+                "[supervisor] recording ask delivery for {}: {err}",
+                item.id
             );
         }
     }
@@ -1922,6 +2044,71 @@ mod tests {
         ))
     }
 
+    /// A supervisor holding the agenda authority (the gateway wiring), so
+    /// the delivery arm's `record_ask_delivery` write-back is observable.
+    /// `logs_home` replaces the hermetic scratch when a test lays down
+    /// persisted lineage (wrapper dirs + index) to resolve against.
+    fn test_supervisor_with_agenda(
+        project_root: PathBuf,
+        bus: EventBus,
+        agenda: Arc<crate::agenda::AgendaHandle>,
+        logs_home: Option<PathBuf>,
+    ) -> SessionSupervisor {
+        let mut config = (*test_supervisor(project_root, bus).config).clone();
+        config.agenda = Some(agenda);
+        if let Some(home) = logs_home {
+            config.logs_home_override = Some(home);
+        }
+        SessionSupervisor::new(config)
+    }
+
+    /// Poll the item until the daemon-recorded delivery marker matches
+    /// (the write-back lands just after the follow-up send, off this
+    /// test's await chain).
+    async fn wait_for_delivery_marker(
+        agenda: &crate::agenda::AgendaHandle,
+        item_id: &str,
+        expected: Option<bool>,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let marker = agenda
+                .item_by_id(item_id)
+                .and_then(|item| item.answer.as_ref().and_then(|answer| answer.delivered));
+            if marker == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "delivery marker never became {expected:?} (currently {marker:?})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Every "answered · awaiting pickup" notification currently on the
+    /// drained event list: `(id, title, text, urgency)` tuples.
+    fn pickup_notifications(events: &[AppEvent]) -> Vec<(String, String, String, String)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::UserNotification {
+                    id,
+                    title,
+                    text,
+                    urgency,
+                    ..
+                } if id.starts_with("agenda-answer-pickup-") => Some((
+                    id.clone(),
+                    title.clone().unwrap_or_default(),
+                    text.clone(),
+                    urgency.as_str().to_string(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn park_one(
         agenda: &crate::agenda::AgendaHandle,
         question: &str,
@@ -2023,14 +2210,25 @@ mod tests {
         assert!(other_rx.try_recv().is_err());
     }
 
-    /// A dead asking session gets NOTHING — no delivery, no dashboard
-    /// warning, no follow-up status; the item holds the answer. Ordering
-    /// is proven by a live sentinel follow-up processed after the outcome.
+    /// A dead asking session with no live successor gets no DELIVERY (and
+    /// the answer never reroutes to an unrelated session), but it is not
+    /// silent either: the item's answer is marked undelivered — the
+    /// "answered · awaiting pickup" chip — and exactly one info-urgency
+    /// notification tells the owner the answer was recorded unheard (item
+    /// title only, never the answer text). Warning surfaces stay quiet: no
+    /// LogEntry, no FollowUpStatus. Ordering is proven by a live sentinel
+    /// follow-up processed after the outcome.
     #[tokio::test]
-    async fn agenda_answer_for_dead_session_delivers_nothing() {
+    async fn agenda_answer_for_dead_session_marks_awaiting_pickup() {
         let bus = EventBus::new();
         let dir = tempfile::tempdir().unwrap();
-        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let agenda = test_agenda(dir.path(), &bus);
+        let supervisor = test_supervisor_with_agenda(
+            PathBuf::from("/tmp/project"),
+            bus.clone(),
+            agenda.clone(),
+            None,
+        );
         let (live_tx, mut live_rx) = mpsc::channel(4);
         {
             let mut state = supervisor.state.lock().await;
@@ -2041,12 +2239,11 @@ mod tests {
         let mut bus_rx = bus.subscribe();
         let _loop_handle = supervisor.clone().spawn();
 
-        let agenda = test_agenda(dir.path(), &bus);
         let item = park_one(&agenda, "Anyone home?", Some("sess-gone"));
         agenda
             .answer_ask(
                 item.ask.as_ref().unwrap().ask_id,
-                answer_resolution("Anyone home?", "no"),
+                answer_resolution("Anyone home?", "ANSWER-CONTENT-42"),
             )
             .unwrap();
 
@@ -2067,8 +2264,31 @@ mod tests {
             live_rx.try_recv().is_err(),
             "the dead asker's answer must not reroute to another session"
         );
-        // Quiet by design: no dashboard warning, no follow-up status.
+        // The undelivered marker is recorded on the answer.
+        wait_for_delivery_marker(&agenda, &item.id, Some(false)).await;
+        // Exactly one awaiting-pickup notification, info urgency, item
+        // title but never the answer text; warning surfaces stay quiet.
+        let mut events = Vec::new();
         while let Ok(event) = bus_rx.try_recv() {
+            events.push(event);
+        }
+        let notifications = pickup_notifications(&events);
+        assert_eq!(
+            notifications.len(),
+            1,
+            "exactly one awaiting-pickup notification: {notifications:?}"
+        );
+        let (id, title, text, urgency) = &notifications[0];
+        assert_eq!(id, &format!("agenda-answer-pickup-{}", item.id));
+        assert_eq!(urgency, "info");
+        assert!(title.contains("awaiting pickup"), "{title}");
+        assert!(text.contains("Anyone home?"), "{text}");
+        assert!(text.contains(&item.id), "{text}");
+        assert!(
+            !text.contains("ANSWER-CONTENT-42"),
+            "the answer text must never ride the notification: {text}"
+        );
+        for event in &events {
             match event {
                 AppEvent::FollowUpStatus { text, .. } => {
                     assert_eq!(text.as_deref(), Some("sentinel"), "unexpected status");
@@ -2084,14 +2304,106 @@ mod tests {
         }
     }
 
+    /// The successor pass: an asker id that died in a daemon restart
+    /// resolves through its RESUME LINEAGE — the persisted identity facts
+    /// in its own session dir name its backend conversation, the wrapper
+    /// index maps that conversation to its successor wrapper, and the
+    /// answer delivers to the LIVE successor (marked delivered, no
+    /// awaiting-pickup notification) — never to an unrelated session of
+    /// the same backend.
+    #[tokio::test]
+    async fn agenda_answer_delivers_to_resume_lineage_successor() {
+        let bus = EventBus::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let agenda = test_agenda(dir.path(), &bus);
+        let supervisor = test_supervisor_with_agenda(
+            PathBuf::from("/tmp/project"),
+            bus.clone(),
+            agenda.clone(),
+            Some(home.path().to_path_buf()),
+        );
+
+        // Persisted lineage under the hermetic home: the dead asker
+        // wrapper announced backend conversation thread-b1; a successor
+        // wrapper later announced the SAME conversation (the index demotes
+        // the old record and prefers the successor).
+        let logs = crate::platform::intendant_home_in(home.path()).join("logs");
+        for wrapper in ["wrapper-old", "wrapper-new"] {
+            let mut log = session_log::SessionLog::open(logs.join(wrapper)).unwrap();
+            log.write_meta(None, None);
+            log.session_identity(wrapper, "codex", "thread-b1");
+        }
+
+        let (succ_tx, mut succ_rx) = mpsc::channel(4);
+        let (other_tx, mut other_rx) = mpsc::channel(4);
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut successor = managed_session("wrapper-new", "codex");
+            successor.follow_up_tx = succ_tx;
+            state.sessions.insert("wrapper-new".to_string(), successor);
+            // Same backend, unrelated conversation: must never receive.
+            let mut other = managed_session("wrapper-other", "codex");
+            other.follow_up_tx = other_tx;
+            state.sessions.insert("wrapper-other".to_string(), other);
+        }
+        let mut bus_rx = bus.subscribe();
+        let _loop_handle = supervisor.clone().spawn();
+
+        let item = park_one(&agenda, "Which grid?", Some("wrapper-old"));
+        agenda
+            .answer_ask(
+                item.ask.as_ref().unwrap().ask_id,
+                answer_resolution("Which grid?", "B"),
+            )
+            .unwrap();
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), succ_rx.recv())
+            .await
+            .expect("answer delivered to the lineage successor")
+            .expect("channel open");
+        assert!(
+            delivered.text.starts_with(&format!(
+                "Answer to your parked question \"Which grid?\" (agenda {})",
+                item.id
+            )),
+            "{}",
+            delivered.text
+        );
+        assert_eq!(delivered.target_session_id.as_deref(), Some("wrapper-new"));
+        assert!(
+            other_rx.try_recv().is_err(),
+            "an unrelated session of the same backend must never receive"
+        );
+        // Delivered marker recorded with the receiving session; no
+        // awaiting-pickup notification for a successful delivery.
+        wait_for_delivery_marker(&agenda, &item.id, Some(true)).await;
+        let mut events = Vec::new();
+        while let Ok(event) = bus_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            pickup_notifications(&events).is_empty(),
+            "a delivered answer raises no awaiting-pickup notification"
+        );
+    }
+
     /// An outcome recorded while a live blocking waiter holds the ask is
     /// returned inline by that waiter — the supervisor must not deliver a
-    /// duplicate into the session.
+    /// duplicate into the session. Inline return IS delivery: the marker
+    /// records `delivered: true` and no awaiting-pickup notification
+    /// fires.
     #[tokio::test]
     async fn inline_waiter_outcome_is_not_delivered_twice() {
         let bus = EventBus::new();
         let dir = tempfile::tempdir().unwrap();
-        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let agenda = test_agenda(dir.path(), &bus);
+        let supervisor = test_supervisor_with_agenda(
+            PathBuf::from("/tmp/project"),
+            bus.clone(),
+            agenda.clone(),
+            None,
+        );
         let (asker_tx, mut asker_rx) = mpsc::channel(4);
         {
             let mut state = supervisor.state.lock().await;
@@ -2099,9 +2411,9 @@ mod tests {
             asker.follow_up_tx = asker_tx;
             state.sessions.insert("sess-held".to_string(), asker);
         }
+        let mut bus_rx = bus.subscribe();
         let _loop_handle = supervisor.clone().spawn();
 
-        let agenda = test_agenda(dir.path(), &bus);
         let item = park_one(&agenda, "Held ask?", Some("sess-held"));
         let ask_id = item.ask.as_ref().unwrap().ask_id;
         crate::mcp::register_pending_ask(ask_id);
@@ -2125,6 +2437,15 @@ mod tests {
         assert!(
             asker_rx.try_recv().is_err(),
             "an inline-waiter outcome must not also arrive as a follow-up"
+        );
+        wait_for_delivery_marker(&agenda, &item.id, Some(true)).await;
+        let mut events = Vec::new();
+        while let Ok(event) = bus_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            pickup_notifications(&events).is_empty(),
+            "an inline-returned answer raises no awaiting-pickup notification"
         );
     }
 

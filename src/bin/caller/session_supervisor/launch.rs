@@ -1858,6 +1858,88 @@ pub(crate) fn persisted_external_identity_for_session_in_home(
     Some((identity.source, identity.backend_session_id))
 }
 
+/// Every external backend conversation `session_id` is RECORDED as having
+/// carried, newest first — the durable half of its identity group, used by
+/// the agenda-ask delivery arm to find a resume-lineage successor after a
+/// daemon restart dropped the in-memory aliases. Sources, in order:
+///
+/// - the id itself in backend-conversation form (an ask parked after an
+///   identity upgrade attributes to the thread id);
+/// - the structured `session_identity` facts in the session's OWN log dir
+///   that name it (identity upgrades append several; facts naming other
+///   wrappers — the daemon head-log's bus-tee copies — are excluded, or a
+///   foreign conversation could claim the delivery);
+/// - wrapper-index records stored under the id (covers a dir whose log
+///   predates structured identity events).
+///
+/// Only canonical-shaped identities count. A native session id (stable
+/// across resume, no backend conversation) yields only the id-form
+/// entries, which resolve to nothing downstream — native successors are
+/// the alias map's business.
+pub(crate) fn recorded_backend_conversations_in_home(
+    home: &Path,
+    session_id: &str,
+) -> Vec<(String, String)> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |source: &str, backend_id: &str| {
+        if !external_agent::source_session_id_is_canonical(source, backend_id) {
+            return;
+        }
+        if out
+            .iter()
+            .any(|(s, b)| s == source && b == backend_id)
+        {
+            return;
+        }
+        out.push((source.to_string(), backend_id.to_string()));
+    };
+    for backend in EXTERNAL_BACKENDS {
+        push(backend.as_short_str(), session_id);
+    }
+    if let Some(log_dir) = session_log_dir_for_id_in_home(home, session_id) {
+        let canonical = crate::session_identity::canonical_session_id_from_meta(&log_dir);
+        if let Some(scan) = crate::session_identity::scan_session_dir(&log_dir, session_id) {
+            // Membership, not addressing: `event_names_session` (the
+            // predicate the index writer uses), NEVER `wrapper_matches` —
+            // the addressing predicate accepts ANY event id once the
+            // requested id prefixes the dir's canonical id, which would
+            // adopt the bus-tee copies in a daemon head-session's log.
+            for identity in scan.identities.iter().rev().filter(|identity| {
+                identity.wrapper_id.as_deref().is_some_and(|wrapper_id| {
+                    crate::session_identity::event_names_session(
+                        Some(wrapper_id),
+                        session_id,
+                        canonical.as_deref(),
+                    )
+                })
+            }) {
+                push(&identity.source, &identity.backend_session_id);
+            }
+        }
+    }
+    for backend in EXTERNAL_BACKENDS {
+        let source = backend.as_short_str();
+        for record in crate::external_wrapper_index::wrappers_for_source(home, source) {
+            if record.intendant_session_id == session_id {
+                push(&record.source, &record.backend_session_id);
+            }
+        }
+    }
+    out
+}
+
+/// The three supervisable external backends (no ALL constant exists on
+/// the enum; keep in sync with `AgentBackend`).
+pub(crate) const EXTERNAL_BACKENDS: [external_agent::AgentBackend; 3] = [
+    external_agent::AgentBackend::Codex,
+    external_agent::AgentBackend::ClaudeCode,
+    external_agent::AgentBackend::Kimi,
+];
+
 pub(crate) fn session_log_dir_for_id_in_home(home: &Path, session_id: &str) -> Option<PathBuf> {
     let session_id = session_id.trim();
     if session_id.is_empty() {
@@ -2106,6 +2188,59 @@ mod tests {
         let mut log = session_log::SessionLog::open(wrapper_dir).unwrap();
         log.write_meta(None, Some("old task"));
         log.session_identity(wrapper_id, source, backend_session_id);
+    }
+
+    /// The resume-lineage collector adopts only identities the session's
+    /// OWN records carry: its dir's wrapper-matching identity facts
+    /// (newest first — upgrades supersede) and wrapper-index records
+    /// stored under its id — never the bus-tee copies of OTHER sessions'
+    /// identity events that land in a daemon head-session's log (adopting
+    /// those would let a foreign conversation claim an ask delivery).
+    #[test]
+    fn recorded_backend_conversations_adopt_own_identities_only() {
+        let home = tempfile::tempdir().unwrap();
+
+        // A wrapper with an identity upgrade: two facts, newest first.
+        let wrapper_dir = home.path().join(".intendant").join("logs").join("wrap-1");
+        let mut log = session_log::SessionLog::open(wrapper_dir).unwrap();
+        log.write_meta(None, None);
+        log.session_identity("wrap-1", "claude-code", "thread-old");
+        log.session_identity("wrap-1", "claude-code", "thread-new");
+        drop(log);
+        let conversations = recorded_backend_conversations_in_home(home.path(), "wrap-1");
+        let own: Vec<&(String, String)> = conversations
+            .iter()
+            .filter(|(_, backend_id)| backend_id.as_str() != "wrap-1")
+            .collect();
+        assert_eq!(
+            own,
+            vec![
+                &("claude-code".to_string(), "thread-new".to_string()),
+                &("claude-code".to_string(), "thread-old".to_string()),
+            ],
+            "own facts adopted newest-first; id-form entries aside"
+        );
+
+        // A head-session log carrying a tee copy of ANOTHER wrapper's
+        // identity: the foreign fact must not be adopted.
+        let head_dir = home.path().join(".intendant").join("logs").join("head-1");
+        let mut head = session_log::SessionLog::open(head_dir).unwrap();
+        head.write_meta(None, None);
+        head.session_identity("some-other-wrapper", "codex", "thread-foreign");
+        drop(head);
+        let conversations = recorded_backend_conversations_in_home(home.path(), "head-1");
+        assert!(
+            !conversations
+                .iter()
+                .any(|(_, backend_id)| backend_id.as_str() == "thread-foreign"),
+            "tee-copied foreign identity adopted: {conversations:?}"
+        );
+
+        // An id with no records at all yields only the id-form entries.
+        let bare = recorded_backend_conversations_in_home(home.path(), "sess-native");
+        assert!(bare
+            .iter()
+            .all(|(_, backend_id)| backend_id.as_str() == "sess-native"));
     }
 
     /// The eager resume-identity write lands in the wrapper's own log and
