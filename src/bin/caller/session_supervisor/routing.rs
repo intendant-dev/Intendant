@@ -1145,55 +1145,84 @@ impl SessionSupervisor {
             }
             return;
         }
-        if attachments.is_empty() {
-            let ack_rx = self.config.bus.subscribe();
-            self.config.bus.send(AppEvent::SteerRequested {
-                session_id: event_session_id.clone(),
-                text: text.clone(),
-                id: steer_id.clone(),
-            });
-            if !steer_id.trim().is_empty() {
-                spawn_text_steer_fallback(
-                    self.config.bus.clone(),
-                    ack_rx,
-                    tx,
-                    text,
-                    steer_id,
-                    event_session_id,
-                    Some(managed_id.clone()),
-                );
+        let resolved_attachments = if attachments.is_empty() {
+            UserAttachments::default()
+        } else {
+            let resolved = self
+                .resolve_session_attachments(&attachments, &session_dir, &project_root)
+                .await;
+            if resolved.len() < attachments.len() {
+                self.warn(&format!(
+                    "Only resolved {} of {} steer attachment(s) for {} session {}",
+                    resolved.len(),
+                    attachments.len(),
+                    source,
+                    short_session(&managed_id)
+                ));
             }
+            resolved
+        };
+
+        // Attachment-bearing steer without a correlation id: the native
+        // mid-turn lane's ack protocol can't be tracked without an id, so
+        // the one lane that needs no ack — queue as the next turn — is the
+        // only safe carrier for the attachment payload. (Frontends always
+        // mint ids; this is the conservative corner.)
+        if !resolved_attachments.is_empty() && steer_id.trim().is_empty() {
+            let msg = FollowUpMessage::steer(text, resolved_attachments, steer_id.clone())
+                .for_target(requested_id.clone().or(Some(managed_id.clone())));
+            if tx.send(msg).await.is_err() {
+                self.warn(&format!(
+                    "Steer dropped: {} session {} in {} is not accepting input",
+                    source,
+                    short_session(&managed_id),
+                    project_root.display()
+                ));
+                return;
+            }
+            self.config.bus.send(AppEvent::SteerQueued {
+                session_id: requested_id.or(Some(managed_id)),
+                id: steer_id,
+                reason: "attachments are queued for the next turn".to_string(),
+            });
             return;
         }
 
-        let resolved_attachments = self
-            .resolve_session_attachments(&attachments, &session_dir, &project_root)
-            .await;
-        if resolved_attachments.len() < attachments.len() {
-            self.warn(&format!(
-                "Only resolved {} of {} steer attachment(s) for {} session {}",
-                resolved_attachments.len(),
-                attachments.len(),
-                source,
-                short_session(&managed_id)
-            ));
-        }
-        let msg = FollowUpMessage::steer(text, resolved_attachments, steer_id.clone())
-            .for_target(requested_id.clone().or(Some(managed_id.clone())));
-        if tx.send(msg).await.is_err() {
-            self.warn(&format!(
-                "Steer dropped: {} session {} in {} is not accepting input",
-                source,
-                short_session(&managed_id),
-                project_root.display()
-            ));
-            return;
-        }
-        self.config.bus.send(AppEvent::SteerQueued {
-            session_id: requested_id.or(Some(managed_id)),
-            id: steer_id,
-            reason: "attachments are queued for the next turn".to_string(),
+        // The attachment-bearing steer rule (deliberate, keep coherent with
+        // `docs/src/external-agent-orchestration.md` "Attachment delivery"):
+        // a steer is a steer — it goes down the native mid-turn lane like
+        // any text steer, never parked for the turn boundary just because
+        // it carries files. The deliverable text is composed ONCE here —
+        // stored-path prelude (`[attachment stored: …]` per file) + the
+        // user's text — and every downstream lane carries it verbatim: the
+        // native mid-turn injection (text-only wire, so the stored path IS
+        // the image delivery mid-turn), the context-injection queue, and
+        // the no-active-turn immediate follow-up. Only if no lane acks
+        // does the fallback below queue the steer as the next turn, where
+        // the resolved attachments additionally ride as content blocks
+        // (the boundary lane can carry pixels; the send site re-derives
+        // the same prelude from the attachments, so the fallback passes
+        // the ORIGINAL text to avoid doubling it).
+        let steer_text =
+            external_agent::text_with_attachments_prelude(&text, &resolved_attachments.items);
+        let ack_rx = self.config.bus.subscribe();
+        self.config.bus.send(AppEvent::SteerRequested {
+            session_id: event_session_id.clone(),
+            text: steer_text,
+            id: steer_id.clone(),
         });
+        if !steer_id.trim().is_empty() {
+            spawn_steer_fallback(
+                self.config.bus.clone(),
+                ack_rx,
+                tx,
+                text,
+                resolved_attachments,
+                steer_id,
+                event_session_id,
+                Some(managed_id.clone()),
+            );
+        }
     }
 
     pub(crate) async fn route_cancel_steer(
@@ -1917,11 +1946,22 @@ pub(crate) fn emit_follow_up_status(
     });
 }
 
-pub(crate) fn spawn_text_steer_fallback(
+/// Arm the steer's queue-as-follow-up fallback: if no delivery lane acks
+/// the steer within [`TEXT_STEER_FALLBACK_TIMEOUT`], it becomes the target
+/// session's next turn. `text` is the user's ORIGINAL text and
+/// `attachments` the resolved attachment payload — the boundary send site
+/// derives the stored-path prelude from the attachments itself, so passing
+/// the composed steer text here would double the prelude. For a steer that
+/// carried attachments, this fallback is also where the pixels ride: the
+/// native mid-turn lane is text-only (stored-path lines), the boundary
+/// lane delivers the content blocks too.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
+pub(crate) fn spawn_steer_fallback(
     bus: EventBus,
     mut ack_rx: tokio::sync::broadcast::Receiver<AppEvent>,
     follow_up_tx: mpsc::Sender<FollowUpMessage>,
     text: String,
+    attachments: UserAttachments,
     steer_id: String,
     target_session_id: Option<String>,
     resolved_session_id: Option<String>,
@@ -1969,7 +2009,7 @@ pub(crate) fn spawn_text_steer_fallback(
             }
         }
 
-        let msg = FollowUpMessage::steer(text, UserAttachments::default(), steer_id.clone())
+        let msg = FollowUpMessage::steer(text, attachments, steer_id.clone())
             .for_target(target_session_id.clone());
         match follow_up_tx.send(msg).await {
             Ok(()) => bus.send(AppEvent::SteerQueued {
@@ -3378,6 +3418,173 @@ mod tests {
         }
     }
 
+    /// Scaffolding for the attachment-steer tests: a temp project store
+    /// with one committed image upload, and a supervisor managing one
+    /// session rooted there. Returns everything a route_steer call needs.
+    async fn attachment_steer_rig(
+        tmp: &tempfile::TempDir,
+        bus: EventBus,
+    ) -> (
+        SessionSupervisor,
+        mpsc::Receiver<FollowUpMessage>,
+        crate::upload_store::UploadDescriptor,
+    ) {
+        use std::io::Write as _;
+        let project_root = tmp.path().join("project");
+        let session_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let mut blob = tempfile::NamedTempFile::new().unwrap();
+        blob.write_all(b"png bytes").unwrap();
+        blob.flush().unwrap();
+        let descriptor = crate::upload_store::commit_upload(
+            blob,
+            "shot.png",
+            "image/png",
+            9,
+            crate::upload_store::UploadDestination::Task,
+            &session_dir,
+            "sess-1",
+            &crate::global_store::StoreScope::Project(project_root.clone()),
+        )
+        .unwrap();
+
+        let supervisor = test_supervisor(project_root.clone(), bus);
+        let (tx, rx) = mpsc::channel(1);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "parent-thread".to_string(),
+                ManagedSession {
+                    session_id: "parent-thread".to_string(),
+                    source: "claude-code".to_string(),
+                    name: None,
+                    phase: "thinking".to_string(),
+                    project_root,
+                    session_dir,
+                    follow_up_tx: tx,
+                    approval_registry: event::ApprovalRegistry::default(),
+                    instance_id: 0,
+                    finished_rx: None,
+                    depth: 0,
+                    sub_agent_children: None,
+                },
+            );
+        }
+        (supervisor, rx, descriptor)
+    }
+
+    /// An attachment-bearing steer takes the native mid-turn lane like any
+    /// text steer — parked-for-boundary is no longer its fate — and the
+    /// requested text is the SAME composition every other lane produces:
+    /// stored-path prelude (greppable `[attachment stored: …]` line naming
+    /// the upload-store file) followed by the user's text.
+    #[tokio::test]
+    async fn attachment_steer_takes_native_lane_with_stored_path_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let (supervisor, mut rx, descriptor) = attachment_steer_rig(&tmp, bus.clone()).await;
+
+        supervisor
+            .route_steer(
+                Some("parent-thread".to_string()),
+                "PS: forgot to attach the screenshot".to_string(),
+                Some("steer-att-1".to_string()),
+                vec![format!("upload:{}", descriptor.id)],
+            )
+            .await;
+
+        // Lane parity pin: the steer text equals the one composition every
+        // delivery lane derives from the same attachment (built here from
+        // the store descriptor via the same builder).
+        let expected = external_agent::text_with_attachments_prelude(
+            "PS: forgot to attach the screenshot",
+            &[external_agent::AgentAttachment::Image(
+                external_agent::AgentImageAttachment::from_frame_path(
+                    descriptor.path.clone(),
+                    String::new(),
+                    "image/png".to_string(),
+                ),
+            )],
+        );
+        match bus_rx.recv().await.expect("steer requested event") {
+            AppEvent::SteerRequested {
+                session_id,
+                text,
+                id,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("parent-thread"));
+                assert_eq!(id, "steer-att-1");
+                assert_eq!(text, expected, "steer text must be the shared composition");
+                assert!(
+                    text.contains(&format!(
+                        "{}{}]",
+                        external_agent::ATTACHMENT_STORED_MARKER,
+                        descriptor.path.display()
+                    )),
+                    "steer text must name the stored path: {text}"
+                );
+                assert!(text.ends_with("PS: forgot to attach the screenshot"));
+            }
+            other => panic!("expected steer requested event, got {other:?}"),
+        }
+
+        // No lane acked: the fallback queues the steer as the next turn,
+        // carrying the ORIGINAL text (the boundary send site re-derives the
+        // prelude) plus the resolved attachment so the pixels ride the
+        // boundary lane.
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
+            .await
+            .expect("unacknowledged attachment steer should queue as follow-up")
+            .expect("follow-up channel should stay open");
+        assert_eq!(msg.text, "PS: forgot to attach the screenshot");
+        assert_eq!(msg.steer_id.as_deref(), Some("steer-att-1"));
+        assert_eq!(msg.attachments.items.len(), 1);
+        match &msg.attachments.items[0] {
+            external_agent::AgentAttachment::Image(img) => {
+                assert_eq!(img.local_path.as_deref(), Some(descriptor.path.as_path()));
+            }
+            other => panic!("expected resolved image attachment, got {other:?}"),
+        }
+    }
+
+    /// A natively acked attachment steer must not also queue a boundary
+    /// follow-up — mid-turn text+path delivery IS the delivery (the stored
+    /// file is the pixel source), same dedup contract as text steers.
+    #[tokio::test]
+    async fn attachment_steer_native_ack_prevents_follow_up_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let (supervisor, mut rx, descriptor) = attachment_steer_rig(&tmp, bus.clone()).await;
+
+        supervisor
+            .route_steer(
+                Some("parent-thread".to_string()),
+                "see the attached screenshot".to_string(),
+                Some("steer-att-2".to_string()),
+                vec![format!("upload:{}", descriptor.id)],
+            )
+            .await;
+
+        match bus_rx.recv().await.expect("steer requested event") {
+            AppEvent::SteerRequested { id, .. } => assert_eq!(id, "steer-att-2"),
+            other => panic!("expected steer requested event, got {other:?}"),
+        }
+        bus.send(AppEvent::SteerAccepted {
+            session_id: Some("parent-thread".to_string()),
+            id: "steer-att-2".to_string(),
+            reason: "claude-code accepted the steer".to_string(),
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "acknowledged attachment steer should not also queue a follow-up"
+        );
+    }
+
     #[tokio::test]
     async fn kimi_child_steer_slash_never_targets_parent_session() {
         let bus = EventBus::new();
@@ -3491,11 +3698,12 @@ mod tests {
         let mut bus_rx = bus.subscribe();
         let (tx, mut rx) = mpsc::channel(1);
 
-        spawn_text_steer_fallback(
+        spawn_steer_fallback(
             bus.clone(),
             bus.subscribe(),
             tx,
             "check the usage chips".to_string(),
+            UserAttachments::default(),
             "steer-alias-1".to_string(),
             Some("backend-native-id".to_string()),
             Some("wrapper-id".to_string()),
