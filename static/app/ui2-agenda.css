@@ -273,6 +273,14 @@ html.ui-v2 .agenda-chip.dismissed {
   background: none;
   border: 1px dashed var(--line);
 }
+/* Answered ask nobody heard (answer.delivered === false on a done item):
+   quiet like the dismissal marker, tinted so an unread reply stands out
+   from plain history. */
+html.ui-v2 .agenda-chip.pickup {
+  color: var(--sky);
+  background: none;
+  border: 1px dashed color-mix(in srgb, var(--sky, #7dcfff) 45%, transparent);
+}
 html.ui-v2 .agenda-card-q {
   font-family: var(--mono);
   font-size: 11px;

@@ -117,14 +117,28 @@ The working doctrine:
 **Answer delivery.** Resolving an ask-backed item — a structured rail
 answer, a plain-text answer typed on the Agenda tab, or a `complete`/
 `retire` that closes it unanswered — broadcasts the outcome. A live
-blocking waiter returns it inline; otherwise, if the asking session is
-still alive, the daemon delivers the outcome **into that session as a user
-message at a turn boundary** (the follow-up lane — plain input text, never
-an instruction channel). Either way the item keeps the durable record: the
-joined text summary every text surface reads, plus the structured
-resolution (`answer.structured` — per-question answers, selected option
-labels, follow-ups, and preview-anchored notes). A session that parked a
-question and died reads the reply from the item next time.
+blocking waiter returns it inline; otherwise the daemon delivers the
+outcome **into the asking session as a user message at a turn boundary**
+(the follow-up lane — plain input text, never an instruction channel).
+Delivery resolves the asker across its **resume lineage**: the live alias
+groups steers use, then the persisted identity facts and wrapper-index
+records of the asker's own backend conversation, so a daemon restart
+between park and answer reaches the conversation's live successor wrapper
+— and never any unrelated session. Either way the item keeps the durable
+record: the joined text summary every text surface reads, plus the
+structured resolution (`answer.structured` — per-question answers,
+selected option labels, follow-ups, and preview-anchored notes).
+
+When an **answer reaches no session** — the asker died with no live
+successor — it is recorded, not silent: the daemon appends a
+`record_ask_delivery` op (daemon-authored, like `record_occurrence`)
+marking `answer.delivered: false`, raises one info-urgency notification
+(item title only, never answer text), and the item card wears a quiet
+"answered · awaiting pickup" chip. A successful injection (or an inline
+waiter return) records `delivered: true` instead. The session-start
+agenda ritual remains the pickup path: a session that parked a question
+and died reads the reply from the item next time (reading does not flip
+the marker; only a later successful delivery does).
 
 **Dismissal is not resolution.** Skipping or denying the rail card records
 a dismissal marker (`dismissed`: verb, time, actor) and clears every

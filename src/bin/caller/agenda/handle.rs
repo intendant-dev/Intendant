@@ -439,6 +439,30 @@ impl AgendaHandle {
         announced
     }
 
+    /// Daemon-internal ask-delivery write-back (the session supervisor's
+    /// delivery arm only — no command twin): records whether the answered
+    /// ask reached a live asking session on `answer.delivered`, and
+    /// broadcasts the change so the "answered · awaiting pickup" chip
+    /// updates live.
+    pub(crate) fn record_ask_delivery(
+        &self,
+        item_id: &str,
+        delivered: bool,
+        session_id: Option<String>,
+    ) -> Result<AgendaItem, AgendaError> {
+        let (item, counts) = {
+            let mut store = self.lock();
+            let item = store.record_ask_delivery(item_id, delivered, session_id, now_ms())?;
+            let counts = store.counts();
+            (item, counts)
+        };
+        self.bus.send(AppEvent::AgendaChanged {
+            item: item.clone(),
+            counts,
+        });
+        Ok(item)
+    }
+
     /// Daemon-internal occurrence write-back (scheduler only): appends the
     /// `record_occurrence` op and broadcasts the change.
     pub(crate) fn record_occurrence(

@@ -355,6 +355,7 @@ mod tests {
             session_id: None,
             kind: None,
             structured,
+            delivered: None,
         }
     }
 
