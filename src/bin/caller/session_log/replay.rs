@@ -957,6 +957,17 @@ pub fn session_log_entry_to_app_event(
                 capabilities,
             })
         }
+        "session_pr_published" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let pr = data.and_then(|d| d.get("pr")).and_then(|v| {
+                serde_json::from_value::<crate::types::SessionPublishedPr>(v.clone()).ok()
+            })?;
+            Some(AppEvent::SessionPrPublished { session_id, pr })
+        }
         "session_goal" => {
             let session_id = data
                 .and_then(|d| d.get("session_id"))
@@ -2224,6 +2235,15 @@ mod tests {
                 token_budget: Some(1000),
             }),
         );
+        log.session_pr_published(
+            "child",
+            &crate::types::SessionPublishedPr {
+                provider: "github".to_string(),
+                repo: "o/r".to_string(),
+                number: "7".to_string(),
+                url: Some("https://github.com/o/r/pull/7".to_string()),
+            },
+        );
         drop(log);
 
         let identity = read_last_event(&log_dir, "session_identity");
@@ -2309,6 +2329,17 @@ mod tests {
                 assert_eq!(goal.elapsed_seconds, Some(42));
             }
             other => panic!("expected SessionGoal, got {:?}", other),
+        }
+
+        let pr = read_last_event(&log_dir, "session_pr_published");
+        match session_log_entry_to_app_event(&pr, &log_dir).unwrap() {
+            AppEvent::SessionPrPublished { session_id, pr } => {
+                assert_eq!(session_id, "child");
+                assert_eq!(pr.repo, "o/r");
+                assert_eq!(pr.number, "7");
+                assert_eq!(pr.url.as_deref(), Some("https://github.com/o/r/pull/7"));
+            }
+            other => panic!("expected SessionPrPublished, got {:?}", other),
         }
     }
 

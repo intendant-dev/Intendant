@@ -1733,6 +1733,7 @@ function loadOlderRemoteSessionWindowEntries(win) {
       applySessionIdentitiesFromReplayEntries(entries);
       applyExternalIdentitiesFromLogEntries(entries);
       applySessionGoalsFromReplayEntries(entries);
+      applySessionPrsFromReplayEntries(entries);
       const records = entries
         .map(entry => sessionWindowRecordFromReplayEntry(entry, win.sessionId))
         .filter(Boolean);

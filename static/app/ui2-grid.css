@@ -372,8 +372,9 @@ html.ui-v2 .session-window-status.done {
   background: rgba(var(--green-rgb), .12);
 }
 
-/* — goal / tier / vitals — */
+/* — goal / pr / tier / vitals — */
 html.ui-v2 .session-window-goal,
+html.ui-v2 .session-window-pr,
 html.ui-v2 .session-window-tier,
 html.ui-v2 .session-window-vitals {
   font-family: var(--mono);

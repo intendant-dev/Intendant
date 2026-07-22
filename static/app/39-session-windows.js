@@ -668,6 +668,62 @@ function renderSessionWindowGoal(win, goal) {
   return status === 'active';
 }
 
+// Published-PR chip: latest PR (+ count when several). Hyperlinks ONLY
+// when the daemon validated the URL (pr.url present) — an unvalidated
+// entry still renders as text, never as a link.
+function renderSessionWindowPr(win, prs) {
+  if (!win?.prChip) return;
+  const list = Array.isArray(prs) ? prs.filter((p) => p && p.number) : [];
+  if (!list.length) {
+    win.prChip.className = 'session-window-pr hidden';
+    win.prChip.textContent = '';
+    win.prChip.removeAttribute('href');
+    win.prChip.title = '';
+    return;
+  }
+  const latest = list[list.length - 1];
+  const extra = list.length > 1 ? ` +${list.length - 1}` : '';
+  win.prChip.className = 'session-window-pr';
+  win.prChip.textContent = `PR #${latest.number}${extra}`;
+  if (latest.url) win.prChip.setAttribute('href', latest.url);
+  else win.prChip.removeAttribute('href');
+  win.prChip.title = list
+    .map((p) => `${p.repo || p.provider || ''}#${p.number}${p.url ? `\n${p.url}` : ''}`)
+    .join('\n');
+}
+
+function applySessionPrPublished(raw = {}) {
+  const data = raw?.data && typeof raw.data === 'object' ? raw.data : raw;
+  const sid = String(data?.session_id || '').trim();
+  const pr = data?.pr;
+  if (!sid || !pr || !pr.number) return;
+  for (const id of sessionGoalUpdateIds(sid)) {
+    const meta = { ...(sessionMetadataById.get(id) || {}) };
+    const list = Array.isArray(meta.publishedPrs) ? meta.publishedPrs.slice() : [];
+    const idx = list.findIndex((p) => p.repo === pr.repo && p.number === pr.number);
+    if (idx >= 0) list[idx] = pr;
+    else {
+      if (list.length >= 16) list.shift();
+      list.push(pr);
+    }
+    meta.publishedPrs = list;
+    sessionMetadataById.set(id, meta);
+    if (sessionWindows.has(id)) {
+      const win = sessionWindows.get(id);
+      win.metadataSignature = '';
+      updateSessionWindow(id, meta);
+    }
+  }
+}
+
+function applySessionPrsFromReplayEntries(entries) {
+  if (!Array.isArray(entries)) return;
+  for (const entry of entries) {
+    if (entry?.event !== 'session_pr_published') continue;
+    applySessionPrPublished(entry);
+  }
+}
+
 function renderSessionWindowTier(win) {
   if (!win?.tier) return;
   const sid = win.sessionId || '';
@@ -4516,6 +4572,7 @@ async function syncExternalSessionWindowTranscript(sessionId) {
     applySessionIdentitiesFromReplayEntries(entries);
     applyExternalIdentitiesFromLogEntries(entries);
     applySessionGoalsFromReplayEntries(entries);
+    applySessionPrsFromReplayEntries(entries);
     const targetSid = sessionWindowTargetForLogSession(record.sessionId) || record.sessionId;
     const targetWin = sessionWindows.get(targetSid) || record.win;
     updateSessionWindowRemotePageState(targetWin, data, record.source, record.sessionId);
@@ -4590,6 +4647,7 @@ async function hydrateRestoredSessionWindow(win, record) {
     applySessionIdentitiesFromReplayEntries(entries);
     applyExternalIdentitiesFromLogEntries(entries);
     applySessionGoalsFromReplayEntries(entries);
+    applySessionPrsFromReplayEntries(entries);
     const targetSid = sessionWindowTargetForLogSession(sid) || sid;
     const targetWin = sessionWindows.get(targetSid) || (win.el?.isConnected ? win : null);
     updateSessionWindowRemotePageState(targetWin, data, source, sid);

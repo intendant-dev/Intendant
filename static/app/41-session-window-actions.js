@@ -248,6 +248,12 @@ function ensureSessionWindow(sessionId, meta = {}) {
   const goalText = document.createElement('span');
   goalText.className = 'session-window-goal-text';
   goal.appendChild(goalText);
+  // Published-PR chip: an <a> when the daemon validated the URL, text
+  // otherwise (renderSessionWindowPr strips href on unvalidated entries).
+  const prChip = document.createElement('a');
+  prChip.className = 'session-window-pr hidden';
+  prChip.target = '_blank';
+  prChip.rel = 'noopener noreferrer';
   const tier = document.createElement('span');
   tier.className = 'session-window-tier hidden';
   const vitals = document.createElement('span');
@@ -315,6 +321,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
   factsRow.appendChild(vitals);
   factsRow.appendChild(tier);
   factsRow.appendChild(goal);
+  factsRow.appendChild(prChip);
   const pathRow = document.createElement('div');
   pathRow.className = 'session-window-path-row';
   const pathIcon = document.createElement('span');
@@ -452,6 +459,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     status,
     goal,
     goalText,
+    prChip,
     tier,
     vitals,
     healthSlot,
@@ -677,6 +685,7 @@ function updateSessionWindow(sessionId, meta = {}) {
   // elapsed-time repaints for the rest (re-rendering EVERY window's goal
   // per metadata update was the waste).
   ensureSessionGoalTickerArmed(renderSessionWindowGoal(win, meta.goal || null));
+  renderSessionWindowPr(win, meta.publishedPrs || null);
   renderSessionWindowTier(win);
   renderSessionWindowVitals(win, (sessionMetadataById.get(sid) || {}).vitals || meta.vitals || null);
   updateSessionWindowActionMenuVisibility(sid);

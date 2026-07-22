@@ -1335,6 +1335,29 @@ body.context-focus-active {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Published-PR chip: same pill family as goal/tier (fact line); renders
+   as a link only when the daemon validated the URL (href present). */
+.session-window-pr {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--mauve) 30%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--mauve) 9%, transparent);
+  color: var(--mauve);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.35;
+  white-space: nowrap;
+  text-decoration: none;
+}
+.session-window-pr[href]:hover {
+  border-color: color-mix(in srgb, var(--mauve) 55%, transparent);
+  background: color-mix(in srgb, var(--mauve) 16%, transparent);
+}
+.session-window-pr.hidden { display: none; }
 .session-window-goal.paused,
 .session-window-goal.usage-limited {
   border-color: color-mix(in srgb, var(--peach) 30%, transparent);

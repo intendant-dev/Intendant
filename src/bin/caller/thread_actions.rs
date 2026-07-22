@@ -4010,6 +4010,44 @@ pub(crate) fn emit_external_session_goal(
     }
 }
 
+/// Validate a backend-reported PR URL for hyperlinking: https with a
+/// host, nothing else. The backend gates on GitHub/GHE shapes already,
+/// but its output is agent-adjacent data — a prompt-injected session
+/// could emit an arbitrary string through this channel, so the dashboard
+/// only ever links what passed this check (`None` keeps the chip
+/// renderable without a link).
+pub(crate) fn validated_pr_url(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw.trim()).ok()?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none_or(str::is_empty) {
+        return None;
+    }
+    Some(parsed.into())
+}
+
+/// Fold a backend PR-publication notice into the session's sticky
+/// display state (`SessionGoal`-shaped: log-persisted, replayed, chip in
+/// the dashboard header).
+pub(crate) fn emit_external_pr_published(
+    config: &DrainConfig<'_>,
+    session_id: Option<String>,
+    provider: String,
+    url: String,
+    repo: String,
+    identifier: String,
+) {
+    if let Some(session_id) = session_id.or_else(|| config.session_id.clone()) {
+        config.bus.send(AppEvent::SessionPrPublished {
+            session_id,
+            pr: types::SessionPublishedPr {
+                provider,
+                repo,
+                number: identifier,
+                url: validated_pr_url(&url),
+            },
+        });
+    }
+}
+
 /// A backend announced its native conversation id after thread start
 /// (Claude Code reveals it on the first stdout message of the first turn).
 /// Upgrade Intendant's identity and resume records from the placeholder
@@ -4252,6 +4290,10 @@ pub(crate) fn handle_idle_codex_subagent_event(
             // Same gating as FileActivity: a subagent thread's commit
             // must not retarget or wake the supervising session's git
             // probes.
+        }
+        external_agent::AgentEvent::CodeChangePublished { .. } => {
+            // Same gating: a subagent thread's PR must not decorate the
+            // supervising session's chip.
         }
         external_agent::AgentEvent::ToolOutputDelta {
             item_id,
@@ -7611,5 +7653,25 @@ mod tests {
         }
 
         fission_lifecycle::drop_pending_deliveries(&[doomed_group]);
+    }
+
+    /// The backend's PR URL is agent-adjacent data: only https-with-host
+    /// survives to a hyperlink; everything else strips to None so the
+    /// chip renders unlinked.
+    #[test]
+    fn validated_pr_url_accepts_only_https_with_host() {
+        assert_eq!(
+            validated_pr_url("https://github.com/o/r/pull/7").as_deref(),
+            Some("https://github.com/o/r/pull/7")
+        );
+        assert_eq!(
+            validated_pr_url("  https://ghe.corp.example/o/r/pull/9  ").as_deref(),
+            Some("https://ghe.corp.example/o/r/pull/9")
+        );
+        assert_eq!(validated_pr_url("http://github.com/o/r/pull/7"), None);
+        assert_eq!(validated_pr_url("javascript:alert(1)"), None);
+        assert_eq!(validated_pr_url("file:///etc/passwd"), None);
+        assert_eq!(validated_pr_url("not a url"), None);
+        assert_eq!(validated_pr_url(""), None);
     }
 }
