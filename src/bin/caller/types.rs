@@ -151,7 +151,7 @@ pub struct SessionPublishedPr {
 // existing `crate::types::Session*Vitals` paths keep working.
 pub use intendant_core::vitals::{
     SessionActivityState, SessionActivityVitals, SessionCacheVitals, SessionConfigVitals,
-    SessionGitVitals, SessionLimitWindow, SessionVitals,
+    SessionContextVitals, SessionGitVitals, SessionLimitWindow, SessionVitals,
 };
 
 /// Normalized region in a shared display view.

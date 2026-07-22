@@ -1029,6 +1029,7 @@ pub(crate) fn codex_thread_settings_config_facts(
         permission_mode,
         permission_kind,
         permission_echoed,
+        ..Default::default()
     };
     (facts != crate::types::SessionConfigVitals::default()).then_some(facts)
 }

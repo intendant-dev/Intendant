@@ -51,7 +51,7 @@ pub const CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER: &str = "### Intendant Supervisi
 /// session whose model has a larger window (1M-beta) and >200k tokens on
 /// board, the FIRST turn's mid-turn meter divides by this default and can
 /// read >100% until that first result corrects it.
-const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
+pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 
 /// Placeholder thread id used until Claude Code reveals the native session
 /// id (it stamps one on every stdout message once the first turn begins).
@@ -729,7 +729,11 @@ fn context_window_from_model_usage(model_usage: &serde_json::Value, model: &str)
 /// divided by the 200k default — the footprint/window clamp then pins the
 /// context meter at exactly 100% for the whole session (observed live on a
 /// claude-fable-5 session at 442k real footprint).
-fn claude_model_context_window(model: &str) -> Option<u64> {
+///
+/// `pub(crate)`: the vitals restore hydrator
+/// (`session_vitals_restore.rs`) sizes a recovered transcript footprint
+/// against this same table.
+pub(crate) fn claude_model_context_window(model: &str) -> Option<u64> {
     const ONE_M: u64 = 1_000_000;
     let model = model.trim();
     for (prefix, window) in [
@@ -1285,6 +1289,30 @@ impl CcReader {
         }
     }
 
+    /// First-hand effort echo: adopt the CLI's own statement of the
+    /// session's effort level and surface it as config facts when it
+    /// actually changed. Probed on `system:init` (`effort` /
+    /// `reasoningEffort`) and on assistant envelopes' top-level `effort`
+    /// — the transcript records the latter on every assistant line, but
+    /// the LIVE stream envelope does not carry it as of 2.1.217 (probed
+    /// live: assistant envelope keys are message / parent_tool_use_id /
+    /// request_id / session_id / timestamp / type / uuid), so the
+    /// assistant arm is defensive future-proofing. Until a CLI states
+    /// one, the launch `--effort` value seeds the config facts at spawn —
+    /// effort is never inferred from output.
+    fn note_effort_echo(&mut self, effort: &str, out: &mut CcLineOutcome) {
+        if self.effort_echo.as_deref() == Some(effort) {
+            return;
+        }
+        self.effort_echo = Some(effort.to_string());
+        out.events.push(AgentEvent::ConfigFacts {
+            facts: crate::types::SessionConfigVitals {
+                effort: Some(effort.to_string()),
+                ..Default::default()
+            },
+        });
+    }
+
     /// Route one wire observation through the shared activity machine and
     /// queue the resulting vitals snapshot (if any) for the drain.
     fn observe_activity(&self, obs: ActivityObs, out: &mut CcLineOutcome) {
@@ -1709,9 +1737,7 @@ impl CcReader {
             }
         }
         // First-hand effort: adopt the CLI's own echo if an init ever
-        // states one (2.1.2xx doesn't; the launch `--effort` value seeds
-        // the config facts at spawn — effort is never inferred from
-        // output).
+        // states one (2.1.2xx doesn't — see `note_effort_echo`).
         if let Some(effort) = msg
             .get("effort")
             .or_else(|| msg.get("reasoningEffort"))
@@ -1719,15 +1745,7 @@ impl CcReader {
             .map(str::trim)
             .filter(|e| !e.is_empty())
         {
-            if self.effort_echo.as_deref() != Some(effort) {
-                self.effort_echo = Some(effort.to_string());
-                out.events.push(AgentEvent::ConfigFacts {
-                    facts: crate::types::SessionConfigVitals {
-                        effort: Some(effort.to_string()),
-                        ..Default::default()
-                    },
-                });
-            }
+            self.note_effort_echo(effort, out);
         }
         if !self.init_logged {
             self.init_logged = true;
@@ -2060,6 +2078,20 @@ impl CcReader {
         // `message_delta`/`result` usage the snapshots are built from.
         if let Some(usage) = msg.get("message").and_then(|m| m.get("usage")) {
             self.note_cache_ttl_flavor(usage);
+        }
+        // Top-level `effort` on the envelope, main thread only (a Task
+        // child can run its own settings): first-hand echo when a CLI
+        // ever states it — 2.1.217's live envelopes don't (transcript
+        // records do); see `note_effort_echo`.
+        if child_scope.is_none() {
+            if let Some(effort) = msg
+                .get("effort")
+                .and_then(|e| e.as_str())
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+            {
+                self.note_effort_echo(effort, out);
+            }
         }
         let Some(content) = msg
             .get("message")
@@ -3782,6 +3814,7 @@ impl ExternalAgent for ClaudeCodeAgent {
                 permission_kind: intendant_core::vitals::claude_permission_kind(&permission_mode)
                     .map(str::to_string),
                 permission_echoed: false,
+                ..Default::default()
             },
         });
 
@@ -4849,6 +4882,45 @@ mod tests {
         let facts = config_facts_of(&out);
         assert_eq!(facts.len(), 1, "model switch emits");
         assert_eq!(facts[0].model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    /// The defensive assistant-envelope effort arm: a top-level `effort`
+    /// on a main-thread assistant envelope becomes a first-hand effort
+    /// echo (change-edged), while sidechain (Task-child) envelopes and
+    /// effort-less envelopes — the live 2.1.217 shape, probed — claim
+    /// nothing.
+    #[test]
+    fn assistant_envelope_effort_echo_is_defensive_and_change_edged() {
+        let mut reader = test_reader();
+        // The live 2.1.217 shape: no top-level effort → no claim.
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]},"session_id":"s1"}"#,
+        );
+        assert!(
+            config_facts_of(&out).is_empty(),
+            "absent effort claims nothing"
+        );
+
+        // A future CLI mirroring its transcript record: adopt the echo.
+        let envelope = r#"{"type":"assistant","effort":"xhigh","message":{"content":[{"type":"text","text":"hi"}]},"session_id":"s1"}"#;
+        let out = reader.process_line(envelope);
+        let facts = config_facts_of(&out);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].effort.as_deref(), Some("xhigh"));
+
+        // Change edge: the same value stays quiet.
+        let out = reader.process_line(envelope);
+        assert!(config_facts_of(&out).is_empty(), "re-echo stays quiet");
+
+        // Sidechain envelopes (Task children run their own settings)
+        // never claim the session's effort.
+        let out = reader.process_line(
+            r#"{"type":"assistant","effort":"low","parent_tool_use_id":"toolu_child","message":{"content":[{"type":"text","text":"hi"}]},"session_id":"s1"}"#,
+        );
+        assert!(
+            config_facts_of(&out).is_empty(),
+            "sidechain effort is the child's, not the session's"
+        );
     }
 
     /// The 2.1.201 status channel echoes the live permission mode after an

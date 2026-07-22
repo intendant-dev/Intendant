@@ -874,6 +874,7 @@ mod tests {
                     limits: Vec::new(),
                     activity: None,
                     config: None,
+                    context: None,
                 },
             },
             crate::types::OutboundEvent::Status {

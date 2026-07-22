@@ -1187,6 +1187,7 @@ pub(crate) async fn run_agent_loop(
                 permission_mode: Some(autonomy_level),
                 permission_kind: Some(intendant_core::vitals::PERMISSION_KIND_AUTONOMY.to_string()),
                 permission_echoed: true,
+                ..Default::default()
             },
         });
     }
