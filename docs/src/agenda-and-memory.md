@@ -188,6 +188,40 @@ daemon ships the same pure helper for ctl and tests), never stored, never
 put on the wire, and never a notification trigger: the reminder lane
 remains the only thing that fires.
 
+### Typed references (G1)
+
+Items are handoff units: a fresh session should be able to pick one up
+cold. Bodies that duplicate files go stale, so items carry **refs** —
+typed POINTERS, never content (`add_ref` / `remove_ref`, ordinary
+attributed ops):
+
+| type | locator | resolves to |
+|---|---|---|
+| `file` | absolute path | the file, plus the drift check below |
+| `memory` | Memory claim id | the Explorer claim |
+| `session` | conversation id | the Sessions row (F1 join) |
+| `url` | http(s) URL | a plain link |
+
+A ref is addressed by `(type, locator)` — no minted id; changing its
+`must_read` flag or label is remove + add, and removals are ops (the log
+keeps history). Refs attach on any status (`ctl agenda ref <id>
+<locator>`, or `--ref` at `add` time — repeatable, all-or-nothing), are
+capped at 32 live per item, and render as chips with **must-reads
+prominent**. A must-read is a pointer the reading agent weighs, not a
+standing order — refs, labels, and locators are data under the same
+doctrine as bodies.
+
+**File refs carry attach-time truth.** The daemon hashes the file at
+intake (bounded at 64 MiB — refs point at working artifacts, not
+archives; a missing file refuses the attach) and records the full sha256
+in the op; replay never re-hashes. The detail surface re-checks **on
+demand** (`GET /api/agenda/items/{id}/refs/drift`, the card's Verify
+button) and renders "changed since attached" or "missing" honestly —
+never on list render, and nothing derived is ever stored. **No blobs,
+ever**: no file contents, copies, or uploads enter the agenda for refs —
+the preview blob store remains exclusively Ask-v2's (pinned in
+`agenda/blobs.rs`). Digests travel; blobs wouldn't.
+
 ### Due reminders
 
 `due_ms` schedules a notification, not work. The owner controls delivery with

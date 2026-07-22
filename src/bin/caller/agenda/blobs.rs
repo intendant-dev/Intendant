@@ -1,6 +1,13 @@
 //! The agenda-scoped preview blob store — custody for the rendered
 //! preview cards of parked rich asks (ask↔agenda unification, slice 1).
 //!
+//! **Boundary pin (G1 steward rider, 2026-07-22): this store serves Ask-v2
+//! previews EXCLUSIVELY.** Typed references (`refs[]`, G1) never touch it —
+//! a ref is a pointer (locator + attach-time digest), never content: no
+//! file bytes, copies, or uploads enter the agenda for refs, here or in
+//! the op log. If a future feature wants ref-adjacent bytes, that is a new
+//! owner decision, not an extension of this store.
+//!
 //! **Copy, don't reference** (ratified guardrail): at park time preview
 //! bytes are committed HERE, under the agenda's own directory
 //! (`<agenda dir>/blobs/<item id>/`), never referenced from a session

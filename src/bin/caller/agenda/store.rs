@@ -5,9 +5,11 @@
 
 use super::types::{
     apply_op, counts, AgendaActor, AgendaCommand, AgendaCounts, AgendaItem, AgendaOp,
-    AgendaOpRecord, AgendaPatch, AgendaStatus, AGENDA_LOG_VERSION, MAX_ANNOTATIONS_PER_ITEM,
-    MAX_BODY_BYTES, MAX_CRITERION_CHARS, MAX_RELIES_ON_PER_ITEM, MAX_SOURCE_CHARS, MAX_TAGS,
-    MAX_TAG_CHARS, MAX_TITLE_CHARS, MAX_UNCLEARED_BLOCKERS_PER_ITEM,
+    AgendaOpRecord, AgendaPatch, AgendaRefType, AgendaStatus, AGENDA_LOG_VERSION,
+    MAX_ANNOTATIONS_PER_ITEM, MAX_BODY_BYTES, MAX_CRITERION_CHARS, MAX_REFS_PER_ITEM,
+    MAX_REF_FILE_HASH_BYTES, MAX_REF_FILE_LOCATOR_CHARS, MAX_REF_ID_LOCATOR_CHARS,
+    MAX_REF_LABEL_CHARS, MAX_REF_URL_LOCATOR_CHARS, MAX_RELIES_ON_PER_ITEM, MAX_SOURCE_CHARS,
+    MAX_TAGS, MAX_TAG_CHARS, MAX_TITLE_CHARS, MAX_UNCLEARED_BLOCKERS_PER_ITEM,
 };
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -39,7 +41,7 @@ pub(crate) enum AgendaError {
 /// preserved on disk but skipped at load (forward compatibility: a newer
 /// build's vocabulary — effects, journal curation — must not brick an older
 /// daemon's ledger).
-const KNOWN_OPS: [&str; 17] = [
+const KNOWN_OPS: [&str; 19] = [
     "add",
     "patch",
     "complete",
@@ -52,6 +54,8 @@ const KNOWN_OPS: [&str; 17] = [
     "clear_blocker",
     "add_relies_on",
     "remove_relies_on",
+    "add_ref",
+    "remove_ref",
     "propose_effect",
     "approve_effect",
     "revoke_effect",
@@ -266,6 +270,21 @@ impl AgendaStore {
         if let AgendaCommand::Ask { questions } = cmd {
             return self.apply_ask(questions, actor, now_ms);
         }
+        // Park (G1: optionally with attached refs): one `add` plus one
+        // `add_ref` per spec appended under this same lock — its own arm
+        // because one command can map to several ops, all-or-nothing.
+        if let AgendaCommand::Add {
+            kind,
+            title,
+            body,
+            tags,
+            due_ms,
+            source: _,
+            refs,
+        } = cmd
+        {
+            return self.apply_add(kind, title, body, tags, due_ms, refs, actor, source, now_ms);
+        }
         // Owner start-now (F3): two ops appended under this same lock —
         // its own arm because one command maps to a propose+approve pair.
         if let AgendaCommand::StartNow {
@@ -408,6 +427,80 @@ impl AgendaStore {
             None,
             now_ms,
         )
+    }
+
+    /// Park one item, optionally with attached refs (G1's parking-gesture
+    /// sugar). Every ref spec is validated — file digests included —
+    /// BEFORE anything is appended, so a refused ref refuses the whole
+    /// park and strands nothing. The `add` op and one `add_ref` per spec
+    /// then append under the caller's lock with identical attribution.
+    #[allow(clippy::too_many_arguments)] // the park's reviewed fields travel together
+    fn apply_add(
+        &mut self,
+        kind: super::types::AgendaKind,
+        title: String,
+        body: String,
+        tags: Vec<String>,
+        due_ms: Option<u64>,
+        refs: Vec<super::types::AgendaRefSpec>,
+        actor: Option<AgendaActor>,
+        source: Option<String>,
+        now_ms: u64,
+    ) -> Result<AgendaItem, AgendaError> {
+        let title = validate_title(&title)?;
+        let body = validate_body(body)?;
+        let tags = validate_tags(tags)?;
+        if refs.len() > MAX_REFS_PER_ITEM {
+            return Err(AgendaError::Invalid(format!(
+                "more than {MAX_REFS_PER_ITEM} refs"
+            )));
+        }
+        let mut validated: Vec<ValidatedRef> = Vec::with_capacity(refs.len());
+        for spec in refs {
+            let vref = validate_ref(spec.ref_type, &spec.locator, spec.must_read, spec.label)?;
+            if validated
+                .iter()
+                .any(|v| v.ref_type == vref.ref_type && v.locator == vref.locator)
+            {
+                return Err(AgendaError::Invalid(format!(
+                    "duplicate {} ref {:?} in one park",
+                    vref.ref_type.as_str(),
+                    vref.locator
+                )));
+            }
+            validated.push(vref);
+        }
+        let id = self.mint_id()?;
+        let mut item = self.append_op(
+            AgendaOp::Add {
+                id: id.clone(),
+                kind,
+                title,
+                body,
+                tags,
+                due_ms,
+                ask: None,
+            },
+            actor.clone(),
+            source.clone(),
+            now_ms,
+        )?;
+        for vref in validated {
+            item = self.append_op(
+                AgendaOp::AddRef {
+                    id: id.clone(),
+                    ref_type: vref.ref_type,
+                    locator: vref.locator,
+                    digest: vref.digest,
+                    must_read: vref.must_read,
+                    label: vref.label,
+                },
+                actor.clone(),
+                source.clone(),
+                now_ms,
+            )?;
+        }
+        Ok(item)
     }
 
     /// Park one validated rich ask: build the questions through the same
@@ -628,25 +721,13 @@ impl AgendaStore {
         // `source` is detached (and validated) in `apply_command` before the
         // translation — the remaining fields are the op's.
         match cmd {
-            AgendaCommand::Add {
-                kind,
-                title,
-                body,
-                tags,
-                due_ms,
-                source: _,
-            } => Ok(AgendaOp::Add {
-                id: self.mint_id()?,
-                kind,
-                title: validate_title(&title)?,
-                body: validate_body(body)?,
-                tags: validate_tags(tags)?,
-                due_ms,
-                ask: None,
-            }),
-            // Handled by `apply_command`'s dedicated arms (ask: blob
-            // commits + rollback; start_now: an atomic two-op append);
-            // reaching here is a daemon bug, not a caller error.
+            // Handled by `apply_command`'s dedicated arms (add: park +
+            // trailing ref ops; ask: blob commits + rollback; start_now: an
+            // atomic two-op append); reaching here is a daemon bug, not a
+            // caller error.
+            AgendaCommand::Add { .. } => Err(AgendaError::Invalid(
+                "internal: add must route through apply_command".into(),
+            )),
             AgendaCommand::Ask { .. } => Err(AgendaError::Invalid(
                 "internal: ask must route through apply_command".into(),
             )),
@@ -923,6 +1004,66 @@ impl AgendaStore {
                 }
                 Ok(AgendaOp::RemoveReliesOn { id, target_id })
             }
+            AgendaCommand::AddRef {
+                id,
+                ref_type,
+                locator,
+                must_read,
+                label,
+                source: _,
+            } => {
+                // Any item status: attaching context to done/retired
+                // history is legitimate bookkeeping (ruled, G1 call 4).
+                let item = self.require(&id)?;
+                let vref = validate_ref(ref_type, &locator, must_read, label)?;
+                if item
+                    .refs
+                    .iter()
+                    .any(|r| r.ref_type == vref.ref_type && r.locator == vref.locator)
+                {
+                    return Err(AgendaError::Transition(format!(
+                        "{id} already carries this {} ref",
+                        vref.ref_type.as_str()
+                    )));
+                }
+                if item.refs.len() >= MAX_REFS_PER_ITEM {
+                    return Err(AgendaError::Invalid(format!(
+                        "more than {MAX_REFS_PER_ITEM} refs"
+                    )));
+                }
+                Ok(AgendaOp::AddRef {
+                    id,
+                    ref_type: vref.ref_type,
+                    locator: vref.locator,
+                    digest: vref.digest,
+                    must_read: vref.must_read,
+                    label: vref.label,
+                })
+            }
+            AgendaCommand::RemoveRef {
+                id,
+                ref_type,
+                locator,
+                source: _,
+            } => {
+                let item = self.require(&id)?;
+                let locator = locator.trim().to_string();
+                if !item
+                    .refs
+                    .iter()
+                    .any(|r| r.ref_type == ref_type && r.locator == locator)
+                {
+                    return Err(AgendaError::NotFound(format!(
+                        "no live {} ref matching {locator:?} on {id}",
+                        ref_type.as_str()
+                    )));
+                }
+                Ok(AgendaOp::RemoveRef {
+                    id,
+                    ref_type,
+                    locator,
+                })
+            }
             AgendaCommand::ApproveEffect { id, digest } => {
                 let item = self.require(&id)?;
                 if item.status != AgendaStatus::Open {
@@ -1155,6 +1296,160 @@ fn validate_source(source: Option<String>) -> Result<Option<String>, AgendaError
     Ok(Some(source.to_string()))
 }
 
+/// One ref spec after intake validation: locator normalized, file digest
+/// minted (recorded in the op — replay never hashes).
+struct ValidatedRef {
+    ref_type: AgendaRefType,
+    locator: String,
+    digest: Option<String>,
+    must_read: bool,
+    label: Option<String>,
+}
+
+/// Validate one typed-ref spec (G1). Per-type locator rules with named
+/// rejections; file refs must exist, be regular files within the digest
+/// bound, and are hashed HERE — attach-time truth, recorded in the op.
+fn validate_ref(
+    ref_type: AgendaRefType,
+    locator: &str,
+    must_read: bool,
+    label: Option<String>,
+) -> Result<ValidatedRef, AgendaError> {
+    let locator = locator.trim();
+    if locator.is_empty() {
+        return Err(AgendaError::Invalid("ref locator must not be empty".into()));
+    }
+    let label = match label {
+        None => None,
+        Some(label) => {
+            let label = label.trim();
+            if label.is_empty() {
+                return Err(AgendaError::Invalid(
+                    "ref label must not be empty — omit it instead".into(),
+                ));
+            }
+            if label.chars().count() > MAX_REF_LABEL_CHARS {
+                return Err(AgendaError::Invalid(format!(
+                    "ref label exceeds {MAX_REF_LABEL_CHARS} characters"
+                )));
+            }
+            Some(label.to_string())
+        }
+    };
+    let digest = match ref_type {
+        AgendaRefType::File => {
+            if locator.chars().count() > MAX_REF_FILE_LOCATOR_CHARS {
+                return Err(AgendaError::Invalid(format!(
+                    "file ref path exceeds {MAX_REF_FILE_LOCATOR_CHARS} characters"
+                )));
+            }
+            let path = Path::new(locator);
+            if !path.is_absolute() {
+                return Err(AgendaError::Invalid(
+                    "file ref path must be absolute".into(),
+                ));
+            }
+            let meta = std::fs::metadata(path).map_err(|err| {
+                AgendaError::Invalid(format!(
+                    "cannot attach a file ref: {locator} is not readable ({err})"
+                ))
+            })?;
+            if !meta.is_file() {
+                return Err(AgendaError::Invalid(format!(
+                    "cannot attach a file ref: {locator} is not a regular file"
+                )));
+            }
+            if meta.len() > MAX_REF_FILE_HASH_BYTES {
+                return Err(AgendaError::Invalid(format!(
+                    "cannot attach a file ref: {locator} exceeds \
+                     {MAX_REF_FILE_HASH_BYTES} bytes — refs point at working \
+                     artifacts, not archives"
+                )));
+            }
+            Some(digest_file(path).map_err(|err| {
+                AgendaError::Invalid(format!("cannot digest file ref {locator}: {err}"))
+            })?)
+        }
+        AgendaRefType::Memory | AgendaRefType::Session => {
+            if locator.chars().count() > MAX_REF_ID_LOCATOR_CHARS {
+                return Err(AgendaError::Invalid(format!(
+                    "{} ref locator exceeds {MAX_REF_ID_LOCATOR_CHARS} characters",
+                    ref_type.as_str()
+                )));
+            }
+            None
+        }
+        AgendaRefType::Url => {
+            if locator.chars().count() > MAX_REF_URL_LOCATOR_CHARS {
+                return Err(AgendaError::Invalid(format!(
+                    "url ref exceeds {MAX_REF_URL_LOCATOR_CHARS} characters"
+                )));
+            }
+            if !locator.starts_with("http://") && !locator.starts_with("https://") {
+                return Err(AgendaError::Invalid(
+                    "url ref must start with http:// or https://".into(),
+                ));
+            }
+            None
+        }
+    };
+    Ok(ValidatedRef {
+        ref_type,
+        locator: locator.to_string(),
+        digest,
+        must_read,
+        label,
+    })
+}
+
+/// Expand-time drift judgment of one file ref against its recorded attach
+/// digest (G1): `missing` (unreadable or not a regular file), `changed`,
+/// or `unchanged`. A file grown past the digest bound is `changed` by size
+/// alone — attach only ever recorded digests of files within the bound.
+/// Presentation only: never stored, never a DTO field; callers invoke it
+/// on detail expand, never on list render.
+pub(crate) fn file_ref_drift(locator: &str, attach_digest: &str) -> &'static str {
+    let path = Path::new(locator);
+    let Ok(meta) = std::fs::metadata(path) else {
+        return "missing";
+    };
+    if !meta.is_file() {
+        return "missing";
+    }
+    if meta.len() > MAX_REF_FILE_HASH_BYTES {
+        return "changed";
+    }
+    match digest_file(path) {
+        Ok(digest) if digest == attach_digest => "unchanged",
+        Ok(_) => "changed",
+        Err(_) => "missing",
+    }
+}
+
+/// Full sha256 of a file's bytes as lowercase hex, streamed in bounded
+/// chunks. Shared by attach-time intake and the expand-time drift check.
+pub(crate) fn digest_file(path: &Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
+}
+
 fn validate_title(title: &str) -> Result<String, AgendaError> {
     let title = title.trim();
     if title.is_empty() {
@@ -1221,6 +1516,7 @@ mod tests {
 
     fn add_cmd(title: &str) -> AgendaCommand {
         AgendaCommand::Add {
+            refs: Vec::new(),
             kind: AgendaKind::Task,
             title: title.to_string(),
             body: String::new(),
@@ -1247,6 +1543,7 @@ mod tests {
         let item = store
             .apply_command(
                 AgendaCommand::Add {
+                    refs: Vec::new(),
                     kind: AgendaKind::Note,
                     title: "  remember the milk  ".into(),
                     body: "whole, not oat".into(),
@@ -1408,6 +1705,7 @@ mod tests {
             add_cmd("   "),
             add_cmd(&"x".repeat(MAX_TITLE_CHARS + 1)),
             AgendaCommand::Add {
+                refs: Vec::new(),
                 kind: AgendaKind::Note,
                 title: "t".into(),
                 body: "b".repeat(MAX_BODY_BYTES + 1),
@@ -1416,6 +1714,7 @@ mod tests {
                 source: None,
             },
             AgendaCommand::Add {
+                refs: Vec::new(),
                 kind: AgendaKind::Note,
                 title: "t".into(),
                 body: String::new(),
@@ -1424,6 +1723,7 @@ mod tests {
                 source: None,
             },
             AgendaCommand::Add {
+                refs: Vec::new(),
                 kind: AgendaKind::Note,
                 title: "t".into(),
                 body: String::new(),
@@ -1541,6 +1841,7 @@ mod tests {
         let question = store
             .apply_command(
                 AgendaCommand::Add {
+                    refs: Vec::new(),
                     kind: AgendaKind::Question,
                     title: "Rotate the fleet certs this week?".into(),
                     body: String::new(),
@@ -1634,6 +1935,7 @@ mod tests {
         let item = store
             .apply_command(
                 AgendaCommand::Add {
+                    refs: Vec::new(),
                     kind: AgendaKind::Task,
                     title: "rotate certs".into(),
                     body: String::new(),
@@ -1652,6 +1954,7 @@ mod tests {
             assert!(matches!(
                 store.apply_command(
                     AgendaCommand::Add {
+                        refs: Vec::new(),
                         kind: AgendaKind::Task,
                         title: "t".into(),
                         body: String::new(),
@@ -2310,5 +2613,346 @@ mod tests {
         std::fs::write(dir.path().join(LOG_FILE), line).unwrap();
         let _store = AgendaStore::open(dir.path()).unwrap();
         assert!(crate::event::next_approval_id() > forged_ask_id);
+    }
+
+    fn add_ref_cmd(id: &str, ref_type: AgendaRefType, locator: &str) -> AgendaCommand {
+        AgendaCommand::AddRef {
+            id: id.to_string(),
+            ref_type,
+            locator: locator.to_string(),
+            must_read: false,
+            label: None,
+            source: None,
+        }
+    }
+
+    /// The G1 intake omnibus (the F2 verbs test's sibling): per-type
+    /// locator rules with named rejections, the attach-time file digest
+    /// recorded in the op, duplicate/cap/remove strictness, and
+    /// remove-is-an-op history.
+    #[test]
+    fn g1_refs_are_strict_at_intake_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let id = store
+            .apply_command(add_cmd("carry the brief"), owner(), 1000)
+            .unwrap()
+            .id;
+
+        // File ref: digest minted at intake, full sha256 hex, recorded.
+        let brief = files.path().join("brief.md");
+        std::fs::write(&brief, b"typed refs, not blobs").unwrap();
+        let brief_loc = brief.to_string_lossy().into_owned();
+        let item = store
+            .apply_command(
+                AgendaCommand::AddRef {
+                    id: id.clone(),
+                    ref_type: AgendaRefType::File,
+                    locator: brief_loc.clone(),
+                    must_read: true,
+                    label: Some("  kickoff brief  ".into()),
+                    source: Some("track-g".into()),
+                },
+                owner(),
+                1001,
+            )
+            .unwrap();
+        assert_eq!(item.refs.len(), 1);
+        let r = &item.refs[0];
+        assert_eq!(r.ref_type, AgendaRefType::File);
+        assert!(r.must_read);
+        assert_eq!(r.label.as_deref(), Some("kickoff brief"));
+        assert_eq!(r.source.as_deref(), Some("track-g"));
+        let digest = r.digest.clone().expect("file refs carry a digest");
+        assert_eq!(digest.len(), 64);
+        assert_eq!(digest, digest_file(&brief).unwrap());
+
+        // Named rejections, none appending: relative path, missing file,
+        // directory, bad url scheme, empty/oversize labels and locators.
+        let ops_before = store.ops();
+        for (cmd, needle) in [
+            (
+                add_ref_cmd(&id, AgendaRefType::File, "relative/path.md"),
+                "absolute",
+            ),
+            (
+                add_ref_cmd(
+                    &id,
+                    AgendaRefType::File,
+                    &files.path().join("gone.md").to_string_lossy(),
+                ),
+                "not readable",
+            ),
+            (
+                add_ref_cmd(&id, AgendaRefType::File, &files.path().to_string_lossy()),
+                "not a regular file",
+            ),
+            (
+                add_ref_cmd(&id, AgendaRefType::Url, "ftp://example.com/x"),
+                "http:// or https://",
+            ),
+            (add_ref_cmd(&id, AgendaRefType::Memory, "   "), "empty"),
+            (
+                add_ref_cmd(&id, AgendaRefType::Session, &"s".repeat(201)),
+                "exceeds 200",
+            ),
+        ] {
+            let err = store.apply_command(cmd, owner(), 1002).unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "expected {needle:?} in {err}"
+            );
+        }
+        let err = store
+            .apply_command(
+                AgendaCommand::AddRef {
+                    id: id.clone(),
+                    ref_type: AgendaRefType::Url,
+                    locator: "https://example.com/pr/1".into(),
+                    must_read: false,
+                    label: Some("   ".into()),
+                    source: None,
+                },
+                owner(),
+                1002,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("label must not be empty"));
+        assert_eq!(store.ops(), ops_before, "rejections never append");
+
+        // Oversize file: sparse-extended past the digest bound, named.
+        let big = files.path().join("big.bin");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(MAX_REF_FILE_HASH_BYTES + 1).unwrap();
+        drop(f);
+        let err = store
+            .apply_command(
+                add_ref_cmd(&id, AgendaRefType::File, &big.to_string_lossy()),
+                owner(),
+                1003,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("not archives"));
+
+        // Duplicate live ref is a transition error; a second TYPE with the
+        // same locator string is a different address and attaches.
+        let err = store
+            .apply_command(
+                add_ref_cmd(&id, AgendaRefType::File, &brief_loc),
+                owner(),
+                1004,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("already carries"));
+
+        // memory/session/url refs attach digest-less.
+        for (rt, loc) in [
+            (AgendaRefType::Memory, "mem-claim-abc123"),
+            (AgendaRefType::Session, "sess-4242"),
+            (AgendaRefType::Url, "https://example.com/pr/7"),
+        ] {
+            let item = store
+                .apply_command(add_ref_cmd(&id, rt, loc), owner(), 1005)
+                .unwrap();
+            let r = item.refs.iter().find(|r| r.locator == loc).unwrap();
+            assert_eq!(r.ref_type, rt);
+            assert!(r.digest.is_none());
+        }
+
+        // Remove is an op: the view drops the ref, the log keeps history.
+        let ops_before = store.ops();
+        let item = store
+            .apply_command(
+                AgendaCommand::RemoveRef {
+                    id: id.clone(),
+                    ref_type: AgendaRefType::Url,
+                    locator: "https://example.com/pr/7".into(),
+                    source: None,
+                },
+                owner(),
+                1006,
+            )
+            .unwrap();
+        assert!(!item.refs.iter().any(|r| r.locator.contains("/pr/7")));
+        assert_eq!(store.ops(), ops_before + 1);
+        let err = store
+            .apply_command(
+                AgendaCommand::RemoveRef {
+                    id: id.clone(),
+                    ref_type: AgendaRefType::Url,
+                    locator: "https://example.com/pr/7".into(),
+                    source: None,
+                },
+                owner(),
+                1007,
+            )
+            .unwrap_err();
+        assert!(matches!(err, AgendaError::NotFound(_)));
+
+        // Reopen replays the log to the same view.
+        let before = store.item(&id).unwrap();
+        let mut reopened = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.item(&id).unwrap(), before);
+
+        // The ref cap is enforced against live refs with a named error.
+        let small = store
+            .apply_command(add_cmd("cap me"), owner(), 2000)
+            .unwrap()
+            .id;
+        for i in 0..MAX_REFS_PER_ITEM {
+            store
+                .apply_command(
+                    add_ref_cmd(
+                        &small,
+                        AgendaRefType::Url,
+                        &format!("https://example.com/{i}"),
+                    ),
+                    owner(),
+                    2001,
+                )
+                .unwrap();
+        }
+        let err = store
+            .apply_command(
+                add_ref_cmd(&small, AgendaRefType::Url, "https://example.com/over"),
+                owner(),
+                2002,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("more than 32 refs"));
+    }
+
+    /// Park-with-refs (the `add` sugar) is all-or-nothing: every spec is
+    /// validated before anything appends, and a good park lands the `add`
+    /// plus one attributed `add_ref` per spec under one lock.
+    #[test]
+    fn g1_add_with_refs_is_all_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let count_before = store.snapshot().len();
+        let ops_before = store.ops();
+        let bad = AgendaCommand::Add {
+            refs: vec![
+                super::super::types::AgendaRefSpec {
+                    ref_type: AgendaRefType::Url,
+                    locator: "https://example.com/ok".into(),
+                    must_read: false,
+                    label: None,
+                },
+                super::super::types::AgendaRefSpec {
+                    ref_type: AgendaRefType::Url,
+                    locator: "gopher://nope".into(),
+                    must_read: false,
+                    label: None,
+                },
+            ],
+            kind: AgendaKind::Task,
+            title: "refused park".into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+        };
+        assert!(store.apply_command(bad, owner(), 1000).is_err());
+        assert_eq!(store.snapshot().len(), count_before, "no item strands");
+        assert_eq!(store.ops(), ops_before, "no op strands");
+
+        // Duplicate specs within one park are refused whole.
+        let dup = AgendaCommand::Add {
+            refs: vec![
+                super::super::types::AgendaRefSpec {
+                    ref_type: AgendaRefType::Memory,
+                    locator: "mem-1".into(),
+                    must_read: false,
+                    label: None,
+                },
+                super::super::types::AgendaRefSpec {
+                    ref_type: AgendaRefType::Memory,
+                    locator: "mem-1".into(),
+                    must_read: true,
+                    label: None,
+                },
+            ],
+            kind: AgendaKind::Task,
+            title: "dup park".into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+        };
+        let err = store.apply_command(dup, owner(), 1000).unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
+
+        let good = AgendaCommand::Add {
+            refs: vec![
+                super::super::types::AgendaRefSpec {
+                    ref_type: AgendaRefType::Url,
+                    locator: "https://example.com/pr/9".into(),
+                    must_read: true,
+                    label: Some("the PR".into()),
+                },
+                super::super::types::AgendaRefSpec {
+                    ref_type: AgendaRefType::Session,
+                    locator: "sess-parent".into(),
+                    must_read: false,
+                    label: None,
+                },
+            ],
+            kind: AgendaKind::Task,
+            title: "parked with context".into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: Some("track-g".into()),
+        };
+        let item = store.apply_command(good, owner(), 2000).unwrap();
+        assert_eq!(item.refs.len(), 2);
+        assert!(item.refs[0].must_read);
+        assert_eq!(item.refs[0].principal.as_deref(), Some("owner"));
+        assert_eq!(item.refs[0].source.as_deref(), Some("track-g"));
+        assert_eq!(store.ops(), ops_before + 3, "one add + two add_ref ops");
+    }
+
+    /// The expand-time drift judgment: unchanged → changed on edit →
+    /// missing on delete; a file grown past the digest bound is `changed`
+    /// by size alone.
+    #[test]
+    fn g1_file_ref_drift_judgments() {
+        let files = tempfile::tempdir().unwrap();
+        let path = files.path().join("artifact.md");
+        std::fs::write(&path, b"v1").unwrap();
+        let loc = path.to_string_lossy().into_owned();
+        let attach = digest_file(&path).unwrap();
+
+        assert_eq!(file_ref_drift(&loc, &attach), "unchanged");
+        std::fs::write(&path, b"v2 drifted").unwrap();
+        assert_eq!(file_ref_drift(&loc, &attach), "changed");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_REF_FILE_HASH_BYTES + 1).unwrap();
+        drop(f);
+        assert_eq!(file_ref_drift(&loc, &attach), "changed");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(file_ref_drift(&loc, &attach), "missing");
+    }
+
+    /// A future ref type inside a known op name degrades exactly like an
+    /// unknown op: the line is preserved on disk and skipped at load.
+    #[test]
+    fn g1_unknown_ref_type_lines_are_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = concat!(
+            "{\"v\":1,\"at_ms\":1,\"op\":{\"type\":\"add\",\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"kind\":\"task\",\"title\":\"host\"}}\n",
+            "{\"v\":1,\"at_ms\":2,\"op\":{\"type\":\"add_ref\",\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"ref_type\":\"sigil\",\"locator\":\"x\"}}\n",
+        );
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join(LOG_FILE), lines).unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(store.skipped_lines(), 1);
+        let item = store.item("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        assert!(item.refs.is_empty());
+        // The foreign line survives on disk verbatim.
+        let text = std::fs::read_to_string(dir.path().join(LOG_FILE)).unwrap();
+        assert!(text.contains("sigil"));
     }
 }

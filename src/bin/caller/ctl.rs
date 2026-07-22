@@ -2422,6 +2422,47 @@ async fn run_agenda(
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
         }
+        "ref" => {
+            let args = parse_command_args(
+                &raw[1..],
+                &["--type", "--label", "--source"],
+                &["--must-read", "--remove"],
+            )?;
+            let id = agenda_resolve_id(
+                client,
+                config,
+                &args,
+                "agenda ref requires an item id first (a unique prefix is enough)",
+            )
+            .await?;
+            let Some(locator_raw) = args.positional.get(1) else {
+                return Err(
+                    "agenda ref requires the locator second (a path, URL, memory claim id, \
+                     or session id)"
+                        .to_string(),
+                );
+            };
+            let (ref_type, locator) = agenda_ref_spec(locator_raw, args.one("--type"))?;
+            let op = if args.has("--remove") {
+                "remove_ref"
+            } else {
+                "add_ref"
+            };
+            let mut map = Map::new();
+            map.insert("op".to_string(), Value::String(op.to_string()));
+            map.insert("id".to_string(), Value::String(id));
+            map.insert("ref_type".to_string(), Value::String(ref_type));
+            map.insert("locator".to_string(), Value::String(locator));
+            if op == "add_ref" {
+                if args.has("--must-read") {
+                    map.insert("must_read".to_string(), Value::Bool(true));
+                }
+                insert_string(&mut map, "label", args.one("--label"));
+            }
+            insert_string(&mut map, "source", args.one("--source"));
+            let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
         "patch" | "edit" => {
             let args = parse_command_args(
                 &raw[1..],
@@ -2466,11 +2507,59 @@ async fn run_agenda(
     Ok(())
 }
 
+/// Resolve one ctl-side ref spec: `[type:]locator` with a `--type`
+/// override. Inference: http(s) URLs are `url`; a path that exists
+/// locally is `file` (canonicalized to the absolute path the daemon
+/// stores); anything else needs an explicit type. Client-side sugar only —
+/// the daemon re-validates everything at intake (and mints the digest).
+fn agenda_ref_spec(raw: &str, explicit: Option<&str>) -> Result<(String, String), String> {
+    let (prefixed, rest) = match raw.split_once(':') {
+        Some((t, rest)) if ["file", "memory", "session", "url"].contains(&t) => (Some(t), rest),
+        _ => (None, raw),
+    };
+    let ref_type = match explicit.or(prefixed) {
+        Some(t) => match t.trim().to_ascii_lowercase().as_str() {
+            t @ ("file" | "memory" | "session" | "url") => t.to_string(),
+            other => {
+                return Err(format!(
+                    "unknown ref type '{other}' (file, memory, session, or url)"
+                ))
+            }
+        },
+        None => {
+            if raw.starts_with("http://") || raw.starts_with("https://") {
+                "url".to_string()
+            } else if std::path::Path::new(raw).exists() {
+                "file".to_string()
+            } else {
+                return Err(format!(
+                    "cannot infer the ref type of {raw:?} — prefix it \
+                     (file:…, memory:…, session:…, url:https://…) or pass --type"
+                ));
+            }
+        }
+    };
+    let locator = if prefixed.is_some() { rest } else { raw };
+    let locator = if ref_type == "file" {
+        // The daemon stores absolute paths; resolve relative args here. A
+        // since-deleted file (removals) passes the stored path verbatim.
+        match std::fs::canonicalize(locator) {
+            Ok(abs) => abs.to_string_lossy().into_owned(),
+            Err(_) => locator.to_string(),
+        }
+    } else {
+        locator.to_string()
+    };
+    Ok((ref_type, locator))
+}
+
 fn agenda_add_args(raw: &[String]) -> Result<Value, String> {
     let args = parse_command_args(
         raw,
-        &["--body", "--tag", "--due", "--kind", "--source"],
-        &["--note", "--task"],
+        &[
+            "--body", "--tag", "--due", "--kind", "--source", "--ref", "--label",
+        ],
+        &["--note", "--task", "--must-read"],
     )?;
     let title = if args.positional.is_empty() {
         return Err("agenda add requires a title".to_string());
@@ -2496,6 +2585,27 @@ fn agenda_add_args(raw: &[String]) -> Result<Value, String> {
     insert_string_array(&mut map, "tags", args.all("--tag"));
     if let Some(due) = args.one("--due") {
         map.insert("due_ms".to_string(), Value::from(parse_due_ms(due)?));
+    }
+    // Refs riding the parking gesture (G1): `--label` and `--must-read`
+    // apply to every `--ref` of this add — attach separately via
+    // `agenda ref` when they differ.
+    let mut refs: Vec<Value> = Vec::new();
+    for spec in args.all("--ref") {
+        let (ref_type, locator) = agenda_ref_spec(spec, None)?;
+        let mut entry = Map::new();
+        entry.insert("ref_type".to_string(), Value::String(ref_type));
+        entry.insert("locator".to_string(), Value::String(locator));
+        if args.has("--must-read") {
+            entry.insert("must_read".to_string(), Value::Bool(true));
+        }
+        insert_string(&mut entry, "label", args.one("--label"));
+        refs.push(Value::Object(entry));
+    }
+    if refs.is_empty() && (args.has("--must-read") || args.one("--label").is_some()) {
+        return Err("--must-read/--label describe refs: pass --ref too".to_string());
+    }
+    if !refs.is_empty() {
+        map.insert("refs".to_string(), Value::Array(refs));
     }
     insert_string(&mut map, "source", args.one("--source"));
     Ok(Value::Object(map))
@@ -2648,6 +2758,22 @@ fn agenda_render_row(item: &Value, blocked: bool) -> String {
             "awaiting approval".to_string()
         };
         row.push_str(&format!("  ⏵ session {state}"));
+    }
+    if let Some(refs) = item
+        .get("refs")
+        .and_then(Value::as_array)
+        .filter(|refs| !refs.is_empty())
+    {
+        let must_read = refs
+            .iter()
+            .filter(|r| r.get("must_read").and_then(Value::as_bool).unwrap_or(false))
+            .count();
+        let noun = if refs.len() == 1 { "ref" } else { "refs" };
+        if must_read > 0 {
+            row.push_str(&format!("  [{} {noun}, {must_read} must-read]", refs.len()));
+        } else {
+            row.push_str(&format!("  [{} {noun}]", refs.len()));
+        }
     }
     if let Some(tags) = item.get("tags").and_then(Value::as_array) {
         for tag in tags.iter().filter_map(Value::as_str) {
@@ -4198,7 +4324,8 @@ If --task is omitted, remaining positional text becomes the task."
 fn help_agenda() {
     println!(
         "Usage:\n\
-  intendant ctl agenda add TITLE... [--note|--task|--kind question] [--body TEXT] [--tag TAG]... [--due WHEN] [--source LABEL]\n\
+  intendant ctl agenda add TITLE... [--note|--task|--kind question] [--body TEXT] [--tag TAG]... [--due WHEN]\n\
+      [--ref [TYPE:]LOCATOR]... [--must-read] [--label TEXT] [--source LABEL]\n\
   intendant ctl agenda ask QUESTION... [--body TEXT] [--tag TAG]... [--due WHEN] [--source LABEL]\n\
   intendant ctl agenda answer ID_PREFIX REPLY... [--source LABEL]\n\
   intendant ctl agenda list [--all|--open|--done|--retired] [--blocked] [--json]\n\
@@ -4206,6 +4333,8 @@ fn help_agenda() {
   intendant ctl agenda block ID_PREFIX CRITERION... [--source LABEL]\n\
   intendant ctl agenda unblock ID_PREFIX [BLOCKER_PREFIX] [--source LABEL]\n\
   intendant ctl agenda relies-on ID_PREFIX TARGET_PREFIX [--remove] [--source LABEL]\n\
+  intendant ctl agenda ref ID_PREFIX [TYPE:]LOCATOR [--type file|memory|session|url]\n\
+      [--must-read] [--label TEXT] [--remove] [--source LABEL]\n\
   intendant ctl agenda complete ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda reopen ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda retire ID_PREFIX [--source LABEL]\n\
@@ -4242,6 +4371,14 @@ satisfies the edge by pure recomputation; a RETIRED one does not — the\n\
 dependent shows \"prerequisite retired — review\". `list --blocked` shows\n\
 open items with an uncleared blocker or unsatisfied dependency; blocked\n\
 is derived at read time, never stored, and never notifies.\n\
+\n\
+`ref` attaches a typed POINTER (never content): a file path (digested at\n\
+attach so the detail view can show drift honestly), a Memory claim id, a\n\
+session/conversation id, or an http(s) URL. Type is inferred (URLs,\n\
+existing paths) or explicit via TYPE: prefix / --type; --must-read marks\n\
+it prominent for whoever picks the item up (a pointer they weigh, not an\n\
+order); --remove drops it (history stays). On `add`, repeat --ref to\n\
+attach at park time — one item, its context, one gesture.\n\
 \n\
 `schedule` proposes a session manifest on an item: at WHEN, spawn a normal\n\
 supervised session with that goal (never raw actions). Nothing fires until\n\
