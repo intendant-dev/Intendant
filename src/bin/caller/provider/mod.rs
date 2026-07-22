@@ -890,7 +890,7 @@ fn select_provider_with_project_keys(
 /// automation greps stderr for it.
 fn unfueled_error_text(project_keys: &ProjectEnvKeys) -> String {
     let mut text = String::from(
-        "No API key found for the selected provider/auth mode. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY, or sign in with `intendant auth chatgpt login`.",
+        "No API key found. For the selected provider/auth mode, set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY, or sign in with `intendant auth chatgpt login`.",
     );
     let mut checked: Vec<String> =
         vec!["credential leases and browser relays (none active)".to_string()];
