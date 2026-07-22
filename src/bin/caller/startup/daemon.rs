@@ -44,6 +44,10 @@ pub(crate) async fn run_daemon(
     // staged uploads / transfer jobs): prune entries idle past the
     // retention window so the store cannot grow unbounded across restarts.
     tokio::task::spawn_blocking(global_store::prune_at_daemon_startup);
+    // Coordination-space liveness GC (§9 rule-8 liveness amendment):
+    // declarations a day past heartbeat, messages past TTL, orphaned
+    // atomic-write temps. Never touches checkpoint documents.
+    tokio::task::spawn_blocking(crate::coordination::gc::sweep_at_daemon_startup);
     // One-time external-wrapper-index repair (v1 -> v2): recompute each
     // (source, backend session) group's active wrapper from log-dir
     // activity, undoing the inversions written while the session-catalog

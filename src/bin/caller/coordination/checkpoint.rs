@@ -32,11 +32,18 @@ impl CheckpointSpace {
         project_root: &Path,
     ) -> Result<CheckpointSpace, CoordinationError> {
         let space = space_key(project_root);
-        let dir = home
-            .join(".intendant")
-            .join("coordination")
-            .join(&space)
-            .join("checkpoints");
+        let space_dir = home.join(".intendant").join("coordination").join(&space);
+        Self::open_at(&space_dir, space)
+    }
+
+    /// Root a space at an already-resolved space dir (the
+    /// `paths::resolve_space_dir` seam — env is read at the caller's
+    /// edge, never here).
+    pub(crate) fn open_at(
+        space_dir: &Path,
+        space: String,
+    ) -> Result<CheckpointSpace, CoordinationError> {
+        let dir = space_dir.join("checkpoints");
         std::fs::create_dir_all(&dir).map_err(io_err)?;
         restrict_dir_modes(&dir)?;
         Ok(CheckpointSpace { dir, space })

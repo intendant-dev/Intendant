@@ -592,6 +592,17 @@ impl SandboxConfig {
     pub fn default_for_project(project_root: &Path, log_dir: &Path) -> Self {
         let mut config = Self::projectless(log_dir);
         config.write_paths.insert(0, project_root.to_path_buf());
+        // Coordination-space bind (Track C): bus writes (declarations,
+        // messages) from sandboxed runtime shells land under the state
+        // root's `coordination/<space-key>` — grant exactly that
+        // subtree, never the state root wholesale (it holds the trust
+        // store; see the `logs/` rationale above).
+        let (space_dir, _) = crate::coordination::paths::resolve_space_dir(
+            crate::coordination::paths::env_override().as_deref(),
+            &crate::platform::intendant_home(),
+            project_root,
+        );
+        config.write_paths.push(space_dir);
         config
     }
 

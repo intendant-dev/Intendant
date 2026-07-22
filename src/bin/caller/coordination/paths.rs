@@ -10,8 +10,6 @@
 //! covers detached temp clones and deliberate space grouping). Env is
 //! read only at the process edge (`env_override`); everything below
 //! takes explicit paths (the repo's hermeticity rule).
-#![cfg_attr(not(test), allow(dead_code))] // C1 PR A: consumed by the PR-B glue; allow dropped as wiring lands.
-
 use std::path::{Path, PathBuf};
 
 pub(crate) const COORDINATION_DIR_ENV: &str = "INTENDANT_COORDINATION_DIR";

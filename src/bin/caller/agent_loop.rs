@@ -287,10 +287,12 @@ pub(crate) fn handle_workflow_checkpoint_call(
     project: &Project,
     local_session_id: &Option<String>,
 ) -> String {
-    let Some(home) = dirs::home_dir() else {
-        return "Error: workflow_checkpoint needs a resolvable home directory.".to_string();
-    };
-    let space = match crate::coordination::CheckpointSpace::open(&home, &project.root) {
+    let (space_dir, space_key) = crate::coordination::paths::resolve_space_dir(
+        crate::coordination::paths::env_override().as_deref(),
+        &crate::platform::intendant_home(),
+        &project.root,
+    );
+    let space = match crate::coordination::CheckpointSpace::open_at(&space_dir, space_key) {
         Ok(space) => space,
         Err(e) => return format!("Error: {e}"),
     };
