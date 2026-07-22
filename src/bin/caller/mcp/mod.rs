@@ -2052,6 +2052,7 @@ impl IntendantServer {
                     attachments: vec![],
                     follow_up_id: None,
                     delegation_id: None,
+                    launch_config: Default::default(),
                 }));
             return "ok (new session dispatched)".to_string();
         }
