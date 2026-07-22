@@ -2154,7 +2154,15 @@ async fn run_agenda(
         "schedule" => {
             let args = parse_command_args(
                 &raw[1..],
-                &["--goal", "--at", "--source"],
+                &[
+                    "--goal",
+                    "--at",
+                    "--every",
+                    "--until",
+                    "--max-occurrences",
+                    "--suspend-after",
+                    "--source",
+                ],
                 &["--orchestrate"],
             )?;
             let id = agenda_resolve_id(
@@ -2183,13 +2191,55 @@ async fn run_agenda(
             if args.has("--orchestrate") {
                 map.insert("orchestrate".to_string(), Value::Bool(true));
             }
+            // Standing cadence (G3-pre): declared INSIDE the digest-bound
+            // manifest, so one approval covers the series.
+            if let Some(every) = args.one("--every") {
+                let mut rec = Map::new();
+                rec.insert(
+                    "every_ms".to_string(),
+                    Value::from(parse_duration_ms(every)?),
+                );
+                if let Some(until) = args.one("--until") {
+                    rec.insert("until_ms".to_string(), Value::from(parse_due_ms(until)?));
+                }
+                if let Some(max) = args.one("--max-occurrences") {
+                    let max: u32 = max
+                        .parse()
+                        .map_err(|_| format!("--max-occurrences {max:?} is not a number"))?;
+                    rec.insert("max_occurrences".to_string(), Value::from(max));
+                }
+                if let Some(n) = args.one("--suspend-after") {
+                    let n: u32 = n
+                        .parse()
+                        .map_err(|_| format!("--suspend-after {n:?} is not a number"))?;
+                    rec.insert("suspend_after_failures".to_string(), Value::from(n));
+                }
+                map.insert("recurrence".to_string(), Value::Object(rec));
+            } else if args.one("--until").is_some()
+                || args.one("--max-occurrences").is_some()
+                || args.one("--suspend-after").is_some()
+            {
+                return Err(
+                    "--until/--max-occurrences/--suspend-after describe a standing cadence: \
+                     pass --every too"
+                        .to_string(),
+                );
+            }
             insert_string(&mut map, "source", args.one("--source"));
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
-            println!(
-                "proposed — nothing fires until the owner approves the digest \
-                 (dashboard Agenda tab, or `agenda approve <id>` from an owner shell)"
-            );
+            if args.one("--every").is_some() {
+                println!(
+                    "proposed as a STANDING manifest — one owner approval covers every \
+                     occurrence until revoked, expired, or suspended by failures \
+                     (dashboard Agenda tab, or `agenda approve <id>` from an owner shell)"
+                );
+            } else {
+                println!(
+                    "proposed — nothing fires until the owner approves the digest \
+                     (dashboard Agenda tab, or `agenda approve <id>` from an owner shell)"
+                );
+            }
         }
         "approve" => {
             // Review-then-bind: without --digest this PRINTS the manifest
@@ -3078,6 +3128,34 @@ fn parse_due_ms(raw: &str) -> Result<u64, String> {
     Err(format!(
         "could not parse due '{raw}': use +45m/+2h/+3d/+1w, epoch ms, RFC3339, YYYY-MM-DD, or 'YYYY-MM-DD HH:MM'"
     ))
+}
+
+/// A cadence INTERVAL (`--every`): `45m`, `2h`, `7d`, `1w` (leading `+`
+/// tolerated), or raw milliseconds. Distinct from [`parse_due_ms`], which
+/// resolves an instant.
+fn parse_duration_ms(raw: &str) -> Result<u64, String> {
+    let raw = raw.trim();
+    let body = raw.strip_prefix('+').unwrap_or(raw);
+    if let Some(unit_pos) = body.find(|c: char| !c.is_ascii_digit()) {
+        let (amount, unit) = body.split_at(unit_pos);
+        let amount: u64 = amount
+            .parse()
+            .map_err(|_| format!("invalid interval '{raw}' (try 45m, 2h, 7d, 1w)"))?;
+        let ms_per = match unit {
+            "m" => 60_000,
+            "h" => 3_600_000,
+            "d" => 86_400_000,
+            "w" => 7 * 86_400_000,
+            _ => {
+                return Err(format!(
+                    "invalid interval unit in '{raw}' (try 45m, 2h, 7d, 1w)"
+                ))
+            }
+        };
+        return Ok(amount * ms_per);
+    }
+    body.parse()
+        .map_err(|_| format!("invalid interval '{raw}' (try 45m, 2h, 7d, 1w, or ms)"))
 }
 
 async fn run_controller(
@@ -4473,7 +4551,8 @@ fn help_agenda() {
   intendant ctl agenda reopen ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda retire ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda patch ID_PREFIX [--title TEXT] [--body TEXT] [--tag TAG]... [--clear-tags] [--due WHEN|--clear-due] [--source LABEL]\n\
-  intendant ctl agenda schedule ID_PREFIX --goal TEXT --at WHEN [--orchestrate] [--source LABEL]\n\
+  intendant ctl agenda schedule ID_PREFIX --goal TEXT --at WHEN [--orchestrate]\n\
+      [--every INTERVAL [--until WHEN] [--max-occurrences N] [--suspend-after N]] [--source LABEL]\n\
   intendant ctl agenda approve ID_PREFIX [--digest HEX]\n\
   intendant ctl agenda revoke-schedule ID_PREFIX\n\
   intendant ctl agenda start ID_PREFIX [--project DIR] [--goal TEXT] [--goal-run]\n\
@@ -4525,7 +4604,14 @@ draws an untyped see-also edge, deduped in both directions; `list\n\
 derived at print time.\n\
 \n\
 `schedule` proposes a session manifest on an item: at WHEN, spawn a normal\n\
-supervised session with that goal (never raw actions). Nothing fires until\n\
+supervised session with that goal (never raw actions). --every INTERVAL\n\
+(45m/2h/7d/1w; floor 15m) declares a STANDING cadence inside the\n\
+digest-bound manifest: ONE approval covers every occurrence until revoked,\n\
+--until/--max-occurrences end the series, and --suspend-after N (default 3)\n\
+suspends after N consecutive failed runs — surfaced, never silent; the\n\
+owner re-arms by re-approving the unchanged digest (one click). On a\n\
+standing approved item, `start` fires one extra occurrence of the approved\n\
+manifest immediately without touching the approval. Nothing fires until\n\
 the owner approves; approval is an owner-surface act (dashboard or an\n\
 owner shell) — agent and peer callers may propose but never approve, and\n\
 approval binds the exact manifest digest, so any revision voids it.\n\

@@ -49,6 +49,7 @@ dashboard, attributed to your session.
 "$INTENDANT" ctl agenda retire 01KX     # hides without destroying history
 "$INTENDANT" ctl agenda patch 01KX --due +3d   # presentation edits (title/body/tags/due)
 "$INTENDANT" ctl agenda schedule 01KX --goal "Run the soak checks and summarize" --at +2d
+"$INTENDANT" ctl agenda schedule 01KX --goal "Weekly housekeeping pass" --at "+1d" --every 7d   # STANDING: one approval covers the series
 "$INTENDANT" ctl agenda annotate 01KX "Tried the vendor API — still 403; evidence in run 88."
 "$INTENDANT" ctl agenda block 01KX "gpt-live-1 available on the API (currently app-only)"
 "$INTENDANT" ctl agenda relies-on 01KX 01KY    # 01KX waits on 01KY (--remove drops the edge)
@@ -148,5 +149,7 @@ dashboard, attributed to your session.
   agenda-review mandate: write annotations and exactly ONE summary item
   per pass; complete/retire nothing another actor created; clear no
   blockers (annotate evidence instead); urgency and reminder loudness are
-  owner policy you do not hold — put recommendations in text; end by
-  re-proposing the next pass (`schedule`) for one-click owner approval.
+  owner policy you do not hold — put recommendations in text. Standing
+  mandates declare their cadence in the manifest (`--every`) — never
+  propose follow-up passes yourself; the one approval already covers the
+  series, and a failure streak suspends it for the owner to re-arm.

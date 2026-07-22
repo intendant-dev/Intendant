@@ -117,6 +117,10 @@ impl AgendaHandle {
             // The combined mint+approve gesture embeds an approval, so it
             // is owner-surface exactly like the approval alone.
             AgendaCommand::StartNow { .. } => "start_now",
+            // Exercising a standing approval (one extra occurrence of the
+            // approved digest) is an execution gesture — owner-surface
+            // like the approval whose authority it spends (G3-pre).
+            AgendaCommand::RequestOccurrence { .. } => "request_occurrence",
             _ => return Ok(()),
         };
         let owner_surface = matches!(
@@ -154,24 +158,40 @@ impl AgendaHandle {
                 interactive,
                 agent_config,
             } => {
-                let provenance_session = self
+                let item = self
                     .lock()
                     .item(&id)
-                    .ok_or_else(|| AgendaError::NotFound(id.clone()))?
-                    .provenance
-                    .session_id;
-                let (resolved, _source) = resolve_spawn_project(
-                    project_root.as_deref(),
-                    provenance_session.as_deref(),
-                    &self.spawn_ctx,
-                )
-                .map_err(AgendaError::Invalid)?;
-                AgendaCommand::StartNow {
-                    id,
-                    goal,
-                    project_root: Some(resolved.to_string_lossy().into_owned()),
-                    interactive,
-                    agent_config,
+                    .ok_or_else(|| AgendaError::NotFound(id.clone()))?;
+                // A standing approved recurring manifest fires AS APPROVED
+                // (the store routes this to request_occurrence): its
+                // project resolves at fire time from the approved bytes,
+                // so resolving here would only invent a spurious refusal.
+                let standing = item.effects.first().is_some_and(|effect| {
+                    effect.manifest.recurrence.is_some() && effect.approval.is_some()
+                });
+                if standing {
+                    AgendaCommand::StartNow {
+                        id,
+                        goal,
+                        project_root,
+                        interactive,
+                        agent_config,
+                    }
+                } else {
+                    let provenance_session = item.provenance.session_id;
+                    let (resolved, _source) = resolve_spawn_project(
+                        project_root.as_deref(),
+                        provenance_session.as_deref(),
+                        &self.spawn_ctx,
+                    )
+                    .map_err(AgendaError::Invalid)?;
+                    AgendaCommand::StartNow {
+                        id,
+                        goal,
+                        project_root: Some(resolved.to_string_lossy().into_owned()),
+                        interactive,
+                        agent_config,
+                    }
                 }
             }
             other => other,
@@ -612,6 +632,7 @@ mod tests {
         let proposed = handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    recurrence: None,
                     id: item.id.clone(),
                     goal: "run the cert sweep and report".into(),
                     fire_at_ms: 4_000_000_000_000,
@@ -671,6 +692,22 @@ mod tests {
         let approval = approved.effects[0].approval.as_ref().unwrap();
         assert_eq!(approval.digest, digest);
         assert_eq!(approval.kind.as_deref(), Some("dashboard"));
+
+        // Exercising the standing approval is owner-surface under the same
+        // gate (G3-pre rider): agents may propose standing manifests but
+        // never fire extra occurrences of one.
+        match handle.apply(
+            AgendaCommand::RequestOccurrence {
+                id: item.id.clone(),
+            },
+            actor("agent_session", Some("sess-a5")),
+        ) {
+            Err(AgendaError::NotPermitted { verb, actor }) => {
+                assert_eq!(verb, "request_occurrence");
+                assert_eq!(actor, "agent_session");
+            }
+            other => panic!("expected NotPermitted for request_occurrence, got {other:?}"),
+        }
 
         // Revocation is owner-surface under the same gate.
         assert!(matches!(
@@ -1474,6 +1511,7 @@ mod tests {
         let first = handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    recurrence: None,
                     id: item.id.clone(),
                     goal: "summarize the week".into(),
                     fire_at_ms: 4_000_000_000_000,
@@ -1511,6 +1549,7 @@ mod tests {
         let revised = handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    recurrence: None,
                     id: item.id.clone(),
                     goal: "summarize the week AND email it".into(),
                     fire_at_ms: 4_000_000_000_000,

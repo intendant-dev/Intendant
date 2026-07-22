@@ -75,6 +75,16 @@ impl SchedulerState {
             .collect()
     }
 
+    /// Effects with a dispatched-or-running occurrence — the standing
+    /// no-overlap rule's receipt-window complement (G3-pre).
+    fn in_flight_effects(&self) -> HashSet<String> {
+        self.awaiting
+            .values()
+            .chain(self.running.values())
+            .map(|s| s.effect_id.clone())
+            .collect()
+    }
+
     /// Remember a terminal event no running entry claimed (first one per
     /// session wins — a `DoneSignal` must not be downgraded by the
     /// parked session's eventual `SessionEnded`).
@@ -286,7 +296,16 @@ async fn run_pass(
         .and_then(|quiet| quiet.ms_until_end(local_minute_of_day()))
         .map(|remaining| now + remaining);
     let in_flight = state.in_flight();
-    let planned = plan(&items, journal, &policy, now, quiet_until, &in_flight);
+    let in_flight_effects = state.in_flight_effects();
+    let planned = plan(
+        &items,
+        journal,
+        &policy,
+        now,
+        quiet_until,
+        &in_flight,
+        &in_flight_effects,
+    );
 
     for occurrence in &planned.deliver {
         deliver_one(handle, journal, occurrence, now);
@@ -298,14 +317,15 @@ async fn run_pass(
         dispatch_session(handle, journal, state, spawn, now);
     }
     for missed in planned.missed_sessions {
-        resolve_spawnless(
-            handle,
-            journal,
-            &missed,
-            OccurrenceState::Missed,
-            now,
-            "missed its window while the daemon was down — re-approve to reschedule",
-        );
+        // A standing series needs no ceremony to continue; a one-shot
+        // needs a fresh approval (the pre-G3-pre message, unchanged).
+        let why = if missed.recurring {
+            "missed its window while the daemon was down — the next scheduled run \
+             is unaffected"
+        } else {
+            "missed its window while the daemon was down — re-approve to reschedule"
+        };
+        resolve_spawnless(handle, journal, &missed, OccurrenceState::Missed, now, why);
     }
     for crashed in planned.crashed {
         resolve_spawnless(
@@ -985,6 +1005,7 @@ mod tests {
         let proposed = handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    recurrence: None,
                     id: item.id.clone(),
                     goal: "run the nightly sweep".into(),
                     fire_at_ms,
@@ -1040,6 +1061,7 @@ mod tests {
         handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    recurrence: None,
                     id: bystander.id.clone(),
                     goal: "must not run".into(),
                     fire_at_ms: now_ms() - 60_000,
@@ -1148,6 +1170,7 @@ mod tests {
         handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    recurrence: None,
                     id: item_id.clone(),
                     goal: "run the nightly sweep, rev 2".into(),
                     fire_at_ms: now_ms() - 30_000,
@@ -1834,6 +1857,7 @@ mod tests {
         let proposed = handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    recurrence: None,
                     id: item.id.clone(),
                     goal: "sweep it".into(),
                     fire_at_ms: now_ms() - 30_000,

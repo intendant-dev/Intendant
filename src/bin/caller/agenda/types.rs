@@ -202,6 +202,52 @@ pub struct AgendaDismissal {
     pub(crate) kind: Option<String>,
 }
 
+/// In-manifest recurrence (G3-pre, ratified A5-rider amendment
+/// 2026-07-22): a manifest may declare its own standing cadence, so ONE
+/// approval covers the series — the ceremony matches the decision
+/// ("housekeeping runs weekly until revoked" is one decision). Because
+/// this lives INSIDE the manifest, the existing digest machinery does all
+/// the work: any edit mints a new digest and voids the approval, and a
+/// recurrence-less manifest serializes byte-identically to the legacy
+/// shape, so every legacy digest is unchanged by construction. Cadence is
+/// TIME only — event triggers are deliberately not vocabulary (G4,
+/// deferred).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecurrenceSpec {
+    /// Cadence interval in ms; intake floors it at
+    /// [`RECURRENCE_MIN_EVERY_MS`] (a runaway sub-minute cadence is a
+    /// session-spawn bomb).
+    pub every_ms: u64,
+    /// Expiry: no instants after this (epoch ms; must exceed
+    /// `fire_at_ms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<u64>,
+    /// Series length bound in INSTANTS (time-defined, replay-derivable):
+    /// instants that pass unspent while the daemon is down still consume
+    /// their indices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_occurrences: Option<u32>,
+    /// Consecutive non-success (`failed`/`unknown`) outcomes that suspend
+    /// the effect — surfaced, never silently re-fired. Default 3. The
+    /// owner re-arms by re-approving the unchanged digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspend_after_failures: Option<u32>,
+}
+
+/// The default failure-suspend threshold when a recurrence declares none.
+pub(crate) const DEFAULT_SUSPEND_AFTER_FAILURES: u32 = 3;
+/// Cadence floor (15 minutes), enforced at intake only.
+pub(crate) const RECURRENCE_MIN_EVERY_MS: u64 = 15 * 60 * 1000;
+
+impl RecurrenceSpec {
+    pub(crate) fn suspend_threshold(&self) -> u32 {
+        self.suspend_after_failures
+            .unwrap_or(DEFAULT_SUSPEND_AFTER_FAILURES)
+            .max(1)
+    }
+}
+
 /// A scheduled-session manifest (slice A5): the complete statement of
 /// what firing does — reviewed by the owner at approval time. Immutable
 /// per revision: [`manifest_digest`] binds the approval, and any edit
@@ -245,6 +291,17 @@ pub struct SessionManifest {
     /// inner value verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
+    /// Standing cadence (G3-pre). Additive: absent-on-the-wire when
+    /// `None`, so legacy manifest bytes — and the digests their approvals
+    /// bind — are unchanged. Living inside the manifest means the digest
+    /// binds it: declaring or editing recurrence revises the manifest and
+    /// voids any standing approval like any other edit. In a shared home,
+    /// an older build re-serializes this manifest WITHOUT the field and
+    /// derives a different digest, sees the approval as a mismatch, and
+    /// never fires — recurrence degrades fail-closed, never as a mangled
+    /// one-shot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recurrence: Option<RecurrenceSpec>,
 }
 
 /// An owner's approval of one manifest revision. `digest` is the bound
@@ -274,6 +331,24 @@ pub struct AgendaRun {
     pub(crate) note: Option<String>,
 }
 
+/// One owner-requested extra instant of an approved standing manifest
+/// (G3-pre `request_occurrence` fold view): the "run now" gesture beside
+/// a standing approval, recorded attributed like every act. The instant
+/// (`at_ms`) was minted at intake and read from the op — replay never
+/// consults a clock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaRequestedRun {
+    pub(crate) at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+}
+
+/// How many requested-run entries the fold keeps in view (the log keeps
+/// all; the journal is the execution truth either way).
+pub(crate) const MAX_REQUESTED_RUNS_VIEW: usize = 8;
+
 /// A scheduled-session effect on an item — a separate object referencing
 /// the entry, per the ratified doctrine (never item fields). `effect_id`
 /// is the stable lineage identity; the digest names one revision. v1
@@ -295,6 +370,35 @@ pub struct AgendaEffect {
     pub(crate) approval: Option<AgendaApproval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_run: Option<AgendaRun>,
+    /// Consecutive non-success (`failed`/`unknown`) occurrence outcomes
+    /// since the last approval (G3-pre) — fold-derived from log order
+    /// alone: `completed` resets it, `approve_effect` (the one-click
+    /// re-arm) and `propose_effect` reset it, `missed`/`started` are
+    /// neutral. Suspension = this counter reaching the manifest's
+    /// threshold; derived, never stored beyond the fold product.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub(crate) consecutive_failures: u32,
+    /// Owner-requested extra instants (G3-pre), newest-8 view; cleared by
+    /// re-propose and revoke (a request exists only under an approval).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) requested: Vec<AgendaRequestedRun>,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
+impl AgendaEffect {
+    /// Suspended = recurring ∧ the failure streak reached the manifest's
+    /// threshold. Render/planner judgment over fold products — the
+    /// planner plans nothing for a suspended effect, and the owner
+    /// re-arms with one re-approval of the unchanged digest.
+    pub(crate) fn suspended(&self) -> bool {
+        self.manifest
+            .recurrence
+            .as_ref()
+            .is_some_and(|rec| self.consecutive_failures >= rec.suspend_threshold())
+    }
 }
 
 /// The digest an approval binds: effect identity + the manifest's
@@ -743,7 +847,10 @@ pub enum AgendaCommand {
     },
     /// Propose (or revise) the item's scheduled-session manifest. Open to
     /// every agenda writer — proposing carries no authority: nothing fires
-    /// without an owner-surface approval of the exact digest.
+    /// without an owner-surface approval of the exact digest. `recurrence`
+    /// (G3-pre) declares a standing cadence INSIDE the digest-bound body;
+    /// an older daemon rejects the unknown field at strict intake rather
+    /// than silently parking a one-shot.
     ProposeEffect {
         id: String,
         goal: String,
@@ -751,8 +858,18 @@ pub enum AgendaCommand {
         #[serde(default)]
         orchestrate: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        recurrence: Option<RecurrenceSpec>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
+    /// Owner "run the standing manifest now" (G3-pre): one extra
+    /// occurrence of the item's ALREADY-APPROVED recurring manifest at
+    /// this instant — within the reviewed decision, so no new approval
+    /// ceremony. **Owner-surface only**, like the approval whose authority
+    /// it exercises. Recurring effects only (a one-shot's "run again" is
+    /// `start_now`'s revise flow); refused while suspended, while a run is
+    /// in flight, or while an earlier request still pends.
+    RequestOccurrence { id: String },
     /// Append an attributed, timestamped note to any item, any status —
     /// the thread under it (A4's answer op generalized). Notes are data,
     /// never instructions; history is the full log, render caps with an
@@ -962,6 +1079,7 @@ impl AgendaCommand {
             AgendaCommand::Ask { .. }
             | AgendaCommand::ApproveEffect { .. }
             | AgendaCommand::RevokeEffect { .. }
+            | AgendaCommand::RequestOccurrence { .. }
             | AgendaCommand::StartNow { .. } => None,
         }
     }
@@ -1105,6 +1223,18 @@ pub(crate) enum AgendaOp {
         id: String,
         effect_id: String,
     },
+    /// Owner-requested extra instant of an approved standing manifest
+    /// (G3-pre). `digest` names the approved revision the request
+    /// exercises; `at_ms` is the instant, minted at intake and read here
+    /// on replay (never the clock). A request folded against a since-
+    /// revised effect (digest mismatch) is warn-skipped — it pointed at
+    /// bytes that no longer stand.
+    RequestOccurrence {
+        id: String,
+        effect_id: String,
+        digest: String,
+        at_ms: u64,
+    },
     /// Daemon-authored occurrence outcome (scheduler only — see the enum
     /// docs). Writes the run result back onto the item's effect.
     RecordOccurrence {
@@ -1157,6 +1287,7 @@ impl AgendaOp {
             | AgendaOp::ProposeEffect { id, .. }
             | AgendaOp::ApproveEffect { id, .. }
             | AgendaOp::RevokeEffect { id, .. }
+            | AgendaOp::RequestOccurrence { id, .. }
             | AgendaOp::RecordOccurrence { id, .. }
             | AgendaOp::RecordAskDelivery { id, .. } => id,
         }
@@ -1579,9 +1710,12 @@ pub(crate) fn apply_op(
                 proposed_session_id: actor.session_id,
                 proposed_kind: actor.kind,
                 // A new revision voids any standing approval — the owner
-                // approved different bytes.
+                // approved different bytes. The failure streak and any
+                // pending requests belonged to those bytes too: reset.
                 approval: None,
                 last_run: None,
+                consecutive_failures: 0,
+                requested: Vec::new(),
             };
             match item.effects.iter_mut().find(|e| e.effect_id == *effect_id) {
                 Some(existing) => *existing = effect,
@@ -1613,6 +1747,10 @@ pub(crate) fn apply_op(
                 principal: actor.principal,
                 kind: actor.kind,
             });
+            // The approve op is the streak reset (G3-pre): re-approving an
+            // unchanged digest is the one-click re-arm of a suspended
+            // standing effect — no new vocabulary.
+            effect.consecutive_failures = 0;
             item.updated_ms = at_ms;
             None
         }
@@ -1624,6 +1762,40 @@ pub(crate) fn apply_op(
                 return Some(format!("revoke_effect for unknown effect on {id} ignored"));
             };
             effect.approval = None;
+            // A request exists only under an approval.
+            effect.requested.clear();
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::RequestOccurrence {
+            id,
+            effect_id,
+            digest,
+            at_ms: instant,
+        } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("request_occurrence for unknown {id} ignored"));
+            };
+            let Some(effect) = item.effects.iter_mut().find(|e| e.effect_id == *effect_id) else {
+                return Some(format!(
+                    "request_occurrence for unknown effect on {id} ignored"
+                ));
+            };
+            if effect.digest != *digest {
+                return Some(format!(
+                    "request_occurrence digest mismatch on {id} ignored (manifest revised)"
+                ));
+            }
+            let actor = rec.actor.clone().unwrap_or_default();
+            effect.requested.push(AgendaRequestedRun {
+                at_ms: *instant,
+                principal: actor.principal,
+                kind: actor.kind,
+            });
+            if effect.requested.len() > MAX_REQUESTED_RUNS_VIEW {
+                let drop = effect.requested.len() - MAX_REQUESTED_RUNS_VIEW;
+                effect.requested.drain(..drop);
+            }
             item.updated_ms = at_ms;
             None
         }
@@ -1650,6 +1822,17 @@ pub(crate) fn apply_op(
                 at_ms,
                 note: note.clone(),
             });
+            // The failure streak (G3-pre), from log order alone: attempted
+            // non-success counts, success resets, `missed` (daemon
+            // downtime, not the mandate's fault) and `started` are
+            // neutral.
+            match state.as_str() {
+                "failed" | "unknown" => {
+                    effect.consecutive_failures = effect.consecutive_failures.saturating_add(1);
+                }
+                "completed" => effect.consecutive_failures = 0,
+                _ => {}
+            }
             item.updated_ms = at_ms;
             None
         }
@@ -1865,6 +2048,7 @@ mod tests {
 
         // Full round-trip with the additive fields set preserves them.
         let full = SessionManifest {
+            recurrence: None,
             goal: "g".into(),
             fire_at_ms: 9,
             orchestrate: true,
@@ -3619,6 +3803,110 @@ mod tests {
                 record
             );
         }
+    }
+
+    /// G3-pre op-line bytes are pinned: the recurrence-bearing manifest
+    /// as `propose_effect` carries it, and the `request_occurrence` line
+    /// whose `at_ms` replay reads (never the clock).
+    #[test]
+    fn g3pre_op_line_formats_are_pinned() {
+        let manifest = SessionManifest {
+            goal: "standing".into(),
+            fire_at_ms: 1000,
+            orchestrate: false,
+            interactive: false,
+            project_root: None,
+            agent_config: None,
+            recurrence: Some(RecurrenceSpec {
+                every_ms: 3_600_000,
+                until_ms: None,
+                max_occurrences: Some(4),
+                suspend_after_failures: None,
+            }),
+        };
+        let propose = AgendaOpRecord {
+            v: 1,
+            at_ms: 50,
+            actor: None,
+            source: None,
+            op: AgendaOp::ProposeEffect {
+                id: "01X".into(),
+                effect_id: "ef-1".into(),
+                manifest,
+            },
+        };
+        let line = serde_json::to_string(&propose).unwrap();
+        assert_eq!(
+            line,
+            r#"{"v":1,"at_ms":50,"op":{"type":"propose_effect","id":"01X","effect_id":"ef-1","manifest":{"goal":"standing","fire_at_ms":1000,"recurrence":{"every_ms":3600000,"max_occurrences":4}}}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgendaOpRecord>(&line).unwrap(),
+            propose
+        );
+
+        let request = AgendaOpRecord {
+            v: 1,
+            at_ms: 51,
+            actor: Some(AgendaActor {
+                principal: Some("owner".into()),
+                session_id: None,
+                kind: Some("dashboard".into()),
+            }),
+            source: None,
+            op: AgendaOp::RequestOccurrence {
+                id: "01X".into(),
+                effect_id: "ef-1".into(),
+                digest: "0a1b".into(),
+                at_ms: 999,
+            },
+        };
+        let line = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            line,
+            r#"{"v":1,"at_ms":51,"actor":{"principal":"owner","kind":"dashboard"},"op":{"type":"request_occurrence","id":"01X","effect_id":"ef-1","digest":"0a1b","at_ms":999}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgendaOpRecord>(&line).unwrap(),
+            request
+        );
+
+        // A stale request against a revised manifest is fold-skipped.
+        let mut items = BTreeMap::new();
+        add_item(&mut items, 1, "01X");
+        apply_op(
+            &mut items,
+            &rec(
+                2,
+                AgendaOp::ProposeEffect {
+                    id: "01X".into(),
+                    effect_id: "ef-1".into(),
+                    manifest: SessionManifest {
+                        goal: "v2".into(),
+                        fire_at_ms: 2000,
+                        orchestrate: false,
+                        interactive: false,
+                        project_root: None,
+                        agent_config: None,
+                        recurrence: None,
+                    },
+                },
+            ),
+        );
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                3,
+                AgendaOp::RequestOccurrence {
+                    id: "01X".into(),
+                    effect_id: "ef-1".into(),
+                    digest: "stale".into(),
+                    at_ms: 3,
+                },
+            ),
+        )
+        .is_some());
+        assert!(items["01X"].effects[0].requested.is_empty());
     }
 
     /// G2 wire commands parse (Place included); unknown fields rejected.

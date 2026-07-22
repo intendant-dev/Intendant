@@ -744,6 +744,12 @@ html.ui-v2 .agenda-group-toggle.active {
   border-color: color-mix(in srgb, var(--iris) 55%, transparent);
 }
 
+/* G3-pre standing manifests: cadence chip + Run now. */
+html.ui-v2 .agenda-chip.standing {
+  color: var(--green, #98c379);
+  border: 1px solid color-mix(in srgb, var(--green, #98c379) 45%, transparent);
+}
+
 /* ---- Start-now confirm sheet (owner ruling 2026-07-21) ----
    The explanation IS the surface: goal text, project, inherited config,
    Interactive/Goal-run toggle, Start + Cancel. Bottom sheet on coarse

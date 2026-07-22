@@ -342,8 +342,16 @@ function agendaEffectBlock(item) {
     ? when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
       + ' ' + when.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
     : '';
+  // Standing cadence (G3-pre): the recurrence lives INSIDE the digest-
+  // bound manifest — one approval covers the series; any edit voids it.
+  const rec = manifest.recurrence || null;
+  const recLabel = rec ? agendaCadenceLabel(rec.every_ms) : '';
+  const suspendThreshold = rec ? (rec.suspend_after_failures || 3) : 0;
+  const suspended = !!rec && (effect.consecutive_failures || 0) >= suspendThreshold;
   const chips =
-    (whenLabel ? `<span class="agenda-chip due">at ${escapeHtml(whenLabel)}</span>` : '')
+    (whenLabel ? `<span class="agenda-chip due">${rec ? 'from' : 'at'} ${escapeHtml(whenLabel)}</span>` : '')
+    + (rec ? `<span class="agenda-chip standing" title="Standing manifest: one approval covers every occurrence${rec.until_ms ? `; ends ${new Date(rec.until_ms).toLocaleDateString()}` : ''}${rec.max_occurrences ? `; at most ${rec.max_occurrences} runs` : ''}">every ${escapeHtml(recLabel)}</span>` : '')
+    + (suspended ? `<span class="agenda-chip blocked" title="${escapeHtml(`${effect.consecutive_failures} consecutive failed runs — re-approve the unchanged manifest to re-arm, or revoke`)}">suspended</span>` : '')
     + (manifest.orchestrate ? '<span class="agenda-chip">orchestrate</span>' : '')
     + (manifest.interactive ? '<span class="agenda-chip" title="Opens the session with the goal as its first message, then waits for you">interactive</span>' : '')
     + (manifest.project_root
@@ -381,6 +389,18 @@ function agendaEffectBlock(item) {
       actions = `<button type="button" class="agenda-btn approve" data-op="approve_effect" data-id="${escapeHtml(item.id)}" data-digest="${escapeHtml(effect.digest || '')}">Approve</button>`;
     }
   }
+  // Standing-effect actions (G3-pre). Suspended + still approved: the
+  // one-click re-arm re-approves the UNCHANGED digest. Approved + armed:
+  // "Run now" fires one extra occurrence of the approved bytes (bare
+  // start_now — the daemon routes it to request_occurrence, approval
+  // untouched).
+  if (rec && item.status === 'open' && effect.approval) {
+    if (suspended) {
+      actions = `<button type="button" class="agenda-btn approve" data-op="approve_effect" data-id="${escapeHtml(item.id)}" data-digest="${escapeHtml(effect.digest || '')}" title="Re-approve the unchanged manifest — resets the failure streak and re-arms the series">Re-arm</button>${actions}`;
+    } else if (!run || run.state !== 'started') {
+      actions = `<button type="button" class="agenda-btn agenda-run-now" data-id="${escapeHtml(item.id)}" title="Fire one extra occurrence of the approved manifest now — the standing approval is untouched">Run now</button>${actions}`;
+    }
+  }
   return `<div class="agenda-effect">
     <div class="agenda-effect-head">
       <span class="agenda-effect-icon" aria-hidden="true">⏵</span>
@@ -394,6 +414,16 @@ function agendaEffectBlock(item) {
       <span class="agenda-item-actions">${actions}</span>
     </div>
   </div>`;
+}
+
+// Human cadence label for a recurrence interval (plain TEXT — callers
+// escape).
+function agendaCadenceLabel(everyMs) {
+  const minutes = Math.round((everyMs || 0) / 60000);
+  if (minutes % (7 * 24 * 60) === 0) return `${minutes / (7 * 24 * 60)}w`;
+  if (minutes % (24 * 60) === 0) return `${minutes / (24 * 60)}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
 }
 
 // The dismissal chip's tooltip (marker on a still-open question whose
@@ -1591,6 +1621,13 @@ function agendaRenderTab() {
   // instant fire); follow-up routes to the origin conversation.
   list.querySelectorAll('button.agenda-start-now').forEach((btn) => {
     btn.addEventListener('click', () => agendaOpenStartSheet(btn.dataset.id, btn));
+  });
+  // G3-pre: Run now fires one extra occurrence of the APPROVED standing
+  // manifest (bare start_now — the daemon routes it to request_occurrence;
+  // the manifest shown in this block is exactly what runs, so no sheet).
+  list.querySelectorAll('button.agenda-run-now').forEach((btn) => {
+    btn.addEventListener('click', () =>
+      agendaSendOp({ op: 'start_now', id: btn.dataset.id }, btn));
   });
   list.querySelectorAll('button.agenda-follow-up').forEach((btn) => {
     btn.addEventListener('click', () => {
