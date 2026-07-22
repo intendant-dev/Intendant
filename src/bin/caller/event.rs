@@ -424,6 +424,14 @@ pub enum AppEvent {
         session_id: String,
         goal: Option<SessionGoal>,
     },
+    /// A session's backend published a pull request (Claude Code
+    /// `system:code_change_published`). Sticky per-session display state
+    /// like `SessionGoal`: broadcast, log-persisted, replayed. `pr.url`
+    /// is already validated (or stripped) by the emitting drain.
+    SessionPrPublished {
+        session_id: String,
+        pr: crate::types::SessionPublishedPr,
+    },
     /// Per-session vitals (git / prompt-cache / rate limits) from the
     /// daemon-side producers; frontends render chips from the latest value.
     SessionVitals {
@@ -2823,6 +2831,12 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             goal: goal.clone(),
         }),
+        AppEvent::SessionPrPublished { session_id, pr } => {
+            Some(OutboundEvent::SessionPrPublished {
+                session_id: session_id.clone(),
+                pr: pr.clone(),
+            })
+        }
         AppEvent::SessionVitals { session_id, vitals } => Some(OutboundEvent::SessionVitals {
             session_id: session_id.clone(),
             vitals: vitals.clone(),
@@ -3907,6 +3921,9 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         }
         AppEvent::SessionGoal { session_id, goal } => {
             log.session_goal(session_id, goal.as_ref());
+        }
+        AppEvent::SessionPrPublished { session_id, pr } => {
+            log.session_pr_published(session_id, pr);
         }
         AppEvent::SessionVitals { session_id, vitals } => {
             log.session_vitals(session_id, vitals);
@@ -6140,6 +6157,24 @@ mod tests {
     #[test]
     fn outbound_skips_tick() {
         assert!(app_event_to_outbound(&AppEvent::Tick).is_none());
+    }
+
+    #[test]
+    fn outbound_session_pr_published_pins_wire_shape() {
+        let event = AppEvent::SessionPrPublished {
+            session_id: "s1".to_string(),
+            pr: crate::types::SessionPublishedPr {
+                provider: "github".to_string(),
+                repo: "intendant-dev/Intendant".to_string(),
+                number: "544".to_string(),
+                url: Some("https://github.com/intendant-dev/Intendant/pull/544".to_string()),
+            },
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"session_pr_published\""));
+        assert!(json.contains("\"number\":\"544\""));
+        assert!(json.contains("\"repo\":\"intendant-dev/Intendant\""));
     }
 
     #[test]

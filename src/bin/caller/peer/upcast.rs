@@ -360,6 +360,27 @@ impl PeerSessionFold {
 
 /// Wrap a fold change (if any) as a single-element `SessionUpdated`
 /// event vec — the common tail of every enrichment arm.
+/// Fold a published-PR notice into a session snapshot's list: dedupe by
+/// repo+number (a re-announced PR refreshes in place), bounded so a
+/// haywire backend cannot grow peer snapshots without limit.
+pub(crate) fn push_published_pr(
+    list: &mut Vec<crate::types::SessionPublishedPr>,
+    pr: &crate::types::SessionPublishedPr,
+) {
+    const MAX_PUBLISHED_PRS: usize = 16;
+    if let Some(existing) = list
+        .iter_mut()
+        .find(|p| p.repo == pr.repo && p.number == pr.number)
+    {
+        *existing = pr.clone();
+        return;
+    }
+    if list.len() >= MAX_PUBLISHED_PRS {
+        list.remove(0);
+    }
+    list.push(pr.clone());
+}
+
 pub(crate) fn session_updated_events(changed: Option<SessionInfo>) -> Vec<PeerEvent> {
     changed
         .map(|session| PeerEvent::SessionUpdated { session })
@@ -965,6 +986,10 @@ impl AppEventUpcaster {
 
             AppEvent::SessionGoal { session_id, goal } => session_updated_events(
                 self.sessions.update(session_id, |s| s.goal = goal.clone()),
+            ),
+
+            AppEvent::SessionPrPublished { session_id, pr } => session_updated_events(
+                self.sessions.update(session_id, |s| push_published_pr(&mut s.published_prs, pr)),
             ),
 
             AppEvent::SessionVitals { session_id, vitals } => session_updated_events(
@@ -1930,6 +1955,10 @@ impl WireEventUpcaster {
             OutboundEvent::SessionGoal { session_id, goal } => {
                 session_updated_events(self.sessions.update(session_id, |s| s.goal = goal.clone()))
             }
+            OutboundEvent::SessionPrPublished { session_id, pr } => session_updated_events(
+                self.sessions
+                    .update(session_id, |s| push_published_pr(&mut s.published_prs, pr)),
+            ),
             OutboundEvent::SessionVitals { session_id, vitals } => session_updated_events(
                 self.sessions
                     .update(session_id, |s| s.vitals = Some(vitals.clone())),
@@ -2472,6 +2501,10 @@ impl WireEventUpcaster {
 
             OutboundEvent::SessionGoal { session_id, goal } => session_updated_events(
                 self.sessions.update(session_id, |s| s.goal = goal.clone()),
+            ),
+
+            OutboundEvent::SessionPrPublished { session_id, pr } => session_updated_events(
+                self.sessions.update(session_id, |s| push_published_pr(&mut s.published_prs, pr)),
             ),
 
             OutboundEvent::SessionVitals { session_id, vitals } => session_updated_events(
@@ -5176,6 +5209,52 @@ mod tests {
             relationship: "subagent".into(),
             ephemeral: true,
         });
+    }
+
+    #[test]
+    fn parity_session_pr_published() {
+        assert_parity(AppEvent::SessionPrPublished {
+            session_id: "s1".into(),
+            pr: crate::types::SessionPublishedPr {
+                provider: "github".into(),
+                repo: "o/r".into(),
+                number: "7".into(),
+                url: Some("https://github.com/o/r/pull/7".into()),
+            },
+        });
+    }
+
+    #[test]
+    fn published_pr_list_dedupes_and_bounds() {
+        let mut list = Vec::new();
+        for i in 0..40 {
+            push_published_pr(
+                &mut list,
+                &crate::types::SessionPublishedPr {
+                    provider: "github".into(),
+                    repo: "o/r".into(),
+                    number: i.to_string(),
+                    url: None,
+                },
+            );
+        }
+        assert_eq!(list.len(), 16, "list is bounded");
+        assert_eq!(list.last().unwrap().number, "39");
+        // Re-announcing an existing PR refreshes in place, no growth.
+        push_published_pr(
+            &mut list,
+            &crate::types::SessionPublishedPr {
+                provider: "github".into(),
+                repo: "o/r".into(),
+                number: "39".into(),
+                url: Some("https://github.com/o/r/pull/39".into()),
+            },
+        );
+        assert_eq!(list.len(), 16);
+        assert_eq!(
+            list.last().unwrap().url.as_deref(),
+            Some("https://github.com/o/r/pull/39")
+        );
     }
 
     #[test]

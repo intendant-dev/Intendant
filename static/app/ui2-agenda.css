@@ -146,6 +146,9 @@ html.ui-v2 .agenda-glyph.open { color: var(--iris); }
 html.ui-v2 .agenda-glyph.done { color: var(--green); }
 html.ui-v2 .agenda-glyph.retired { color: var(--text-3); }
 html.ui-v2 .agenda-glyph.question { color: var(--amber); font-weight: 700; }
+html.ui-v2 .agenda-item-head-openable { cursor: pointer; border-radius: 8px; }
+html.ui-v2 .agenda-item-head-openable:hover { background: var(--hover-wash); }
+html.ui-v2 .agenda-item-head-openable:hover .agenda-item-title { color: var(--iris-2); }
 html.ui-v2 .agenda-open-ask-btn {
   border-color: rgba(var(--iris-rgb), .4);
   color: var(--iris-2);
