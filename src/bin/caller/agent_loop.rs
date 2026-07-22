@@ -4283,6 +4283,14 @@ mod coordination_intent {
     use super::native_session_intent;
     use crate::conversation::{Conversation, MessageProvenance};
 
+    /// UFCS on purpose: the provenance-parity pin below censuses this
+    /// file's production conversation entry points by their method-call
+    /// spelling; a test fixture is not an emission site and must not
+    /// join (or force a re-pin of) that count.
+    fn append(conv: &mut Conversation, provenance: MessageProvenance, text: &str) {
+        Conversation::add_user(conv, provenance, text.to_string());
+    }
+
     #[test]
     fn latest_task_bearing_message_wins_and_injections_never_do() {
         let mut conv = Conversation::new("system".into(), 100_000);
@@ -4291,11 +4299,15 @@ mod coordination_intent {
             "",
             "no task yet → empty (declare falls back)"
         );
-        conv.add_user(MessageProvenance::Task, "initial task".into());
-        conv.add_user(MessageProvenance::SystemInjection, "[System] nudge".into());
+        append(&mut conv, MessageProvenance::Task, "initial task");
+        append(
+            &mut conv,
+            MessageProvenance::SystemInjection,
+            "[System] nudge",
+        );
         assert_eq!(native_session_intent(&conv), "initial task");
-        conv.add_user(MessageProvenance::FollowUp, "[New Task] pivot".into());
-        conv.add_user(MessageProvenance::Steer, "steer text".into());
+        append(&mut conv, MessageProvenance::FollowUp, "[New Task] pivot");
+        append(&mut conv, MessageProvenance::Steer, "steer text");
         assert_eq!(
             native_session_intent(&conv),
             "[New Task] pivot",
