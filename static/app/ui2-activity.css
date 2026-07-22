@@ -1104,10 +1104,16 @@ html.ui-v2 .session-window .session-window-empty-retry {
 html.ui-v2 .session-window .session-window-empty-retry:hover { background: var(--surface-2); color: var(--text); }
 
 /* vitals chips: quiet ghost chips — full detail stays one click away in
-   the explainer, the default row is glanceable */
+   the explainer, the default row is glanceable.
+   NO `display` here (reconciled 2026-07-22): this re-skin used to declare
+   `display: inline-flex`, and at (0,3,1) it out-ranked the (0,3,0) chip
+   state machine in 12-styles-tasks-log.css — the .vit-attn/.vit-overflow
+   default-hide and the @container quiet-chip fold — so expanded headers
+   grew the collapsed states' attention chip and a bogus "+N". The base
+   .session-window-vitals .vit-chip rule already supplies inline-flex;
+   chip visibility belongs to the state machine alone. */
 html.ui-v2 .session-window .session-window-vitals { gap: 4px; }
 html.ui-v2 .session-window .vit-chip {
-  display: inline-flex;
   align-items: center;
   gap: 4px;
   border: 1px solid transparent;
