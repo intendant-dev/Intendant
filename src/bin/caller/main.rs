@@ -2944,7 +2944,17 @@ fn configure_sandbox_env(
     // the denial-consent flow can recompute the grant env live (the flag
     // lock pins the state for this daemon's lifetime).
     let base_cfg = match project_write_scope {
-        Some(root) => sandbox::SandboxConfig::default_for_project(root, log_dir),
+        Some(root) => {
+            // Coordination-space bind (Track C): env override → derived
+            // worktree-normalized key, resolved here at the edge so the
+            // sandbox constructor stays pure.
+            let (space_dir, _) = crate::coordination::paths::resolve_space_dir(
+                crate::coordination::paths::env_override().as_deref(),
+                &crate::platform::intendant_home(),
+                root,
+            );
+            sandbox::SandboxConfig::default_for_project(root, log_dir, Some(&space_dir))
+        }
         None => sandbox::SandboxConfig::projectless(log_dir),
     };
     sandbox::record_sandbox_startup(sandbox::SandboxRuntimeState {

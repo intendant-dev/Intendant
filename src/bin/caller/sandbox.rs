@@ -589,20 +589,23 @@ impl SandboxConfig {
     /// - Write: project root, the OS scratch dir(s), session-log roots, and
     ///   the Unix toolchain caches
     ///   (`toolchain_cache_write_paths`)
-    pub fn default_for_project(project_root: &Path, log_dir: &Path) -> Self {
+    pub fn default_for_project(
+        project_root: &Path,
+        log_dir: &Path,
+        coordination_space_dir: Option<&Path>,
+    ) -> Self {
         let mut config = Self::projectless(log_dir);
         config.write_paths.insert(0, project_root.to_path_buf());
         // Coordination-space bind (Track C): bus writes (declarations,
-        // messages) from sandboxed runtime shells land under the state
-        // root's `coordination/<space-key>` — grant exactly that
+        // messages) from sandboxed runtime shells land under the
+        // session's `coordination/<space-key>` dir — grant exactly that
         // subtree, never the state root wholesale (it holds the trust
-        // store; see the `logs/` rationale above).
-        let (space_dir, _) = crate::coordination::paths::resolve_space_dir(
-            crate::coordination::paths::env_override().as_deref(),
-            &crate::platform::intendant_home(),
-            project_root,
-        );
-        config.write_paths.push(space_dir);
+        // store; see the `logs/` rationale above). Resolved by the
+        // caller's edge (`paths::resolve_space_dir`) — this constructor
+        // stays pure for hermetic tests.
+        if let Some(space_dir) = coordination_space_dir {
+            config.write_paths.push(space_dir.to_path_buf());
+        }
         config
     }
 
@@ -1281,6 +1284,7 @@ mod tests {
         let config = SandboxConfig::default_for_project(
             Path::new("/home/user/project"),
             Path::new("/tmp/logs"),
+            None,
         );
         assert!(config.enabled);
         assert!(config
@@ -1301,7 +1305,7 @@ mod tests {
         let log_dir = Path::new("/tmp/logs");
         let projectless = SandboxConfig::projectless(log_dir);
         let mut with_project =
-            SandboxConfig::default_for_project(Path::new("/home/user/project"), log_dir);
+            SandboxConfig::default_for_project(Path::new("/home/user/project"), log_dir, None);
         // Exactly one path apart: the project root. No cwd, no widening.
         assert!(!projectless
             .write_paths
@@ -1311,6 +1315,20 @@ mod tests {
             .retain(|p| p != Path::new("/home/user/project"));
         assert_eq!(projectless.write_paths, with_project.write_paths);
         assert!(projectless.enabled);
+    }
+
+    /// The coordination-space grant is exactly the injected dir — the
+    /// caller's edge resolves it; the constructor never reads env.
+    #[test]
+    fn project_config_grants_injected_coordination_space_dir() {
+        let log_dir = Path::new("/tmp/logs");
+        let space = Path::new("/state/coordination/proj-abc123");
+        let config = SandboxConfig::default_for_project(
+            Path::new("/home/user/project"),
+            log_dir,
+            Some(space),
+        );
+        assert!(config.write_paths.contains(&space.to_path_buf()));
     }
 
     /// The write set grants the state root's `logs/` subtree only — never
@@ -1434,8 +1452,11 @@ mod tests {
 
     #[test]
     fn disabled_config_skips_apply() {
-        let mut config =
-            SandboxConfig::default_for_project(Path::new("/tmp/test"), Path::new("/tmp/logs"));
+        let mut config = SandboxConfig::default_for_project(
+            Path::new("/tmp/test"),
+            Path::new("/tmp/logs"),
+            None,
+        );
         config.enabled = false;
         assert_eq!(config.apply_to_current_process().unwrap(), false);
     }
@@ -1445,6 +1466,7 @@ mod tests {
         let config = SandboxConfig::default_for_project(
             Path::new("/home/user/myproject"),
             Path::new("/var/log/intendant"),
+            None,
         );
         assert!(config.write_paths.len() >= 3);
     }
