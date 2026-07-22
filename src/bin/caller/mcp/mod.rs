@@ -73,6 +73,7 @@ pub(crate) use tools_ask::unregister_pending_ask;
 mod tools_display;
 mod tools_managed;
 mod tools_notes;
+mod tools_whoami;
 pub(crate) use tools_notes::{
     note_image_extension, SESSION_NOTE_MAX_IMAGES, SESSION_NOTE_MAX_IMAGE_BYTES,
     SESSION_NOTE_MAX_TEXT_BYTES, SESSION_NOTE_MAX_TOTAL_IMAGE_BYTES,
@@ -468,6 +469,11 @@ impl IntendantServer {
                 self.get_status_for_session(session_id, managed_context_override)
                     .await,
             )),
+            // Identity is answered from the gate-resolved actor alone — the
+            // lane's default session id is deliberately not consulted, so
+            // the report never claims a session the caller didn't
+            // authenticate as.
+            "whoami" => Ok(text_tool_result(self.whoami_for_caller(&actor).await)),
             "get_logs" => {
                 let Parameters(params) = parse_params::<GetLogsParams>(args)?;
                 Ok(text_tool_result(
