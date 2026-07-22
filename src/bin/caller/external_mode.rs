@@ -7,11 +7,15 @@
 // is the deferred cosmetic pass (see the god-file split design).
 use crate::*;
 
-/// Surface a visible warning when an outbound message carries image
+/// Surface a visible notice when an outbound message carries image
 /// attachments the backend cannot deliver natively (the
-/// `send_message_with_images` default forwards text only). Non-image files
-/// always travel via the staged-path prelude, so images are the only
-/// attachment kind that can silently vanish on an unsupporting backend.
+/// `send_message_with_images` default forwards text only). The stored-path
+/// prelude (`[attachment stored: …]` — see
+/// `external_agent::format_attachments_prelude`) still names every stored
+/// attachment in the delivered text, so the agent can read the file with
+/// its own tools — the pixels just don't arrive inline. An image with no
+/// stored file (in-memory only) gets no path line either, so that corner
+/// stays an honest "will not reach the agent" warning.
 fn warn_undeliverable_images(
     session_log: &SharedSessionLog,
     agent_name: &str,
@@ -21,11 +25,29 @@ fn warn_undeliverable_images(
     if supports_images {
         return;
     }
-    let dropped = attachments.iter().filter(|a| a.is_image()).count();
-    if dropped > 0 {
+    let stored_path = |a: &&external_agent::AgentAttachment| match a {
+        external_agent::AgentAttachment::Image(img) => Some(img.local_path.is_some()),
+        external_agent::AgentAttachment::File(_) => None,
+    };
+    let referenced = attachments
+        .iter()
+        .filter(|a| stored_path(a) == Some(true))
+        .count();
+    let vanishing = attachments
+        .iter()
+        .filter(|a| stored_path(a) == Some(false))
+        .count();
+    if referenced > 0 {
         slog(session_log, |l| {
             l.warn(&format!(
-                "{agent_name} backend does not deliver image attachments; {dropped} image(s) will not reach the agent (text and staged file paths still sent)"
+                "{agent_name} backend does not take inline image input; {referenced} image attachment(s) delivered as stored-file path reference(s) only"
+            ));
+        });
+    }
+    if vanishing > 0 {
+        slog(session_log, |l| {
+            l.warn(&format!(
+                "{agent_name} backend does not take inline image input; {vanishing} image attachment(s) have no stored file and will not reach the agent"
             ));
         });
     }

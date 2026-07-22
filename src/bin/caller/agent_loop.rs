@@ -132,21 +132,14 @@ impl UserAttachments {
             .collect()
     }
 
-    pub(crate) fn text_with_file_prelude(&self, text: &str) -> String {
-        let files: Vec<&external_agent::AgentFileAttachment> = self
-            .items
-            .iter()
-            .filter_map(|att| match att {
-                external_agent::AgentAttachment::File(file) => Some(file),
-                external_agent::AgentAttachment::Image(_) => None,
-            })
-            .collect();
-        let prelude = external_agent::format_file_attachments_prelude(&files);
-        if prelude.is_empty() {
-            text.to_string()
-        } else {
-            format!("{}{}", prelude, text)
-        }
+    /// The native-session spelling of the delivery contract: the same
+    /// stored-path prelude every external lane uses
+    /// ([`external_agent::text_with_attachments_prelude`]), covering files
+    /// AND images with on-disk paths. Pixels still ride separately via
+    /// [`Self::conversation_images`]; the path lines make the stored files
+    /// referenceable.
+    pub(crate) fn text_with_attachments_prelude(&self, text: &str) -> String {
+        external_agent::text_with_attachments_prelude(text, &self.items)
     }
 }
 
@@ -3787,7 +3780,9 @@ pub(crate) async fn run_round_loop(
                     break;
                 };
                 round += 1;
-                let followup_text = message.attachments.text_with_file_prelude(&message.text);
+                let followup_text = message
+                    .attachments
+                    .text_with_attachments_prelude(&message.text);
                 let followup_images = message.attachments.conversation_images();
                 slog(&session_log, |l| {
                     l.info(&format!(
@@ -4251,6 +4246,56 @@ mod budget_tail {
             .into_iter()
             .collect();
         assert_eq!(budget_tail_index(&batch, &handled), None);
+    }
+}
+
+#[cfg(test)]
+mod user_attachments {
+    use super::UserAttachments;
+    use crate::external_agent;
+    use std::path::PathBuf;
+
+    /// Native-session seam: the composed text names stored images (not just
+    /// files — the pre-unification helper skipped them) while the pixels
+    /// still ride separately as conversation images.
+    #[test]
+    fn native_prelude_names_stored_images_and_keeps_pixels() {
+        let attachments = UserAttachments::from_items(vec![
+            external_agent::AgentAttachment::Image(
+                external_agent::AgentImageAttachment::from_frame_path(
+                    PathBuf::from("/store/uploads/s1/cd34__shot.png"),
+                    "aGk=".to_string(),
+                    "image/png".to_string(),
+                ),
+            ),
+            external_agent::AgentAttachment::File(external_agent::AgentFileAttachment {
+                local_path: PathBuf::from("/store/uploads/s1/ab12__report.pdf"),
+                name: "report.pdf".to_string(),
+                mime_type: "application/pdf".to_string(),
+                size: 9,
+            }),
+        ]);
+        let composed = attachments.text_with_attachments_prelude("check these");
+        assert!(
+            composed.contains(&format!(
+                "{}/store/uploads/s1/cd34__shot.png]",
+                external_agent::ATTACHMENT_STORED_MARKER
+            )),
+            "image path line missing: {composed}"
+        );
+        assert!(
+            composed.contains(&format!(
+                "{}/store/uploads/s1/ab12__report.pdf]",
+                external_agent::ATTACHMENT_STORED_MARKER
+            )),
+            "file path line missing: {composed}"
+        );
+        assert!(composed.ends_with("check these"));
+        assert_eq!(
+            attachments.conversation_images().len(),
+            1,
+            "the image block lane is unchanged by the path line"
+        );
     }
 }
 

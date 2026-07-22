@@ -1799,7 +1799,10 @@ impl ExternalAgent for KimiCodeAgent {
             .cloned()
             .map(AgentAttachment::Image)
             .collect::<Vec<_>>();
-        let content = self.attachment_content(message, &attachments).await?;
+        // Same stored-path prelude as the trait default: Kimi delivers the
+        // content natively AND the model can reference the on-disk file.
+        let augmented = super::text_with_attachments_prelude(message, &attachments);
+        let content = self.attachment_content(&augmented, &attachments).await?;
         self.submit_content(thread, content).await?;
         Ok(())
     }
@@ -1810,7 +1813,12 @@ impl ExternalAgent for KimiCodeAgent {
         message: &str,
         attachments: &[AgentAttachment],
     ) -> Result<(), CallerError> {
-        let content = self.attachment_content(message, attachments).await?;
+        // Native file upload + inline images carry the bytes; the
+        // stored-path prelude keeps the delivered message shape (and the
+        // greppable `[attachment stored: …]` reference) identical to every
+        // other backend.
+        let augmented = super::text_with_attachments_prelude(message, attachments);
+        let content = self.attachment_content(&augmented, attachments).await?;
         self.submit_content(thread, content).await?;
         Ok(())
     }
