@@ -2139,9 +2139,7 @@ mod tests {
                 3,
             )
             .unwrap();
-        let marked = store
-            .record_ask_delivery(&item.id, false, None, 4)
-            .unwrap();
+        let marked = store.record_ask_delivery(&item.id, false, None, 4).unwrap();
         assert_eq!(marked.answer.as_ref().unwrap().delivered, Some(false));
 
         // A later successful successor delivery supersedes the miss.

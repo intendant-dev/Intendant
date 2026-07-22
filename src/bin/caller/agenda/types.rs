@@ -1855,10 +1855,11 @@ mod tests {
     /// `delivered` key).
     #[test]
     fn answer_without_delivered_field_deserializes_to_none() {
-        let answer: AgendaAnswer =
-            serde_json::from_str(r#"{"text":"A","at_ms":2}"#).unwrap();
+        let answer: AgendaAnswer = serde_json::from_str(r#"{"text":"A","at_ms":2}"#).unwrap();
         assert_eq!(answer.delivered, None);
-        assert!(!serde_json::to_string(&answer).unwrap().contains("delivered"));
+        assert!(!serde_json::to_string(&answer)
+            .unwrap()
+            .contains("delivered"));
 
         let marked = AgendaAnswer {
             delivered: Some(false),

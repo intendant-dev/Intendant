@@ -1376,8 +1376,7 @@ impl SessionSupervisor {
         let mut candidates: Vec<(String, String)> = Vec::new();
         for (source, backend_id) in recorded_backend_conversations_in_home(&home, asker) {
             candidates.push((source.clone(), backend_id.clone()));
-            for record in crate::external_wrapper_index::wrappers_for(&home, &source, &backend_id)
-            {
+            for record in crate::external_wrapper_index::wrappers_for(&home, &source, &backend_id) {
                 candidates.push((source.clone(), record.intendant_session_id));
             }
         }
@@ -1444,10 +1443,7 @@ impl SessionSupervisor {
             return;
         }
         if let Err(err) = agenda.record_ask_delivery(&item.id, delivered, session_id) {
-            eprintln!(
-                "[supervisor] recording ask delivery for {}: {err}",
-                item.id
-            );
+            eprintln!("[supervisor] recording ask delivery for {}: {err}", item.id);
         }
     }
 

@@ -1889,10 +1889,7 @@ pub(crate) fn recorded_backend_conversations_in_home(
         if !external_agent::source_session_id_is_canonical(source, backend_id) {
             return;
         }
-        if out
-            .iter()
-            .any(|(s, b)| s == source && b == backend_id)
-        {
+        if out.iter().any(|(s, b)| s == source && b == backend_id) {
             return;
         }
         out.push((source.to_string(), backend_id.to_string()));
