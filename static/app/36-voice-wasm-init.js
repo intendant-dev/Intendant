@@ -633,7 +633,20 @@ async function main() {
           // Historical replay can emit lifecycle commands such as session_ended
           // that move the live dashboard to Sessions. The URL remains the
           // navigation source of truth, so re-apply it after replay settles.
+          const changesWasActive = isChangesSubtabActive();
           applyCurrentRoute();
+          // The replay reset the Changes pane (resetChangesPane above) and
+          // the route re-apply early-returns for an already-active subtab,
+          // so a dashboard parked on Changes — an #activity/changes deep
+          // link at cold boot, or a live reconnect — would keep the loading
+          // placeholder until some unrelated trigger refetched. Re-run the
+          // activation fetch now that the replayed session context is in
+          // place; when the route apply itself just switched onto Changes,
+          // switchActivitySubtab already fetched and this stays out of its
+          // way.
+          if (changesWasActive && isChangesSubtabActive()) {
+            refreshChangesForActivation();
+          }
           reconcileRecordingStreams();
         });
         return;

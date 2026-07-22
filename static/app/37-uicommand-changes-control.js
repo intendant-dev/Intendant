@@ -312,6 +312,17 @@ let changesRefreshTimer = null;
 let changesRefreshSeq = 0;
 let changesRenderFrame = null;
 let pendingChangesAutoSelect = null;
+// Whether the pane's content states a real answer — a parsed list
+// response, a delivered daemon error, or the target-mismatch notice.
+// False until the FIRST fetch resolves (and again after a bare
+// resetChangesPane), so the empty state reads as loading instead of
+// claiming "No file changes yet" before anything was actually asked.
+let changesListResolved = false;
+// One-shot re-arm for a boot whose first fetch failed on the transport
+// lane (tunnel not up yet, and no HTTP twin in Connect mode) — the
+// refreshControlPane deep-link pattern: poll for a usable tunnel, then
+// re-run the activation fetch if the pane still has no answer.
+let changesWaitingForTransport = false;
 
 // Split the changed-files map into the session-edit rows and the
 // working-tree rows (records the daemon's git lane tagged
@@ -326,11 +337,14 @@ function changesEntriesByOrigin() {
   return { session, workingTree };
 }
 
-// The list pane's honest empty-state line: only claim "no changes" when
-// BOTH the session sources and the working tree are empty — and say the
-// working tree is clean when that is affirmatively known (total 0 from
-// the same status parse the dirty chip counts).
+// The list pane's honest empty-state line: before the first fetch has
+// resolved the pane has no answer to state, so it says loading; after
+// that, only claim "no changes" when BOTH the session sources and the
+// working tree are empty — and say the working tree is clean when that
+// is affirmatively known (total 0 from the same status parse the dirty
+// chip counts).
 function changesEmptyStateMessage() {
+  if (!changesListResolved) return 'Loading changes...';
   if (changesWorkingTree && Number(changesWorkingTree.total) === 0) {
     return 'No file changes yet — the working tree is clean.';
   }
@@ -490,7 +504,7 @@ function renderChangesFileList(emptyMessage = null) {
   });
 }
 
-function resetChangesPane(message = 'No file changes yet') {
+function resetChangesPane(message = null) {
   if (changesRenderFrame) {
     cancelAnimationFrame(changesRenderFrame);
     changesRenderFrame = null;
@@ -499,10 +513,16 @@ function resetChangesPane(message = 'No file changes yet') {
   changedFiles.clear();
   changesWorkingTree = null;
   activeChangesFile = null;
-  renderChangesFileList(message);
+  // A bare reset (session switch, bootstrap replay) returns the pane to
+  // the pre-answer state — the next default render says loading until a
+  // fetch resolves. An explicit message (load errors, tracking
+  // unavailable) IS the pane's answer and renders verbatim.
+  changesListResolved = !!message;
+  const text = message || changesEmptyStateMessage();
+  renderChangesFileList(text);
   renderChangesDiffHeader(null);
   const content = document.getElementById('changes-diff-content');
-  if (content) content.innerHTML = `<span class="changes-empty">${escapeHtml(message)}</span>`;
+  if (content) content.innerHTML = `<span class="changes-empty">${escapeHtml(text)}</span>`;
   updateChangesBadge();
   stationScheduleUpdate();
 }
@@ -593,6 +613,8 @@ function fetchChangesResponse(path = '') {
 }
 
 function showChangesTargetMismatch(message) {
+  // The mismatch notice is a stated answer, not a pending fetch.
+  changesListResolved = true;
   activeChangesFile = null;
   changedFiles.clear();
   changesWorkingTree = null;
@@ -619,6 +641,7 @@ async function refreshChangesList(options = {}) {
     const resp = await fetchChangesResponse();
     const data = await parseChangesResponse(resp);
     if (seq !== changesRefreshSeq) return;
+    changesListResolved = true;
     changedFiles.clear();
     // List shape: `{files: [...], working_tree: {...}?}` (the envelope);
     // a bare array (the pre-envelope daemon shape) still parses.
@@ -662,12 +685,61 @@ async function refreshChangesList(options = {}) {
     }
     stationScheduleUpdate();
   } catch (e) {
-    if (!quiet) {
+    if (seq !== changesRefreshSeq) return;
+    // A thrown DaemonApiError (any kind but a delivered 'http') is a
+    // transport-lane failure; everything else came out of a delivered
+    // daemon response (parseChangesResponse's structured error / status
+    // shapes).
+    const laneFailure = !!(e && e.name === 'DaemonApiError' && e.kind !== 'http');
+    // Quiet refreshes keep the previous content on failure — but a pane
+    // that has never resolved is only showing the loading placeholder,
+    // so a delivered "no" (e.g. the watcher-absent 503) must land as the
+    // answer rather than park the loading state forever. A lane failure
+    // before the first answer instead arms the tunnel retry: the cold
+    // boot's fetch can precede any usable transport.
+    if (!quiet || (!changesListResolved && !laneFailure)) {
       resetChangesPane(e.message === 'file watcher not active'
         ? 'Change tracking unavailable'
         : `Unable to load changes: ${e.message}`);
+    } else if (!changesListResolved && laneFailure) {
+      armChangesTransportRetry();
     }
   }
+}
+
+// The subtab-activation fetch — one function so every path that "opens"
+// the Changes view (switchActivitySubtab in 48-router-settings.js, the
+// bootstrap-replay re-arm in 36-voice-wasm-init.js, the transport retry
+// below) runs the identical list + timeline refresh instead of
+// hand-rolled copies. refreshHistory is a no-op when the endpoint 404s,
+// so a session resumed mid-flight still shows its existing timeline.
+function refreshChangesForActivation() {
+  refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true });
+  if (typeof refreshHistory === 'function') refreshHistory();
+}
+
+// Deep links (#activity/changes) activate the subtab during initial
+// route apply, before the dashboard tunnel is constructed — and in
+// Connect mode there is no HTTP twin to fall back to, so that first
+// fetch fails on the lane. Poll briefly for a usable tunnel (the
+// refreshControlPane deep-link pattern) and re-run the activation fetch
+// once, unless something else resolved the pane meanwhile.
+function armChangesTransportRetry() {
+  if (changesWaitingForTransport) return;
+  changesWaitingForTransport = true;
+  const retry = () => {
+    if (changesListResolved) {
+      changesWaitingForTransport = false;
+      return;
+    }
+    if (dashboardControlTransport && dashboardControlTransport.canUseRpc()) {
+      changesWaitingForTransport = false;
+      if (isChangesSubtabActive()) refreshChangesForActivation();
+      return;
+    }
+    setTimeout(retry, 250);
+  };
+  setTimeout(retry, 250);
 }
 
 function scheduleChangesRefresh() {
