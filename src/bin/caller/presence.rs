@@ -47,6 +47,7 @@ pub fn action_to_control_msg(action: &PresenceAction) -> Option<(ControlMsg, Str
                     attachments: envelope.attachment_frame_ids.clone(),
                     follow_up_id: None,
                     delegation_id: None,
+                    launch_config: Default::default(),
                 },
                 confirmation,
             ))

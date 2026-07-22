@@ -570,6 +570,21 @@ pub(crate) async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::SetClaudeEffort { effort } => {
+            let label = crate::project::normalize_claude_effort(effort.as_deref())
+                .unwrap_or_else(|| "<model default>".to_string());
+            emit_control_result(
+                control_tx,
+                "set_claude_effort",
+                true,
+                format!(
+                    "Claude Code reasoning effort set to {} (applies on next task)",
+                    label
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::SetClaudePermissionMode { mode } => {
             emit_control_result(
                 control_tx,
@@ -1512,6 +1527,7 @@ pub(crate) async fn handle_control_command_mcp(
                         attachments: vec![],
                         follow_up_id: None,
                         delegation_id: None,
+                        launch_config: Default::default(),
                     }));
                     emit_control_result(
                         control_tx,

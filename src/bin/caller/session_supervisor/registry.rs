@@ -407,6 +407,11 @@ impl SessionSupervisor {
                 let current = self.config.shared_claude_config.read().await.clone();
                 let cfg = &mut project.config.agent.claude_code;
                 cfg.model = current.model;
+                // The daemon-default leg of the effort resolution chain:
+                // explicit per-create `claude_effort` is applied AFTER this
+                // overlay (`apply_session_claude_effort`), so the order is
+                // explicit pin → this daemon default → backend default.
+                cfg.effort = current.effort;
                 cfg.permission_mode = current.permission_mode;
                 cfg.allowed_tools = current.allowed_tools;
             }

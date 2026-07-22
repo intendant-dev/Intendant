@@ -72,44 +72,53 @@ impl SessionSupervisor {
         }
     }
 
-    /// Create and dispatch a new managed session. Returns the launched
-    /// session id once the task is actually dispatched (the peer-
-    /// delegation receipt keys on this — see
-    /// [`Self::acknowledge_delegation`]); `None` on every failure exit,
-    /// which all narrate their own error before returning.
+    /// Create and dispatch a new managed session. THE shared launch path:
+    /// every session-creating lane (`CreateSession`, untargeted
+    /// `StartTask` — composer, ctl, peer delegations, the agenda's
+    /// scheduled/start-now spawns) funnels through this one body, so the
+    /// launch-config resolution chain (explicit `launch` pin → daemon
+    /// default setting → backend default) and the persisted/echoed launch
+    /// provenance are uniform across lanes. Returns the launched session
+    /// id once the task is actually dispatched (the peer-delegation
+    /// receipt keys on this — see [`Self::acknowledge_delegation`]);
+    /// `None` on every failure exit, which all narrate their own error
+    /// before returning.
     #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn start_new_session(
         &self,
         task: String,
         name: Option<String>,
         project_root: Option<String>,
-        agent: Option<String>,
-        agent_command: Option<String>,
-        claude_model: Option<String>,
-        claude_permission_mode: Option<String>,
-        claude_effort: Option<String>,
-        kimi_model: Option<String>,
-        kimi_thinking: Option<String>,
-        kimi_permission_mode: Option<String>,
-        kimi_allowed_tools: Option<String>,
-        kimi_plan_mode: Option<bool>,
-        kimi_swarm_mode: Option<bool>,
-        codex_model: Option<String>,
-        codex_reasoning_effort: Option<String>,
-        codex_sandbox: Option<String>,
-        codex_approval_policy: Option<String>,
-        codex_managed_context: Option<String>,
-        codex_context_archive: Option<String>,
+        launch: event::AgentLaunchConfig,
         orchestrate: Option<bool>,
         direct: Option<bool>,
         reference_frame_ids: Vec<String>,
         display_target: Option<String>,
         attachments: Vec<String>,
-        codex_service_tier: Option<String>,
         worktree: Option<SessionWorktreeRequest>,
         hosted_lease_id: Option<String>,
         reserved: Option<ReservedSessionLaunch>,
     ) -> Option<String> {
+        let event::AgentLaunchConfig {
+            agent,
+            agent_command,
+            claude_model,
+            claude_permission_mode,
+            claude_effort,
+            kimi_model,
+            kimi_thinking,
+            kimi_permission_mode,
+            kimi_allowed_tools,
+            kimi_plan_mode,
+            kimi_swarm_mode,
+            codex_model,
+            codex_reasoning_effort,
+            codex_sandbox,
+            codex_approval_policy,
+            codex_managed_context,
+            codex_context_archive,
+            codex_service_tier,
+        } = launch;
         self.wait_for_launch_gate_in_tests().await;
         let session_name = match normalize_session_name_option(name.as_deref()) {
             Ok(name) => name,

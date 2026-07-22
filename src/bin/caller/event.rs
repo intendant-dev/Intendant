@@ -985,10 +985,13 @@ pub enum AppEvent {
 
     /// Emitted when one or more Claude Code runtime fields change. Mirror of
     /// `GeminiConfigChanged` — fields omitted were not touched,
-    /// `model_cleared` distinguishes "no change" from "override removed".
+    /// `model_cleared`/`effort_cleared` distinguish "no change" from
+    /// "override removed".
     ClaudeConfigChanged {
         model: Option<String>,
         model_cleared: bool,
+        effort: Option<String>,
+        effort_cleared: bool,
         permission_mode: Option<String>,
         allowed_tools: Option<Vec<String>>,
     },
@@ -1348,6 +1351,108 @@ pub enum ApprovalResponse {
     },
 }
 
+/// The optional agent-launch configuration vocabulary shared by every
+/// session-creating lane: `CreateSession`'s one-shot config fields,
+/// `StartTask`'s additive twin (flattened, so the wire fields read exactly
+/// like `CreateSession`'s), and the agenda manifest's `agent_config` block.
+/// Field names, types, and inherit-vs-pin semantics are exactly
+/// `CreateSession`'s — `None` inherits the daemon default at launch
+/// (explicit per-create value → daemon default setting → backend default).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentLaunchConfig {
+    /// Backend selection: "internal", "codex", "claude-code", or "kimi".
+    /// Omitted means the configured default backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Executable path or command name for the selected external agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_command: Option<String>,
+    /// Claude Code launch pins (claude-code sessions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_permission_mode: Option<String>,
+    /// Reasoning-effort level (`crate::project::CLAUDE_EFFORTS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_effort: Option<String>,
+    /// Kimi launch pins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_permission_mode: Option<String>,
+    /// Same sentinel vocabulary as `CreateSession.kimi_allowed_tools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_allowed_tools: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_plan_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kimi_swarm_mode: Option<bool>,
+    /// Codex launch pins (codex sessions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_managed_context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_context_archive: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_service_tier: Option<String>,
+}
+
+impl AgentLaunchConfig {
+    /// True when no field carries a value — the legacy wire shape. The
+    /// hosted-control action wall pins StartTask on this, so the
+    /// exhaustive destructuring is deliberate: a new field extends the
+    /// fail-closed pin at compile time instead of shipping unexamined.
+    pub fn is_empty(&self) -> bool {
+        let Self {
+            agent,
+            agent_command,
+            claude_model,
+            claude_permission_mode,
+            claude_effort,
+            kimi_model,
+            kimi_thinking,
+            kimi_permission_mode,
+            kimi_allowed_tools,
+            kimi_plan_mode,
+            kimi_swarm_mode,
+            codex_model,
+            codex_reasoning_effort,
+            codex_sandbox,
+            codex_approval_policy,
+            codex_managed_context,
+            codex_context_archive,
+            codex_service_tier,
+        } = self;
+        agent.is_none()
+            && agent_command.is_none()
+            && claude_model.is_none()
+            && claude_permission_mode.is_none()
+            && claude_effort.is_none()
+            && kimi_model.is_none()
+            && kimi_thinking.is_none()
+            && kimi_permission_mode.is_none()
+            && kimi_allowed_tools.is_none()
+            && kimi_plan_mode.is_none()
+            && kimi_swarm_mode.is_none()
+            && codex_model.is_none()
+            && codex_reasoning_effort.is_none()
+            && codex_sandbox.is_none()
+            && codex_approval_policy.is_none()
+            && codex_managed_context.is_none()
+            && codex_context_archive.is_none()
+            && codex_service_tier.is_none()
+    }
+}
+
 /// Commands received from the Unix control socket, MCP, and web gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -1688,6 +1793,15 @@ pub enum ControlMsg {
         #[serde(default)]
         model: Option<String>,
     },
+    /// Set the Claude Code daemon-default reasoning effort (`--effort`).
+    /// `None`/missing/empty clears the default (the CLI picks per model).
+    /// Values are `crate::project::CLAUDE_EFFORTS`. Applies to the NEXT
+    /// task because the effort is latched at process spawn; per-create
+    /// `claude_effort` pins override this default.
+    SetClaudeEffort {
+        #[serde(default)]
+        effort: Option<String>,
+    },
     /// Set the Claude Code permission mode (`--permission-mode`):
     /// `"default" | "acceptEdits" | "plan" | "auto" | "dontAsk" |
     /// "bypassPermissions"` (`"manual"` and empty normalize to `"default"`;
@@ -1980,6 +2094,18 @@ pub enum ControlMsg {
         /// gateway is unchanged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delegation_id: Option<String>,
+        /// Optional agent-launch configuration for the session this
+        /// StartTask creates — the same one-shot vocabulary `CreateSession`
+        /// carries, flattened so the wire fields read identically
+        /// (`claude_effort`, `codex_model`, …). Additive: every field
+        /// defaults to inherit, and an all-inherit config serializes to
+        /// nothing, so legacy frames are byte-identical. Ignored when
+        /// `session_id` targets an existing session (the text routes as a
+        /// follow-up; launch config is create-time only). Every inner field
+        /// is skip-serialized when unset, so an all-inherit config flattens
+        /// to zero keys.
+        #[serde(flatten)]
+        launch_config: AgentLaunchConfig,
     },
     ResumeSession {
         /// Session source: "intendant", "codex", "claude-code", "kimi", or
@@ -3254,11 +3380,15 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::ClaudeConfigChanged {
             model,
             model_cleared,
+            effort,
+            effort_cleared,
             permission_mode,
             allowed_tools,
         } => Some(OutboundEvent::ClaudeConfigChanged {
             model: model.clone(),
             model_cleared: *model_cleared,
+            effort: effort.clone(),
+            effort_cleared: *effort_cleared,
             permission_mode: permission_mode.clone(),
             allowed_tools: allowed_tools.clone(),
         }),
@@ -5053,6 +5183,7 @@ mod tests {
                 attachments: vec![],
                 follow_up_id: None,
                 delegation_id: None,
+                launch_config: Default::default(),
             },
             ControlMsg::FollowUp {
                 session_id: None,
@@ -5706,6 +5837,7 @@ mod tests {
             attachments: vec!["ann-recording-1".to_string(), "ann-recording-2".to_string()],
             follow_up_id: None,
             delegation_id: None,
+            launch_config: Default::default(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ControlMsg = serde_json::from_str(&json).unwrap();
@@ -5729,6 +5861,62 @@ mod tests {
             }
             _ => panic!("expected StartTask"),
         }
+    }
+
+    /// StartTask's launch config is FLATTENED onto the wire: the fields
+    /// read exactly like CreateSession's (additive), an all-inherit config
+    /// serializes to zero extra keys (legacy frames byte-stable), and a
+    /// legacy frame with no config keys parses to the empty config.
+    #[test]
+    fn control_msg_start_task_launch_config_is_flat_and_additive() {
+        // Legacy frame → empty config; nothing else disturbed.
+        let legacy = r#"{"action":"start_task","task":"run it","direct":true}"#;
+        let parsed: ControlMsg = serde_json::from_str(legacy).unwrap();
+        match &parsed {
+            ControlMsg::StartTask {
+                task,
+                direct,
+                launch_config,
+                ..
+            } => {
+                assert_eq!(task, "run it");
+                assert_eq!(*direct, Some(true));
+                assert!(launch_config.is_empty());
+            }
+            _ => panic!("expected StartTask"),
+        }
+        // …and an empty config re-serializes with NO config keys at all.
+        let json = serde_json::to_string(&parsed).unwrap();
+        for key in [
+            "agent",
+            "claude_model",
+            "claude_effort",
+            "claude_permission_mode",
+            "codex_model",
+            "codex_reasoning_effort",
+            "kimi_model",
+        ] {
+            assert!(
+                !json.contains(&format!("\"{key}\"")),
+                "empty launch config must not emit {key}: {json}"
+            );
+        }
+
+        // Config keys ride FLAT at the top level, exactly the
+        // CreateSession vocabulary.
+        let configured = r#"{"action":"start_task","task":"run it","agent":"claude-code","claude_model":"haiku","claude_effort":"max","codex_reasoning_effort":"low"}"#;
+        let parsed: ControlMsg = serde_json::from_str(configured).unwrap();
+        let ControlMsg::StartTask { launch_config, .. } = &parsed else {
+            panic!("expected StartTask");
+        };
+        assert_eq!(launch_config.agent.as_deref(), Some("claude-code"));
+        assert_eq!(launch_config.claude_model.as_deref(), Some("haiku"));
+        assert_eq!(launch_config.claude_effort.as_deref(), Some("max"));
+        assert_eq!(launch_config.codex_reasoning_effort.as_deref(), Some("low"));
+        let json = serde_json::to_string(&parsed).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["claude_effort"], "max", "flat on the wire: {json}");
+        assert_eq!(value.get("launch_config"), None, "never nested: {json}");
     }
 
     #[test]

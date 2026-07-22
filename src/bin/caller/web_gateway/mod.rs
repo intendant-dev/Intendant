@@ -3412,7 +3412,7 @@ mod tests {
         )
         .await;
         assert!(
-            resp.contains("426"),
+            resp.starts_with("HTTP/1.1 426"),
             "cleartext HTTP to a --tls gateway must get 426, got: {resp}"
         );
         assert!(
@@ -3454,7 +3454,7 @@ mod tests {
         )
         .await;
         assert!(
-            resp.contains("426"),
+            resp.starts_with("HTTP/1.1 426"),
             "cleartext WS to a --tls gateway must get 426, got: {resp}"
         );
         assert!(
@@ -3490,7 +3490,7 @@ mod tests {
             "loopback cleartext /mcp should reach the MCP handler, got: {resp}"
         );
         assert!(
-            !resp.contains("426"),
+            !resp.starts_with("HTTP/1.1 426"),
             "loopback cleartext /mcp must not be rejected by strict TLS, got: {resp}"
         );
         assert!(
@@ -3519,7 +3519,7 @@ mod tests {
         )
         .await;
         assert!(
-            resp.contains("426"),
+            resp.starts_with("HTTP/1.1 426"),
             "loopback cleartext /mcp without token should stay on the strict TLS reject path, got: {resp}"
         );
         handle.abort();
@@ -3543,7 +3543,7 @@ mod tests {
         )
         .await;
         assert!(
-            resp.contains("426"),
+            resp.starts_with("HTTP/1.1 426"),
             "browser-origin cleartext /mcp should stay on the strict TLS reject path, got: {resp}"
         );
         assert!(

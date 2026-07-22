@@ -834,6 +834,10 @@ pub enum OutboundEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         model_cleared: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        effort_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
         permission_mode: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         allowed_tools: Option<Vec<String>>,

@@ -400,10 +400,34 @@ impl SessionSupervisor {
                     worktree.unwrap_or(false).then_some(SessionWorktreeRequest {
                         branch: worktree_branch,
                     });
+                // Bundle the one-shot launch config once; both the /fast
+                // projection and the main create thread it through THE
+                // shared launch path (start_new_session).
+                let launch = event::AgentLaunchConfig {
+                    agent,
+                    agent_command,
+                    claude_model,
+                    claude_permission_mode,
+                    claude_effort,
+                    kimi_model,
+                    kimi_thinking,
+                    kimi_permission_mode,
+                    kimi_allowed_tools,
+                    kimi_plan_mode,
+                    kimi_swarm_mode,
+                    codex_model,
+                    codex_reasoning_effort,
+                    codex_sandbox,
+                    codex_approval_policy,
+                    codex_managed_context,
+                    codex_context_archive,
+                    codex_service_tier,
+                };
                 if let Some(parsed) = parse_codex_slash_command(&task) {
                     match parsed {
                         Ok(command) if command.op == "fast" => {
-                            let agent = match codex_fast_new_session_agent(agent.as_deref()) {
+                            let agent = match codex_fast_new_session_agent(launch.agent.as_deref())
+                            {
                                 Ok(agent) => Some(agent),
                                 Err(message) => {
                                     self.loop_error(message);
@@ -423,32 +447,12 @@ impl SessionSupervisor {
                                     String::new(),
                                     name,
                                     project_root,
-                                    agent,
-                                    agent_command,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    codex_model,
-                                    codex_reasoning_effort,
-                                    codex_sandbox,
-                                    codex_approval_policy,
-                                    codex_managed_context,
-                                    codex_context_archive,
+                                    codex_fast_launch(&launch, agent),
                                     orchestrate,
                                     direct,
                                     Vec::new(),
                                     None,
                                     Vec::new(),
-                                    Some(
-                                        crate::external_agent::codex::CODEX_FAST_SERVICE_TIER
-                                            .to_string(),
-                                    ),
                                     worktree_request,
                                     hosted_lease_id,
                                     reserved,
@@ -460,24 +464,7 @@ impl SessionSupervisor {
                     }
                     if !reference_frame_ids.is_empty()
                         || display_target.is_some()
-                        || agent.is_some()
-                        || agent_command.is_some()
-                        || claude_model.is_some()
-                        || claude_permission_mode.is_some()
-                        || claude_effort.is_some()
-                        || kimi_model.is_some()
-                        || kimi_thinking.is_some()
-                        || kimi_permission_mode.is_some()
-                        || kimi_allowed_tools.is_some()
-                        || kimi_plan_mode.is_some()
-                        || kimi_swarm_mode.is_some()
-                        || codex_model.is_some()
-                        || codex_reasoning_effort.is_some()
-                        || codex_sandbox.is_some()
-                        || codex_approval_policy.is_some()
-                        || codex_managed_context.is_some()
-                        || codex_context_archive.is_some()
-                        || codex_service_tier.is_some()
+                        || !launch.is_empty()
                         || name.is_some()
                         || worktree_request.is_some()
                     {
@@ -494,29 +481,12 @@ impl SessionSupervisor {
                         task,
                         name,
                         project_root,
-                        agent,
-                        agent_command,
-                        claude_model,
-                        claude_permission_mode,
-                        claude_effort,
-                        kimi_model,
-                        kimi_thinking,
-                        kimi_permission_mode,
-                        kimi_allowed_tools,
-                        kimi_plan_mode,
-                        kimi_swarm_mode,
-                        codex_model,
-                        codex_reasoning_effort,
-                        codex_sandbox,
-                        codex_approval_policy,
-                        codex_managed_context,
-                        codex_context_archive,
+                        launch,
                         orchestrate,
                         direct,
                         reference_frame_ids,
                         display_target,
                         attachments,
-                        codex_service_tier,
                         worktree_request,
                         hosted_lease_id,
                         reserved,
@@ -531,11 +501,21 @@ impl SessionSupervisor {
                 display_target,
                 attachments,
                 follow_up_id,
+                launch_config,
                 ..
             } => {
                 if !reference_frame_ids.is_empty() || display_target.is_some() {
                     self.warn(&format!(
                         "Targeted StartTask for {} dropped reference frame/display metadata; routing text as follow-up",
+                        short_session(&session_id)
+                    ));
+                }
+                // Launch config is create-time only: a targeted StartTask
+                // routes into an existing session whose config latched at
+                // spawn, so silently honoring it would lie.
+                if !launch_config.is_empty() {
+                    self.warn(&format!(
+                        "Targeted StartTask for {} dropped agent launch config; it applies only when creating a session",
                         short_session(&session_id)
                     ));
                 }
@@ -553,6 +533,7 @@ impl SessionSupervisor {
                 attachments,
                 follow_up_id: _,
                 delegation_id,
+                launch_config,
             } => {
                 // Peer-delegation dedup: the delegating daemon re-sends
                 // the same delegation_id after a connection drop
@@ -577,6 +558,15 @@ impl SessionSupervisor {
                 if let Some(parsed) = parse_codex_slash_command(&task) {
                     match parsed {
                         Ok(command) if command.op == "fast" => {
+                            let agent = match codex_fast_new_session_agent(
+                                launch_config.agent.as_deref(),
+                            ) {
+                                Ok(agent) => Some(agent),
+                                Err(message) => {
+                                    self.loop_error(message);
+                                    return;
+                                }
+                            };
                             if !reference_frame_ids.is_empty()
                                 || display_target.is_some()
                                 || !attachments.is_empty()
@@ -590,32 +580,12 @@ impl SessionSupervisor {
                                     String::new(),
                                     None,
                                     project_root,
-                                    Some("codex".to_string()),
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
+                                    codex_fast_launch(&launch_config, agent),
                                     orchestrate,
                                     direct,
                                     Vec::new(),
                                     None,
                                     Vec::new(),
-                                    Some(
-                                        crate::external_agent::codex::CODEX_FAST_SERVICE_TIER
-                                            .to_string(),
-                                    ),
                                     None,
                                     None,
                                     reserved,
@@ -630,7 +600,10 @@ impl SessionSupervisor {
                         }
                         Ok(_) | Err(_) => {}
                     }
-                    if !reference_frame_ids.is_empty() || display_target.is_some() {
+                    if !reference_frame_ids.is_empty()
+                        || display_target.is_some()
+                        || !launch_config.is_empty()
+                    {
                         self.warn(
                             "Slash command dropped reference frame/display metadata; routing to active Codex session",
                         );
@@ -644,34 +617,22 @@ impl SessionSupervisor {
                         .await;
                     return;
                 }
+                // The create-shaped StartTask threads its launch config
+                // through the SAME path CreateSession uses — the agenda's
+                // scheduled/start-now spawns, ctl task, and peer
+                // delegations all get the identical resolution chain and
+                // recorded launch provenance.
                 let started = self
                     .start_new_session(
                         task,
                         None,
                         project_root,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
+                        launch_config,
                         orchestrate,
                         direct,
                         reference_frame_ids,
                         display_target,
                         attachments,
-                        None,
                         None,
                         None,
                         reserved,
@@ -1576,6 +1537,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: Some(id.to_string()),
+            launch_config: Default::default(),
         };
         bus.send(AppEvent::ControlCommand(delegated("dg-mid-1")));
         let exec = supervisor.exec.clone();
@@ -1946,6 +1908,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: Some(delegation_id.to_string()),
+            launch_config: Default::default(),
         }
     }
 
@@ -2069,6 +2032,7 @@ mod tests {
                 attachments: vec![],
                 follow_up_id: None,
                 delegation_id: None,
+                launch_config: Default::default(),
             })
             .await;
 
@@ -2102,5 +2066,221 @@ mod tests {
             }
         }
         assert!(saw_start, "the plain task should still launch");
+    }
+
+    /// Read the single launched session's persisted launch-config overlay
+    /// (`session_agent_config.json`) from a supervisor's hermetic logs
+    /// home. The overlay is written by `start_new_session` BEFORE the
+    /// backend spawns, so a deliberately unspawnable agent command keeps
+    /// these tests from ever launching a real CLI.
+    async fn sole_session_agent_config(
+        supervisor: &SessionSupervisor,
+    ) -> crate::session_config::SessionAgentConfig {
+        let home = supervisor
+            .config
+            .logs_home_override
+            .clone()
+            .expect("test supervisor has a hermetic logs home");
+        // Session dirs mint under `<home>/.intendant/logs/<uuid>`
+        // (SessionLog::resolve_path_in_home).
+        let logs_dir = crate::platform::intendant_home_in(&home).join("logs");
+        let mut config_path = None;
+        wait_until("the launched session's persisted config", 10_000, || {
+            let Ok(entries) = std::fs::read_dir(&logs_dir) else {
+                return false;
+            };
+            let mut found = Vec::new();
+            for entry in entries.flatten() {
+                let candidate = entry
+                    .path()
+                    .join(crate::session_config::SESSION_AGENT_CONFIG_FILE);
+                if candidate.is_file() {
+                    found.push(candidate);
+                }
+            }
+            if found.len() == 1 {
+                config_path = Some(found.remove(0));
+                true
+            } else {
+                false
+            }
+        })
+        .await;
+        let raw = std::fs::read_to_string(config_path.expect("config path")).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    /// An agent command that can never resolve to a real binary — the
+    /// launch persists its config, then the spawn fails, keeping the
+    /// test hermetic (no external CLI ever starts).
+    const UNSPAWNABLE: &str = "/nonexistent/intendant-test-agent-binary";
+
+    /// The load-bearing parity proof for the config-on-every-lane fix: an
+    /// untargeted StartTask carrying launch config persists EXACTLY the
+    /// launch-config overlay the equivalent CreateSession persists — same
+    /// shared path, same normalization, same recorded provenance (this
+    /// overlay is what the sessions catalog, the launch-config modal, and
+    /// resumes read).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_task_launch_config_reaches_launch_identically_to_create_session() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let launch = event::AgentLaunchConfig {
+            agent: Some("claude-code".to_string()),
+            agent_command: Some(UNSPAWNABLE.to_string()),
+            claude_model: Some("haiku".to_string()),
+            claude_permission_mode: Some("plan".to_string()),
+            claude_effort: Some("max".to_string()),
+            ..Default::default()
+        };
+
+        let create_bus = EventBus::new();
+        let create_supervisor =
+            test_supervisor(project_dir.path().to_path_buf(), create_bus.clone());
+        create_supervisor
+            .handle_control_msg(event::ControlMsg::CreateSession {
+                task: "compare the lanes".to_string(),
+                name: None,
+                project_root: None,
+                agent: launch.agent.clone(),
+                agent_command: launch.agent_command.clone(),
+                claude_model: launch.claude_model.clone(),
+                claude_permission_mode: launch.claude_permission_mode.clone(),
+                claude_effort: launch.claude_effort.clone(),
+                kimi_model: None,
+                kimi_thinking: None,
+                kimi_permission_mode: None,
+                kimi_allowed_tools: None,
+                kimi_plan_mode: None,
+                kimi_swarm_mode: None,
+                codex_model: None,
+                codex_reasoning_effort: None,
+                codex_sandbox: None,
+                codex_approval_policy: None,
+                codex_managed_context: None,
+                codex_context_archive: None,
+                codex_service_tier: None,
+                orchestrate: None,
+                direct: Some(true),
+                reference_frame_ids: vec![],
+                display_target: None,
+                attachments: vec![],
+                worktree: None,
+                worktree_branch: None,
+                hosted_lease_id: None,
+            })
+            .await;
+        let created = sole_session_agent_config(&create_supervisor).await;
+
+        let task_bus = EventBus::new();
+        let task_supervisor = test_supervisor(project_dir.path().to_path_buf(), task_bus.clone());
+        task_supervisor
+            .handle_control_msg(event::ControlMsg::StartTask {
+                session_id: None,
+                task: "compare the lanes".to_string(),
+                orchestrate: None,
+                direct: Some(true),
+                project_root: None,
+                reference_frame_ids: vec![],
+                display_target: None,
+                attachments: vec![],
+                follow_up_id: None,
+                delegation_id: None,
+                launch_config: launch,
+            })
+            .await;
+        let started = sole_session_agent_config(&task_supervisor).await;
+
+        assert_eq!(
+            created, started,
+            "StartTask launch config must persist the identical overlay CreateSession persists"
+        );
+        assert_eq!(created.source.as_deref(), Some("claude-code"));
+        assert_eq!(created.claude_model.as_deref(), Some("haiku"));
+        assert_eq!(created.claude_permission_mode.as_deref(), Some("plan"));
+        assert_eq!(created.claude_effort.as_deref(), Some("max"));
+    }
+
+    /// The effort resolution chain at the shared launch path, per backend:
+    /// an explicit per-create pin beats the daemon default, the daemon
+    /// default fills an absent pin, and with neither the backend default
+    /// (no pin at all) launches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effort_resolution_chain_explicit_beats_daemon_default_beats_absent() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let claude_launch = |effort: Option<&str>| event::AgentLaunchConfig {
+            agent: Some("claude-code".to_string()),
+            agent_command: Some(UNSPAWNABLE.to_string()),
+            claude_effort: effort.map(str::to_string),
+            ..Default::default()
+        };
+        let spawn_with = |launch: event::AgentLaunchConfig, daemon_default: Option<&str>| {
+            let bus = EventBus::new();
+            let supervisor = test_supervisor(project_dir.path().to_path_buf(), bus);
+            let default_effort = daemon_default.map(str::to_string);
+            async move {
+                supervisor.config.shared_claude_config.write().await.effort = default_effort;
+                supervisor
+                    .handle_control_msg(event::ControlMsg::StartTask {
+                        session_id: None,
+                        task: "resolve the chain".to_string(),
+                        orchestrate: None,
+                        direct: Some(true),
+                        project_root: None,
+                        reference_frame_ids: vec![],
+                        display_target: None,
+                        attachments: vec![],
+                        follow_up_id: None,
+                        delegation_id: None,
+                        launch_config: launch,
+                    })
+                    .await;
+                sole_session_agent_config(&supervisor).await
+            }
+        };
+
+        // Explicit pin beats the daemon default.
+        let explicit = spawn_with(claude_launch(Some("max")), Some("high")).await;
+        assert_eq!(explicit.claude_effort.as_deref(), Some("max"));
+        // The daemon default fills an absent pin.
+        let defaulted = spawn_with(claude_launch(None), Some("high")).await;
+        assert_eq!(defaulted.claude_effort.as_deref(), Some("high"));
+        // Neither: the backend default (no --effort flag) launches.
+        let inherited = spawn_with(claude_launch(None), None).await;
+        assert_eq!(inherited.claude_effort, None);
+
+        // Codex rides the same chain through the same path (its daemon
+        // default predates this fix; pin the parity here).
+        let codex_launch = event::AgentLaunchConfig {
+            agent: Some("codex".to_string()),
+            agent_command: Some(UNSPAWNABLE.to_string()),
+            codex_reasoning_effort: Some("xhigh".to_string()),
+            ..Default::default()
+        };
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(project_dir.path().to_path_buf(), bus);
+        supervisor
+            .config
+            .shared_codex_config
+            .write()
+            .await
+            .reasoning_effort = Some("low".to_string());
+        supervisor
+            .handle_control_msg(event::ControlMsg::StartTask {
+                session_id: None,
+                task: "resolve the codex chain".to_string(),
+                orchestrate: None,
+                direct: Some(true),
+                project_root: None,
+                reference_frame_ids: vec![],
+                display_target: None,
+                attachments: vec![],
+                follow_up_id: None,
+                delegation_id: None,
+                launch_config: codex_launch,
+            })
+            .await;
+        let codex = sole_session_agent_config(&supervisor).await;
+        assert_eq!(codex.source.as_deref(), Some("codex"));
+        assert_eq!(codex.codex_reasoning_effort.as_deref(), Some("xhigh"));
     }
 }

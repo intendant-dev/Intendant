@@ -860,6 +860,7 @@ mod tests {
             "set-codex-reasoning-effort",
             "set-claude-model-select",
             "set-claude-model-custom",
+            "set-claude-effort",
             "set-claude-permission-mode",
             "set-kimi-model-select",
             "set-kimi-model-custom",
@@ -872,10 +873,28 @@ mod tests {
         }
         assert!(APP_HTML.contains("codex_model: selectedCodexModel"));
         assert!(APP_HTML.contains("claude_model: selectedClaudeModel"));
+        assert!(APP_HTML.contains("claude_effort: selectedClaudeEffort"));
         assert!(APP_HTML.contains("kimi_model: selectedKimiModel"));
         assert!(APP_HTML.contains("function populateSettingsCodexModel"));
         assert!(APP_HTML.contains("function populateSettingsClaudeModel"));
+        assert!(APP_HTML.contains("function populateSettingsClaudeEffort"));
         assert!(APP_HTML.contains("function populateSettingsKimiModel"));
+    }
+
+    /// The agenda Start-now sheet's config controls are wired end to end:
+    /// the daemon-default provenance hint, the explicit-pick recording, and
+    /// the `agent_config` block on the start_now payload (with the backend
+    /// pinned alongside any explicit pick, so the reviewed config binds).
+    #[test]
+    fn agenda_start_sheet_config_controls_are_wired() {
+        assert!(APP_HTML.contains("function agendaStartBackendConfig"));
+        assert!(APP_HTML.contains(r#"select.id = id;"#));
+        assert!(APP_HTML.contains("Daemon default (${defaultValue})"));
+        assert!(APP_HTML.contains("'explicit — recorded on the manifest'"));
+        assert!(APP_HTML.contains("if (model) agentConfig[spec.modelKey] = model;"));
+        assert!(APP_HTML.contains("if (effort) agentConfig[spec.effortKey] = effort;"));
+        assert!(APP_HTML.contains("agentConfig.agent = spec.backend;"));
+        assert!(APP_HTML.contains("params.agent_config = agentConfig;"));
     }
 
     #[test]

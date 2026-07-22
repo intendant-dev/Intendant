@@ -273,6 +273,7 @@ impl AgendaStore {
             goal,
             project_root,
             interactive,
+            agent_config,
         } = cmd
         {
             return self.start_now(
@@ -282,6 +283,7 @@ impl AgendaStore {
                 // Absent defaults to interactive (owner-ratified): the
                 // session opens with the item and waits for the owner.
                 interactive.unwrap_or(true),
+                agent_config,
                 actor,
                 now_ms,
             );
@@ -319,15 +321,22 @@ impl AgendaStore {
     /// recorded verbatim on the manifest (the handle resolves and
     /// validates it before the store runs; `None` from a direct caller
     /// falls back to fire-time resolution in the scheduler).
+    /// `agent_config` is the sheet's reviewed launch pins, recorded on the
+    /// manifest verbatim (an all-inherit block normalizes to the legacy
+    /// absent shape so the manifest bytes — and digest — stay identical to
+    /// a config-less gesture); the launch path normalizes and
+    /// backend-gates the values at spawn.
     ///
     /// The caller (`AgendaHandle::apply`) has already enforced the
     /// owner-surface gate — this command embeds an approval.
+    #[allow(clippy::too_many_arguments)] // the confirm sheet's reviewed parameters travel together
     fn start_now(
         &mut self,
         id: &str,
         goal_override: Option<&str>,
         project_root: Option<String>,
         interactive: bool,
+        agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
         actor: Option<AgendaActor>,
         now_ms: u64,
     ) -> Result<AgendaItem, AgendaError> {
@@ -376,6 +385,7 @@ impl AgendaStore {
             orchestrate: false,
             interactive,
             project_root,
+            agent_config: agent_config.filter(|config| !config.is_empty()),
         };
         let digest = super::types::manifest_digest(id, &effect_id, &manifest);
         self.append_op(
@@ -758,9 +768,11 @@ impl AgendaStore {
                         orchestrate,
                         // Proposals keep the legacy autonomous shape; the
                         // project resolves at fire time (provenance →
-                        // daemon default → named refusal).
+                        // daemon default → named refusal), and the launch
+                        // config inherits the daemon defaults.
                         interactive: false,
                         project_root: None,
+                        agent_config: None,
                     },
                 })
             }

@@ -1005,6 +1005,7 @@ const DASHBOARD_CONTROL_MSG_RPC_ACTIONS = new Set([
   'set_codex_approval_policy',
   'set_codex_model',
   'set_claude_model',
+  'set_claude_effort',
   'set_claude_permission_mode',
   'set_claude_allowed_tools',
   'set_kimi_command',

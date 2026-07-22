@@ -328,6 +328,16 @@ fn dispatch_session(
             attachments: Vec::new(),
             follow_up_id: None,
             delegation_id: Some(format!("{DELEGATION_PREFIX}{}", spawn.occurrence_id)),
+            // The manifest's owner-reviewed agent config, forwarded so the
+            // spawn resolves launch settings through the same chain as a
+            // pane-created session (explicit manifest pin → daemon default
+            // → backend default). None = the legacy manifest shape,
+            // all-inherit.
+            launch_config: spawn
+                .agent_config
+                .clone()
+                .map(|config| *config)
+                .unwrap_or_default(),
         }));
     state.awaiting.insert(spawn.occurrence_id.clone(), spawn);
 }
@@ -1143,6 +1153,7 @@ mod tests {
                     goal: None,
                     project_root: None,
                     interactive: None,
+                    agent_config: None,
                 },
                 owner(),
             )
@@ -1226,6 +1237,71 @@ mod tests {
                 "spent start-now occurrence must not re-dispatch"
             );
         }
+    }
+
+    /// A start-now carrying the confirm sheet's launch pins records them on
+    /// the minted manifest and the fired StartTask forwards them verbatim —
+    /// the scheduled lane's spawn is config-indistinguishable from a
+    /// pane-created session.
+    #[tokio::test]
+    async fn start_now_agent_config_rides_the_manifest_onto_the_dispatched_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Task,
+                    title: "start me configured".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        let config = crate::event::AgentLaunchConfig {
+            agent: Some("claude-code".into()),
+            claude_effort: Some("max".into()),
+            claude_model: Some("haiku".into()),
+            ..Default::default()
+        };
+        let confirmed = handle
+            .apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                    goal: None,
+                    project_root: None,
+                    interactive: None,
+                    agent_config: Some(Box::new(config.clone())),
+                },
+                owner(),
+            )
+            .unwrap();
+        assert_eq!(
+            confirmed.effects[0].manifest.agent_config.as_deref(),
+            Some(&config),
+            "the reviewed launch pins are recorded on the approved manifest"
+        );
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut dispatched = 0;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                launch_config,
+                delegation_id: Some(_),
+                ..
+            }) = event
+            {
+                assert_eq!(launch_config, config);
+                dispatched += 1;
+            }
+        }
+        assert_eq!(dispatched, 1, "exactly one configured occurrence fires");
     }
 
     #[tokio::test]

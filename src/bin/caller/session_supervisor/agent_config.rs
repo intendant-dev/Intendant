@@ -567,6 +567,28 @@ pub(crate) fn codex_fast_new_session_agent(agent: Option<&str>) -> Result<String
     }
 }
 
+/// The `/fast` projection of a launch config: an idle Codex session keeps
+/// the Codex fields and the agent command, drops the other backends' pins,
+/// and forces the Fast service tier — identical for the CreateSession and
+/// untargeted StartTask arms.
+pub(crate) fn codex_fast_launch(
+    launch: &crate::event::AgentLaunchConfig,
+    agent: Option<String>,
+) -> crate::event::AgentLaunchConfig {
+    crate::event::AgentLaunchConfig {
+        agent,
+        agent_command: launch.agent_command.clone(),
+        codex_model: launch.codex_model.clone(),
+        codex_reasoning_effort: launch.codex_reasoning_effort.clone(),
+        codex_sandbox: launch.codex_sandbox.clone(),
+        codex_approval_policy: launch.codex_approval_policy.clone(),
+        codex_managed_context: launch.codex_managed_context.clone(),
+        codex_context_archive: launch.codex_context_archive.clone(),
+        codex_service_tier: Some(crate::external_agent::codex::CODEX_FAST_SERVICE_TIER.to_string()),
+        ..Default::default()
+    }
+}
+
 pub(crate) fn normalize_session_agent_command(command: Option<&str>) -> Option<String> {
     command
         .map(str::trim)

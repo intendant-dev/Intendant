@@ -291,6 +291,32 @@ function populateSettingsClaudeModel(configuredModel) {
   updateSettingsClaudeCustomModelRow();
 }
 
+// Sync the Claude reasoning select to the daemon default. The static
+// option list is pinned to project::CLAUDE_EFFORTS by a daemon-side parity
+// test; a daemon-served value outside it (a newer CLI level) is appended so
+// the configured default always displays honestly.
+function populateSettingsClaudeEffort(configuredEffort, servedEfforts) {
+  const select = document.getElementById('set-claude-effort');
+  if (!select) return;
+  const effort = String(configuredEffort || '').trim();
+  for (const served of Array.isArray(servedEfforts) ? servedEfforts : []) {
+    const value = String(served || '').trim();
+    if (value && ![...select.options].some(o => o.value === value)) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = value;
+      select.appendChild(option);
+    }
+  }
+  if (effort && ![...select.options].some(o => o.value === effort)) {
+    const option = document.createElement('option');
+    option.value = effort;
+    option.textContent = effort;
+    select.appendChild(option);
+  }
+  select.value = effort;
+}
+
 function settingsKimiModelValue() {
   const select = document.getElementById('set-kimi-model-select');
   if (!select) return '';
@@ -374,6 +400,7 @@ async function loadSettings() {
     };
     controlClaudeConfig = {
       model: d.claude_model || '',
+      effort: d.claude_effort || '',
       permission_mode: d.claude_permission_mode || 'default',
       allowed_tools: Array.isArray(d.claude_allowed_tools) ? d.claude_allowed_tools : [],
     };
@@ -389,6 +416,7 @@ async function loadSettings() {
     setNewSessionAgentDefaults(d);
     populateSettingsCodexModel(d.codex_model, d.codex_reasoning_effort);
     populateSettingsClaudeModel(d.claude_model);
+    populateSettingsClaudeEffort(d.claude_effort, d.claude_efforts);
     populateSettingsKimiModel(d.kimi_model);
     document.getElementById('set-claude-permission-mode').value = controlClaudeConfig.permission_mode;
     document.getElementById('set-kimi-thinking').value = controlKimiConfig.thinking;
@@ -444,6 +472,7 @@ async function saveSettings() {
   const selectedCodexModel = settingsCodexModelValue();
   const selectedCodexReasoningEffort = g('set-codex-reasoning-effort')?.value || '';
   const selectedClaudeModel = settingsClaudeModelValue();
+  const selectedClaudeEffort = g('set-claude-effort')?.value || '';
   const selectedClaudePermissionMode = g('set-claude-permission-mode')?.value || 'default';
   const selectedClaudeCommand = (g('set-claude-command')?.value || '').trim() || 'claude';
   const selectedKimiModel = settingsKimiModelValue();
@@ -508,6 +537,7 @@ async function saveSettings() {
     codex_managed_context: controlCodexConfig.managed_context || 'vanilla',
     codex_context_archive: controlCodexConfig.context_archive || 'summary',
     claude_model: selectedClaudeModel,
+    claude_effort: selectedClaudeEffort,
     claude_permission_mode: selectedClaudePermissionMode,
     claude_allowed_tools: Array.isArray(controlClaudeConfig.allowed_tools)
       ? controlClaudeConfig.allowed_tools
@@ -628,6 +658,7 @@ async function saveSettings() {
     service_tier: selectedCodexServiceTier || null,
   });
   dispatchControlMsg({ action: 'set_claude_model', model: selectedClaudeModel || null });
+  dispatchControlMsg({ action: 'set_claude_effort', effort: selectedClaudeEffort || null });
   dispatchControlMsg({ action: 'set_claude_permission_mode', mode: selectedClaudePermissionMode });
   dispatchControlMsg({
     action: 'set_claude_allowed_tools',

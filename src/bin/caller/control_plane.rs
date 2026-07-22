@@ -43,11 +43,14 @@ pub type SharedCodexConfig = Arc<RwLock<CodexRuntimeConfig>>;
 
 /// Runtime-adjustable Claude Code launch settings. Like the Codex config,
 /// these map to claude CLI flags latched at process spawn (`--model`,
-/// `--permission-mode`, `--allowedTools`), so a change forces the daemon
-/// loop to tear down the persistent agent before the next task.
+/// `--effort`, `--permission-mode`, `--allowedTools`), so a change forces
+/// the daemon loop to tear down the persistent agent before the next task.
 #[derive(Debug, Clone)]
 pub struct ClaudeRuntimeConfig {
     pub model: Option<String>,
+    /// Daemon-default reasoning effort. Per-create `claude_effort` pins
+    /// override it; `None` lets the CLI pick the model default.
+    pub effort: Option<String>,
     pub permission_mode: String,
     pub allowed_tools: Vec<String>,
 }
@@ -569,6 +572,33 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 .send(claude_config_changed_event(ClaudeConfigDelta {
                     model: normalized.clone(),
                     model_cleared: normalized.is_none(),
+                    ..Default::default()
+                }));
+        }
+        ControlMsg::SetClaudeEffort { effort } => {
+            // Same normalizer as every other effort funnel: empty /
+            // "default" / "inherit" clear the daemon default (the CLI then
+            // picks per model), canonical levels lowercase, unknown values
+            // pass through for newer CLIs.
+            let normalized = crate::project::normalize_claude_effort(effort.as_deref());
+            {
+                let mut guard = state.claude_config.write().await;
+                guard.effort = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_claude_field(root, |cfg| {
+                    cfg.effort = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist claude_code.effort to intendant.toml: {e}"
+                    );
+                }
+            }
+            state
+                .bus
+                .send(claude_config_changed_event(ClaudeConfigDelta {
+                    effort: normalized.clone(),
+                    effort_cleared: normalized.is_none(),
                     ..Default::default()
                 }));
         }
@@ -1250,6 +1280,8 @@ where
 struct ClaudeConfigDelta {
     model: Option<String>,
     model_cleared: bool,
+    effort: Option<String>,
+    effort_cleared: bool,
     permission_mode: Option<String>,
     allowed_tools: Option<Vec<String>>,
 }
@@ -1258,6 +1290,8 @@ fn claude_config_changed_event(delta: ClaudeConfigDelta) -> AppEvent {
     AppEvent::ClaudeConfigChanged {
         model: delta.model,
         model_cleared: delta.model_cleared,
+        effort: delta.effort,
+        effort_cleared: delta.effort_cleared,
         permission_mode: delta.permission_mode,
         allowed_tools: delta.allowed_tools,
     }
@@ -1343,6 +1377,7 @@ mod tests {
     fn test_claude_config() -> SharedClaudeConfig {
         Arc::new(RwLock::new(ClaudeRuntimeConfig {
             model: None,
+            effort: None,
             permission_mode: "default".to_string(),
             allowed_tools: Vec::new(),
         }))
@@ -2256,6 +2291,56 @@ mod tests {
         ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(codex_config.read().await.reasoning_effort, None);
+
+        handle.abort();
+    }
+
+    /// SetClaudeEffort round-trip on the SetClaudeModel/SetCodexReasoningEffort
+    /// pattern: normalize into live shared state, persist to the project's
+    /// intendant.toml, and clear on inherit sentinels — with unknown values
+    /// passing through (forward compatibility with newer CLIs, matching
+    /// `normalize_claude_effort`).
+    #[tokio::test]
+    async fn set_claude_effort_normalizes_persists_and_clears() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let claude_config = test_claude_config();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: test_codex_config(),
+            claude_config: claude_config.clone(),
+            kimi_config: test_kimi_config(),
+            bus: bus.clone(),
+            project_root: Some(project_dir.path().to_path_buf()),
+        });
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetClaudeEffort {
+            effort: Some(" MAX ".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(claude_config.read().await.effort.as_deref(), Some("max"));
+        let persisted =
+            crate::project::Project::from_root(project_dir.path().to_path_buf()).unwrap();
+        assert_eq!(
+            persisted.config.agent.claude_code.effort.as_deref(),
+            Some("max"),
+            "the daemon default persists to intendant.toml"
+        );
+
+        // "default" is the inherit sentinel → clears the daemon default,
+        // in live state and on disk.
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetClaudeEffort {
+            effort: Some("default".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(claude_config.read().await.effort, None);
+        let persisted =
+            crate::project::Project::from_root(project_dir.path().to_path_buf()).unwrap();
+        assert_eq!(persisted.config.agent.claude_code.effort, None);
 
         handle.abort();
     }

@@ -2449,6 +2449,7 @@ pub(crate) async fn run_with_presence(
                 if matches!(backend, external_agent::AgentBackend::ClaudeCode) {
                     let cc = &mut proj.config.agent.claude_code;
                     cc.model = current_claude_config.model.clone();
+                    cc.effort = current_claude_config.effort.clone();
                     cc.permission_mode = current_claude_config.permission_mode.clone();
                     cc.allowed_tools = current_claude_config.allowed_tools.clone();
                 }

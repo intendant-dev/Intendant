@@ -267,6 +267,14 @@ pub struct SettingsPayload {
     // Mirrors the Codex/Gemini fields for the Activity → Control sub-tab.
     #[serde(default)]
     pub claude_model: Option<String>,
+    /// Daemon-default reasoning effort (`--effort`). Empty string is an
+    /// explicit clear; omission leaves the existing value untouched.
+    #[serde(default)]
+    pub claude_effort: Option<String>,
+    /// Read-only vocabulary accepted by the daemon
+    /// (`crate::project::CLAUDE_EFFORTS`); POST callers may omit it.
+    #[serde(default)]
+    pub claude_efforts: Vec<String>,
     #[serde(default)]
     pub claude_permission_mode: Option<String>,
     #[serde(default)]
@@ -426,6 +434,13 @@ pub(crate) fn settings_payload_from_config(
         )),
         claude_command: Some(config.agent.claude_code.command.clone()),
         claude_model: config.agent.claude_code.model.clone(),
+        claude_effort: crate::project::normalize_claude_effort(
+            config.agent.claude_code.effort.as_deref(),
+        ),
+        claude_efforts: crate::project::CLAUDE_EFFORTS
+            .iter()
+            .map(|effort| (*effort).to_string())
+            .collect(),
         claude_permission_mode: Some(crate::project::normalize_claude_permission_mode(
             &config.agent.claude_code.permission_mode,
         )),
@@ -658,6 +673,12 @@ pub(crate) fn apply_settings_payload(
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(str::to_string);
+    }
+    if payload.claude_effort.is_some() {
+        // Empty clears the daemon default (the CLI picks per model), like
+        // codex_reasoning_effort above.
+        config.agent.claude_code.effort =
+            crate::project::normalize_claude_effort(payload.claude_effort.as_deref());
     }
     if let Some(mode) = payload.claude_permission_mode.as_deref() {
         config.agent.claude_code.permission_mode =
@@ -945,6 +966,11 @@ pub(crate) fn dispatch_agent_settings_control_msgs(bus: &EventBus, payload: &Set
     if payload.claude_model.is_some() {
         bus.send(AppEvent::ControlCommand(ControlMsg::SetClaudeModel {
             model: payload.claude_model.clone(),
+        }));
+    }
+    if payload.claude_effort.is_some() {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetClaudeEffort {
+            effort: payload.claude_effort.clone(),
         }));
     }
     if let Some(mode) = payload.claude_permission_mode.clone() {
@@ -1741,7 +1767,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "cu_provider": null,
             "cu_model": null,
             "cu_backend": "auto",
@@ -1783,8 +1809,11 @@ mod tests {
             "kimi_swarm_mode": true,
             "kimi_allowed_tools": [],
             "kimi_allowed_tools_cleared": false
-        })
-        .to_string();
+        });
+        // Appended outside the literal: one more key inside the json!
+        // block trips the macro's recursion limit.
+        body["claude_effort"] = serde_json::json!("max");
+        let body = body.to_string();
 
         let (status, _) = settings_post_result(&body, Some(dir.path()), &bus, true);
         assert_eq!(status, 200);
@@ -1797,6 +1826,7 @@ mod tests {
         let mut saw_managed = false;
         let mut saw_archive = false;
         let mut saw_claude_model = false;
+        let mut saw_claude_effort = false;
         let mut saw_claude_permission = false;
         let mut saw_kimi_command = false;
         let mut saw_kimi_model = false;
@@ -1842,6 +1872,10 @@ mod tests {
                     assert_eq!(model.as_deref(), Some("fable"));
                     saw_claude_model = true;
                 }
+                ControlMsg::SetClaudeEffort { effort } => {
+                    assert_eq!(effort.as_deref(), Some("max"));
+                    saw_claude_effort = true;
+                }
                 ControlMsg::SetClaudePermissionMode { mode } => {
                     assert_eq!(mode, "plan");
                     saw_claude_permission = true;
@@ -1885,6 +1919,7 @@ mod tests {
         assert!(saw_managed, "SetCodexManagedContext was not dispatched");
         assert!(saw_archive, "SetCodexContextArchive was not dispatched");
         assert!(saw_claude_model, "SetClaudeModel was not dispatched");
+        assert!(saw_claude_effort, "SetClaudeEffort was not dispatched");
         assert!(
             saw_claude_permission,
             "SetClaudePermissionMode was not dispatched"
@@ -1909,8 +1944,52 @@ mod tests {
         assert!(saved.contains("managed_context = \"managed\""));
         assert!(saved.contains("model = \"gpt-5.6-sol\""));
         assert!(saved.contains("model = \"fable\""));
+        assert!(saved.contains("effort = \"max\""));
         assert!(saved.contains("command = \"/opt/kimi/bin/kimi\""));
         assert!(saved.contains("model = \"k2.7 coding\""));
+    }
+
+    /// The Claude reasoning daemon default round-trips through the settings
+    /// surface, and the served vocabulary is derived from (and pinned to)
+    /// `project::CLAUDE_EFFORTS` — the single source the New Session pane
+    /// markup and the launch normalizers share.
+    #[tokio::test]
+    async fn settings_claude_effort_round_trips_and_serves_the_canonical_vocabulary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = crate::project::Project::from_root(dir.path().to_path_buf()).unwrap();
+        project.config.agent.claude_code.effort = Some("xhigh".to_string());
+        project.save_config().unwrap();
+
+        let body =
+            settings_get_response_body(Some(dir.path()), &RuntimeSettingsState::default()).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["claude_effort"], "xhigh");
+        assert_eq!(
+            value["claude_efforts"]
+                .as_array()
+                .expect("claude_efforts vocabulary")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>(),
+            crate::project::CLAUDE_EFFORTS.to_vec(),
+            "the served vocabulary derives from project::CLAUDE_EFFORTS"
+        );
+
+        // POST with an empty string clears the daemon default.
+        let mut payload = settings_payload_from_config(&project.config);
+        payload.claude_effort = Some(String::new());
+        apply_settings_payload(&mut project.config, &payload);
+        assert_eq!(project.config.agent.claude_code.effort, None);
+
+        // Omission leaves the existing value untouched (partial clients).
+        project.config.agent.claude_code.effort = Some("high".to_string());
+        let mut payload = settings_payload_from_config(&project.config);
+        payload.claude_effort = None;
+        apply_settings_payload(&mut project.config, &payload);
+        assert_eq!(
+            project.config.agent.claude_code.effort.as_deref(),
+            Some("high")
+        );
     }
 
     // ── S5 golden transcripts: settings / keys family ──
@@ -2342,6 +2421,7 @@ mod tests {
                             | ControlMsg::SetCodexManagedContext { .. }
                             | ControlMsg::SetCodexContextArchive { .. }
                             | ControlMsg::SetClaudeModel { .. }
+                            | ControlMsg::SetClaudeEffort { .. }
                             | ControlMsg::SetClaudePermissionMode { .. }
                             | ControlMsg::SetClaudeAllowedTools { .. }
                             | ControlMsg::SetKimiCommand { .. }

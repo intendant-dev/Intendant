@@ -214,6 +214,19 @@ pub struct SessionManifest {
     /// project-less.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) project_root: Option<String>,
+    /// Additive: the agent-launch configuration the spawned session runs
+    /// with — exactly the CreateSession vocabulary (backend selection,
+    /// model/effort/permission pins per backend). `None` (the legacy
+    /// shape) inherits every field, so legacy manifest bytes — and the
+    /// digests their approvals bind — are unchanged. Setting it revises
+    /// the manifest and mints a new digest, exactly like any other
+    /// manifest edit: the owner approves the config they reviewed. At
+    /// fire time each field resolves explicit pin → daemon default →
+    /// backend default, through the same launch path every session uses.
+    /// Boxed for enum-size hygiene only — serde and the digest see the
+    /// inner value verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
 }
 
 /// An owner's approval of one manifest revision. `digest` is the bound
@@ -658,6 +671,11 @@ pub enum AgendaCommand {
     /// - `interactive`: absent defaults to **true** (owner-ratified): the
     ///   session opens with the goal as its first user message and waits
     ///   for the owner. `false` is the autonomous goal run.
+    /// - `agent_config`: the confirm sheet's reviewed launch pins (the
+    ///   CreateSession vocabulary — backend/model/effort). Recorded on the
+    ///   minted manifest and applied by the spawn's resolution chain
+    ///   (explicit pin → daemon default → backend default); absent fields
+    ///   inherit the daemon defaults honestly.
     StartNow {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -666,6 +684,8 @@ pub enum AgendaCommand {
         project_root: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         interactive: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
     },
 }
 
@@ -1406,23 +1426,46 @@ mod tests {
             project_root: Some("/work/project".into()),
             ..legacy.clone()
         };
+        let with_config = SessionManifest {
+            agent_config: Some(Box::new(crate::event::AgentLaunchConfig {
+                agent: Some("claude-code".into()),
+                claude_effort: Some("max".into()),
+                ..Default::default()
+            })),
+            ..legacy.clone()
+        };
         let interactive_digest = manifest_digest("item-1", "ef-1", &interactive);
         let project_digest = manifest_digest("item-1", "ef-1", &with_project);
+        let config_digest = manifest_digest("item-1", "ef-1", &with_config);
         assert_ne!(interactive_digest, base_digest);
         assert_ne!(project_digest, base_digest);
         assert_ne!(interactive_digest, project_digest);
+        assert_ne!(
+            config_digest, base_digest,
+            "setting the agent-config block revises the digest — the owner approves the config they reviewed"
+        );
 
-        // Full round-trip with both fields set preserves them.
+        // Full round-trip with the additive fields set preserves them.
         let full = SessionManifest {
             goal: "g".into(),
             fire_at_ms: 9,
             orchestrate: true,
             interactive: true,
             project_root: Some("/work/project".into()),
+            agent_config: Some(Box::new(crate::event::AgentLaunchConfig {
+                agent: Some("claude-code".into()),
+                claude_model: Some("haiku".into()),
+                claude_effort: Some("xhigh".into()),
+                ..Default::default()
+            })),
         };
         let round: SessionManifest =
             serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
         assert_eq!(round, full);
+        // The block is a nested object on the manifest (never flattened —
+        // manifest fields and config fields must not collide).
+        let value = serde_json::to_value(&full).unwrap();
+        assert_eq!(value["agent_config"]["claude_effort"], "xhigh");
     }
 
     #[test]

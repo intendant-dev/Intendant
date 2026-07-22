@@ -233,18 +233,36 @@ owner's act-on-item. On dashboard surfaces the button opens a **confirm
 sheet** (bottom sheet on coarse pointers and narrow viewports, anchored
 popover-card on desktop) whose content is the explanation: the editable
 goal text the session will receive, the resolved project directory, the
-config the spawn inherits (backend and execution — honest daemon
-defaults), and an **Interactive / Goal run** toggle. The one-click instant
-fire is retired on dashboard surfaces (owner ruling, 2026-07-21). On
-confirm, the daemon mints a manifest from the reviewed parameters — the
-goal statement (item title and body quoted as data, carrying the item id
-so the spawned session's own attributed `ctl` can annotate or complete it,
-or the sheet's edited text) plus a fixed mode coda — and appends the
-propose and approve operations atomically, the approval binding the digest
-of exactly that minted manifest. With its fire time set to now, the
-ordinary scheduler pass journals the occurrence and dispatches through the
-same StartTask lane as any scheduled firing — start now is scheduled
-firing with a zero-length wait, never a bypass.
+launch config the spawn runs with — the daemon-default backend plus
+editable model and reasoning/thinking selects, prefilled to the daemon
+defaults with honest provenance ("daemon default (max)" vs "explicit —
+recorded on the manifest") — and an **Interactive / Goal run** toggle. The
+one-click instant fire is retired on dashboard surfaces (owner ruling,
+2026-07-21). On confirm, the daemon mints a manifest from the reviewed
+parameters — the goal statement (item title and body quoted as data,
+carrying the item id so the spawned session's own attributed `ctl` can
+annotate or complete it, or the sheet's edited text) plus a fixed mode
+coda, and any explicit config picks as the manifest's `agent_config` block
+— and appends the propose and approve operations atomically, the approval
+binding the digest of exactly that minted manifest. With its fire time set
+to now, the ordinary scheduler pass journals the occurrence and dispatches
+through the same StartTask lane as any scheduled firing — start now is
+scheduled firing with a zero-length wait, never a bypass.
+
+**Launch config rides the manifest** (`agent_config`, additive): the
+optional block carries exactly the `CreateSession` one-shot vocabulary
+(backend selection, per-backend model / effort / permission pins —
+`ctl agenda start --agent/--claude-model/--claude-effort/…`). A legacy
+manifest without it — and the digest its approval binds — is unchanged;
+setting it revises the manifest like any other edit. At fire time the
+scheduler forwards the block on `StartTask`, and the spawn resolves every
+field through the same chain as any other launch lane: **explicit
+per-create/manifest pin → daemon default setting (the Settings tab's
+"Codex reasoning" / "Claude reasoning" rows, `SetCodexReasoningEffort` /
+`SetClaudeEffort`) → backend default**. The applied config is recorded and
+echoed exactly as a pane-created session's (the persisted launch overlay,
+the vitals Model chip's `model · effort`), so scheduled spawns are
+config-indistinguishable from composer spawns.
 
 **Interactive is the default** (`interactive`, additive on the manifest):
 the spawned session opens with the goal as its first user message and then

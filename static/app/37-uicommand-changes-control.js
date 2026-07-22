@@ -1012,6 +1012,7 @@ window.doPrune = doPrune;
 
 let controlClaudeConfig = {
   model: '',
+  effort: '',
   permission_mode: 'default',
   allowed_tools: [],
 };
@@ -1203,6 +1204,7 @@ async function refreshControlPane() {
     }
     controlClaudeConfig = {
       model: d.claude_model || '',
+      effort: d.claude_effort || '',
       permission_mode: d.claude_permission_mode || 'default',
       allowed_tools: Array.isArray(d.claude_allowed_tools) ? d.claude_allowed_tools : [],
     };
@@ -1243,9 +1245,11 @@ function renderControlPane() {
   const $ = id => document.getElementById(id);
   if (isClaude) {
     const modelInp = $('control-claude-model');
+    const effortSel = $('control-claude-effort');
     const modeSel = $('control-claude-permission-mode');
     const toolsTA = $('control-claude-allowed-tools');
     if (modelInp) modelInp.value = controlClaudeConfig.model || '';
+    if (effortSel) effortSel.value = controlClaudeConfig.effort || '';
     if (modeSel) modeSel.value = controlClaudeConfig.permission_mode || 'default';
     if (toolsTA) toolsTA.value = (controlClaudeConfig.allowed_tools || []).join('\n');
   }
@@ -1437,6 +1441,13 @@ function onControlClaudeModelCommit(ev) {
   dispatchControlMsg({ action: 'set_claude_model', model: model || null });
 }
 
+function onControlClaudeEffortChange(ev) {
+  const effort = ev.target.value;
+  if (effort === (controlClaudeConfig.effort || '')) return;
+  controlClaudeConfig.effort = effort;
+  dispatchControlMsg({ action: 'set_claude_effort', effort: effort || null });
+}
+
 function onControlClaudePermissionModeChange(ev) {
   const mode = ev.target.value;
   if (mode === (controlClaudeConfig.permission_mode || 'default')) return;
@@ -1599,6 +1610,11 @@ function applyClaudeConfigChanged(evt) {
     controlClaudeConfig.model = evt.model;
   } else if (evt.model_cleared) {
     controlClaudeConfig.model = '';
+  }
+  if (evt.effort !== undefined && evt.effort !== null) {
+    controlClaudeConfig.effort = evt.effort;
+  } else if (evt.effort_cleared) {
+    controlClaudeConfig.effort = '';
   }
   if (evt.permission_mode) {
     controlClaudeConfig.permission_mode = evt.permission_mode;
@@ -2654,8 +2670,10 @@ function wireControlPaneListeners() {
 
   // ── Claude Code section ──
   const claudeModelInp = $('control-claude-model');
+  const claudeEffortSel = $('control-claude-effort');
   const claudeModeSel = $('control-claude-permission-mode');
   const claudeToolsTA = $('control-claude-allowed-tools');
+  if (claudeEffortSel) claudeEffortSel.addEventListener('change', onControlClaudeEffortChange);
   if (claudeModeSel) claudeModeSel.addEventListener('change', onControlClaudePermissionModeChange);
   if (claudeModelInp) {
     claudeModelInp.addEventListener('change', onControlClaudeModelCommit);
