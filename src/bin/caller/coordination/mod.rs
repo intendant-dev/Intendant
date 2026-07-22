@@ -22,6 +22,12 @@
 //!    non-regular files rejected, per-file byte bound and per-space
 //!    scan bound enforced BEFORE parsing; unparseable or over-bound
 //!    entries are surfaced by name, never silently skipped.
+//!    *Liveness amendment (C1)*: for the liveness kinds a malformed
+//!    ENTRY is a named rejection carried in the scan result and the
+//!    scan continues — one bad same-UID file must not blind the radar;
+//!    scan-bound overflow stays corruption-grade (hard error). The
+//!    checkpoint kind keeps the original all-or-nothing posture: a
+//!    corrupt space must not half-restore a workflow.
 //! 6. **Bounds are write-side too**: body and file-count caps reject
 //!    loudly (named errors) instead of degrading.
 //! 7. **Attribution is honest**: a writer records its session id, and
@@ -31,25 +37,46 @@
 //! 8. **Checkpoint GC is acknowledgement-driven, never TTL**: a
 //!    generation is removed ONLY when a successor supersedes it (the
 //!    successor's own write is durable first) or a terminal record
-//!    closes the workflow. No time-based deletion path exists in this
-//!    module by construction.
+//!    closes the workflow. *Liveness amendment (C1)*: the liveness
+//!    kinds — and only they — age out on time (`gc::sweep_all`):
+//!    declarations a day past their last heartbeat, messages past
+//!    their TTL, orphaned atomic-write temps after an hour. The sweep
+//!    never opens, ages, or deletes a checkpoint document, and never
+//!    deletes what it cannot parse (malformed entries are kept and
+//!    reported).
 //! 9. **Daemonless cleanup**: `complete` (the terminal record) removes
 //!    the workflow's generations; an abandoned space is inert bytes a
 //!    human can delete — nothing replays or executes from it.
 //!
-//! The one v0 kind — the **workflow checkpoint** — replaces the tombed
-//! memory system's single live orchestration duty (the orchestrator
-//! prompt's `project_state` checkpoints): after each sub-agent
-//! completes, the orchestrator persists "what's done / in flight /
-//! decided / constrained" so a successor (post-compaction or
-//! post-restart) resumes with full awareness. Everything broader
-//! (session intent files, message relay, collision radar, daemon push
-//! lanes) is Track C, deferred — deliberately absent here.
+//! The founding v0 kind — the **workflow checkpoint**
+//! (`checkpoint.rs`) — replaces the tombed memory system's single live
+//! orchestration duty (the orchestrator prompt's `project_state`
+//! checkpoints): after each sub-agent completes, the orchestrator
+//! persists "what's done / in flight / decided / constrained" so a
+//! successor (post-compaction or post-restart) resumes with full
+//! awareness.
+//!
+//! Track C (C1) extends the space with the **liveness kinds** — data
+//! that describes who is working right now, and therefore expires:
+//! `declarations.rs` (`sessions/` — one declaration per live session:
+//! identity, intent, believed-dirty paths, heartbeat by mtime) and
+//! `messages.rs` (`messages/<writer>/` — bounded TTL'd notes between
+//! sessions; the `daemon` writer name is reserved for the daemon's
+//! lanes). `scan.rs` carries the shared rule-5 liveness machinery and
+//! field grammars, `paths.rs` the space-dir resolution seam
+//! (`INTENDANT_COORDINATION_DIR` override → derived key), and `gc.rs`
+//! the rule-8 liveness sweep. The consumers — collision radar,
+//! daemon-rendered prompt lanes, the CLI — are C2/C3.
 
 use std::path::{Path, PathBuf};
 
 mod checkpoint;
 pub(crate) use checkpoint::*;
+pub(crate) mod declarations;
+pub(crate) mod gc;
+pub(crate) mod messages;
+pub(crate) mod paths;
+pub(crate) mod scan;
 
 /// Per-document byte cap (frontmatter + body).
 const MAX_DOC_BYTES: usize = 64 * 1024;
