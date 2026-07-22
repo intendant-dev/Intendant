@@ -54,7 +54,8 @@ Add Intendant to your MCP client config (Claude Code
 The full MCP tool surface (dispatched in `call_tool_by_name`) is broad. For
 model clients that front-load tool schemas into every request, prefer the
 HTTP transport's `tool_profile=core` query parameter and the `intendant ctl`
-CLI for lazy discovery. `tool_profile=core` advertises `get_status`; the
+CLI for lazy discovery. `tool_profile=core` advertises `get_status`; `whoami`
+(the caller's own identity, for provenance in memory/agenda writes); the
 agent-to-user collaboration primitives (`post_session_note`, `ask_user`,
 `notify_user`); Agenda and Memory list/read/propose tools; the shared-view
 tools; and the minimal real-display/CU set (`list_displays`,
@@ -200,6 +201,7 @@ Full MCP tool groups:
 | Tool                   | Description | Params |
 |------------------------|-------------|--------|
 | `get_status`           | Provider, model, turn, budget %, phase, autonomy, verbosity, tokens. | — |
+| `whoami`               | The caller's own gate-resolved identity, for provenance in memory/agenda writes: supervised callers get their daemon session id, backend harness (`claude-code`/`codex`/`kimi`/`native`) with its harness session id, wrapper aliases (restart/resume rotations of the same conversation), project root, and log dir; unsupervised callers get `supervised:false` plus their principal id. Claims a session only when the call authenticated with that session's token — never from request fields. Also `intendant ctl whoami`. | — |
 | `get_logs`             | Log entries, cursor-paginated and level-filterable. Without `session_id`, HTTP/ctl reads the daemon's currently observed session. | `session_id?`, `since_id?`, `level_filter?`, `limit?` |
 | `get_pending_approval` | The current pending approval request (or null). | — |
 | `get_pending_input`    | The current pending `askHuman` question (or null). | — |

@@ -61,6 +61,11 @@ pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
                 call_tool(&client, &config, "get_status", Value::Object(Map::new())).await?;
             print_tool_response(response, &config, None)?;
         }
+        "whoami" => {
+            ensure_help(&command[1..], help_whoami)?;
+            let response = call_tool(&client, &config, "whoami", Value::Object(Map::new())).await?;
+            print_tool_response(response, &config, None)?;
+        }
         "dashboard-url" => run_dashboard_url(&config)?,
         "logs" => run_logs(&client, &config, &command[1..]).await?,
         "tools" | "tool" => run_tools(&client, &config, &command[1..]).await?,
@@ -3829,6 +3834,7 @@ Global flags:\n\
 \n\
 Commands:\n\
   status                    Get current status\n\
+  whoami                    This caller's gate-resolved identity: daemon + harness session ids, project root, log dir\n\
   dashboard-url             Print the local dashboard URL carrying this boot's loopback admission token\n\
   logs                      Read log entries\n\
   tools                     Lazy MCP tool discovery and generic calls\n\
@@ -3856,6 +3862,18 @@ Run `intendant ctl <command> --help` for focused help."
 
 fn help_status() {
     println!("Usage: intendant ctl status [--json|--raw]");
+}
+
+fn help_whoami() {
+    println!(
+        "Usage: intendant ctl whoami [--json|--raw]\n\
+\n\
+Reports the identity the daemon's gate resolved for THIS caller: inside a\n\
+supervised session (session-scoped INTENDANT_MCP_URL) that is the session's\n\
+daemon id, backend harness + harness session id, wrapper aliases, project\n\
+root, and log dir — cite these when writing memory or agenda entries.\n\
+Unsupervised callers get supervised:false plus their principal id."
+    );
 }
 
 fn help_logs() {
