@@ -584,6 +584,7 @@ function agendaThreadBlock(item) {
 // wears a render-level flag only.
 
 let agendaGroupByHub = false;
+let agendaAttentionOrderOn = false;
 
 function agendaChildrenOf(id) {
   return (agendaItems || []).filter(
@@ -651,6 +652,36 @@ function agendaJumpToItem(id) {
   card.scrollIntoView({ block: 'center', behavior: 'smooth' });
   card.classList.add('agenda-jump-flash');
   setTimeout(() => card.classList.remove('agenda-jump-flash'), 2400);
+}
+
+// The Attention lens (G3): the SAME open cards ordered by what needs the
+// owner — blocking questions, approval-pending manifests, suspended
+// standing effects, triage-recommended items, then recency. A pure
+// reorder over data the tab already holds (triage recommendations are
+// ordinary annotations with the self-described `triage` source — data,
+// gating nothing); the attention queue is a VIEW, never a second inbox.
+function agendaAttentionClass(item) {
+  if (item.kind === 'question' && item.status === 'open') return 0;
+  const effect = (item.effects || [])[0];
+  if (effect && !effect.approval && item.status === 'open') return 1;
+  if (effect && effect.manifest && effect.manifest.recurrence) {
+    const threshold = (effect.manifest.recurrence.suspend_after_failures || 3);
+    if ((effect.consecutive_failures || 0) >= threshold) return 2;
+  }
+  if ((item.annotations || []).some((n) => n.source === 'triage')) return 3;
+  return 4;
+}
+
+function agendaAttentionOrder(filtered) {
+  return filtered
+    .slice()
+    .sort((a, b) => {
+      const ca = agendaAttentionClass(a);
+      const cb = agendaAttentionClass(b);
+      if (ca !== cb) return ca - cb;
+      return (b.updated_ms || 0) - (a.updated_ms || 0);
+    })
+    .map((item) => ({ item, depth: 0 }));
 }
 
 // Grouped ordering (the by-hub lens): the SAME filtered cards, reordered
@@ -1502,7 +1533,9 @@ function agendaRenderTab() {
   // Newest first reads best in a review list; ULIDs sort by creation.
   // The by-hub lens reorders the SAME cards (children nested under
   // parents) — the flat order stays the default and the guarantee.
-  const ordered = agendaGroupByHub
+  const ordered = agendaAttentionOrderOn
+    ? agendaAttentionOrder(filtered)
+    : agendaGroupByHub
     ? agendaGroupedOrder(filtered)
     : filtered
         .slice()
@@ -1860,12 +1893,30 @@ function agendaPositionCard() {
         });
       });
       const group = document.getElementById('agenda-group-toggle');
+      const attention = document.getElementById('agenda-attention-toggle');
+      const syncLenses = () => {
+        if (group) {
+          group.classList.toggle('active', agendaGroupByHub);
+          group.setAttribute('aria-pressed', agendaGroupByHub ? 'true' : 'false');
+        }
+        if (attention) {
+          attention.classList.toggle('active', agendaAttentionOrderOn);
+          attention.setAttribute('aria-pressed', agendaAttentionOrderOn ? 'true' : 'false');
+        }
+        agendaRenderTab();
+      };
       if (group) {
         group.addEventListener('click', () => {
           agendaGroupByHub = !agendaGroupByHub;
-          group.classList.toggle('active', agendaGroupByHub);
-          group.setAttribute('aria-pressed', agendaGroupByHub ? 'true' : 'false');
-          agendaRenderTab();
+          if (agendaGroupByHub) agendaAttentionOrderOn = false;
+          syncLenses();
+        });
+      }
+      if (attention) {
+        attention.addEventListener('click', () => {
+          agendaAttentionOrderOn = !agendaAttentionOrderOn;
+          if (agendaAttentionOrderOn) agendaGroupByHub = false;
+          syncLenses();
         });
       }
     }

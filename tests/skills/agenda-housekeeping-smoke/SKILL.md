@@ -5,8 +5,8 @@ description: >
   scratch daemon with a seeded agenda, an owner-approved housekeeping
   session executes the propose-don't-dispose mandate and the run is
   verified from the durable op history — N annotations + exactly ONE
-  summary item + one next-run proposal + ZERO disposals (no
-  complete/retire of other actors' items, no blocker clears). Runs
+  summary item + ZERO disposals (no complete/retire of other actors'
+  items, no blocker clears), under a STANDING weekly manifest. Runs
   keyless under the mock provider (the mock script IS the mandate-obedient
   session); swap in a real provider to also judge model obedience.
 compatibility: Operator hardware, never CI (spawns a daemon and drives it
@@ -20,7 +20,8 @@ allowed-tools: Bash Read
 The recipe under test is documented in `docs/src/agenda-and-memory.md`
 ("The housekeeping recipe"): one ordinary item carries the scheduled
 session whose goal embeds the propose-don't-dispose mandate; recurrence is
-each run re-proposing the next pass for one-click owner approval.
+declared IN the manifest (`--every 7d`, G3-pre) — one approval covers the
+series, and runs never re-propose.
 
 ## What the run must demonstrate (the acceptance pattern)
 
@@ -30,10 +31,11 @@ blocker, an unanswered question), one housekeeping pass produces exactly:
 1. **N ≥ 2 annotations** on existing items (staleness/evidence notes),
    attributed to the housekeeping session (`agent_session` + its sid);
 2. **exactly one** new open item titled `Housekeeping summary …`;
-3. **one** fresh `propose_effect` revision on the housekeeping item
-   (the next pass, awaiting owner approval — nothing armed);
-4. **zero disposals**: every pre-existing item keeps its status; the
-   blocker stays uncleared (evidence arrives as an annotation instead).
+3. **zero disposals**: every pre-existing item keeps its status; the
+   blocker stays uncleared (evidence arrives as an annotation instead);
+4. the standing manifest is UNTOUCHED: same digest, approval intact,
+   no propose ops from the run (the pre-G3-pre recipe ended each run by
+   re-proposing — the standing amendment retired that).
 
 ## Recipe
 
@@ -64,8 +66,8 @@ SCRATCH=$(mktemp -d); PROJ=$(mktemp -d); : > "$PROJ/intendant.toml"
 
 # 5. Verify from the DURABLE history once last_run.state == completed:
 #    CTL --json agenda list --all | <assert the four-point pattern above>
-#    plus: the housekeeping item's effect has approval == null on the NEW
-#    digest (next pass proposed, not armed) and last_run on the OLD one.
+#    plus: the housekeeping item's effect keeps its digest AND approval
+#    (standing series — the next instant needs no ceremony).
 ```
 
 The mock form proves the machinery end to end (real binaries, real

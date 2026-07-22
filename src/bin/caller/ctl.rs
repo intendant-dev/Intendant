@@ -2321,8 +2321,14 @@ async fn run_agenda(
             map.insert("id".to_string(), Value::String(id));
             insert_string(&mut map, "project_root", args.one("--project"));
             insert_string(&mut map, "goal", args.one("--goal"));
+            // Absent-on-the-wire unless --goal-run: the daemon defaults a
+            // minted manifest to interactive, and on a STANDING approved
+            // manifest (G3-pre) an absent mode means "fire as approved" —
+            // an explicit value would read as a revision request there.
             let goal_run = args.has("--goal-run");
-            map.insert("interactive".to_string(), Value::Bool(!goal_run));
+            if goal_run {
+                map.insert("interactive".to_string(), Value::Bool(false));
+            }
             let mut agent_config = Map::new();
             insert_string(&mut agent_config, "agent", args.one("--agent"));
             insert_string(
@@ -2742,9 +2748,17 @@ async fn run_agenda_list(
     let args = parse_command_args(
         raw,
         &["--under"],
-        &["--all", "--open", "--done", "--retired", "--blocked"],
+        &[
+            "--all",
+            "--open",
+            "--done",
+            "--retired",
+            "--blocked",
+            "--frontier",
+        ],
     )?;
     let blocked_only = args.has("--blocked");
+    let frontier_only = args.has("--frontier");
     let status = if args.has("--all") {
         None
     } else if args.has("--done") {
@@ -2758,7 +2772,7 @@ async fn run_agenda_list(
     };
     let mut tool_args = Map::new();
     insert_string(&mut tool_args, "status", status);
-    if (config.json || config.raw) && args.one("--under").is_none() {
+    if (config.json || config.raw) && args.one("--under").is_none() && !frontier_only {
         let response = call_tool(client, config, "agenda_list", Value::Object(tool_args)).await?;
         return print_tool_response(response, config, None);
     }
@@ -2793,6 +2807,51 @@ async fn run_agenda_list(
             Some(subtree)
         }
     };
+    // The un-triaged frontier (G3, render-time, never stored): open items
+    // newer than the newest `triage:summary` item, plus open items lacking
+    // both a placement and a triage annotation. Summary items are excluded
+    // BY DEFINITION (one of the two loop-prevention pins; the mandate's
+    // never-list is the other). Markers ride existing vocabulary — the tag
+    // and the self-described `--source triage` label — UNVERIFIED data
+    // gating nothing, same trust class as the overdue chip.
+    let summary_tagged = |item: &Value| {
+        item.get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| tags.iter().any(|t| t.as_str() == Some("triage:summary")))
+    };
+    let triage_watermark: u64 = all_items
+        .iter()
+        .filter(|item| summary_tagged(item))
+        .filter_map(|item| {
+            item.get("provenance")
+                .and_then(|p| p.get("created_ms"))
+                .and_then(Value::as_u64)
+        })
+        .max()
+        .unwrap_or(0);
+    let in_frontier = |item: &Value| {
+        if item.get("status").and_then(Value::as_str) != Some("open") || summary_tagged(item) {
+            return false;
+        }
+        let created = item
+            .get("provenance")
+            .and_then(|p| p.get("created_ms"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if created > triage_watermark {
+            return true;
+        }
+        let placed = item.get("part_of").is_some_and(|p| !p.is_null());
+        let triaged = item
+            .get("annotations")
+            .and_then(Value::as_array)
+            .is_some_and(|notes| {
+                notes
+                    .iter()
+                    .any(|n| n.get("source").and_then(Value::as_str) == Some("triage"))
+            });
+        !placed && !triaged
+    };
     let items: Vec<&Value> = all_items
         .iter()
         .filter(|item| {
@@ -2800,6 +2859,7 @@ async fn run_agenda_list(
             let id = item.get("id").and_then(Value::as_str).unwrap_or("");
             status.is_none_or(|s| item_status == s)
                 && (!blocked_only || agenda_item_is_blocked(&all_items, item))
+                && (!frontier_only || in_frontier(item))
                 && under_subtree.as_ref().is_none_or(|s| s.contains(id))
         })
         .collect();
@@ -2812,10 +2872,14 @@ async fn run_agenda_list(
         return Ok(());
     }
     if items.is_empty() {
-        match (blocked_only, status) {
-            (true, _) => println!("no blocked agenda items"),
-            (false, Some(status)) => println!("no {status} agenda items"),
-            (false, None) => println!("agenda is empty"),
+        if frontier_only {
+            println!("frontier empty — nothing awaits triage");
+        } else {
+            match (blocked_only, status) {
+                (true, _) => println!("no blocked agenda items"),
+                (false, Some(status)) => println!("no {status} agenda items"),
+                (false, None) => println!("agenda is empty"),
+            }
         }
     }
     for item in &items {
@@ -4547,6 +4611,7 @@ fn help_agenda() {
   intendant ctl agenda place ID_PREFIX HUB_PREFIX|--under HUB [--remove] [--source LABEL]\n\
   intendant ctl agenda relates ID_PREFIX TARGET_PREFIX [--remove] [--source LABEL]\n\
   intendant ctl agenda list --under HUB_PREFIX   # the hub's placed subtree\n\
+  intendant ctl agenda list --frontier           # the un-triaged frontier (triage mandate's scope)\n\
   intendant ctl agenda complete ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda reopen ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda retire ID_PREFIX [--source LABEL]\n\
