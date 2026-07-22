@@ -623,7 +623,7 @@ directory is safe to delete; it rebuilds on the next scan.
   aggregate tiles including **free disk** on the tightest worktree-hosting
   volume (amber under 10% free, rose under 5%) and **reclaimable** build
   output; and **related-session chips** — the sessions observed inside
-  each checkout, supervised and raw Codex/Claude/Kimi alike. Clicking a chip
+  each checkout, supervised and raw Codex/Claude/Kimi/Pi alike. Clicking a chip
   focuses the live session window when one exists, otherwise it lands on
   Recent with the ID prefilled. Checkouts with a CACHEDIR.TAG-marked Cargo
   `target/` offer **Clean target/** — delete the build directory to
@@ -660,6 +660,10 @@ directory is safe to delete; it rebuilds on the next scan.
   inherit, or a custom id), thinking (`off` through `max`), permission
   (`manual`/`auto`/`yolo`), exact active tools (unset/inherit is distinct from
   an intentionally empty set), and explicit plan/swarm toggles. The
+  Pi controls expose its binary, free-form model pattern or provider/model id,
+  thinking level, and exact active tools (inherit, deliberately none, or a
+  name list). Model and thinking can apply live after launch; tools are
+  launch-time because Pi's public RPC has no active-tool mutation command. The
   binary/model/effort/thinking convenience
   values use per-browser localStorage; a remembered value that is no longer a
   valid option — or a backend the daemon now reports missing — falls back to
@@ -670,12 +674,15 @@ directory is safe to delete; it rebuilds on the next scan.
   never becomes a sticky default.
 
 **Settings → Providers & models** exposes the daemon's global Codex, Claude,
-and Kimi defaults independently of whichever backend is currently selected.
+Kimi, and Pi defaults independently of whichever backend is currently selected.
 With an attached project, Save writes that project's `intendant.toml`; a projectless
 daemon writes `<state-root>/intendant.toml` (normally
 `~/.intendant/intendant.toml`) while `/api/project-root` remains `null`. These
 defaults seed new sessions, but an existing session's persisted launch config
-continues to control its next attach/resume.
+continues to control its next attach/resume. Pi's Settings fields persist
+directly to `[agent.pi]` rather than creating a daemon-wide Pi runtime-config
+mirror. Reattached Pi sessions merge the current TOML base with their persisted
+overlay (the overlay wins), while supported live changes use RPC.
 
 Internal sessions' window menus additionally expose **Delegate…** — spawn a
 supervised sub-agent (task, optional name, role, backend, worktree isolation)
@@ -712,6 +719,13 @@ menu derives from its advertised actions — including compact, head fork,
 side, undo, archive/restore, goals and native budgets, review, normal/highspeed
 model switching, model/tool catalogs, exact tool changes, context clear, and
 background-task control — rather than a backend-name heuristic.
+
+Pi sessions get four pinnable rows: binary, model, thinking, and exact active
+tools. Save applies model and thinking live and persists the resulting pins;
+binary/tools apply on the next attach or through **Save & restart**. The action
+menu derives `compact`, `fork`, `side`, `rename`, `model`, and `thinking` from
+the advertised Pi capability list. It does not show goals, native sub-agents,
+review, rollback, plan/todo, or MCP controls that upstream Pi does not have.
 
 The separate **Restart with saved config** action is a power-user shortcut for
 reapplying settings that were already persisted elsewhere.
@@ -1927,7 +1941,7 @@ response omits the header.
 | POST | `/api/kimi-auth/start` | CredentialsManage | own origin | ≤ 4 KiB | Start the Kimi Code sign-in ceremony (`kimi login` on a daemon-private PTY) |
 | GET | `/api/kimi-auth/status` | CredentialsManage | own origin | none | Kimi Code sign-in ceremony state (verification URL + one-time code) |
 | POST | `/api/kimi-auth/cancel` | CredentialsManage | own origin | none | Cancel the Kimi Code sign-in ceremony (non-destructive; prior login keeps working) |
-| GET | `/api/external-agents` | SessionInspect | own origin | none | Detected external coding agents (codex, claude, kimi) |
+| GET | `/api/external-agents` | SessionInspect | own origin | none | Detected external coding agents (codex, claude, kimi, pi) |
 | POST | `/api/diagnostics/visual-freshness` | DisplayInput | own origin | ≤ 16 MiB | Visual-freshness diagnostics transcript sink (NDJSON body) |
 | GET | `/api/displays` | DisplayView | own origin | none | Enumerate active displays |
 | any | `/api/peer-pairing/requests[/…]` | public | public | streaming | Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath) |

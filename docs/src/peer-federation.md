@@ -44,7 +44,7 @@ These are two orthogonal relationships, and they compose:
 |---|---|---|
 | Relationship | Peer / peer (A2A-shaped) | Master / worker (ACP-shaped) |
 | Mental model | "I federate with a peer daemon" | "I spawn a process and give it a task" |
-| Right for | OpenClaw, Hermes, Letta, **another Intendant** | Codex, Claude Code, Kimi Code, Aider, goose |
+| Right for | OpenClaw, Hermes, Letta, **another Intendant** | Codex, Claude Code, Kimi Code, Pi, Aider, goose |
 | Lifecycle | Connect to an already-running daemon | Spawn and supervise a child process |
 
 A peer Intendant can itself supervise an external coding-agent subprocess via its own

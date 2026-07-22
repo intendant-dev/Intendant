@@ -3472,8 +3472,8 @@ function updateStatusBar(d, opts = {}) {
   }
   if (d.external_agent !== undefined) {
     // Accept any of the serialization forms we might see on the wire:
-    //   short:      "codex" | "claude-code" | "kimi"
-    //   display:    "Codex" | "Claude Code" | "Kimi Code"
+    //   short:      "codex" | "claude-code" | "kimi" | "pi"
+    //   display:    "Codex" | "Claude Code" | "Kimi Code" | "Pi"
     //   serde enum: "claude_code"
     // Normalize to the canonical short form used by the dropdown
     // <option value> attributes, then derive a pretty label from that.
@@ -3509,6 +3509,8 @@ function normalizeAgentId(raw) {
       v === 'cc' || v === 'claude code') return 'claude-code';
   if (v === 'kimi' || v === 'kimi-code' || v === 'kimi_code' ||
       v === 'kimicode' || v === 'kimi code' || v === 'moonshot') return 'kimi';
+  if (v === 'pi' || v === 'pi-coding-agent' || v === 'pi_coding_agent' ||
+      v === 'pi coding agent') return 'pi';
   return '';
 }
 
@@ -3517,6 +3519,7 @@ function prettyAgentName(shortId) {
     'codex': 'Codex',
     'claude-code': 'Claude Code',
     'kimi': 'Kimi Code',
+    'pi': 'Pi',
   }[shortId] || shortId;
 }
 

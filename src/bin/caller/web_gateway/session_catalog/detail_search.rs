@@ -595,9 +595,10 @@ pub(crate) fn session_log_search_from_home_with_progress(
             continue;
         };
 
-        let search_result = if source == kimi_history::KIMI_SOURCE {
-            search_kimi_session(
+        let search_result = if matches!(source, kimi_history::KIMI_SOURCE | pi_history::PI_SOURCE) {
+            search_parsed_external_session(
                 home,
+                source,
                 session_id,
                 query,
                 &terms,
@@ -775,23 +776,24 @@ pub(crate) fn normalize_session_source_filter(source_filter: &str) -> String {
     match value.as_str() {
         "" | "all" => "all".to_string(),
         "external" => "external".to_string(),
-        "intendant" | "codex" | "claude-code" | "gemini" | "kimi" => value,
+        "intendant" | "codex" | "claude-code" | "gemini" | "kimi" | "pi" => value,
         "kimi-code" | "kimi code" => "kimi".to_string(),
+        "pi-coding-agent" | "pi_coding_agent" | "pi coding agent" => "pi".to_string(),
         "claude" => "claude-code".to_string(),
         _ => "all".to_string(),
     }
 }
 
-fn search_kimi_session(
+fn search_parsed_external_session(
     home: &Path,
+    source: &str,
     session_id: &str,
     query: &str,
     terms: &[String],
     mode: SessionLogSearchMode,
     deleted_external_sessions: &HashSet<(String, String)>,
 ) -> Option<(usize, Vec<serde_json::Value>)> {
-    let entries =
-        external_session_entries_from_home_arc(home, kimi_history::KIMI_SOURCE, session_id)?;
+    let entries = external_session_entries_from_home_arc(home, source, session_id)?;
     let candidates = entries.iter().map(|entry| SessionLogSearchCandidate {
         ts: entry
             .get("ts")
@@ -801,7 +803,7 @@ fn search_kimi_session(
         source: entry
             .get("source")
             .and_then(|value| value.as_str())
-            .unwrap_or(kimi_history::KIMI_SOURCE)
+            .unwrap_or(source)
             .to_string(),
         level: entry
             .get("level")
@@ -1121,6 +1123,18 @@ pub(crate) fn session_log_match_snippet(text: &str, terms: &[String], max_chars:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_detail_search_source_aliases_normalize_to_pi() {
+        for alias in [
+            "pi",
+            "pi-coding-agent",
+            "pi_coding_agent",
+            "pi coding agent",
+        ] {
+            assert_eq!(normalize_session_source_filter(alias), "pi");
+        }
+    }
 
     #[test]
     fn session_frame_group_titles_are_rendered_as_text() {

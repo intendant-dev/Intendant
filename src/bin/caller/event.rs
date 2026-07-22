@@ -1360,7 +1360,7 @@ pub enum ApprovalResponse {
 /// (explicit per-create value → daemon default setting → backend default).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentLaunchConfig {
-    /// Backend selection: "internal", "codex", "claude-code", or "kimi".
+    /// Backend selection: "internal", "codex", "claude-code", "kimi", or "pi".
     /// Omitted means the configured default backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
@@ -1389,6 +1389,14 @@ pub struct AgentLaunchConfig {
     pub kimi_plan_mode: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kimi_swarm_mode: Option<bool>,
+    /// Pi launch pins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_thinking: Option<String>,
+    /// Same sentinel vocabulary as `CreateSession.pi_allowed_tools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_allowed_tools: Option<String>,
     /// Codex launch pins (codex sessions only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_model: Option<String>,
@@ -1424,6 +1432,9 @@ impl AgentLaunchConfig {
             kimi_allowed_tools,
             kimi_plan_mode,
             kimi_swarm_mode,
+            pi_model,
+            pi_thinking,
+            pi_allowed_tools,
             codex_model,
             codex_reasoning_effort,
             codex_sandbox,
@@ -1443,6 +1454,9 @@ impl AgentLaunchConfig {
             && kimi_allowed_tools.is_none()
             && kimi_plan_mode.is_none()
             && kimi_swarm_mode.is_none()
+            && pi_model.is_none()
+            && pi_thinking.is_none()
+            && pi_allowed_tools.is_none()
             && codex_model.is_none()
             && codex_reasoning_effort.is_none()
             && codex_sandbox.is_none()
@@ -1721,6 +1735,14 @@ pub enum ControlMsg {
         /// empty active set, otherwise comma/newline-separated exact names.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kimi_allowed_tools: Option<String>,
+        /// Pi launch pins. Model/thinking inherit when omitted; tools use the
+        /// same `inherit` / `none` / exact-list vocabulary as Kimi.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_thinking: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_allowed_tools: Option<String>,
     },
     /// Stop a live managed session. Unlike hiding a dashboard card, this
     /// removes the live session from daemon state and asks the backend process
@@ -1785,6 +1807,12 @@ pub enum ControlMsg {
         /// Same sentinel vocabulary as `ConfigureSessionAgent`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kimi_allowed_tools: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_thinking: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_allowed_tools: Option<String>,
     },
     /// Set the Claude Code model override (`--model`). `None`/missing lets
     /// the claude CLI pick its configured default. Applies to the NEXT task
@@ -1906,7 +1934,7 @@ pub enum ControlMsg {
         project_root: Option<String>,
         /// Optional one-shot agent override for this session. Omitted means
         /// use the configured default. Accepted values are "internal",
-        /// "codex", "claude-code", or "kimi".
+        /// "codex", "claude-code", "kimi", or "pi".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
         /// Optional one-shot executable path or command name for the selected
@@ -1941,6 +1969,14 @@ pub enum ControlMsg {
         /// `ConfigureSessionAgent` so explicit empty and inherit survive JSON.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kimi_allowed_tools: Option<String>,
+        /// Optional one-shot Pi launch settings. `pi_allowed_tools` accepts
+        /// `inherit`, `none`, or a comma/newline-separated exact tool list.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_thinking: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_allowed_tools: Option<String>,
         /// Optional one-shot Codex model override for this session (e.g.
         /// "gpt-5.3-codex"). Launch-time only — Codex sessions cannot switch
         /// models mid-session, so unlike `claude_model` there is no matching
@@ -2027,8 +2063,8 @@ pub enum ControlMsg {
         /// testing / …); unknown values fall back to the base prompt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
-        /// Child backend: "internal" (default), "codex", "claude-code", or
-        /// "kimi".
+        /// Child backend: "internal" (default), "codex", "claude-code",
+        /// "kimi", or "pi".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
         /// Isolate the child in a fresh git worktree off the parent
@@ -2108,7 +2144,7 @@ pub enum ControlMsg {
         launch_config: AgentLaunchConfig,
     },
     ResumeSession {
-        /// Session source: "intendant", "codex", "claude-code", "kimi", or
+        /// Session source: "intendant", "codex", "claude-code", "kimi", "pi", or
         /// retired-history "gemini".
         source: String,
         /// Display id from the Sessions tab. For Intendant this is the
@@ -2188,7 +2224,7 @@ pub enum ControlMsg {
     /// the wire cannot set. The child is spawned/attached immediately and
     /// announced via a `session_fork_result` event carrying `request_id`.
     ForkSessionAtAnchor {
-        /// Session source: "intendant", "codex", "claude-code", or "kimi".
+        /// Session source: "intendant", "codex", "claude-code", "kimi", or "pi".
         source: String,
         /// Display id from the Sessions tab. For Intendant this is the
         /// session log id; for external backends the native session id.
@@ -5156,6 +5192,9 @@ mod tests {
                 kimi_plan_mode: None,
                 kimi_swarm_mode: None,
                 kimi_allowed_tools: None,
+                pi_model: None,
+                pi_thinking: None,
+                pi_allowed_tools: None,
                 codex_model: Some("gpt-5.3-codex".to_string()),
                 codex_reasoning_effort: Some("high".to_string()),
                 codex_sandbox: Some("danger-full-access".to_string()),
@@ -5459,6 +5498,9 @@ mod tests {
                 kimi_plan_mode,
                 kimi_swarm_mode,
                 kimi_allowed_tools,
+                pi_model,
+                pi_thinking,
+                pi_allowed_tools,
                 codex_model,
                 codex_reasoning_effort,
                 codex_sandbox,
@@ -5485,6 +5527,9 @@ mod tests {
                 assert!(kimi_plan_mode.is_none());
                 assert!(kimi_swarm_mode.is_none());
                 assert!(kimi_allowed_tools.is_none());
+                assert!(pi_model.is_none());
+                assert!(pi_thinking.is_none());
+                assert!(pi_allowed_tools.is_none());
                 assert_eq!(name.as_deref(), Some("Bugfix work"));
                 assert_eq!(project_root.as_deref(), Some("/repo"));
                 assert_eq!(agent.as_deref(), Some("codex"));
@@ -5614,6 +5659,9 @@ mod tests {
                 kimi_plan_mode,
                 kimi_swarm_mode,
                 kimi_allowed_tools,
+                pi_model,
+                pi_thinking,
+                pi_allowed_tools,
             } => {
                 assert_eq!(session_id, "abc123");
                 assert_eq!(source.as_deref(), Some("codex"));
@@ -5634,6 +5682,9 @@ mod tests {
                 assert!(kimi_plan_mode.is_none());
                 assert!(kimi_swarm_mode.is_none());
                 assert!(kimi_allowed_tools.is_none());
+                assert!(pi_model.is_none());
+                assert!(pi_thinking.is_none());
+                assert!(pi_allowed_tools.is_none());
             }
             _ => panic!("expected ConfigureSessionAgent"),
         }
@@ -5677,6 +5728,22 @@ mod tests {
                 assert_eq!(kimi_plan_mode.as_deref(), Some("true"));
                 assert_eq!(kimi_swarm_mode.as_deref(), Some("enabled"));
                 assert_eq!(kimi_allowed_tools.as_deref(), Some("none"));
+            }
+            _ => panic!("expected ConfigureSessionAgent"),
+        }
+
+        let json = r#"{"action":"configure_session_agent","session_id":"pi-1","source":"pi","pi_model":"openai-codex/gpt-5.6-codex","pi_thinking":"xhigh","pi_allowed_tools":"read,bash"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ConfigureSessionAgent {
+                pi_model,
+                pi_thinking,
+                pi_allowed_tools,
+                ..
+            } => {
+                assert_eq!(pi_model.as_deref(), Some("openai-codex/gpt-5.6-codex"));
+                assert_eq!(pi_thinking.as_deref(), Some("xhigh"));
+                assert_eq!(pi_allowed_tools.as_deref(), Some("read,bash"));
             }
             _ => panic!("expected ConfigureSessionAgent"),
         }
@@ -5764,6 +5831,9 @@ mod tests {
                 kimi_plan_mode,
                 kimi_swarm_mode,
                 kimi_allowed_tools,
+                pi_model,
+                pi_thinking,
+                pi_allowed_tools,
             } => {
                 assert_eq!(source, "codex");
                 assert_eq!(session_id, "thread-1");
@@ -5787,6 +5857,9 @@ mod tests {
                 assert!(kimi_plan_mode.is_none());
                 assert!(kimi_swarm_mode.is_none());
                 assert!(kimi_allowed_tools.is_none());
+                assert!(pi_model.is_none());
+                assert!(pi_thinking.is_none());
+                assert!(pi_allowed_tools.is_none());
             }
             _ => panic!("expected RestartSession"),
         }

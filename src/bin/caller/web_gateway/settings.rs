@@ -218,7 +218,7 @@ pub struct SettingsPayload {
     #[serde(default)]
     pub sandbox_extra_write_paths: Option<Vec<String>>,
     // External agent default (persisted to `[agent] default_backend`).
-    // Values: "codex" | "claude-code" | "kimi" | None (internal agent).
+    // Values: "codex" | "claude-code" | "kimi" | "pi" | None (internal agent).
     #[serde(default)]
     pub external_agent: Option<String>,
     // Codex runtime config (persisted to `[agent.codex]`). Mirrored here so
@@ -300,6 +300,25 @@ pub struct SettingsPayload {
     /// means "leave this Settings field unchanged" on PATCH-like POSTs.
     #[serde(default)]
     pub kimi_allowed_tools_cleared: Option<bool>,
+    // Pi launch defaults persist directly to `[agent.pi]`. Unlike Codex and
+    // Kimi, Pi deliberately has no daemon-wide mirrored runtime-config
+    // object: new sessions load the project config, reattached sessions use it
+    // as a base beneath their persisted overlay, and active sessions use their
+    // per-session model/thinking actions.
+    #[serde(default)]
+    pub pi_command: Option<String>,
+    #[serde(default)]
+    pub pi_model: Option<String>,
+    #[serde(default)]
+    pub pi_thinking: Option<String>,
+    /// Pi's exact active-tool override. `Some([])` disables all tools;
+    /// `None` mutates only when `pi_allowed_tools_cleared` is true.
+    #[serde(default)]
+    pub pi_allowed_tools: Option<Vec<String>>,
+    /// Explicitly remove the active-tool override and restore Pi's profile
+    /// defaults. JSON null/omission otherwise means "leave unchanged".
+    #[serde(default)]
+    pub pi_allowed_tools_cleared: Option<bool>,
     // Per-category approval rules (persisted to `[approval]`). Exposed here
     // for the dashboard's "Approval rules" controls to populate the selects.
     // Live edits flow through the `set_approval_rule` ControlMsg, not through
@@ -457,6 +476,11 @@ pub(crate) fn settings_payload_from_config(
         kimi_swarm_mode: Some(config.agent.kimi.swarm_mode),
         kimi_allowed_tools: config.agent.kimi.allowed_tools.clone(),
         kimi_allowed_tools_cleared: Some(config.agent.kimi.allowed_tools.is_none()),
+        pi_command: Some(config.agent.pi.command.clone()),
+        pi_model: config.agent.pi.model.clone(),
+        pi_thinking: crate::project::normalize_pi_thinking(config.agent.pi.thinking.as_deref()),
+        pi_allowed_tools: config.agent.pi.allowed_tools.clone(),
+        pi_allowed_tools_cleared: Some(config.agent.pi.allowed_tools.is_none()),
         approval_file_read: config.approval.file_read.as_str().to_string(),
         approval_file_write: config.approval.file_write.as_str().to_string(),
         approval_file_delete: config.approval.file_delete.as_str().to_string(),
@@ -721,6 +745,27 @@ pub(crate) fn apply_settings_payload(
     } else if let Some(tools) = payload.kimi_allowed_tools.as_deref() {
         config.agent.kimi.allowed_tools = Some(normalize_kimi_allowed_tools(tools));
     }
+    if payload.pi_command.is_some() {
+        config.agent.pi.command =
+            normalize_settings_agent_command(payload.pi_command.as_deref(), "pi");
+    }
+    if payload.pi_model.is_some() {
+        config.agent.pi.model = payload
+            .pi_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(ToString::to_string);
+    }
+    if payload.pi_thinking.is_some() {
+        config.agent.pi.thinking =
+            crate::project::normalize_pi_thinking(payload.pi_thinking.as_deref());
+    }
+    if payload.pi_allowed_tools_cleared == Some(true) {
+        config.agent.pi.allowed_tools = None;
+    } else if let Some(tools) = payload.pi_allowed_tools.as_deref() {
+        config.agent.pi.allowed_tools = Some(crate::project::normalize_pi_allowed_tools(tools));
+    }
 }
 
 pub(crate) fn settings_post_result(
@@ -779,6 +824,12 @@ fn executable_repoint_denials(
         let next = normalize_settings_agent_command(payload.kimi_command.as_deref(), "kimi");
         if next != config.agent.kimi.command {
             denied.push("kimi_command");
+        }
+    }
+    if payload.pi_command.is_some() {
+        let next = normalize_settings_agent_command(payload.pi_command.as_deref(), "pi");
+        if next != config.agent.pi.command {
+            denied.push("pi_command");
         }
     }
     denied
@@ -895,6 +946,13 @@ pub(crate) fn settings_post_result_with_sandbox_apply(
 /// `apply_settings_payload`'s partial-client compatibility. The dashboard's
 /// full payload includes the bool and list fields, while older partial API
 /// clients can omit them without clearing live state.
+///
+/// Pi is intentionally absent: it has no daemon-wide runtime-config overlay.
+/// Its global defaults live only in `[agent.pi]`; new sessions load that source,
+/// reattached sessions use it beneath their persisted overlay, and active-session
+/// changes travel through thread actions. Keeping that boundary thin avoids
+/// adding a Pi-shaped state mirror throughout the agent OS merely to configure
+/// the replaceable engine below.
 pub(crate) fn dispatch_agent_settings_control_msgs(bus: &EventBus, payload: &SettingsPayload) {
     bus.send(AppEvent::ControlCommand(ControlMsg::SetExternalAgent {
         agent: payload.external_agent.clone(),
@@ -1070,7 +1128,7 @@ pub(crate) fn project_root_response_body(project_root: Option<&Path>) -> String 
     .to_string()
 }
 
-/// Availability of the external-agent backends (Codex, Claude Code, Kimi):
+/// Availability of the external-agent backends (Codex, Claude Code, Kimi, Pi):
 /// the configured command, whether it resolves to an executable, when this
 /// daemon last ran a session with it, and passive protocol-compatibility
 /// evidence for that exact artifact. The status path remains stat/read-only
@@ -1514,6 +1572,7 @@ mod tests {
         project.config.agent.codex.model = Some("gpt-5.6-sol".to_string());
         project.config.agent.claude_code.model = Some("fable".to_string());
         project.config.agent.kimi.model = Some("k2.7 coding".to_string());
+        project.config.agent.pi.model = Some("openai-codex/gpt-5.6-sol".to_string());
         project.save_config().unwrap();
         let runtime = RuntimeSettingsState {
             settings_root: Some(settings_root.path().to_path_buf()),
@@ -1526,6 +1585,7 @@ mod tests {
         assert_eq!(value["codex_model"], "gpt-5.6-sol");
         assert_eq!(value["claude_model"], "fable");
         assert_eq!(value["kimi_model"], "k2.7 coding");
+        assert_eq!(value["pi_model"], "openai-codex/gpt-5.6-sol");
     }
 
     #[test]
@@ -1566,6 +1626,11 @@ mod tests {
         assert_eq!(payload.kimi_swarm_mode, None);
         assert_eq!(payload.kimi_allowed_tools, None);
         assert_eq!(payload.kimi_allowed_tools_cleared, None);
+        assert_eq!(payload.pi_command, None);
+        assert_eq!(payload.pi_model, None);
+        assert_eq!(payload.pi_thinking, None);
+        assert_eq!(payload.pi_allowed_tools, None);
+        assert_eq!(payload.pi_allowed_tools_cleared, None);
         assert_eq!(payload.sandbox_enabled, None);
         assert_eq!(payload.sandbox_extra_write_paths, None);
 
@@ -1582,6 +1647,10 @@ mod tests {
         config.agent.kimi.plan_mode = true;
         config.agent.kimi.swarm_mode = true;
         config.agent.kimi.allowed_tools = Some(vec!["Read".to_string()]);
+        config.agent.pi.command = "/keep/pi".to_string();
+        config.agent.pi.model = Some("keep-pi-model".to_string());
+        config.agent.pi.thinking = Some("keep-pi-thinking".to_string());
+        config.agent.pi.allowed_tools = Some(vec!["read".to_string()]);
         config.sandbox.enabled = Some(false);
         config.sandbox.extra_write_paths = vec!["/keep/me".to_string()];
         apply_settings_payload(&mut config, &payload);
@@ -1598,6 +1667,16 @@ mod tests {
         assert_eq!(config.agent.kimi.permission_mode, "auto");
         assert!(config.agent.kimi.plan_mode);
         assert!(config.agent.kimi.swarm_mode);
+        assert_eq!(config.agent.pi.command, "/keep/pi");
+        assert_eq!(config.agent.pi.model.as_deref(), Some("keep-pi-model"));
+        assert_eq!(
+            config.agent.pi.thinking.as_deref(),
+            Some("keep-pi-thinking")
+        );
+        assert_eq!(
+            config.agent.pi.allowed_tools,
+            Some(vec!["read".to_string()])
+        );
         // Older clients that omit the runtime-sandbox fields must not
         // clear the persisted [sandbox] config.
         assert_eq!(config.sandbox.enabled, Some(false));
@@ -1618,6 +1697,10 @@ mod tests {
         config.agent.kimi.plan_mode = true;
         config.agent.kimi.swarm_mode = true;
         config.agent.kimi.allowed_tools = Some(vec!["Read".to_string()]);
+        config.agent.pi.command = "/usr/local/bin/pi".to_string();
+        config.agent.pi.model = Some("openai-codex/gpt-5.6-sol".to_string());
+        config.agent.pi.thinking = Some("xhigh".to_string());
+        config.agent.pi.allowed_tools = Some(vec!["read".to_string()]);
 
         let payload = settings_payload_from_config(&config);
         assert_eq!(
@@ -1658,6 +1741,14 @@ mod tests {
         assert_eq!(payload.kimi_swarm_mode, Some(true));
         assert_eq!(payload.kimi_allowed_tools, Some(vec!["Read".to_string()]));
         assert_eq!(payload.kimi_allowed_tools_cleared, Some(false));
+        assert_eq!(payload.pi_command.as_deref(), Some("/usr/local/bin/pi"));
+        assert_eq!(
+            payload.pi_model.as_deref(),
+            Some("openai-codex/gpt-5.6-sol")
+        );
+        assert_eq!(payload.pi_thinking.as_deref(), Some("xhigh"));
+        assert_eq!(payload.pi_allowed_tools, Some(vec!["read".to_string()]));
+        assert_eq!(payload.pi_allowed_tools_cleared, Some(false));
 
         let body = serde_json::json!({
             "cu_provider": null,
@@ -1692,7 +1783,12 @@ mod tests {
             "kimi_plan_mode": false,
             "kimi_swarm_mode": true,
             "kimi_allowed_tools": [" Read ", "Write", "Read"],
-            "kimi_allowed_tools_cleared": false
+            "kimi_allowed_tools_cleared": false,
+            "pi_command": "  /opt/pi/bin/pi  ",
+            "pi_model": " openai-codex/gpt-5.6-sol ",
+            "pi_thinking": " HIGH ",
+            "pi_allowed_tools": [" read ", "bash", "read"],
+            "pi_allowed_tools_cleared": false
         })
         .to_string();
 
@@ -1715,6 +1811,16 @@ mod tests {
             config.agent.kimi.allowed_tools,
             Some(vec!["Read".to_string(), "Write".to_string()])
         );
+        assert_eq!(config.agent.pi.command, "/opt/pi/bin/pi");
+        assert_eq!(
+            config.agent.pi.model.as_deref(),
+            Some("openai-codex/gpt-5.6-sol")
+        );
+        assert_eq!(config.agent.pi.thinking.as_deref(), Some("high"));
+        assert_eq!(
+            config.agent.pi.allowed_tools,
+            Some(vec!["read".to_string(), "bash".to_string()])
+        );
     }
 
     #[test]
@@ -1735,6 +1841,26 @@ mod tests {
         let round_trip = settings_payload_from_config(&config);
         assert_eq!(round_trip.kimi_allowed_tools, None);
         assert_eq!(round_trip.kimi_allowed_tools_cleared, Some(true));
+    }
+
+    #[test]
+    fn pi_allowed_tools_settings_preserve_empty_and_explicit_clear() {
+        let mut config = crate::project::ProjectConfig::default();
+        let mut payload = settings_payload_from_config(&config);
+        payload.pi_allowed_tools = Some(Vec::new());
+        payload.pi_allowed_tools_cleared = Some(false);
+        apply_settings_payload(&mut config, &payload);
+        assert_eq!(config.agent.pi.allowed_tools, Some(Vec::new()));
+
+        let mut clear = settings_payload_from_config(&config);
+        clear.pi_allowed_tools = None;
+        clear.pi_allowed_tools_cleared = Some(true);
+        apply_settings_payload(&mut config, &clear);
+        assert_eq!(config.agent.pi.allowed_tools, None);
+
+        let round_trip = settings_payload_from_config(&config);
+        assert_eq!(round_trip.pi_allowed_tools, None);
+        assert_eq!(round_trip.pi_allowed_tools_cleared, Some(true));
     }
 
     #[test]
@@ -1813,6 +1939,11 @@ mod tests {
         // Appended outside the literal: one more key inside the json!
         // block trips the macro's recursion limit.
         body["claude_effort"] = serde_json::json!("max");
+        body["pi_command"] = serde_json::json!("/opt/pi/bin/pi");
+        body["pi_model"] = serde_json::json!("openai-codex/gpt-5.6-sol");
+        body["pi_thinking"] = serde_json::json!("high");
+        body["pi_allowed_tools"] = serde_json::json!(["read", "bash"]);
+        body["pi_allowed_tools_cleared"] = serde_json::json!(false);
         let body = body.to_string();
 
         let (status, _) = settings_post_result(&body, Some(dir.path()), &bus, true);
@@ -1947,6 +2078,8 @@ mod tests {
         assert!(saved.contains("effort = \"max\""));
         assert!(saved.contains("command = \"/opt/kimi/bin/kimi\""));
         assert!(saved.contains("model = \"k2.7 coding\""));
+        assert!(saved.contains("command = \"/opt/pi/bin/pi\""));
+        assert!(saved.contains("model = \"openai-codex/gpt-5.6-sol\""));
     }
 
     /// The Claude reasoning daemon default round-trips through the settings
@@ -2601,6 +2734,7 @@ mod tests {
         body["codex_command"] = serde_json::json!("/tmp/evil-codex");
         body["claude_command"] = serde_json::json!("/tmp/evil-claude");
         body["kimi_command"] = serde_json::json!("/tmp/evil-kimi");
+        body["pi_command"] = serde_json::json!("/tmp/evil-pi");
 
         let (status, response) = settings_post_result_with_sandbox_apply(
             &body.to_string(),
@@ -2613,6 +2747,7 @@ mod tests {
         assert!(response.contains("codex_command"), "{response}");
         assert!(response.contains("claude_command"), "{response}");
         assert!(response.contains("kimi_command"), "{response}");
+        assert!(response.contains("pi_command"), "{response}");
         assert!(
             !dir.path().join("intendant.toml").exists(),
             "denied save must not persist config"
@@ -2634,6 +2769,7 @@ mod tests {
             "/tmp/evil-claude"
         );
         assert_eq!(reloaded.config.agent.kimi.command, "/tmp/evil-kimi");
+        assert_eq!(reloaded.config.agent.pi.command, "/tmp/evil-pi");
     }
 
     #[test]

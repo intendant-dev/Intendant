@@ -352,6 +352,12 @@ function updateSettingsKimiToolsMode() {
   if (input) input.disabled = mode !== 'exact';
 }
 
+function updateSettingsPiToolsMode() {
+  const mode = document.getElementById('set-pi-tools-mode')?.value || 'default';
+  const input = document.getElementById('set-pi-allowed-tools');
+  if (input) input.disabled = mode !== 'exact';
+}
+
 async function loadSettings() {
   try {
     const d = await fetchDashboardSettings();
@@ -383,6 +389,7 @@ async function loadSettings() {
     document.getElementById('set-codex-managed-command').value = d.codex_managed_command || '';
     document.getElementById('set-claude-command').value = d.claude_command || 'claude';
     document.getElementById('set-kimi-command').value = d.kimi_command || 'kimi';
+    document.getElementById('set-pi-command').value = d.pi_command || 'pi';
     document.getElementById('set-codex-service-tier').value = normalizeCodexServiceTier(d.codex_service_tier || '');
     controlCodexConfig = {
       command: d.codex_command || 'codex',
@@ -413,6 +420,12 @@ async function loadSettings() {
       swarm_mode: !!d.kimi_swarm_mode,
       allowed_tools: kimiAllowedToolsFromSettings(d),
     };
+    controlPiConfig = {
+      command: d.pi_command || 'pi',
+      model: d.pi_model || '',
+      thinking: d.pi_thinking || '',
+      allowed_tools: piAllowedToolsFromSettings(d),
+    };
     setNewSessionAgentDefaults(d);
     populateSettingsCodexModel(d.codex_model, d.codex_reasoning_effort);
     populateSettingsClaudeModel(d.claude_model);
@@ -427,6 +440,13 @@ async function loadSettings() {
       'set-kimi-tools-mode',
       'set-kimi-allowed-tools',
       controlKimiConfig.allowed_tools,
+    );
+    document.getElementById('set-pi-model').value = controlPiConfig.model;
+    document.getElementById('set-pi-thinking').value = controlPiConfig.thinking;
+    renderKimiToolsEditor(
+      'set-pi-tools-mode',
+      'set-pi-allowed-tools',
+      controlPiConfig.allowed_tools,
     );
     // External agent: persisted to intendant.toml via `[agent]
     // default_backend`. Sync the Settings dropdown and status bar
@@ -485,6 +505,13 @@ async function saveSettings() {
     'set-kimi-allowed-tools',
   );
   const selectedKimiCommand = (g('set-kimi-command')?.value || '').trim() || 'kimi';
+  const selectedPiCommand = (g('set-pi-command')?.value || '').trim() || 'pi';
+  const selectedPiModel = (g('set-pi-model')?.value || '').trim();
+  const selectedPiThinking = g('set-pi-thinking')?.value || '';
+  const selectedPiAllowedTools = readKimiToolsEditor(
+    'set-pi-tools-mode',
+    'set-pi-allowed-tools',
+  );
   const payload = {
     cu_provider: g('set-cu-provider').value || null,
     cu_model: g('set-cu-model').value || null,
@@ -549,6 +576,11 @@ async function saveSettings() {
     kimi_swarm_mode: selectedKimiSwarmMode,
     kimi_allowed_tools: selectedKimiAllowedTools,
     kimi_allowed_tools_cleared: selectedKimiAllowedTools === null,
+    pi_command: selectedPiCommand,
+    pi_model: selectedPiModel,
+    pi_thinking: selectedPiThinking,
+    pi_allowed_tools: selectedPiAllowedTools,
+    pi_allowed_tools_cleared: selectedPiAllowedTools === null,
   };
   let settingsSaved = false;
   try {
@@ -606,6 +638,12 @@ async function saveSettings() {
     swarm_mode: selectedKimiSwarmMode,
     allowed_tools: selectedKimiAllowedTools,
   };
+  controlPiConfig = {
+    command: selectedPiCommand,
+    model: selectedPiModel,
+    thinking: selectedPiThinking,
+    allowed_tools: selectedPiAllowedTools,
+  };
   newSessionCodexDefaultServiceTier = selectedCodexServiceTier;
   newSessionCodexGlobalModel = selectedCodexModel;
   newSessionCodexGlobalReasoningEffort = selectedCodexReasoningEffort;
@@ -617,6 +655,10 @@ async function saveSettings() {
   newSessionKimiGlobalPlanMode = selectedKimiPlanMode;
   newSessionKimiGlobalSwarmMode = selectedKimiSwarmMode;
   newSessionKimiGlobalAllowedTools = selectedKimiAllowedTools;
+  newSessionAgentCommands.pi = selectedPiCommand;
+  newSessionPiGlobalModel = selectedPiModel;
+  newSessionPiGlobalThinking = selectedPiThinking;
+  newSessionPiGlobalAllowedTools = selectedPiAllowedTools;
   if (!newSessionCodexFastModeTouched) {
     newSessionCodexFastMode = codexServiceTierIsFast(selectedCodexServiceTier);
   }
@@ -671,6 +713,10 @@ async function saveSettings() {
   dispatchControlMsg({ action: 'set_kimi_plan_mode', enabled: selectedKimiPlanMode });
   dispatchControlMsg({ action: 'set_kimi_swarm_mode', enabled: selectedKimiSwarmMode });
   dispatchControlMsg({ action: 'set_kimi_allowed_tools', tools: selectedKimiAllowedTools });
+  // Pi has no daemon-wide config mirror by design. The POST above persists
+  // `[agent.pi]` for new sessions and as the base beneath reattached session
+  // overlays; active Pi sessions expose model and thinking through their
+  // per-session Configure controls.
   // The save may have recomputed the live write-grant set (extra grants
   // resolve and dedup daemon-side) — re-pull just this card's view so
   // "where it can write" stays truthful.
@@ -693,6 +739,7 @@ document.getElementById('set-codex-model-custom')?.addEventListener('input', () 
 document.getElementById('set-claude-model-select')?.addEventListener('change', updateSettingsClaudeCustomModelRow);
 document.getElementById('set-kimi-model-select')?.addEventListener('change', updateSettingsKimiCustomModelRow);
 document.getElementById('set-kimi-tools-mode')?.addEventListener('change', updateSettingsKimiToolsMode);
+document.getElementById('set-pi-tools-mode')?.addEventListener('change', updateSettingsPiToolsMode);
 document.getElementById('download-session-report-btn')?.addEventListener('click', downloadSessionReportViaDashboardControl);
 document.getElementById('connect-self-test-btn')?.addEventListener('click', () => {
   runConnectSelfTests().catch(err => {
@@ -1310,7 +1357,7 @@ function summarizeSessionUsage(sessions) {
 function agentUsageKey(session) {
   const source = (session && session.source) || 'intendant';
   if (source === 'claude-code') return 'claude';
-  if (source === 'codex' || source === 'kimi' || source === 'intendant') return source;
+  if (source === 'codex' || source === 'kimi' || source === 'pi' || source === 'intendant') return source;
   return 'other';
 }
 
@@ -1319,6 +1366,7 @@ function agentUsageLabel(key) {
     codex: 'Codex',
     claude: 'Claude Code',
     kimi: 'Kimi Code',
+    pi: 'Pi',
     intendant: 'Intendant Internal',
     other: 'Other',
   }[key] || key;
@@ -1362,7 +1410,7 @@ function addEntryToAgentUsageBucket(bucket, sessionId, entry) {
 }
 
 function summarizeUsageByAgent(sessions) {
-  const order = ['codex', 'claude', 'kimi', 'intendant', 'other'];
+  const order = ['codex', 'claude', 'kimi', 'pi', 'intendant', 'other'];
   const periods = [
     { key: 'today', label: 'Today' },
     { key: 'week', label: 'Last 7 Days' },
@@ -1420,6 +1468,7 @@ function tokenActivityAgentLabel(key) {
     codex: 'Codex',
     claude: 'Claude',
     kimi: 'Kimi',
+    pi: 'Pi',
     intendant: 'Intendant',
     other: 'Other',
   }[key] || key;
@@ -2258,7 +2307,7 @@ const UI2_BY_MODEL_CARD_LIMIT = 8;
 
 // Session-source chip for a model card. Honest labels only: the corpus
 // knows which backend ran a session (source), not which live role
-// (main/presence) a model played — so the chip says native/codex/claude/kimi,
+// (main/presence) a model played — so the chip says native/codex/claude/kimi/pi,
 // never a role the data can't prove.
 function ui2ModelSourceChipHtml(bucket) {
   const sources = Array.from(bucket.sources);
@@ -2268,6 +2317,7 @@ function ui2ModelSourceChipHtml(bucket) {
     codex: 'codex',
     claude: 'claude code',
     kimi: 'kimi code',
+    pi: 'pi',
     other: 'other',
     mixed: 'mixed',
   }[key] || key;

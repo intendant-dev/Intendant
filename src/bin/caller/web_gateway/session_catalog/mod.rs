@@ -1,5 +1,5 @@
 //! The non-HTTP session catalog: list/index caches and their
-//! fingerprints, external (codex/claude/kimi/gemini) session-file parsing,
+//! fingerprints, external (codex/claude/kimi/pi/gemini) session-file parsing,
 //! transcripts and activity replay assembly, context-snapshot replay,
 //! session search, worktree observed-session hints, usage accounting,
 //! and the sort/merge/stream core behind the sessions API.
@@ -8,6 +8,8 @@ use super::*;
 
 #[path = "../../kimi_history.rs"]
 pub(crate) mod kimi_history;
+#[path = "../../pi_history.rs"]
+pub(crate) mod pi_history;
 
 mod replay;
 pub(crate) use replay::*;
@@ -355,7 +357,7 @@ pub(crate) fn cached_limited_session_list_cache(
 /// all: the bus-driven invalidator (`spawn_session_list_cache_invalidator`
 /// in `startup/wiring.rs`) drops both cache tiers on session lifecycle
 /// events, so this window only limits staleness for changes the bus can't
-/// see — chiefly EXTERNAL backend session dirs (codex / claude / kimi) written by
+/// see — chiefly EXTERNAL backend session dirs (codex / claude / kimi / pi) written by
 /// other processes. Three minutes keeps those reasonably fresh; the hard
 /// TTL (`SESSION_LIST_RESPONSE_CACHE_TTL_SECS`) stays at 30s as the storm
 /// shield for the 2026-07-05 relationship-hydration incident.
@@ -997,6 +999,10 @@ pub(crate) fn targeted_external_session_rows_from_home(
         EXTERNAL_SESSION_SCAN_LIMIT,
     ));
     external_sessions.extend(list_kimi_sessions_with_limit(
+        home,
+        EXTERNAL_SESSION_SCAN_LIMIT,
+    ));
+    external_sessions.extend(list_pi_sessions_with_limit(
         home,
         EXTERNAL_SESSION_SCAN_LIMIT,
     ));
@@ -2518,6 +2524,7 @@ pub(crate) fn list_sessions_from_home_impl(
         home_path,
         external_scan_limit,
     ));
+    external_sessions.extend(list_pi_sessions_with_limit(home_path, external_scan_limit));
     let deleted_external_sessions = read_deleted_external_sessions(home_path);
     if !deleted_external_sessions.is_empty() {
         external_sessions.retain(|session| {

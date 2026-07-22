@@ -1398,6 +1398,125 @@ pub(crate) fn list_kimi_sessions_with_limit(
     rows
 }
 
+fn pi_usage_to_session_usage(usage: pi_history::PiUsage) -> SessionUsage {
+    SessionUsage {
+        total_tokens: usage.total,
+        prompt_tokens: usage
+            .input
+            .saturating_add(usage.cache_read)
+            .saturating_add(usage.cache_write),
+        completion_tokens: usage.output,
+        cache_creation_tokens: usage.cache_write,
+        cached_tokens: usage.cache_read,
+    }
+}
+
+fn pi_history_preview(history: &pi_history::PiSessionHistory) -> Option<serde_json::Value> {
+    let mut preview = SessionPreviewBuilder::default();
+    for entry in history.active_entries() {
+        if entry.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(message) = entry.get("message") else {
+            continue;
+        };
+        let text = pi_history::pi_message_text(message);
+        if text.trim().is_empty() {
+            continue;
+        }
+        match message.get("role").and_then(serde_json::Value::as_str) {
+            Some("user") => preview.push_user(&text),
+            Some("assistant") => preview.push_assistant(&text),
+            _ => {}
+        }
+    }
+    preview.into_value()
+}
+
+fn pi_session_list_row(location: &pi_history::PiSessionLocation) -> Option<serde_json::Value> {
+    let key = session_list_cache_key(
+        "pi",
+        &location.path,
+        format!("pi-row-v1:{SESSION_ROW_PREVIEW_FORMAT}"),
+    )?;
+    if let Some(row) = cached_session_list_row(&key) {
+        return Some(row);
+    }
+    let history = pi_history::parse_pi_session(location.clone());
+    let provider = history
+        .provider
+        .as_deref()
+        .unwrap_or(pi_history::PI_SOURCE_LABEL);
+    let cwd = location.cwd.clone();
+    let mut row = external_session_json(
+        pi_history::PI_SOURCE,
+        pi_history::PI_SOURCE_LABEL,
+        location.session_id.clone(),
+        location.session_id.clone(),
+        location.created_at.clone(),
+        history
+            .updated_at
+            .clone()
+            .or_else(|| file_mtime_string(&location.path)),
+        history.name.clone(),
+        history
+            .first_prompt
+            .as_deref()
+            .map(|prompt| compact_text(prompt, 180)),
+        provider,
+        history.model.clone(),
+        history.turns,
+        derive_project_root_from_cwd(cwd.as_deref()),
+        cwd,
+        Some(location.path.to_string_lossy().to_string()),
+        file_size(&location.path),
+    );
+    apply_session_usage(
+        &mut row,
+        pi_usage_to_session_usage(history.usage),
+        history.model.as_deref(),
+    );
+    let mut daily_usage = BTreeMap::<String, SessionUsage>::new();
+    for record in &history.usage_records {
+        if let Some(day) = usage_day_from_timestamp(record.timestamp.as_deref()) {
+            daily_usage
+                .entry(day)
+                .or_default()
+                .add(pi_usage_to_session_usage(record.usage));
+        }
+    }
+    apply_session_daily_usage(&mut row, &daily_usage, history.model.as_deref());
+    if let Some(preview) = pi_history_preview(&history) {
+        row["preview"] = preview;
+    }
+    if let Some(thinking) = history.thinking {
+        row["pi_thinking"] = serde_json::Value::String(thinking);
+    }
+    row["pi_agent_dir"] =
+        serde_json::Value::String(location.agent_dir.to_string_lossy().to_string());
+    if let Some(parent) = location.parent_session.as_ref() {
+        row["parent_session_path"] =
+            serde_json::Value::String(parent.to_string_lossy().to_string());
+    }
+    store_session_list_row(key, &row);
+    Some(row)
+}
+
+#[allow(dead_code)]
+pub(crate) fn list_pi_sessions(home: &Path) -> Vec<serde_json::Value> {
+    list_pi_sessions_with_limit(home, EXTERNAL_SESSION_SCAN_LIMIT)
+}
+
+pub(crate) fn list_pi_sessions_with_limit(
+    home: &Path,
+    scan_limit: usize,
+) -> Vec<serde_json::Value> {
+    pi_history::list_pi_sessions_from_home(home, scan_limit)
+        .iter()
+        .filter_map(pi_session_list_row)
+        .collect()
+}
+
 // Consolidated (message-search F3 phase 2): the streaming id reader moved
 // to `external_agent::codex::rollout` (this file's copy was the canonical
 // body), and the finder delegates to `codex_history`'s engine — which

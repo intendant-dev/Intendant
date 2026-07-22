@@ -10,7 +10,10 @@
 use crate::*;
 
 fn suppress_persistent_tool_starts(backend: Option<&external_agent::AgentBackend>) -> bool {
-    !matches!(backend, Some(external_agent::AgentBackend::Kimi))
+    !matches!(
+        backend,
+        Some(external_agent::AgentBackend::Kimi | external_agent::AgentBackend::Pi)
+    )
 }
 
 pub(crate) fn get_task_from_flags_or_env(flags: &CliFlags) -> Result<String, CallerError> {
@@ -1355,7 +1358,7 @@ pub(crate) async fn run_with_presence(
                     // The shared tail below logs and busses the result.
                     Err(deferral)
                 } else if let Some(ref mut agent) = persistent_agent {
-                    // Backends without an in-process fork (Claude Code) fork
+                    // Backends without an in-process fork (Claude Code and Pi) fork
                     // by respawning — mirror the drain-level
                     // `ForkHandling::RespawnResume` branch through the shared
                     // helper (fork bare; side/btw with the boundary prompt).
@@ -1520,6 +1523,53 @@ pub(crate) async fn run_with_presence(
                                 source: "Kimi".into(),
                                 content: format!(
                                     "Live Kimi profile changed, but its restart/fork configuration was not persisted: {error}"
+                                ),
+                                turn: None,
+                            });
+                        }
+                    }
+                }
+                if success
+                    && action_backend == Some(external_agent::AgentBackend::Pi)
+                    && pi_launch_mutating_thread_action(&op)
+                {
+                    if let Some(agent) = persistent_agent.as_ref() {
+                        let drain_config = DrainConfig {
+                            bus: &bus,
+                            web_port,
+                            session_id: local_session_id.clone(),
+                            alias_session_id: persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.clone()),
+                            backend_thread_id: persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.clone()),
+                            autonomy: autonomy.clone(),
+                            session_log: &session_log,
+                            project_root: &project.root,
+                            log_dir: &log_dir,
+                            approval_registry: &approval_registry,
+                            json_approval: None,
+                            agent_source: Some("Pi".to_string()),
+                            suppress_agent_started: true,
+                            persist_model_responses_inline: false,
+                            headless: false,
+                            context_injection: &context_injection,
+                            reload_credentials: None,
+                        };
+                        if let Err(error) = persist_live_external_launch_config(
+                            agent.as_ref(),
+                            &drain_config,
+                            &external_agent::AgentBackend::Pi,
+                            result_session_id.as_deref(),
+                        ) {
+                            slog(&session_log, |log| log.warn(&error));
+                            bus.send(AppEvent::LogEntry {
+                                session_id: result_session_id.clone(),
+                                level: "error".into(),
+                                source: "Pi".into(),
+                                content: format!(
+                                    "Live Pi profile changed, but its restart/fork configuration was not persisted: {error}"
                                 ),
                                 turn: None,
                             });
@@ -2110,7 +2160,7 @@ pub(crate) async fn run_with_presence(
                 turns_to_drop,
             } => {
                 // Three possible states:
-                //   1. External agent active (Codex / CC / Gemini)
+                //   1. External agent active (Codex / Claude / Kimi / Pi)
                 //   2. Native agent active (persistent_conv is Some)
                 //   3. Neither — nothing to roll back from
                 //
@@ -2535,6 +2585,8 @@ pub(crate) async fn run_with_presence(
                     );
                 } else if *backend == external_agent::AgentBackend::Kimi {
                     emit_kimi_session_capabilities(&bus, session_log_id(&session_log).as_deref());
+                } else if *backend == external_agent::AgentBackend::Pi {
+                    emit_pi_session_capabilities(&bus, session_log_id(&session_log).as_deref());
                 }
                 persistent_agent = Some(agent);
                 persistent_thread = Some(thread);
@@ -3939,6 +3991,9 @@ mod tests {
         )));
         assert!(suppress_persistent_tool_starts(Some(
             &external_agent::AgentBackend::ClaudeCode
+        )));
+        assert!(!suppress_persistent_tool_starts(Some(
+            &external_agent::AgentBackend::Pi
         )));
         assert!(suppress_persistent_tool_starts(None));
     }

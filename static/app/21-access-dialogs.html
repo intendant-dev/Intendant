@@ -373,6 +373,7 @@
                   <option value="codex">Codex (OpenAI)</option>
                   <option value="claude-code">Claude Code (Anthropic)</option>
                   <option value="kimi">Kimi Code (Moonshot AI)</option>
+                  <option value="pi">Pi coding agent</option>
                 </select>
               </div>
               <div class="settings-row">
@@ -485,6 +486,35 @@
                 <textarea id="set-kimi-allowed-tools" rows="3" autocomplete="off" spellcheck="false" placeholder="one per line, e.g. Read"></textarea>
               </div>
               <div class="settings-row">
+                <label for="set-pi-model">Pi model</label>
+                <input id="set-pi-model" type="text" placeholder="Pi profile default, or provider/model" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="settings-row">
+                <label for="set-pi-thinking">Pi thinking</label>
+                <select id="set-pi-thinking">
+                  <option value="">Model default</option>
+                  <option value="off">off</option>
+                  <option value="minimal">minimal</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                  <option value="max">max</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label for="set-pi-tools-mode">Pi active tools</label>
+                <select id="set-pi-tools-mode">
+                  <option value="default">Pi profile default</option>
+                  <option value="exact">Exact list</option>
+                  <option value="none">No tools</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label for="set-pi-allowed-tools">Exact Pi tool names</label>
+                <textarea id="set-pi-allowed-tools" rows="3" autocomplete="off" spellcheck="false" placeholder="one per line, e.g. read"></textarea>
+              </div>
+              <div class="settings-row">
                 <label>Codex binary</label>
                 <input id="set-codex-command" type="text" placeholder="codex or /usr/local/bin/codex" autocomplete="off">
               </div>
@@ -499,6 +529,10 @@
               <div class="settings-row">
                 <label>Kimi binary</label>
                 <input id="set-kimi-command" type="text" placeholder="kimi or /usr/local/bin/kimi" autocomplete="off">
+              </div>
+              <div class="settings-row">
+                <label>Pi binary</label>
+                <input id="set-pi-command" type="text" placeholder="pi or /usr/local/bin/pi" autocomplete="off">
               </div>
               <div class="settings-row">
                 <label>Codex tier</label>
@@ -720,7 +754,7 @@
                 <textarea id="set-sandbox-extra-paths" rows="3" placeholder="/absolute/path/one&#10;or/relative/to/the/project" spellcheck="false"></textarea>
               </div>
               <p class="settings-note">One path per line — absolute, or relative to the project root. Applies to new commands immediately.</p>
-              <p class="settings-note">External agents (Codex, Claude Code, Kimi Code) use their own permission/sandbox settings — see the session config.</p>
+              <p class="settings-note">External agents (Codex, Claude Code, Kimi Code, Pi) use their own permission/sandbox settings — see the session config.</p>
             </section>
           </div>
         </div>
@@ -990,6 +1024,35 @@
       <label for="session-config-kimi-allowed-tools">Exact names</label>
       <textarea id="session-config-kimi-allowed-tools" rows="3" autocomplete="off" spellcheck="false" placeholder="Read, Write"></textarea>
     </div>
+    <div class="session-config-row" id="session-config-pi-model-row">
+      <label for="session-config-pi-model">Pi model</label>
+      <input id="session-config-pi-model" type="text" autocomplete="off" spellcheck="false" placeholder="inherit — or provider/model">
+    </div>
+    <div class="session-config-row" id="session-config-pi-thinking-row">
+      <label for="session-config-pi-thinking">Thinking</label>
+      <select id="session-config-pi-thinking">
+        <option value="inherit">inherit global profile</option>
+        <option value="off">off</option>
+        <option value="minimal">minimal</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+        <option value="xhigh">xhigh</option>
+        <option value="max">max</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-pi-tools-mode-row">
+      <label for="session-config-pi-tools-mode">Active tools</label>
+      <select id="session-config-pi-tools-mode" onchange="onSessionConfigPiToolsModeChange()">
+        <option value="inherit">inherit global profile</option>
+        <option value="exact">exact list</option>
+        <option value="none">no tools</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-pi-tools-row">
+      <label for="session-config-pi-allowed-tools">Exact names</label>
+      <textarea id="session-config-pi-allowed-tools" rows="3" autocomplete="off" spellcheck="false" placeholder="read, bash, edit, write"></textarea>
+    </div>
     <div class="session-config-status" id="session-config-status"></div>
     <div class="modal-actions">
       <button class="modal-cancel" type="button" onclick="closeSessionConfigModal()">Cancel</button>
@@ -1068,6 +1131,7 @@
         <option value="codex">Codex</option>
         <option value="claude-code">Claude Code</option>
         <option value="kimi">Kimi</option>
+        <option value="pi">Pi</option>
       </select>
     </div>
     <div class="session-config-row">

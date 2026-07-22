@@ -441,13 +441,14 @@ function ui2SettingsBuild() {
         { value: 'codex', label: 'Codex', note: 'Supervise OpenAI Codex as the backend' },
         { value: 'claude-code', label: 'Claude Code', note: 'Supervise Claude Code as the backend' },
         { value: 'kimi', label: 'Kimi Code', note: 'Supervise Moonshot AI Kimi Code as the backend' },
+        { value: 'pi', label: 'Pi', note: 'Supervise Pi RPC as the backend' },
       ], 'Managed backend');
       if (seg) {
         const carrier = document.getElementById('set-external-agent').closest('.settings-row');
         carrier.parentNode.insertBefore(seg, carrier);
       }
       ui2SettingsFoldRows(ext, 'Binaries & service tier', [
-        'set-codex-command', 'set-codex-managed-command', 'set-claude-command', 'set-kimi-command', 'set-codex-service-tier',
+        'set-codex-command', 'set-codex-managed-command', 'set-claude-command', 'set-kimi-command', 'set-pi-command', 'set-codex-service-tier',
       ]);
       const link = ui2SettingsEl('p', 'settings-note ui2-crosslink');
       link.innerHTML = 'Advanced live controls — sandbox, approval policy, allowed tools, and thread actions — are in <a href="#activity/control">Activity → Control</a>.';

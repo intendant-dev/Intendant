@@ -380,6 +380,9 @@ impl SessionSupervisor {
                 kimi_allowed_tools,
                 kimi_plan_mode,
                 kimi_swarm_mode,
+                pi_model,
+                pi_thinking,
+                pi_allowed_tools,
                 codex_model,
                 codex_reasoning_effort,
                 codex_sandbox,
@@ -415,6 +418,9 @@ impl SessionSupervisor {
                     kimi_allowed_tools,
                     kimi_plan_mode,
                     kimi_swarm_mode,
+                    pi_model,
+                    pi_thinking,
+                    pi_allowed_tools,
                     codex_model,
                     codex_reasoning_effort,
                     codex_sandbox,
@@ -753,6 +759,9 @@ impl SessionSupervisor {
                 kimi_allowed_tools,
                 kimi_plan_mode,
                 kimi_swarm_mode,
+                pi_model,
+                pi_thinking,
+                pi_allowed_tools,
             } => {
                 self.restart_session(
                     source,
@@ -778,6 +787,9 @@ impl SessionSupervisor {
                         kimi_allowed_tools,
                         kimi_plan_mode,
                         kimi_swarm_mode,
+                        pi_model,
+                        pi_thinking,
+                        pi_allowed_tools,
                         ..Default::default()
                     },
                 )
@@ -916,6 +928,9 @@ impl SessionSupervisor {
                 kimi_allowed_tools,
                 kimi_plan_mode,
                 kimi_swarm_mode,
+                pi_model,
+                pi_thinking,
+                pi_allowed_tools,
             } => {
                 self.configure_session_agent(
                     session_id,
@@ -938,6 +953,9 @@ impl SessionSupervisor {
                         kimi_allowed_tools,
                         kimi_plan_mode,
                         kimi_swarm_mode,
+                        pi_model,
+                        pi_thinking,
+                        pi_allowed_tools,
                         ..Default::default()
                     },
                 )
@@ -1233,6 +1251,9 @@ mod tests {
             kimi_allowed_tools: None,
             kimi_plan_mode: None,
             kimi_swarm_mode: None,
+            pi_model: None,
+            pi_thinking: None,
+            pi_allowed_tools: None,
             codex_model: None,
             codex_reasoning_effort: None,
             codex_sandbox: None,

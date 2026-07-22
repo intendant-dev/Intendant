@@ -109,6 +109,11 @@ fn format_agent_output_with_stderr(stdout: &str, stderr: &str) -> String {
 pub struct IntendantServer {
     state: SharedMcpState,
     bus: EventBus,
+    /// HTTP/ctl is an observer and control-plane client, not the owner of a
+    /// task launcher or managed sessions' approval responders. Route daemon
+    /// actions through `ControlMsg` so the session supervisor remains the
+    /// single writer and resolves the exact session-owned registry.
+    http_control_plane_facade: bool,
     /// The home dir persisted-session lookups resolve against. Resolved
     /// once at construction (the MCP transport edge); tests inject a temp
     /// home via [`IntendantServer::new_with_home`] so fixtures never read
@@ -126,14 +131,25 @@ impl IntendantServer {
         Self {
             state,
             bus,
+            http_control_plane_facade: false,
             home,
             tool_router: Self::tool_router(),
         }
     }
 
     pub fn new_http(state: SharedMcpState, bus: EventBus) -> Self {
+        Self::new_http_with_home(state, bus, crate::platform::home_dir())
+    }
+
+    pub(crate) fn new_http_with_home(
+        state: SharedMcpState,
+        bus: EventBus,
+        home: std::path::PathBuf,
+    ) -> Self {
         spawn_http_observation_listener(state.clone(), bus.subscribe());
-        Self::new(state, bus)
+        let mut server = Self::new_with_home(state, bus, home);
+        server.http_control_plane_facade = true;
+        server
     }
 
     /// The daemon's agenda ledger handle, when this server shape carries
@@ -1019,6 +1035,62 @@ fn resolve_pending_approval(
     ActionOutcome::Ok
 }
 
+impl IntendantServer {
+    /// Resolve an approval in standalone stdio mode, or dispatch the same
+    /// session-targeted control command used by the dashboard when this is
+    /// the HTTP/ctl facade. The HTTP state mirrors prompts but deliberately
+    /// owns no responder registry of its own.
+    async fn resolve_or_route_pending_approval(
+        &self,
+        requested_id: u64,
+        response: ApprovalResponse,
+        scope: McpToolScope<'_>,
+    ) -> ActionOutcome {
+        if !self.http_control_plane_facade {
+            let mut state = self.state.write().await;
+            return resolve_pending_approval(&mut state, requested_id, response, scope);
+        }
+        if let Some(reason) = scope_denies_approval_resolution(scope) {
+            return ActionOutcome::Denied { reason };
+        }
+        let session_id = {
+            let state = self.state.read().await;
+            let Some(pending) = state.pending_approvals.get(&requested_id) else {
+                return ActionOutcome::NoOp {
+                    reason: format!("No pending approval with id {requested_id}"),
+                };
+            };
+            debug_assert_eq!(pending.id, requested_id);
+            pending.session_id.clone()
+        };
+        let control = match response {
+            ApprovalResponse::Approve => ControlMsg::Approve {
+                session_id,
+                id: requested_id,
+            },
+            ApprovalResponse::Deny => ControlMsg::Deny {
+                session_id,
+                id: requested_id,
+            },
+            ApprovalResponse::Skip => ControlMsg::Skip {
+                session_id,
+                id: requested_id,
+            },
+            ApprovalResponse::ApproveAll => ControlMsg::ApproveAll {
+                session_id,
+                id: requested_id,
+            },
+            ApprovalResponse::Answer { .. } => {
+                return ActionOutcome::Denied {
+                    reason: "structured answers must use answer_question".to_string(),
+                };
+            }
+        };
+        self.bus.send(AppEvent::ControlCommand(control));
+        ActionOutcome::Ok
+    }
+}
+
 /// Deliver an askHuman reply by writing the session-scoped response file the
 /// agent loop polls.
 fn respond_to_human_question(state: &mut McpAppState, text: &str) -> ActionOutcome {
@@ -1578,10 +1650,25 @@ impl IntendantServer {
         params: GetLogsParams,
         session_id: Option<&str>,
     ) -> String {
-        let target_session_id = params.session_id.as_deref().or(session_id);
-        if let Some(entries) =
-            read_persisted_log_entries_for_session(&self.home, target_session_id, &params)
-        {
+        let explicit_session_id = params
+            .session_id
+            .as_deref()
+            .or(session_id)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        let target_session_id = match explicit_session_id {
+            Some(id) => Some(id),
+            None => {
+                let active = self.state.read().await.session_id.trim().to_string();
+                (!active.is_empty()).then_some(active)
+            }
+        };
+        if let Some(entries) = read_persisted_log_entries_for_session(
+            &self.home,
+            target_session_id.as_deref(),
+            &params,
+        ) {
             return serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
         }
 
@@ -1657,9 +1744,10 @@ impl IntendantServer {
         params: ApproveParams,
         scope: McpToolScope<'_>,
     ) -> String {
-        let mut s = self.state.write().await;
-        let outcome = resolve_pending_approval(&mut s, params.id, ApprovalResponse::Approve, scope);
-        if outcome == ActionOutcome::Ok {
+        let outcome = self
+            .resolve_or_route_pending_approval(params.id, ApprovalResponse::Approve, scope)
+            .await;
+        if outcome == ActionOutcome::Ok && !self.http_control_plane_facade {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
                 id: params.id,
@@ -1676,9 +1764,10 @@ impl IntendantServer {
     }
 
     pub(crate) async fn deny_scoped(&self, params: DenyParams, scope: McpToolScope<'_>) -> String {
-        let mut s = self.state.write().await;
-        let outcome = resolve_pending_approval(&mut s, params.id, ApprovalResponse::Deny, scope);
-        if outcome == ActionOutcome::Ok {
+        let outcome = self
+            .resolve_or_route_pending_approval(params.id, ApprovalResponse::Deny, scope)
+            .await;
+        if outcome == ActionOutcome::Ok && !self.http_control_plane_facade {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
                 id: params.id,
@@ -1697,9 +1786,10 @@ impl IntendantServer {
     }
 
     pub(crate) async fn skip_scoped(&self, params: SkipParams, scope: McpToolScope<'_>) -> String {
-        let mut s = self.state.write().await;
-        let outcome = resolve_pending_approval(&mut s, params.id, ApprovalResponse::Skip, scope);
-        if outcome == ActionOutcome::Ok {
+        let outcome = self
+            .resolve_or_route_pending_approval(params.id, ApprovalResponse::Skip, scope)
+            .await;
+        if outcome == ActionOutcome::Ok && !self.http_control_plane_facade {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
                 id: params.id,
@@ -1721,17 +1811,16 @@ impl IntendantServer {
         params: ApproveAllParams,
         scope: McpToolScope<'_>,
     ) -> String {
-        let mut s = self.state.write().await;
-        let outcome =
-            resolve_pending_approval(&mut s, params.id, ApprovalResponse::ApproveAll, scope);
-        if outcome == ActionOutcome::Ok {
+        let outcome = self
+            .resolve_or_route_pending_approval(params.id, ApprovalResponse::ApproveAll, scope)
+            .await;
+        if outcome == ActionOutcome::Ok && !self.http_control_plane_facade {
             self.bus.send(AppEvent::ApprovalResolved {
                 session_id: None,
                 id: params.id,
                 action: "approve_all".to_string(),
             });
-            let autonomy = s.autonomy.clone();
-            drop(s);
+            let autonomy = self.state.read().await.autonomy.clone();
             let mut a = autonomy.write().await;
             a.level = AutonomyLevel::Full;
         }
@@ -1944,6 +2033,27 @@ impl IntendantServer {
                     launch_config: Default::default(),
                 }));
             return "ok (CU task dispatched)".to_string();
+        }
+
+        // The HTTP/ctl facade does not own a launcher: the daemon's session
+        // supervisor is the process-wide task dispatcher. Send the same
+        // control-plane primitive as the dashboard instead of falling into
+        // the standalone MCP launcher's "not configured" error.
+        if self.http_control_plane_facade {
+            self.bus
+                .send(AppEvent::ControlCommand(ControlMsg::StartTask {
+                    session_id: None,
+                    task: params.task,
+                    orchestrate: params.orchestrate,
+                    direct: None,
+                    project_root: None,
+                    reference_frame_ids: vec![],
+                    display_target: None,
+                    attachments: vec![],
+                    follow_up_id: None,
+                    delegation_id: None,
+                }));
+            return "ok (new session dispatched)".to_string();
         }
         match self
             .start_task_internal(params.task, "MCP", params.orchestrate)
@@ -4582,6 +4692,177 @@ pub(crate) mod tests {
                 }
                 _ => panic!("Expected NoOp"),
             }
+        });
+    }
+
+    #[test]
+    fn http_facade_observes_and_routes_exact_session_approval() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let bus = EventBus::new();
+            let mut events = bus.subscribe();
+            let home = tempdir().unwrap();
+            let server = IntendantServer::new_http_with_home(
+                state.clone(),
+                bus.clone(),
+                home.path().to_path_buf(),
+            );
+            bus.send(AppEvent::ApprovalRequired {
+                session_id: Some("managed-session".to_string()),
+                id: 42,
+                command_preview: "exec: pwd".to_string(),
+                category: crate::autonomy::ActionCategory::CommandExec,
+            });
+
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &server
+                            .get_pending_approval_scoped(McpToolScope::Unrestricted)
+                            .await,
+                    )
+                    .unwrap();
+                    if value.get("id") == Some(&serde_json::json!(42)) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("HTTP observer records the pending approval");
+
+            assert_eq!(
+                server
+                    .approve_scoped(ApproveParams { id: 42 }, McpToolScope::Unrestricted)
+                    .await,
+                "ok"
+            );
+            let routed = timeout(Duration::from_secs(2), async {
+                loop {
+                    match events.recv().await.unwrap() {
+                        AppEvent::ControlCommand(ControlMsg::Approve { session_id, id }) => {
+                            break (session_id, id)
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("approval routed through the control plane");
+            assert_eq!(routed, (Some("managed-session".to_string()), 42));
+            assert!(state.read().await.pending_approvals.contains_key(&42));
+
+            bus.send(AppEvent::ApprovalResolved {
+                session_id: Some("managed-session".to_string()),
+                id: 42,
+                action: "approve".to_string(),
+            });
+            timeout(Duration::from_secs(2), async {
+                while state.read().await.pending_approvals.contains_key(&42) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("resolution clears the observed prompt");
+        });
+    }
+
+    #[test]
+    fn http_facade_dispatches_new_tasks_to_the_session_supervisor() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let bus = EventBus::new();
+            let mut events = bus.subscribe();
+            let home = tempdir().unwrap();
+            let server =
+                IntendantServer::new_http_with_home(test_state(), bus, home.path().to_path_buf());
+            let result = server
+                .start_task(Parameters(StartTaskParams {
+                    session_id: None,
+                    task: "inspect the parser".to_string(),
+                    orchestrate: Some(false),
+                    reference_frame_ids: vec![],
+                    display_target: None,
+                }))
+                .await;
+            assert_eq!(result, "ok (new session dispatched)");
+            let (task, orchestrate) = timeout(Duration::from_secs(2), async {
+                loop {
+                    match events.recv().await.unwrap() {
+                        AppEvent::ControlCommand(ControlMsg::StartTask {
+                            session_id: None,
+                            task,
+                            orchestrate,
+                            ..
+                        }) => break (task, orchestrate),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("new task routed through the control plane");
+            assert_eq!(task, "inspect the parser");
+            assert_eq!(orchestrate, Some(false));
+        });
+    }
+
+    #[test]
+    fn get_logs_defaults_to_the_observed_active_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "active-session-logs";
+            let log_dir = crate::platform::intendant_home_in(home.path())
+                .join("logs")
+                .join(session_id);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            std::fs::write(
+                log_dir.join("session_meta.json"),
+                serde_json::json!({ "session_id": session_id }).to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                log_dir.join("session.jsonl"),
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "ts": "2026-07-22T12:00:00Z",
+                        "event": "info",
+                        "message": "live log row"
+                    })
+                ),
+            )
+            .unwrap();
+            let state = test_state();
+            state.write().await.session_id = session_id.to_string();
+            let server =
+                IntendantServer::new_with_home(state, EventBus::new(), home.path().to_path_buf());
+            let logs: Vec<LogEntrySnapshot> = serde_json::from_str(
+                &server
+                    .get_logs_for_session(
+                        GetLogsParams {
+                            session_id: None,
+                            since_id: None,
+                            level_filter: None,
+                            limit: None,
+                        },
+                        None,
+                    )
+                    .await,
+            )
+            .unwrap();
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].content, "live log row");
         });
     }
 

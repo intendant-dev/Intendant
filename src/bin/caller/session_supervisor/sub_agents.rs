@@ -11,7 +11,7 @@ fn delegate_backend(agent: Option<&str>) -> Result<Option<external_agent::AgentB
             .map(Some)
             .ok_or_else(|| {
                 format!(
-                    "unknown sub-agent backend `{value}`; use internal, codex, claude-code, or kimi"
+                    "unknown sub-agent backend `{value}`; use internal, codex, claude-code, kimi, or pi"
                 )
             }),
     }
@@ -385,7 +385,7 @@ mod tests {
         }
         assert!(delegate_backend(Some("unknown"))
             .unwrap_err()
-            .contains("codex, claude-code, or kimi"));
+            .contains("codex, claude-code, kimi, or pi"));
     }
 
     /// The scripted mock provider behind a test-held gate: every chat call

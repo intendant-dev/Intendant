@@ -2,7 +2,7 @@
 //! background sweep that enumerates every message source on this box —
 //! intendant session logs, Codex rollouts (user home, leased-active
 //! homes, staged lease remnants), Claude Code transcripts (same three
-//! places) — runs the per-source extractors, and publishes the resulting
+//! places), Kimi wires and Pi session trees — runs the per-source extractors, and publishes the resulting
 //! shards to the store. Everything below [`spawn_indexer`] takes its
 //! roots as parameters; only that production edge resolves the real
 //! environment.
@@ -25,6 +25,7 @@ use super::extract_claude::extract_claude_session;
 use super::extract_codex::extract_codex_session;
 use super::extract_intendant::extract_intendant_session;
 use super::extract_kimi::extract_kimi_session;
+use super::extract_pi::extract_pi_session;
 use super::record::{Generation, Source};
 use super::store::{PublishOutcome, SessionShard, Snapshot, Store, RETENTION_MS};
 use std::collections::{HashMap, HashSet};
@@ -54,6 +55,9 @@ pub(crate) struct SweepRoots {
     /// Kimi homes: each directly contains `session_index.jsonl` and
     /// `sessions/<workdir-key>/session_<uuid>/`.
     pub kimi_roots: Vec<PathBuf>,
+    /// Pi agent dirs: each directly contains
+    /// `sessions/--<encoded-cwd>--/<timestamp>_<id>.jsonl`.
+    pub pi_roots: Vec<PathBuf>,
     /// Staged lease entries (whole entry dirs): deleted once every
     /// transcript file inside was published — the drain half of the
     /// custody design (deletion never waited on us; indexing consumes the
@@ -148,6 +152,16 @@ impl Indexer {
             &mut stats,
         );
         self.sweep_kimi(
+            roots,
+            &store,
+            &snapshot,
+            &cursor_by_path,
+            &mut seen_paths,
+            &mut failed_paths,
+            horizon,
+            &mut stats,
+        );
+        self.sweep_pi(
             roots,
             &store,
             &snapshot,
@@ -741,6 +755,87 @@ impl Indexer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // one sweep's shared frame, threaded to each lane
+    fn sweep_pi(
+        &mut self,
+        roots: &SweepRoots,
+        store: &Store,
+        snapshot: &Snapshot,
+        cursor_by_path: &HashMap<PathBuf, (String, SourceCursor)>,
+        seen_paths: &mut HashSet<PathBuf>,
+        failed_paths: &mut Vec<PathBuf>,
+        horizon_ms: i64,
+        stats: &mut SweepStats,
+    ) {
+        let mut locations = HashMap::<
+            String,
+            crate::web_gateway::session_catalog::pi_history::PiSessionLocation,
+        >::new();
+        for root in &roots.pi_roots {
+            for location in crate::web_gateway::session_catalog::pi_history::list_pi_sessions_in(
+                root,
+                crate::web_gateway::session_catalog::pi_history::PI_SESSION_SCAN_LIMIT,
+            ) {
+                let replace = locations
+                    .get(&location.session_id)
+                    .map(|current| location.updated_millis > current.updated_millis)
+                    .unwrap_or(true);
+                if replace {
+                    locations.insert(location.session_id.clone(), location);
+                }
+            }
+        }
+        let mut locations = locations.into_values().collect::<Vec<_>>();
+        locations.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+
+        for location in locations {
+            let path = location.path.clone();
+            if file_mtime_ms(&path) < horizon_ms {
+                continue;
+            }
+            seen_paths.insert(path.clone());
+            let session_key = format!("{}:{}", Source::Pi.as_str(), location.session_id);
+            if snapshot.manifest.tombstones.contains_key(&session_key) {
+                continue;
+            }
+            if cursor_by_path.get(&path).is_some_and(|(key, cursor)| {
+                key == &session_key && cursor.check() == CursorCheck::Unchanged
+            }) {
+                stats.skipped_unchanged += 1;
+                continue;
+            }
+            if !cursor_by_path.contains_key(&path) && self.skip_known_unpublishable(&path, stats) {
+                continue;
+            }
+            stats.parsed += 1;
+            match extract_pi_session(location) {
+                Ok((shard, cursors)) => {
+                    if shard.records.is_empty() {
+                        self.remember_unpublishable(&path, cursors);
+                        continue;
+                    }
+                    self.publish(
+                        store,
+                        &session_key,
+                        shard,
+                        cursors,
+                        &path,
+                        failed_paths,
+                        stats,
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[message-search] Pi extract {} failed: {error}",
+                        path.display()
+                    );
+                    failed_paths.push(path);
+                    stats.failures += 1;
+                }
+            }
+        }
+    }
+
     fn skip_unchanged(
         &mut self,
         path: &Path,
@@ -900,6 +995,9 @@ pub(crate) fn resolve_production_roots() -> SweepRoots {
         kimi_roots: vec![
             crate::web_gateway::session_catalog::kimi_history::kimi_home_in(&user_home),
         ],
+        pi_roots: vec![
+            crate::web_gateway::session_catalog::pi_history::pi_agent_dir_in(&user_home),
+        ],
         staged_entries: Vec::new(),
     };
     add_registry_and_staged_roots(&staging.active, &staging.staging, &mut roots);
@@ -976,6 +1074,7 @@ pub(crate) fn add_registry_and_staged_roots(
                 Some("codex") => roots.codex_roots.push(home),
                 Some("claude-code") => roots.claude_project_roots.push(home.join("projects")),
                 Some("kimi") => roots.kimi_roots.push(home),
+                Some("pi") => roots.pi_roots.push(home),
                 _ => {}
             }
         }
@@ -1001,11 +1100,13 @@ pub(crate) fn add_registry_and_staged_roots(
                 });
             match source.as_deref() {
                 Some("kimi") => roots.kimi_roots.push(path.clone()),
+                Some("pi") => roots.pi_roots.push(path.clone()),
                 Some("claude-code") => {
                     roots.claude_project_roots.push(path.join("projects"));
                 }
                 Some("codex") => roots.codex_roots.push(path.clone()),
                 _ if staged_entry_looks_like_kimi(&path) => roots.kimi_roots.push(path.clone()),
+                _ if staged_entry_looks_like_pi(&path) => roots.pi_roots.push(path.clone()),
                 _ => {
                     if path.join("sessions").is_dir() || path.join("archived_sessions").is_dir() {
                         roots.codex_roots.push(path.clone());
@@ -1027,6 +1128,14 @@ fn staged_entry_looks_like_kimi(entry: &Path) -> bool {
         state
             .parent()
             .is_some_and(|session| session.join("agents").is_dir())
+    })
+}
+
+fn staged_entry_looks_like_pi(entry: &Path) -> bool {
+    let mut session_files = Vec::new();
+    collect_suffix_files(&entry.join("sessions"), ".jsonl", 4, &mut session_files);
+    session_files.into_iter().any(|path| {
+        crate::web_gateway::session_catalog::pi_history::read_pi_session_header(&path).is_some()
     })
 }
 
@@ -1125,6 +1234,7 @@ mod tests {
             codex_roots: vec![tmp.join("codex-home")],
             claude_project_roots: vec![tmp.join("claude-projects")],
             kimi_roots: vec![tmp.join("kimi-home")],
+            pi_roots: vec![tmp.join("pi-home")],
             staged_entries: Vec::new(),
         }
     }

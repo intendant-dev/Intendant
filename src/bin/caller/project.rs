@@ -84,7 +84,7 @@ pub struct ExperimentalConfig {
     /// task with a fast vision model that either completes it on the
     /// display or escalates to the main agent. Vaulted because the extra
     /// hop adds latency to every task, and under subscription-based
-    /// external agents (Codex, Claude Code, Kimi Code) it drags in an API-key model
+    /// external agents (Codex, Claude Code, Kimi Code, Pi) it drags in an API-key model
     /// the deployment otherwise doesn't need. Frame-grounded dashboard
     /// dispatches (the user points at a display and issues a task) are
     /// NOT behind this flag — they are an explicit CU request, and the
@@ -129,6 +129,9 @@ pub struct ExternalAgentConfig {
     /// Kimi Code settings.
     #[serde(default)]
     pub kimi: KimiConfig,
+    /// Pi coding-agent settings.
+    #[serde(default)]
+    pub pi: PiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -707,6 +710,68 @@ impl Default for KimiConfig {
             kimi_fork_expected_horizon: None,
         }
     }
+}
+
+/// Configuration for the supervised Pi RPC harness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PiConfig {
+    /// Path or command name for the Pi binary.
+    #[serde(default = "default_pi_command")]
+    pub command: String,
+    /// Model pattern or provider/model identifier. Unset delegates to Pi.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Pi thinking level. Unset delegates to the selected model's default.
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// Optional exact active-tool override. `None` keeps Pi's defaults,
+    /// `Some([])` disables tools, and a non-empty list enables exactly those
+    /// names. Intendant's approval extension still gates every mutating or
+    /// unknown tool.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+fn default_pi_command() -> String {
+    "pi".to_string()
+}
+
+impl Default for PiConfig {
+    fn default() -> Self {
+        Self {
+            command: default_pi_command(),
+            model: None,
+            thinking: None,
+            allowed_tools: None,
+        }
+    }
+}
+
+/// Canonicalize Pi's documented thinking vocabulary. Empty and explicit
+/// inherit sentinels leave Pi's selected model in control; unknown values are
+/// retained for forward compatibility and rejected visibly by Pi if needed.
+pub fn normalize_pi_thinking(thinking: Option<&str>) -> Option<String> {
+    let trimmed = thinking.map(str::trim).filter(|value| !value.is_empty())?;
+    let lowered = trimmed.to_ascii_lowercase();
+    match lowered.as_str() {
+        "default" | "inherit" | "global" => None,
+        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Some(lowered),
+        _ => Some(trimmed.to_string()),
+    }
+}
+
+pub fn normalize_pi_allowed_tools(tools: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for tool in tools
+        .iter()
+        .map(|tool| tool.trim())
+        .filter(|tool| !tool.is_empty())
+    {
+        if !normalized.iter().any(|candidate| candidate == tool) {
+            normalized.push(tool.to_string());
+        }
+    }
+    normalized
 }
 
 fn default_true() -> bool {
@@ -2592,6 +2657,10 @@ context_window = 200000
         assert!(config.agent.kimi.allowed_tools.is_none());
         assert!(!config.agent.kimi.plan_mode);
         assert!(!config.agent.kimi.swarm_mode);
+        assert_eq!(config.agent.pi.command, "pi");
+        assert!(config.agent.pi.model.is_none());
+        assert!(config.agent.pi.thinking.is_none());
+        assert!(config.agent.pi.allowed_tools.is_none());
     }
 
     #[test]
@@ -2620,6 +2689,12 @@ permission_mode = "auto"
 allowed_tools = ["Read", " Write ", "Read"]
 plan_mode = true
 swarm_mode = true
+
+[agent.pi]
+command = "/usr/local/bin/pi"
+model = "openai-codex/gpt-5.6-codex"
+thinking = "HIGH"
+allowed_tools = ["read", "bash", "read"]
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.agent.default_backend.as_deref(), Some("codex"));
@@ -2655,6 +2730,19 @@ swarm_mode = true
         );
         assert!(config.agent.kimi.plan_mode);
         assert!(config.agent.kimi.swarm_mode);
+        assert_eq!(config.agent.pi.command, "/usr/local/bin/pi");
+        assert_eq!(
+            config.agent.pi.model.as_deref(),
+            Some("openai-codex/gpt-5.6-codex")
+        );
+        assert_eq!(
+            normalize_pi_thinking(config.agent.pi.thinking.as_deref()),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            normalize_pi_allowed_tools(config.agent.pi.allowed_tools.as_deref().unwrap()),
+            vec!["read", "bash"]
+        );
     }
 
     #[test]
@@ -2681,6 +2769,23 @@ default_backend = "codex"
         assert!(config.agent.kimi.allowed_tools.is_none());
         assert!(!config.agent.kimi.plan_mode);
         assert!(!config.agent.kimi.swarm_mode);
+        assert_eq!(config.agent.pi.command, "pi");
+        assert!(config.agent.pi.model.is_none());
+        assert!(config.agent.pi.thinking.is_none());
+        assert!(config.agent.pi.allowed_tools.is_none());
+    }
+
+    #[test]
+    fn pi_thinking_normalizer_is_forward_compatible() {
+        assert_eq!(
+            normalize_pi_thinking(Some(" HIGH ")),
+            Some("high".to_string())
+        );
+        assert_eq!(normalize_pi_thinking(Some("inherit")), None);
+        assert_eq!(
+            normalize_pi_thinking(Some("future-effort")),
+            Some("future-effort".to_string())
+        );
     }
 
     #[test]

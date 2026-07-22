@@ -33,6 +33,7 @@ pub fn normalize_source(raw: &str) -> String {
             "claude-code".to_string()
         }
         "kimi" | "kimi-code" | "kimi_code" | "kimicode" | "kimi code" => "kimi".to_string(),
+        "pi" | "pi-coding-agent" | "pi_coding_agent" | "pi coding agent" => "pi".to_string(),
         "gemini" | "gemini-cli" | "gemini_cli" | "gemini cli" => "gemini".to_string(),
         _ => value,
     }

@@ -1,5 +1,5 @@
 //! The external-agent execution shape: run_external_agent_mode
-//! supervises a third-party coding CLI (Codex, Claude Code, Kimi Code) as the
+//! supervises a third-party coding harness (Codex, Claude Code, Kimi Code, Pi) as the
 //! session's backend, draining its events into the app event stream.
 
 // Same entangled class as the drain (external_events.rs): keeps the
@@ -268,6 +268,8 @@ pub(crate) async fn run_external_agent_mode(
         emit_claude_code_session_capabilities(&bus, intendant_session_id.as_deref());
     } else if backend == external_agent::AgentBackend::Kimi {
         emit_kimi_session_capabilities(&bus, intendant_session_id.as_deref());
+    } else if backend == external_agent::AgentBackend::Pi {
+        emit_pi_session_capabilities(&bus, intendant_session_id.as_deref());
     }
     // Use one control receiver across idle waits and active turn drains.
     // A second parked receiver would retain mid-turn controls and replay them
@@ -392,6 +394,11 @@ pub(crate) async fn run_external_agent_mode(
         emit_kimi_session_capabilities(&bus, intendant_session_id.as_deref());
         if live_session_id != intendant_session_id {
             emit_kimi_session_capabilities(&bus, live_session_id.as_deref());
+        }
+    } else if backend == external_agent::AgentBackend::Pi {
+        emit_pi_session_capabilities(&bus, intendant_session_id.as_deref());
+        if live_session_id != intendant_session_id {
+            emit_pi_session_capabilities(&bus, live_session_id.as_deref());
         }
     }
     if emit_session_started_after_identity {

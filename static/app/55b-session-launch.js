@@ -156,6 +156,17 @@ function onNewSessionKimiToolsModeChange() {
 }
 window.onNewSessionKimiToolsModeChange = onNewSessionKimiToolsModeChange;
 
+function onNewSessionPiToolsModeChange() {
+  const mode = document.getElementById('new-session-pi-tools-mode')?.value || 'inherit';
+  const input = document.getElementById('new-session-pi-allowed-tools');
+  const appliesToPi = effectiveNewSessionAgentId() === 'pi';
+  if (input) {
+    input.disabled = !appliesToPi || mode !== 'exact';
+    if (appliesToPi && mode === 'exact') input.focus();
+  }
+}
+window.onNewSessionPiToolsModeChange = onNewSessionPiToolsModeChange;
+
 // ── Last-used launch options (per-browser) ──
 // The agent picker and the identity-shaped external options (backend,
 // binary path, model ids, efforts) reset to their inherit choices on
@@ -197,6 +208,8 @@ function saveNewSessionAgentPrefs() {
     kimi_model: value('new-session-kimi-model-select'),
     kimi_model_custom: value('new-session-kimi-model').trim(),
     kimi_thinking: value('new-session-kimi-thinking'),
+    pi_model: value('new-session-pi-model').trim(),
+    pi_thinking: value('new-session-pi-thinking'),
     saved_at: new Date().toISOString(),
   };
   try {
@@ -257,6 +270,9 @@ function applyNewSessionAgentPrefs() {
     updateNewSessionKimiCustomModelRow();
   }
   restoreNewSessionSelectValue('new-session-kimi-thinking', prefs.kimi_thinking);
+  const piModel = document.getElementById('new-session-pi-model');
+  if (piModel) piModel.value = text(prefs.pi_model);
+  restoreNewSessionSelectValue('new-session-pi-thinking', prefs.pi_thinking);
   newSessionAgentPrefsApplied = true;
   // Sync the fold/enabled state now for a restored external backend. A
   // render is only safe once the effective agent is known-external —
@@ -321,6 +337,7 @@ function setNewSessionAgentDefaults(settings) {
     codex: settings.codex_command || 'codex',
     'claude-code': settings.claude_command || 'claude',
     kimi: settings.kimi_command || 'kimi',
+    pi: settings.pi_command || 'pi',
   };
   newSessionCodexManagedContext =
     settings.codex_managed_context === 'managed' ? 'managed' : 'vanilla';
@@ -336,6 +353,9 @@ function setNewSessionAgentDefaults(settings) {
   newSessionKimiGlobalPlanMode = !!settings.kimi_plan_mode;
   newSessionKimiGlobalSwarmMode = !!settings.kimi_swarm_mode;
   newSessionKimiGlobalAllowedTools = kimiAllowedToolsFromSettings(settings);
+  newSessionPiGlobalModel = String(settings.pi_model || '').trim();
+  newSessionPiGlobalThinking = String(settings.pi_thinking || '').trim();
+  newSessionPiGlobalAllowedTools = piAllowedToolsFromSettings(settings);
   const configuredCatalog = Array.isArray(settings.codex_models)
     ? settings.codex_models
       .map(entry => ({
@@ -367,6 +387,7 @@ function commandDefaultForNewSessionAgent(agentId) {
     codex: 'codex',
     'claude-code': 'claude',
     kimi: 'kimi',
+    pi: 'pi',
   }[agentId] || '');
 }
 
@@ -451,9 +472,14 @@ function renderNewSessionAgentControls(options = {}) {
   const kimiSwarmToggle = document.getElementById('new-session-kimi-swarm-mode');
   const kimiToolsModeSel = document.getElementById('new-session-kimi-tools-mode');
   const kimiToolsInput = document.getElementById('new-session-kimi-allowed-tools');
+  const piModelInput = document.getElementById('new-session-pi-model');
+  const piThinkingSelect = document.getElementById('new-session-pi-thinking');
+  const piToolsModeSelect = document.getElementById('new-session-pi-tools-mode');
+  const piToolsInput = document.getElementById('new-session-pi-allowed-tools');
   const appliesToClaude = effectiveAgent === 'claude-code';
   const appliesToCodex = effectiveAgent === 'codex';
   const appliesToKimi = effectiveAgent === 'kimi';
+  const appliesToPi = effectiveAgent === 'pi';
   if (codexModelSel) {
     codexModelSel.disabled = !appliesToCodex;
     if (!appliesToCodex) codexModelSel.value = '';
@@ -519,6 +545,31 @@ function renderNewSessionAgentControls(options = {}) {
       : (globalTools.length
         ? `Global: ${globalTools.join(', ')}`
         : 'Global: no optional tools');
+  }
+  if (piModelInput) {
+    piModelInput.disabled = !appliesToPi;
+    if (!appliesToPi) piModelInput.value = '';
+    piModelInput.placeholder = newSessionPiGlobalModel
+      ? `Global: ${newSessionPiGlobalModel}`
+      : 'Global setting, or provider/model';
+  }
+  if (piThinkingSelect) {
+    piThinkingSelect.disabled = !appliesToPi;
+    if (!appliesToPi) piThinkingSelect.value = '';
+  }
+  if (piToolsModeSelect) {
+    piToolsModeSelect.disabled = !appliesToPi;
+    if (!appliesToPi) piToolsModeSelect.value = 'inherit';
+  }
+  if (piToolsInput) {
+    const mode = piToolsModeSelect?.value || 'inherit';
+    piToolsInput.disabled = !appliesToPi || mode !== 'exact';
+    if (!appliesToPi) piToolsInput.value = '';
+    piToolsInput.placeholder = newSessionPiGlobalAllowedTools === null
+      ? 'Global: Pi profile defaults'
+      : (newSessionPiGlobalAllowedTools.length
+        ? `Global: ${newSessionPiGlobalAllowedTools.join(', ')}`
+        : 'Global: no tools');
   }
   if (managedContextSel) {
     managedContextSel.disabled = !appliesToCodex;
@@ -629,7 +680,7 @@ function newSessionAddKeysAction() {
 // link lands on that card); .env and vault leases stay as secondary paths.
 const NEW_SESSION_UNFUELED_MESSAGE =
   'No model credentials for the internal agent yet — add a key in Settings → API Keys (applies immediately, no restart). ' +
-  'A .env key on the daemon or a vault credential lease works too; external agents (Codex, Claude Code, Kimi Code) sign in with their own accounts.';
+  'A .env key on the daemon or a vault credential lease works too; external agents (Codex, Claude Code, Kimi Code, Pi) sign in with their own accounts.';
 
 // ── Projectless preflight ──
 // A daemon launched outside any project reports project_root: null and has
@@ -1126,6 +1177,21 @@ async function startNewSession() {
       msg.kimi_allowed_tools = tools.length ? tools.join(',') : 'none';
     } else {
       msg.kimi_allowed_tools = toolsMode;
+    }
+  }
+  if (effectiveNewSessionAgentId() === 'pi') {
+    const model = document.getElementById('new-session-pi-model')?.value.trim() || '';
+    if (model) msg.pi_model = model;
+    const thinking = document.getElementById('new-session-pi-thinking')?.value || '';
+    if (thinking) msg.pi_thinking = thinking;
+    const toolsMode = document.getElementById('new-session-pi-tools-mode')?.value || 'inherit';
+    if (toolsMode === 'exact') {
+      const tools = normalizeKimiToolNames(
+        document.getElementById('new-session-pi-allowed-tools')?.value || '',
+      );
+      msg.pi_allowed_tools = tools.length ? tools.join(',') : 'none';
+    } else {
+      msg.pi_allowed_tools = toolsMode;
     }
   }
   // Execution shape: an explicit per-launch choice beats the global Direct

@@ -1,12 +1,12 @@
 # Introduction
 
-Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop to work in — shell access, file editing, a graphical display it can see and control, voice interaction, and the ability to make phone calls — all wrapped in a layered human oversight system. A durable Agenda carries parked intent across session and context boundaries, while a provenance-labeled Memory plane carries machine-wide claims through explicit, bounded retrieval. Beyond running its own agent loop, Intendant also **supervises external coding agents** (Codex, Claude Code, Kimi Code) as managed backends and **federates with peer machines** for multi-host display and task routing.
+Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop to work in — shell access, file editing, a graphical display it can see and control, voice interaction, and the ability to make phone calls — all wrapped in a layered human oversight system. A durable Agenda carries parked intent across session and context boundaries, while a provenance-labeled Memory plane carries machine-wide claims through explicit, bounded retrieval. Beyond running its own agent loop, Intendant also **supervises external coding agents** (Codex, Claude Code, Kimi Code, Pi) as managed backends and **federates with peer machines** for multi-host display and task routing.
 
 It runs on **macOS, Linux, and Windows** and is **provider-agnostic** (OpenAI, Anthropic, Gemini). Its shipped trust anchors are local presence and an independently reached direct-mTLS dashboard; CLI and MCP provide automation, and the dashboard provides visual and voice control. The packaged macOS app contains a local mTLS bridge, but no Developer ID-signed/notarized release has been published for this alpha, and an `-unsigned-dev` artifact is not a distribution trust anchor. Hosted Connect gives any browser zero-install route linking and discovery, but the default build fixes every hosted-provenance session at `role:none`; it is not a daemon-control interface.
 
 Beyond the single machine, daemons federate into a **network of agentic networks**: fleets owned by people and organizations, where an owner grants other people — and other daemons — scoped IAM access to their machines, infrastructure, and resources ([Trust Architecture](./trust-architecture.md)). Credential-custody components include sealed vault storage, time-boxed leases, and browser client egress, but the default build does not yet bridge a Connect-origin account vault into a trusted local/direct-mTLS daemon session. `.env` remains supported, and full-credential OAuth leases temporarily materialize private auth files ([Credential Custody](./credential-custody.md)).
 
-The name is the thesis. In a theater, performers play and conductors orchestrate — but the *Intendant* runs the house: who gets the stage, which productions run, on whose authority, with the books open. Here agents perform; orchestrators conduct (the native orchestrator, or supervised Codex / Claude Code / Kimi Code as guest conductors); the Intendant runs the house and answers to you.
+The name is the thesis. In a theater, performers play and conductors orchestrate — but the *Intendant* runs the house: who gets the stage, which productions run, on whose authority, with the books open. Here agents perform; orchestrators conduct (the native orchestrator, or supervised Codex / Claude Code / Kimi Code / Pi as guest conductors); the Intendant runs the house and answers to you.
 
 > **About this book.** These docs are verified against the source periodically, but Intendant moves fast and active areas — the dashboard, external-agent orchestration, federation — can drift ahead of the prose between verifications. **When the docs and the code disagree, the code is authoritative.** Every chapter cites real file and module paths so you can check; the explanations focus on the *shape and the why* of each subsystem, which changes more slowly than exact line numbers.
 
@@ -45,14 +45,14 @@ Intendant is built around a few core ideas:
   │      ▲                        │                │                         │
   │      │ render          ┌──────┴──────┐   ┌─────┴───────────────┐         │
   │   presence ◄───────────┤ native loop │   │ external-agent       │        │
-  │   (mediator AI)        │ + sub-agents│   │ (Codex/Claude/Kimi)  │        │
+  │   (mediator AI)        │ + sub-agents│   │(Codex/Claude/Kimi/Pi)│        │
   │                        └──────┬──────┘   └─────┬───────────────┘         │
   └───────────────────────────────┼────────────────┼────────────────────────┘
               │                    │                │
               ▼                    ▼                ▼
         Voice / Model APIs   intendant-runtime   external CLI subprocess
-        (live + streaming)   (command exec)      (wired to Intendant's
-                                                   MCP server)
+        (live + streaming)   (command exec)      (scoped MCP or ctl
+                                                   bootstrap)
 
         ◄─── WebRTC display + peer federation ───►  browsers / peer daemons
 ```
@@ -62,7 +62,7 @@ See [Architecture](./architecture.md) for the full picture.
 ## Key Capabilities
 
 - **Multi-provider LLM integration** — native tool calling, streaming, prompt caching, and computer use across OpenAI, Anthropic, and Gemini ([Runtime Protocol](./runtime-protocol.md), [Multi-Agent Orchestration](./multi-agent.md))
-- **External-agent orchestration** — supervise Codex, Claude Code, or Kimi Code as managed backends with steering, approvals, rollback, sub-agents, and usage accounting ([External-Agent Orchestration](./external-agent-orchestration.md))
+- **External-agent orchestration** — supervise Codex, Claude Code, Kimi Code, or Pi on common lifecycle, approval, history, search, and usage rails while preserving each harness's real capability boundaries ([External-Agent Orchestration](./external-agent-orchestration.md))
 - **WebRTC display pipeline** — a shared encoder pool (VP8 baseline plus on-demand H.264 on macOS/Linux; one always-on software Media Foundation H.264 layer on Windows), tile-based dirty-region streaming, multi-monitor, and bidirectional clipboard ([Display Pipeline](./display-pipeline.md))
 - **Peer federation** — Agent Cards, capability-based task routing, and cross-machine display sharing *with granted input* over mTLS, so an agent can use a computer on a peer machine when IAM allows ([Peer Federation](./peer-federation.md))
 - **Trust architecture** — daemon-local IAM (principals, grants, roles, ceilings), shipped local/direct-mTLS authentication, a packaged macOS local bridge whose current artifact is unsigned development-only, staged browser identity-key records for fleet signing and future identity work, passkey-protected envelope formats, org root keys signing grant documents and revocation lists, and an append-only transparency log for hosted metadata. No Developer ID-signed/notarized app release exists for this alpha. ([Trust Architecture](./trust-architecture.md), [Self-Hosted Rendezvous](./self-hosted-rendezvous.md))

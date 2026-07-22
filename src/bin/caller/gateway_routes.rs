@@ -1653,7 +1653,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::SessionInspect,
         BodyPolicy::None,
         RouteHandlerId::ExternalAgents,
-        "Detected external coding agents (codex, claude, kimi)",
+        "Detected external coding agents (codex, claude, kimi, pi)",
     )
     .with_tunnel(tunnel_method("api_external_agents")),
     op_route(

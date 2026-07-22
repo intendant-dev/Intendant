@@ -193,6 +193,10 @@ Every agent Intendant runs or supervises reaches the same executor:
   `execute_cu_actions`; the injected `$INTENDANT`/`INTENDANT_MCP_URL` env
   makes `"$INTENDANT" ctl cu ...` work from their shells for the long tail.
   See [External Agent Orchestration](./external-agent-orchestration.md).
+- **Pi (supervised)** — upstream Pi has no MCP client, so its appended
+  supervision prompt uses the same scoped `$INTENDANT ctl cu ...` path
+  directly. It reaches the same executor and grants; the UI never labels it
+  as native Pi MCP.
 - **Anything with a shell** — `intendant ctl cu` speaks to the running
   daemon's `/mcp` endpoint; discovery is lazy via `--help`.
 
@@ -506,13 +510,13 @@ invoking control.
 > model (`try_cu_first` in `display_glue.rs`) — is **off by default**, behind
 > `[experimental] cu_first_routing = true`. In practice it added a model hop
 > (latency) to every task and, under subscription-based external agents
-> (Codex, Claude Code, Kimi Code), reintroduced an API-key model the deployment
+> (Codex, Claude Code, Kimi Code, Pi), reintroduced an API-key model the deployment
 > otherwise didn't need. The code stays runnable for a future pickup. What
 > remains always-on is the *frame-grounded* dispatch described below: when
 > the user issues a task while pointing at a display, that is an explicit
 > computer-use request, and the CU task path is the only machinery that can
 > act on the referenced frames. The fast paths and observation layer above
-> are designed for the heavy agents (native, Codex, Claude Code, Kimi Code) as primary
+> are designed for the heavy agents (native, Codex, Claude Code, Kimi Code, Pi) as primary
 > consumers and do not depend on either router.
 
 Frame-grounded work goes to a fast CU model, with escalation to the heavy

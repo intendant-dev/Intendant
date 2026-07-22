@@ -1240,6 +1240,219 @@ pub(crate) fn parse_gemini_session_entries(
     Some(entries)
 }
 
+/// Project Pi's persisted v3 session tree into the same Activity grammar as
+/// the live RPC adapter. Only the active parent chain is rendered; sibling
+/// branches remain in Pi's append-only file and can become active again, but
+/// showing them as simultaneous conversation would be false history.
+pub(crate) fn parse_pi_session_entries(
+    path: &Path,
+    session_id: &str,
+    steers: &ExternalSteerLedger,
+) -> Option<Vec<serde_json::Value>> {
+    let history = pi_history::parse_pi_session_file(path)?;
+    if history
+        .location
+        .as_ref()
+        .map(|location| location.session_id.as_str())
+        != Some(session_id)
+    {
+        return None;
+    }
+    let agent_source = crate::external_agent::AgentBackend::Pi.to_string();
+    let mut entries = Vec::new();
+    let mut user_turns = ReplayUserTurnRevisionState::default();
+    let mut steer_cursor = steers.cursor();
+
+    for raw in history.active_entries() {
+        let ts = pi_history::pi_entry_timestamp(raw).unwrap_or_default();
+        let ts_ms = timestamp_millis_from_str(&ts);
+        let entry_id = value_str(raw, "id");
+        let mut push = |mut entry: serde_json::Value| {
+            entry["ts"] = serde_json::Value::String(ts.clone());
+            if let Some(ts_ms) = ts_ms {
+                entry["ts_ms"] = serde_json::Value::from(ts_ms);
+            }
+            if let Some(entry_id) = entry_id.as_deref() {
+                entry["message_uuid"] = serde_json::Value::String(entry_id.to_string());
+            }
+            entries.push(entry);
+        };
+        match raw.get("type").and_then(serde_json::Value::as_str) {
+            Some("message") => {
+                let Some(message) = raw.get("message") else {
+                    continue;
+                };
+                match message.get("role").and_then(serde_json::Value::as_str) {
+                    Some("user") => {
+                        let text = pi_history::pi_message_text(message);
+                        if text.trim().is_empty() || is_injected_external_user_text(&text) {
+                            continue;
+                        }
+                        let mut entry = serde_json::json!({
+                            "level": "info",
+                            "source": "User",
+                            "content": text,
+                        });
+                        if !steer_cursor.try_consume_mid_turn_steer(&text, ts_ms) {
+                            let (turn, revision) = user_turns.record_next_turn();
+                            entry["user_turn_index"] = serde_json::json!(turn);
+                            entry["user_turn_revision"] = serde_json::json!(revision);
+                        }
+                        push(entry);
+                    }
+                    Some("assistant") => {
+                        let Some(parts) =
+                            message.get("content").and_then(serde_json::Value::as_array)
+                        else {
+                            continue;
+                        };
+                        for part in parts {
+                            match part.get("type").and_then(serde_json::Value::as_str) {
+                                Some("text") => {
+                                    let text = part
+                                        .get("text")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("")
+                                        .trim();
+                                    if !text.is_empty() {
+                                        push(serde_json::json!({
+                                            "level": "model",
+                                            "source": agent_source,
+                                            "content": text,
+                                        }));
+                                    }
+                                }
+                                Some("thinking") => {
+                                    let text = part
+                                        .get("thinking")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("")
+                                        .trim();
+                                    if !text.is_empty() {
+                                        push(serde_json::json!({
+                                            "level": "model",
+                                            "source": agent_source,
+                                            "kind": "reasoning",
+                                            "content": text,
+                                        }));
+                                    }
+                                }
+                                Some("toolCall") => {
+                                    let name = part
+                                        .get("name")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("");
+                                    let args = part
+                                        .get("arguments")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null);
+                                    let preview =
+                                        crate::external_agent::pi::tool_preview(name, &args);
+                                    let Some(content) =
+                                        crate::external_output::external_tool_preview_text(
+                                            name, &preview,
+                                        )
+                                    else {
+                                        continue;
+                                    };
+                                    let mut entry = serde_json::json!({
+                                        "level": "agent",
+                                        "source": agent_source,
+                                        "kind": "tool_call",
+                                        "content": content,
+                                    });
+                                    if let Some(id) =
+                                        part.get("id").and_then(serde_json::Value::as_str)
+                                    {
+                                        entry["item_id"] =
+                                            serde_json::Value::String(id.to_string());
+                                    }
+                                    push(entry);
+                                }
+                                _ => {}
+                            }
+                        }
+                        if message
+                            .get("stopReason")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("error")
+                        {
+                            if let Some(error) = message
+                                .get("errorMessage")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::trim)
+                                .filter(|error| !error.is_empty())
+                            {
+                                push(serde_json::json!({
+                                    "level": "warn",
+                                    "source": agent_source,
+                                    "kind": "backend_error",
+                                    "content": error,
+                                }));
+                            }
+                        }
+                    }
+                    Some("toolResult") => {
+                        let text = crate::external_agent::pi::result_text(Some(message));
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        let mut entry = serde_json::json!({
+                            "level": if message.get("isError").and_then(serde_json::Value::as_bool)
+                                == Some(true) { "warn" } else { "agent" },
+                            "source": agent_source,
+                            "kind": "agent_output",
+                            "content": text,
+                        });
+                        if let Some(id) = message
+                            .get("toolCallId")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            entry["item_id"] = serde_json::Value::String(id.to_string());
+                        }
+                        push(entry);
+                    }
+                    _ => {}
+                }
+            }
+            Some("compaction") | Some("branch_summary") => {
+                let summary = raw
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|summary| !summary.is_empty());
+                if let Some(summary) = summary {
+                    push(serde_json::json!({
+                        "level": "info",
+                        "source": agent_source,
+                        "kind": if raw.get("type").and_then(serde_json::Value::as_str)
+                            == Some("compaction") { "compaction" } else { "branch_summary" },
+                        "content": summary,
+                    }));
+                }
+            }
+            Some("custom_message")
+                if raw.get("display").and_then(serde_json::Value::as_bool) == Some(true) =>
+            {
+                let text = raw
+                    .get("content")
+                    .and_then(message_content_text)
+                    .unwrap_or_default();
+                if !text.trim().is_empty() {
+                    push(serde_json::json!({
+                        "level": "info",
+                        "source": agent_source,
+                        "kind": "custom_message",
+                        "content": text,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(entries)
+}
+
 pub(crate) fn find_claude_session_file_for_transcript(
     home: &Path,
     session_id: &str,
@@ -1339,6 +1552,7 @@ pub(crate) fn parse_external_session_entries_from_file(
         "codex" => parse_codex_session_entries(path, steers),
         "claude-code" => parse_claude_session_entries(path, steers),
         "gemini" => parse_gemini_session_entries(path, session_id),
+        "pi" => parse_pi_session_entries(path, session_id, steers),
         _ => None,
     }
 }
@@ -1364,7 +1578,7 @@ pub(crate) fn external_session_entries_from_file_arc(
     }
 
     let steers = match source {
-        "codex" | "claude-code" => external_mid_turn_steer_ledger(home, source, session_id),
+        "codex" | "claude-code" | "pi" => external_mid_turn_steer_ledger(home, source, session_id),
         _ => ExternalSteerLedger::default(),
     };
     let mut entries = parse_external_session_entries_from_file(source, session_id, path, &steers)?;
@@ -1402,6 +1616,7 @@ pub(crate) fn external_session_entries_from_home_arc(
             }
         },
         "gemini" => find_gemini_session_file_for_transcript(home, session_id),
+        "pi" => pi_history::find_pi_session_from_home(home, session_id).map(|entry| entry.path),
         _ => None,
     }?;
 
@@ -1953,6 +2168,54 @@ pub(crate) fn session_ended_id_from_wire(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_transcript_renders_only_the_active_tree_with_tools_and_reasoning() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("agent/sessions/--repo--");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-07-21T00-00-00Z_01J_PI_REPLAY.jsonl");
+        let rows = [
+            serde_json::json!({"type":"session","version":3,"id":"01J_PI_REPLAY","timestamp":"2026-07-21T00:00:00Z","cwd":"/repo"}),
+            serde_json::json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-07-21T00:00:01Z","message":{"role":"user","content":"active prompt","timestamp":1784592001000i64}}),
+            serde_json::json!({"type":"message","id":"old","parentId":"u1","timestamp":"2026-07-21T00:00:02Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt","content":[{"type":"text","text":"abandoned answer"}],"usage":{},"stopReason":"stop","timestamp":1784592002000i64}}),
+            serde_json::json!({"type":"message","id":"a1","parentId":"u1","timestamp":"2026-07-21T00:00:03Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt","content":[{"type":"thinking","thinking":"reasoning trace"},{"type":"toolCall","id":"tool-1","name":"read","arguments":{"path":"src/lib.rs"}},{"type":"text","text":"current answer"}],"usage":{},"stopReason":"toolUse","timestamp":1784592003000i64}}),
+            serde_json::json!({"type":"message","id":"r1","parentId":"a1","timestamp":"2026-07-21T00:00:04Z","message":{"role":"toolResult","toolCallId":"tool-1","toolName":"read","content":[{"type":"text","text":"file body"}],"isError":false,"timestamp":1784592004000i64}}),
+        ];
+        let body = rows
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{body}\n")).unwrap();
+
+        let entries =
+            parse_pi_session_entries(&path, "01J_PI_REPLAY", &ExternalSteerLedger::default())
+                .expect("Pi replay");
+        let rendered = entries
+            .iter()
+            .filter_map(|entry| entry.get("content").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(rendered.contains(&"active prompt"));
+        assert!(rendered.contains(&"reasoning trace"));
+        assert!(rendered.contains(&"current answer"));
+        assert!(rendered.contains(&"file body"));
+        assert!(!rendered.contains(&"abandoned answer"));
+        assert!(entries.iter().any(|entry| {
+            entry.get("kind").and_then(serde_json::Value::as_str) == Some("tool_call")
+                && entry.get("item_id").and_then(serde_json::Value::as_str) == Some("tool-1")
+        }));
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| {
+                    entry.get("source").and_then(serde_json::Value::as_str) == Some("User")
+                })
+                .and_then(|entry| entry.get("user_turn_index"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
 
     #[test]
     fn gemini_transcript_lookup_is_scoped_per_home() {

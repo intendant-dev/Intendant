@@ -22,6 +22,7 @@ pub(crate) enum Source {
     Codex,
     ClaudeCode,
     Kimi,
+    Pi,
 }
 
 impl Source {
@@ -31,6 +32,7 @@ impl Source {
             Source::Codex => "codex",
             Source::ClaudeCode => "claude-code",
             Source::Kimi => "kimi",
+            Source::Pi => "pi",
         }
     }
 }

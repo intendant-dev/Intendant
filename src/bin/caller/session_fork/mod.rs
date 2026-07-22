@@ -90,7 +90,7 @@ pub(crate) struct ForkPoint {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ForkPointCatalog {
     pub(crate) session_id: String,
-    /// `intendant` | `codex` | `claude-code` | `gemini` | `kimi`.
+    /// `intendant` | `codex` | `claude-code` | `gemini` | `kimi` | `pi`.
     pub(crate) source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) backend_session_id: Option<String>,
