@@ -1310,10 +1310,18 @@ const VITALS_SYMBOLS = {
     icon: 'pencil',
     chip: (v) => `●${v.count}`,
     factText: (v) => `${v.count} dirty`,
-    explain: (v) => [
-      `${v.count} file${v.count === 1 ? ' has' : 's have'} changes that aren't committed to git yet.`,
-      'Normal while the agent works — they become permanent history once committed.',
-    ],
+    explain: (v) => {
+      const lines = [
+        `${v.count} file${v.count === 1 ? ' has' : 's have'} changes that aren't committed to git yet.`,
+        'Normal while the agent works — they become permanent history once committed.',
+      ];
+      // Honesty line, same pattern as the divergence card: WHERE the
+      // count was measured. The probe follows the checkout the agent
+      // actually works in, and "View the changes" lists that same
+      // checkout's uncommitted files.
+      if (v.checkout) lines.push(`Counted at ${v.checkout}.`);
+      return lines;
+    },
     action: (v, sessionId) => ({ label: 'View the changes', run: () => vitalsOpenChangesTab(sessionId) }),
   },
   divergence: {
@@ -1679,7 +1687,9 @@ function vitalsChipModels(vitals, meta, sessionId) {
     const branch = String(git.branch || '').trim();
     if (branch) push('branch', 'branch', { branch });
     const dirty = Number(git.dirtyFiles) || 0;
-    if (dirty > 0) push('dirty', 'dirty', { count: dirty });
+    if (dirty > 0) {
+      push('dirty', 'dirty', { count: dirty, checkout: String(git.checkout || '').trim() });
+    }
     const primaryRef = String(git.primaryRef || '').trim();
     if (primaryRef) {
       push('divergence', 'divergence', {
