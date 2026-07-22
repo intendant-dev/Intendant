@@ -49,6 +49,12 @@ const STATION_DEBUG_JSON_REQUIRED_KEYS = ['fps', 'renderer', 'hosts'];
 const STATION_DEBUG_JSON_LIST_LIMIT = 16;
 const PROTECTED_DASHBOARD_PORT = 8765;
 const STALE_BINARY_MTIME_SLOP_MS = 1000;
+// First exec of a cold-linked large debug binary (146MB observed) can take
+// well over 5s to page in; a warm `--help` still returns in milliseconds, so
+// this ceiling never slows the warm path.
+const DASHBOARD_BINARY_VERIFY_TIMEOUT_MS = 30000;
+const EXPLICIT_DASHBOARD_BINARY_STAT_ATTEMPTS = 3;
+const EXPLICIT_DASHBOARD_BINARY_STAT_RETRY_DELAY_MS = 400;
 const DASHBOARD_BINARY_INPUT_FILES = ['Cargo.toml', 'Cargo.lock'];
 const DASHBOARD_BINARY_INPUT_DIRS = ['src', 'crates', 'static'];
 const STATIC_IDENTITY_ASSETS = [
@@ -159,7 +165,9 @@ Options:
                              --probe-json "fuel=window.qa.sessionsFuel()".
                              With --json the readbacks ride in the result as "probes"
                              instead of separate lines
-  --screenshot PATH          Capture a PNG screenshot after validation/probes
+  --screenshot PATH          Capture a PNG screenshot after validation and all
+                             probes — taken after the --probe-json readbacks,
+                             so the image evidences probe-final page state
   --station-interaction-probe
                              Click/activate rendered Station hotspots and report latency
   --station-hotspot-probe    Alias for --station-interaction-probe
@@ -167,7 +175,11 @@ Options:
   --keep-browser             Leave Chromium running for manual follow-up; implies --keep-artifacts
   --launch-dashboard         Launch a temporary Intendant dashboard and stop it afterward
   --hold-dashboard           With --launch-dashboard, keep the temporary dashboard alive until interrupted
-  --dashboard-binary PATH    Intendant binary for --launch-dashboard (default: $INTENDANT or a fresh target/{release,debug}/intendant)
+  --dashboard-binary PATH    Intendant binary for --launch-dashboard. An explicit
+                             path is used as-is: if it is missing or unreadable the
+                             run fails after a brief stat retry — it never falls
+                             back to another binary. Auto-discovery default:
+                             $INTENDANT or a fresh target/{release,debug}/intendant
   --dashboard-arg ARG        Extra arg appended to the launched dashboard command; repeatable
   --dashboard-timeout MS     Temporary dashboard readiness timeout (default: ${DEFAULT_DASHBOARD_TIMEOUT_MS})
   --require-current-static   Fail unless served embedded dashboard static assets match this worktree
@@ -691,6 +703,12 @@ async function main() {
     let validation = await harness.validate(opts);
     const artifacts = {};
     const harnessRetries = {};
+    // --probe-json readbacks run before the screenshot capture so the image
+    // evidences probe-final page state — the order the help text documents
+    // (probe expressions may deliberately mutate the page to stage it).
+    const probes = opts.probeJson.length
+      ? await harness.collectProbeJson(opts.probeJson)
+      : undefined;
     if (opts.screenshotPath) {
       const screenshot = await captureValidationScreenshotWithRetry(
         opts,
@@ -711,9 +729,6 @@ async function main() {
     if (opts.keepArtifacts || opts.keepBrowser) {
       artifacts.browserUserDataDir = harness.userDataDir;
     }
-    const probes = opts.probeJson.length
-      ? await harness.collectProbeJson(opts.probeJson)
-      : undefined;
     const result = {
       status: 'pass',
       url: opts.url,
@@ -830,7 +845,13 @@ class TemporaryDashboard {
   static async launch(opts, launchEnv = { env: process.env }) {
     const port = validateDashboardLaunchOptions(opts);
     await assertDashboardPortAvailable(port, opts.url);
-    const executable = resolveDashboardBinary(opts.dashboardBinary);
+    const resolved = await resolveDashboardBinary(opts.dashboardBinary);
+    const executable = resolved.path;
+    // Which binary this run validates, and why (stderr: stdout stays PASS/JSON).
+    const skippedNote = resolved.skipped.length
+      ? ` skipped=${quote(resolved.skipped.join('; '))}`
+      : '';
+    console.error(`dashboard binary path=${quote(executable)} source=${quote(resolved.source)}${skippedNote}`);
     const args = dashboardLaunchArgs(port, opts.dashboardArgs, new URL(opts.url).protocol);
     assertDashboardBinarySupportsLaunchArgs(executable, args);
     const logs = new BoundedLog(LOG_BUFFER_LIMIT);
@@ -1180,33 +1201,63 @@ function dashboardArgsSelectTlsMode(args) {
   });
 }
 
-function resolveDashboardBinary(explicit, env = process.env, cwd = process.cwd()) {
+// Resolves the dashboard binary to `{ path, source, skipped }` so the launch
+// path can report which binary was chosen and why. An explicit
+// --dashboard-binary is authoritative and never falls back to discovery.
+async function resolveDashboardBinary(explicit, env = process.env, cwd = process.cwd(), statRetry = {}) {
   const exeName = process.platform === 'win32' ? 'intendant.exe' : 'intendant';
-  const candidates = [];
   if (explicit) {
-    candidates.push({ path: explicit, source: '--dashboard-binary', strictFreshness: true });
+    // A transient stat/IO failure (observed live under disk pressure,
+    // 2026-07-22) used to drop the explicit candidate here and silently fall
+    // through to $INTENDANT — QA probes then validated an older dashboard.
+    // Retry the stat briefly, then fail naming the path and the stat error.
+    const issue = await explicitDashboardBinaryIssue(explicit, statRetry);
+    if (issue) {
+      throw new Error(
+        `--dashboard-binary ${explicit} is not a usable executable (${issue}); `
+          + 'an explicit --dashboard-binary never falls back to $INTENDANT/target/PATH discovery — '
+          + 'fix the path or rebuild the binary',
+      );
+    }
+    const staleReason = worktreeTargetFreshnessIssue(explicit, cwd);
+    if (staleReason) {
+      throw new Error(formatStaleDashboardBinaryMessage(staleReason));
+    }
+    return { path: explicit, source: '--dashboard-binary', skipped: [] };
   }
+  const candidates = [];
   if (env.INTENDANT) {
-    candidates.push({ path: env.INTENDANT, source: 'INTENDANT', strictFreshness: true });
+    candidates.push({ path: env.INTENDANT, source: '$INTENDANT', strictFreshness: true, noteSkip: true });
   }
   candidates.push({
     path: path.join(cwd, 'target', 'release', exeName),
     source: 'target/release',
     strictFreshness: false,
+    noteSkip: true,
   });
   candidates.push({
     path: path.join(cwd, 'target', 'debug', exeName),
     source: 'target/debug',
     strictFreshness: false,
+    noteSkip: true,
   });
   candidates.push(...whichCandidates([exeName, 'intendant']).map((candidate) => ({
     path: candidate,
     source: 'PATH',
     strictFreshness: false,
+    noteSkip: false,
   })));
   const stale = [];
+  const skipped = [];
   for (const candidate of candidates) {
-    if (!candidate.path || !isExecutableFile(candidate.path)) {
+    if (!candidate.path) {
+      continue;
+    }
+    const issue = binaryCandidateIssue(candidate.path);
+    if (issue) {
+      if (candidate.noteSkip) {
+        skipped.push(`${candidate.source}: ${issue}`);
+      }
       continue;
     }
     const staleReason = worktreeTargetFreshnessIssue(candidate.path, cwd);
@@ -1215,9 +1266,12 @@ function resolveDashboardBinary(explicit, env = process.env, cwd = process.cwd()
       if (candidate.strictFreshness) {
         throw new Error(formatStaleDashboardBinaryMessage(staleReason));
       }
+      if (candidate.noteSkip) {
+        skipped.push(`${candidate.source}: stale`);
+      }
       continue;
     }
-    return candidate.path;
+    return { path: candidate.path, source: candidate.source, skipped };
   }
   if (stale.length) {
     throw new Error(formatStaleDashboardBinaryMessage(stale[0]));
@@ -1225,6 +1279,44 @@ function resolveDashboardBinary(explicit, env = process.env, cwd = process.cwd()
   throw new Error(
     'no intendant binary found for --launch-dashboard; run `cargo build --release` or pass --dashboard-binary',
   );
+}
+
+// Returns undefined when `candidate` is a usable executable file, else a short
+// reason string carrying the stat error.
+function binaryCandidateIssue(candidate) {
+  let stat;
+  try {
+    stat = fs.statSync(candidate);
+  } catch (error) {
+    return error.code === 'ENOENT'
+      ? 'not found (ENOENT)'
+      : `stat failed: ${error.code || error.message}`;
+  }
+  if (!stat.isFile()) {
+    return 'not a regular file';
+  }
+  if (process.platform !== 'win32' && !(stat.mode & 0o111)) {
+    return 'not executable';
+  }
+  return undefined;
+}
+
+async function explicitDashboardBinaryIssue(candidate, statRetry = {}) {
+  const attempts = Math.max(1, statRetry.attempts || EXPLICIT_DASHBOARD_BINARY_STAT_ATTEMPTS);
+  const delayMs = statRetry.delayMs === undefined
+    ? EXPLICIT_DASHBOARD_BINARY_STAT_RETRY_DELAY_MS
+    : statRetry.delayMs;
+  let issue;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    issue = binaryCandidateIssue(candidate);
+    if (issue === undefined) {
+      return undefined;
+    }
+    if (attempt < attempts) {
+      await delay(delayMs);
+    }
+  }
+  return attempts > 1 ? `${issue} after ${attempts} stat attempts` : issue;
 }
 
 function worktreeTargetFreshnessIssue(candidate, cwd = process.cwd()) {
@@ -1319,10 +1411,13 @@ function assertDashboardBinarySupportsLaunchArgs(executable, args) {
   const result = spawnSync(executable, ['--help'], {
     encoding: 'utf8',
     maxBuffer: 1024 * 1024,
-    timeout: 5000,
+    timeout: DASHBOARD_BINARY_VERIFY_TIMEOUT_MS,
   });
   if (result.error) {
-    throw new Error(`could not verify dashboard binary ${executable}: ${result.error.message}`);
+    const detail = result.error.code === 'ETIMEDOUT'
+      ? `--help did not finish within ${DASHBOARD_BINARY_VERIFY_TIMEOUT_MS}ms`
+      : result.error.message;
+    throw new Error(`could not verify dashboard binary ${executable}: ${detail}`);
   }
   const output = `${result.stdout || ''}\n${result.stderr || ''}`;
   const missing = requiredFlags.filter((flag) => !output.includes(flag));
@@ -6062,12 +6157,49 @@ async function runSelfTest() {
     touch('Cargo.toml', 1000);
     touch(path.join('src', 'main.rs'), 3000);
     touch(path.join('target', 'release', process.platform === 'win32' ? 'intendant.exe' : 'intendant'), 1500);
-    assert.throws(
+    await assert.rejects(
       () => resolveDashboardBinary(undefined, {}, root),
       /refusing stale dashboard binary.*cargo build --release/,
     );
+    // An explicit stale binary stays fail-closed too.
+    await assert.rejects(
+      () => resolveDashboardBinary(binary, {}, root, { attempts: 1, delayMs: 0 }),
+      /refusing stale dashboard binary/,
+    );
     touch(path.join('target', 'release', process.platform === 'win32' ? 'intendant.exe' : 'intendant'), 5000);
-    assert.strictEqual(resolveDashboardBinary(undefined, {}, root), binary);
+    const discovered = await resolveDashboardBinary(undefined, {}, root);
+    assert.strictEqual(discovered.path, binary);
+    assert.strictEqual(discovered.source, 'target/release');
+    const explicitResolved = await resolveDashboardBinary(binary, {}, root, { attempts: 1, delayMs: 0 });
+    assert.strictEqual(explicitResolved.path, binary);
+    assert.strictEqual(explicitResolved.source, '--dashboard-binary');
+    // Explicit + unusable hard-fails naming the path and the stat error —
+    // never falls back, even with valid $INTENDANT/target fallbacks present.
+    const missing = path.join(root, 'no-such-intendant');
+    await assert.rejects(
+      () => resolveDashboardBinary(missing, { INTENDANT: binary }, root, { attempts: 3, delayMs: 10 }),
+      (error) => /--dashboard-binary .*no-such-intendant/.test(error.message)
+        && /not found \(ENOENT\) after 3 stat attempts/.test(error.message)
+        && /never falls back/.test(error.message),
+    );
+    // The brief stat retry rides out a transient window where the explicit
+    // binary is not yet statable.
+    const lateBinary = path.join(root, 'late-intendant');
+    const lateTimer = setTimeout(() => {
+      try {
+        fs.copyFileSync(binary, lateBinary);
+        if (process.platform !== 'win32') {
+          fs.chmodSync(lateBinary, 0o755);
+        }
+      } catch (_) {}
+    }, 60);
+    try {
+      const late = await resolveDashboardBinary(lateBinary, {}, root, { attempts: 10, delayMs: 60 });
+      assert.strictEqual(late.path, lateBinary);
+      assert.strictEqual(late.source, '--dashboard-binary');
+    } finally {
+      clearTimeout(lateTimer);
+    }
     if (process.platform !== 'win32') {
       assertDashboardBinarySupportsLaunchArgs(binary, dashboardLaunchArgs(8893));
     }
