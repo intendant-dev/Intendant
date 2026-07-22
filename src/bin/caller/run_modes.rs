@@ -3851,8 +3851,10 @@ pub(crate) async fn run_direct_mode(
                     ))
                 });
                 // Append the new task as a continuation message
-                let resume_msg = attachments
-                    .text_with_file_prelude(&format!("[Session resumed] Continue with: {}", task));
+                let resume_msg = attachments.text_with_attachments_prelude(&format!(
+                    "[Session resumed] Continue with: {}",
+                    task
+                ));
                 let resume_seq = if attachment_images.is_empty() {
                     conv.add_user(MessageProvenance::ResumeTask, resume_msg)
                 } else {
@@ -3901,7 +3903,7 @@ pub(crate) async fn run_direct_mode(
                 let task_seq = setup_fresh_conversation_with_attachments(
                     &mut conv,
                     &project,
-                    &attachments.text_with_file_prelude(&task),
+                    &attachments.text_with_attachments_prelude(&task),
                     attachment_images.clone(),
                 );
                 slog(&session_log, |l| {
@@ -3921,7 +3923,7 @@ pub(crate) async fn run_direct_mode(
         let task_seq = setup_fresh_conversation_with_attachments(
             &mut conv,
             &project,
-            &attachments.text_with_file_prelude(&task),
+            &attachments.text_with_attachments_prelude(&task),
             attachment_images.clone(),
         );
         // The canonical record carries the renderable upload refs delivered

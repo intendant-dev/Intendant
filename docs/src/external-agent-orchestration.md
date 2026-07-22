@@ -56,7 +56,7 @@ pub trait ExternalAgent: Send + Sync {
     // Turns
     async fn send_message(&mut self, thread: &AgentThread, message: &str) -> Result<(), CallerError>;
     async fn send_message_with_images(/* … */) -> Result<(), CallerError>;          // default: text-only
-    async fn send_message_with_attachments(/* … */) -> Result<(), CallerError>;     // default: stage files + prelude
+    async fn send_message_with_attachments(/* … */) -> Result<(), CallerError>;     // default: stored-path prelude + image blocks
 
     // Oversight
     async fn resolve_approval(&mut self, request_id: &str, decision: ApprovalDecision)
@@ -103,6 +103,40 @@ dropdown's `<option value>`.
 
 Gemini CLI was previously supported as a backend and was retired in July 2026;
 persisted sessions from it remain readable but cannot be resumed.
+
+### Attachment delivery
+
+User attachments (dashboard uploads, pasted screenshots) follow one contract
+on every delivery lane — new task, queued follow-up, mid-turn steer, and
+native sessions alike:
+
+- **Stored-path reference.** Every delivered user message names each
+  attachment that exists on disk with a stable, greppable line ending in
+  `[attachment stored: <absolute path>]`
+  (`external_agent::ATTACHMENT_STORED_MARKER`), composed once by
+  `external_agent::text_with_attachments_prelude` — prelude before the
+  user's text. The receiving agent can act on the stored file immediately
+  (read it, relay it to a sub-agent) without hunting the store.
+  Image-capable backends get the inline image block *and* the path line
+  tying those pixels to their disk path; backends without image input get
+  the path line as the whole image delivery (no silent drop). Backend
+  overrides of `send_message_with_attachments` must keep the prelude so
+  the reference contract holds everywhere.
+- **Durable stores.** Dashboard uploads land in the project-local
+  `.intendant/uploads/` store (never pruned; explicit delete only) or, for
+  projectless daemons, the daemon-global store (pruned after 14 days of
+  inactivity) — the referenced path outlives the turn that delivered it.
+- **Steers are steers.** An attachment-bearing steer takes the native
+  mid-turn injection lane like any text steer — it is never parked for the
+  turn boundary just because it carries files. The mid-turn lane is
+  text-only, so the stored-path line *is* the image delivery there; if no
+  lane acks the steer, the standard fallback queues it as the session's
+  next turn, where the pixels additionally ride as content blocks (the
+  boundary send site re-derives the same prelude). A natively acked steer
+  never double-delivers at the boundary. (Until 2026-07-22 attachment
+  steers were routed straight to the boundary follow-up lane — arriving
+  minutes late and out of order relative to later text steers; that
+  routing is gone.)
 
 ## Per-Backend Reference
 
