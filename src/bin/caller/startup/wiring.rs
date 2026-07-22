@@ -205,6 +205,10 @@ pub(crate) struct GatewaySpawn {
     /// thread it into session launches so the native `peer` tool and
     /// the MCP peer tools act on the same registry.
     pub(crate) peer_registry: crate::peer::PeerRegistry,
+    /// The daemon's agenda authority, when the store opened. Mode runners
+    /// thread it into the session supervisor so the ask-delivery arm can
+    /// record whether an answer reached a live session.
+    pub(crate) agenda: Option<Arc<crate::agenda::AgendaHandle>>,
 }
 
 /// Build and spawn the web gateway the way every mode does: gateway
@@ -349,6 +353,7 @@ pub(crate) fn spawn_mode_web_gateway(
     // inside spawn_web_gateway, and an emission before those subscriptions
     // would miss both.
     let agenda_boot_announce = mcp_http_state.agenda.clone();
+    let agenda_for_supervisor = mcp_http_state.agenda.clone();
     // The P1 Memory service. The durable plane runs on the
     // proven-custody OS (macOS);
     // multi-platform custody stays full Gate B, so other OSes run
@@ -482,5 +487,6 @@ pub(crate) fn spawn_mode_web_gateway(
         shared_session,
         log_line: dashboard_log_line(web_tls_acceptor, web_port, web_bind_ip),
         peer_registry,
+        agenda: agenda_for_supervisor,
     })
 }

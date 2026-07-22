@@ -39,7 +39,7 @@ pub(crate) enum AgendaError {
 /// preserved on disk but skipped at load (forward compatibility: a newer
 /// build's vocabulary — effects, journal curation — must not brick an older
 /// daemon's ledger).
-const KNOWN_OPS: [&str; 16] = [
+const KNOWN_OPS: [&str; 17] = [
     "add",
     "patch",
     "complete",
@@ -56,6 +56,7 @@ const KNOWN_OPS: [&str; 16] = [
     "approve_effect",
     "revoke_effect",
     "record_occurrence",
+    "record_ask_delivery",
 ];
 
 const LOG_FILE: &str = "agenda.jsonl";
@@ -977,6 +978,33 @@ impl AgendaStore {
             state: write.state.to_string(),
             session_id: write.session_id,
             note: write.note.map(|n| n.chars().take(500).collect()),
+        };
+        self.append_op(op, None, None, now_ms)
+    }
+
+    /// Daemon-internal ask-delivery write-back (the session supervisor's
+    /// delivery arm only — no command twin, mirroring `record_occurrence`,
+    /// so no external surface can forge delivery facts). Requires a
+    /// current answer to annotate; the fold keeps the boolean on
+    /// `answer.delivered` and the log keeps the receiving session as
+    /// history.
+    pub(crate) fn record_ask_delivery(
+        &mut self,
+        item_id: &str,
+        delivered: bool,
+        session_id: Option<String>,
+        now_ms: u64,
+    ) -> Result<AgendaItem, AgendaError> {
+        self.refresh_if_stale()?;
+        if self.require(item_id)?.answer.is_none() {
+            return Err(AgendaError::Invalid(format!(
+                "{item_id} has no current answer to mark"
+            )));
+        }
+        let op = AgendaOp::RecordAskDelivery {
+            id: item_id.to_string(),
+            delivered,
+            session_id,
         };
         self.append_op(op, None, None, now_ms)
     }
@@ -2075,6 +2103,82 @@ mod tests {
         ));
         assert_eq!(store.ops(), 0);
         assert!(!super::super::blobs::blobs_root(dir.path()).exists());
+    }
+
+    /// The ask-delivery marker round-trip at store level: recorded only on
+    /// items with a current answer, superseded by a later write-back,
+    /// durable across a store reopen (refold from disk), and cleared with
+    /// the answer view when the question reopens.
+    #[test]
+    fn record_ask_delivery_round_trips_and_requires_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let item = store
+            .apply_command(ask_cmd(vec![ask_question("Which grid?")]), None, 1)
+            .unwrap();
+
+        // No answer yet: named refusal, nothing appended.
+        assert!(matches!(
+            store.record_ask_delivery(&item.id, false, None, 2),
+            Err(AgendaError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.record_ask_delivery("01UNKNOWN", false, None, 2),
+            Err(AgendaError::NotFound(_))
+        ));
+
+        store
+            .apply_command(
+                AgendaCommand::Answer {
+                    id: item.id.clone(),
+                    text: "A".into(),
+                    structured: None,
+                    source: None,
+                },
+                None,
+                3,
+            )
+            .unwrap();
+        let marked = store.record_ask_delivery(&item.id, false, None, 4).unwrap();
+        assert_eq!(marked.answer.as_ref().unwrap().delivered, Some(false));
+
+        // A later successful successor delivery supersedes the miss.
+        let flipped = store
+            .record_ask_delivery(&item.id, true, Some("sess-successor".into()), 5)
+            .unwrap();
+        assert_eq!(flipped.answer.as_ref().unwrap().delivered, Some(true));
+
+        // Refold from disk: the marker is durable history.
+        drop(store);
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store
+                .item(&item.id)
+                .unwrap()
+                .answer
+                .as_ref()
+                .unwrap()
+                .delivered,
+            Some(true)
+        );
+
+        // Reopen clears the answer (and its marker) from the view; the
+        // write-back is then refused until a fresh answer lands.
+        store
+            .apply_command(
+                AgendaCommand::Reopen {
+                    id: item.id.clone(),
+                    source: None,
+                },
+                None,
+                6,
+            )
+            .unwrap();
+        assert!(store.item(&item.id).unwrap().answer.is_none());
+        assert!(matches!(
+            store.record_ask_delivery(&item.id, true, None, 7),
+            Err(AgendaError::Invalid(_))
+        ));
     }
 
     /// Answer with structured fields completes the item and records both
