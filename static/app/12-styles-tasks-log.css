@@ -839,51 +839,9 @@ body.context-focus-active {
   position: relative;
   z-index: 1;
 }
-.session-relationship-wires {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  pointer-events: none;
-  overflow: visible;
-}
-.session-relationship-wire {
-  fill: none;
-  stroke: color-mix(in srgb, var(--overlay0) 82%, transparent);
-  stroke-width: 1.5;
-  vector-effect: non-scaling-stroke;
-}
-.session-relationship-wire.side {
-  stroke-dasharray: 4 4;
-}
-.session-relationship-wire.fork {
-  stroke: color-mix(in srgb, var(--blue) 82%, transparent);
-}
-.session-relationship-wire.subagent {
-  stroke: color-mix(in srgb, var(--green) 82%, transparent);
-}
-.session-relationship-wire.active {
-  stroke-width: 2.4;
-  stroke: var(--blue);
-  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--blue) 45%, transparent));
-}
-.session-relationship-endpoint {
-  fill: var(--base);
-  stroke: color-mix(in srgb, var(--overlay0) 88%, transparent);
-  stroke-width: 1.4;
-}
-.session-relationship-endpoint.side {
-  stroke-dasharray: 3 2;
-}
-.session-relationship-endpoint.fork {
-  stroke: color-mix(in srgb, var(--blue) 94%, transparent);
-}
-.session-relationship-endpoint.subagent {
-  stroke: color-mix(in srgb, var(--green) 94%, transparent);
-}
-.session-relationship-endpoint.active {
-  stroke: var(--blue);
-  stroke-width: 2;
-}
+/* The SVG relationship-wire overlay retired with the lineage-lanes grid
+   (2026-07-21): lineage is structural now — lane wrappers + in-flow elbow
+   connectors in ui2-grid.css — so nothing can occlude or mis-route it. */
 .session-window-grid.resized {
   height: var(--session-window-grid-height);
   max-height: none;
@@ -932,6 +890,7 @@ body.context-focus-active {
   top: 6px;
 }
 .subtab-pane.concurrent-log-maximized .session-window-grid,
+.subtab-pane.concurrent-log-maximized .session-lane-legend,
 .subtab-pane.concurrent-log-maximized .session-window-grid-resize-handle {
   display: none !important;
 }
@@ -1018,18 +977,13 @@ body.context-focus-active {
 .session-window.minimized {
   min-height: 36px;
   max-height: 36px;
-  /* Dock band: minimized bars flow to the END of the grid (visual order
-     only — DOM order is untouched, so Focus display-gating, activate
-     scrollIntoView, and persistence are unaffected) and pack into dense
-     36px max-content rows below the active cards, taskbar-style. The
-     lineage wires re-render from live rects on the same rAF pass every
-     minimize change already schedules, so they follow the moved bars. */
-  order: 9;
+  /* No dock band: a minimized window stays IN ITS LANE as a dimmed
+     one-liner (the lanes grid is the family tree — teleporting a bar to
+     a far dock band severed it from its lineage). Focus display-gating,
+     activate scrollIntoView, and persistence were never order-aware. */
 }
-/* Gentle dock-in when a card collapses to its bar. Opacity only — a
-   transform would skew the rect the wire-render rAF pass reads
-   mid-animation — and no FLIP/measured motion: DOM efficiency is an
-   explicit bar for this band. */
+/* Gentle dock-in when a card collapses to its bar. Opacity only, no
+   FLIP/measured motion: DOM efficiency is an explicit bar here. */
 @media (prefers-reduced-motion: no-preference) {
   .session-window.minimized {
     animation: session-window-dock-in .2s ease-out;
@@ -1040,14 +994,13 @@ body.context-focus-active {
   to { opacity: 1; }
 }
 .session-window.minimized .session-window-log,
-.session-window.minimized .session-window-cwd,
-.session-window.minimized .session-window-task,
 .session-window.minimized .session-window-jump-bottom {
   display: none;
 }
 .session-window.minimized .session-window-header {
   height: 36px;
   border-bottom: 0;
+  justify-content: center;
 }
 .session-window.header-collapsed:not(.minimized) {
   min-height: 130px;
@@ -1055,115 +1008,107 @@ body.context-focus-active {
 .session-window:not(.header-collapsed):not(.minimized) {
   max-height: none;
 }
-/* Collapsed header = the one-line glance: health dot, status pill,
-   "id · name", plus the control clusters. Everything else — PROJ/CWD,
-   relationship chips, goal, tier, the quiet vitals chips — folds into
-   the vitals pane behind the dot (openVitalsGlossary). The minimized
-   36px bar shows the same glance primitives, tighter. */
+/* Compact states (collapsed one-liner, minimized bar): only the identity
+   row survives — the fact line, path line, message line, and relation
+   strip fold into the vitals pane behind the dot (openVitalsGlossary).
+   The minimized 36px bar shows the same glance primitives, tighter. */
+.session-window.header-collapsed .session-window-facts-row,
+.session-window.header-collapsed .session-window-path-row,
 .session-window.header-collapsed .session-window-task,
-.session-window.header-collapsed .session-window-project,
-.session-window.header-collapsed .session-window-cwd,
 .session-window.header-collapsed .session-window-relation-strip,
-.session-window.header-collapsed .session-window-goal,
-.session-window.header-collapsed .session-window-tier,
-.session-window.minimized .session-window-project,
+.session-window.minimized .session-window-facts-row,
+.session-window.minimized .session-window-path-row,
+.session-window.minimized .session-window-task,
 .session-window.minimized .session-window-relation-strip {
   display: none;
 }
-.session-window.minimized .session-window-goal {
-  display: none;
-}
-.session-window.minimized .session-window-tier {
-  display: none;
-}
-/* Glance order: dot (+ the single attention chip) first, status pill,
-   then identity — controls keep the right edge via the menu cluster's
-   auto margin. Applies to both compact states. */
-.session-window.header-collapsed .session-window-vitals,
-.session-window.minimized .session-window-vitals { order: -3; }
-.session-window.header-collapsed .session-window-status,
-.session-window.minimized .session-window-status { order: -2; }
-.session-window.header-collapsed .session-window-title,
-.session-window.minimized .session-window-title { order: -1; }
-.session-window.header-collapsed .session-window-title {
-  gap: 1px;
-}
-.session-window.minimized .session-window-title {
-  flex-direction: row;
-  align-items: center;
-}
-.session-window.minimized .session-window-meta {
-  flex: 1;
-}
+/* Glance order: dot (+ the single attention chip) first, then status,
+   then identity — the pre-redesign glance grammar; controls keep the
+   right edge. Expanded keeps DOM order (dot, id · name, status, controls). */
+.session-window.header-collapsed .session-window-identity-row .session-window-health,
+.session-window.minimized .session-window-identity-row .session-window-health { order: -2; }
+.session-window.header-collapsed .session-window-identity-row .session-window-status,
+.session-window.minimized .session-window-identity-row .session-window-status { order: -1; }
+/* Header = a column of rows (grid redesign 2026-07-21): identity line,
+   quiet icon fact line, one path line, one clamped message line. */
 .session-window-header {
   position: relative;
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
   padding: 6px 8px;
   border-bottom: 1px solid var(--surface0);
   background: var(--session-window-header-bg);
   flex-shrink: 0;
 }
 .session-window:not(.header-collapsed):not(.minimized) .session-window-header {
-  align-items: flex-start;
-  flex-wrap: wrap;
   cursor: pointer;
 }
-.session-window.header-collapsed .session-window-header {
+.session-window-identity-row {
+  min-width: 0;
+  display: flex;
   align-items: center;
-  /* One line by design; when a long name meets an attention chip the
-     header wraps rather than clipping anything (never-chop doctrine). */
-  flex-wrap: wrap;
+  gap: 7px;
 }
-.session-window-title {
-  min-width: 0;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.session-window.header-collapsed .session-window-title {
-  flex: 1 1 auto;
-  max-width: none;
-}
-.session-window:not(.header-collapsed):not(.minimized) .session-window-title {
-  flex: 1 1 100%;
-  order: 1;
-}
-.session-window-meta {
+.session-window-facts-row {
   min-width: 0;
   display: flex;
-  align-items: baseline;
-  gap: 8px;
+  align-items: center;
   flex-wrap: wrap;
-  row-gap: 2px;
+  gap: 4px 10px;
 }
-.session-window-id {
-  flex-shrink: 1;
+.session-window-facts-row:not(:has(> :not(.hidden))) {
+  display: none;
+}
+.session-window-path-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+}
+.session-window-path-icon {
+  flex-shrink: 0;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  color: var(--overlay0);
+}
+.session-window-path-icon svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+/* Identity: the short-id CHIP keeps the per-session badge hue; the NAME
+   reads as plain text beside it (renderSessionIdentity's parts). Uniform
+   row discipline: one line, ellipsis — the full identity is the title. */
+.session-window-id {
+  flex: 1 1 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   min-width: 0;
-  max-width: 260px;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 700;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.session-window-id .session-identity-short,
+.session-window-id .session-identity-prefix {
+  flex-shrink: 0;
   color: var(--session-badge-fg, var(--text));
   background: var(--session-badge-bg, var(--session-window-chip-bg));
   border: 1px solid var(--session-badge-border, transparent);
   border-radius: 3px;
   padding: 1px 5px;
-  font-size: 11px;
-  font-weight: 700;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
-.session-window:not(.header-collapsed):not(.minimized) .session-window-id {
-  max-width: none;
-  overflow: visible;
-  text-overflow: clip;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  flex-wrap: wrap;
+.session-window-id .session-identity-separator {
+  display: none;
 }
 .session-window-relation-strip {
   flex-shrink: 0;
@@ -1173,10 +1118,6 @@ body.context-focus-active {
   min-width: 0;
   max-width: 100%;
   overflow: hidden;
-}
-.session-window:not(.header-collapsed):not(.minimized) .session-window-relation-strip {
-  flex-wrap: wrap;
-  overflow: visible;
 }
 .session-window-relation-chip {
   flex-shrink: 0;
@@ -1204,24 +1145,15 @@ body.context-focus-active {
 .session-window-relation-chip.children {
   color: var(--teal);
 }
+/* Uniform row discipline: identity parts stay one clamped line in every
+   state — full text lives in the element titles. */
 .session-identity-name {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.session-window:not(.header-collapsed):not(.minimized) .session-identity-name,
-.session-window:not(.header-collapsed):not(.minimized) .session-identity-short,
-.session-window:not(.header-collapsed):not(.minimized) .session-identity-full {
-  overflow: visible;
-  text-overflow: clip;
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
 .session-identity-full {
-  display: none;
-}
-.session-window:not(.header-collapsed):not(.minimized) .session-identity-full {
   display: none;
 }
 .session-identity-short,
@@ -1231,55 +1163,37 @@ body.context-focus-active {
 .session-identity-separator {
   opacity: 0.65;
 }
+/* The message line: one clamped quiet line (tooltip keeps the full text). */
 .session-window-task {
   color: var(--overlay1);
   font-size: 11px;
+  font-style: italic;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* One path line: cwd (the worktree/checkout the agent works in) leads
+   behind the row icon; the project folds in after it and hides entirely
+   when it repeats the cwd (.path-dup, refreshSessionWindowPathLabels). */
 .session-window-project,
 .session-window-cwd {
   min-width: 0;
-  flex: 1;
-  max-width: min(280px, 100%);
   font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.session-window:not(.header-collapsed):not(.minimized) .session-window-task,
-.session-window:not(.header-collapsed):not(.minimized) .session-window-project,
-.session-window:not(.header-collapsed):not(.minimized) .session-window-cwd {
-  overflow: visible;
-  text-overflow: clip;
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
-.session-window:not(.header-collapsed):not(.minimized) .session-window-project,
-.session-window:not(.header-collapsed):not(.minimized) .session-window-cwd {
-  max-width: none;
-  line-height: 1.35;
-}
-.session-window:not(.header-collapsed):not(.minimized) .session-window-project {
-  flex: 1 1 100%;
-}
+.session-window-cwd { flex-shrink: 1; }
+.session-window-project { flex-shrink: 4; }
+.session-window-project.path-dup { display: none; }
 .session-window-project { color: var(--sapphire); }
 .session-window-cwd { color: var(--green); }
-.session-window-task::before,
-.session-window-project::before,
-.session-window-cwd::before {
-  display: inline-block;
-  min-width: 30px;
+.session-window-project::before {
+  content: "· from";
   margin-right: 4px;
   color: var(--overlay0);
   font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
 }
-.session-window-task::before { content: "msg"; }
-.session-window-project::before { content: "proj"; }
-.session-window-cwd::before { content: "cwd"; }
 .session-window-worktree {
   flex-shrink: 1;
   min-width: 0;
@@ -1389,14 +1303,9 @@ body.context-focus-active {
   border-color: color-mix(in srgb, var(--blue) 26%, transparent);
   color: var(--blue);
 }
-.session-window:not(.header-collapsed):not(.minimized) .session-window-tier,
-.session-window:not(.header-collapsed):not(.minimized) .session-window-status,
-.session-window:not(.header-collapsed):not(.minimized) .session-window-menu-cluster,
-.session-window:not(.header-collapsed):not(.minimized) .session-window-state-cluster {
-  order: 3;
-}
+/* Goal + tier live on the fact line — one clamped chip each. */
 .session-window-goal {
-  flex: 0 2 230px;
+  flex: 0 2 auto;
   min-width: 0;
   max-width: 280px;
   display: inline-flex;
@@ -1413,14 +1322,6 @@ body.context-focus-active {
   white-space: nowrap;
   overflow: hidden;
 }
-.session-window:not(.header-collapsed):not(.minimized) .session-window-goal {
-  flex: 1 1 100%;
-  order: 2;
-  max-width: none;
-  align-items: flex-start;
-  white-space: normal;
-  overflow: visible;
-}
 .session-window-goal::before {
   content: "/goal";
   flex-shrink: 0;
@@ -1434,8 +1335,8 @@ body.context-focus-active {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* Published-PR chip: same pill family as goal/tier; renders as a link
-   only when the daemon validated the URL (href present). */
+/* Published-PR chip: same pill family as goal/tier (fact line); renders
+   as a link only when the daemon validated the URL (href present). */
 .session-window-pr {
   flex: 0 0 auto;
   display: inline-flex;
@@ -1457,12 +1358,6 @@ body.context-focus-active {
   background: color-mix(in srgb, var(--mauve) 16%, transparent);
 }
 .session-window-pr.hidden { display: none; }
-.session-window:not(.header-collapsed):not(.minimized) .session-window-goal-text {
-  overflow: visible;
-  text-overflow: clip;
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
 .session-window-goal.paused,
 .session-window-goal.usage-limited {
   border-color: color-mix(in srgb, var(--peach) 30%, transparent);
@@ -1554,6 +1449,31 @@ body.context-focus-active {
 }
 .session-window-vitals .vit-health[data-severity="warn"]::before { background: var(--yellow); }
 .session-window-vitals .vit-health[data-severity="crit"]::before { background: var(--red); }
+/* Monoline chip icons (grid redesign): the 24×24 stroke set from
+   VITALS_ICON_PATHS replaces the emoji glyphs; text rides in .vit-txt. */
+.session-window-vitals .vit-chip .vit-icon {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.85;
+}
+.session-window-vitals .vit-chip .vit-txt {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The identity-line half of the vitals row: health dot + the compact
+   states' attention chip (renderSessionWindowVitals mounts them here). */
+.session-window-health {
+  flex: none;
+  flex-wrap: nowrap;
+}
+.session-window-health:empty { display: none; }
 /* Compact states (collapsed one-liner, minimized bar): the whole cluster
    folds into the pane behind the dot — only the dot and the single
    .vit-attn attention chip render (most severe symbol, short grammar,
@@ -1881,12 +1801,6 @@ body.context-focus-active {
 }
 .session-window-menu-cluster {
   position: relative;
-  margin-left: 2px;
-}
-.session-window:not(.header-collapsed):not(.minimized) .session-window-menu-cluster {
-  margin-left: auto;
-}
-.session-window.header-collapsed .session-window-menu-cluster {
   margin-left: auto;
 }
 .session-window-state-cluster {

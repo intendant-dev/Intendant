@@ -592,11 +592,13 @@
     // on the first live event) — rebind when the grid gains it.
     const grid = document.getElementById('session-window-grid');
     if (grid) {
+      // subtree: windows live inside lane wrappers, not as direct grid
+      // children (renderSessionLanes) — childList alone would miss them.
       new MutationObserver(() => {
         if (!peekIsOpen() || !peekBoundSid) return;
         const win = peekTargetWindow(peekBoundSid);
         if (win && win.log !== peekBoundLog) peekBind(peekBoundSid);
-      }).observe(grid, { childList: true });
+      }).observe(grid, { childList: true, subtree: true });
     }
 
     window.__ui2Peek = {

@@ -1830,17 +1830,13 @@ body.display-fullscreen-open {
     max-height: 260px;
   }
   .session-window-header {
-    flex-wrap: wrap;
-    gap: 5px;
+    gap: 4px;
     padding: 6px;
   }
-  .session-window-title {
-    order: 1;
-    flex: 1 1 100%;
+  .session-window-identity-row {
+    flex-wrap: wrap;
+    gap: 5px;
   }
-  .session-window-status { order: 2; }
-  .session-window-menu-cluster { order: 3; margin-left: auto; }
-  .session-window-state-cluster { order: 4; }
   .session-window-action {
     width: 28px;
     height: 28px;

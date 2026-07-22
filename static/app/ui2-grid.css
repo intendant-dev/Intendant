@@ -1,13 +1,15 @@
-/* ── ui-v2 Activity Grid mode: session-window re-skin ──────────────────
-   All scoped html.ui-v2. The v1 window machinery (collapse states,
-   resize, maximize, menus, wires geometry, prompt-target ring driven by
-   the per-session badge vars) stays fully in charge — this fragment
-   re-tones surfaces, chips, controls, and type to the v2 language. The
-   Catppuccin bridge already re-points the state colors (blue→iris,
-   mauve→violet, …), so state semantics inherit v2 hues without
-   restating every rule. Geometry-critical rules (heights, container-
-   type, overflow incl. menu-open, flex orders) are deliberately not
-   touched. */
+/* ── ui-v2 Activity Grid mode: lineage lanes + session-window re-skin ──
+   All scoped html.ui-v2. Grid layout (ratified 2026-07-21, candidate B
+   "lineage lanes" + the A/C fold-ins): the grid is a horizontal flex of
+   family lanes — each top-level session's card followed by its
+   descendant tree with in-flow elbow connectors (renderSessionLanes owns
+   the DOM; kind color = relationship kind). Descendants render as
+   compact fixed-height rows and expand in place; hover lights the
+   family. The v1 window machinery (collapse states, resize, maximize,
+   menus, prompt-target ring driven by the per-session badge vars) stays
+   fully in charge — lane wrappers are display:contents everywhere except
+   the lanes surface, so Focus promotion and the maximized state see the
+   same flat window set they always did. */
 
 /* — grid container + resize handle — */
 html.ui-v2 .session-window-grid {
@@ -18,33 +20,12 @@ html.ui-v2 .session-window-grid {
 }
 /* Resized grid: the dragged size is a DEFINITE height, as v1 intends —
    the grid claims exactly the share the user dragged, and the concurrent
-   view gets the rest.
-
-   The row-overlap cure that used to live here (grid-auto-rows:
-   max-content + align-content: start) moved to the BASE
-   .session-window-grid rule in 12-styles-tasks-log.css: the ledger
-   finding #4 track-sizing artifact — `auto` rows in a definite-height
-   grid compress below their content-sized cards, which then paint over
-   the next row ("320px cards in 298px tracks") — was not specific to
-   .resized. Any clamped height reproduces it (the base 42vh max-height,
-   the flexed concurrent-log-minimized state, transient non-.resized
-   frames), so the pin is now universal and this rule keeps only the
-   definite-height + overflow mechanics.
-
-   History, still binding: the earlier fix — height:auto + the dragged
-   size as a max-height cap — did dodge the overlap, but only by making
-   the height indefinite, which silently removed drag-to-grow: an
-   auto-height grid can never exceed its content, so dragging the handle
-   down just moved a cap nothing was pressing against, and in fit mode
-   (where the cap IS the content height) the drag was a pure no-op. It
-   also outranked v1's `.maximized` and `.concurrent-log-minimized`
-   geometry, so neither state could resize the grid — hence the :not()
-   scoping here. */
+   view gets the rest. (History in git: the auto-height variant silently
+   removed drag-to-grow.) */
 html.ui-v2 .subtab-pane:not(.concurrent-log-minimized) .session-window-grid.resized:not(.maximized) {
   height: var(--session-window-grid-height);
   max-height: none;
   overflow-y: auto;
-  overflow-x: hidden;
 }
 html.ui-v2 .session-window-grid-resize-handle::before {
   width: 44px;
@@ -57,13 +38,218 @@ html.ui-v2 .session-window-grid-resize-handle.dragging::before {
   background: var(--iris);
 }
 
+/* — lane wrappers: transparent everywhere but the lanes surface —
+   Outside grid layout (Focus surfaces) and under .maximized, the
+   wrappers contribute no boxes, so the pre-lane display gating
+   (.ui2-focus-window promotion, .maximized single-window flex) keeps
+   working over a visually flat window set. */
+html.ui-v2 .session-lane,
+html.ui-v2 .session-lane-kids,
+html.ui-v2 .session-lane-kid { display: contents; }
+html.ui-v2 .session-lane-kdot { display: none; }
+
+/* — the lanes surface — */
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  overflow-x: auto;
+  overflow-y: auto;
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1 1 560px;
+  min-width: 360px;
+  max-width: 660px;
+  transition: opacity var(--t-fast);
+}
+/* container-type: inline-size zeroes a card's intrinsic width, and the
+   base .session-window align-self: start would shrink a lane ROOT to its
+   borders — stretch it to the lane (kid-wrapped descendants are block
+   children and fill naturally). */
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane > .session-window {
+  align-self: stretch;
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane-kids {
+  display: flex;
+  flex-direction: column;
+  margin-left: 17px;
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane-kid {
+  display: block;
+  position: relative;
+  padding-left: 22px;
+  padding-top: 8px;
+}
+/* tree rails + elbows — plain flow, can never be occluded */
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane-kid::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--line-2);
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane-kid:last-child::before {
+  height: 25px;
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane-kid::after {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 23px;
+  width: 16px;
+  height: 2px;
+  border-radius: 2px;
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane-kid.k-sub::after {
+  background: rgba(var(--green-rgb), .75);
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane-kid.k-fork::after {
+  background: rgba(var(--iris-rgb), .8);
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane-kid.k-side::after {
+  background: repeating-linear-gradient(90deg, rgba(var(--violet-rgb), .8) 0 4px, transparent 4px 7px);
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane-kdot {
+  display: block;
+  position: absolute;
+  left: 14px;
+  top: 20px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--bg);
+  border: 2px solid var(--line-2);
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane-kid.k-sub .session-lane-kdot {
+  border-color: rgba(var(--green-rgb), .9);
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane-kid.k-fork .session-lane-kdot {
+  border-color: rgba(var(--iris-rgb), .95);
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-lane-kid.k-side .session-lane-kdot {
+  border-color: rgba(var(--violet-rgb), .9);
+}
+
+/* — compact child rows (uniform row discipline, fold-in from C) —
+   A descendant that isn't expanded renders as a fixed-height two-line
+   row: identity line + the latest log entry clamped to one line. Click
+   expands the SAME window to a full card in place. */
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-row {
+  min-height: 0;
+  max-height: none;
+  border-radius: 10px;
+  cursor: pointer;
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-row:hover {
+  border-color: rgba(var(--iris-rgb), .4);
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-row .session-window-header {
+  gap: 2px;
+  padding: 6px 10px 3px;
+  border-bottom: 0;
+  background: transparent;
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-row .session-window-facts-row,
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-row .session-window-path-row,
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-row .session-window-task,
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-row .session-window-relation-strip,
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-row .session-window-jump-bottom {
+  display: none;
+}
+/* the one-line live tail: latest entry only, clamped, inert */
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-row .session-window-log {
+  flex: none;
+  max-height: 26px;
+  overflow: hidden;
+  padding: 0 10px 6px;
+  pointer-events: none;
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-row .session-window-log > :not(:last-child) {
+  display: none;
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-row .session-window-log .log-entry {
+  max-height: 20px;
+  overflow: hidden;
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-row .session-window-empty {
+  padding: 0 4px 4px;
+  font-size: 11px;
+}
+/* idle/done children: minimized = a dimmed one-liner, IN LANE */
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-child.minimized {
+  min-height: 30px;
+  max-height: 30px;
+  opacity: .62;
+  cursor: pointer;
+  border-radius: 10px;
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-child.minimized .session-window-header {
+  height: 30px;
+  padding: 3px 10px;
+}
+html.ui-v2[data-ui2-layout="grid"] #session-window-grid:not(.maximized) .session-window.lane-child.minimized:hover {
+  opacity: .95;
+}
+
+/* — hover-family (fold-in from A): light ancestors + descendants, dim
+   the rest. Class flips only (applySessionLaneHover). — */
+@media (hover: hover) {
+  html.ui-v2[data-ui2-layout="grid"] #session-window-grid.family-hover .session-lane:not(.family-lit-lane) {
+    opacity: .45;
+  }
+  html.ui-v2[data-ui2-layout="grid"] #session-window-grid.family-hover .family-lit-lane .session-window:not(.family-lit) {
+    opacity: .55;
+  }
+  html.ui-v2[data-ui2-layout="grid"] #session-window-grid.family-hover .session-window.family-lit {
+    border-color: rgba(var(--iris-rgb), .45);
+  }
+}
+
+/* — lane legend: connector-kind key + live counts — */
+html.ui-v2 .session-lane-legend {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px 14px 0;
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-3);
+}
+html.ui-v2 .session-lane-legend.hidden,
+html.ui-v2:not([data-ui2-layout="grid"]) .session-lane-legend,
+html.ui-v2[data-ui2-layout="grid"]:has(#session-window-grid.maximized) .session-lane-legend {
+  display: none;
+}
+html.ui-v2 .session-lane-legend .lane-legend-kind i {
+  display: inline-block;
+  width: 18px;
+  height: 2px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+html.ui-v2 .session-lane-legend .lane-legend-sub i { background: rgba(var(--green-rgb), .8); }
+html.ui-v2 .session-lane-legend .lane-legend-fork i { background: rgba(var(--iris-rgb), .85); }
+html.ui-v2 .session-lane-legend .lane-legend-side i {
+  background: repeating-linear-gradient(90deg, rgba(var(--violet-rgb), .8) 0 4px, transparent 4px 7px);
+}
+html.ui-v2 .session-lane-legend .lane-legend-count { margin-left: auto; }
+
 /* — window card (design-system polish: no shadow at rest — shadows are
      reserved for overlays, primary buttons, and the approval hero) — */
 html.ui-v2 .session-window {
   border: 1px solid var(--line);
   border-radius: var(--r-card);
   box-shadow: none;
-  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+  transition: border-color var(--t-fast), box-shadow var(--t-fast), opacity var(--t-fast);
 }
 html.ui-v2 .session-window:hover { border-color: var(--line-2); }
 html.ui-v2 .session-window.foreground {
@@ -79,34 +265,68 @@ html.ui-v2 .session-window.prompt-target {
     0 8px 22px rgba(var(--iris-rgb), .10);
 }
 
-/* — header + title stack — */
+/* — header: identity line + quiet fact line + path line + message — */
 html.ui-v2 .session-window-header {
-  gap: 8px;
-  padding: 8px 10px;
+  gap: 3px;
+  padding: 8px 11px 6px;
   border-bottom: 1px solid var(--line);
 }
+html.ui-v2 .session-window-identity-row { gap: 8px; }
+/* identity: badge-hued short-id CHIP + plain-text name */
 html.ui-v2 .session-window-id {
-  border-radius: var(--r-ctl);
+  font-size: 12.5px;
+  font-weight: 600;
+  gap: 6px;
+}
+html.ui-v2 .session-window-id .session-identity-short,
+html.ui-v2 .session-window-id .session-identity-prefix {
   font-family: var(--mono);
   font-size: 10px;
+  font-weight: 700;
+  border-radius: var(--r-ctl);
   padding: 2px 6px;
 }
-html.ui-v2 .session-window-task { color: var(--text-2); font-size: 12px; }
-html.ui-v2 .session-window-project,
-html.ui-v2 .session-window-cwd { font-family: var(--mono); font-size: 10px; }
-/* the msg/proj/cwd eyebrow prefixes read as labels, not noise */
-html.ui-v2 .session-window-task::before,
-html.ui-v2 .session-window-project::before,
-html.ui-v2 .session-window-cwd::before {
+html.ui-v2 .session-window-id .session-identity-name { color: var(--text); }
+/* controls swap in on hover, replacing the status pill (question-panel
+   swap pattern); keyboard focus and an open menu also reveal them */
+html.ui-v2 .session-window .session-window-action-cluster { display: none; }
+html.ui-v2 .session-window:hover .session-window-action-cluster,
+html.ui-v2 .session-window:focus-within .session-window-action-cluster,
+html.ui-v2 .session-window.menu-open .session-window-action-cluster { display: inline-flex; }
+html.ui-v2 .session-window:hover .session-window-identity-row .session-window-status,
+html.ui-v2 .session-window.menu-open .session-window-identity-row .session-window-status { display: none; }
+@media (hover: none) {
+  /* touch devices have no hover: controls stay present, status stays */
+  html.ui-v2 .session-window .session-window-action-cluster { display: inline-flex; }
+  html.ui-v2 .session-window:hover .session-window-identity-row .session-window-status { display: inline-flex; }
+}
+/* fact line: quiet mono icon+value pairs (vit-chip tone in ui2-activity) */
+html.ui-v2 .session-window-facts-row { gap: 2px 10px; }
+/* path line: worktree/cwd leads, project folds behind, all quiet */
+html.ui-v2 .session-window-path-row {
   font-family: var(--mono);
-  font-size: 8.5px;
-  font-weight: 700;
-  letter-spacing: .12em;
-  text-transform: uppercase;
+  font-size: 10px;
   color: var(--text-3);
 }
+html.ui-v2 .session-window-project,
+html.ui-v2 .session-window-cwd {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+}
+html.ui-v2 .session-window-project::before {
+  color: var(--text-3);
+  opacity: .7;
+  font-size: 10px;
+}
+/* message line: one clamped italic line */
+html.ui-v2 .session-window-task {
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-style: italic;
+}
 
-/* — relation chips (hues match the wires: bridge maps them together) — */
+/* — relation chips (hues match the connector kinds) — */
 html.ui-v2 .session-window-relation-chip {
   font-family: var(--mono);
   font-size: 9px;
@@ -152,7 +372,7 @@ html.ui-v2 .session-window-status.done {
   background: rgba(var(--green-rgb), .12);
 }
 
-/* — goal / pr / tier / vitals chips — */
+/* — goal / pr / tier / vitals — */
 html.ui-v2 .session-window-goal,
 html.ui-v2 .session-window-pr,
 html.ui-v2 .session-window-tier,
@@ -160,7 +380,7 @@ html.ui-v2 .session-window-vitals {
   font-family: var(--mono);
   font-size: 9.5px;
 }
-html.ui-v2 .session-window-vitals { gap: 7px; }
+html.ui-v2 .session-window-vitals { gap: 2px 8px; }
 
 /* — window controls (−, ⛶, ×, ⋯) — */
 html.ui-v2 .session-window-action {
@@ -225,19 +445,6 @@ html.ui-v2 .session-window-jump-bottom {
 }
 html.ui-v2 .session-window-jump-bottom:hover { color: var(--text); background: var(--surface-2); }
 
-/* — relationship wires (SVG): quieter idle, iris when active — */
-html.ui-v2 .session-relationship-wire { stroke: color-mix(in srgb, var(--text-3) 45%, transparent); }
-html.ui-v2 .session-relationship-wire.fork { stroke: rgba(var(--iris-rgb), .62); }
-html.ui-v2 .session-relationship-wire.subagent { stroke: rgba(var(--green-rgb), .6); }
-html.ui-v2 .session-relationship-wire.active {
-  stroke: var(--iris);
-  filter: drop-shadow(0 0 4px rgba(var(--iris-rgb), .45));
-}
-html.ui-v2 .session-relationship-endpoint { fill: var(--bg); stroke: color-mix(in srgb, var(--text-3) 55%, transparent); }
-html.ui-v2 .session-relationship-endpoint.fork { stroke: rgba(var(--iris-rgb), .8); }
-html.ui-v2 .session-relationship-endpoint.subagent { stroke: rgba(var(--green-rgb), .78); }
-html.ui-v2 .session-relationship-endpoint.active { stroke: var(--iris); }
-
 /* — "Concurrent view" strip label + its window controls — */
 html.ui-v2 .concurrent-log-label {
   font-family: var(--mono);
@@ -265,9 +472,10 @@ html.ui-v2 .session-window-header { background: var(--surface-2); }
 html.ui-v2 .concurrent-log-region { background: var(--bg); }
 
 /* Light theme: the session-badge vars are dark-theme pastels (see the
-   matching remap in ui2-activity.css) — re-derive the window id chip
+   matching remap in ui2-activity.css) — re-derive the short-id chip
    toward ink so per-session identity stays legible on light surfaces. */
-html.ui-v2[data-theme="light"] .session-window-id {
+html.ui-v2[data-theme="light"] .session-window-id .session-identity-short,
+html.ui-v2[data-theme="light"] .session-window-id .session-identity-prefix {
   color: color-mix(in srgb, var(--session-badge-fg, var(--text-2)) 34%, var(--text));
   border-color: color-mix(in srgb, var(--session-badge-border, var(--line-2)) 55%, var(--line-2));
 }

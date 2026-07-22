@@ -300,7 +300,23 @@ function ui2WireMirrors() {
     });
     ui2Mirror('task-target-chip', rebuildSwitcher);
     const grid = document.getElementById('session-window-grid');
-    if (grid) new MutationObserver(rebuildSwitcher).observe(grid, { childList: true });
+    // subtree: windows live inside lane wrappers, not as direct grid
+    // children (renderSessionLanes) — childList alone would miss them.
+    // Filtered to window membership changes so per-log-entry appends
+    // under the same subtree never churn the switcher rebuild.
+    if (grid) {
+      new MutationObserver((muts) => {
+        for (const m of muts) {
+          for (const n of [...m.addedNodes, ...m.removedNodes]) {
+            if (n.nodeType === 1
+                && (n.classList?.contains('session-window') || n.querySelector?.('.session-window'))) {
+              rebuildSwitcher();
+              return;
+            }
+          }
+        }
+      }).observe(grid, { childList: true, subtree: true });
+    }
     rebuildSwitcher();
   }
   };

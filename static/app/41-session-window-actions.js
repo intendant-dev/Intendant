@@ -192,10 +192,24 @@ function ensureSessionWindow(sessionId, meta = {}) {
   el.tabIndex = 0;
   applySessionBadgeStyle(el, sid);
 
+  // Header anatomy (grid redesign, ratified 2026-07-21): four stacked
+  // rows — identity (health dot + id chip + name + status pill + hover
+  // controls), a quiet icon fact line (vitals + tier + goal), one path
+  // line (worktree/cwd leading, project folded behind, full paths in
+  // tooltips), and one clamped message line. Collapsed/minimized states
+  // hide rows 2–4 and keep the identity one-liner.
   const header = document.createElement('div');
   header.className = 'session-window-header';
-  const title = document.createElement('div');
-  title.className = 'session-window-title';
+  const identityRow = document.createElement('div');
+  identityRow.className = 'session-window-identity-row';
+  // The vitals renderer mounts the health dot (and the compact states'
+  // single attention chip) here, so the verdict leads the identity line
+  // while the quiet fact chips live on their own row.
+  // Dual class: the health slot inherits the .session-window-vitals chip
+  // styling (and the collapsed-state attn-chip fold rules) without a
+  // parallel rule set — it is the identity-line half of the vitals row.
+  const healthSlot = document.createElement('span');
+  healthSlot.className = 'session-window-health session-window-vitals';
   const id = document.createElement('div');
   id.className = 'session-window-id';
   renderSessionIdentity(id, sid, { order: 'id-name' });
@@ -222,19 +236,10 @@ function ensureSessionWindow(sessionId, meta = {}) {
   );
   const worktreeBadge = document.createElement('span');
   worktreeBadge.className = 'session-window-worktree hidden';
-  const metaRow = document.createElement('div');
-  metaRow.className = 'session-window-meta';
-  metaRow.appendChild(id);
-  metaRow.appendChild(relationStrip);
-  metaRow.appendChild(project);
-  metaRow.appendChild(worktreeBadge);
   const task = document.createElement('div');
   task.className = 'session-window-task';
   task.textContent = meta.task || 'initial message pending';
   task.title = meta.task || 'Initial user message not known yet';
-  title.appendChild(metaRow);
-  title.appendChild(cwd);
-  title.appendChild(task);
   const status = document.createElement('span');
   status.className = 'session-window-status';
   status.textContent = sessionPhaseLabel(normalizeSessionPhase(meta.phase || 'idle'));
@@ -305,14 +310,32 @@ function ensureSessionWindow(sessionId, meta = {}) {
   windowControls.appendChild(minimize);
   windowControls.appendChild(maximize);
   windowControls.appendChild(close);
-  header.appendChild(title);
-  header.appendChild(goal);
-  header.appendChild(prChip);
-  header.appendChild(tier);
-  header.appendChild(vitals);
-  header.appendChild(status);
-  header.appendChild(menuControls);
-  header.appendChild(windowControls);
+  identityRow.appendChild(healthSlot);
+  identityRow.appendChild(id);
+  identityRow.appendChild(relationStrip);
+  identityRow.appendChild(status);
+  identityRow.appendChild(menuControls);
+  identityRow.appendChild(windowControls);
+  const factsRow = document.createElement('div');
+  factsRow.className = 'session-window-facts-row';
+  factsRow.appendChild(vitals);
+  factsRow.appendChild(tier);
+  factsRow.appendChild(goal);
+  factsRow.appendChild(prChip);
+  const pathRow = document.createElement('div');
+  pathRow.className = 'session-window-path-row';
+  const pathIcon = document.createElement('span');
+  pathIcon.className = 'session-window-path-icon';
+  pathIcon.setAttribute('aria-hidden', 'true');
+  pathIcon.innerHTML = typeof vitalsIconSvg === 'function' ? vitalsIconSvg('folder') : '';
+  pathRow.appendChild(pathIcon);
+  pathRow.appendChild(cwd);
+  pathRow.appendChild(project);
+  pathRow.appendChild(worktreeBadge);
+  header.appendChild(identityRow);
+  header.appendChild(factsRow);
+  header.appendChild(pathRow);
+  header.appendChild(task);
 
   const log = document.createElement('div');
   log.className = 'session-window-log';
@@ -329,6 +352,25 @@ function ensureSessionWindow(sessionId, meta = {}) {
   el.appendChild(jumpBottom);
   el.addEventListener('mousedown', () => focusSessionWindow(sid));
   el.addEventListener('focus', () => focusSessionWindow(sid));
+  // Lane child rows expand in place on click (anywhere that isn't a
+  // control); a minimized (one-line) child row restores to its compact
+  // row through the same explicit-intent path as the □ control.
+  el.addEventListener('click', (e) => {
+    if (e.target.closest?.('button, a, input, textarea, select, [role="menu"]')) return;
+    const win = sessionWindows.get(sid);
+    if (!win || !sessionWindowIsLaneChild(sid)) return;
+    if (win.minimized) {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleSessionWindowMinimized(sid);
+      return;
+    }
+    if (!win.laneExpanded) {
+      e.preventDefault();
+      e.stopPropagation();
+      setSessionWindowLaneExpanded(sid, true);
+    }
+  });
   log.addEventListener('scroll', () => updateSessionWindowFollowFromScroll(sessionWindows.get(sid)), { passive: true });
   jumpBottom.addEventListener('click', (e) => {
     e.preventDefault();
@@ -339,6 +381,9 @@ function ensureSessionWindow(sessionId, meta = {}) {
   header.addEventListener('click', (e) => {
     if (e.target.closest?.('button, a, input, textarea, select, [role="menu"]')) return;
     if (sessionWindows.get(sid)?.minimized) return;
+    // A compact lane row's header click is the row click (expand) — the
+    // el-level listener above owns it.
+    if (sessionWindowIsLaneRow(sid)) return;
     e.preventDefault();
     e.stopPropagation();
     closeSessionWindowMenus();
@@ -379,6 +424,13 @@ function ensureSessionWindow(sessionId, meta = {}) {
   minimize.addEventListener('click', (e) => {
     e.stopPropagation();
     closeSessionWindowMenus();
+    // On an expanded lane child, − means "back to the compact row" —
+    // minimize-to-one-line stays one more − away (from the row itself).
+    const win = sessionWindows.get(sid);
+    if (win && !win.minimized && win.laneExpanded && sessionWindowIsLaneChild(sid)) {
+      setSessionWindowLaneExpanded(sid, false);
+      return;
+    }
     toggleSessionWindowMinimized(sid);
   });
   maximize.addEventListener('click', (e) => {
@@ -410,6 +462,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     prChip,
     tier,
     vitals,
+    healthSlot,
     source: meta.source || '',
     actionMenuButton: actions,
     actionMenu,
@@ -433,6 +486,9 @@ function ensureSessionWindow(sessionId, meta = {}) {
     renderStart: 0,
     renderEnd: 0,
     headerCollapsed: startHeaderCollapsed,
+    // Lane presentation (per-page-load, like minimized): a descendant
+    // renders as a compact row until expanded in place.
+    laneExpanded: false,
   };
   sessionWindows.set(sid, win);
   renderSessionWindowLogPlaceholder(win);
@@ -671,6 +727,7 @@ function updateSessionWindowMinimizeState(sessionId) {
     win.minimize.setAttribute('aria-label', win.minimize.title);
     win.minimize.setAttribute('aria-pressed', minimized ? 'true' : 'false');
   }
+  updateSessionWindowLaneState(sid);
   updateSessionWindowJumpButton(win);
 }
 
@@ -700,6 +757,83 @@ function toggleSessionWindowHeaderCollapsed(sessionId) {
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win) return;
   setSessionWindowHeaderCollapsed(sid, !win.headerCollapsed);
+}
+
+// ── Lane presentation (grid layout = lineage lanes) ────────────────────
+// The grid renders each top-level session as a lane: the root's full card
+// followed by its descendant tree (renderSessionLanes owns the DOM). A
+// descendant defaults to a compact fixed-height row (.lane-row: identity
+// line + one-line live tail); clicking it expands the SAME window element
+// to a full card in place — no second window implementation exists. All
+// of this is presentation over the ordinary session-window machinery:
+// transcript history, menus, composer targeting, focus, badges, and
+// minimize (the one-line dimmed state) behave identically in every shape.
+
+// One hop up: the parent that would anchor this window's lane position.
+// Only a parent with its own live window counts — an orphaned child (its
+// parent's card was closed) renders as a lane root, with its relation
+// chip still naming the parent.
+function sessionWindowLaneParentId(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !sessionWindows.has(sid)) return '';
+  const meta = sessionMetadataById.get(sid) || {};
+  const parentId = String(meta.parentId || '').trim();
+  if (!parentId || parentId === sid || !sessionWindows.has(parentId)) return '';
+  return parentId;
+}
+
+function sessionWindowIsLaneChild(sessionId) {
+  return !!sessionWindowLaneParentId(sessionId);
+}
+
+// The compact-row predicate the click paths key on: a descendant that is
+// neither expanded in place, minimized to one line, nor maximized.
+function sessionWindowIsLaneRow(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win) return false;
+  return sessionWindowIsLaneChild(sid)
+    && !win.laneExpanded
+    && !win.minimized
+    && maximizedSessionWindowId !== sid;
+}
+
+// Class flips only — never a re-layout beyond what the classes imply.
+// Called from the minimize-state applier (below) and the lane render
+// pass, so every membership / relationship / minimize crossing re-derives
+// the presentation.
+function updateSessionWindowLaneState(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win) return;
+  const child = sessionWindowIsLaneChild(sid);
+  win.el.classList.toggle('lane-child', child);
+  win.el.classList.toggle('lane-root', !child);
+  win.el.classList.toggle('lane-row', sessionWindowIsLaneRow(sid));
+  if (win.minimize && !win.minimized) {
+    const rowVerb = child && win.laneExpanded ? 'Collapse to row' : (child ? 'Minimize to one line' : 'Minimize window');
+    win.minimize.title = rowVerb;
+    win.minimize.setAttribute('aria-label', rowVerb);
+  }
+}
+
+function setSessionWindowLaneExpanded(sessionId, expanded) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win) return;
+  const next = !!expanded;
+  if (win.laneExpanded === next) return;
+  win.laneExpanded = next;
+  // An expanded-in-place child shows the full header (path + message
+  // lines) — the sub-agent starts-collapsed default is a row-state
+  // economy that no longer applies.
+  if (next && win.headerCollapsed) setSessionWindowHeaderCollapsed(sid, false);
+  updateSessionWindowLaneState(sid);
+  if (next) {
+    focusSessionWindow(sid);
+    scheduleSessionWindowScrollToBottom(win);
+  }
+  scheduleSessionRelationshipRender();
 }
 
 // Minimize UNMOUNTS the transcript children — a minimized card used to
@@ -985,6 +1119,9 @@ window.qa = Object.assign(window.qa || {}, {
         headerCollapsed: !!win.headerCollapsed,
         minimizedClass: win.el.classList.contains('minimized'),
         headerCollapsedClass: win.el.classList.contains('header-collapsed'),
+        laneExpanded: !!win.laneExpanded,
+        laneRowClass: win.el.classList.contains('lane-row'),
+        laneChildClass: win.el.classList.contains('lane-child'),
         hardDone: sessionWindowHasHardDoneEvidence(sid),
         followOutput: !!win.followOutput,
         logAtBottom: sessionWindowIsRenderingTail(win) && sessionWindowLogIsAtBottom(win.log),
@@ -1027,6 +1164,9 @@ function setSessionWindowMaximized(sessionId, maximized) {
       win.userRestoredWhileDone = true;
       win.autoMinimized = false;
     }
+    // Un-maximize should land on the full card, not snap back to the
+    // compact row the user just zoomed out of.
+    if (win && sessionWindowIsLaneChild(sid)) win.laneExpanded = true;
     setSessionWindowMinimized(sid, false);
     maximizedSessionWindowId = sid;
     focusSessionWindow(sid);

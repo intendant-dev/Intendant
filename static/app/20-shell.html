@@ -252,6 +252,14 @@
                after the backend reports steer_delivered. -->
           <div class="steer-strip empty" id="steer-strip"></div>
 
+          <!-- Lane legend: connector-kind key + live family counts (Grid
+               layout only; renderSessionLanes owns visibility + counts). -->
+          <div class="session-lane-legend hidden" id="session-lane-legend">
+            <span class="lane-legend-kind lane-legend-sub"><i></i>sub-agent</span>
+            <span class="lane-legend-kind lane-legend-fork"><i></i>fork</span>
+            <span class="lane-legend-kind lane-legend-side"><i></i>side conversation</span>
+            <span class="lane-legend-count" id="session-lane-legend-count"></span>
+          </div>
           <div class="session-window-grid hidden" id="session-window-grid"></div>
           <div class="session-window-grid-resize-handle hidden" id="session-window-grid-resize-handle" title="Drag to resize session windows and concurrent view"></div>
           <div class="concurrent-log-region" id="concurrent-log-region">
