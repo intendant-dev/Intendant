@@ -593,6 +593,7 @@ impl AppEventUpcaster {
             | AppEvent::SessionActivity { .. }
             | AppEvent::SessionRateLimits { .. }
             | AppEvent::SessionConfigFacts { .. }
+            | AppEvent::SessionRecoveredFacts { .. }
             | AppEvent::ContextSnapshot { .. }
             | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::ExternalFollowUpRequested { .. }
@@ -4788,6 +4789,7 @@ mod tests {
             limits: Vec::new(),
             activity: None,
             config: None,
+            context: None,
         }
     }
 

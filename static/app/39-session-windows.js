@@ -1118,6 +1118,21 @@ function vitalsChipFactTextFromChip(text) {
   return String(text || '').replace(VITALS_CHIP_GLYPH_PREFIX, '').trim();
 }
 
+// Recovered-provenance caveat (instant vitals hydration): a chip whose
+// value was hydrated from the session's on-disk records — the
+// `modelRecoveredAtEpoch` / `permissionRecoveredAtEpoch` /
+// `recoveredAtEpoch` stamps — says so in its explainer instead of
+// passing disk state off as a live report. The stamp is the source
+// record's epoch; the daemon clears it on every live fold, so the chip
+// renders normally (no extra glyph) and the caveat disappears the
+// moment the backend speaks.
+function vitalsRecoveredCaveat(recoveredAtEpoch) {
+  const epoch = Number(recoveredAtEpoch);
+  if (!Number.isFinite(epoch) || epoch <= 0) return '';
+  const wall = formatLimitResetWallClock(epoch);
+  return `From the session log as of ${wall || 'an earlier run'} — live values arrive with the next turn.`;
+}
+
 const VITALS_SYMBOLS = {
   health: {
     label: 'Session health',
@@ -1236,6 +1251,8 @@ const VITALS_SYMBOLS = {
       if (v.effort) {
         lines.push(`Reasoning effort is set to “${v.effort}” — how hard the model may think before answering. A setting, not a measurement.`);
       }
+      const caveat = vitalsRecoveredCaveat(v.recoveredAtEpoch);
+      if (caveat) lines.push(caveat);
       return lines;
     },
     action: (v) => (v.model ? { label: 'Copy model id', run: () => vitalsCopyText(v.model) } : null),
@@ -1249,7 +1266,12 @@ const VITALS_SYMBOLS = {
     explain: (v) => {
       const lines = [...v.lines];
       lines.push(`In the agent's own vocabulary: “${v.mode}”.`);
-      if (!v.echoed) {
+      const caveat = vitalsRecoveredCaveat(v.recoveredAtEpoch);
+      if (caveat) {
+        // Recovered modes are also unconfirmed (echoed stays false) —
+        // the dated caveat carries both facts in one line.
+        lines.push(caveat);
+      } else if (!v.echoed) {
         lines.push("This is the launch setting — the agent hasn't confirmed it yet.");
       }
       return lines;
@@ -1353,10 +1375,15 @@ const VITALS_SYMBOLS = {
     quiet: 'No cache reading on the last request.',
     icon: 'bolt',
     chip: (v) => `⚡${v.hitPct}%`,
-    explain: (v) => [
-      `${v.hitPct}% of the last request was answered from the provider's prompt cache.`,
-      'Cached input is far cheaper and faster than fresh input.',
-    ],
+    explain: (v) => {
+      const lines = [
+        `${v.hitPct}% of the last request was answered from the provider's prompt cache.`,
+        'Cached input is far cheaper and faster than fresh input.',
+      ];
+      const caveat = vitalsRecoveredCaveat(v.recoveredAtEpoch);
+      if (caveat) lines.push(caveat);
+      return lines;
+    },
   },
   'cache-ttl': {
     label: 'Cache freshness',
@@ -1365,15 +1392,20 @@ const VITALS_SYMBOLS = {
     icon: 'clock',
     chip: (v) => (v.cold ? '✗' : `⏳${v.countdown}`),
     factText: (v) => (v.cold ? 'cache cold' : v.countdown),
-    explain: (v) => (v.cold
-      ? [
-        'The prompt cache went cold — the next request rebuilds it.',
-        'Nothing is broken; the next turn just costs a little more once.',
-      ]
-      : [
-        `The prompt cache stays warm for another ${v.countdown}.`,
-        'If the session idles past that, the next request rebuilds it — slower and pricier.',
-      ]),
+    explain: (v) => {
+      const lines = v.cold
+        ? [
+          'The prompt cache went cold — the next request rebuilds it.',
+          'Nothing is broken; the next turn just costs a little more once.',
+        ]
+        : [
+          `The prompt cache stays warm for another ${v.countdown}.`,
+          'If the session idles past that, the next request rebuilds it — slower and pricier.',
+        ];
+      const caveat = vitalsRecoveredCaveat(v.recoveredAtEpoch);
+      if (caveat) lines.push(caveat);
+      return lines;
+    },
   },
   limit: {
     label: 'Rate limit',
@@ -1610,6 +1642,7 @@ function vitalsChipModels(vitals, meta, sessionId) {
         model,
         shortName: vitalsModelShortName(model),
         effort: factsEffort,
+        recoveredAtEpoch: Number(facts.modelRecoveredAtEpoch) || 0,
       });
     }
     const mode = String(facts.permissionMode || '').trim();
@@ -1620,6 +1653,7 @@ function vitalsChipModels(vitals, meta, sessionId) {
         lines: display.lines,
         mode,
         echoed: facts.permissionEchoed === true,
+        recoveredAtEpoch: Number(facts.permissionRecoveredAtEpoch) || 0,
       }, {
         // Cosmetic tint only: a chosen bypass/ungated configuration is
         // worth noticing, but it is not a failure — no health-dot
@@ -1674,10 +1708,11 @@ function vitalsChipModels(vitals, meta, sessionId) {
 
   const cache = vitals?.cache && typeof vitals.cache === 'object' ? vitals.cache : null;
   if (cache) {
+    const cacheRecoveredAt = Number(cache.recoveredAtEpoch) || 0;
     const hitRaw = Number(cache.hitPct);
     if (Number.isFinite(hitRaw) && cache.hitPct !== null && cache.hitPct !== undefined) {
       const hitPct = Math.max(0, Math.min(100, hitRaw));
-      push('cache-hit', 'cache-hit', { hitPct }, {
+      push('cache-hit', 'cache-hit', { hitPct, recoveredAtEpoch: cacheRecoveredAt }, {
         severity: hitPct >= 90 ? 'ok' : '',
         tone: hitPct >= 90 ? 'ok' : hitPct >= 50 ? 'warn' : 'crit',
       });
@@ -1685,10 +1720,13 @@ function vitalsChipModels(vitals, meta, sessionId) {
     const remaining = sessionCacheCountdownSeconds(cache);
     if (remaining !== null) {
       if (remaining > 0) {
-        push('cache-ttl', 'cache-ttl', { cold: false, countdown: formatCacheCountdown(remaining) },
-          { severity: '', tone: remaining <= 60 ? 'crit' : '', ticking: true });
+        push('cache-ttl', 'cache-ttl', {
+          cold: false,
+          countdown: formatCacheCountdown(remaining),
+          recoveredAtEpoch: cacheRecoveredAt,
+        }, { severity: '', tone: remaining <= 60 ? 'crit' : '', ticking: true });
       } else {
-        push('cache-ttl', 'cache-ttl', { cold: true, countdown: '' });
+        push('cache-ttl', 'cache-ttl', { cold: true, countdown: '', recoveredAtEpoch: cacheRecoveredAt });
       }
     }
   }
@@ -3276,8 +3314,9 @@ function normalizeSessionVitals(raw) {
   const limits = Array.isArray(src.limits) ? src.limits : [];
   const activity = src.activity && typeof src.activity === 'object' ? src.activity : null;
   const config = src.config && typeof src.config === 'object' ? src.config : null;
-  if (!git && !cache && !limits.length && !activity && !config) return null;
-  return { git, cache, limits, activity, config };
+  const context = src.context && typeof src.context === 'object' ? src.context : null;
+  if (!git && !cache && !limits.length && !activity && !config && !context) return null;
+  return { git, cache, limits, activity, config, context };
 }
 
 // Merge an arriving vitals snapshot over what a session already has. A
@@ -3296,6 +3335,7 @@ function mergeSessionVitals(incoming, existing) {
     limits: incoming.limits?.length ? incoming.limits : existing.limits || [],
     activity: incoming.activity || existing.activity || null,
     config: incoming.config || existing.config || null,
+    context: incoming.context || existing.context || null,
   };
 }
 
@@ -3318,6 +3358,12 @@ function applySessionVitals(raw = {}, options = {}) {
   // Once per arrival (not per identity alias), from the incoming limits —
   // transitions are about what the wire just said, not the merged cache.
   maybeAlertLimitTransitions(sid, vitals.limits, options);
+  // The header context meter can be riding this session's vitals.context
+  // fallback (no live update_usage yet — bootstrap, restored sessions);
+  // re-derive it so the recovered figure lands without waiting on usage.
+  if (vitals.context && typeof renderForegroundSessionUsage === 'function') {
+    renderForegroundSessionUsage();
+  }
   refreshSessionVitalsTicker();
 }
 

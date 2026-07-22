@@ -72,6 +72,34 @@ impl SessionSupervisor {
         }
     }
 
+    /// Instant-vitals hydration for a resumed/attached external session,
+    /// fired beside [`Self::seed_resumed_git_vitals_locus`]: the recorded
+    /// launch config and the backend transcript tail fill the session's
+    /// Model/permissions chips and context meter NOW (fill-if-absent at
+    /// the hub — see `session_vitals_restore`), instead of waiting
+    /// seconds for the spawned backend's first wire echo. Keyed exactly
+    /// like the lane's `register_git_vitals` so the facts land on the
+    /// entry just registered.
+    fn hydrate_resumed_session_vitals(
+        &self,
+        session_id: &str,
+        backend: Option<&external_agent::AgentBackend>,
+        resume_token: &str,
+        launch_config: Option<&crate::session_config::SessionAgentConfig>,
+    ) {
+        let Some(backend) = backend else {
+            return;
+        };
+        crate::session_vitals_restore::hydrate_resumed_session_vitals(
+            self.config.bus.clone(),
+            self.logs_home(),
+            session_id.to_string(),
+            backend.clone(),
+            resume_token.to_string(),
+            launch_config.cloned(),
+        );
+    }
+
     /// Create and dispatch a new managed session. THE shared launch path:
     /// every session-creating lane (`CreateSession`, untargeted
     /// `StartTask` — composer, ctl, peer delegations, the agenda's
@@ -976,6 +1004,12 @@ impl SessionSupervisor {
                     &resume_token,
                     codex_home.as_deref(),
                 );
+                self.hydrate_resumed_session_vitals(
+                    &session_id,
+                    external_backend.as_ref(),
+                    &resume_token,
+                    effective_session_agent_config.as_ref(),
+                );
                 let intendant_session_id = session_log
                     .lock()
                     .map(|log| log.session_id().to_string())
@@ -1121,6 +1155,16 @@ impl SessionSupervisor {
             external_backend.as_ref(),
             &resume_token,
             codex_home.as_deref(),
+        );
+        self.hydrate_resumed_session_vitals(
+            if fork {
+                &intendant_session_id
+            } else {
+                &live_session_id
+            },
+            external_backend.as_ref(),
+            &resume_token,
+            effective_session_agent_config.as_ref(),
         );
         self.activate_shared_session(session_log.clone()).await;
         self.config.bus.send(AppEvent::SessionStarted {

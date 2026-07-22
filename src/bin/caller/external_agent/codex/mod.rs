@@ -388,6 +388,7 @@ impl CodexAgent {
                     .map(str::to_string),
                 permission_mode,
                 permission_echoed: true,
+                ..Default::default()
             },
         });
     }

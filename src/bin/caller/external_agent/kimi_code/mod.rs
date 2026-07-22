@@ -1069,6 +1069,7 @@ impl KimiCodeAgent {
                 permission_kind: kimi_permission_kind(&self.launch.permission_mode)
                     .map(str::to_string),
                 permission_echoed: echoed,
+                ..Default::default()
             },
         });
     }
@@ -2502,7 +2503,10 @@ fn validate_permission_mode(mode: &str) -> Result<(), CallerError> {
     }
 }
 
-fn kimi_permission_kind(permission: &str) -> Option<&'static str> {
+/// `pub(crate)`: the vitals restore hydrator
+/// (`session_vitals_restore.rs`) classifies a recovered launch config's
+/// kimi mode through this same catalog.
+pub(crate) fn kimi_permission_kind(permission: &str) -> Option<&'static str> {
     match permission {
         "manual" => Some(intendant_core::vitals::PERMISSION_KIND_ASK),
         "auto" => Some(intendant_core::vitals::PERMISSION_KIND_AUTO_SAFE),

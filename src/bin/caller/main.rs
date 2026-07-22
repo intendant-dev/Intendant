@@ -88,6 +88,7 @@ mod session_log;
 mod session_names;
 mod session_supervisor;
 mod session_vitals;
+mod session_vitals_restore;
 mod setup;
 mod shared_view_lifecycle;
 mod skill_install;

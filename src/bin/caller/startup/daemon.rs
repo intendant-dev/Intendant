@@ -144,23 +144,34 @@ pub(crate) async fn run_daemon(
         (Some(session_id), Some(root)) => vec![(session_id, root)],
         _ => Vec::new(),
     };
-    let (vitals_git_targets, _vitals_producer) =
-        session_vitals::spawn_session_vitals_producer(bus.clone(), vitals_git_seed);
+    let (vitals_git_targets, _vitals_producer) = session_vitals::spawn_session_vitals_producer(
+        bus.clone(),
+        vitals_git_seed,
+        Some(crate::session_vitals_restore::account_limit_store_path()),
+    );
     // Restored sessions: a restart empties the target registry, so idle
     // session windows lose their git/health chips until the next resume.
-    // Re-register the store's non-ended sessions (bounded, newest-first,
-    // insert-if-absent — see register_restored_session_targets) off the
-    // startup path; the first probe tick re-emits each session's rows and
-    // the bootstrap caches carry them to later-connecting dashboards.
+    // One bounded walk (newest-first, insert-if-absent — see
+    // restore_session_vitals_at_boot) re-registers the store's non-ended
+    // sessions AND hydrates their vitals from disk (recorded launch
+    // config + backend transcript tails), off the startup path; the
+    // hub's emissions and the first probe tick re-fill each session's
+    // chips, and the bootstrap caches carry them to later-connecting
+    // dashboards.
     {
         let registry = vitals_git_targets.clone();
+        let restore_bus = bus.clone();
         tokio::task::spawn_blocking(move || {
-            let restored = session_vitals::register_restored_session_targets(
-                &crate::platform::home_dir(),
-                &registry,
-            );
-            if restored > 0 {
-                eprintln!("Session vitals: git targets restored for {restored} session(s)");
+            let (restored, hydrated) =
+                crate::session_vitals_restore::restore_session_vitals_at_boot(
+                    &crate::platform::home_dir(),
+                    &registry,
+                    &restore_bus,
+                );
+            if restored > 0 || hydrated > 0 {
+                eprintln!(
+                    "Session vitals: git targets restored for {restored} session(s), vitals hydrated for {hydrated}"
+                );
             }
         });
     }

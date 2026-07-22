@@ -631,37 +631,61 @@ impl GitVitalsProber {
 /// the git family blanks to "not reported" the moment usage wins the
 /// race). The alias map canonicalizes every apply/remove so one entry —
 /// and therefore every emitted snapshot — carries all sections.
-struct SessionVitalsHub {
-    bus: EventBus,
-    sessions: Mutex<HashMap<String, SessionVitals>>,
+pub(crate) struct SessionVitalsHub {
+    pub(crate) bus: EventBus,
+    pub(crate) sessions: Mutex<HashMap<String, SessionVitals>>,
     /// alias id → canonical id, fed by `SessionIdentity` (native →
     /// wrapper). Chains are flattened at link time so `resolve` is one
     /// hop in practice; the hop cap is a cycle guard only.
-    aliases: Mutex<HashMap<String, String>>,
+    pub(crate) aliases: Mutex<HashMap<String, String>>,
     /// canonical id → backend source ("claude-code", "codex"), fed by
     /// `SessionIdentity`. Membership key for the account-scoped limits
     /// fold; native sessions never appear here.
-    session_sources: Mutex<HashMap<String, String>>,
+    pub(crate) session_sources: Mutex<HashMap<String, String>>,
     /// Per backend source: the account's latest known rate-limit windows,
     /// by label, freshest report per window (`observed_at_epoch`). The
     /// account outlives any one session, so a session starting mid-warning
     /// inherits the known state instead of claiming ignorance.
-    account_limits: Mutex<HashMap<String, std::collections::BTreeMap<String, SessionLimitWindow>>>,
+    pub(crate) account_limits:
+        Mutex<HashMap<String, std::collections::BTreeMap<String, SessionLimitWindow>>>,
+    /// Daemon state file the account window store persists to (see
+    /// `session_vitals_restore::account_limit_store`) so a restart keeps
+    /// the account's last known windows; `None` disables persistence
+    /// (unit tests, embedded producers).
+    pub(crate) limit_store: Option<PathBuf>,
 }
 
 impl SessionVitalsHub {
-    fn new(bus: EventBus) -> Arc<Self> {
+    /// Persistence-free hub — the unit-test constructor (production goes
+    /// through [`Self::with_limit_store`]).
+    #[cfg(test)]
+    pub(crate) fn new(bus: EventBus) -> Arc<Self> {
+        Self::with_limit_store(bus, None)
+    }
+
+    /// Hub with rate-limit window persistence: `limit_store` (when set) is
+    /// read once here — restoring the accounts' last known windows — and
+    /// rewritten whenever a report changes an account store. Stale
+    /// restores stay honest downstream: every window keeps its
+    /// `observed_at_epoch`, and the frontends' reset-rollover degradation
+    /// already refuses to present a lapsed window as current.
+    pub(crate) fn with_limit_store(bus: EventBus, limit_store: Option<PathBuf>) -> Arc<Self> {
+        let account_limits = limit_store
+            .as_deref()
+            .map(crate::session_vitals_restore::load_account_limit_store)
+            .unwrap_or_default();
         Arc::new(Self {
             bus,
             sessions: Mutex::new(HashMap::new()),
             aliases: Mutex::new(HashMap::new()),
             session_sources: Mutex::new(HashMap::new()),
-            account_limits: Mutex::new(HashMap::new()),
+            account_limits: Mutex::new(account_limits),
+            limit_store,
         })
     }
 
     /// Canonical id for any member of an identity group.
-    fn resolve(&self, session_id: &str) -> String {
+    pub(crate) fn resolve(&self, session_id: &str) -> String {
         let aliases = self.aliases.lock().expect("vitals alias lock");
         let mut id = session_id.trim();
         for _ in 0..4 {
@@ -715,6 +739,9 @@ impl SessionVitalsHub {
                 if vitals.config.is_none() {
                     vitals.config = orphan.config;
                 }
+                if vitals.context.is_none() {
+                    vitals.context = orphan.context;
+                }
             });
         }
     }
@@ -755,7 +782,11 @@ impl SessionVitalsHub {
     /// session of that source. Sourceless (native) sessions keep
     /// per-session windows. An empty report still mirrors the account
     /// view — that is how a newly linked session inherits known state.
-    fn apply_rate_limit_windows(&self, session_id: &str, windows: Vec<SessionLimitWindow>) {
+    pub(crate) fn apply_rate_limit_windows(
+        &self,
+        session_id: &str,
+        windows: Vec<SessionLimitWindow>,
+    ) {
         let session_id = self.resolve(session_id);
         let source = self
             .session_sources
@@ -769,12 +800,15 @@ impl SessionVitalsHub {
             }
             return;
         };
-        let merged: Vec<SessionLimitWindow> = {
+        let (merged, store_changed): (Vec<SessionLimitWindow>, bool) = {
             let mut accounts = self.account_limits.lock().expect("vitals account lock");
             let store = accounts.entry(source.clone()).or_default();
-            fold_limit_windows(store, &windows);
-            store.values().cloned().collect()
+            let changed = fold_limit_windows(store, &windows);
+            (store.values().cloned().collect(), changed)
         };
+        if store_changed {
+            self.persist_account_limits();
+        }
         if merged.is_empty() {
             return;
         }
@@ -792,7 +826,7 @@ impl SessionVitalsHub {
         }
     }
 
-    fn apply(&self, session_id: &str, update: impl FnOnce(&mut SessionVitals)) {
+    pub(crate) fn apply(&self, session_id: &str, update: impl FnOnce(&mut SessionVitals)) {
         let session_id = self.resolve(session_id);
         let changed = {
             let mut sessions = self.sessions.lock().expect("vitals state lock");
@@ -813,7 +847,13 @@ impl SessionVitalsHub {
     /// switch), and a known value is never blanked by a later partial
     /// that omits it. The permission fields travel as one datum — a mode
     /// update carries its display kind and echo provenance with it.
-    fn apply_config_facts(&self, session_id: &str, update: SessionConfigVitals) {
+    ///
+    /// This is the LIVE fold: a field it states overwrites any
+    /// disk-recovered value and clears that field's recovered stamp, so a
+    /// hydrator/live race settles on the live claim regardless of arrival
+    /// order (`apply_recovered_facts` is fill-if-absent — see
+    /// `session_vitals_restore`).
+    pub(crate) fn apply_config_facts(&self, session_id: &str, update: SessionConfigVitals) {
         if update == SessionConfigVitals::default() {
             return;
         }
@@ -821,6 +861,7 @@ impl SessionVitalsHub {
             let config = vitals.config.get_or_insert_with(Default::default);
             if update.model.is_some() {
                 config.model = update.model;
+                config.model_recovered_at_epoch = None;
             }
             if update.effort.is_some() {
                 config.effort = update.effort;
@@ -829,6 +870,7 @@ impl SessionVitalsHub {
                 config.permission_mode = update.permission_mode;
                 config.permission_kind = update.permission_kind;
                 config.permission_echoed = update.permission_echoed;
+                config.permission_recovered_at_epoch = None;
             }
         });
     }
@@ -890,11 +932,13 @@ impl SessionVitalsHub {
 /// incumbent — legacy emissions predate the stamp — always yields to a
 /// report). Windows the report does not mention persist: providers
 /// announce one window per event (Claude Code), and an unmentioned
-/// window's last known state is still the account's best truth.
+/// window's last known state is still the account's best truth. Returns
+/// whether the store actually changed (the persistence trigger).
 fn fold_limit_windows(
     store: &mut std::collections::BTreeMap<String, SessionLimitWindow>,
     incoming: &[SessionLimitWindow],
-) {
+) -> bool {
+    let mut changed = false;
     for window in incoming {
         let label = window.label.trim();
         if label.is_empty() {
@@ -904,11 +948,14 @@ fn fold_limit_windows(
             Some(existing)
                 if existing.observed_at_epoch.unwrap_or(0)
                     > window.observed_at_epoch.unwrap_or(0) => {}
+            Some(existing) if existing == window => {}
             _ => {
                 store.insert(label.to_string(), window.clone());
+                changed = true;
             }
         }
     }
+    changed
 }
 
 /// Unix seconds now — the cache-countdown anchor.
@@ -917,6 +964,24 @@ fn epoch_seconds() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Context-section percentage for one usage snapshot. The snapshot's own
+/// `usage_pct` is authoritative when it says anything — external backends
+/// compute it from this very footprint, and some (Codex managed context)
+/// know better than a naive division. The exception is the
+/// zero-with-tokens shape: the native usage rail's `usage_pct` mirrors
+/// `TurnStarted.budget_pct`, which is 0.0 on a session's FIRST turn while
+/// `tokens_used` is already real (the budget figure lags one turn) — the
+/// context section must not claim an empty window beside a stated
+/// footprint, so that one inconsistent shape derives the percentage from
+/// the section's own tokens/window instead (clamped like every producer).
+fn context_usage_pct(main: &ModelUsageSnapshot) -> f64 {
+    if main.usage_pct > 0.0 || main.tokens_used == 0 || main.context_window == 0 {
+        return main.usage_pct;
+    }
+    let effective_window = main.context_window.max(main.tokens_used);
+    (main.tokens_used as f64 / effective_window as f64) * 100.0
 }
 
 /// Fold one usage snapshot into a session's cache section. Returns `None`
@@ -949,6 +1014,7 @@ fn cache_vitals_from_usage(
         hit_pct: Some(hit_pct),
         last_activity_epoch: now_epoch,
         ttl_seconds,
+        recovered_at_epoch: None,
     })
 }
 
@@ -963,7 +1029,7 @@ fn cache_vitals_from_usage(
 /// each other's chips) — and record each session's backend source, the
 /// membership key of the account-scoped limits fold. Sessions are pruned on
 /// `SessionEnded`.
-fn spawn_cache_vitals_listener(
+pub(crate) fn spawn_cache_vitals_listener(
     bus: EventBus,
     hub: Arc<SessionVitalsHub>,
 ) -> tokio::task::JoinHandle<()> {
@@ -987,10 +1053,25 @@ fn spawn_cache_vitals_listener(
                     }
                     hub.apply(&session_id, |vitals| {
                         let previous_ttl = vitals.cache.as_ref().and_then(|c| c.ttl_seconds);
-                        if let Some(cache) =
-                            cache_vitals_from_usage(&main, previous_ttl, epoch_seconds())
+                        let now_epoch = epoch_seconds();
+                        if let Some(cache) = cache_vitals_from_usage(&main, previous_ttl, now_epoch)
                         {
                             vitals.cache = Some(cache);
+                        }
+                        // Context footprint: every backend's usage rail
+                        // states tokens/window/pct in one vocabulary, so
+                        // this single fill covers them all. A LIVE fold:
+                        // it overwrites any disk-recovered section (the
+                        // absent stamp clears the caveat by construction).
+                        // All-zero snapshots carry no footprint claim.
+                        if main.tokens_used > 0 {
+                            vitals.context = Some(crate::types::SessionContextVitals {
+                                tokens_used: main.tokens_used,
+                                context_window: main.context_window,
+                                usage_pct: context_usage_pct(&main),
+                                observed_at_epoch: now_epoch,
+                                recovered_at_epoch: None,
+                            });
                         }
                     });
                 }
@@ -1013,6 +1094,14 @@ fn spawn_cache_vitals_listener(
                     session_id: Some(session_id),
                     facts,
                 }) => hub.apply_config_facts(&session_id, facts),
+                // Disk-recovered facts from the boot/resume hydrator:
+                // fill-if-absent, so whatever a live producer already
+                // stated wins regardless of arrival order (see
+                // `session_vitals_restore`).
+                Ok(AppEvent::SessionRecoveredFacts {
+                    session_id: Some(session_id),
+                    facts,
+                }) => hub.apply_recovered_facts(&session_id, *facts),
                 // The autonomy level is daemon-global shared state; the
                 // fold updates every autonomy-backed config section so a
                 // Control-tab change shows up mid-session.
@@ -1267,79 +1356,31 @@ impl GitVitalsTargets {
     }
 }
 
-/// Cap on boot-time registration of restored sessions. A long-lived
-/// store accumulates thousands of non-ended session dirs (a real store
-/// measured ~2.1k across ~100 distinct roots), and every registered
-/// target costs a per-tick probe plus an emission — and a session-log
-/// write — for every session sharing a root whenever that root's git
-/// state changes. The newest N by meta mtime cover the session windows
-/// a dashboard realistically shows; older idle sessions regain their
-/// chips the moment they are resumed (launch-time registration, as
-/// before).
-const RESTORED_TARGET_CAP: usize = 64;
-
 /// Register git-probe targets for sessions RESTORED from the on-disk
 /// session store (`<home>/.intendant/logs`) — the daemon-boot
 /// complement to the supervisor's launch/resume registration. Without
 /// it a restart empties the registry, and idle session windows lose
 /// their git/health chips until the next resume touches them.
 ///
-/// Scope mirrors the `SessionEnded` prune: a `completed` meta means the
-/// session ended before the restart (the prune would have dropped it),
-/// so it stays unregistered; `idle` / `interrupted` / stale `running`
-/// sessions were live in a daemon's registry when it died and come
-/// back. Worktree sessions register their CHECKOUT
-/// (`meta.worktree.path`), exactly like launch-time registration.
-/// The newest [`RESTORED_TARGET_CAP`] sessions win (meta-file mtime —
-/// re-stamped on every lifecycle transition — is the recency key), and
-/// registration is insert-if-absent so the primary seed and any
-/// launch/resume racing the scan keep their fresher roots.
+/// The candidate walk (scope, recency cap, worktree-checkout roots)
+/// lives in [`crate::session_vitals_restore::restored_session_candidates`]
+/// — shared with the boot vitals hydrator so both restore lanes cover
+/// exactly the same sessions. Registration is insert-if-absent so the
+/// primary seed and any launch/resume racing the scan keep their
+/// fresher roots.
 ///
 /// Returns how many sessions were registered. Synchronous filesystem
-/// walk — call it from a blocking context.
+/// walk. Production boots through
+/// `session_vitals_restore::restore_session_vitals_at_boot`, which runs
+/// this same registration over one shared walk; this wrapper remains the
+/// registration contract's test seam.
+#[cfg(test)]
 pub(crate) fn register_restored_session_targets(home: &Path, registry: &GitVitalsTargets) -> usize {
-    let logs_dir = crate::platform::intendant_home_in(home).join("logs");
-    let Ok(entries) = std::fs::read_dir(&logs_dir) else {
-        return 0;
-    };
-    // (meta mtime, session id, effective root)
-    let mut restored: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
-    for entry in entries.flatten() {
-        let meta_path = entry.path().join("session_meta.json");
-        let Ok(raw) = std::fs::read_to_string(&meta_path) else {
-            continue;
-        };
-        let Ok(meta) = serde_json::from_str::<crate::session_log::SessionMeta>(&raw) else {
-            continue;
-        };
-        // Parity with the SessionEnded prune: completed = ended.
-        if meta.status.as_deref() == Some("completed") {
-            continue;
-        }
-        let root = meta
-            .worktree
-            .as_ref()
-            .map(|worktree| worktree.path.clone())
-            .or(meta.project_root);
-        let Some(root) = root.filter(|root| !root.trim().is_empty()) else {
-            continue;
-        };
-        let session_id = meta.session_id.trim().to_string();
-        if session_id.is_empty() {
-            continue;
-        }
-        let mtime = meta_path
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::UNIX_EPOCH);
-        restored.push((mtime, session_id, PathBuf::from(root)));
-    }
-    // Newest first; the cap keeps probe work and emission fan-out bounded.
-    restored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    restored
+    crate::session_vitals_restore::restored_session_candidates(home)
         .into_iter()
-        .take(RESTORED_TARGET_CAP)
-        .filter(|(_, session_id, root)| registry.register_restored(session_id, root.clone()))
+        .filter(|candidate| {
+            registry.register_restored(&candidate.session_id, candidate.root.clone())
+        })
         .count()
 }
 
@@ -1384,15 +1425,21 @@ async fn probe_cached(
 /// backend-agnostic, so the listener runs wherever a bus exists — a
 /// projectless daemon still reports cache and rate-limit vitals for every
 /// session; only the git segment needs a repo target.
+///
+/// `limit_store` (production:
+/// [`crate::session_vitals_restore::account_limit_store_path`]) makes the
+/// per-account rate-limit window store survive restarts: restored here,
+/// rewritten on change. `None` keeps the store memory-only.
 pub(crate) fn spawn_session_vitals_producer(
     bus: EventBus,
     seed_targets: Vec<(String, PathBuf)>,
+    limit_store: Option<PathBuf>,
 ) -> (GitVitalsTargets, tokio::task::JoinHandle<()>) {
     let registry = GitVitalsTargets::default();
     for (session_id, cwd) in seed_targets {
         registry.register(&session_id, cwd);
     }
-    let hub = SessionVitalsHub::new(bus.clone());
+    let hub = SessionVitalsHub::with_limit_store(bus.clone(), limit_store);
     let wake = Arc::new(tokio::sync::Notify::new());
     let _cache_listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
     let _target_maintainer =
@@ -1519,6 +1566,7 @@ fn spawn_git_target_maintainer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_vitals_restore::RESTORED_TARGET_CAP;
 
     fn sh(cwd: &Path, args: &[&str]) {
         let status = std::process::Command::new(args[0])
@@ -1973,6 +2021,47 @@ mod tests {
         }
     }
 
+    /// The context section's percentage: the snapshot's own figure is
+    /// authoritative whenever it says anything, and the one inconsistent
+    /// shape — the native rail's first-turn `budget_pct` 0.0 beside a
+    /// real `tokens_used` (observed live: 4499 tokens / 200k window
+    /// logged as 0.0%) — derives from the section's own tokens/window
+    /// instead of claiming an empty context.
+    #[test]
+    fn context_usage_pct_derives_only_for_the_zero_with_tokens_shape() {
+        let mut main = ModelUsageSnapshot {
+            tokens_used: 4_499,
+            context_window: 200_000,
+            usage_pct: 0.0,
+            ..Default::default()
+        };
+        let derived = context_usage_pct(&main);
+        assert!(
+            (derived - 2.2495).abs() < 0.001,
+            "zero-with-tokens derives tokens/window, got {derived}"
+        );
+
+        // A stated percentage passes through verbatim — external
+        // backends' own figures (managed context) know better.
+        main.usage_pct = 41.5;
+        assert_eq!(context_usage_pct(&main), 41.5);
+
+        // No tokens (guarded earlier by the caller) and no window both
+        // pass the snapshot's figure through unchanged.
+        main.usage_pct = 0.0;
+        main.tokens_used = 0;
+        assert_eq!(context_usage_pct(&main), 0.0);
+        main.tokens_used = 4_499;
+        main.context_window = 0;
+        assert_eq!(context_usage_pct(&main), 0.0);
+
+        // A footprint past the window clamps via the effective window —
+        // never above 100.
+        main.context_window = 2_000;
+        let clamped = context_usage_pct(&main);
+        assert!((clamped - 100.0).abs() < f64::EPSILON);
+    }
+
     #[test]
     fn cache_vitals_hit_math_and_ttl_resolution() {
         // 90 read / 10 fresh → 90% hit; explicit flavor wins.
@@ -2071,6 +2160,7 @@ mod tests {
                 hit_pct: Some(90),
                 last_activity_epoch: 1,
                 ttl_seconds: Some(300),
+                recovered_at_epoch: None,
             })
         });
         // Identical rewrite → no emission.
@@ -2134,6 +2224,7 @@ mod tests {
                 permission_mode: Some("bypassPermissions".into()),
                 permission_kind: Some("bypass".into()),
                 permission_echoed: false,
+                ..Default::default()
             },
         });
         let (sid, config) = tokio::time::timeout(deadline, wait_config(&mut rx))
@@ -2565,7 +2656,7 @@ mod tests {
 
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
         assert_eq!(
             register_restored_session_targets(home.path(), &targets),
             1,
@@ -2618,6 +2709,7 @@ mod tests {
         let (_targets, _producer) = spawn_session_vitals_producer(
             bus.clone(),
             vec![("vcs-session".to_string(), repo_a.path().to_path_buf())],
+            None,
         );
 
         let deadline = std::time::Duration::from_secs(20);
@@ -2763,7 +2855,7 @@ mod tests {
 
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
         targets.register("shared-a", repo.path().to_path_buf());
         targets.register("shared-b", repo.path().to_path_buf());
 
@@ -2813,7 +2905,7 @@ mod tests {
         // Subscribed before the producer spawns, so every change-only hub
         // emission is queued here — sequential waits never miss one.
         let mut rx = bus.subscribe();
-        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
         targets.register("s-fork", root.to_path_buf());
 
         let deadline = std::time::Duration::from_secs(20);
@@ -2880,7 +2972,7 @@ mod tests {
 
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
         targets.register("s-announce", root.to_path_buf());
 
         let deadline = std::time::Duration::from_secs(20);
@@ -2947,7 +3039,7 @@ mod tests {
 
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
         targets.register("supervised-1", root.to_path_buf());
 
         let deadline = std::time::Duration::from_secs(20);
@@ -2988,7 +3080,7 @@ mod tests {
         // (regression: the listener used to die with the git gating,
         // blanking the dashboard's Prompt cache row daemon-wide).
         let bus = EventBus::new();
-        let _producer = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        let _producer = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
         let mut rx = bus.subscribe();
         bus.send(AppEvent::UsageSnapshot {
             session_id: Some("cc-session".into()),
@@ -3479,12 +3571,22 @@ mod tests {
             "permissionMode",
             "permissionKind",
             "permissionEchoed",
+            // Recovered-provenance stamps (instant vitals hydration): the
+            // model/permissions/cache chips caveat disk-hydrated values.
+            "modelRecoveredAtEpoch",
+            "permissionRecoveredAtEpoch",
+            "recoveredAtEpoch",
         ] {
             assert!(
                 catalog.contains(field),
                 "catalog stopped consuming wire field {field} — SessionVitals and VITALS_SYMBOLS drifted"
             );
         }
+        // The recovered caveat itself: one sentence pattern, dated.
+        assert!(
+            catalog.contains("From the session log as of"),
+            "catalog lost the recovered-provenance caveat line"
+        );
         // The permission display kinds (the daemon-side catalog in
         // intendant-core vitals.rs) must each have plain-language copy in
         // the frontend catalog — one vocabulary, two responsibilities.
@@ -3508,6 +3610,30 @@ mod tests {
             assert!(
                 catalog.contains(state),
                 "catalog stopped handling activity state {state}"
+            );
+        }
+        // The context section rides the vitals store (normalize + merge
+        // in this fragment) and feeds the header meter's fallback lane in
+        // fragment 41 — pin both consumers so the wire section can't
+        // silently lose its frontend.
+        for marker in [
+            "src.context",
+            "context: incoming.context || existing.context",
+        ] {
+            assert!(
+                fragment.contains(marker),
+                "fragment 39 stopped carrying vitals.context ({marker})"
+            );
+        }
+        let actions_fragment = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("static/app/41-session-window-actions.js"),
+        )
+        .expect("dashboard session-window-actions fragment");
+        for marker in ["contextPctFromVitals", "vitals?.context", "usagePct"] {
+            assert!(
+                actions_fragment.contains(marker),
+                "fragment 41 lost the context-meter vitals fallback ({marker})"
             );
         }
     }
