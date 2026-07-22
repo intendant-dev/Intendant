@@ -6,7 +6,6 @@
 //! (45 min), garbage collection is time-based (24 h — the ruled §9
 //! rule-8 amendment for liveness kinds), and a reader treats every
 //! field as unverified same-UID input.
-#![cfg_attr(not(test), allow(dead_code))] // C1 PR A: consumed by the PR-B glue; allow dropped as wiring lands.
 
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
@@ -273,6 +272,7 @@ impl DeclarationSpace {
 
     /// The radar's read: every declaration in the space, with the
     /// rule-5 liveness amendment — malformed entries surface by name.
+    #[cfg_attr(not(test), allow(dead_code))] // C2 radar's entry point; write/GC paths are live (C1 PR B).
     pub(crate) fn scan(
         &self,
         now_ms: u64,
@@ -308,7 +308,10 @@ pub(crate) fn scan_dir(
 
 /// Branch names render in radar summaries: printable, bounded, no
 /// control bytes, no leading dash (option-injection hygiene).
-fn valid_branch(s: &str) -> bool {
+/// `pub(crate)`: the lifecycle glue pre-filters its optional branch
+/// hint through the same grammar rather than sinking a declaration on
+/// an exotic branch name.
+pub(crate) fn valid_branch(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 256
         && !s.starts_with('-')

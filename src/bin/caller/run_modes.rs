@@ -888,6 +888,7 @@ pub(crate) async fn run_with_presence(
                         headless: false,
                         context_injection: &context_injection,
                         reload_credentials: None,
+                        coordination_declaration: None,
                     };
                     match apply_external_context_rewind(
                         agent,
@@ -1291,6 +1292,7 @@ pub(crate) async fn run_with_presence(
                         headless: false,
                         context_injection: &context_injection,
                         reload_credentials: None,
+                        coordination_declaration: None,
                     };
                     apply_context_rewind_backout_action(agent, &op, &action_params, &drain_config)
                         .await
@@ -1339,6 +1341,7 @@ pub(crate) async fn run_with_presence(
                         headless: false,
                         context_injection: &context_injection,
                         reload_credentials: None,
+                        coordination_declaration: None,
                     };
                     if is_fission_spawn_action(&op) {
                         apply_fission_spawn_action(agent, &action_params, &drain_config).await
@@ -1470,6 +1473,7 @@ pub(crate) async fn run_with_presence(
                         headless: false,
                         context_injection: &context_injection,
                         reload_credentials: None,
+                        coordination_declaration: None,
                     };
                     persist_codex_service_tier_for_drain(
                         &drain_config,
@@ -1509,6 +1513,7 @@ pub(crate) async fn run_with_presence(
                             headless: false,
                             context_injection: &context_injection,
                             reload_credentials: None,
+                            coordination_declaration: None,
                         };
                         if let Err(error) = persist_live_external_launch_config(
                             agent.as_ref(),
@@ -1556,6 +1561,7 @@ pub(crate) async fn run_with_presence(
                             headless: false,
                             context_injection: &context_injection,
                             reload_credentials: None,
+                            coordination_declaration: None,
                         };
                         if let Err(error) = persist_live_external_launch_config(
                             agent.as_ref(),
@@ -1614,6 +1620,7 @@ pub(crate) async fn run_with_presence(
                             headless: false,
                             context_injection: &context_injection,
                             reload_credentials: None,
+                            coordination_declaration: None,
                         };
                         match persist_external_fork_child_launch_overlay(
                             agent.as_ref(),
@@ -1683,6 +1690,7 @@ pub(crate) async fn run_with_presence(
                                 headless: false,
                                 context_injection: &context_injection,
                                 reload_credentials: None,
+                                coordination_declaration: None,
                             };
                             emit_side_session_started(
                                 &drain_config,
@@ -1778,6 +1786,7 @@ pub(crate) async fn run_with_presence(
                     headless: false,
                     context_injection: &context_injection,
                     reload_credentials: None,
+                    coordination_declaration: None,
                 };
                 if let Some(child_thread_id) =
                     scoped_event_codex_subagent_thread_id(&event_thread_id, &cumulative_stats)
@@ -2715,6 +2724,7 @@ pub(crate) async fn run_with_presence(
                     headless: false,
                     context_injection: &context_injection,
                     reload_credentials: None,
+                    coordination_declaration: None,
                 };
                 let codex_managed_context_enabled =
                     matches!(backend, external_agent::AgentBackend::Codex)

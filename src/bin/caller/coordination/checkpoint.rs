@@ -26,17 +26,28 @@ pub(crate) struct CheckpointSpace {
 impl CheckpointSpace {
     /// Root a space under `<home>/.intendant/coordination/`. `home` is
     /// a parameter (hermetic tests inject tempdirs; the tool edge
-    /// resolves the real home — the repo's hermeticity rule).
+    /// resolves the real home — the repo's hermeticity rule). Production
+    /// edges resolve through `paths::resolve_space_dir` + [`Self::open_at`]
+    /// (the B1 seam), leaving this derivation-included shape to the
+    /// checkpoint tests, which pin it unmodified.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open(
         home: &Path,
         project_root: &Path,
     ) -> Result<CheckpointSpace, CoordinationError> {
         let space = space_key(project_root);
-        let dir = home
-            .join(".intendant")
-            .join("coordination")
-            .join(&space)
-            .join("checkpoints");
+        let space_dir = home.join(".intendant").join("coordination").join(&space);
+        Self::open_at(&space_dir, space)
+    }
+
+    /// Root a space at an already-resolved space dir (the
+    /// `paths::resolve_space_dir` seam — env is read at the caller's
+    /// edge, never here).
+    pub(crate) fn open_at(
+        space_dir: &Path,
+        space: String,
+    ) -> Result<CheckpointSpace, CoordinationError> {
+        let dir = space_dir.join("checkpoints");
         std::fs::create_dir_all(&dir).map_err(io_err)?;
         restrict_dir_modes(&dir)?;
         Ok(CheckpointSpace { dir, space })

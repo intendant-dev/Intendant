@@ -5,7 +5,7 @@
 //! weighs, and expiry is advisory until GC removes the file. The
 //! `daemon` writer name is reserved for the daemon's own lanes
 //! (C2 radar notes); plain writers are refused it here.
-#![cfg_attr(not(test), allow(dead_code))] // C1 PR A: consumed by the C2/C3 lanes + skill; allow dropped as wiring lands.
+#![cfg_attr(not(test), allow(dead_code))] // C1 staging: GC already consumes the scan side; the write/read lanes are C2 (radar notes) / C3 (messages + skill). Drop as that wiring lands.
 
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};

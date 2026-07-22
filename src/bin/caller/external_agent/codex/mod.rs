@@ -617,6 +617,10 @@ impl CodexAgent {
             &self.intendant_mcp_url(port),
             self.mcp_session_id.as_deref(),
             self.mcp_auth_token.as_deref(),
+            // The spawn assigns `working_dir` from the launch config
+            // before building the child env, so the coordination-space
+            // bind rides the same call (None in unit tests → no bind).
+            self.working_dir.as_deref(),
         );
         command.env(
             "INTENDANT_MANAGED_CONTEXT",

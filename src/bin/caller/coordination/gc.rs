@@ -10,8 +10,6 @@
 //! eligible inside `checkpoints/`). Malformed liveness entries are
 //! KEPT and reported — GC deletes only what it can positively
 //! attribute to an expired lifetime, never what it cannot parse.
-#![cfg_attr(not(test), allow(dead_code))] // C1 PR A: consumed by the PR-B daemon wiring; allow dropped as wiring lands.
-
 use std::path::Path;
 
 use super::{declarations, messages, scan, MAX_SCAN_ENTRIES};
@@ -314,5 +312,32 @@ mod tests {
         assert_eq!(report.spaces, 2);
         assert_eq!(report.declarations_removed, 2);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+}
+
+/// Daemon-startup sweep (the `global_store::prune_at_daemon_startup`
+/// pattern): resolve the real state root at the edge, sweep every
+/// space, log one line when anything happened.
+pub(crate) fn sweep_at_daemon_startup() {
+    let root = super::paths::coordination_root(&crate::platform::intendant_home());
+    let report = sweep_all(&root, super::now_ms());
+    if report.removed_anything() || !report.errors.is_empty() || !report.malformed_kept.is_empty() {
+        eprintln!(
+            "[coordination] gc: {} declarations, {} messages, {} temp orphans removed across {} spaces{}{}",
+            report.declarations_removed,
+            report.messages_removed,
+            report.tmp_removed,
+            report.spaces,
+            if report.malformed_kept.is_empty() {
+                String::new()
+            } else {
+                format!("; kept malformed: {}", report.malformed_kept.join(", "))
+            },
+            if report.errors.is_empty() {
+                String::new()
+            } else {
+                format!("; errors: {}", report.errors.join("; "))
+            },
+        );
     }
 }

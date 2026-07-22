@@ -104,6 +104,11 @@ impl TestRig {
             // A host shell exporting the Connect rendezvous URL would make
             // the daemon-lane tests dial out; the suite is no-network.
             .env_remove("INTENDANT_CONNECT_RENDEZVOUS_URL")
+            // Supervised shells (native runtime children, external
+            // backends) inherit a coordination-space bind; honoring it
+            // here would write this rig's session declarations into the
+            // HOST's live bus space instead of the fresh HOME below.
+            .env_remove("INTENDANT_COORDINATION_DIR")
             // The suite is display-free by contract, but a host with a live
             // X session at :0 (a self-hosted runner doubling as a desktop)
             // breaks that hermeticity: the caller's vision probe finds the

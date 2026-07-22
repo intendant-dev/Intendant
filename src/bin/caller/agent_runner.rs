@@ -358,6 +358,9 @@ const RUNTIME_CHILD_BASE_ENV: &[&str] = &[
     // Exact controller→runtime path control; all other INTENDANT_* names
     // default-deny and the spawn site injects its live controls explicitly.
     "INTENDANT_HOME",
+    // Coordination-space bind (Track C): shell children resolve the
+    // session's bus space through this; carries no authority.
+    "INTENDANT_COORDINATION_DIR",
 ];
 
 /// Whether a controller env name may be copied into the runtime's cleared
@@ -768,6 +771,20 @@ async fn run_agent_inner(
     // pipeline got this via `cd <dir> &&` in its spawn shell string.)
     if let Some(workdir) = workdir.filter(|dir| dir.is_dir()) {
         cmd.current_dir(workdir);
+    }
+
+    // Coordination-space bind (Track C): the runtime's shell children
+    // read and write bus files (declarations, messages) via the
+    // coordination skill, so export the session's resolved space dir.
+    // An isolated worktree child thereby lands in its main repo's
+    // space; an inherited override wins (sub-agent seam).
+    if let Some(root) = workdir.filter(|dir| dir.is_dir()) {
+        let (space_dir, _) = crate::coordination::paths::resolve_space_dir(
+            crate::coordination::paths::env_override().as_deref(),
+            &crate::platform::intendant_home(),
+            root,
+        );
+        cmd.env(crate::coordination::paths::COORDINATION_DIR_ENV, &space_dir);
     }
 
     // If sandbox config is provided, serialize it as an env var. The

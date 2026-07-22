@@ -1520,6 +1520,7 @@ impl ExternalAgent for KimiCodeAgent {
                     url,
                     self.mcp_session_id.as_deref(),
                     self.mcp_auth_token.as_deref(),
+                    Some(&config.working_dir),
                 );
             }
             crate::platform::die_with_parent(&mut command);

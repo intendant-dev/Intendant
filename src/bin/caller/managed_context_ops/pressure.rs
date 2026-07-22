@@ -1240,6 +1240,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let snapshot = external_agent::AgentContextSnapshot {
             source: "codex".to_string(),
@@ -1337,6 +1338,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
 
         let snapshot = latest_external_context_snapshot_from_log(&config).expect("snapshot");

@@ -3756,6 +3756,7 @@ impl ExternalAgent for ClaudeCodeAgent {
                 &self.intendant_mcp_url(port),
                 self.mcp_session_id.as_deref(),
                 self.mcp_auth_token.as_deref(),
+                Some(&config.working_dir),
             );
         }
         // An active oauth:claude-code lease materializes a synthesized
