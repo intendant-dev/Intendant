@@ -1619,6 +1619,10 @@ body.context-focus-active {
   cursor: pointer;
 }
 .vx-action:hover { background: var(--surface1); }
+/* A row may carry several actions (the model row's "Change for this
+   session" + "Copy model id"): siblings breathe apart and wrap cleanly
+   on the narrow bottom sheet. */
+.vx-action + .vx-action { margin-left: 8px; }
 /* — The facts card: each fact is an atomic token (a real <button>) that
    never wraps internally (white-space: nowrap); lines wrap BETWEEN
    tokens. Family groups sit a wide gap apart; facts within a group read

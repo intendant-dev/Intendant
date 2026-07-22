@@ -1256,7 +1256,24 @@ const VITALS_SYMBOLS = {
       if (caveat) lines.push(caveat);
       return lines;
     },
-    action: (v) => (v.model ? { label: 'Copy model id', run: () => vitalsCopyText(v.model) } : null),
+    // Model and reasoning effort (with permissions and tools) are
+    // per-session settings, editable through the launch-config sheet for
+    // external-agent sessions — surface that entry point right where a
+    // reader inspecting the model facts goes looking for it. Native
+    // sessions have no sheet, so they get no dead button.
+    action: (v, sessionId) => {
+      const actions = [];
+      const sid = String(sessionId || '').trim();
+      if (sid && sessionConfigSource(sessionConfigMetadata(sid))
+          && typeof window.openSessionConfigModal === 'function') {
+        actions.push({
+          label: 'Change for this session — Launch config...',
+          run: () => window.openSessionConfigModal(sid),
+        });
+      }
+      if (v.model) actions.push({ label: 'Copy model id', run: () => vitalsCopyText(v.model) });
+      return actions.length ? actions : null;
+    },
   },
   permissions: {
     label: 'Permissions',
@@ -2653,7 +2670,12 @@ function vxExplainerRow(spec) {
     }
     body.appendChild(desc);
   }
-  if (spec.action) body.appendChild(vxActionButton(spec.action));
+  // A symbol may carry one action or several (the model row pairs
+  // "Change for this session" with "Copy model id") — each renders as
+  // its own button.
+  for (const action of Array.isArray(spec.action) ? spec.action : (spec.action ? [spec.action] : [])) {
+    body.appendChild(vxActionButton(action));
+  }
   row.appendChild(body);
   if (spec.onTap && !spec.absent) {
     row.setAttribute('role', 'button');
