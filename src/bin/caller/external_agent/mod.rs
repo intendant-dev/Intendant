@@ -170,11 +170,21 @@ pub(crate) fn intendant_bootstrap_mcp_url_at(
 /// without putting the secret on argv. With these set,
 /// `"$INTENDANT" ctl ...` works from any backend's shell without further
 /// configuration.
+///
+/// `project_root` (the backend's working dir) additionally binds the
+/// session's coordination space (Track C §3.6): this is the ruled
+/// plumbing site for all four external backends — the child's shell
+/// resolves the bus through `INTENDANT_COORDINATION_DIR` instead of
+/// re-deriving the space key. An override already on the supervisor's
+/// own env wins (a supervised controller keeps its parent's space);
+/// the var carries no authority. `None` (tests, portless spawns)
+/// skips the bind — and the env read — entirely.
 pub(super) fn add_intendant_bootstrap_env(
     command: &mut tokio::process::Command,
     mcp_url: &str,
     session_id: Option<&str>,
     mcp_token: Option<&str>,
+    project_root: Option<&std::path::Path>,
 ) {
     command.env("INTENDANT_MCP_URL", mcp_url);
     if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
@@ -189,6 +199,14 @@ pub(super) fn add_intendant_bootstrap_env(
     }
     if let Ok(current_exe) = std::env::current_exe() {
         command.env("INTENDANT", current_exe);
+    }
+    if let Some(root) = project_root.filter(|dir| dir.is_dir()) {
+        let (space_dir, _) = crate::coordination::paths::resolve_space_dir(
+            crate::coordination::paths::env_override().as_deref(),
+            &crate::platform::intendant_home(),
+            root,
+        );
+        command.env(crate::coordination::paths::COORDINATION_DIR_ENV, space_dir);
     }
 }
 
@@ -2261,6 +2279,7 @@ mod tests {
             "http://localhost:1/mcp?x",
             Some("sess-1"),
             Some("process-token"),
+            None, // no project root → no coordination bind (and no env/home read)
         );
 
         let envs: Vec<(OsString, Option<OsString>)> = command
@@ -2305,6 +2324,52 @@ mod tests {
             Some(OsString::from(
                 crate::web_gateway::session_scoped_mcp_token("process-token", "sess-1")
             ))
+        );
+        assert!(
+            set_value_for(crate::coordination::paths::COORDINATION_DIR_ENV).is_none(),
+            "no project root → no coordination bind"
+        );
+    }
+
+    /// The §3.6 external plumbing site: a project root binds the child's
+    /// `INTENDANT_COORDINATION_DIR`. Hermetic — the supervisor-side
+    /// override is set (under the env lock), so resolution short-circuits
+    /// before any home-dir or git access.
+    #[test]
+    fn bootstrap_env_binds_coordination_space_for_supervised_children() {
+        use std::ffi::{OsStr, OsString};
+
+        let _env = crate::test_support::TEST_ENV_LOCK.blocking_lock();
+        let var = crate::coordination::paths::COORDINATION_DIR_ENV;
+        let saved = std::env::var_os(var);
+        let tmp = tempfile::tempdir().unwrap();
+        let space = tmp.path().join("proj-0011223344556677");
+        std::fs::create_dir_all(&space).unwrap();
+        std::env::set_var(var, &space);
+
+        let mut command = tokio::process::Command::new("true");
+        add_intendant_bootstrap_env(
+            &mut command,
+            "http://localhost:1/mcp?x",
+            Some("sess-1"),
+            None,
+            Some(tmp.path()),
+        );
+
+        match &saved {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+
+        let bound = command
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == OsStr::new(var))
+            .and_then(|(_, v)| v.map(OsString::from));
+        assert_eq!(
+            bound,
+            Some(space.as_os_str().to_os_string()),
+            "supervisor override rides through to the child verbatim"
         );
     }
 

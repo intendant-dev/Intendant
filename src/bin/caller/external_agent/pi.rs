@@ -524,6 +524,7 @@ impl ExternalAgent for PiAgent {
                 &url,
                 self.mcp_session_id.as_deref(),
                 self.mcp_auth_token.as_deref(),
+                Some(&config.working_dir),
             );
         }
         if let Some(dir) = crate::credential_leases::materialized_pi_agent_dir() {
