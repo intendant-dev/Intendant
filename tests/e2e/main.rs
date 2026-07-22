@@ -5133,15 +5133,16 @@ async fn headless_rollback_writes_a_conversation_rewound_cut() {
     use futures_util::SinkExt;
 
     let rig = TestRig::new();
+    let client_attached = rig.home.path().join("rollback-client-attached");
     let script = rig.write_script(&serde_json::json!({
         "profiles": [{
             "steps": [
                 // The boot task starts before any websocket can connect,
                 // and rail events do not replay to late joiners — the
-                // scripted think-time holds the question back until this
-                // test's connection is up.
+                // file barrier holds the question back until this test's
+                // connection is up, without a scheduler-dependent sleep.
                 { "content": "Need input before charting.",
-                  "delay_ms": 8_000,
+                  "wait_for_file": client_attached,
                   "tool_calls": [{ "name": "ask_human",
                                    "arguments": { "nonce": 1, "question": "Which payload?" } }] },
                 { "content": "Round one done, payload chosen.",
@@ -5195,6 +5196,7 @@ async fn headless_rollback_writes_a_conversation_rewound_cut() {
     ))
     .await
     .expect("connect /ws");
+    std::fs::write(&client_attached, b"ready").expect("release mock provider barrier");
 
     let question = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
         json.get("event").and_then(|v| v.as_str()) == Some("user_question")

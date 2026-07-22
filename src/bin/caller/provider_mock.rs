@@ -42,10 +42,12 @@ use crate::error::CallerError;
 use crate::provider::{ChatProvider, ChatResponse, TokenUsage, ToolCall};
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 pub const MOCK_SCRIPT_ENV: &str = "INTENDANT_MOCK_SCRIPT";
+const MOCK_FILE_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
 struct MockScript {
@@ -95,6 +97,12 @@ struct MockStep {
     /// `user_question`) to late-joining websockets.
     #[serde(default)]
     delay_ms: u64,
+    /// Optional deterministic test barrier. The step does not answer until
+    /// this file exists, or fails loudly after a bounded wait. This is the
+    /// race-free counterpart to `delay_ms` for boot-started tasks whose
+    /// non-replayed rail events require a client to attach first.
+    #[serde(default)]
+    wait_for_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,6 +234,29 @@ impl ChatProvider for MockProvider {
         let step = &profile.steps[step_index];
         if step.delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(step.delay_ms)).await;
+        }
+        if let Some(path) = &step.wait_for_file {
+            let deadline = tokio::time::Instant::now() + MOCK_FILE_BARRIER_TIMEOUT;
+            loop {
+                match std::fs::metadata(path) {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(CallerError::Config(format!(
+                            "mock step file barrier {} is unreadable: {error}",
+                            path.display()
+                        )));
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(CallerError::Config(format!(
+                        "mock step timed out after {}s waiting for file barrier {}",
+                        MOCK_FILE_BARRIER_TIMEOUT.as_secs(),
+                        path.display()
+                    )));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
         }
 
         // Plausible non-zero usage so budget and usage accounting run.
@@ -375,6 +406,47 @@ mod tests {
         conversation.push(message("tool", "exit 1 — command not found"));
         let err = provider.chat(&conversation).await.unwrap_err().to_string();
         assert!(err.contains("mock expectation failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn file_barrier_holds_a_step_until_the_test_releases_it() {
+        let dir = tempfile::tempdir().expect("barrier temp dir");
+        let barrier = dir.path().join("client-attached");
+        let provider = std::sync::Arc::new(
+            MockProvider::from_json(
+                &serde_json::json!({
+                    "profiles": [{
+                        "steps": [{
+                            "wait_for_file": barrier,
+                            "content": "released"
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .expect("valid barrier script"),
+        );
+        let chat = {
+            let provider = std::sync::Arc::clone(&provider);
+            tokio::spawn(async move {
+                provider
+                    .chat(&[message("user", "wait for the client")])
+                    .await
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !chat.is_finished(),
+            "step escaped before its barrier existed"
+        );
+        std::fs::write(&barrier, b"ready").expect("release barrier");
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), chat)
+            .await
+            .expect("barrier release should wake the step")
+            .expect("chat task should not panic")
+            .expect("released step should answer");
+        assert_eq!(response.content, "released");
     }
 
     #[test]

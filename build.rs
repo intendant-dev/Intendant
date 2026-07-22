@@ -284,6 +284,18 @@ impl WasmCrate {
 }
 
 fn main() {
+    // MSVC's default executable stack reserve is 1 MiB, while the Unix
+    // controller builds run their `#[tokio::main]` future on an 8 MiB main
+    // thread. Intendant's large startup/dispatch future can legitimately
+    // exceed the Windows default before Tokio moves work onto worker threads;
+    // reserve the same 8 MiB virtual range for the controller only. Windows
+    // commits stack pages on demand, so this does not add 8 MiB of resident
+    // memory to every process. The smaller runtime and Connect binaries keep
+    // the platform default.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bin=intendant=/STACK:8388608");
+    }
+
     // Assemble static/app.html from the static/app/ fragments (see
     // crates/app-html-assembler) before anything compiles, so the
     // `include_str!` embed in web_gateway/static_assets.rs always matches the
