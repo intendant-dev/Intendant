@@ -370,6 +370,7 @@ pub(crate) enum RouteHandlerId {
     AgendaOp,
     /// Raw bytes of one parked-ask preview blob (agenda blob store).
     AgendaBlobRaw,
+    AgendaRefDrift,
     /// Merge-patch the owner's reminder delivery policy.
     AgendaReminderPolicy,
     /// Bounded Memory claim search (q/limit/candidates query params).
@@ -938,6 +939,26 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::AgendaBlobRaw,
         "Fetch one parked-ask preview blob's raw bytes (attachment; MIME sniffing disabled)",
     ),
+    // Expand-time drift check of one item's file refs (G1): re-hashes each
+    // file ref against its recorded attach digest ON DEMAND — the detail
+    // view's honesty check, deliberately never part of the list snapshot
+    // (no per-row IO). Read-only; nothing is stored.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/agenda/items",
+            &[
+                SegmentSpec::Capture("item_id"),
+                SegmentSpec::Literal("refs"),
+                SegmentSpec::Literal("drift"),
+            ],
+        ),
+        PeerOperation::AgendaRead,
+        BodyPolicy::None,
+        RouteHandlerId::AgendaRefDrift,
+        "Re-hash one item's file refs against their attach digests (expand-time drift check)",
+    )
+    .with_tunnel(tunnel_method("api_agenda_ref_drift")),
     // Reminder delivery policy is owner policy, not agenda authorship:
     // it rides the Settings operation (quiet hours and urgency decide how
     // loudly the daemon speaks — the same class as its other knobs), so

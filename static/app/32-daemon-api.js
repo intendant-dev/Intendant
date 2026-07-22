@@ -180,6 +180,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_session_current_rollback: { verb: 'POST', path: '/api/session/current/rollback' },
   api_agenda_list: { verb: 'GET', path: '/api/agenda' },
   api_agenda_op: { verb: 'POST', path: '/api/agenda/op' },
+  api_agenda_ref_drift: { verb: 'GET', path: '/api/agenda/items/{item_id}/refs/drift' },
   api_agenda_reminder_policy: { verb: 'POST', path: '/api/agenda/reminders/policy' },
   api_memory_search: { verb: 'GET', path: '/api/memory/search', query: ['q', 'limit', 'candidates'] },
   api_memory_claim: { verb: 'GET', path: '/api/memory/claim', query: ['id'] },
