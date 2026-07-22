@@ -123,7 +123,7 @@ const PROBER_CACHE_CAP: usize = 256;
 
 /// The one `git status` invocation both dirty-state surfaces run: the
 /// vitals prober (async, per-tick) and the Changes tab's working-tree
-/// fallback (sync, per request) spawn exactly these arguments and feed
+/// lane (sync, per request) spawn exactly these arguments and feed
 /// the output to [`parse_status_v2`], so "what counts as dirty" — the
 /// chip's count and the tab's file list — is a single definition.
 pub(crate) const GIT_STATUS_ARGS: [&str; 4] = [
@@ -164,7 +164,7 @@ pub(crate) struct StatusFacts {
     /// `branch.head`, mapped to the spellings the old
     /// `rev-parse --abbrev-ref HEAD` emitted: `HEAD` when detached, empty
     /// on an unborn branch (where the old probe failed).
-    branch: String,
+    pub(crate) branch: String,
     /// `branch.oid`: HEAD's sha — the merge-parity cache key's HEAD side.
     /// `None` on an unborn branch (`(initial)`).
     head_oid: Option<String>,
@@ -309,7 +309,7 @@ pub(crate) fn parse_status_v2(output: &str) -> StatusFacts {
 }
 
 /// Synchronous working-tree status for `root` — the Changes tab's
-/// fallback lane runs this on blocking paths (HTTP handler thread,
+/// working-tree lane runs this on blocking paths (HTTP handler thread,
 /// tunnel `spawn_blocking`). Same arguments, same parser as the async
 /// vitals probe, so both surfaces state the same dirty set. `None` when
 /// `root` is not a git checkout or git itself fails.
@@ -1319,6 +1319,19 @@ impl GitVitalsTargets {
             .collect()
     }
 
+    /// One session's effective probe target — the checkout the dirty chip
+    /// is counting right now (activity locus when one is active, else the
+    /// registered root). Read-side lanes (the Changes tab's working-tree
+    /// list) resolve through this so they state the SAME checkout as the
+    /// chip; `None` for unregistered ids.
+    pub(crate) fn effective_for(&self, session_id: &str) -> Option<PathBuf> {
+        self.targets
+            .lock()
+            .expect("git vitals targets lock")
+            .get(session_id.trim())
+            .map(|target| target.effective())
+    }
+
     /// Fold a session's write activity into its locus state (no-op for
     /// unregistered ids).
     fn observe_write_activity(&self, session_id: &str, paths: &[String]) {
@@ -1354,6 +1367,27 @@ impl GitVitalsTargets {
         target.candidate = None;
         Some(target.registered_root.clone())
     }
+}
+
+/// The daemon's live git-target registry, published once at startup for
+/// read-side lanes that must state the same checkout the vitals prober
+/// probes (the Changes tab's working-tree list — see
+/// `web_gateway::routes_sessions`). Same precedent as
+/// `file_watcher`'s live-watcher registry: request handlers have no
+/// path to the startup wiring, so the edge publishes and the transport
+/// edge reads. Tests never publish — resolution seams take the registry
+/// as a parameter and inject their own.
+static PUBLISHED_GIT_TARGETS: OnceLock<GitVitalsTargets> = OnceLock::new();
+
+/// Publish the daemon's live registry (first publisher wins; the daemon
+/// startup paths create exactly one registry per process).
+pub(crate) fn publish_git_vitals_targets(registry: &GitVitalsTargets) {
+    let _ = PUBLISHED_GIT_TARGETS.set(registry.clone());
+}
+
+/// The published live registry, when a daemon startup path wired one.
+pub(crate) fn published_git_vitals_targets() -> Option<&'static GitVitalsTargets> {
+    PUBLISHED_GIT_TARGETS.get()
 }
 
 /// Register git-probe targets for sessions RESTORED from the on-disk
@@ -2590,6 +2624,31 @@ mod tests {
         // Unregistered ids are a calm no-op.
         targets.seed_locus("nope", &worktree);
         assert_eq!(targets.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn effective_for_states_the_chips_checkout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let worktree = repo.join(".claude/worktrees/wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
+
+        let targets = GitVitalsTargets::default();
+        assert_eq!(targets.effective_for("s1"), None, "unregistered id");
+
+        targets.register("s1", repo.clone());
+        assert_eq!(targets.effective_for("s1"), Some(repo.clone()));
+
+        // The activity locus IS the effective target — the same value the
+        // prober snapshot probes, so a reader resolves the chip's checkout.
+        targets.seed_locus("s1", &worktree.join("src"));
+        assert_eq!(targets.effective_for("s1"), Some(worktree.clone()));
+        assert_eq!(targets.snapshot()[0].1, worktree);
+
+        assert_eq!(targets.effective_for("  s1  "), Some(worktree));
+        assert_eq!(targets.effective_for("other"), None);
     }
 
     /// Seed one restored-session record (`session_meta.json`) under

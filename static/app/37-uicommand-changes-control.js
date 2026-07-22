@@ -301,12 +301,41 @@ function processCommands(cmds) {
 
 // ── Changes sub-tab ──
 
-const changedFiles = new Map(); // path -> {kind, lines_added, lines_removed, diff_available, reason}
+const changedFiles = new Map(); // path -> {kind, lines_added, lines_removed, diff_available, reason, origin}
+// Working-tree summary from the last list response: the target
+// checkout's uncommitted totals ({checkout, branch, total, listed,
+// truncated}) — the same git-status truth the vitals dirty chip counts.
+// null until a list response carries one (non-git targets never do).
+let changesWorkingTree = null;
 let activeChangesFile = null;
 let changesRefreshTimer = null;
 let changesRefreshSeq = 0;
 let changesRenderFrame = null;
 let pendingChangesAutoSelect = null;
+
+// Split the changed-files map into the session-edit rows and the
+// working-tree rows (records the daemon's git lane tagged
+// origin:"working_tree" — uncommitted files the session-scoped sources
+// don't cover), each sorted by path.
+function changesEntriesByOrigin() {
+  const session = [];
+  const workingTree = [];
+  for (const entry of [...changedFiles.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    ((entry[1] && entry[1].origin === 'working_tree') ? workingTree : session).push(entry);
+  }
+  return { session, workingTree };
+}
+
+// The list pane's honest empty-state line: only claim "no changes" when
+// BOTH the session sources and the working tree are empty — and say the
+// working tree is clean when that is affirmatively known (total 0 from
+// the same status parse the dirty chip counts).
+function changesEmptyStateMessage() {
+  if (changesWorkingTree && Number(changesWorkingTree.total) === 0) {
+    return 'No file changes yet — the working tree is clean.';
+  }
+  return 'No file changes yet';
+}
 
 // A session's backend reported a commit/push/merge/rebase. The daemon
 // side already woke the git prober (the chip arrives via session_vitals);
@@ -338,7 +367,11 @@ function sessionIdTargetsCurrentChanges(eventSid) {
 }
 
 function onFileChanged(path, kind, linesAdded, linesRemoved) {
-  changedFiles.set(path, { kind, lines_added: linesAdded, lines_removed: linesRemoved });
+  // Watcher push events are session edits by definition (only the
+  // session's tracked root gets fs events) — a path previously listed
+  // from the working-tree lane upgrades to a session edit here, and the
+  // next list refresh re-derives both realms from the daemon.
+  changedFiles.set(path, { kind, lines_added: linesAdded, lines_removed: linesRemoved, origin: 'session' });
   if (isChangesSubtabActive() && !activeChangesFile) {
     pendingChangesAutoSelect = path;
   }
@@ -393,29 +426,65 @@ function changesStatsHtml(info) {
   return `<span class="changes-stats">+${info.lines_added} &minus;${info.lines_removed}</span>`;
 }
 
-function renderChangesFileList(emptyMessage = 'No file changes yet') {
+function changesFileEntryHtml(path, info) {
+  const active = path === activeChangesFile ? ' active' : '';
+  const workingTree = info.origin === 'working_tree' ? ' working-tree' : '';
+  const initial = info.kind === 'created' ? 'A'
+    : info.kind === 'deleted' ? 'D'
+    : info.kind === 'external' ? 'X'
+    : 'M';
+  const badge = `<span class="kind-badge ${info.kind}">${initial}</span>`;
+  const stats = changesStatsHtml(info);
+  const parts = path.split('/');
+  const name = parts.pop();
+  const dir = parts.length > 0 ? parts.join('/') + '/' : '';
+  return `<button type="button" class="changes-file-entry${workingTree}${active}" data-path="${escapeHtml(path)}" title="${escapeHtml(path)}">`
+    + `${badge}<span class="changes-file-name">${escapeHtml(name)}</span>${stats}`
+    + `<span class="changes-file-dir">${escapeHtml(dir)}</span></button>`;
+}
+
+function renderChangesFileList(emptyMessage = null) {
   const container = document.getElementById('changes-file-list');
   if (!container) return;
   if (changedFiles.size === 0) {
-    container.innerHTML = `<div class="changes-empty">${escapeHtml(emptyMessage)}</div>`;
+    const message = emptyMessage || changesEmptyStateMessage();
+    container.innerHTML = `<div class="changes-empty">${escapeHtml(message)}</div>`;
     return;
   }
-  const sorted = [...changedFiles.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-  container.innerHTML = sorted.map(([path, info]) => {
-    const active = path === activeChangesFile ? ' active' : '';
-    const initial = info.kind === 'created' ? 'A'
-      : info.kind === 'deleted' ? 'D'
-      : info.kind === 'external' ? 'X'
-      : 'M';
-    const badge = `<span class="kind-badge ${info.kind}">${initial}</span>`;
-    const stats = changesStatsHtml(info);
-    const parts = path.split('/');
-    const name = parts.pop();
-    const dir = parts.length > 0 ? parts.join('/') + '/' : '';
-    return `<button type="button" class="changes-file-entry${active}" data-path="${escapeHtml(path)}" title="${escapeHtml(path)}">`
-      + `${badge}<span class="changes-file-name">${escapeHtml(name)}</span>${stats}`
-      + `<span class="changes-file-dir">${escapeHtml(dir)}</span></button>`;
-  }).join('');
+  const { session, workingTree } = changesEntriesByOrigin();
+  const rows = (entries) => entries.map(([path, info]) => changesFileEntryHtml(path, info)).join('');
+  let html;
+  if (workingTree.length === 0) {
+    // Session edits only — the classic single-list look.
+    html = rows(session);
+  } else {
+    // Two realms on one pane, each labeled: the session's own tracked
+    // edits, then the checkout's uncommitted set (the dirty chip's
+    // count). The session realm states its own emptiness so an empty
+    // edit stream never contradicts a populated working tree.
+    const summary = changesWorkingTree || {};
+    const total = Number(summary.total) || workingTree.length;
+    const checkout = String(summary.checkout || '').trim();
+    const headTitle = 'Files with uncommitted git changes in '
+      + (checkout || 'the session’s checkout')
+      + ' — the working tree the dirty indicator counts. Not necessarily edited by this session.';
+    html = '<div class="changes-section-label">Session edits</div>'
+      + (session.length
+        ? rows(session)
+        : '<div class="changes-empty-note">No edits tracked from this session yet.</div>')
+      + `<div class="changes-section-label" title="${escapeHtml(headTitle)}">Uncommitted in working tree`
+      + `<span class="changes-section-count">${total}</span>`
+      + (checkout ? `<span class="changes-section-checkout">${escapeHtml(checkout)}</span>` : '')
+      + '</div>'
+      + rows(workingTree);
+    if (total > workingTree.length) {
+      const note = summary.truncated
+        ? `Showing the first ${workingTree.length} of ${total} uncommitted files.`
+        : `${total - workingTree.length} of ${total} uncommitted file${total === 1 ? '' : 's'} appear${total - workingTree.length === 1 ? 's' : ''} under session edits.`;
+      html += `<div class="changes-empty-note">${escapeHtml(note)}</div>`;
+    }
+  }
+  container.innerHTML = html;
   container.querySelectorAll('.changes-file-entry').forEach(entry => {
     entry.addEventListener('click', () => selectChangesFile(entry.dataset.path || ''));
   });
@@ -428,6 +497,7 @@ function resetChangesPane(message = 'No file changes yet') {
   }
   pendingChangesAutoSelect = null;
   changedFiles.clear();
+  changesWorkingTree = null;
   activeChangesFile = null;
   renderChangesFileList(message);
   renderChangesDiffHeader(null);
@@ -525,6 +595,7 @@ function fetchChangesResponse(path = '') {
 function showChangesTargetMismatch(message) {
   activeChangesFile = null;
   changedFiles.clear();
+  changesWorkingTree = null;
   renderChangesFileList(message || 'Change tracking unavailable for selected target');
   const header = document.getElementById('changes-diff-header');
   if (header) header.textContent = 'Change tracking unavailable';
@@ -549,17 +620,24 @@ async function refreshChangesList(options = {}) {
     const data = await parseChangesResponse(resp);
     if (seq !== changesRefreshSeq) return;
     changedFiles.clear();
-    if (Array.isArray(data)) {
-      for (const item of data) {
-        if (!item || !item.path) continue;
-        changedFiles.set(item.path, {
-          kind: item.kind || 'modified',
-          lines_added: item.lines_added || 0,
-          lines_removed: item.lines_removed || 0,
-          diff_available: item.diff_available !== false,
-          reason: item.reason || '',
-        });
-      }
+    // List shape: `{files: [...], working_tree: {...}?}` (the envelope);
+    // a bare array (the pre-envelope daemon shape) still parses.
+    const items = Array.isArray(data) ? data
+      : (data && Array.isArray(data.files)) ? data.files
+      : [];
+    changesWorkingTree = (!Array.isArray(data) && data && typeof data.working_tree === 'object')
+      ? data.working_tree
+      : null;
+    for (const item of items) {
+      if (!item || !item.path) continue;
+      changedFiles.set(item.path, {
+        kind: item.kind || 'modified',
+        lines_added: item.lines_added || 0,
+        lines_removed: item.lines_removed || 0,
+        diff_available: item.diff_available !== false,
+        reason: item.reason || '',
+        origin: item.origin === 'working_tree' ? 'working_tree' : 'session',
+      });
     }
 
     if (activeChangesFile && !changedFiles.has(activeChangesFile)) {
@@ -578,7 +656,7 @@ async function refreshChangesList(options = {}) {
       renderChangesDiffHeader(null);
       const content = document.getElementById('changes-diff-content');
       if (content) {
-        const msg = changedFiles.size ? 'Select a file to view changes' : 'No file changes yet';
+        const msg = changedFiles.size ? 'Select a file to view changes' : changesEmptyStateMessage();
         content.innerHTML = `<span class="changes-empty">${escapeHtml(msg)}</span>`;
       }
     }
@@ -621,6 +699,7 @@ async function selectChangesFile(path, options = {}) {
         lines_removed: data.lines_removed || 0,
         diff_available: data.diff_available !== false,
         reason: data.reason || '',
+        origin: prev.origin || (data.origin === 'working_tree' ? 'working_tree' : 'session'),
       });
       renderChangesFileList();
       stationScheduleUpdate();
