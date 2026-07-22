@@ -149,6 +149,11 @@ pub(crate) async fn run_daemon(
         vitals_git_seed,
         Some(crate::session_vitals_restore::account_limit_store_path()),
     );
+    // Publish the live registry for read-side lanes: the Changes tab's
+    // working-tree list resolves a session's checkout through the SAME
+    // effective target the dirty chip probes (activity locus included),
+    // so the chip and the tab can never state different checkouts.
+    session_vitals::publish_git_vitals_targets(&vitals_git_targets);
     // Restored sessions: a restart empties the target registry, so idle
     // session windows lose their git/health chips until the next resume.
     // One bounded walk (newest-first, insert-if-absent — see

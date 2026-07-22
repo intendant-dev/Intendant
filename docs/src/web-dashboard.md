@@ -257,8 +257,14 @@ Five visible views (the first retains the internal `log` id for compatibility):
 - **Context** — the agent's current working context (what it is operating on).
 - **Managed** — operator console for managed-Codex context maintenance (see
   below).
-- **Changes** — file changes / diffs produced during the session (with its own
-  badge when new changes land).
+- **Changes** — file changes / diffs, in two labeled realms: the session's own
+  tracked edits (rewind baseline / external diff log) and **Uncommitted in
+  working tree** — the target session's checkout's git-dirty set (the same
+  status parse, and the same effective checkout, the vitals dirty chip counts,
+  activity locus included; capped at 200 rows with an honest truncation note).
+  The empty state only claims "no changes" when both realms are empty, and
+  affirms a clean working tree when that is known. Has its own badge when new
+  changes land.
 - **Control** — direct controls for steering the run.
 
 Session-window headers carry a **vitals chip** (the operator-statusline
