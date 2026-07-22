@@ -966,6 +966,24 @@ fn epoch_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+/// Context-section percentage for one usage snapshot. The snapshot's own
+/// `usage_pct` is authoritative when it says anything — external backends
+/// compute it from this very footprint, and some (Codex managed context)
+/// know better than a naive division. The exception is the
+/// zero-with-tokens shape: the native usage rail's `usage_pct` mirrors
+/// `TurnStarted.budget_pct`, which is 0.0 on a session's FIRST turn while
+/// `tokens_used` is already real (the budget figure lags one turn) — the
+/// context section must not claim an empty window beside a stated
+/// footprint, so that one inconsistent shape derives the percentage from
+/// the section's own tokens/window instead (clamped like every producer).
+fn context_usage_pct(main: &ModelUsageSnapshot) -> f64 {
+    if main.usage_pct > 0.0 || main.tokens_used == 0 || main.context_window == 0 {
+        return main.usage_pct;
+    }
+    let effective_window = main.context_window.max(main.tokens_used);
+    (main.tokens_used as f64 / effective_window as f64) * 100.0
+}
+
 /// Fold one usage snapshot into a session's cache section. Returns `None`
 /// when the snapshot carries no per-request cache sample (nothing to
 /// learn). `previous_ttl` keeps the last known TTL flavor across read-only
@@ -1050,7 +1068,7 @@ pub(crate) fn spawn_cache_vitals_listener(
                             vitals.context = Some(crate::types::SessionContextVitals {
                                 tokens_used: main.tokens_used,
                                 context_window: main.context_window,
-                                usage_pct: main.usage_pct,
+                                usage_pct: context_usage_pct(&main),
                                 observed_at_epoch: now_epoch,
                                 recovered_at_epoch: None,
                             });
@@ -2001,6 +2019,47 @@ mod tests {
             cache_ttl_seconds: ttl,
             ..Default::default()
         }
+    }
+
+    /// The context section's percentage: the snapshot's own figure is
+    /// authoritative whenever it says anything, and the one inconsistent
+    /// shape — the native rail's first-turn `budget_pct` 0.0 beside a
+    /// real `tokens_used` (observed live: 4499 tokens / 200k window
+    /// logged as 0.0%) — derives from the section's own tokens/window
+    /// instead of claiming an empty context.
+    #[test]
+    fn context_usage_pct_derives_only_for_the_zero_with_tokens_shape() {
+        let mut main = ModelUsageSnapshot {
+            tokens_used: 4_499,
+            context_window: 200_000,
+            usage_pct: 0.0,
+            ..Default::default()
+        };
+        let derived = context_usage_pct(&main);
+        assert!(
+            (derived - 2.2495).abs() < 0.001,
+            "zero-with-tokens derives tokens/window, got {derived}"
+        );
+
+        // A stated percentage passes through verbatim — external
+        // backends' own figures (managed context) know better.
+        main.usage_pct = 41.5;
+        assert_eq!(context_usage_pct(&main), 41.5);
+
+        // No tokens (guarded earlier by the caller) and no window both
+        // pass the snapshot's figure through unchanged.
+        main.usage_pct = 0.0;
+        main.tokens_used = 0;
+        assert_eq!(context_usage_pct(&main), 0.0);
+        main.tokens_used = 4_499;
+        main.context_window = 0;
+        assert_eq!(context_usage_pct(&main), 0.0);
+
+        // A footprint past the window clamps via the effective window —
+        // never above 100.
+        main.context_window = 2_000;
+        let clamped = context_usage_pct(&main);
+        assert!((clamped - 100.0).abs() < f64::EPSILON);
     }
 
     #[test]

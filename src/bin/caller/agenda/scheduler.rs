@@ -28,6 +28,28 @@ const SAFETY_TICK: std::time::Duration = std::time::Duration::from_secs(300);
 /// is exactly the RFC's "session creation is idempotent by occurrence id".
 const DELEGATION_PREFIX: &str = "agenda-occ-";
 
+/// Cap on remembered pre-receipt session outcomes. Terminal events are
+/// rare (one per session end), and most remembered entries belong to
+/// non-scheduled sessions whose receipts never come — the cap simply
+/// bounds that residue; eviction is oldest-first.
+const EARLY_OUTCOME_CAP: usize = 64;
+
+/// A session's terminal event observed BEFORE its `TaskReceived` receipt
+/// — the fast-spawn inversion: `start_new_session` dispatches the child
+/// loop and returns before the supervisor's executor emits the receipt,
+/// so a fast first turn (mock-speed sessions; a loaded box descheduling
+/// the executor) can land `DoneSignal` on the bus first. Dropping such a
+/// completion strands the occurrence as running-forever (supervised
+/// sessions park after done — no `SessionEnded` ever follows to resolve
+/// it); remembering it lets the receipt complete the arc in order
+/// (started → terminal) whichever event wins the race.
+struct EarlyOutcome {
+    /// `None` = completed normally (note carries the done message);
+    /// `Some(reason)` = the session ended without finishing.
+    failed: Option<String>,
+    note: String,
+}
+
 /// In-flight scheduled-session bookkeeping (in-memory; the journal is the
 /// durable truth, and a restart resolves both maps fail-closed).
 #[derive(Default)]
@@ -37,6 +59,11 @@ struct SchedulerState {
     awaiting: HashMap<String, SpawnOccurrence>,
     /// Receipt seen, session running: session id → spawn facts.
     running: HashMap<String, SpawnOccurrence>,
+    /// Terminal events that arrived before their receipt, session id →
+    /// outcome, insertion-ordered for the cap eviction (see
+    /// [`EarlyOutcome`]). First terminal per session wins; consumed by
+    /// the receipt.
+    early_outcomes: Vec<(String, EarlyOutcome)>,
 }
 
 impl SchedulerState {
@@ -46,6 +73,27 @@ impl SchedulerState {
             .cloned()
             .chain(self.running.values().map(|s| s.occurrence_id.clone()))
             .collect()
+    }
+
+    /// Remember a terminal event no running entry claimed (first one per
+    /// session wins — a `DoneSignal` must not be downgraded by the
+    /// parked session's eventual `SessionEnded`).
+    fn remember_early_outcome(&mut self, session_id: &str, outcome: EarlyOutcome) {
+        if self.early_outcomes.iter().any(|(id, _)| id == session_id) {
+            return;
+        }
+        self.early_outcomes.push((session_id.to_string(), outcome));
+        if self.early_outcomes.len() > EARLY_OUTCOME_CAP {
+            self.early_outcomes.remove(0);
+        }
+    }
+
+    fn take_early_outcome(&mut self, session_id: &str) -> Option<EarlyOutcome> {
+        let index = self
+            .early_outcomes
+            .iter()
+            .position(|(id, _)| id == session_id)?;
+        Some(self.early_outcomes.remove(index).1)
     }
 }
 
@@ -369,6 +417,16 @@ fn observe_event(
             );
             record_on_item(handle, &spawn, "started", Some(session_id.clone()), None);
             state.running.insert(session_id.clone(), spawn);
+            // The session's terminal event can beat this receipt onto the
+            // bus (the fast-spawn inversion — see [`EarlyOutcome`]): a
+            // remembered outcome resolves the occurrence now, keeping the
+            // journal arc in order (started, then the terminal).
+            if let Some(early) = state.take_early_outcome(session_id) {
+                match early.failed {
+                    None => complete_running(handle, journal, state, session_id, early.note),
+                    Some(reason) => fail_running(handle, journal, state, session_id, &reason),
+                }
+            }
         }
         // The two normal-completion shapes: `signal_done` exits emit
         // DoneSignal (the common case — proven live), while no-commands
@@ -378,7 +436,11 @@ fn observe_event(
             message,
         } => {
             let note = message.clone().unwrap_or_else(|| "done".to_string());
-            complete_running(handle, journal, state, session_id, note);
+            if state.running.contains_key(session_id) {
+                complete_running(handle, journal, state, session_id, note);
+            } else {
+                state.remember_early_outcome(session_id, EarlyOutcome { failed: None, note });
+            }
         }
         AppEvent::TaskComplete {
             session_id: Some(session_id),
@@ -386,34 +448,63 @@ fn observe_event(
             summary,
         } => {
             let note = summary.clone().unwrap_or_else(|| reason.clone());
-            complete_running(handle, journal, state, session_id, note);
+            if state.running.contains_key(session_id) {
+                complete_running(handle, journal, state, session_id, note);
+            } else {
+                state.remember_early_outcome(session_id, EarlyOutcome { failed: None, note });
+            }
         }
         AppEvent::SessionEnded {
             session_id, reason, ..
         } => {
             // Normal completion removes the entry first (supervised
-            // sessions park after done); reaching here running means the
-            // session stopped or errored before finishing.
-            let Some(spawn) = state.running.remove(session_id) else {
-                return;
-            };
-            session_record(
-                journal,
-                &spawn,
-                now_ms(),
-                OccurrenceState::Failed,
-                Some(session_id.clone()),
-            );
-            record_on_item(
-                handle,
-                &spawn,
-                "failed",
-                Some(session_id.clone()),
-                Some(reason.clone()),
-            );
+            // sessions park after done); a RUNNING session reaching here
+            // stopped or errored before finishing — and pre-receipt the
+            // same end is remembered as a failed outcome (first terminal
+            // per session wins, so a done session's later end never
+            // downgrades its completion).
+            if state.running.contains_key(session_id) {
+                fail_running(handle, journal, state, session_id, reason);
+            } else {
+                state.remember_early_outcome(
+                    session_id,
+                    EarlyOutcome {
+                        failed: Some(reason.clone()),
+                        note: reason.clone(),
+                    },
+                );
+            }
         }
         _ => {}
     }
+}
+
+/// A running scheduled session ended without finishing: journal `failed`
+/// and write the reason back to the item.
+fn fail_running(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    state: &mut SchedulerState,
+    session_id: &str,
+    reason: &str,
+) {
+    let Some(spawn) = state.running.remove(session_id) else {
+        return;
+    };
+    session_record(
+        journal,
+        &spawn,
+        now_ms(),
+        OccurrenceState::Failed,
+        Some(session_id.to_string()),
+    );
+    record_on_item(
+        handle,
+        &spawn,
+        "failed",
+        Some(session_id.to_string()),
+        Some(reason.to_string()),
+    );
 }
 
 /// A running scheduled session finished normally: journal `completed` and
@@ -1237,6 +1328,238 @@ mod tests {
                 "spent start-now occurrence must not re-dispatch"
             );
         }
+    }
+
+    /// The fast-spawn inversion: `start_new_session` dispatches the child
+    /// loop and returns before the executor emits `TaskReceived`, so a
+    /// fast first turn (mock-speed; a loaded box) can land its terminal
+    /// event on the bus FIRST. The scheduler must resolve the occurrence
+    /// whichever order the receipt and the terminal arrive — dropping the
+    /// early completion stranded the occurrence as running-forever (the
+    /// parked session never emits `SessionEnded`; observed live on the
+    /// #552 Linux e2e leg, 180s write-back timeout).
+    #[tokio::test]
+    async fn completion_before_receipt_still_writes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Task,
+                    title: "race me".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        handle
+            .apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                    goal: None,
+                    project_root: None,
+                    interactive: None,
+                    agent_config: None,
+                },
+                owner(),
+            )
+            .unwrap();
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut delegation_id = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                delegation_id: Some(id),
+                ..
+            }) = event
+            {
+                delegation_id = Some(id);
+            }
+        }
+        let delegation_id = delegation_id.expect("occurrence dispatched");
+        let occurrence_id = delegation_id
+            .strip_prefix(DELEGATION_PREFIX)
+            .unwrap()
+            .to_string();
+
+        // The terminal beats the receipt onto the bus. A later
+        // SessionEnded (a parked-then-stopped session) must not
+        // downgrade it: first terminal per session wins.
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::DoneSignal {
+                session_id: Some("sess-fast".into()),
+                message: Some("won the race".into()),
+            },
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::SessionEnded {
+                session_id: "sess-fast".into(),
+                reason: "stopped".into(),
+                error_kind: None,
+            },
+        );
+        assert!(
+            journal.progress(&occurrence_id).started.is_none(),
+            "no receipt yet — nothing journaled"
+        );
+
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id,
+                session_id: "sess-fast".into(),
+            },
+        );
+        // The receipt drains the remembered outcome: the journal arc stays
+        // in order (started, then the terminal) and the item completes.
+        let progress = journal.progress(&occurrence_id);
+        assert_eq!(progress.started.as_deref(), Some("sess-fast"));
+        assert_eq!(progress.terminal, Some(OccurrenceState::Completed));
+        let (items, _, _) = handle.snapshot();
+        let run = items.iter().find(|i| i.id == item.id).unwrap().effects[0]
+            .last_run
+            .clone()
+            .unwrap();
+        assert_eq!(run.state, "completed");
+        assert_eq!(run.note.as_deref(), Some("won the race"));
+        assert!(state.running.is_empty(), "occurrence fully resolved");
+        assert!(
+            state.take_early_outcome("sess-fast").is_none(),
+            "the remembered outcome is consumed by the receipt"
+        );
+    }
+
+    /// The same inversion with a failure shape: a session that dies
+    /// before its receipt resolves the occurrence `failed` instead of
+    /// stranding it. Unrelated sessions' terminals stay bounded residue.
+    #[tokio::test]
+    async fn early_session_end_before_receipt_fails_the_occurrence() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Task,
+                    title: "die fast".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        handle
+            .apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                    goal: None,
+                    project_root: None,
+                    interactive: None,
+                    agent_config: None,
+                },
+                owner(),
+            )
+            .unwrap();
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut delegation_id = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                delegation_id: Some(id),
+                ..
+            }) = event
+            {
+                delegation_id = Some(id);
+            }
+        }
+        let delegation_id = delegation_id.expect("occurrence dispatched");
+        let occurrence_id = delegation_id
+            .strip_prefix(DELEGATION_PREFIX)
+            .unwrap()
+            .to_string();
+
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::SessionEnded {
+                session_id: "sess-dead".into(),
+                reason: "error: exploded".into(),
+                error_kind: None,
+            },
+        );
+        // Bystander terminals (every session in the daemon ends
+        // eventually) stay bounded residue and — under the cap — never
+        // evict the entry the receipt is about to claim.
+        for index in 0..(EARLY_OUTCOME_CAP - 1) {
+            observe_event(
+                &handle,
+                &mut journal,
+                &mut state,
+                &AppEvent::DoneSignal {
+                    session_id: Some(format!("bystander-{index}")),
+                    message: None,
+                },
+            );
+        }
+        assert_eq!(state.early_outcomes.len(), EARLY_OUTCOME_CAP);
+
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id,
+                session_id: "sess-dead".into(),
+            },
+        );
+        let progress = journal.progress(&occurrence_id);
+        assert_eq!(progress.started.as_deref(), Some("sess-dead"));
+        assert_eq!(progress.terminal, Some(OccurrenceState::Failed));
+        let (items, _, _) = handle.snapshot();
+        let run = items.iter().find(|i| i.id == item.id).unwrap().effects[0]
+            .last_run
+            .clone()
+            .unwrap();
+        assert_eq!(run.state, "failed");
+        assert_eq!(run.note.as_deref(), Some("error: exploded"));
+
+        // Overflow past the cap drops the OLDEST remembered outcome
+        // (sess-dead was consumed by the receipt: CAP-1 remain; two more
+        // pushes cross the cap once).
+        for extra in ["one-more", "two-more"] {
+            state.remember_early_outcome(
+                extra,
+                EarlyOutcome {
+                    failed: None,
+                    note: "n".into(),
+                },
+            );
+        }
+        assert_eq!(state.early_outcomes.len(), EARLY_OUTCOME_CAP);
+        assert!(
+            state.take_early_outcome("bystander-0").is_none(),
+            "oldest entry evicted at the cap"
+        );
+        assert!(state.take_early_outcome("two-more").is_some());
     }
 
     /// A start-now carrying the confirm sheet's launch pins records them on
