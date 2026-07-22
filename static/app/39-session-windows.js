@@ -1100,6 +1100,7 @@ const VITALS_ICON_PATHS = {
   pause: '<path d="M9 5.5v13"/><path d="M15 5.5v13"/>',
   slash: '<circle cx="12" cy="12" r="8.2"/><path d="M6.5 6.5l11 11"/>',
   dots: '<circle cx="5.5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="18.5" cy="12" r="1.4"/>',
+  hierarchy: '<circle cx="12" cy="5.8" r="2.3"/><circle cx="6.2" cy="18.2" r="2.3"/><circle cx="17.8" cy="18.2" r="2.3"/><path d="M12 8.1v3.4"/><path d="M6.2 15.9v-1.4a3 3 0 0 1 3-3h5.6a3 3 0 0 1 3 3v1.4"/>',
 };
 
 function vitalsIconSvg(iconId) {
@@ -1373,6 +1374,9 @@ const VITALS_SYMBOLS = {
     quiet: 'Nothing unpushed on the primary branch.',
     icon: 'push',
     chip: (v) => `${v.primaryName}⇡${v.count}`,
+    // The generic glyph strip only takes LEADING glyphs, so this chip's
+    // mid-string ⇡ needs an explicit glyph-free fact-line twin.
+    factText: (v) => `${v.count} unpushed on ${v.primaryName}`,
     explain: (v) => [
       `The primary branch ${v.primaryName} has ${v.count} commit${v.count === 1 ? '' : 's'} that ${v.count === 1 ? 'hasn’t' : 'haven’t'} been pushed yet.`,
     ],
@@ -1794,7 +1798,10 @@ function vitalsChipModels(vitals, meta, sessionId) {
   // with the color.
   const culprits = models
     .filter((m) => m.severity === 'warn' || m.severity === 'crit')
-    .map((m) => m.brief || (m.text ? `${m.label}: ${m.text}` : m.label));
+    .map((m) => {
+      const fact = m.factText || m.text;
+      return m.brief || (fact ? `${m.label}: ${fact}` : m.label);
+    });
   const healthDef = VITALS_SYMBOLS.health;
   models.unshift({
     id: 'health',
@@ -2275,19 +2282,24 @@ function vitalsChildrenSummary(children) {
 
 // Card-token text projection, shared by the builder and the 1 Hz ticker
 // so in-place updates can never drift from first render. `chip` is the
-// catalog's chip grammar; `brief` is attention grammar (a floated culprit
-// NAMES itself in plain words); `parity` renders the quiet word — a
-// conflict always floats as its brief, so in-line parity is "clean".
+// glyph-free fact grammar (m.factText beside its monoline icon — the
+// header fact line's vocabulary; the legacy glyph m.text stays a
+// rail/Station-only concern); `brief` is attention grammar (a floated
+// culprit NAMES itself in plain words); `parity` renders the quiet word —
+// a conflict always floats as its brief, so in-line parity is "clean".
 function vfcProjectText(proj, model) {
   if (proj === 'verdict') {
     const word = vxVerdictText(model);
     return word.charAt(0).toUpperCase() + word.slice(1);
   }
   if (proj === 'brief') {
-    return model.brief || (model.text ? `${model.label}: ${model.text}` : model.label);
+    const fact = model.factText || model.text;
+    return model.brief || (fact ? `${model.label}: ${fact}` : model.label);
   }
-  if (proj === 'parity') return model.severity === 'crit' ? (model.brief || model.text) : 'clean';
-  return model.text || '●';
+  if (proj === 'parity') {
+    return model.severity === 'crit' ? (model.brief || model.factText || model.text) : 'clean';
+  }
+  return model.factText || model.text || '—';
 }
 
 function vfcProjectTone(proj, model) {
@@ -2312,6 +2324,10 @@ function vitalsFactsCardPlan(models, meta) {
     anchor: model.id,
     label: model.label,
     proj,
+    // The symbol's monoline icon (the header fact line's vocabulary)
+    // rides fact projections; the verdict keeps its dot and a floated
+    // brief names itself in plain words, so neither carries one.
+    icon: proj === 'chip' || proj === 'parity' ? (model.icon || '') : '',
     text: vfcProjectText(proj, model),
     tone: vfcProjectTone(proj, model),
   });
@@ -2357,7 +2373,8 @@ function vitalsFactsCardPlan(models, meta) {
       anchor: cwd ? 'fact:cwd' : 'fact:project',
       label: cwd ? 'Working folder' : 'Project',
       proj: 'place',
-      text: `📁 ${vitalsLeadingTruncatedPath(placePath)}`,
+      icon: 'folder',
+      text: vitalsLeadingTruncatedPath(placePath),
       tone: '',
       copy: placePath,
     }]);
@@ -2374,7 +2391,8 @@ function vitalsFactsCardPlan(models, meta) {
       anchor: 'fact:relationship',
       label: 'Relationship',
       proj: 'relation',
-      text: `🧬 ${relationText}`,
+      icon: 'hierarchy',
+      text: relationText,
       tone: '',
     }]);
   }
@@ -2405,6 +2423,11 @@ function buildVitalsFactsCard(plan, panel) {
         if (tok.tone) btn.dataset.tone = tok.tone;
         if (index > 0) btn.appendChild(vxEl('span', 'vfc-sep', '·'));
         if (tok.proj === 'verdict') btn.appendChild(vxEl('span', 'vfc-dot'));
+        if (tok.icon) {
+          btn.dataset.vfcIcon = tok.icon;
+          const iconMarkup = vitalsIconSvg(tok.icon);
+          if (iconMarkup) btn.insertAdjacentHTML('beforeend', iconMarkup);
+        }
         btn.appendChild(vxEl('span', 'vfc-text', tok.text));
         btn.setAttribute('aria-label', `${tok.label}: ${tok.text} — show explanation`);
         btn.addEventListener('click', (event) => {
@@ -2881,6 +2904,17 @@ function openVitalsGlossary(sessionId, anchor, focusId = '') {
         if (tone) btn.dataset.tone = tone;
         else delete btn.dataset.tone;
       }
+      // A state-dependent icon (the activity token) follows its text: swap
+      // the small svg in place — never a token rebuild.
+      const icon = proj === 'chip' || proj === 'parity' ? (m.icon || '') : '';
+      if ((btn.dataset.vfcIcon || '') !== icon) {
+        if (icon) btn.dataset.vfcIcon = icon;
+        else delete btn.dataset.vfcIcon;
+        btn.querySelector('.vit-icon')?.remove();
+        const iconMarkup = vitalsIconSvg(icon);
+        const txt = btn.querySelector('.vfc-text');
+        if (iconMarkup && txt) txt.insertAdjacentHTML('beforebegin', iconMarkup);
+      }
     }
     for (const row of panel.querySelectorAll('[data-vx-model]')) {
       const m = byId.get(row.dataset.vxModel);
@@ -2964,8 +2998,15 @@ function refanSessionVitalsForIdentityGroup(sessionId) {
 
 // QA readback (window.qa convention): the chip models a session renders
 // and the facts-card plan the pane composes, serializable — e2e probes
-// assert backend parity on these.
+// assert backend parity on these. vitalsApply is the injection twin
+// (sessionWindowSweeps.build's convention): it routes a synthetic
+// session_vitals event through the real applySessionVitals lane so
+// harness probes can render real chips and click through to the pane.
 window.qa = Object.assign(window.qa || {}, {
+  vitalsApply: (evt) => {
+    applySessionVitals(evt || {});
+    return true;
+  },
   vitalsChips: (sessionId) => vitalsModelsForSession(sessionId).map((m) => ({
     id: m.id,
     key: m.key,
@@ -2980,8 +3021,8 @@ window.qa = Object.assign(window.qa || {}, {
     const meta = sessionMetadataById.get(sid) || {};
     return vitalsFactsCardPlan(vitalsModelsForSession(sid), meta).lines.map((line) => ({
       name: line.name,
-      groups: line.groups.map((group) => group.map(({ id, anchor, proj, text, tone }) => ({
-        id, anchor, proj, text, tone,
+      groups: line.groups.map((group) => group.map(({ id, anchor, proj, icon, text, tone }) => ({
+        id, anchor, proj, icon, text, tone,
       }))),
     }));
   },
