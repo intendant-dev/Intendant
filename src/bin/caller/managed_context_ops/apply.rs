@@ -780,6 +780,7 @@ mod tests {
             headless: true,
             context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         }
     }
 

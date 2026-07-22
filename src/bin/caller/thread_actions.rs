@@ -3428,6 +3428,8 @@ pub(crate) async fn drain_external_child_turn(
         headless: config.headless,
         context_injection: config.context_injection,
         reload_credentials: config.reload_credentials,
+        // Child activity heartbeats the parent session's declaration.
+        coordination_declaration: config.coordination_declaration,
     };
 
     match drain_external_agent_events(
@@ -5140,6 +5142,7 @@ mod tests {
             headless: false,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let child = "session_parent:agent-7";
         let mut stats = LoopStats::default();
@@ -5349,6 +5352,7 @@ mod tests {
             headless: false,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let child = "session_parent:agent-7";
         let mut stats = LoopStats::default();
@@ -5455,6 +5459,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let mut stats = LoopStats::default();
 
@@ -5540,6 +5545,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let mut stats = LoopStats::default();
         let errored = external_agent::SubAgentState {
@@ -5702,6 +5708,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
 
         emit_side_session_started(
@@ -5780,6 +5787,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let mut stats = LoopStats::default();
 
@@ -5900,6 +5908,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let mut stats = LoopStats::default();
 
@@ -6123,6 +6132,7 @@ mod tests {
             headless: true,
             context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         }
     }
 

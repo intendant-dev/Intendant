@@ -499,6 +499,46 @@ pub(crate) async fn run_external_agent_mode(
         Some(FollowUpMessage::with_attachments(task, attachments))
     };
 
+    // Coordination-bus declaration (Track C §1.5): the supervisor
+    // declares on the backend's behalf (`backend:` set) for the whole
+    // supervised span; the drain's event ticks heartbeat it, and the
+    // guard's Drop removes it on any orderly exit (crash-abandoned
+    // copies age out by TTL). Advisory: bus trouble logs and the
+    // session runs undeclared. Identity note: the declaration keeps the
+    // spawn-time session id even if the primary address later rotates
+    // (fork/native-id upgrades) — the `session:` field is a correlation
+    // hint, not routing state.
+    let coordination_declaration = live_session_id
+        .clone()
+        .or_else(|| session_log_id(&session_log))
+        .and_then(|session_id| {
+            let (space_dir, space_key) = coordination::paths::resolve_space_dir(
+                coordination::paths::env_override().as_deref(),
+                &crate::platform::intendant_home(),
+                &project.root,
+            );
+            match coordination::lifecycle::SessionDeclarationGuard::declare(
+                coordination::lifecycle::DeclareParams {
+                    space_dir: &space_dir,
+                    space_key: &space_key,
+                    session_id: &session_id,
+                    backend: backend.as_short_str(),
+                    project_root: &project.root,
+                    branch: crate::worktree::current_branch(&project.root),
+                    intent: surgical_task_statement.as_deref().unwrap_or(""),
+                },
+                coordination::now_ms(),
+            ) {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    slog(&session_log, |l| {
+                        l.debug(&format!("Coordination declaration skipped: {e}"))
+                    });
+                    None
+                }
+            }
+        });
+
     // Reload-credentials handshake: the drain raises this when the request
     // arrives mid-turn (after interrupting the backend); the loop applies
     // the in-place respawn at the next safe point. Idle requests apply
@@ -526,6 +566,7 @@ pub(crate) async fn run_external_agent_mode(
         headless,
         context_injection: &context_injection,
         reload_credentials: Some(&backend_credentials_reload),
+        coordination_declaration: coordination_declaration.as_ref(),
     };
     let mut codex_thread_action_dedupe = CodexThreadActionDedupe::default();
     if let Some(ready_tx) = ready_for_thread_actions {

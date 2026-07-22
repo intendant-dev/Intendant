@@ -1206,6 +1206,15 @@ pub(crate) struct DrainConfig<'a> {
     /// for lanes without the in-loop respawn (the foreground persistent
     /// loop), where the event is simply not consumable mid-turn.
     pub(crate) reload_credentials: Option<&'a std::sync::atomic::AtomicBool>,
+    /// The supervised session's coordination-bus declaration, owned by
+    /// the supervision loop (Track C §1.5: the supervisor writes for the
+    /// backend). The drain's event ticks are the wrapper's heartbeat
+    /// boundary — internally throttled, so a busy drain costs one mtime
+    /// touch a minute. `None` for lanes without a session declaration
+    /// (child/side drains inherit the parent's guard; the legacy
+    /// persistent presence lane and tests pass `None`).
+    pub(crate) coordination_declaration:
+        Option<&'a crate::coordination::lifecycle::SessionDeclarationGuard>,
 }
 
 impl DrainConfig<'_> {

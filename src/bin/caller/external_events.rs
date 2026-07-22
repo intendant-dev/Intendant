@@ -1150,6 +1150,13 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
             }
         };
 
+        // Event-drain tick = the wrapper's declaration heartbeat (§1.5):
+        // the backend demonstrably produced work, so the supervisor
+        // refreshes its liveness claim (throttled inside the guard).
+        if let Some(declaration) = config.coordination_declaration {
+            declaration.heartbeat_now();
+        }
+
         let (event_thread_id, event_turn_id, event) = event.into_scope();
         let event_is_primary =
             scoped_event_targets_config(&event_thread_id, &local_session_id, &alias_session_id);
@@ -1200,6 +1207,9 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 headless: config.headless,
                 context_injection: config.context_injection,
                 reload_credentials: config.reload_credentials,
+                // Child activity is the same supervised session working:
+                // the parent's declaration stays the one liveness claim.
+                coordination_declaration: config.coordination_declaration,
             };
             &child_config_storage
         } else {
@@ -3032,6 +3042,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let delayed_bus = bus.clone();
@@ -3114,6 +3125,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let side_id = "kimi-parent:agent-0";
         let mut open_side_threads = HashMap::new();
@@ -3245,6 +3257,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         // The steer is already on the bus when the drain starts — the
@@ -3333,6 +3346,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let child_id = "kimi-parent:agent-1";
         let state = |status: &str, message: Option<&str>| external_agent::SubAgentState {
@@ -3453,6 +3467,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let side_id = "kimi-parent:side-agent";
         let subagent_id = "kimi-parent:worker-agent";
@@ -3595,6 +3610,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -3937,6 +3953,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -4110,6 +4127,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -4248,6 +4266,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -4405,6 +4424,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -4619,6 +4639,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -4778,6 +4799,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -4889,6 +4911,7 @@ mod tests {
             headless: true,
             context_injection: &context_injection,
             reload_credentials: None,
+            coordination_declaration: None,
         };
         let (_event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));

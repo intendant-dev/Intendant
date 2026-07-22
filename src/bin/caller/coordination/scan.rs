@@ -263,11 +263,18 @@ pub(crate) fn valid_rel_path(s: &str) -> bool {
 
 /// Absolute box-local path field (`root:`): printable, bounded, no
 /// control bytes — machine value, never rendered into summaries.
+/// "Absolute" is judged for every platform's spelling (all three are
+/// first-class): unix `/…`, Windows drive (`C:\…` / `C:/…`) and UNC
+/// (`\\server\…`) forms — a Windows daemon's declarations must carry
+/// their roots too.
 pub(crate) fn valid_abs_path(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let windows_abs = matches!(bytes, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
+        || s.starts_with("\\\\");
     !s.is_empty()
         && s.len() <= 1024
-        && s.starts_with('/')
-        && !s.bytes().any(|b| b.is_ascii_control())
+        && (s.starts_with('/') || windows_abs)
+        && !bytes.iter().any(|b| b.is_ascii_control())
 }
 
 /// Closed backend enum for declaration frontmatter.
@@ -313,6 +320,29 @@ mod tests {
             assert!(!valid_rel_path(bad), "{bad:?} must be rejected");
         }
         assert!(!valid_rel_path(&"x".repeat(513)), "length bound");
+    }
+
+    #[test]
+    fn abs_path_grammar_accepts_every_platform_spelling() {
+        for good in [
+            "/Users/u/projects/x",
+            "/tmp",
+            "C:\\Users\\ci\\repo",
+            "c:/work/repo",
+            "\\\\server\\share\\repo",
+        ] {
+            assert!(valid_abs_path(good), "{good:?} must be accepted");
+        }
+        for bad in [
+            "",
+            "relative/path",
+            "C:no-separator",
+            "1:\\not-a-drive",
+            "has\x1bcontrol/",
+            &format!("/{}", "x".repeat(1024)),
+        ] {
+            assert!(!valid_abs_path(bad), "{bad:?} must be rejected");
+        }
     }
 
     #[test]

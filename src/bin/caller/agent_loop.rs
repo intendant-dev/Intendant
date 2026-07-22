@@ -1128,6 +1128,10 @@ pub(crate) async fn run_agent_loop(
     // Session-scoped MCP bootstrap for the runtime child's env: `ctl` run
     // by shell commands inside this session then auto-attributes to it.
     runtime_mcp_env: Option<&agent_runner::RuntimeMcpEnv>,
+    // The session's coordination-bus declaration (owned by the enclosing
+    // round loop): each turn boundary is a heartbeat tick (§1.5 cadence —
+    // throttled internally, no timers here).
+    coordination_declaration: Option<&coordination::lifecycle::SessionDeclarationGuard>,
 ) -> Result<(LoopStats, LoopExitReason), CallerError> {
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
@@ -1394,6 +1398,13 @@ pub(crate) async fn run_agent_loop(
                     });
                 }
             }
+        }
+
+        // Turn boundary = the native declaration's heartbeat tick
+        // (§1.5): an mtime touch at most once a minute, keeping the
+        // radar's staleness clock honest while the session works.
+        if let Some(declaration) = coordination_declaration {
+            declaration.heartbeat_now();
         }
 
         conversation.increment_turn();
@@ -3463,6 +3474,70 @@ fn steer_follow_up(
         .for_target(local_session_id.clone())
 }
 
+/// The declaration's `## intent` source for a native session: the most
+/// recent task-bearing user message (initial task, resume task, or the
+/// follow-up that started the current round). Free text — normalized
+/// and bounded by `declaration_intent` at write time.
+fn native_session_intent(conversation: &Conversation) -> String {
+    conversation
+        .messages()
+        .iter()
+        .rev()
+        .find(|m| {
+            matches!(
+                m.provenance,
+                MessageProvenance::Task
+                    | MessageProvenance::ResumeTask
+                    | MessageProvenance::FollowUp
+            )
+        })
+        .map(|m| m.content.clone())
+        .unwrap_or_default()
+}
+
+/// Coordination-bus declaration for a native supervised session (Track C
+/// §1.5): written at session start, heartbeat at turn boundaries, removed
+/// by the guard's Drop on any orderly loop exit — a crash-abandoned copy
+/// ages out by TTL. Space resolution follows the B1 seam (env override →
+/// derived worktree-normalized key), so a sub-agent session in an
+/// isolated worktree lands in its main repo's space. Advisory: bus
+/// trouble logs and the session runs undeclared; a session without an id
+/// has no writer identity and declares nothing.
+fn declare_native_session_on_bus(
+    local_session_id: &Option<String>,
+    project: &Project,
+    conversation: &Conversation,
+    session_log: &SharedSessionLog,
+) -> Option<coordination::lifecycle::SessionDeclarationGuard> {
+    let session_id = local_session_id.as_deref()?;
+    let (space_dir, space_key) = coordination::paths::resolve_space_dir(
+        coordination::paths::env_override().as_deref(),
+        &crate::platform::intendant_home(),
+        &project.root,
+    );
+    let intent = native_session_intent(conversation);
+    match coordination::lifecycle::SessionDeclarationGuard::declare(
+        coordination::lifecycle::DeclareParams {
+            space_dir: &space_dir,
+            space_key: &space_key,
+            session_id,
+            backend: "native",
+            project_root: &project.root,
+            branch: crate::worktree::current_branch(&project.root),
+            intent: &intent,
+        },
+        coordination::now_ms(),
+    ) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            slog(session_log, |l| {
+                l.debug(&format!("Coordination declaration skipped: {e}"))
+            });
+            None
+        }
+    }
+}
+
 /// Wraps `run_agent_loop` in a multi-round loop that waits for follow-up messages
 /// between rounds. The session continues until the user closes the channel,
 /// budget is exhausted, safety cap is reached, or a non-recoverable exit occurs.
@@ -3503,6 +3578,11 @@ pub(crate) async fn run_round_loop(
     // so a dying watcher's late push cannot resurrect a delivered steer as
     // an extra round. Grows one small id per steer, like round_ledger.
     let mut delivered_steer_ids: HashSet<String> = HashSet::new();
+    // This loop IS the native session: declare on the coordination bus
+    // for its whole span (all rounds + parked waits); the guard's Drop
+    // removes the declaration on any orderly exit.
+    let coordination_declaration =
+        declare_native_session_on_bus(&local_session_id, project, conversation, &session_log);
 
     loop {
         let (stats, exit_reason) = run_agent_loop(
@@ -3524,6 +3604,7 @@ pub(crate) async fn run_round_loop(
             headless,
             orchestration,
             runtime_mcp_env,
+            coordination_declaration.as_ref(),
         )
         .await?;
 
@@ -4195,6 +4276,32 @@ fn budget_tail_index(
     tool_results
         .iter()
         .rposition(|(call_id, _, _)| !handled_call_ids.contains(call_id))
+}
+
+#[cfg(test)]
+mod coordination_intent {
+    use super::native_session_intent;
+    use crate::conversation::{Conversation, MessageProvenance};
+
+    #[test]
+    fn latest_task_bearing_message_wins_and_injections_never_do() {
+        let mut conv = Conversation::new("system".into(), 100_000);
+        assert_eq!(
+            native_session_intent(&conv),
+            "",
+            "no task yet → empty (declare falls back)"
+        );
+        conv.add_user(MessageProvenance::Task, "initial task".into());
+        conv.add_user(MessageProvenance::SystemInjection, "[System] nudge".into());
+        assert_eq!(native_session_intent(&conv), "initial task");
+        conv.add_user(MessageProvenance::FollowUp, "[New Task] pivot".into());
+        conv.add_user(MessageProvenance::Steer, "steer text".into());
+        assert_eq!(
+            native_session_intent(&conv),
+            "[New Task] pivot",
+            "latest task-bearing message is the session's current goal"
+        );
+    }
 }
 
 #[cfg(test)]

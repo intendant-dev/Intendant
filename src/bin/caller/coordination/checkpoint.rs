@@ -26,7 +26,11 @@ pub(crate) struct CheckpointSpace {
 impl CheckpointSpace {
     /// Root a space under `<home>/.intendant/coordination/`. `home` is
     /// a parameter (hermetic tests inject tempdirs; the tool edge
-    /// resolves the real home — the repo's hermeticity rule).
+    /// resolves the real home — the repo's hermeticity rule). Production
+    /// edges resolve through `paths::resolve_space_dir` + [`Self::open_at`]
+    /// (the B1 seam), leaving this derivation-included shape to the
+    /// checkpoint tests, which pin it unmodified.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open(
         home: &Path,
         project_root: &Path,

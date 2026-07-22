@@ -64,9 +64,12 @@
 //! sessions; the `daemon` writer name is reserved for the daemon's
 //! lanes). `scan.rs` carries the shared rule-5 liveness machinery and
 //! field grammars, `paths.rs` the space-dir resolution seam
-//! (`INTENDANT_COORDINATION_DIR` override → derived key), and `gc.rs`
-//! the rule-8 liveness sweep. The consumers — collision radar,
-//! daemon-rendered prompt lanes, the CLI — are C2/C3.
+//! (`INTENDANT_COORDINATION_DIR` override → derived key), `gc.rs` the
+//! rule-8 liveness sweep, and `lifecycle.rs` the supervised-session
+//! declaration glue (declare at start / heartbeat at loop boundaries /
+//! remove on clean end) the native and wrapper loops own. The
+//! consumers — collision radar, daemon-rendered prompt lanes, the
+//! CLI — are C2/C3.
 
 use std::path::{Path, PathBuf};
 
@@ -74,6 +77,7 @@ mod checkpoint;
 pub(crate) use checkpoint::*;
 pub(crate) mod declarations;
 pub(crate) mod gc;
+pub(crate) mod lifecycle;
 pub(crate) mod messages;
 pub(crate) mod paths;
 pub(crate) mod scan;
@@ -249,7 +253,9 @@ fn ulid_like() -> String {
     out
 }
 
-fn now_ms() -> u64 {
+/// Process clock in epoch ms — `pub(crate)` so the loop edges can pass
+/// the same clock the stores use into declare/heartbeat calls.
+pub(crate) fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
