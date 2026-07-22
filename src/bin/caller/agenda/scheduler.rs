@@ -333,7 +333,11 @@ fn dispatch_session(
             // pane-created session (explicit manifest pin → daemon default
             // → backend default). None = the legacy manifest shape,
             // all-inherit.
-            launch_config: spawn.agent_config.clone().unwrap_or_default(),
+            launch_config: spawn
+                .agent_config
+                .clone()
+                .map(|config| *config)
+                .unwrap_or_default(),
         }));
     state.awaiting.insert(spawn.occurrence_id.clone(), spawn);
 }
@@ -1272,13 +1276,13 @@ mod tests {
                     goal: None,
                     project_root: None,
                     interactive: None,
-                    agent_config: Some(config.clone()),
+                    agent_config: Some(Box::new(config.clone())),
                 },
                 owner(),
             )
             .unwrap();
         assert_eq!(
-            confirmed.effects[0].manifest.agent_config.as_ref(),
+            confirmed.effects[0].manifest.agent_config.as_deref(),
             Some(&config),
             "the reviewed launch pins are recorded on the approved manifest"
         );

@@ -501,8 +501,9 @@ pub(crate) struct SpawnOccurrence {
     pub(crate) project_root: Option<String>,
     /// The manifest's owner-approved agent-launch pins, forwarded verbatim
     /// onto the spawn's StartTask. `None` = the legacy manifest shape
-    /// (every launch field inherits the daemon default).
-    pub(crate) agent_config: Option<crate::event::AgentLaunchConfig>,
+    /// (every launch field inherits the daemon default). Boxed as on the
+    /// manifest (enum/struct-size hygiene only).
+    pub(crate) agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
     /// The parking session (item provenance) — the fallback the dispatcher
     /// resolves a project from when the manifest carries none.
     pub(crate) provenance_session_id: Option<String>,

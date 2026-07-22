@@ -426,14 +426,14 @@ impl SessionSupervisor {
                 if let Some(parsed) = parse_codex_slash_command(&task) {
                     match parsed {
                         Ok(command) if command.op == "fast" => {
-                            let agent =
-                                match codex_fast_new_session_agent(launch.agent.as_deref()) {
-                                    Ok(agent) => Some(agent),
-                                    Err(message) => {
-                                        self.loop_error(message);
-                                        return;
-                                    }
-                                };
+                            let agent = match codex_fast_new_session_agent(launch.agent.as_deref())
+                            {
+                                Ok(agent) => Some(agent),
+                                Err(message) => {
+                                    self.loop_error(message);
+                                    return;
+                                }
+                            };
                             if !reference_frame_ids.is_empty()
                                 || display_target.is_some()
                                 || !attachments.is_empty()

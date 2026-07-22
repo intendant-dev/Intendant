@@ -223,8 +223,10 @@ pub struct SessionManifest {
     /// manifest edit: the owner approves the config they reviewed. At
     /// fire time each field resolves explicit pin → daemon default →
     /// backend default, through the same launch path every session uses.
+    /// Boxed for enum-size hygiene only — serde and the digest see the
+    /// inner value verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) agent_config: Option<crate::event::AgentLaunchConfig>,
+    pub(crate) agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
 }
 
 /// An owner's approval of one manifest revision. `digest` is the bound
@@ -683,7 +685,7 @@ pub enum AgendaCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         interactive: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent_config: Option<crate::event::AgentLaunchConfig>,
+        agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
     },
 }
 
@@ -1425,11 +1427,11 @@ mod tests {
             ..legacy.clone()
         };
         let with_config = SessionManifest {
-            agent_config: Some(crate::event::AgentLaunchConfig {
+            agent_config: Some(Box::new(crate::event::AgentLaunchConfig {
                 agent: Some("claude-code".into()),
                 claude_effort: Some("max".into()),
                 ..Default::default()
-            }),
+            })),
             ..legacy.clone()
         };
         let interactive_digest = manifest_digest("item-1", "ef-1", &interactive);
@@ -1450,12 +1452,12 @@ mod tests {
             orchestrate: true,
             interactive: true,
             project_root: Some("/work/project".into()),
-            agent_config: Some(crate::event::AgentLaunchConfig {
+            agent_config: Some(Box::new(crate::event::AgentLaunchConfig {
                 agent: Some("claude-code".into()),
                 claude_model: Some("haiku".into()),
                 claude_effort: Some("xhigh".into()),
                 ..Default::default()
-            }),
+            })),
         };
         let round: SessionManifest =
             serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();

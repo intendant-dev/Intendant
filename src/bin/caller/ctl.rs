@@ -2270,7 +2270,11 @@ async fn run_agenda(
             map.insert("interactive".to_string(), Value::Bool(!goal_run));
             let mut agent_config = Map::new();
             insert_string(&mut agent_config, "agent", args.one("--agent"));
-            insert_string(&mut agent_config, "claude_model", args.one("--claude-model"));
+            insert_string(
+                &mut agent_config,
+                "claude_model",
+                args.one("--claude-model"),
+            );
             insert_string(
                 &mut agent_config,
                 "claude_effort",

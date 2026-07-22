@@ -5912,10 +5912,7 @@ mod tests {
         assert_eq!(launch_config.agent.as_deref(), Some("claude-code"));
         assert_eq!(launch_config.claude_model.as_deref(), Some("haiku"));
         assert_eq!(launch_config.claude_effort.as_deref(), Some("max"));
-        assert_eq!(
-            launch_config.codex_reasoning_effort.as_deref(),
-            Some("low")
-        );
+        assert_eq!(launch_config.codex_reasoning_effort.as_deref(), Some("low"));
         let json = serde_json::to_string(&parsed).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["claude_effort"], "max", "flat on the wire: {json}");

@@ -336,7 +336,7 @@ impl AgendaStore {
         goal_override: Option<&str>,
         project_root: Option<String>,
         interactive: bool,
-        agent_config: Option<crate::event::AgentLaunchConfig>,
+        agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
         actor: Option<AgendaActor>,
         now_ms: u64,
     ) -> Result<AgendaItem, AgendaError> {
