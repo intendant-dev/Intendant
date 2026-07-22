@@ -1121,7 +1121,7 @@ pub enum OutboundEvent {
     /// The agent's conversation was rolled back to a specific round.
     /// Emitted after `POST /api/session/current/rollback` with
     /// `revert_conversation: true`. `backend` is one of "native",
-    /// "codex", "claude-code", "kimi", "gemini"; `method` is "truncated"
+    /// "codex", "claude-code", "kimi", "pi", "gemini"; `method` is "truncated"
     /// (native / Codex `thread/rollback` / Kimi `undo`) or "session-reset"
     /// (CC / Gemini re-init).
     ConversationRolledBack {

@@ -94,6 +94,9 @@ impl SessionSupervisor {
         kimi_allowed_tools: Option<String>,
         kimi_plan_mode: Option<bool>,
         kimi_swarm_mode: Option<bool>,
+        pi_model: Option<String>,
+        pi_thinking: Option<String>,
+        pi_allowed_tools: Option<String>,
         codex_model: Option<String>,
         codex_reasoning_effort: Option<String>,
         codex_sandbox: Option<String>,
@@ -458,6 +461,39 @@ impl SessionSupervisor {
                 return None;
             };
             if let Err(e) = apply_session_kimi_swarm_mode(&mut project, backend, enabled) {
+                self.loop_error(format!("Session create failed: {e}"));
+                return None;
+            }
+        }
+        if let Some(model) = crate::session_config::normalize_pi_model(pi_model.as_deref()) {
+            let Some(ref backend) = backend else {
+                self.loop_error("Session create failed: pi_model requires Pi".to_string());
+                return None;
+            };
+            if let Err(e) = apply_session_pi_model(&mut project, backend, model) {
+                self.loop_error(format!("Session create failed: {e}"));
+                return None;
+            }
+        }
+        if let Some(thinking) = crate::session_config::normalize_pi_thinking(pi_thinking.as_deref())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error("Session create failed: pi_thinking requires Pi".to_string());
+                return None;
+            };
+            if let Err(e) = apply_session_pi_thinking(&mut project, backend, thinking) {
+                self.loop_error(format!("Session create failed: {e}"));
+                return None;
+            }
+        }
+        if let Some(tools) =
+            crate::session_config::normalize_pi_allowed_tools(pi_allowed_tools.as_deref())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error("Session create failed: pi_allowed_tools requires Pi".to_string());
+                return None;
+            };
+            if let Err(e) = apply_session_pi_allowed_tools(&mut project, backend, tools) {
                 self.loop_error(format!("Session create failed: {e}"));
                 return None;
             }
@@ -2085,6 +2121,11 @@ pub(crate) fn resumed_transcript_cwd(
             )?
             .work_dir
             .map(PathBuf::from)
+        }
+        external_agent::AgentBackend::Pi => {
+            crate::web_gateway::session_catalog::pi_history::find_pi_session_from_home(home, token)?
+                .cwd
+                .map(PathBuf::from)
         }
     }
 }

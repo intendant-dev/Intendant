@@ -1,10 +1,9 @@
 # Agent Execution & Multi-Agent Orchestration
 
-Intendant runs a task one of three ways. The simplest is a single native agent
-loop; the richest is an orchestration session that decomposes a task and
-delegates pieces to sub-agents, each a fully supervised session of its own. The
-third hands the whole task to a third-party coding CLI (Codex, Claude Code, or Kimi Code)
-and supervises it — that path has its own chapter,
+Intendant runs a task through four execution shapes. Direct is one native loop;
+Orchestrate is that loop with the delegation prompt; Sub-Agent is a supervised
+child; External-Agent hands the task to a third-party coding harness (Codex,
+Claude Code, Kimi Code, or Pi) and supervises it — that path has its own chapter,
 [External-Agent Orchestration](./external-agent-orchestration.md).
 
 This chapter covers Intendant's *native* execution: how a session's shape is
@@ -24,7 +23,7 @@ sessions, orchestration sessions, sub-agents, and external agents alike.
 | **Direct** | `--direct`, a "simple" task heuristic, or any native non-daemon CLI path | One supervised agent loop, no delegation | `run_direct_mode` (`run_modes.rs`) |
 | **Orchestrate** | Default for non-trivial tasks under the daemon (no `--direct`); explicit `orchestrate` flag on task submission | The same loop with the orchestration prompt; delegates via `spawn_sub_agent` | `run_direct_mode` with `SubAgentRole::Orchestrator` |
 | **Sub-Agent** | Spawned by another session's `spawn_sub_agent` tool call | A supervised child session with a role prompt; reports back with `submit_result` | `SessionSupervisor::start_sub_agent_session` (`session_supervisor/sub_agents.rs`) |
-| **External-Agent** | `--agent <backend>` or `[agent] default_backend`, or `backend` on `spawn_sub_agent` | A supervised third-party coding CLI wired to Intendant's MCP server | `run_external_agent_mode` (`external_mode.rs`) — see [External-Agent Orchestration](./external-agent-orchestration.md) |
+| **External-Agent** | `--agent <backend>` or `[agent] default_backend`, or `backend` on `spawn_sub_agent` | A supervised third-party coding harness using scoped MCP or `$INTENDANT ctl` | `run_external_agent_mode` (`external_mode.rs`) — see [External-Agent Orchestration](./external-agent-orchestration.md) |
 
 These are configurations of one thing, not modes of different things: every
 native session is `run_direct_mode` with a `NativeSessionConfig` (role,
@@ -69,7 +68,7 @@ SessionSupervisor::start_sub_agent_session
     ├─ optional git worktree branched off the parent project's HEAD
     ├─ records the parent link ("subagent" relationship — the same kind
     │  Codex-spawned children use, so the dashboard renders both alike)
-    └─ spawns the child session: internal loop, or codex / claude-code / kimi
+    └─ spawns the child session: internal loop, or codex / claude-code / kimi / pi
     ▼
 Child session — its own dashboard row, live activity, approvals under the
 daemon's autonomy, steerable, stoppable, lineage-tracked
@@ -98,7 +97,7 @@ Parent's wait_sub_agents call returns the structured results
   `sub_agent.rs`). A child that finishes without submitting gets a result
   synthesized from its final message and exit state; usage always comes from
   session accounting, not self-report.
-- **Backends compose**: `backend: "codex"` / `"claude-code"` / `"kimi"` runs the child as
+- **Backends compose**: `backend: "codex"` / `"claude-code"` / `"kimi"` / `"pi"` runs the child as
   a supervised external agent instead of the internal loop. The
   orchestrator/worker matrix is fully general — native conducting Codex
   workers, or (via the MCP `start_task` tool external agents already have)
@@ -126,7 +125,7 @@ Both halves of the delegation surface are exposed in the web dashboard:
   external agent is selected.
 - **Delegate on a live session**: every internal session's window menu has
   **Delegate…** — task, optional name, role, backend (internal / Codex /
-  Claude Code), and worktree isolation. It sends
+  Claude Code / Kimi / Pi), and worktree isolation. It sends
   `ControlMsg::SpawnSubAgent { session_id, task, name?, role?, agent?,
   worktree? }`, and the supervisor (`delegate_sub_agent`) runs the same
   `start_sub_agent_session` path the tool uses: same relationship kind, same

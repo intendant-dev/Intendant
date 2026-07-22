@@ -1006,6 +1006,13 @@ let controlKimiConfig = {
   // null = native Kimi profile, [] = deliberately no optional tools.
   allowed_tools: null,
 };
+let controlPiConfig = {
+  command: 'pi',
+  model: '',
+  thinking: '',
+  // null = Pi profile defaults, [] = deliberately no tools.
+  allowed_tools: null,
+};
 
 function normalizeKimiToolNames(value) {
   const values = Array.isArray(value) ? value : String(value || '').split(/[\n,]/);
@@ -1021,6 +1028,13 @@ function kimiAllowedToolsFromSettings(settings) {
   if (settings?.kimi_allowed_tools_cleared === true) return null;
   return Array.isArray(settings?.kimi_allowed_tools)
     ? normalizeKimiToolNames(settings.kimi_allowed_tools)
+    : null;
+}
+
+function piAllowedToolsFromSettings(settings) {
+  if (settings?.pi_allowed_tools_cleared === true) return null;
+  return Array.isArray(settings?.pi_allowed_tools)
+    ? normalizeKimiToolNames(settings.pi_allowed_tools)
     : null;
 }
 
@@ -1067,6 +1081,7 @@ let newSessionAgentCommands = {
   codex: 'codex',
   'claude-code': 'claude',
   kimi: 'kimi',
+  pi: 'pi',
 };
 let newSessionCodexManagedContext = 'vanilla';
 let newSessionCodexContextArchive = 'summary';
@@ -1111,6 +1126,9 @@ let newSessionKimiGlobalPermissionMode = 'manual';
 let newSessionKimiGlobalPlanMode = false;
 let newSessionKimiGlobalSwarmMode = false;
 let newSessionKimiGlobalAllowedTools = null;
+let newSessionPiGlobalModel = '';
+let newSessionPiGlobalThinking = '';
+let newSessionPiGlobalAllowedTools = null;
 let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnName = '';
@@ -1182,6 +1200,14 @@ async function refreshControlPane() {
       swarm_mode: !!d.kimi_swarm_mode,
       allowed_tools: kimiAllowedToolsFromSettings(d),
     };
+    controlPiConfig = {
+      command: d.pi_command || 'pi',
+      model: d.pi_model || '',
+      thinking: d.pi_thinking || '',
+      allowed_tools: Array.isArray(d.pi_allowed_tools)
+        ? normalizeKimiToolNames(d.pi_allowed_tools)
+        : null,
+    };
     controlApprovalRules = {};
     for (const cat of CONTROL_APPROVAL_CATEGORIES) {
       const v = d['approval_' + cat];
@@ -1198,15 +1224,18 @@ function renderControlPane() {
   const codexSection = document.getElementById('control-codex-section');
   const claudeSection = document.getElementById('control-claude-section');
   const kimiSection = document.getElementById('control-kimi-section');
+  const piSection = document.getElementById('control-pi-section');
   const emptyMsg = document.getElementById('control-no-backend');
   const isCodex = controlCurrentBackend === 'codex';
   const isClaude = controlCurrentBackend === 'claude-code';
   const isKimi = controlCurrentBackend === 'kimi';
+  const isPi = controlCurrentBackend === 'pi';
   if (badge) badge.textContent = controlCurrentBackend || 'none';
   if (codexSection) codexSection.style.display = isCodex ? '' : 'none';
   if (claudeSection) claudeSection.style.display = isClaude ? '' : 'none';
   if (kimiSection) kimiSection.style.display = isKimi ? '' : 'none';
-  if (emptyMsg) emptyMsg.style.display = (isCodex || isClaude || isKimi) ? 'none' : '';
+  if (piSection) piSection.style.display = isPi ? '' : 'none';
+  if (emptyMsg) emptyMsg.style.display = (isCodex || isClaude || isKimi || isPi) ? 'none' : '';
   const $ = id => document.getElementById(id);
   if (isClaude) {
     const modelInp = $('control-claude-model');
@@ -1232,6 +1261,20 @@ function renderControlPane() {
       'control-kimi-allowed-tools',
       controlKimiConfig.allowed_tools,
     );
+  }
+  if (isPi) {
+    const modelInp = $('control-pi-model');
+    const thinkingInp = $('control-pi-thinking');
+    const toolsTA = $('control-pi-tools');
+    if (modelInp) modelInp.value = controlPiConfig.model || '';
+    if (thinkingInp) thinkingInp.value = controlPiConfig.thinking || '';
+    if (toolsTA) {
+      toolsTA.value = Array.isArray(controlPiConfig.allowed_tools)
+        ? (controlPiConfig.allowed_tools.length
+          ? controlPiConfig.allowed_tools.join('\n')
+          : '(no tools)')
+        : '';
+    }
   }
   if (isCodex) {
     const sandboxSel = $('control-codex-sandbox');
@@ -2206,14 +2249,16 @@ function handleCodexThreadActionResult(evt) {
   if (evt.success && evt.action === 'rename') {
     const sid = String(evt.session_id || '').trim();
     const rename = String(evt.message || '').match(
-      /^(Codex thread|Claude Code session|Kimi session) renamed to\s+(.+)$/i
+      /^(Codex thread|Claude Code session|Kimi session|Pi session) renamed to\s+(.+)$/i
     );
     const name = String(rename?.[2] || '').trim();
-    const source = /^Kimi session$/i.test(rename?.[1] || '')
-      ? 'kimi'
-      : /^Claude Code session$/i.test(rename?.[1] || '')
-        ? 'claude-code'
-        : 'codex';
+    const source = /^Pi session$/i.test(rename?.[1] || '')
+      ? 'pi'
+      : /^Kimi session$/i.test(rename?.[1] || '')
+        ? 'kimi'
+        : /^Claude Code session$/i.test(rename?.[1] || '')
+          ? 'claude-code'
+          : 'codex';
     if (sid && name) {
       applySessionRenameToUi(sid, source, name);
       updateSessionWindow(sid, { name });

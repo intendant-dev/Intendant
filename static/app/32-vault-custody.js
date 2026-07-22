@@ -1213,6 +1213,15 @@ const VAULT_OAUTH_PROVIDERS = {
     clientId: '17e5f671-d194-4dfb-9706-5516cb48c098',
     formEncoded: true,
   },
+  'oauth:pi': {
+    // Pi's auth.json may contain several providers. Browser-side refresh is
+    // currently supported for its `openai-codex` credential; other Pi OAuth
+    // providers remain available through the explicit full-credential mode.
+    tokenUrl: 'https://auth.openai.com/oauth/token',
+    clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+    // Match Pi's public-client refresh request exactly.
+    formEncoded: true,
+  },
 };
 /* Refresh when the current token has less life left than this. With
    provider access tokens living ≈1 h against a 5-minute renewal tick,
@@ -1224,6 +1233,7 @@ function vaultOauthRefreshTokenOf(kind, secretJson) {
   if (kind === 'oauth:codex') return String(secretJson?.tokens?.refresh_token || '');
   if (kind === 'oauth:claude-code') return String(secretJson?.claudeAiOauth?.refreshToken || '');
   if (kind === 'oauth:kimi') return String(secretJson?.refresh_token || '');
+  if (kind === 'oauth:pi') return String(secretJson?.['openai-codex']?.refresh || '');
   return '';
 }
 
@@ -1232,6 +1242,7 @@ function vaultOauthRefreshTokenOf(kind, secretJson) {
 function vaultOauthExpiryMs(kind, secretJson) {
   if (kind === 'oauth:claude-code') return Number(secretJson?.claudeAiOauth?.expiresAt) || 0;
   if (kind === 'oauth:kimi') return (Number(secretJson?.expires_at) || 0) * 1000;
+  if (kind === 'oauth:pi') return Number(secretJson?.['openai-codex']?.expires) || 0;
   if (kind === 'oauth:codex') {
     try {
       // ChatGPT-plan access tokens are JWTs; exp is authoritative and
@@ -1258,6 +1269,15 @@ function vaultOauthAccessMaterial(kind, secretJson) {
   }
   if (kind === 'oauth:claude-code' && copy.claudeAiOauth) copy.claudeAiOauth.refreshToken = '';
   if (kind === 'oauth:kimi') copy.refresh_token = '';
+  if (kind === 'oauth:pi') {
+    for (const [provider, credential] of Object.entries(copy || {})) {
+      if (credential?.type === 'oauth') {
+        credential.refresh = '';
+      } else if (credential?.type === 'api_key') {
+        delete copy[provider];
+      }
+    }
+  }
   return JSON.stringify(copy);
 }
 
@@ -1278,12 +1298,22 @@ async function vaultOauthRefresh(kind, entry) {
   if (!refreshToken) throw new Error('the stored auth JSON has no refresh token — re-paste the auth file');
   let response;
   try {
-    const refreshBody = {
-      grant_type: 'refresh_token',
-      client_id: provider.clientId,
-      refresh_token: refreshToken,
-      ...(provider.scope ? { scope: provider.scope } : {}),
-    };
+    // Preserve Pi's upstream public-client request shape byte-for-byte in
+    // field order as well as content. OAuth servers should not care about
+    // ordering, but this keeps the browser recipe directly auditable against
+    // Pi's refreshAccessToken implementation.
+    const refreshBody = kind === 'oauth:pi'
+      ? {
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+          client_id: provider.clientId,
+        }
+      : {
+          grant_type: 'refresh_token',
+          client_id: provider.clientId,
+          refresh_token: refreshToken,
+          ...(provider.scope ? { scope: provider.scope } : {}),
+        };
     response = await fetch(vaultOauthEndpointOverrides[kind] || provider.tokenUrl, {
       method: 'POST',
       headers: {
@@ -1324,6 +1354,19 @@ async function vaultOauthRefresh(kind, entry) {
     }
     if (fresh.scope) secretJson.scope = String(fresh.scope);
     if (fresh.token_type) secretJson.token_type = String(fresh.token_type);
+  } else if (kind === 'oauth:pi') {
+    const credential = secretJson['openai-codex'];
+    if (!credential || credential.type !== 'oauth') {
+      throw new Error(
+        'browser refresh currently supports Pi’s openai-codex login only — enable full-credential OAuth leases for another Pi provider'
+      );
+    }
+    if (!fresh.refresh_token || typeof fresh.expires_in !== 'number') {
+      throw new Error('Pi openai-codex refresh returned no rotated refresh token or expiry');
+    }
+    credential.access = String(fresh.access_token);
+    credential.refresh = String(fresh.refresh_token);
+    credential.expires = nowMs + Number(fresh.expires_in) * 1000;
   }
   vaultUpsertEntry({ id: entry.id, secret: JSON.stringify(secretJson) });
   return secretJson;
@@ -1405,7 +1448,7 @@ function vaultEntryLeaseKind(entry) {
   if (entry.kind === 'api_key' && entry.provider === 'rfc2136-dns') {
     return 'dns:rfc2136';
   }
-  if (entry.kind === 'oauth' && ['codex', 'claude-code', 'kimi'].includes(entry.provider)) {
+  if (entry.kind === 'oauth' && ['codex', 'claude-code', 'kimi', 'pi'].includes(entry.provider)) {
     return `oauth:${entry.provider}`;
   }
   return null;
@@ -2695,6 +2738,7 @@ function vaultProviderLabel(provider) {
   if (provider === 'codex') return 'Codex (subscription)';
   if (provider === 'claude-code') return 'Claude Code (subscription)';
   if (provider === 'kimi') return 'Kimi Code (subscription)';
+  if (provider === 'pi') return 'Pi (subscription OAuth)';
   if (provider === 'cloudflare-dns') return 'Cloudflare DNS';
   if (provider === 'rfc2136-dns') return 'RFC2136 TSIG';
   return provider || 'custom';
@@ -2906,7 +2950,7 @@ function vaultRenderAddForm(card) {
   const fillProviders = () => {
     providerSelect.innerHTML = '';
     const providers = kindSelect.value === 'oauth'
-      ? ['codex', 'claude-code', 'kimi']
+      ? ['codex', 'claude-code', 'kimi', 'pi']
       : ['anthropic', 'openai', 'gemini', 'cloudflare-dns', 'rfc2136-dns'];
     for (const provider of providers) {
       const option = document.createElement('option');
@@ -2931,7 +2975,7 @@ function vaultRenderAddForm(card) {
   const secretArea = document.createElement('textarea');
   secretArea.className = 'vault-phrase-input';
   secretArea.rows = 4;
-  secretArea.placeholder = 'Paste the agent auth file JSON (Codex: ~/.codex/auth.json · Claude Code: ~/.claude/.credentials.json · Kimi: ~/.kimi-code/credentials/kimi-code.json)';
+  secretArea.placeholder = 'Paste the agent auth file JSON (Codex: ~/.codex/auth.json · Claude Code: ~/.claude/.credentials.json · Kimi: ~/.kimi-code/credentials/kimi-code.json · Pi: ~/.pi/agent/auth.json)';
   secretArea.style.display = 'none';
   kindSelect.addEventListener('change', () => {
     fillProviders();

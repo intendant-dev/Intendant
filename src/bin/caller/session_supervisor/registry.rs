@@ -421,6 +421,9 @@ impl SessionSupervisor {
                 cfg.swarm_mode = current.swarm_mode;
                 cfg.allowed_tools = current.allowed_tools;
             }
+            // Pi has no mutable daemon-wide runtime config rail yet; its
+            // project/TOML config is already present on `project`.
+            Some(external_agent::AgentBackend::Pi) => {}
             None => {}
         }
         Ok(project)

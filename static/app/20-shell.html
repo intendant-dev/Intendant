@@ -935,8 +935,40 @@
                 </div>
               </fieldset>
             </div>
+            <div id="control-pi-section" style="display:none">
+              <fieldset class="control-group">
+                <legend>Session actions</legend>
+                <div class="control-actions-row">
+                  <button class="control-action-btn" data-codex-action="compact" title="Compact Pi's current context">Compact</button>
+                  <button class="control-action-btn" data-codex-action="fork" title="Fork the current Pi session">Fork…</button>
+                  <button class="control-action-btn" data-codex-action="side" title="Ask a side question in a Pi fork">Side…</button>
+                  <button class="control-action-btn" data-codex-action="rename" title="Rename the current Pi session">Rename…</button>
+                </div>
+                <div class="control-hint">
+                  Actions are gated by the live Pi session's advertised capabilities. Compact and rename use RPC; fork and side sessions respawn through Pi's native <code>--fork</code> path. Model and thinking can also be changed from the session's Configure dialog.
+                </div>
+              </fieldset>
+              <fieldset class="control-group">
+                <legend>Global launch profile</legend>
+                <div class="control-row">
+                  <label for="control-pi-model">Model</label>
+                  <input type="text" id="control-pi-model" readonly placeholder="Pi default">
+                </div>
+                <div class="control-row">
+                  <label for="control-pi-thinking">Thinking</label>
+                  <input type="text" id="control-pi-thinking" readonly placeholder="model default">
+                </div>
+                <div class="control-row">
+                  <label for="control-pi-tools">Active tools</label>
+                  <textarea id="control-pi-tools" rows="3" readonly placeholder="Pi defaults" style="flex:1;padding:4px 8px;background:var(--surface0);border:1px solid var(--surface1);color:var(--text);border-radius:4px;font-size:12px;font-family:var(--font-mono);resize:vertical"></textarea>
+                </div>
+                <div class="control-hint">
+                  These defaults come from <code>intendant.toml [agent.pi]</code>. Override them for a new session below, or use a session's Configure dialog to persist pins for its next attach.
+                </div>
+              </fieldset>
+            </div>
             <div id="control-no-backend" class="control-disabled-overlay" style="display:none">
-              Pick Codex, Claude Code, or Kimi Code in Settings &rarr; Agent to configure backend-specific knobs.
+              Pick Codex, Claude Code, Kimi Code, or Pi in Settings &rarr; Agent to configure backend-specific knobs.
             </div>
           </div>
         </div>
@@ -1390,6 +1422,7 @@
                     <label><input type="checkbox" value="codex"> Codex</label>
                     <label><input type="checkbox" value="claude-code"> Claude</label>
                     <label><input type="checkbox" value="kimi"> Kimi</label>
+                    <label><input type="checkbox" value="pi"> Pi</label>
                   </div>
                 </div>
                 <div class="sessions-control sessions-multi-filter" data-session-filter="status">
@@ -1531,6 +1564,7 @@
                     <label><input type="checkbox" value="codex"> Codex</label>
                     <label><input type="checkbox" value="claude-code"> Claude</label>
                     <label><input type="checkbox" value="kimi"> Kimi</label>
+                    <label><input type="checkbox" value="pi"> Pi</label>
                   </div>
                 </div>
                 <div class="sessions-control sessions-multi-filter" data-session-filter="deep-status">
@@ -1661,6 +1695,7 @@
                       <option value="codex">Codex</option>
                       <option value="claude-code">Claude Code</option>
                       <option value="kimi">Kimi Code</option>
+                      <option value="pi">Pi</option>
                     </select>
                   </label>
                   <label class="sessions-new-session-field" for="new-session-execution" id="new-session-execution-wrap"
@@ -1681,13 +1716,13 @@
                   <span class="sessions-fueled-text" id="new-session-fueled-text">Fueled &mdash; model credentials active, ready to launch.</span>
                 </div>
                 <div id="new-session-unfueled-banner" class="sessions-unfueled-banner hidden">
-                  <span class="sessions-unfueled-text">No model credentials on this daemon &mdash; the internal agent can&rsquo;t start. External agents (Codex, Claude Code, Kimi Code) sign in with their own accounts and still work.</span>
+                  <span class="sessions-unfueled-text">No model credentials on this daemon &mdash; the internal agent can&rsquo;t start. External agents (Codex, Claude Code, Kimi Code, Pi) sign in with their own accounts and still work.</span>
                   <button type="button" class="ui-btn sessions-unfueled-add-keys" onclick="focusSettingsApiKeys()">Add API keys</button>
                 </div>
                 <details class="ui-fold sessions-new-external-fold" id="new-session-external-fold">
                   <summary>External agent options</summary>
                   <div class="ui-fold-body">
-                    <p class="ui-fold-hint">These apply to external agents — pick Codex, Claude Code, or Kimi Code above to enable.</p>
+                    <p class="ui-fold-hint">These apply to external agents — pick Codex, Claude Code, Kimi Code, or Pi above to enable.</p>
                     <div class="sessions-new-agent-row sessions-new-external-grid">
                       <div class="sessions-new-session-field">
                         <label for="new-session-agent-command">Binary path</label>
@@ -1806,6 +1841,35 @@
                       <label class="sessions-new-session-field" for="new-session-kimi-allowed-tools">
                         Exact tool names
                         <textarea id="new-session-kimi-allowed-tools" rows="2" autocomplete="off" spellcheck="false" placeholder="Read, Write" disabled></textarea>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-pi-model">
+                        Pi model
+                        <input id="new-session-pi-model" type="text" autocomplete="off" spellcheck="false" placeholder="Global setting, or provider/model" disabled>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-pi-thinking">
+                        Pi thinking
+                        <select id="new-session-pi-thinking" disabled>
+                          <option value="">Global setting</option>
+                          <option value="off">off</option>
+                          <option value="minimal">minimal</option>
+                          <option value="low">low</option>
+                          <option value="medium">medium</option>
+                          <option value="high">high</option>
+                          <option value="xhigh">xhigh</option>
+                          <option value="max">max</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-pi-tools-mode">
+                        Pi active tools
+                        <select id="new-session-pi-tools-mode" onchange="onNewSessionPiToolsModeChange()" disabled>
+                          <option value="inherit">Global setting</option>
+                          <option value="exact">Exact list</option>
+                          <option value="none">No tools</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-pi-allowed-tools">
+                        Exact Pi tool names
+                        <textarea id="new-session-pi-allowed-tools" rows="2" autocomplete="off" spellcheck="false" placeholder="read, bash, edit, write" disabled></textarea>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-codex-sandbox">
                         Sandbox

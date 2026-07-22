@@ -72,11 +72,11 @@ trust framing applies to the MCP *server* side — see
 ## External coding-agent CLIs
 
 Instead of the native agent loop, Intendant can delegate coding work to an
-external CLI agent — **Codex**, **Claude Code**, or **Kimi Code** — selected
-per-invocation with `--agent <codex|claude-code|kimi>` or by default via
+external harness — **Codex**, **Claude Code**, **Kimi Code**, or **Pi** — selected
+per-invocation with `--agent <codex|claude-code|kimi|pi>` or by default via
 `[agent] default_backend`. Each backend's binary path, model, sandbox/approval
 policy, and tool restrictions are configured under `[agent.codex]`,
-`[agent.claude_code]`, and `[agent.kimi]` (full key reference in
+`[agent.claude_code]`, `[agent.kimi]`, and `[agent.pi]` (full key reference in
 [Configuration](./configuration.md#agent-and-external-backends)).
 
 Notable details:
@@ -93,6 +93,12 @@ Notable details:
   `:btw`/swarm sub-agents, goals, live model/thinking/permission/plan/swarm
   changes, structured interactions, file upload, and reconnect snapshots that
   Kimi's narrower ACP facade does not expose.
+- **Pi** runs upstream's documented JSONL RPC mode with discovered extensions
+  disabled and one private fail-closed Intendant approval extension. It keeps
+  Pi's native subscription/API provider support, sessions, images, steering,
+  interruption, compaction, fork, rename, and live model/thinking controls.
+  Pi has no built-in MCP; the supervised prompt truthfully directs it to the
+  scoped `$INTENDANT ctl` bootstrap for platform capabilities.
 
 This is a deep topic with its own chapter — see
 [External Agent Orchestration](./external-agent-orchestration.md).

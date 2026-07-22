@@ -97,6 +97,7 @@ fn external_thread_rename_name_from_result(
             external_agent::AgentBackend::Codex => "Codex thread renamed to ",
             external_agent::AgentBackend::Kimi => "Kimi session renamed to ",
             external_agent::AgentBackend::ClaudeCode => "Claude Code session renamed to ",
+            external_agent::AgentBackend::Pi => "Pi session renamed to ",
         };
         message
             .strip_prefix(prefix)
@@ -441,6 +442,16 @@ pub(crate) fn kimi_thread_action_capabilities() -> Vec<String> {
     .collect()
 }
 
+/// Pi RPC exposes native compaction, abort/steer, live model and thinking
+/// controls, plus durable session resume. Fork and side sessions use the
+/// common respawn-resume rail with Pi's `--fork` support.
+pub(crate) fn pi_thread_action_capabilities() -> Vec<String> {
+    ["compact", "fork", "side", "rename", "model", "thinking"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
 /// Capabilities of the primary NATIVE session: follow-up turns, mid-turn
 /// steering (the context-injection queue), interrupts, and the `goal*`
 /// family served by the shared `GoalEngine` running in the presence loop.
@@ -532,6 +543,33 @@ pub(crate) fn emit_kimi_session_capabilities(bus: &EventBus, session_id: Option<
     bus.send(AppEvent::SessionCapabilities {
         session_id: session_id.to_string(),
         capabilities: kimi_external_session_capabilities(),
+    });
+}
+
+pub(crate) fn pi_external_session_capabilities() -> types::SessionCapabilities {
+    types::SessionCapabilities {
+        follow_up: true,
+        steer: true,
+        interrupt: true,
+        thread_actions: pi_thread_action_capabilities(),
+        codex_thread_actions: Vec::new(),
+        codex_managed_context: None,
+        codex_sandbox: None,
+        codex_approval_policy: None,
+        codex_context_archive: None,
+        codex_command: None,
+        codex_fast_mode: None,
+        codex_service_tier: None,
+    }
+}
+
+pub(crate) fn emit_pi_session_capabilities(bus: &EventBus, session_id: Option<&str>) {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    bus.send(AppEvent::SessionCapabilities {
+        session_id: session_id.to_string(),
+        capabilities: pi_external_session_capabilities(),
     });
 }
 
@@ -1160,6 +1198,19 @@ pub(crate) fn kimi_launch_mutating_thread_action(op: &str) -> bool {
             | "tools-all"
             | "tools_set"
             | "tools_all"
+    )
+}
+
+pub(crate) fn pi_launch_mutating_thread_action(op: &str) -> bool {
+    matches!(
+        op,
+        "model"
+            | "model-set"
+            | "set-model"
+            | "thinking"
+            | "effort"
+            | "reasoning-effort"
+            | "reasoning_effort"
     )
 }
 
@@ -2143,7 +2194,7 @@ pub(crate) async fn handle_external_thread_action(
     let result_session_id = target_session_id.or_else(|| config.session_id.clone());
     let action_backend = external_backend_of_config(config)
         .or_else(|| external_agent::AgentBackend::from_str_loose(agent.name()));
-    // Backends without an in-process fork (Claude Code) fork by respawning:
+    // Backends without an in-process fork (Claude Code and Pi) fork by respawning:
     // a NEW supervisor session resumes the current thread with the backend's
     // fork flag, and the child announces its own native id on its first turn
     // (the lineage relationship is emitted at that identity upgrade). The
@@ -2225,6 +2276,9 @@ pub(crate) async fn handle_external_thread_action(
                         external_agent::AgentBackend::Kimi => {
                             format!("Kimi session renamed to {name}")
                         }
+                        external_agent::AgentBackend::Pi => {
+                            format!("Pi session renamed to {name}")
+                        }
                     };
                 }
                 Ok(None) => {}
@@ -2287,6 +2341,28 @@ pub(crate) async fn handle_external_thread_action(
                 source: "Kimi".into(),
                 content: format!(
                     "Live Kimi profile changed, but its restart/fork configuration was not persisted: {error}"
+                ),
+                turn: None,
+            });
+        }
+    }
+    if success
+        && action_backend == Some(external_agent::AgentBackend::Pi)
+        && pi_launch_mutating_thread_action(&op)
+    {
+        if let Err(error) = persist_live_external_launch_config(
+            agent.as_ref(),
+            config,
+            &external_agent::AgentBackend::Pi,
+            result_session_id.as_deref(),
+        ) {
+            slog(config.session_log, |log| log.warn(&error));
+            config.bus.send(AppEvent::LogEntry {
+                session_id: result_session_id.clone(),
+                level: "error".into(),
+                source: "Pi".into(),
+                content: format!(
+                    "Live Pi profile changed, but its restart/fork configuration was not persisted: {error}"
                 ),
                 turn: None,
             });
@@ -2746,7 +2822,7 @@ pub(crate) fn emit_side_session_started(
 }
 
 /// Which external backend this drain supervises, from its display source
-/// ("Codex", "Claude Code", "Kimi Code"). None for unknown/legacy sources.
+/// ("Codex", "Claude Code", "Kimi", "Pi"). None for unknown/legacy sources.
 pub(crate) fn external_backend_of_config(
     config: &DrainConfig<'_>,
 ) -> Option<external_agent::AgentBackend> {
@@ -4057,6 +4133,8 @@ pub(crate) fn persist_native_backend_session_id(config: &DrainConfig<'_>, native
         emit_claude_code_session_capabilities(config.bus, Some(native_id));
     } else if backend == external_agent::AgentBackend::Kimi {
         emit_kimi_session_capabilities(config.bus, Some(native_id));
+    } else if backend == external_agent::AgentBackend::Pi {
+        emit_pi_session_capabilities(config.bus, Some(native_id));
     }
     let mut launch = crate::session_config::read_log_dir_config(config.log_dir).unwrap_or_default();
     if launch.source.is_none() {

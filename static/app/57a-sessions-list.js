@@ -695,7 +695,7 @@ function buildSessionCard(m, derived, ctx) {
     sourceEl.title = `${prettyAgentName(backendSource) || backendSource} backend`;
   }
   // Badge tint is CSS-keyed off the normalized source id (native=iris,
-  // codex=neutral, claude-code=amber, kimi=sky).
+  // codex=neutral, claude-code=amber, kimi=sky; Pi uses the external default).
   sourceEl.dataset.src = source;
   top.appendChild(sourceEl);
 

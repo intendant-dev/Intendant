@@ -446,6 +446,97 @@ const KIMI_SERVER_EVENT_TYPES: &[&str] = &[
     "usage.record",
 ];
 
+// Pi coding-agent 0.81.1 RPC vocabulary. Pi's RPC mode is deliberately a
+// small LF-delimited JSON protocol; pin every discriminator we either consume
+// or intentionally ignore so upgrades become passive, artifact-specific drift
+// evidence without launching a probe or spending quota.
+const PI_ENVELOPE_TYPES: &[&str] = &[
+    "response",
+    "agent_start",
+    "agent_end",
+    "agent_settled",
+    "turn_start",
+    "turn_end",
+    "message_start",
+    "message_update",
+    "message_end",
+    "tool_execution_start",
+    "tool_execution_update",
+    "tool_execution_end",
+    "queue_update",
+    "compaction_start",
+    "compaction_end",
+    "entry_appended",
+    "session_info_changed",
+    "thinking_level_changed",
+    "auto_retry_start",
+    "auto_retry_end",
+    "summarization_retry_scheduled",
+    "summarization_retry_attempt_start",
+    "summarization_retry_finished",
+    "extension_error",
+    "extension_ui_request",
+];
+const PI_RESPONSE_COMMANDS: &[&str] = &[
+    "prompt",
+    "steer",
+    "follow_up",
+    "abort",
+    "new_session",
+    "get_state",
+    "set_model",
+    "cycle_model",
+    "get_available_models",
+    "set_thinking_level",
+    "cycle_thinking_level",
+    "get_available_thinking_levels",
+    "set_steering_mode",
+    "set_follow_up_mode",
+    "compact",
+    "set_auto_compaction",
+    "set_auto_retry",
+    "abort_retry",
+    "bash",
+    "abort_bash",
+    "get_session_stats",
+    "export_html",
+    "switch_session",
+    "fork",
+    "clone",
+    "get_fork_messages",
+    "get_entries",
+    "get_tree",
+    "get_last_assistant_text",
+    "set_session_name",
+    "get_messages",
+    "get_commands",
+];
+const PI_MESSAGE_DELTA_TYPES: &[&str] = &[
+    "start",
+    "text_start",
+    "text_delta",
+    "text_end",
+    "thinking_start",
+    "thinking_delta",
+    "thinking_end",
+    "toolcall_start",
+    "toolcall_delta",
+    "toolcall_end",
+    "done",
+    "error",
+];
+const PI_EXTENSION_UI_METHODS: &[&str] = &[
+    "select",
+    "confirm",
+    "input",
+    "editor",
+    "notify",
+    "setStatus",
+    "setWidget",
+    "setTitle",
+    "set_editor_text",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProtocolSurface {
@@ -468,6 +559,10 @@ pub(crate) enum ProtocolSurface {
     CodexItemType,
     KimiRootField,
     KimiEvent,
+    PiEnvelope,
+    PiResponseCommand,
+    PiMessageDelta,
+    PiExtensionUi,
     MonitorCapacity,
 }
 
@@ -493,6 +588,10 @@ impl ProtocolSurface {
             Self::CodexItemType => "codex_item_type",
             Self::KimiRootField => "kimi_root_field",
             Self::KimiEvent => "kimi_event",
+            Self::PiEnvelope => "pi_envelope",
+            Self::PiResponseCommand => "pi_response_command",
+            Self::PiMessageDelta => "pi_message_delta",
+            Self::PiExtensionUi => "pi_extension_ui",
             Self::MonitorCapacity => "monitor_capacity",
         }
     }
@@ -641,6 +740,7 @@ fn profile_key(profile: &str) -> &'static str {
         "managed" => "managed",
         "vanilla" => "vanilla",
         "server-v1" => "server-v1",
+        "rpc" => "rpc",
         _ => "other",
     }
 }
@@ -1192,6 +1292,100 @@ pub(crate) fn kimi_findings(value: &serde_json::Value) -> Vec<ProtocolFinding> {
     findings
 }
 
+/// Redacted compatibility checks for one Pi RPC line. Only fixed
+/// discriminators and their JSON kinds are inspected; prompts, output, tool
+/// arguments, and extension titles never enter the compatibility store.
+pub(crate) fn pi_findings(value: &serde_json::Value) -> Vec<ProtocolFinding> {
+    let mut findings = Vec::new();
+    let Some(object) = value.as_object() else {
+        findings.push(ProtocolFinding::kind_mismatch(
+            ProtocolSurface::PiEnvelope,
+            "root",
+            JsonValueKind::Object,
+            JsonValueKind::of(Some(value)),
+        ));
+        return findings;
+    };
+    let Some(envelope) = require_string(
+        &mut findings,
+        ProtocolSurface::PiEnvelope,
+        "type",
+        object.get("type"),
+    ) else {
+        return findings;
+    };
+    unknown_if_not_in(
+        &mut findings,
+        ProtocolSurface::PiEnvelope,
+        &envelope,
+        PI_ENVELOPE_TYPES,
+        FindingSeverity::Warning,
+    );
+    match envelope.as_str() {
+        "response" => {
+            if let Some(command) = require_string(
+                &mut findings,
+                ProtocolSurface::PiResponseCommand,
+                "command",
+                object.get("command"),
+            ) {
+                unknown_if_not_in(
+                    &mut findings,
+                    ProtocolSurface::PiResponseCommand,
+                    &command,
+                    PI_RESPONSE_COMMANDS,
+                    FindingSeverity::Warning,
+                );
+            }
+            if JsonValueKind::of(object.get("success")) != JsonValueKind::Bool {
+                findings.push(ProtocolFinding::kind_mismatch(
+                    ProtocolSurface::PiResponseCommand,
+                    "success",
+                    JsonValueKind::Bool,
+                    JsonValueKind::of(object.get("success")),
+                ));
+            }
+        }
+        "message_update" => {
+            let delta_type = object
+                .get("assistantMessageEvent")
+                .and_then(|event| event.get("type"));
+            if let Some(delta_type) = require_string(
+                &mut findings,
+                ProtocolSurface::PiMessageDelta,
+                "assistantMessageEvent.type",
+                delta_type,
+            ) {
+                unknown_if_not_in(
+                    &mut findings,
+                    ProtocolSurface::PiMessageDelta,
+                    &delta_type,
+                    PI_MESSAGE_DELTA_TYPES,
+                    FindingSeverity::Warning,
+                );
+            }
+        }
+        "extension_ui_request" => {
+            if let Some(method) = require_string(
+                &mut findings,
+                ProtocolSurface::PiExtensionUi,
+                "method",
+                object.get("method"),
+            ) {
+                unknown_if_not_in(
+                    &mut findings,
+                    ProtocolSurface::PiExtensionUi,
+                    &method,
+                    PI_EXTENSION_UI_METHODS,
+                    FindingSeverity::Error,
+                );
+            }
+        }
+        _ => {}
+    }
+    findings
+}
+
 pub(crate) fn codex_server_request_is_supported(method: &str) -> bool {
     CODEX_SUPPORTED_SERVER_REQUEST_METHODS.contains(&method)
 }
@@ -1317,10 +1511,12 @@ pub(crate) fn manifest_digest(backend: &AgentBackend) -> String {
     static CLAUDE_DIGEST: OnceLock<String> = OnceLock::new();
     static CODEX_DIGEST: OnceLock<String> = OnceLock::new();
     static KIMI_DIGEST: OnceLock<String> = OnceLock::new();
+    static PI_DIGEST: OnceLock<String> = OnceLock::new();
     let cache = match backend {
         AgentBackend::ClaudeCode => &CLAUDE_DIGEST,
         AgentBackend::Codex => &CODEX_DIGEST,
         AgentBackend::Kimi => &KIMI_DIGEST,
+        AgentBackend::Pi => &PI_DIGEST,
     };
     cache
         .get_or_init(|| compute_manifest_digest(backend))
@@ -1357,6 +1553,12 @@ fn compute_manifest_digest(backend: &AgentBackend) -> String {
             ("item", CODEX_ITEM_TYPES),
         ],
         AgentBackend::Kimi => &[("server_event", KIMI_SERVER_EVENT_TYPES)],
+        AgentBackend::Pi => &[
+            ("envelope", PI_ENVELOPE_TYPES),
+            ("response", PI_RESPONSE_COMMANDS),
+            ("message_delta", PI_MESSAGE_DELTA_TYPES),
+            ("extension_ui", PI_EXTENSION_UI_METHODS),
+        ],
     };
     let mut material = format!(
         "schema:{STORE_SCHEMA_VERSION}\0contract:{CONTRACT_REVISION}\0{}",
@@ -1530,6 +1732,9 @@ impl ProtocolWatchHandle {
                 .as_deref()
                 .and_then(sanitize_codex_reported_version),
             AgentBackend::Kimi => reported_version.as_deref().and_then(kimi_reported_version),
+            // Pi's RPC handshake does not report a version. The executable
+            // fingerprint still gives exact passive artifact identity.
+            AgentBackend::Pi => None,
         };
         if self
             .inner
@@ -2203,6 +2408,72 @@ mod tests {
         assert!(!serde_json::to_string(&semantic)
             .unwrap()
             .contains("SENTINEL_NOT_A_TIMESTAMP"));
+    }
+
+    #[test]
+    fn pi_known_rpc_shapes_are_accepted() {
+        for value in [
+            serde_json::json!({
+                "type": "response", "id": "rpc-1", "command": "get_state",
+                "success": true, "data": { "sessionId": "SENTINEL_SESSION" }
+            }),
+            serde_json::json!({
+                "type": "message_update",
+                "assistantMessageEvent": { "type": "thinking_delta", "delta": "SENTINEL" },
+                "message": { "role": "assistant" }
+            }),
+            serde_json::json!({
+                "type": "extension_ui_request", "id": "ui-1", "method": "select",
+                "title": "SENTINEL_PRIVATE_APPROVAL", "options": ["one", "two"]
+            }),
+            serde_json::json!({ "type": "entry_appended", "entry": { "secret": "SENTINEL" } }),
+        ] {
+            assert!(pi_findings(&value).is_empty(), "{value}");
+        }
+    }
+
+    #[test]
+    fn pi_unknown_discriminants_are_redacted_and_ui_drift_is_error_severity() {
+        let envelope = pi_findings(&serde_json::json!({
+            "type": "future.private.event",
+            "payload": { "prompt": "SENTINEL_PI_PROMPT" }
+        }));
+        assert_eq!(envelope.len(), 1);
+        assert_eq!(envelope[0].surface, ProtocolSurface::PiEnvelope);
+        assert_eq!(envelope[0].severity, FindingSeverity::Warning);
+
+        let ui = pi_findings(&serde_json::json!({
+            "type": "extension_ui_request", "method": "futureSecretDialog",
+            "title": "SENTINEL_PI_TITLE"
+        }));
+        assert_eq!(ui.len(), 1);
+        assert_eq!(ui[0].surface, ProtocolSurface::PiExtensionUi);
+        assert_eq!(ui[0].severity, FindingSeverity::Error);
+        let serialized = serde_json::to_string(&(envelope, ui)).unwrap();
+        for secret in [
+            "future.private.event",
+            "futureSecretDialog",
+            "SENTINEL_PI_PROMPT",
+            "SENTINEL_PI_TITLE",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+    }
+
+    #[test]
+    fn pi_rpc_shape_drift_records_only_field_and_kind() {
+        let findings = pi_findings(&serde_json::json!({
+            "type": "response", "command": ["SENTINEL_COMMAND"],
+            "success": "SENTINEL_SUCCESS", "data": "SENTINEL_DATA"
+        }));
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().all(|finding| {
+            finding.surface == ProtocolSurface::PiResponseCommand && finding.actual_kind.is_some()
+        }));
+        let serialized = serde_json::to_string(&findings).unwrap();
+        for secret in ["SENTINEL_COMMAND", "SENTINEL_SUCCESS", "SENTINEL_DATA"] {
+            assert!(!serialized.contains(secret));
+        }
     }
 
     #[test]

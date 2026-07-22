@@ -58,11 +58,19 @@ state:
 | Field | Type | Notes |
 |-------|------|-------|
 | `autonomy` | `SharedAutonomy` | Global autonomy level + the user-display grant flag |
-| `external_agent` | `Arc<RwLock<Option<AgentBackend>>>` | Active backend: Codex / Claude Code / Kimi, or `None` (internal) |
+| `external_agent` | `Arc<RwLock<Option<AgentBackend>>>` | Active backend: Codex / Claude Code / Kimi / Pi, or `None` (internal) |
 | `codex_config` | `SharedCodexConfig` | Runtime Codex config, including ordinary/managed commands, sandbox, approval policy, model/reasoning/service tier, web/network/write access, and managed-context/archive modes |
 | `claude_config` | `SharedClaudeConfig` | Runtime Claude Code config (model, permission mode, allowed tools) |
 | `kimi_config` | `SharedKimiConfig` | Runtime Kimi config (command, model, thinking, permission mode, plan mode, swarm mode) |
 | `project_root` | `Option<PathBuf>` | When set, state changes also persist to `intendant.toml` |
+
+Pi is deliberately not another shared config field. Its global defaults live
+in `[agent.pi]`; new sessions seed from that TOML, while reattached sessions
+merge the current TOML base with their persisted launch overlay (the overlay
+wins). Live model/thinking changes use Pi RPC and persist in that overlay;
+command/tool changes require restart. This keeps a replaceable engine's
+configuration below the platform boundary instead of mirroring it throughout
+the control plane.
 
 It is spawned once during each controller startup path
 (`startup/daemon.rs` or `startup/headless.rs`). `spawn` takes the state and
@@ -84,7 +92,8 @@ spawn**. Codex locks its sandbox / approval / model / tool configuration at
 `thread/start`; Claude Code likewise latches model, permission mode, and allowed
 tools when the CLI process is launched. Kimi latches its command at process
 start, but can apply model, thinking, permission, plan, and swarm changes live
-through its session profile. So when a frontend flips, say, the Codex
+through its session profile. Pi latches command and active tools but applies
+model and thinking live through RPC. So when a frontend flips, say, the Codex
 sandbox mode or the Claude Code permission mode, the control plane updates the
 shared config and persists it, but an already-running external-agent thread keeps
 its old values for the rest of its life. The change takes effect on the **next**
@@ -92,12 +101,13 @@ task — the daemon loop re-reads the shared config at the start of each task an
 for changes that cannot be applied mid-session, tears down the persistent agent
 so the next launch picks them up. Each `ControlMsg::SetCodex*`,
 `ControlMsg::SetClaude*`, and `ControlMsg::SetKimi*` variant documents this in
-its doc comment.
+its doc comment. Pi's global Settings save goes straight to TOML rather than
+adding a fourth family of daemon-wide backend-specific setters.
 
 Thread actions apply *immediately* rather than next-task when the selected
 backend supports them: `/new`, `/compact`, `/fast`, `/fork`, `/undo`,
-`/review`, goals, and the backend-neutral subsets exposed by Claude Code and
-Kimi. The
+`/review`, goals, and the backend-neutral subsets exposed by Claude Code,
+Kimi, and Pi. The
 wire variant retains its historical name `CodexThreadAction`, but the
 advertised operation catalog is universal. The control plane does not own the
 persistent agent, so it merely *re-broadcasts* these as
@@ -136,7 +146,7 @@ It subscribes to the bus and handles the session-lifecycle `ControlMsg`s:
 | `CreateSession` | Explicitly create a new managed session and submit its first task (the forward-compatible primitive for parallel sessions). A task of exactly `/fast` is special-cased into a new idle Codex session with the fast service tier enabled. |
 | `StartTask { session_id: None }` | Start a new managed session (legacy clients). A task of exactly `/fast` follows the same idle fast Codex bootstrap path as `CreateSession`. |
 | `StartTask { session_id: Some(id) }` | Route the text as a follow-up turn into the named session |
-| `ResumeSession` | Re-attach an existing session by source (`intendant`/`codex`/`claude-code`/`kimi`) + id, optionally with a prompt |
+| `ResumeSession` | Re-attach an existing session by source (`intendant`/`codex`/`claude-code`/`kimi`/`pi`) + id, optionally with a prompt |
 | `FollowUp` | Route text to a session's follow-up channel (target id, or the active session) |
 | `EditUserMessage` | Rewind a session to a user turn and submit replacement text (rollback-capable backends only) |
 | `Interrupt` / `Steer` | Mid-turn control of a running session. If a steer body is a supported Codex slash command, the supervisor converts it to a Codex thread action instead of injecting it as model text. |
@@ -234,7 +244,7 @@ by it, so the supervisor picks it up.
 
 `file_watcher.rs` is a live filesystem watcher rooted at the project directory
 (a projectless daemon starts no watcher — there is nothing to watch).
-It works for **all** agent types — internal, Codex, Claude Code, Kimi —
+It works for **all** agent types — internal, Codex, Claude Code, Kimi, Pi —
 because it watches the filesystem directly rather than diffing git, so an
 external CLI's edits show up the same as Intendant's own. It does two jobs:
 

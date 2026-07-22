@@ -1,10 +1,12 @@
 # External-Agent Orchestration
 
-Intendant can hand a whole task to a third-party coding CLI — **OpenAI Codex**,
-**Claude Code**, or **Kimi Code** — and supervise it as a subordinate worker. The
-external tool does the actual coding; Intendant wraps it in its own oversight,
-display, and computer-use surface by pointing the tool's MCP client at Intendant's
-own [MCP server](./mcp-server.md).
+Intendant can hand a whole task to a third-party coding harness — **OpenAI
+Codex**, **Claude Code**, **Kimi Code**, or **Pi** — and supervise it as a
+subordinate worker. The external tool does the actual coding; Intendant wraps
+it in its own oversight, lifecycle, display, and computer-use surfaces. Codex,
+Claude Code, and Kimi receive a scoped Intendant MCP bootstrap. Pi intentionally
+does not pretend to have MCP: its supervised system prompt points at the scoped
+`$INTENDANT ctl` bootstrap instead.
 
 This is one of the four current execution shapes — Direct, Orchestrate,
 Sub-Agent, and External-Agent (see
@@ -20,9 +22,10 @@ one in Intendant gives you:
 - **One oversight surface.** The supervised agent's command/file approval requests
   are lifted into Intendant's frontends (web dashboard, MCP, `--json`) and the
   same autonomy policy that governs the native agent.
-- **Display & computer use.** Intendant injects an `intendant` MCP server into the
-  external tool's config, so the coding agent can call Intendant's MCP tools —
-  screenshots, computer use, etc. — over MCP-over-HTTP against the running gateway.
+- **Display & computer use.** MCP-capable backends receive a scoped `intendant`
+  MCP server over the running gateway. Pi receives the same session-scoped
+  authority through `$INTENDANT ctl`; this preserves Pi's intentionally small
+  core instead of inventing a fake MCP integration.
 - **Presence & multi-session.** The supervised session is just another session on
   the [EventBus](./architecture.md); the [presence layer](./presence.md) narrates
   it and the daemon can run several alongside native agents
@@ -87,13 +90,16 @@ one process (Codex threads and Kimi `:btw`/swarm agents).
 `resume_session` id, and the Codex-only knobs (`sandbox`, `reasoning_effort`,
 `web_search`, `network_access`, `writable_roots`). Kimi's adapter additionally
 receives its launch profile (`thinking`, permission mode, plan mode, and swarm
-mode). Backends that don't model a field ignore it.
+mode); Pi receives model, thinking level, and an exact active-tool override.
+Backends that don't model a field ignore it.
 
 The supported backend identities are the `AgentBackend` enum (`Codex`,
-`ClaudeCode`, `Kimi`). `from_str_loose()` accepts the canonical short forms plus
-older/display forms (`codex`, `claude-code`/`claude_code`/`cc`, and
-`kimi`/`kimi-code`/`kimi_code`, case-insensitive); `as_short_str()` emits the
-canonical wire form that matches the dashboard dropdown's `<option value>`.
+`ClaudeCode`, `Kimi`, `Pi`). `from_str_loose()` accepts the canonical short
+forms plus older/display forms (`codex`, `claude-code`/`claude_code`/`cc`,
+`kimi`/`kimi-code`/`kimi_code`, and
+`pi`/`pi-coding-agent`/`pi_coding_agent`/`pi coding agent`, case-insensitive);
+`as_short_str()` emits the canonical wire form that matches the dashboard
+dropdown's `<option value>`.
 
 Gemini CLI was previously supported as a backend and was retired in July 2026;
 persisted sessions from it remain readable but cannot be resumed.
@@ -104,25 +110,26 @@ persisted sessions from it remain readable but cannot be resumed.
 adapter from `[agent.<backend>]` config, then `run_external_agent_mode()`
 (`external_mode.rs`) drives the supervise loop.
 
-| | **Codex** (reference impl) | **Claude Code** | **Kimi Code** |
-|---|---|---|---|
-| Module | `external_agent/codex/` (mod, threads, wire, context_trace, reader) | `external_agent/claude_code.rs` | `external_agent/kimi_code/` (mod, bridge, events, review, rpc, runtime, websocket, wire) |
-| Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --permission-mode <mode>` | Kimi 0.27: `kimi server run --foreground --port 0 --log-level silent`; Kimi 0.28: `kimi web --no-open --port 0 --log-level silent` |
-| Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio | bearer-authenticated loopback REST + reconnecting cursor/snapshot WebSocket (`server-v1`), plus a typed allowlist over authenticated reflected v2 RPCs |
-| MCP injection | Per-process `-c mcp_servers.intendant.{type,url,bearer_token_env_var}` overrides plus scoped env; no workspace config file | Inline `--mcp-config '{…}'` JSON with an environment-expanded Authorization header | Per-session bridge home containing generated `mcp.json`; scoped bearer stays in the child environment |
-| Multi-thread | Yes — many threads per process | No | Yes — the main session plus native `:btw` and swarm agents |
-| Native thread id | Yes | Yes — announced via `AgentEvent::NativeSessionId` on the first turn (placeholder `claude-code-session` until then; `--resume` keeps the id stable so resumed threads are canonical immediately) | Yes — returned at create/resume before the first prompt |
-| Mid-turn steer | Yes (`turn/steer`) | Yes — a stdin user message is absorbed into the running turn at the CLI's next checkpoint (verified on 2.1.215; 2.1.207 discarded such lines). No stdout echo, so delivery is inferred at the next model checkpoint; an idle session delivers the steer immediately as its own turn | Yes — Kimi queued prompts plus `prompts::steer`; a completion race becomes an ordinary immediate follow-up without losing text |
-| Mid-turn interrupt | Yes (`turn/interrupt`) | Yes (`control_request` `interrupt`; the process survives for follow-up turns) | Yes — active prompt abort, with a session abort fallback |
-| Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) | Yes — usage events plus typed `agentRPCService.getContext` snapshots: Kimi's current post-compaction model history and measured `tokenCount`, scoped to the exact selected main/composite agent, with the configured model catalog's context window |
-| Reasoning trace | Yes | Yes (`thinking` blocks) | Yes — thinking deltas/messages |
-| Rollback turns | Yes (`thread/rollback`) | No → session reset | Yes — native `undo`, including edit-and-rerun of an active historical user turn |
-| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | `compact`, `fork` (respawns via `--resume <id> --fork-session`), `side` (`/btw` — the same respawn carrying a side boundary + question as the child's first prompt; lineage `fork_relationship: "side"`), the full `goal*` family (wrapper goal engine), and live `model` / `permission-mode` — all via universal `thread_actions`. No fast/review/memory-reset — see [Dashboard and Station parity](#dashboard-and-station-parity-codex-vs-claude-code) | Native `compact`, head and exact historical real-user-turn-boundary `fork`, `side`/`:btw`, `undo`, archive/restore/rename, goal get/set/pause/resume/complete/clear with enforced token/turn/wall-clock budgets, live model/thinking/permission/plan/swarm switches, official normal↔highspeed model toggling, supervisor-enforced tool-free read-only review turns over bounded controller-collected workspace evidence, background-task list/output/cancel, exact per-agent active-tool control, model catalog, and destructive per-agent context clear. Kimi has no persistent-memory plane equivalent to Codex `memory-reset`, explicit “mark budget-limited” setter, arbitrary item/message/child fork anchor, or child-only undo |
-| Native sub-agents | Yes — collab tools spawn real attachable threads (`SubAgentToolCall`) | Yes — the in-band `Agent`/`Task` tool; async children stream `parent_tool_use_id`-tagged envelopes, surfaced as ephemeral `task-*` child sessions on the same `SubAgentToolCall`/relationship rail | Yes — native swarm and `:btw` agents retain their own ids, scoped activity, relationships, status, and results |
+| | **Codex** (reference impl) | **Claude Code** | **Kimi Code** | **Pi** |
+|---|---|---|---|---|
+| Module | `external_agent/codex/` (mod, threads, wire, context_trace, reader) | `external_agent/claude_code.rs` | `external_agent/kimi_code/` (mod, bridge, events, review, rpc, runtime, websocket, wire) | `external_agent/pi.rs` |
+| Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --permission-mode <mode>` | Kimi 0.27: `kimi server run --foreground --port 0 --log-level silent`; Kimi 0.28: `kimi web --no-open --port 0 --log-level silent` | `pi --mode rpc --no-extensions --no-approve --extension <private> --append-system-prompt <bootstrap>` plus session/model/thinking/tool flags |
+| Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio | bearer-authenticated loopback REST + reconnecting cursor/snapshot WebSocket (`server-v1`), plus a typed allowlist over authenticated reflected v2 RPCs | documented LF-delimited JSON RPC over stdio |
+| Intendant capability injection | Per-process `-c mcp_servers.intendant.{type,url,bearer_token_env_var}` overrides plus scoped env; no workspace config file | Inline `--mcp-config '{…}'` JSON with an environment-expanded Authorization header | Per-session bridge home containing generated `mcp.json`; scoped bearer stays in the child environment | No MCP. Scoped `$INTENDANT`, `INTENDANT_MCP_URL`, and session authority support on-demand `intendant ctl` calls |
+| Multi-thread | Yes — many threads per process | No | Yes — the main session plus native `:btw` and swarm agents | No — one Pi RPC process/session per wrapper |
+| Native thread id | Yes | Yes — announced via `AgentEvent::NativeSessionId` on the first turn (placeholder `claude-code-session` until then; `--resume` keeps the id stable so resumed threads are canonical immediately) | Yes — returned at create/resume before the first prompt | Yes — `get_state.sessionId` before the first prompt |
+| Mid-turn steer | Yes (`turn/steer`) | Yes — a stdin user message is absorbed into the running turn at the CLI's next checkpoint (verified on 2.1.215; 2.1.207 discarded such lines). No stdout echo, so delivery is inferred at the next model checkpoint; an idle session delivers the steer immediately as its own turn | Yes — Kimi queued prompts plus `prompts::steer`; a completion race becomes an ordinary immediate follow-up without losing text | Yes (`steer`) |
+| Mid-turn interrupt | Yes (`turn/interrupt`) | Yes (`control_request` `interrupt`; the process survives for follow-up turns) | Yes — active prompt abort, with a session abort fallback | Yes (`abort`) |
+| Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) | Yes — usage events plus typed `agentRPCService.getContext` snapshots: Kimi's current post-compaction model history and measured `tokenCount`, scoped to the exact selected main/composite agent, with the configured model catalog's context window | Yes — assistant-message usage/cache fields plus model context window from state/model events |
+| Reasoning trace | Yes | Yes (`thinking` blocks) | Yes — thinking deltas/messages | Yes — thinking deltas/messages |
+| Rollback turns | Yes (`thread/rollback`) | No → session reset | Yes — native `undo`, including edit-and-rerun of an active historical user turn | No → fork or reset |
+| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | `compact`, `fork` (respawns via `--resume <id> --fork-session`), `side` (`/btw` — the same respawn carrying a side boundary + question as the child's first prompt; lineage `fork_relationship: "side"`), the full `goal*` family (wrapper goal engine), and live `model` / `permission-mode` — all via universal `thread_actions`. No fast/review/memory-reset — see [Dashboard and Station parity](#dashboard-and-station-parity-codex-vs-claude-code) | Native `compact`, head and exact historical real-user-turn-boundary `fork`, `side`/`:btw`, `undo`, archive/restore/rename, goal get/set/pause/resume/complete/clear with enforced token/turn/wall-clock budgets, live model/thinking/permission/plan/swarm switches, official normal↔highspeed model toggling, supervisor-enforced tool-free read-only review turns over bounded controller-collected workspace evidence, background-task list/output/cancel, exact per-agent active-tool control, model catalog, and destructive per-agent context clear. Kimi has no persistent-memory plane equivalent to Codex `memory-reset`, explicit “mark budget-limited” setter, arbitrary item/message/child fork anchor, or child-only undo | Native compact and rename; fork/side respawn from the parent session; live model and thinking. No native goals/review/fast/memory reset |
+| Native sub-agents | Yes — collab tools spawn real attachable threads (`SubAgentToolCall`) | Yes — the in-band `Agent`/`Task` tool; async children stream `parent_tool_use_id`-tagged envelopes, surfaced as ephemeral `task-*` child sessions on the same `SubAgentToolCall`/relationship rail | Yes — native swarm and `:btw` agents retain their own ids, scoped activity, relationships, status, and results | No — upstream Pi deliberately omits built-in sub-agents |
 
-All three spawn through `crate::platform::spawn_command(&cfg.command)` with the
+All four spawn through `crate::platform::spawn_command(&cfg.command)` with the
 working dir set to the project root. Codex and Claude pipe their protocol over
-stdio and forward stderr into the session activity log. Kimi starts its local
+stdio and forward stderr into the session activity log; Pi does the same for
+its RPC stream. Kimi starts its local
 server in silent mode, reads the one-line ephemeral origin from stdout and the
 private bearer token from its isolated bridge home, validates the API/RPC
 contract, and immediately unlinks the on-disk token while retaining it only in
@@ -137,7 +144,7 @@ deduplicated lifecycle boundary.
 
 ### Passive protocol compatibility watch
 
-Every supervised Codex, Claude Code, or Kimi Code process carries a passive
+Every supervised Codex, Claude Code, Kimi Code, or Pi process carries a passive
 compatibility watch. It fingerprints the resolved executable with filesystem metadata and,
 while a user-started session is already running, compares fixed wire
 discriminants against the adapter's embedded vocabulary. Unknown message
@@ -154,8 +161,9 @@ four most recently observed fingerprints, so upgrade residue does not
 accumulate.
 
 The initial vocabulary baseline is Claude Code 2.1.210, Codex app-server
-0.144.1, and the complete projected Kimi Code server-v1/agent-event-bus
-vocabulary in 0.27.0/0.28.0. Known-but-intentionally-ignored notifications are
+0.144.1, the complete projected Kimi Code server-v1/agent-event-bus vocabulary
+in 0.27.0/0.28.0, and Pi RPC as source-audited in `pi-mono` package 0.81.1.
+Known-but-intentionally-ignored notifications are
 included so the
 watch reports new protocol surface, not ordinary traffic the adapter already
 chose to ignore. Structural-check changes bump a separate contract revision,
@@ -192,15 +200,15 @@ known-but-unsupported request is itself a compatibility finding.
 
 What each supervised backend actually receives:
 
-| | **Codex** | **Claude Code** | **Kimi Code** |
-|---|---|---|---|
-| MCP tool exposure | `tool_profile=core` (bootstrap set) | `tool_profile=core` (bootstrap set) | `tool_profile=core` (bootstrap set) |
-| Session-scoped MCP bearer | child env → Authorization header | child env → environment-expanded Authorization header | child env → generated bridge MCP bearer-variable reference |
-| `session_id` scope in URL | yes | yes | yes |
-| `$INTENDANT` + `INTENDANT_MCP_URL` env (`ctl` bootstrap) | yes (+ `INTENDANT_MANAGED_CONTEXT`) | yes | yes |
-| Guidance channel | managed-context developer message | first-prompt bootstrap addendum | generated bridge-home MCP config + ordinary tool discovery |
+| | **Codex** | **Claude Code** | **Kimi Code** | **Pi** |
+|---|---|---|---|---|
+| MCP tool exposure | `tool_profile=core` (bootstrap set) | `tool_profile=core` (bootstrap set) | `tool_profile=core` (bootstrap set) | none — Pi has no built-in MCP |
+| Session-scoped authority | child env → MCP Authorization header | child env → environment-expanded MCP Authorization header | child env → generated bridge MCP bearer-variable reference | child env → scoped `intendant ctl` bootstrap |
+| `session_id` scope in URL | yes | yes | yes | yes, consumed by `ctl`, not advertised as Pi MCP |
+| `$INTENDANT` + `INTENDANT_MCP_URL` env (`ctl` bootstrap) | yes (+ `INTENDANT_MANAGED_CONTEXT`) | yes | yes | yes |
+| Guidance channel | managed-context developer message | first-prompt bootstrap addendum | generated bridge-home MCP config + ordinary tool discovery | appended system prompt naming truthful `ctl --help` discovery |
 
-The bootstrap set for all three backends includes the CU path
+The MCP bootstrap set for Codex, Claude Code, and Kimi includes the CU path
 (`read_screen`, `take_screenshot`, `execute_cu_actions`, `list_displays`,
 `grant_user_display`, `revoke_user_display`) and the shared-view tools
 regardless of managed context; managed-context/fission tools remain
@@ -217,7 +225,7 @@ platform's process-bootstrap set (macOS `__CF_USER_TEXT_ENCODING`; Linux
 `PATHEXT`, `APPDATA`, `USERPROFILE`, …), proxy vars
 (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`, either case), the CLIs'
 own config-home pointers (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`,
-`KIMI_CODE_HOME`), and the
+`KIMI_CODE_HOME`, `PI_CODING_AGENT_DIR`), and the
 `INTENDANT`/`INTENDANT_*` control channel. Everything else is dropped —
 in particular the controller's provider API keys
 (`OPENAI`/`ANTHROPIC`/`GEMINI_API_KEY` and every `*_API_KEY`/`*_API_TOKEN`
@@ -225,9 +233,9 @@ shape), ambient host credentials (`SSH_AUTH_SOCK`, `AWS_*` secrets,
 `GH_TOKEN`/`GITHUB_TOKEN`, `KUBECONFIG`, `DOCKER_CONFIG`, registry tokens),
 the Linux D-Bus session bus (`DBUS_SESSION_BUS_ADDRESS` — desktop-keyring
 reach), and `NODE_OPTIONS`. Backends authenticate with their own
-subscription auth under `HOME` (`~/.codex`, `~/.claude`, `~/.kimi-code`) or a vault-leased
-home injected explicitly at spawn; they never see the controller's model
-keys.
+subscription auth under their own homes (`~/.codex`, `~/.claude`,
+`~/.kimi-code`, `~/.pi/agent`) or a vault-leased home injected explicitly at
+spawn; they never see the controller's model keys.
 
 `INTENDANT_ENV_PASSTHROUGH` (comma-separated exact names,
 case-insensitive, set on the controller) deliberately extends the
@@ -893,6 +901,119 @@ from its session store, including nested agents; leased and staged Kimi homes
 are swept alongside the normal home so custody does not make transcripts
 temporarily invisible.
 
+### Pi
+
+Pi is integrated as an upstream, replaceable cognitive engine, not copied into
+Intendant and not wrapped in a terminal scraper. Intendant launches the
+documented RPC mode and speaks LF-delimited JSON on stdin/stdout. The adapter
+uses correlated request ids and bounded response waits; its initial
+`get_state` handshake has a 25-second whole-handshake ceiling and a bounded
+pre-response event buffer. EOF, malformed JSON, failed requests, and protocol
+drift become ordinary supervised backend errors instead of leaving a window
+that looks live. The child is killed and reaped if any startup step fails.
+
+The launch deliberately keeps upstream Pi's useful defaults while removing
+ambient executable code from the trust boundary:
+
+```text
+pi --mode rpc --no-extensions --no-approve \
+   --extension <intendant-private-supervision.ts> \
+   --append-system-prompt <truthful ctl bootstrap> \
+   [--session-id <id> | --session <id> | --fork <id> --session-id <child>] \
+   [--model <pattern>] [--thinking <level>] [--tools <exact,list> | --no-tools]
+```
+
+`--no-extensions` disables discovered user/project extensions but still admits
+the one explicit Intendant extension. `--no-approve` suppresses Pi's own
+project-code trust ceremony. Pi's independent project-context loader still
+reads the normal `AGENTS.md`/`CLAUDE.md` instruction chain, so supervision does
+not throw away repository policy merely to prevent project code execution.
+`PI_SKIP_VERSION_CHECK=1` and `PI_TELEMETRY=0` eliminate startup network noise;
+Intendant never runs `pi --version`, starts a probe conversation, or spends
+quota merely to populate compatibility status.
+
+The private extension is the approval boundary. Upstream's read-only built-ins
+`read`, `grep`, `find`, and `ls` pass without a prompt except when they target
+Pi's own agent home (including Pi's `~`, `@`, `file://`, Unicode-space, and
+canonicalized symlink aliases). `write`, `edit`,
+`bash`, and every unknown/future tool block on Intendant's existing approval
+rail. The extension sends a fixed marker and bounded structured preview through
+Pi's extension UI `select`; Intendant maps the choice to approve once, approve
+that tool name for this supervised session, deny, or cancel. An absent UI,
+extension exception, malformed marker, unknown future blocking UI method, or
+unrecognized tool all fail closed. This is an authorization gate, not a second
+filesystem sandbox: an approved `bash` command has the authority of the
+supervised child process, subject to the operating environment and any separate
+host controls.
+
+Pi has no built-in MCP and Intendant does not claim otherwise. The child gets a
+private session-scoped `$INTENDANT`/`INTENDANT_MCP_URL` environment and an
+appended system instruction to discover missing platform capabilities with
+`"$INTENDANT" ctl --help`. Computer use, shared displays, peers, Agenda, and
+Memory therefore remain Intendant services above the harness. The scoped URL
+and bearer stay out of argv and out of the model-visible prompt. As with every
+external child, provider API keys and ambient host credentials are removed from
+its environment; Pi authenticates from its own agent home.
+
+The RPC translation covers user/assistant messages, streaming text and
+thinking, tool start/output/completion, file activity, errors, usage/cache
+facts, model/context-window facts, compaction boundaries, and turn lifecycle.
+Native image input is preserved. Pi's `steer` and `abort` commands implement
+mid-turn follow-up and interrupt. Universal thread actions expose:
+
+- `compact`, including optional custom instructions;
+- `fork` and `side`, implemented by a new supervised process using Pi's native
+  `--fork <parent> --session-id <child>` path (side adds the shared
+  read-only-side-conversation boundary as the child's first prompt);
+- native session rename;
+- live `set_model` and `set_thinking_level`, with the resulting launch pins
+  persisted so a later reattach does not silently revert them.
+
+Pi intentionally advertises no native sub-agent, goal, plan/todo, review,
+memory-reset, rollback, or MCP surface. Those are honest upstream boundaries,
+not placeholders. Intendant's own orchestration remains available above Pi by
+starting separately supervised sessions; it is not smuggled into Pi as a fake
+native feature.
+
+Global defaults live in `[agent.pi]` and are editable in Settings: command,
+model, thinking, and the exact active-tool override. `allowed_tools` has three
+states: omitted means Pi profile defaults, `[]` means no tools, and a non-empty
+array is the exact active set. Model and thinking can also change live from a
+session's Configure controls; tools are launch-time because Pi's public RPC
+does not expose active-tool mutation. There is deliberately no daemon-wide
+`PiRuntimeConfig` mirror: new sessions load the project TOML, reattached
+sessions reload it as their base and reapply their persisted launch overlay,
+and active sessions use RPC actions.
+That keeps the cognitive-engine boundary thin instead of spreading Pi-specific
+state through the agent OS.
+
+Native Pi v3 history is parsed directly from
+`$PI_CODING_AGENT_DIR/sessions/--encoded-cwd--/*.jsonl` (default
+`~/.pi/agent`). A session file is a header followed by parent-linked entries;
+the last complete entry is the active leaf. Replay walks that leaf's parent
+chain, while search indexes every physical branch and labels inactive siblings
+as superseded. Usage aggregation counts all physical assistant entries because
+all branches may have incurred billed/subscription usage. Torn trailing JSONL
+is ignored, scans and row sizes are bounded, exact upstream session-id grammar
+is enforced, and the transport edge injects roots so tests never scan a real
+home. Catalog, replay, message search, resume lookup, names, CWD, model/thinking,
+leased homes, and credential-free staged transcripts all share that parser.
+
+Pi can use its ordinary local `auth.json`, including its `openai-codex` OAuth
+provider for a ChatGPT subscription. Custody-managed sessions use `oauth:pi`:
+Intendant materializes a private `PI_CODING_AGENT_DIR` containing `auth.json`,
+best-effort copies `settings.json`, stages `sessions/` before cleanup, and
+deletes the leased home on expiry/revocation/shutdown. Access-token leases
+recursively reject every Pi refresh token and API-key credential. Browser
+refresh currently supports Pi's `openai-codex` entry with the same public
+form-encoded refresh request Pi uses; other Pi OAuth providers require the
+explicit full-credential mode. A Pi process can rotate a refresh token while
+using a full-credential materialized copy, but Intendant does not yet
+compare-and-swap that mutated copy back into the browser vault. Deleting the
+leased home can therefore leave the vault holding the superseded refresh
+token; prefer access-token mode for `openai-codex`, and re-import a changed
+full credential before tearing its lease down.
+
 ## Rate-limit Parking
 
 Claude Code's `rate_limit_event` with status `rejected`, correlated with the
@@ -1104,7 +1225,7 @@ defaults, so a bare `[agent]` with just `default_backend` works.
 ```toml
 [agent]
 # Which backend to use when --agent is not passed. Omit/empty = native agent.
-# Accepts: "codex", "claude-code", "kimi".
+# Accepts: "codex", "claude-code", "kimi", "pi".
 default_backend = "codex"
 
 [agent.codex]
@@ -1136,12 +1257,21 @@ swarm_mode      = true
 # Exact active-tool replacement. Omit to inherit Kimi's profile; [] disables
 # every optional tool (unlike Claude's empty allowlist, which means all).
 allowed_tools   = ["Read", "Grep", "Glob", "AskUserQuestion"]
+
+[agent.pi]
+command       = "pi"
+# Optional Pi model pattern or provider/model id; omit for the Pi profile default.
+model         = "openai-codex/gpt-5.6-sol"
+thinking      = "high" # off | minimal | low | medium | high | xhigh | max
+# Exact active-tool replacement. Omit for Pi's profile; [] means no tools.
+allowed_tools = ["read", "grep", "find", "ls", "bash"]
 ```
 
 Values are normalized at dispatch (`normalize_sandbox_mode`,
 `normalize_approval_policy`, `normalize_reasoning_effort`,
 `normalize_codex_managed_context`, `normalize_codex_context_archive`,
-`normalize_kimi_permission_mode`, `normalize_kimi_thinking`): unknown or empty
+`normalize_kimi_permission_mode`, `normalize_kimi_thinking`,
+`normalize_pi_thinking`, `normalize_pi_allowed_tools`): unknown or empty
 authority values fall back to the safe
 default rather than silently escalating privileges (e.g. a typo'd Codex sandbox
 becomes `workspace-write`, not `danger-full-access`; an unknown
@@ -1154,6 +1284,7 @@ becomes `workspace-write`, not `danger-full-access`; an unknown
 intendant --agent codex "refactor the auth module"
 intendant --agent claude-code "add tests for the parser"
 intendant --agent kimi "implement the parser tests"
+intendant --agent pi "implement the parser tests"
 ```
 
 `--agent <name>` parses via `AgentBackend::from_str_loose` and overrides
@@ -1177,7 +1308,8 @@ shared state (when driven over MCP) → config default → native.
   policy, model, reasoning effort, tool set, and writable roots at `thread/start`.
   Changing these mid-session requires a teardown + respawn. The daemon's runtime
   config checks detect drift across tasks and force a rebuild when any latched
-  field changes.
+  field changes. Pi's active tool set is likewise process-start-only; model and
+  thinking use live RPC controls.
 - **Codex resume cwd is thread-stateful.** Intendant sends `cwd` on
   `thread/resume`, and then sends `thread/settings/update` with the requested
   project root for resumed Codex threads. A non-running Codex thread can load
@@ -1208,10 +1340,10 @@ shared state (when driven over MCP) → config default → native.
   unsupported by this backend" from "feature attempted but failed" partly by these
   error messages — a backend without native steering returns the
   unsupported error, and the caller falls back to **queueing** the text onto the
-  context-injection queue for delivery at the next turn. Codex and Kimi steer
-  natively; Claude Code deliberately takes this queued fallback because its
-  stream-json mode discards mid-turn input. Don't reword those strings without
-  checking the drain logic.
+  context-injection queue for delivery at the next turn. Codex, Claude Code,
+  Kimi, and Pi now steer through their adapter paths (Claude's behavior remains
+  version-sensitive and delivery is inferred at its next checkpoint). Don't
+  reword those strings without checking the drain logic.
 - **Only turn-implying events wake an idle session into the observe drain.**
   While idle, messages/reasoning/tool/plan/diff/turn events are treated as a
   backend-initiated turn and drained; ambient events — stderr `Log` lines,
@@ -1241,10 +1373,11 @@ shared state (when driven over MCP) → config default → native.
 - **`--direct` does not bypass external mode.** It only forces single-agent
   execution of the *native* worker. If a backend is configured, the supervised CLI
   still runs.
-- **MCP reachability needs the gateway.** The injected `intendant` MCP server is
+- **MCP/ctl reachability needs the gateway.** The injected `intendant` MCP server is
   MCP-over-HTTP at `http://localhost:<web_port>/mcp`. The external tool can only
   reach Intendant's display/CU tools while the gateway is up; without a resolved
-  `web_port`, the MCP entry still points at the default port but nothing answers.
+  `web_port`, the MCP entry still points at the default port but nothing
+  answers. Pi uses the same gateway authority through `$INTENDANT ctl`, not MCP.
 - **The external tool brings its own keys.** Intendant supervises the process but
   the coding CLI authenticates to its own provider with its own credentials —
   Intendant's `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` are for the

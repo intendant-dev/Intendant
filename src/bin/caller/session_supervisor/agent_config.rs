@@ -30,7 +30,9 @@ impl SessionSupervisor {
             .is_some_and(|backend| {
                 matches!(
                     backend,
-                    external_agent::AgentBackend::Codex | external_agent::AgentBackend::Kimi
+                    external_agent::AgentBackend::Codex
+                        | external_agent::AgentBackend::Kimi
+                        | external_agent::AgentBackend::Pi
                 )
             });
             if supports_native_rename {
@@ -163,6 +165,7 @@ impl SessionSupervisor {
         let is_codex = matches!(backend, external_agent::AgentBackend::Codex);
         let is_claude = matches!(backend, external_agent::AgentBackend::ClaudeCode);
         let is_kimi = matches!(backend, external_agent::AgentBackend::Kimi);
+        let is_pi = matches!(backend, external_agent::AgentBackend::Pi);
         let clear_codex_sandbox =
             is_codex && session_config_clear_value(overrides.codex_sandbox.as_deref());
         let clear_codex_approval_policy =
@@ -207,6 +210,13 @@ impl SessionSupervisor {
             is_kimi && session_config_clear_value(overrides.kimi_plan_mode.as_deref());
         let clear_kimi_swarm_mode =
             is_kimi && session_config_clear_value(overrides.kimi_swarm_mode.as_deref());
+        let clear_pi_model = is_pi && session_config_clear_value(overrides.pi_model.as_deref());
+        let clear_pi_thinking =
+            is_pi && session_config_clear_value(overrides.pi_thinking.as_deref());
+        let clear_pi_allowed_tools = is_pi
+            && overrides.pi_allowed_tools.as_deref().is_some_and(|tools| {
+                crate::session_config::normalize_pi_allowed_tools(Some(tools)).is_none()
+            });
         let mut config = crate::session_config::from_wire_fields(
             overrides.as_wire_fields(backend.as_short_str()),
         );
@@ -276,6 +286,15 @@ impl SessionSupervisor {
         }
         if clear_kimi_swarm_mode {
             config.kimi_swarm_mode = None;
+        }
+        if clear_pi_model {
+            config.pi_model = None;
+        }
+        if clear_pi_thinking {
+            config.pi_thinking = None;
+        }
+        if clear_pi_allowed_tools {
+            config.pi_allowed_tools = None;
         }
         if config.is_empty() {
             let message = "Session config failed: no launch settings supplied".to_string();
@@ -545,7 +564,7 @@ impl SessionAgentSelection {
             .map(Self::External)
             .ok_or_else(|| {
                 format!(
-                    "unknown agent '{}' (expected internal, codex, claude-code, or kimi)",
+                    "unknown agent '{}' (expected internal, codex, claude-code, kimi, or pi)",
                     trimmed
                 )
             })
@@ -598,6 +617,9 @@ pub(crate) struct LaunchOverrides {
     pub(crate) kimi_allowed_tools: Option<String>,
     pub(crate) kimi_plan_mode: Option<String>,
     pub(crate) kimi_swarm_mode: Option<String>,
+    pub(crate) pi_model: Option<String>,
+    pub(crate) pi_thinking: Option<String>,
+    pub(crate) pi_allowed_tools: Option<String>,
     /// Internal-only anchor-fork parameters (set by the supervisor's fork
     /// orchestrator, never parsed from any wire message — deliberately
     /// absent from `as_wire_fields`, so `ResumeSession` senders cannot
@@ -648,6 +670,9 @@ impl LaunchOverrides {
             kimi_allowed_tools: self.kimi_allowed_tools.as_deref(),
             kimi_plan_mode: self.kimi_plan_mode.as_deref(),
             kimi_swarm_mode: self.kimi_swarm_mode.as_deref(),
+            pi_model: self.pi_model.as_deref(),
+            pi_thinking: self.pi_thinking.as_deref(),
+            pi_allowed_tools: self.pi_allowed_tools.as_deref(),
         }
     }
 
@@ -744,6 +769,9 @@ pub(crate) fn apply_session_agent_command(
         }
         external_agent::AgentBackend::Kimi => {
             project.config.agent.kimi.command = command;
+        }
+        external_agent::AgentBackend::Pi => {
+            project.config.agent.pi.command = command;
         }
     }
 }
@@ -891,6 +919,50 @@ pub(crate) fn apply_session_kimi_swarm_mode(
             Ok(())
         }
         _ => Err("kimi_swarm_mode requires Kimi".to_string()),
+    }
+}
+
+pub(crate) fn apply_session_pi_model(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    model: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Pi => {
+            project.config.agent.pi.model = Some(model);
+            Ok(())
+        }
+        _ => Err("pi_model requires Pi".to_string()),
+    }
+}
+
+pub(crate) fn apply_session_pi_thinking(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    thinking: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Pi => {
+            project.config.agent.pi.thinking =
+                crate::project::normalize_pi_thinking(Some(&thinking));
+            Ok(())
+        }
+        _ => Err("pi_thinking requires Pi".to_string()),
+    }
+}
+
+pub(crate) fn apply_session_pi_allowed_tools(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    tools: Vec<String>,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Pi => {
+            project.config.agent.pi.allowed_tools =
+                Some(crate::project::normalize_pi_allowed_tools(&tools));
+            Ok(())
+        }
+        _ => Err("pi_allowed_tools requires Pi".to_string()),
     }
 }
 
@@ -1522,6 +1594,26 @@ mod tests {
         assert!(cross.kimi_allowed_tools.is_none());
         assert!(cross.kimi_plan_mode.is_none());
         assert!(cross.kimi_swarm_mode.is_none());
+
+        let pi_overrides = LaunchOverrides {
+            agent_command: Some("/tmp/pi".to_string()),
+            pi_model: Some("openai-codex/gpt-5.6-codex".to_string()),
+            pi_thinking: Some(" HIGH ".to_string()),
+            pi_allowed_tools: Some("read,\nbash,read".to_string()),
+            ..Default::default()
+        };
+        let pi = crate::session_config::from_wire_fields(pi_overrides.as_wire_fields("pi"));
+        assert_eq!(pi.agent_command.as_deref(), Some("/tmp/pi"));
+        assert_eq!(pi.pi_model.as_deref(), Some("openai-codex/gpt-5.6-codex"));
+        assert_eq!(pi.pi_thinking.as_deref(), Some("high"));
+        assert_eq!(
+            pi.pi_allowed_tools.as_deref(),
+            Some(&["read".to_string(), "bash".to_string()][..])
+        );
+        let cross = crate::session_config::from_wire_fields(pi_overrides.as_wire_fields("codex"));
+        assert!(cross.pi_model.is_none());
+        assert!(cross.pi_thinking.is_none());
+        assert!(cross.pi_allowed_tools.is_none());
     }
 
     #[test]
@@ -1571,6 +1663,44 @@ mod tests {
             apply_session_kimi_swarm_mode(&mut project, &codex, false).unwrap_err(),
         ] {
             assert!(error.contains("requires Kimi"), "got: {error}");
+        }
+    }
+
+    #[test]
+    fn applies_all_session_pi_controls_to_pi_only() {
+        let mut project = Project {
+            root: PathBuf::from("/tmp/project"),
+            config: crate::project::ProjectConfig::default(),
+        };
+        let pi = external_agent::AgentBackend::Pi;
+        apply_session_agent_command(&mut project, &pi, "/opt/pi/bin/pi".to_string());
+        apply_session_pi_model(&mut project, &pi, "openai-codex/gpt-5.6-codex".to_string())
+            .unwrap();
+        apply_session_pi_thinking(&mut project, &pi, " HIGH ".to_string()).unwrap();
+        apply_session_pi_allowed_tools(
+            &mut project,
+            &pi,
+            vec![" read ".to_string(), "bash".to_string(), "read".to_string()],
+        )
+        .unwrap();
+        assert_eq!(project.config.agent.pi.command, "/opt/pi/bin/pi");
+        assert_eq!(
+            project.config.agent.pi.model.as_deref(),
+            Some("openai-codex/gpt-5.6-codex")
+        );
+        assert_eq!(project.config.agent.pi.thinking.as_deref(), Some("high"));
+        assert_eq!(
+            project.config.agent.pi.allowed_tools.as_deref(),
+            Some(&["read".to_string(), "bash".to_string()][..])
+        );
+
+        let codex = external_agent::AgentBackend::Codex;
+        for error in [
+            apply_session_pi_model(&mut project, &codex, "model".to_string()).unwrap_err(),
+            apply_session_pi_thinking(&mut project, &codex, "high".to_string()).unwrap_err(),
+            apply_session_pi_allowed_tools(&mut project, &codex, Vec::new()).unwrap_err(),
+        ] {
+            assert!(error.contains("requires Pi"), "got: {error}");
         }
     }
 

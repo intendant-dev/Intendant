@@ -452,7 +452,7 @@ function updateLogEmptyState() {
 const LOG_EMPTY_DEFAULT_TITLE = 'No activity yet';
 const LOG_EMPTY_DEFAULT_HINT = 'Send a task below to start the agent, or pick a session from Sessions.';
 
-/* External-agent availability (Codex / Claude Code / Kimi Code): which backends this
+/* External-agent availability (Codex / Claude Code / Kimi Code / Pi): which backends this
    daemon can actually spawn. External agents run on their own accounts,
    so the fueling nudge must not read as "nothing works" while one is
    present — and the new-session picker greys out backends whose CLI is

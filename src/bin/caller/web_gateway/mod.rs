@@ -309,7 +309,7 @@ impl Default for WebGatewayConfig {
 // (~tens of seconds on a real corpus). One small JSON file per entry,
 // written atomically via tempfile+rename: daemons sharing a HOME can only
 // race toward equivalent content, never corrupt an entry. External
-// stores (~/.codex, ~/.claude, ~/.kimi-code, ~/.gemini) are never written — the index
+// stores (~/.codex, ~/.claude, ~/.kimi-code, ~/.pi/agent, ~/.gemini) are never written — the index
 // mirrors them under ~/.intendant/cache/session_index/.
 //
 // Entries carry a per-namespace schema stamp: when the value shape changes

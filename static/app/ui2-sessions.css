@@ -470,8 +470,8 @@ html.ui-v2 #tab-sessions .session-card .ui-chip.muted {
   color: var(--text-2);
 }
 
-/* Source badges: native = iris, Codex = neutral, Claude Code = amber, Kimi = sky
-   (radius-6 chips in the reference; keyed off the gated data-src). */
+/* Source badges: native = iris, Codex = neutral, Claude Code = amber, Kimi = sky,
+   Pi = external default (radius-6 chips; keyed off the gated data-src). */
 html.ui-v2 #tab-sessions .session-card .sc-source {
   border-radius: 6px;
   letter-spacing: .02em;

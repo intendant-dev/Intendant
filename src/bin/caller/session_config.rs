@@ -85,6 +85,14 @@ pub struct SessionAgentConfig {
     /// and immediately after the native fork, before any undo is attempted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kimi_fork_expected_horizon: Option<String>,
+    /// Pi launch pins. `None` inherits the current global setting;
+    /// `Some([])` on tools deliberately disables every Pi tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_allowed_tools: Option<Vec<String>>,
     /// Canonical native id of the thread this session was FORKED from
     /// (backend-neutral lineage record). While the fork's own native id is
     /// still unknown, `resume == forked_from` also tells the spawner to add
@@ -149,6 +157,9 @@ impl SessionAgentConfig {
             && self.kimi_home.is_none()
             && self.kimi_fork_rollback_turns.is_none()
             && self.kimi_fork_expected_horizon.is_none()
+            && self.pi_model.is_none()
+            && self.pi_thinking.is_none()
+            && self.pi_allowed_tools.is_none()
             && self.forked_from.is_none()
             && self.fork_relationship.is_none()
             && self.fork_anchor.is_none()
@@ -231,6 +242,15 @@ impl SessionAgentConfig {
         if self.kimi_fork_expected_horizon.is_none() {
             self.kimi_fork_expected_horizon = fallback.kimi_fork_expected_horizon;
         }
+        if self.pi_model.is_none() {
+            self.pi_model = fallback.pi_model;
+        }
+        if self.pi_thinking.is_none() {
+            self.pi_thinking = fallback.pi_thinking;
+        }
+        if self.pi_allowed_tools.is_none() {
+            self.pi_allowed_tools = fallback.pi_allowed_tools;
+        }
         if self.forked_from.is_none() {
             self.forked_from = fallback.forked_from;
         }
@@ -286,6 +306,7 @@ pub fn agent_command_conflicts_with_source(source: &str, command: &str) -> Optio
         "codex" => AgentBackend::Codex,
         "claude" => AgentBackend::ClaudeCode,
         "kimi" => AgentBackend::Kimi,
+        "pi" => AgentBackend::Pi,
         _ => return None,
     };
     (owner != source_backend).then(|| owner.as_short_str())
@@ -507,6 +528,38 @@ pub fn normalize_kimi_bool(value: Option<&str>) -> Option<bool> {
     }
 }
 
+/// Per-session Pi model pin. Explicit inherit sentinels clear the pin.
+pub fn normalize_pi_model(model: Option<&str>) -> Option<String> {
+    let trimmed = model.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "inherit" | "default" | "global"
+    ) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+pub fn normalize_pi_thinking(thinking: Option<&str>) -> Option<String> {
+    crate::project::normalize_pi_thinking(thinking)
+}
+
+pub fn normalize_pi_allowed_tools(tools: Option<&str>) -> Option<Vec<String>> {
+    let trimmed = tools.map(str::trim).filter(|value| !value.is_empty())?;
+    match trimmed.to_ascii_lowercase().as_str() {
+        "inherit" | "default" | "global" => return None,
+        "none" => return Some(Vec::new()),
+        _ => {}
+    }
+    let mut normalized = Vec::new();
+    for tool in trimmed.split([',', '\n']).map(str::trim) {
+        if !tool.is_empty() && !normalized.iter().any(|candidate| candidate == tool) {
+            normalized.push(tool.to_string());
+        }
+    }
+    Some(normalized)
+}
+
 pub fn effective_codex_home() -> Option<String> {
     let from_env = std::env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
@@ -540,6 +593,9 @@ pub struct WireSessionAgentFields<'a> {
     pub kimi_allowed_tools: Option<&'a str>,
     pub kimi_plan_mode: Option<&'a str>,
     pub kimi_swarm_mode: Option<&'a str>,
+    pub pi_model: Option<&'a str>,
+    pub pi_thinking: Option<&'a str>,
+    pub pi_allowed_tools: Option<&'a str>,
 }
 
 pub fn from_wire(
@@ -571,6 +627,7 @@ pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
     let is_codex = source.as_deref() == Some("codex");
     let is_claude = source.as_deref() == Some("claude-code");
     let is_kimi = source.as_deref() == Some("kimi");
+    let is_pi = source.as_deref() == Some("pi");
     let agent_command = sanitize_agent_command_for_source(
         source.as_deref(),
         normalize_agent_command(fields.agent_command),
@@ -643,6 +700,13 @@ pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
         kimi_home: None,
         kimi_fork_rollback_turns: None,
         kimi_fork_expected_horizon: None,
+        pi_model: is_pi.then(|| normalize_pi_model(fields.pi_model)).flatten(),
+        pi_thinking: is_pi
+            .then(|| normalize_pi_thinking(fields.pi_thinking))
+            .flatten(),
+        pi_allowed_tools: is_pi
+            .then(|| normalize_pi_allowed_tools(fields.pi_allowed_tools))
+            .flatten(),
         forked_from: None,
         fork_relationship: None,
     }
@@ -687,6 +751,9 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             kimi_home: None,
             kimi_fork_rollback_turns: None,
             kimi_fork_expected_horizon: None,
+            pi_model: None,
+            pi_thinking: None,
+            pi_allowed_tools: None,
             forked_from: None,
             fork_relationship: None,
             fork_anchor: None,
@@ -727,6 +794,9 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 kimi_home: None,
                 kimi_fork_rollback_turns: None,
                 kimi_fork_expected_horizon: None,
+                pi_model: None,
+                pi_thinking: None,
+                pi_allowed_tools: None,
                 forked_from: None,
                 fork_relationship: None,
                 fork_anchor: None,
@@ -765,6 +835,9 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 kimi_home: None,
                 kimi_fork_rollback_turns: kimi.kimi_fork_rollback_turns,
                 kimi_fork_expected_horizon: kimi.kimi_fork_expected_horizon.clone(),
+                pi_model: None,
+                pi_thinking: None,
+                pi_allowed_tools: None,
                 forked_from: None,
                 fork_relationship: None,
                 fork_anchor: None,
@@ -772,6 +845,21 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 codex_fork_rollback_turns: None,
                 codex_fork_rollback_item_id: None,
                 codex_fork_rollback_position: None,
+            }
+        }
+        AgentBackend::Pi => {
+            let pi = &project.config.agent.pi;
+            SessionAgentConfig {
+                source: Some("pi".to_string()),
+                project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
+                agent_command: Some(pi.command.clone()),
+                pi_model: normalize_pi_model(pi.model.as_deref()),
+                pi_thinking: normalize_pi_thinking(pi.thinking.as_deref()),
+                pi_allowed_tools: pi
+                    .allowed_tools
+                    .as_deref()
+                    .map(crate::project::normalize_pi_allowed_tools),
+                ..Default::default()
             }
         }
     }
@@ -854,6 +942,21 @@ pub fn apply_to_project(
             }
             kimi.kimi_fork_rollback_turns = config.kimi_fork_rollback_turns;
             kimi.kimi_fork_expected_horizon = config.kimi_fork_expected_horizon.clone();
+        }
+        AgentBackend::Pi => {
+            let pi = &mut project.config.agent.pi;
+            if let Some(command) = config.agent_command.clone() {
+                pi.command = command;
+            }
+            if let Some(model) = config.pi_model.clone() {
+                pi.model = Some(model);
+            }
+            if let Some(thinking) = config.pi_thinking.as_deref() {
+                pi.thinking = crate::project::normalize_pi_thinking(Some(thinking));
+            }
+            if let Some(tools) = config.pi_allowed_tools.as_ref() {
+                pi.allowed_tools = Some(crate::project::normalize_pi_allowed_tools(tools));
+            }
         }
     }
 }
@@ -1007,6 +1110,15 @@ fn normalize_session_agent_config(
     }
     if let Some(home) = config.kimi_home.take() {
         config.kimi_home = normalize_kimi_home(Some(&home));
+    }
+    if let Some(model) = config.pi_model.take() {
+        config.pi_model = normalize_pi_model(Some(&model));
+    }
+    if let Some(thinking) = config.pi_thinking.take() {
+        config.pi_thinking = normalize_pi_thinking(Some(&thinking));
+    }
+    if let Some(tools) = config.pi_allowed_tools.take() {
+        config.pi_allowed_tools = Some(crate::project::normalize_pi_allowed_tools(&tools));
     }
     config
 }
@@ -1334,6 +1446,26 @@ pub fn apply_config_to_session_json(session: &mut Value, config: &SessionAgentCo
     }
     if let Some(home) = config.kimi_home.as_deref() {
         obj.insert("kimi_home".to_string(), Value::String(home.to_string()));
+    }
+    if let Some(model) = config.pi_model.as_deref() {
+        obj.insert("pi_model".to_string(), Value::String(model.to_string()));
+    }
+    if let Some(thinking) = config.pi_thinking.as_deref() {
+        obj.insert(
+            "pi_thinking".to_string(),
+            Value::String(thinking.to_string()),
+        );
+    }
+    if let Some(tools) = config.pi_allowed_tools.as_ref() {
+        obj.insert(
+            "pi_allowed_tools".to_string(),
+            Value::Array(
+                tools
+                    .iter()
+                    .map(|tool| Value::String(tool.clone()))
+                    .collect(),
+            ),
+        );
     }
 }
 
@@ -2061,6 +2193,67 @@ mod tests {
         })
         .kimi_home
         .is_none());
+    }
+
+    #[test]
+    fn pi_launch_pins_normalize_round_trip_and_apply_to_catalog_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = from_wire_fields(WireSessionAgentFields {
+            source: Some("Pi Coding Agent"),
+            agent_command: Some("  /opt/pi/bin/pi  "),
+            pi_model: Some("  openai-codex/gpt-5.6-codex  "),
+            pi_thinking: Some("  HIGH  "),
+            pi_allowed_tools: Some("read, bash, read, edit"),
+            ..Default::default()
+        });
+        assert_eq!(config.source.as_deref(), Some("pi"));
+        assert_eq!(config.agent_command.as_deref(), Some("/opt/pi/bin/pi"));
+        assert_eq!(
+            config.pi_model.as_deref(),
+            Some("openai-codex/gpt-5.6-codex")
+        );
+        assert_eq!(config.pi_thinking.as_deref(), Some("high"));
+        assert_eq!(
+            config.pi_allowed_tools.as_deref(),
+            Some(["read".to_string(), "bash".to_string(), "edit".to_string()].as_slice())
+        );
+
+        write_log_dir_config(dir.path(), &config).unwrap();
+        let loaded = read_log_dir_config(dir.path()).unwrap();
+        assert_eq!(loaded, config);
+        let mut row = serde_json::json!({"source":"pi","session_id":"pi-session"});
+        apply_config_to_session_json(&mut row, &loaded);
+        assert_eq!(row["pi_model"], "openai-codex/gpt-5.6-codex");
+        assert_eq!(row["pi_thinking"], "high");
+        assert_eq!(
+            row["pi_allowed_tools"],
+            serde_json::json!(["read", "bash", "edit"])
+        );
+    }
+
+    #[test]
+    fn pi_tools_none_is_distinct_from_inherit_and_other_sources_cannot_inject_pins() {
+        let disabled = from_wire_fields(WireSessionAgentFields {
+            source: Some("pi"),
+            pi_model: Some("inherit"),
+            pi_thinking: Some("global"),
+            pi_allowed_tools: Some("none"),
+            ..Default::default()
+        });
+        assert_eq!(disabled.pi_model, None);
+        assert_eq!(disabled.pi_thinking, None);
+        assert_eq!(disabled.pi_allowed_tools, Some(Vec::new()));
+
+        let foreign = from_wire_fields(WireSessionAgentFields {
+            source: Some("codex"),
+            pi_model: Some("should-not-cross-backends"),
+            pi_thinking: Some("high"),
+            pi_allowed_tools: Some("bash"),
+            ..Default::default()
+        });
+        assert_eq!(foreign.pi_model, None);
+        assert_eq!(foreign.pi_thinking, None);
+        assert_eq!(foreign.pi_allowed_tools, None);
     }
 
     #[test]

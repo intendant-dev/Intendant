@@ -1486,7 +1486,7 @@ function stationHandleControlsAction(action) {
   if (op.startsWith('backend:')) {
     const agent = op.slice('backend:'.length).trim();
     const value = agent === 'internal' ? null : agent;
-    if (value && !['codex', 'claude-code', 'kimi'].includes(value)) return;
+    if (value && !['codex', 'claude-code', 'kimi', 'pi'].includes(value)) return;
     dispatchControlMsg({ action: 'set_external_agent', agent: value });
     showControlToast?.('success', `Backend: ${value || 'intendant'}`);
     return;

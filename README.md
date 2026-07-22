@@ -14,7 +14,7 @@
   <a href="https://intendant.dev/trust">How trust works</a>
 </p>
 
-Intendant is an open-source operating environment for autonomous AI agents, written in Rust. The agent gets a real machine — shell, file editing, a graphical desktop it can see and control, voice, and phone calls — under layered human oversight: an autonomy dial, per-category rules, and per-action approval gates, with every command, diff, and decision logged and replayable. A durable Agenda carries deferred intent across sessions, while a provenance-labeled Memory plane carries explicitly retrieved machine-wide claims. Intendant runs its own agent loop, supervises **Codex, Claude Code, and Kimi Code** as managed backends, and is portable across OpenAI, Anthropic, and Gemini — on macOS, Linux, and Windows, all first-class.
+Intendant is an open-source operating environment for autonomous AI agents, written in Rust. The agent gets a real machine — shell, file editing, a graphical desktop it can see and control, voice, and phone calls — under layered human oversight: an autonomy dial, per-category rules, and per-action approval gates, with every command, diff, and decision logged and replayable. A durable Agenda carries deferred intent across sessions, while a provenance-labeled Memory plane carries explicitly retrieved machine-wide claims. Intendant runs its own agent loop, supervises **Codex, Claude Code, Kimi Code, and Pi** as managed backends, and is portable across OpenAI, Anthropic, and Gemini — on macOS, Linux, and Windows, all first-class.
 
 Your everyday directory can be a browser tab. Hosted Connect gives any browser zero-install route linking, discovery, and fleet presence, but the default binary gives hosted-origin code an immutable `role:none`: it cannot open a daemon-control session, even after a local grant or configuration edit. Its rendezvous-controlled fleet WebPKI names are likewise discovery-only. Administration and ordinary control start from a trusted local console or an independently reached daemon-served direct/mTLS dashboard. The packaged macOS app contains a local mTLS bridge, but no Developer ID-signed/notarized release has been published for this alpha; an `-unsigned-dev` artifact is for development, not a distribution trust anchor.
 
@@ -77,7 +77,7 @@ Organizations are a root keypair, not a row in someone's database. The org signs
 
 In a theater, performers play and conductors orchestrate. Above them stands the **Intendant** — the general director who runs the house: who gets the stage, which productions run, on whose authority, with the books open. The Intendant doesn't play a note; it makes the performance possible and accountable. The older sense of the word reaches further: royal intendants administered provinces on behalf of the crown — authority delegated, scoped, and revocable.
 
-That is the shape of this system. Agents perform. Orchestrators conduct — the native orchestrator decomposing work across sub-agents, or Codex, Claude Code, and Kimi Code as guest conductors bringing their own ensembles. The Intendant runs the house — the machine, the schedule, the stage door, the ledger — and answers to you. And houses federate: your companies can tour other houses on signed contracts, honored at the stage door but always subordinate to the house's own rules. A network of agentic networks.
+That is the shape of this system. Agents perform. Orchestrators conduct — the native orchestrator decomposing work across sub-agents, or Codex, Claude Code, Kimi Code, and Pi as guest conductors bringing their own ensembles. The Intendant runs the house — the machine, the schedule, the stage door, the ledger — and answers to you. And houses federate: your companies can tour other houses on signed contracts, honored at the stage door but always subordinate to the house's own rules. A network of agentic networks.
 
 ## Architecture
 
@@ -90,14 +90,14 @@ That is the shape of this system. Agents perform. Orchestrators conduct — the 
   │      ▲                        │                │                         │
   │      │ render          ┌──────┴──────┐   ┌─────┴───────────────┐         │
   │   presence ◄───────────┤ native loop │   │ external-agent       │        │
-  │   (mediator AI)        │ + sub-agents│   │ (Codex/Claude/Kimi)  │        │
+  │   (mediator AI)        │ + sub-agents│   │(Codex/Claude/Kimi/Pi)│        │
   │                        └──────┬──────┘   └─────┬───────────────┘         │
   └───────────────────────────────┼────────────────┼────────────────────────┘
               │                    │                │
               ▼                    ▼                ▼
         Voice / Model APIs   intendant-runtime   external CLI subprocess
-        (live + streaming)   (command exec,      (wired to Intendant's
-                              never holds keys)    MCP server)
+        (live + streaming)   (command exec,      (scoped MCP or ctl
+                              never holds keys)    bootstrap)
 
         ◄─── WebRTC display + peer federation ───►  browsers / peer daemons
 
@@ -111,7 +111,7 @@ That is the shape of this system. Agents perform. Orchestrators conduct — the 
 
 **WebRTC display pipeline** — agents see and interact with graphical displays through a custom WebRTC transport (built on rtc-rs): macOS/Linux use a VP8 baseline plus on-demand H264 (VideoToolbox on macOS; NVENC/VA-API with x264 fallback on Linux), while Windows uses one always-on software Media Foundation H264 layer. Tile-based dirty-region streaming, bidirectional clipboard, multi-monitor, and peer-to-peer display sharing run across the same pipeline.
 
-**External-agent orchestration** — supervise Codex, Claude Code, or Kimi Code inside the same EventBus, approval, display, computer-use, shared-view, session, diff, usage, and cost surfaces as native agents. All support persistent managed sessions, interrupts, attachments, MCP tools, and native sub-agents; Intendant preserves backend differences honestly — Codex adds managed-context rewind and fission, Claude Code queues steering at turn boundaries, and Kimi adds native queued steering, undo, `:btw`/swarm agents, goals, structured questions, and live model/thinking/permission/plan/swarm controls through its local server.
+**External-agent orchestration** — supervise Codex, Claude Code, Kimi Code, or Pi inside the same EventBus, approval, display, computer-use, shared-view, session, diff, history/search, usage, and cost surfaces as native agents. Intendant preserves backend differences honestly: Codex adds managed-context rewind and fission; Claude Code exposes stream-json controls and in-band agents; Kimi adds queued steering, undo, `:btw`/swarm agents, goals, and rich live profile control; Pi stays upstream and small, using documented JSONL RPC plus one private fail-closed approval extension. Pi has no built-in MCP or native sub-agents, so scoped platform capabilities are discovered through `$INTENDANT ctl` instead of being mislabeled.
 
 **Persistent daemon** — a control plane supervises many concurrent sessions and is the single writer of shared state; an idle web server runs headless. Federate with peer daemons for multi-host display and capability-based task routing.
 
@@ -119,7 +119,7 @@ That is the shape of this system. Agents perform. Orchestrators conduct — the 
 
 **Phone calls** — outbound SIP calls via pjsua with a voice model conducting the conversation, returning structured data.
 
-Four execution shapes: **Direct** (one native loop), **Orchestrate** (the same loop with the orchestration prompt and native delegation tools), **Sub-Agent** (a supervised child task, optionally in an isolated git worktree), and **External-Agent** (a supervised Codex, Claude Code, or Kimi Code CLI).
+Four execution shapes: **Direct** (one native loop), **Orchestrate** (the same loop with the orchestration prompt and native delegation tools), **Sub-Agent** (a supervised child task, optionally in an isolated git worktree), and **External-Agent** (a supervised Codex, Claude Code, Kimi Code, or Pi harness).
 
 ## Dependencies
 
@@ -129,6 +129,7 @@ Four execution shapes: **Direct** (one native loop), **Orchestrate** (the same l
 - **macOS**: `./scripts/setup-macos.sh` installs everything (cliclick, ffmpeg, Vortex Audio, wasm-pack, app bundle)
 - **Linux**: `./scripts/setup-linux.sh` installs everything (build-essential/binutils, libvpx, libxcb, xdotool, PipeWire, ffmpeg, PulseAudio, Xvfb)
 - **Windows**: `./scripts/setup-windows.ps1` (`x86_64-pc-windows-msvc`) — see the [Windows support](https://intendant-dev.github.io/Intendant/windows-support.html) docs
+- **Pi (optional external backend)**: Node.js 22.19+ and `npm install -g @earendil-works/pi-coding-agent`
 
 ## Quick Start
 
@@ -158,7 +159,7 @@ One-shot and headless invocations, when you want them:
 ```bash
 ./target/release/intendant "Fix the flaky CI job"        # submit a task straight from the CLI
 ./target/release/intendant --continue "now the docs"     # resume the most recent session
-./target/release/intendant --agent kimi "task"           # supervise an external CLI (codex | claude-code | kimi)
+./target/release/intendant --agent pi "task"             # supervise a harness (codex | claude-code | kimi | pi)
 ./target/release/intendant --mcp                         # MCP server on stdio (for Claude Code, etc.)
 ./target/release/intendant --direct --no-web --json "t"  # headless single agent, JSONL to stdout
 ```

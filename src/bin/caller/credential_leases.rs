@@ -137,7 +137,7 @@ tokio::task_local! {
 /// ("codex" → `oauth:codex`), derived from the materialization plans.
 fn lease_kind_for_source(source: &str) -> Option<&'static str> {
     let source = source.trim();
-    ["oauth:codex", "oauth:claude-code", "oauth:kimi"]
+    ["oauth:codex", "oauth:claude-code", "oauth:kimi", "oauth:pi"]
         .into_iter()
         .find(|kind| {
             materialization_plan(kind).is_some_and(|plan| plan.source.eq_ignore_ascii_case(source))
@@ -407,6 +407,7 @@ pub fn known_kind(kind: &str) -> bool {
             | "oauth:codex"
             | "oauth:claude-code"
             | "oauth:kimi"
+            | "oauth:pi"
     )
 }
 
@@ -834,17 +835,17 @@ pub fn take_dry_notices() -> Vec<DryNotice> {
 }
 
 /* ── OAuth materialization (external agents) ──
-Codex, Claude Code, and Kimi Code are child processes that read credentials from
+Codex, Claude Code, Kimi Code, and Pi are child processes that read credentials from
 files, not from memory we control — the documented weakening in the
 custody chapter. An active oauth lease therefore materializes a
 private home directory (0700) holding exactly the leased auth file
 (0600); spawns point the agent at it (CODEX_HOME / CLAUDE_CONFIG_DIR /
-KIMI_CODE_HOME)
+KIMI_CODE_HOME / PI_CODING_AGENT_DIR)
 and it is deleted on lease expiry, revocation, and daemon shutdown —
 normal exits via the `LeaseShutdownGuard` held by `main`, signal
 shutdown via the handler's explicit revoke — with the startup
 recovery sweep covering crashes where neither cleanup path ran. Configuration
-(Codex/Kimi config.toml / Claude settings.json) is copied best-effort so behavior is normally
+(Codex/Kimi config.toml / Claude/Pi settings.json) is copied best-effort so behavior is normally
 preserved; copy failures are currently silent, arbitrary user configuration is
 not inspected for embedded secrets, and the user's known auth files never are.
 The directory lives under the daemon state root, outside any project worktree, so the
@@ -1211,6 +1212,19 @@ fn materialization_plan(kind: &str) -> Option<MaterializationPlan> {
                 "config.toml",
             )),
             source: "kimi",
+            transcript_dirs: &["sessions"],
+        }),
+        "oauth:pi" => Some(MaterializationPlan {
+            dir_name: "pi-home",
+            auth_name: "auth.json",
+            carry_over: Some((
+                std::env::var_os("PI_CODING_AGENT_DIR")
+                    .map(PathBuf::from)
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| crate::platform::home_dir().join(".pi").join("agent")),
+                "settings.json",
+            )),
+            source: "pi",
             transcript_dirs: &["sessions"],
         }),
         _ => None,
@@ -1607,7 +1621,7 @@ fn run_deferred_cleanup_in(
 /// the path survives.
 fn kind_for_reaped_path(path: &Path) -> Option<&'static str> {
     let name = path.file_name()?.to_str()?;
-    ["oauth:codex", "oauth:claude-code", "oauth:kimi"]
+    ["oauth:codex", "oauth:claude-code", "oauth:kimi", "oauth:pi"]
         .into_iter()
         .find(|kind| {
             materialization_plan(kind)
@@ -1726,6 +1740,11 @@ pub fn materialized_kimi_code_home() -> Option<PathBuf> {
     materialized_home_for_kind("oauth:kimi")
 }
 
+/// The synthesized PI_CODING_AGENT_DIR while an oauth:pi lease is active.
+pub fn materialized_pi_agent_dir() -> Option<PathBuf> {
+    materialized_home_for_kind("oauth:pi")
+}
+
 fn materialized_home_for_kind(kind: &str) -> Option<PathBuf> {
     if let Ok(Some(home)) = LEASED_STARTUP_HOME
         .try_with(|(scoped_kind, home)| (scoped_kind == kind).then(|| home.clone()))
@@ -1791,7 +1810,7 @@ pub fn startup_materialization_sweep() {
                     "[credential-leases] startup sweep refused unsafe root {}: {error}",
                     root.display()
                 );
-                for kind in ["oauth:codex", "oauth:claude-code", "oauth:kimi"] {
+                for kind in ["oauth:codex", "oauth:claude-code", "oauth:kimi", "oauth:pi"] {
                     queue_materialization_cleanup(
                         kind,
                         "startup sweep refused unsafe materialization root",
@@ -1806,7 +1825,7 @@ pub fn startup_materialization_sweep() {
         // leased sessions — stage them before the sweep deletes the root
         // (works with no indexer running; the drainer picks them up later).
         let mut swept_kinds: Vec<&str> = Vec::new();
-        for kind in ["oauth:codex", "oauth:claude-code", "oauth:kimi"] {
+        for kind in ["oauth:codex", "oauth:claude-code", "oauth:kimi", "oauth:pi"] {
             if let Some(plan) = materialization_plan(kind) {
                 let home = canonical_root.join(plan.dir_name);
                 if require_real_directory(&home, "materialized home")
@@ -1823,7 +1842,7 @@ pub fn startup_materialization_sweep() {
         if let Ok(entries) = std::fs::read_dir(&canonical_root) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                for kind in ["oauth:codex", "oauth:claude-code", "oauth:kimi"] {
+                for kind in ["oauth:codex", "oauth:claude-code", "oauth:kimi", "oauth:pi"] {
                     let Some(plan) = materialization_plan(kind) else {
                         continue;
                     };
@@ -1856,7 +1875,7 @@ pub fn startup_materialization_sweep() {
                     "[credential-leases] startup sweep of {} failed: {err}",
                     canonical_root.display()
                 );
-                for kind in ["oauth:codex", "oauth:claude-code", "oauth:kimi"] {
+                for kind in ["oauth:codex", "oauth:claude-code", "oauth:kimi", "oauth:pi"] {
                     queue_materialization_cleanup(
                         kind,
                         "startup sweep failed to delete materialization root",
@@ -1897,6 +1916,11 @@ fn access_token_material_error(kind: &str, material: &str) -> Option<String> {
         ],
         "oauth:claude-code" => &[("/claudeAiOauth/refreshToken", "a refresh token")],
         "oauth:kimi" => &[("/refresh_token", "a refresh token")],
+        // Pi stores one credential object per provider. OAuth entries use a
+        // dynamic provider key and `{type:"oauth", access, refresh,
+        // expires}`; scan below instead of pretending one JSON pointer can
+        // name every provider.
+        "oauth:pi" => &[],
         _ => &[],
     };
     for (pointer, what) in durable {
@@ -1908,7 +1932,42 @@ fn access_token_material_error(kind: &str, material: &str) -> Option<String> {
             }
         }
     }
+    if kind == "oauth:pi" && pi_material_has_durable_authority(&parsed) {
+        return Some(
+            "access-token lease material may not contain a refresh token or API-key credential — grant it as a full-credential lease instead"
+                .to_string(),
+        );
+    }
     None
+}
+
+fn pi_material_has_durable_authority(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().any(pi_material_has_durable_authority),
+        serde_json::Value::Object(object) => {
+            if object
+                .get("refresh")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return true;
+            }
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("api_key")
+                && (object
+                    .get("key")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+                    || object
+                        .get("env")
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(|env| !env.is_empty()))
+            {
+                return true;
+            }
+            object.values().any(pi_material_has_durable_authority)
+        }
+        _ => false,
+    }
 }
 
 fn resolve_mode(kind: &str, mode: Option<&str>, material: &str) -> Result<LeaseMode, String> {
@@ -3058,6 +3117,25 @@ mod tests {
             .join("credentials")
             .join("kimi-code.json");
         assert!(kimi_creds.is_file());
+        materialize_with_plan(
+            root.path(),
+            &staging,
+            &MaterializationPlan {
+                dir_name: "pi-home",
+                auth_name: "auth.json",
+                carry_over: None,
+                source: "pi",
+                transcript_dirs: &["sessions"],
+            },
+            r#"{"openai-codex":{"type":"oauth","access":"at","refresh":"rt","expires":9999999999999}}"#,
+        )
+        .unwrap();
+        let pi_auth = root.path().join("pi-home").join("auth.json");
+        assert!(pi_auth.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&pi_auth).unwrap(),
+            r#"{"openai-codex":{"type":"oauth","access":"at","refresh":"rt","expires":9999999999999}}"#
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3083,6 +3161,8 @@ mod tests {
                 root.path().join("kimi-home"),
                 root.path().join("kimi-home").join("credentials"),
                 kimi_creds.clone(),
+                root.path().join("pi-home"),
+                pi_auth.clone(),
             ] {
                 crate::platform::validate_owner_private_permissions(&path)
                     .unwrap_or_else(|error| panic!("{} was not private: {error}", path.display()));
@@ -3098,8 +3178,8 @@ mod tests {
             .collect();
         assert_eq!(
             dirs.len(),
-            3,
-            "only the three external-agent oauth kinds may materialize"
+            4,
+            "only the four external-agent oauth kinds may materialize"
         );
 
         let cleanup_kind = |kind: &str| {
@@ -3126,6 +3206,9 @@ mod tests {
         );
         cleanup_kind("oauth:kimi");
         assert!(!root.path().join("kimi-home").exists());
+        assert!(pi_auth.is_file(), "Pi materialization remains isolated");
+        cleanup_kind("oauth:pi");
+        assert!(!root.path().join("pi-home").exists());
         // Cleaning an already-gone kind is a quiet no-op.
         cleanup_kind("oauth:claude-code");
     }
@@ -3388,6 +3471,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("refresh token"), "{err}");
+        let err = grant(
+            "oauth:pi",
+            "Pi",
+            r#"{"openai-codex":{"type":"oauth","access":"at","refresh":"rt","expires":9999999999999}}"#,
+            Some("access_token"),
+            "root",
+            "local",
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("refresh token"), "{err}");
+        for material in [
+            r#"{"anthropic":{"type":"api_key","key":"sk-live"}}"#,
+            r#"{"cloudflare":{"type":"api_key","env":{"CLOUDFLARE_API_TOKEN":"secret"}}}"#,
+        ] {
+            let err = grant(
+                "oauth:pi",
+                "Pi",
+                material,
+                Some("access_token"),
+                "root",
+                "local",
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(err.contains("API-key credential"), "{err}");
+        }
         // A durable API key riding in the codex auth file is refused too.
         let err = grant(
             "oauth:codex",
@@ -3453,6 +3565,14 @@ mod tests {
             ),
             Ok(LeaseMode::OauthAccessToken)
         );
+        assert_eq!(
+            resolve_mode(
+                "oauth:pi",
+                Some("access_token"),
+                r#"{"openai-codex":{"type":"oauth","access":"at","refresh":"","expires":9999999999999},"bedrock":{"type":"api_key"}}"#,
+            ),
+            Ok(LeaseMode::OauthAccessToken)
+        );
         // Omitting the mode keeps the pre-split meaning: full credential.
         assert_eq!(
             resolve_mode(
@@ -3499,6 +3619,7 @@ mod tests {
             Some("oauth:claude-code")
         );
         assert_eq!(lease_kind_for_source("KIMI"), Some("oauth:kimi"));
+        assert_eq!(lease_kind_for_source("PI"), Some("oauth:pi"));
         assert_eq!(lease_kind_for_source("native"), None);
 
         // Without an active lease the spawn never used a materialized

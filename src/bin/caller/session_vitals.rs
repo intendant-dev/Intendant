@@ -625,7 +625,7 @@ impl GitVitalsProber {
 /// backend-native id announced mid-flight by `SessionIdentity` — and the
 /// two vitals producers arrive keyed by *different* members of that pair
 /// (git probes ride the registered wrapper id, usage snapshots the id the
-/// drain stamps, native for Codex/Claude Code/Kimi Code). Without folding, each
+/// drain stamps, native for Codex/Claude Code/Kimi Code/Pi). Without folding, each
 /// logical session holds two half-empty hub entries whose emissions
 /// overwrite each other on the frontend (the identity-seam drop class:
 /// the git family blanks to "not reported" the moment usage wins the
@@ -3312,7 +3312,7 @@ mod tests {
     /// The dashboard's vitals symbol catalog (static/app/39-session-windows.js,
     /// VITALS_SYMBOLS_BEGIN..END) is the single source for every vitals chip,
     /// rail tooltip, and tap-to-explain popover — and the backend-parity
-    /// surface: all three backends render the same symbol grammar from these
+    /// surface: every backend renders the same symbol grammar from these
     /// wire fields. Pin both directions so a `SessionVitals` schema change or
     /// a catalog refactor fails here instead of shipping as silent drift.
     #[test]

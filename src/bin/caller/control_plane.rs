@@ -220,7 +220,7 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             // Persist to intendant.toml so the setting survives daemon
             // restarts. Any frontend (dashboard, TUI, MCP) that sends
             // this control message gets persistence for free. Always
-            // write the canonical SHORT form ("codex" | "claude-code" | "kimi") —
+            // write the canonical SHORT form ("codex" | "claude-code" | "kimi" | "pi") —
             // the TOML round-trip must preserve identity, and
             // from_str_loose needs a form it'll parse back. The Display
             // form ("Claude Code") used to slip through here, which broke

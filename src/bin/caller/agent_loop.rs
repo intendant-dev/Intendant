@@ -355,9 +355,12 @@ pub(crate) async fn handle_spawn_sub_agent_call(
         "codex" => Some(external_agent::AgentBackend::Codex),
         "claude-code" | "claude_code" => Some(external_agent::AgentBackend::ClaudeCode),
         "kimi" | "kimi-code" | "kimi_code" => Some(external_agent::AgentBackend::Kimi),
+        "pi" | "pi-coding-agent" | "pi_coding_agent" | "pi coding agent" => {
+            Some(external_agent::AgentBackend::Pi)
+        }
         other => {
             return format!(
-                "Error: unknown sub-agent backend `{other}`; use internal, codex, claude-code, or kimi."
+                "Error: unknown sub-agent backend `{other}`; use internal, codex, claude-code, kimi, or pi."
             );
         }
     };

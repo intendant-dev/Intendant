@@ -213,6 +213,32 @@ function openSessionConfigModal(sessionOrId) {
       'inherit',
     );
   }
+  const isPi = source === 'pi';
+  for (const rowId of ['session-config-pi-model-row', 'session-config-pi-thinking-row',
+    'session-config-pi-tools-mode-row', 'session-config-pi-tools-row']) {
+    const row = document.getElementById(rowId);
+    if (row) row.style.display = isPi ? '' : 'none';
+  }
+  if (isPi) {
+    const modelInput = document.getElementById('session-config-pi-model');
+    if (modelInput) {
+      modelInput.value = String(meta.pi_model || meta.piModel || '').trim();
+    }
+    const thinkingSelect = document.getElementById('session-config-pi-thinking');
+    if (thinkingSelect) {
+      thinkingSelect.value = String(meta.pi_thinking || meta.piThinking || '').trim() || 'inherit';
+    }
+    const pinnedTools = meta.pi_allowed_tools ?? meta.piAllowedTools;
+    const tools = Array.isArray(pinnedTools)
+      ? normalizeKimiToolNames(pinnedTools)
+      : null;
+    renderKimiToolsEditor(
+      'session-config-pi-tools-mode',
+      'session-config-pi-allowed-tools',
+      tools,
+      'inherit',
+    );
+  }
   updateSessionConfigClaudeCustomRow();
   updateSessionConfigKimiCustomRow();
   const status = document.getElementById('session-config-status');
@@ -224,7 +250,9 @@ function openSessionConfigModal(sessionOrId) {
         ? 'Save applies model & permissions to the live session; tools & effort apply at the next launch (or Save & restart).'
         : (isKimi
           ? 'Save applies Kimi model, thinking, permissions, plan, swarm, and explicit tool sets live. Restoring Kimi profile-default tools requires Save & restart.'
-          : 'Save & restart applies changes now.'));
+          : (isPi
+            ? 'Save applies explicit Pi model and thinking pins live. Inherited values and active-tool changes take effect on the next attach, or immediately with Save & restart.'
+            : 'Save & restart applies changes now.')));
   }
   const modal = document.getElementById('session-config-modal');
   if (modal) modal.style.display = 'flex';
@@ -313,7 +341,8 @@ function handleSessionConfigResult(result) {
     pending.mode,
     pending.archiveMode,
     pending.claudeForm,
-    pending.kimiForm
+    pending.kimiForm,
+    pending.piForm
   );
   scheduleSessionsMetadataRefresh(200);
   showControlToast('success', pending.restart ? 'Launch config saved; restarting session' : 'Launch config saved');
@@ -392,7 +421,26 @@ function applyKimiPinsLocal(target, kimiForm, { snake }) {
   }
 }
 
-function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mode, archiveMode, claudeForm, kimiForm) {
+function applyPiPinsLocal(target, piForm, { snake }) {
+  if (!piForm) return;
+  const keys = snake
+    ? { model: 'pi_model', thinking: 'pi_thinking', allowedTools: 'pi_allowed_tools' }
+    : { model: 'piModel', thinking: 'piThinking', allowedTools: 'piAllowedTools' };
+  for (const key of ['model', 'thinking']) {
+    const value = piForm[key];
+    if (!value || value === 'inherit') delete target[keys[key]];
+    else target[keys[key]] = value;
+  }
+  if (!piForm.allowedTools || piForm.allowedTools === 'inherit') {
+    delete target[keys.allowedTools];
+  } else if (piForm.allowedTools === 'none') {
+    target[keys.allowedTools] = [];
+  } else {
+    target[keys.allowedTools] = normalizeKimiToolNames(piForm.allowedTools);
+  }
+}
+
+function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mode, archiveMode, claudeForm, kimiForm, piForm) {
   const ids = Array.from(new Set([
     meta.sessionId,
     meta.backendSessionId,
@@ -419,6 +467,9 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
     }
     if (meta.source === 'kimi') {
       applyKimiPinsLocal(next, kimiForm, { snake: false });
+    }
+    if (meta.source === 'pi') {
+      applyPiPinsLocal(next, piForm, { snake: false });
     }
     sessionMetadataById.set(id, next);
     if (sessionWindows.has(id)) updateSessionWindow(id, next);
@@ -466,6 +517,9 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
     }
     if (meta.source === 'kimi') {
       applyKimiPinsLocal(session, kimiForm, { snake: true });
+    }
+    if (meta.source === 'pi') {
+      applyPiPinsLocal(session, piForm, { snake: true });
     }
   }
   persistSessionWindowState();
@@ -538,6 +592,29 @@ function onSessionConfigKimiToolsModeChange() {
 }
 window.onSessionConfigKimiToolsModeChange = onSessionConfigKimiToolsModeChange;
 
+function sessionConfigPiFormValues() {
+  const model = document.getElementById('session-config-pi-model')?.value.trim() || 'inherit';
+  const thinking = document.getElementById('session-config-pi-thinking')?.value || 'inherit';
+  const toolsMode = document.getElementById('session-config-pi-tools-mode')?.value || 'inherit';
+  const toolNames = normalizeKimiToolNames(
+    document.getElementById('session-config-pi-allowed-tools')?.value || '',
+  );
+  const allowedTools = toolsMode === 'inherit'
+    ? 'inherit'
+    : (toolsMode === 'none' || toolNames.length === 0 ? 'none' : toolNames.join(','));
+  return { model, thinking, allowedTools };
+}
+
+function onSessionConfigPiToolsModeChange() {
+  const mode = document.getElementById('session-config-pi-tools-mode')?.value || 'inherit';
+  const input = document.getElementById('session-config-pi-allowed-tools');
+  if (input) {
+    input.disabled = mode !== 'exact';
+    if (mode === 'exact') input.focus();
+  }
+}
+window.onSessionConfigPiToolsModeChange = onSessionConfigPiToolsModeChange;
+
 function saveSessionConfigModal(options = {}) {
   if (!sessionConfigEditing || !app) return;
   const command = document.getElementById('session-config-command')?.value.trim() || '';
@@ -559,6 +636,7 @@ function saveSessionConfigModal(options = {}) {
   // KEEP an existing pin — see the supervisor's clear-before-merge dance).
   const claudeForm = sessionConfigClaudeFormValues();
   const kimiForm = sessionConfigKimiFormValues();
+  const piForm = sessionConfigPiFormValues();
   const payload = {
     action: 'configure_session_agent',
     session_id: sessionConfigEditing.sessionId,
@@ -586,6 +664,11 @@ function saveSessionConfigModal(options = {}) {
       kimi_swarm_mode: kimiForm.swarmMode,
       kimi_allowed_tools: kimiForm.allowedTools,
     } : {}),
+    ...(sessionConfigEditing.source === 'pi' ? {
+      pi_model: piForm.model,
+      pi_thinking: piForm.thinking,
+      pi_allowed_tools: piForm.allowedTools,
+    } : {}),
   };
   try {
     if (sessionConfigSavePending?.timeoutHandle) {
@@ -609,6 +692,7 @@ function saveSessionConfigModal(options = {}) {
       archiveMode,
       claudeForm: sessionConfigEditing.source === 'claude-code' ? claudeForm : null,
       kimiForm: sessionConfigEditing.source === 'kimi' ? kimiForm : null,
+      piForm: sessionConfigEditing.source === 'pi' ? piForm : null,
       restart: options.restart === true,
       timeoutHandle: setTimeout(() => {
         const pending = sessionConfigSavePending;
@@ -698,6 +782,30 @@ function saveSessionConfigModal(options = {}) {
         dispatchCodexThreadAction(
           'tools-set',
           { names: effectiveTools },
+          sessionConfigEditing.sessionId,
+        );
+      }
+    }
+    if (
+      sessionConfigEditing.source === 'pi' &&
+      options.restart !== true &&
+      !sessionWindowIsDetached(sessionConfigEditing.sessionId)
+    ) {
+      // Pi's launch `--model` accepts patterns, while live set_model requires
+      // an exact provider/model pair (or an exact id under the current
+      // provider). Clearing a pin to inherit therefore waits for reattach;
+      // replaying a global launch pattern into the live RPC would be wrong.
+      if (piForm.model !== 'inherit') {
+        dispatchCodexThreadAction(
+          'model',
+          { model: piForm.model },
+          sessionConfigEditing.sessionId,
+        );
+      }
+      if (piForm.thinking !== 'inherit') {
+        dispatchCodexThreadAction(
+          'thinking',
+          { thinking: piForm.thinking },
           sessionConfigEditing.sessionId,
         );
       }

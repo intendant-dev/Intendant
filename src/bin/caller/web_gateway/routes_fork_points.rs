@@ -5,6 +5,8 @@
 //! its canonical external identity first (so the catalog is derived from
 //! the backend's own transcript), then a plain native log dir, then the
 //! backend stores directly (a bare Codex rollout, Claude, or Kimi session id).
+//! Pi advertises its native head fork as a live thread action; it has no
+//! historical anchor-surgery arm in this catalog.
 
 use super::*;
 use crate::session_fork::{

@@ -530,7 +530,7 @@ fn native_locator_outcome(
 }
 
 // ---------------------------------------------------------------------
-// External (Codex / Claude Code / Kimi Code / legacy Gemini) resolution
+// External (Codex / Claude Code / Kimi Code / Pi / legacy Gemini) resolution
 // ---------------------------------------------------------------------
 
 /// The transcript file the detail view renders — the same dispatch as
@@ -547,6 +547,7 @@ fn external_transcript_path(home: &Path, source: &str, session_id: &str) -> Opti
             let location = kimi_history::find_kimi_session_from_home(home, session_id)?;
             Some(location.selected_agent(session_id)?.wire_path.clone())
         }),
+        "pi" => pi_history::find_pi_session_from_home(home, session_id).map(|entry| entry.path),
         _ => None,
     }
 }
@@ -751,6 +752,8 @@ fn external_locator_outcome(
                 entry.get("item_id").and_then(|value| value.as_str()) == Some(record_id.as_str())
                     || entry.get("record_id").and_then(|value| value.as_str())
                         == Some(record_id.as_str())
+                    || entry.get("message_uuid").and_then(|value| value.as_str())
+                        == Some(record_id.as_str())
             }) {
                 return LocateOutcome::Resolved {
                     total_index: index,
@@ -766,6 +769,9 @@ fn external_locator_outcome(
                 "kimi" => {
                     LocateOutcome::unavailable("record not found in the selected Kimi agent wire")
                 }
+                "pi" => LocateOutcome::unavailable(
+                    "record belongs to an inactive Pi branch and is not in the current replay",
+                ),
                 other => LocateOutcome::unavailable(format!(
                     "locate is not supported for {other} sessions"
                 )),

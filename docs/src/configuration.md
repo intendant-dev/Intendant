@@ -53,7 +53,7 @@ for the headless `tests/e2e/` suite and demos) and requires
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. On macOS/Linux it also holds `access-certs/`; Windows keeps that store under the OS data directory instead. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`, `~/.kimi-code`), the Windows access-cert store, the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves), and the current macOS durable Memory plane at `~/.intendant/memory-plane` (which does not yet honor `INTENDANT_HOME`). |
+| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. On macOS/Linux it also holds `access-certs/`; Windows keeps that store under the OS data directory instead. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`, `~/.kimi-code`, `~/.pi/agent`), the Windows access-cert store, the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves), and the current macOS durable Memory plane at `~/.intendant/memory-plane` (which does not yet honor `INTENDANT_HOME`). |
 | `INTENDANT_MEMORY_EPHEMERAL` | unset | Set to `1` to force the owner-plane Memory service to use an in-memory plane. With the variable unset, macOS attempts durable storage at `~/.intendant/memory-plane` and falls back softly to an honestly labeled ephemeral plane if bootstrap fails; Linux and Windows currently use the ephemeral plane. |
 | `INTENDANT_LOOPBACK_TOKEN` | unset | **Client-side only.** Explicit loopback admission token for `intendant ctl` and harnesses, overriding the automatic per-port file discovery (`<state root>/loopback-tokens/<port>.token`). Every daemon boot mints and persists that per-instance token (0600) and refuses tokenless loopback requests to owner-posture surfaces; see the trust-architecture chapter's "Loopback trust vs. the runtime sandbox". The daemon itself never reads this variable — a daemon-side env intake would leak into child processes — and the runtime child-environment allowlist never passes it to model-driven code. |
 
@@ -297,7 +297,7 @@ Routes coding tasks to an external CLI agent instead of the native loop (see
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `default_backend` | string | unset (use native) | `codex`, `claude-code`, or `kimi` |
+| `default_backend` | string | unset (use native) | `codex`, `claude-code`, `kimi`, or `pi` |
 
 `[agent.codex]`:
 
@@ -355,6 +355,26 @@ changing the command requires restart. Intendant runs a private `kimi server`
 beneath a per-session bridge home, so concurrent Kimi sessions do not contend
 for the primary home's server lock and Intendant never edits the user's
 `~/.kimi-code/mcp.json`.
+
+`[agent.pi]`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `command` | string | `pi` | Path or command name for the Pi binary |
+| `model` | string | unset | Pi model pattern or `provider/model` id. Blank inherits Pi's configured profile |
+| `thinking` | string | unset | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; blank/`inherit` leaves the selected model's Pi default in control. Unknown non-empty values are retained for forward compatibility and rejected visibly by Pi if unsupported |
+| `allowed_tools` | array or unset | unset | Exact active Pi tool names at process launch. Unset keeps Pi's profile, `[]` deliberately starts with no tools, and a non-empty array replaces the active set |
+
+All four Pi fields can be pinned per session. An exact model id (optionally
+`provider/model`) and thinking level apply live to an attached session and are
+persisted back into that session's launch overlay; launch-only model patterns,
+command, and tools require restart. Global Settings writes `[agent.pi]`
+directly rather than maintaining a daemon-wide Pi-shaped runtime mirror: new
+sessions load TOML, reattached sessions load it as their base and reapply their
+persisted overlay, while active ones use Pi RPC. Supervision
+disables discovered extensions, loads one private approval extension, preserves
+normal `AGENTS.md`/`CLAUDE.md` context, and uses `$INTENDANT ctl` for platform
+capabilities because upstream Pi has no built-in MCP.
 
 Unknown or empty values for authority-shaped fields such as Codex
 `approval_policy`/`sandbox` and Kimi `permission_mode` are normalized to their
@@ -1105,6 +1125,12 @@ permission_mode = "manual"
 plan_mode = false
 swarm_mode = false
 # allowed_tools = ["AskUserQuestion", "Write"]
+
+[agent.pi]
+command = "pi"
+# model = "openai-codex/gpt-5.6-sol"
+# thinking = "high"
+# allowed_tools = ["read", "grep", "find", "ls", "bash"]
 
 [live_audio]
 enabled = false
