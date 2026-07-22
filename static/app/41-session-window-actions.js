@@ -3367,10 +3367,37 @@ function usageForForegroundSession() {
   return latestGlobalUsage;
 }
 
+// Context percentage from a session's vitals `context` section — the
+// fallback lane when no live update_usage has arrived this tab-lifetime
+// (bootstrap after a daemon restart, attaching to an idle session): the
+// daemon persists and replays vitals, so the recovered footprint is
+// available immediately. Looks across the identity group like the
+// update_usage cache does. Null when no session in the group carries one.
+function contextPctFromVitals(sid) {
+  if (!sid || typeof sessionMetadataById === 'undefined') return null;
+  // relatedSessionIdsForSession includes sid itself.
+  const ids = typeof relatedSessionIdsForSession === 'function'
+    ? relatedSessionIdsForSession(sid) : new Set([sid]);
+  for (const id of ids) {
+    const context = sessionMetadataById.get(id)?.vitals?.context;
+    const pct = Number(context?.usagePct);
+    if (context && Number.isFinite(pct)) return pct;
+  }
+  return null;
+}
+
 function renderForegroundSessionUsage() {
   const usageCommand = usageForForegroundSession();
   const main = usageCommand ? parseUsageJson(usageCommand.main_json) : null;
-  setContextUsagePct(main && typeof main.usage_pct === 'number' ? main.usage_pct : null);
+  if (main && typeof main.usage_pct === 'number') {
+    setContextUsagePct(main.usage_pct);
+    return;
+  }
+  // Live usage first; vitals.context second (recovered/replayed footprint).
+  const sid = typeof explicitForegroundSessionId === 'function'
+    ? explicitForegroundSessionId() : '';
+  const fallbackPct = contextPctFromVitals(sid);
+  setContextUsagePct(fallbackPct !== null ? fallbackPct : null);
 }
 
 function applyMainBackendStatus() {

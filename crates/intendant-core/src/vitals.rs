@@ -53,6 +53,41 @@ pub struct SessionCacheVitals {
     /// is unknown (the countdown is hidden, the hit receipt still shows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_seconds: Option<u32>,
+    /// Present when this section was hydrated from the session's on-disk
+    /// records (a resumed/restored session's transcript) rather than a
+    /// live wire report; the value is the as-of epoch of the record it
+    /// came from. Frontends caveat the claim ("from the session log as
+    /// of …"); every live usage fold overwrites the section with the
+    /// stamp absent. Wire-additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_at_epoch: Option<u64>,
+}
+
+/// Live context-footprint snapshot — the vitals `context` section behind
+/// the dashboard's context meter. `tokens_used` is the last model call's
+/// prompt+output footprint (input + cache reads + cache writes + output),
+/// `usage_pct` its share of `context_window` (producers clamp via the
+/// effective window, so it never exceeds 100). Live `UsageSnapshot`s fill
+/// it turn by turn; the restore hydrator seeds it from a resumed
+/// transcript's last usage record with `recovered_at_epoch` set, so an
+/// idle or freshly restored session states its footprint instead of `--`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionContextVitals {
+    /// Context footprint of the latest call, in tokens.
+    pub tokens_used: u64,
+    /// Context window the footprint is measured against.
+    pub context_window: u64,
+    /// `tokens_used` as a percentage of the window (≤ 100 by producer
+    /// clamping).
+    pub usage_pct: f64,
+    /// Unix seconds when these numbers were current: emission time for
+    /// live fills, the source record's timestamp for recovered ones.
+    pub observed_at_epoch: u64,
+    /// Present when hydrated from on-disk records (see
+    /// [`SessionCacheVitals::recovered_at_epoch`]); live fills clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_at_epoch: Option<u64>,
 }
 
 /// One provider rate-limit window (subscription 5h/7d, per-minute API
@@ -204,6 +239,18 @@ pub struct SessionConfigVitals {
     /// the backend has not yet confirmed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub permission_echoed: bool,
+    /// Present when `model` (and its decorating `effort`) was hydrated
+    /// from the session's on-disk records — recorded launch config or the
+    /// transcript — rather than reported live this daemon lifetime; the
+    /// value is the as-of epoch of the source. Frontends caveat the chip;
+    /// any live fold that states a model clears it. Wire-additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_recovered_at_epoch: Option<u64>,
+    /// Present when the permission fields were hydrated from on-disk
+    /// records (which also keep `permission_echoed` false); cleared by
+    /// any live fold that states a mode. Wire-additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_recovered_at_epoch: Option<u64>,
 }
 
 /// The backend-agnostic permission display classes — the one catalog
@@ -275,10 +322,11 @@ pub fn codex_permission_kind(approval_policy: &str, sandbox: &str) -> Option<&'s
 }
 
 /// Per-session vitals (git / prompt-cache / rate limits / live activity /
-/// config facts) shown by the dashboard and Station — the port of the
-/// operator statusline. Sections are independent: producers fill what
-/// they know, frontends hide what is absent.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// config facts / context footprint) shown by the dashboard and Station —
+/// the port of the operator statusline. Sections are independent:
+/// producers fill what they know, frontends hide what is absent.
+/// (`PartialEq` only: the context section carries an `f64`.)
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionVitals {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,6 +340,10 @@ pub struct SessionVitals {
     /// Session configuration facts (model / effort / permission mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<SessionConfigVitals>,
+    /// Context-footprint snapshot behind the dashboard's context meter.
+    /// Wire-additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<SessionContextVitals>,
 }
 
 #[cfg(test)]
@@ -473,6 +525,7 @@ mod tests {
             permission_mode: Some("bypassPermissions".into()),
             permission_kind: Some(PERMISSION_KIND_BYPASS.into()),
             permission_echoed: true,
+            ..Default::default()
         };
         let wire = serde_json::to_value(&full).expect("serializes");
         assert_eq!(wire["model"], "claude-fable-5");
@@ -488,5 +541,93 @@ mod tests {
             serde_json::json!({}),
             "absent facts serialize to nothing"
         );
+    }
+
+    /// The recovered-provenance stamps are wire-additive: serialized
+    /// camelCase when present, absent otherwise, and legacy emissions
+    /// without them deserialize to `None` (a live claim, no caveat).
+    #[test]
+    fn recovered_stamps_round_trip_and_stay_wire_additive() {
+        let config = SessionConfigVitals {
+            model: Some("claude-fable-5".into()),
+            permission_mode: Some("plan".into()),
+            permission_kind: Some(PERMISSION_KIND_PLAN.into()),
+            model_recovered_at_epoch: Some(1_784_500_000),
+            permission_recovered_at_epoch: Some(1_784_500_000),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&config).expect("serializes");
+        assert_eq!(wire["modelRecoveredAtEpoch"], 1_784_500_000u64);
+        assert_eq!(wire["permissionRecoveredAtEpoch"], 1_784_500_000u64);
+        let back: SessionConfigVitals = serde_json::from_value(wire).expect("deserializes");
+        assert_eq!(back, config);
+
+        let legacy: SessionConfigVitals =
+            serde_json::from_str(r#"{"model":"claude-fable-5"}"#).expect("legacy deserializes");
+        assert_eq!(legacy.model_recovered_at_epoch, None);
+        assert_eq!(legacy.permission_recovered_at_epoch, None);
+        let rewire = serde_json::to_value(&legacy).expect("serializes");
+        assert!(rewire.get("modelRecoveredAtEpoch").is_none());
+        assert!(rewire.get("permissionRecoveredAtEpoch").is_none());
+
+        let cache = SessionCacheVitals {
+            hit_pct: Some(97),
+            last_activity_epoch: 1_784_500_000,
+            ttl_seconds: Some(3600),
+            recovered_at_epoch: Some(1_784_500_000),
+        };
+        let wire = serde_json::to_value(&cache).expect("serializes");
+        assert_eq!(wire["recoveredAtEpoch"], 1_784_500_000u64);
+        let legacy: SessionCacheVitals =
+            serde_json::from_str(r#"{"hitPct":40,"lastActivityEpoch":1}"#)
+                .expect("legacy deserializes");
+        assert_eq!(legacy.recovered_at_epoch, None);
+        assert!(serde_json::to_value(&legacy)
+            .expect("serializes")
+            .get("recoveredAtEpoch")
+            .is_none());
+    }
+
+    /// The context section's wire shape: camelCase, the recovered stamp
+    /// only when present, and the whole section wire-additive on
+    /// `SessionVitals` (legacy emissions without it deserialize to
+    /// `None`, and an absent section serializes to nothing).
+    #[test]
+    fn context_vitals_wire_shape_and_additivity() {
+        let context = SessionContextVitals {
+            tokens_used: 442_000,
+            context_window: 1_000_000,
+            usage_pct: 44.2,
+            observed_at_epoch: 1_784_500_000,
+            recovered_at_epoch: None,
+        };
+        let wire = serde_json::to_value(&context).expect("serializes");
+        assert_eq!(wire["tokensUsed"], 442_000u64);
+        assert_eq!(wire["contextWindow"], 1_000_000u64);
+        assert_eq!(wire["usagePct"], 44.2);
+        assert_eq!(wire["observedAtEpoch"], 1_784_500_000u64);
+        assert!(wire.get("recoveredAtEpoch").is_none());
+        let back: SessionContextVitals = serde_json::from_value(wire).expect("deserializes");
+        assert_eq!(back, context);
+
+        let vitals = SessionVitals {
+            context: Some(SessionContextVitals {
+                recovered_at_epoch: Some(1_784_400_000),
+                ..context
+            }),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&vitals).expect("serializes");
+        assert_eq!(wire["context"]["recoveredAtEpoch"], 1_784_400_000u64);
+
+        let legacy: SessionVitals = serde_json::from_str(
+            r#"{"git":{"branch":"main","dirtyFiles":0,"ahead":0,"behind":0}}"#,
+        )
+        .expect("legacy deserializes");
+        assert!(legacy.context.is_none());
+        assert!(serde_json::to_value(&legacy)
+            .expect("serializes")
+            .get("context")
+            .is_none());
     }
 }

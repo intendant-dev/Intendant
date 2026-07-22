@@ -1031,6 +1031,7 @@ impl EventTranslator {
                 permission_mode: permission,
                 permission_kind,
                 permission_echoed: echoed,
+                ..Default::default()
             },
         }]
     }

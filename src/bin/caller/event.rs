@@ -469,6 +469,18 @@ pub enum AppEvent {
         session_id: Option<String>,
         facts: crate::types::SessionConfigVitals,
     },
+    /// Disk-recovered session facts from the boot/resume vitals hydrator
+    /// (`session_vitals_restore`): recorded launch config + backend
+    /// transcript tail, provenance-stamped. Hub-internal like
+    /// `SessionConfigFacts` — the hub folds it fill-if-absent (live
+    /// producers always win) into `SessionVitals`, the outbound and
+    /// session-logged carrier; this event itself has no outbound twin
+    /// and is never persisted. Boxed: the payload carries several vitals
+    /// sections and rides a clone-per-subscriber broadcast.
+    SessionRecoveredFacts {
+        session_id: Option<String>,
+        facts: Box<crate::session_vitals_restore::RecoveredSessionFacts>,
+    },
     SessionAttached {
         session_id: String,
         source: String,
@@ -2972,6 +2984,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::SessionActivity { .. } => None,
         AppEvent::SessionRateLimits { .. } => None,
         AppEvent::SessionConfigFacts { .. } => None,
+        AppEvent::SessionRecoveredFacts { .. } => None,
         AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {
             session_id: session_id.clone(),
             source: source.clone(),
