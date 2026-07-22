@@ -1029,6 +1029,22 @@ body.context-focus-active {
 .session-window.minimized .session-window-identity-row .session-window-health { order: -2; }
 .session-window.header-collapsed .session-window-identity-row .session-window-status,
 .session-window.minimized .session-window-identity-row .session-window-status { order: -1; }
+/* Compact states stay ONE line (a wrapped second line would outgrow the
+   minimized 36px bar and blur the one-liner glance grammar), so the
+   identity keeps priority by size instead of by wrap: the id sits at its
+   content width (grow 0 — the attention chip claims the line's slack
+   instead, see the vitals compact block below) and shrinks only for a
+   pathological name, never below its 8-hex chip plus the start of the
+   name — the chip itself never clips. */
+.session-window.header-collapsed .session-window-identity-row,
+.session-window.minimized .session-window-identity-row {
+  flex-wrap: nowrap;
+}
+.session-window.header-collapsed .session-window-id,
+.session-window.minimized .session-window-id {
+  flex: 0 1 auto;
+  min-width: 80px;
+}
 /* Header = a column of rows (grid redesign 2026-07-21): identity line,
    quiet icon fact line, one path line, one clamped message line. */
 .session-window-header {
@@ -1048,6 +1064,11 @@ body.context-focus-active {
 .session-window-identity-row {
   min-width: 0;
   display: flex;
+  /* Identity-first (owner ruling 2026-07-22): expanded headers WRAP this
+     row rather than crushing the id chip + name — the status pill and
+     window controls flow to a second line on narrow lanes. The compact
+     one-liner states opt back into nowrap above. */
+  flex-wrap: wrap;
   align-items: center;
   gap: 7px;
 }
@@ -1084,10 +1105,17 @@ body.context-focus-active {
   stroke-linejoin: round;
 }
 /* Identity: the short-id CHIP keeps the per-session badge hue; the NAME
-   reads as plain text beside it (renderSessionIdentity's parts). Uniform
-   row discipline: one line, ellipsis — the full identity is the title. */
+   reads as plain text beside it (renderSessionIdentity's parts).
+   Identity-first (owner ruling 2026-07-22): the id NEVER flex-shrinks in
+   expanded headers — it was the row's only shrinkable item, so any
+   overflow (hover-revealed controls, a wide chip) silently crushed the
+   session's name and clipped its id chip mid-glyph. Siblings wrap to a
+   second line instead; max-width caps the pathological very-long name to
+   a full row of its own, and only then may the name ellipsize (the full
+   identity is always in the title/aria-label). */
 .session-window-id {
-  flex: 1 1 auto;
+  flex: 1 0 auto;
+  max-width: 100%;
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -1401,7 +1429,10 @@ body.context-focus-active {
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  flex: none; /* shrink-proof: a chip is shown whole or dropped, never crushed */
+  /* shrink-proof: a chip is shown whole or dropped, never crushed — with
+     ONE documented exception: the compact states' attention chip yields
+     (ellipsizes) to the identity, see the compact block below. */
+  flex: none;
   margin: 0;
   padding: 1px 7px;
   border: 1px solid color-mix(in srgb, var(--teal) 22%, transparent);
@@ -1485,8 +1516,32 @@ body.context-focus-active {
 .session-window-vitals .vit-chip.vit-attn { display: none; }
 .session-window.header-collapsed .session-window-vitals .vit-chip:not(.vit-health):not(.vit-attn),
 .session-window.minimized .session-window-vitals .vit-chip:not(.vit-health):not(.vit-attn) { display: none; }
+/* Identity-first on the one-liner (owner ruling 2026-07-22): when the
+   compact line is tight, the attention chip — not the session's id +
+   name — is the member that yields. Its guaranteed slot is a 44px floor
+   (icon + a few glyphs, .vit-txt end-ellipsizes); it GROWS into the
+   line's leftover space up to its natural text width, so the id + name
+   render whole first and the chip takes only what remains. The health
+   slot (flex:none while expanded) carries the same floor AT THE ROW
+   LEVEL — its 64px basis is dot (16) + the vitals gap (4) + the chip
+   floor (44), because an auto basis would bake the chip's full-grown
+   width back into the row and re-crush the name. Severity never leaves
+   the screen: the dot's color carries it, the pane has the words. */
+.session-window.header-collapsed .session-window-identity-row .session-window-health,
+.session-window.minimized .session-window-identity-row .session-window-health {
+  flex: 1 1 64px;
+  max-width: max-content;
+}
 .session-window.header-collapsed .session-window-vitals .vit-chip.vit-attn,
-.session-window.minimized .session-window-vitals .vit-chip.vit-attn { display: inline-flex; }
+.session-window.minimized .session-window-vitals .vit-chip.vit-attn {
+  display: inline-flex;
+  flex: 1 1 44px;
+  /* The explicit min matters: without it the auto minimum is the nowrap
+     text's full min-content, and the chip would refuse to shrink and
+     paint past its floored slot on a tight minimized bar. */
+  min-width: 44px;
+  max-width: max-content;
+}
 @container (max-width: 560px) {
   /* Expanded-but-narrow: quiet chips fold into "+N"; attention chips
      ([data-elevated]) keep their survival. The compact-state rules above
