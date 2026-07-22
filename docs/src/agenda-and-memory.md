@@ -222,6 +222,35 @@ ever**: no file contents, copies, or uploads enter the agenda for refs —
 the preview blob store remains exclusively Ask-v2's (pinned in
 `agenda/blobs.rs`). Digests travel; blobs wouldn't.
 
+### The graph: placement and adjacency (G2)
+
+Two more edge vocabularies make the agenda navigable, both ordinary
+attributed ops, both **pure navigation**:
+
+- **`part_of`** (`add_part_of` / `remove_part_of`, plus the atomic `place`
+  command) — subordination with a **single live parent**. Re-parenting is
+  a remove+add pair; `place` validates the *new* target in full (cycle,
+  depth rail 16, children rail 500) before touching the current placement,
+  so a refused gesture never strands the item. **A hub is just an item
+  with children** — no new kind, no `project` field: projects are hubs by
+  convention. Roll-up counts, the tree lens (the dashboard's "By hub"
+  toggle, `ctl agenda list --under <id>`), and "hub done · open children"
+  flags are all derived at render from the ordinary snapshot.
+- **`relates_to`** (`add_relates_to` / `remove_relates_to`) — untyped
+  see-also adjacency: stored directed (the writer's item carries the
+  edge), rendered as the undirected union, deduped in both directions at
+  intake; removal names the pair in either order and the daemon resolves
+  the stored side. Capped at 32 stored edges per item.
+
+**Two rules are pinned.** *Anti-hiding:* a `part_of` placement never
+removes an item from the flat recent lens — grouping is an opt-in reorder
+of the same cards, and a placed item still appears wherever its status
+puts it. *No transitive semantics:* placement propagates nothing —
+`blocked` stays `relies_on`-only (a blocked child renders its hub
+unblocked; there is an explicit test), completion never cascades, and a
+hub completed over open children gets a render-level flag, nothing more.
+Every transitive behavior is a future decision, not a default.
+
 ### Due reminders
 
 `due_ms` schedules a notification, not work. The owner controls delivery with

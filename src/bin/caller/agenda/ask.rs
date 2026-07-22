@@ -345,6 +345,8 @@ mod tests {
             blockers: Vec::new(),
             relies_on: Vec::new(),
             refs: Vec::new(),
+            part_of: None,
+            relates_to: Vec::new(),
         }
     }
 

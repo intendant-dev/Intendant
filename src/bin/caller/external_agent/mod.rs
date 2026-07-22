@@ -888,45 +888,85 @@ pub enum AgentAttachment {
     File(AgentFileAttachment),
 }
 
-impl AgentAttachment {
-    /// Images flow through each backend's native image path; files need
-    /// the "stage + point" workaround. Exposed as a method so call sites
-    /// reading a heterogeneous `&[AgentAttachment]` can split into two
-    /// buckets cleanly.
-    pub fn is_image(&self) -> bool {
-        matches!(self, AgentAttachment::Image(_))
-    }
-}
-
-/// Build the short prelude that precedes a user's message when the task
-/// carries one or more non-image file attachments. Tells the model what
-/// files are available and where to find them, without pretending the
-/// backend has a real "document" content block.
+/// Stable, greppable marker that opens every stored-attachment path line in
+/// a delivered user message: `[attachment stored: <absolute path>]`.
 ///
-/// Empty string when there are no file attachments — callers can
-/// concatenate unconditionally.
-pub fn format_file_attachments_prelude(files: &[&AgentFileAttachment]) -> String {
-    if files.is_empty() {
+/// This is the reference half of the attachment contract: the pixels/bytes
+/// may or may not ride a given lane, but the stored path always does, so the
+/// receiving agent can act on the file (read it, relay it to a sub-agent)
+/// without hunting the store. Keep the marker identical across every
+/// delivery lane — task, follow-up, steer, native — and treat its exact
+/// spelling as an interface (tests pin it).
+pub const ATTACHMENT_STORED_MARKER: &str = "[attachment stored: ";
+
+/// Build the prelude that precedes a user's message when it carries
+/// attachments. One line per attachment that exists on disk — non-image
+/// files always, images when their store path is known (an in-memory
+/// screenshot has no stored file and gets no line). Each line ends with the
+/// stable `[attachment stored: <absolute path>]` marker so the model can
+/// reference the stored file directly; for backends that also deliver the
+/// image content block, the line ties the inline pixels to their disk path.
+///
+/// Retention note: dashboard uploads live in the project-local
+/// `.intendant/uploads/` store (never pruned) or, for projectless daemons,
+/// the daemon-global store (pruned after
+/// [`crate::global_store::GLOBAL_STORE_RETENTION_DAYS`] days of
+/// inactivity) — durable either way, not session-lifetime temp files.
+///
+/// Empty string when nothing has a stored path — callers can concatenate
+/// unconditionally.
+pub fn format_attachments_prelude(attachments: &[AgentAttachment]) -> String {
+    let mut lines = String::new();
+    for attachment in attachments {
+        match attachment {
+            AgentAttachment::File(f) => {
+                // Humanised size: "123 B" / "1.2 KB" / "4.3 MB". Nothing
+                // fancy — just avoids raw byte counts for multi-MB PDFs.
+                lines.push_str(&format!(
+                    "- `{}` ({}, {}) — {}{}]\n",
+                    f.name,
+                    f.mime_type,
+                    human_bytes(f.size),
+                    ATTACHMENT_STORED_MARKER,
+                    f.local_path.display(),
+                ));
+            }
+            AgentAttachment::Image(img) => {
+                let Some(path) = img.local_path.as_ref() else {
+                    continue;
+                };
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
+                lines.push_str(&format!(
+                    "- `{}` ({}) — {}{}]\n",
+                    name,
+                    img.mime_type,
+                    ATTACHMENT_STORED_MARKER,
+                    path.display(),
+                ));
+            }
+        }
+    }
+    if lines.is_empty() {
         return String::new();
     }
-    let mut out = String::from(
+    format!(
         "The user attached the following file(s). Read them with your file \
-         tools when relevant; paths are absolute.\n\n",
-    );
-    for f in files {
-        // Humanised size: "123 B" / "1.2 KB" / "4.3 MB". Nothing fancy —
-        // just avoids showing raw byte counts for multi-MB PDFs.
-        let size = human_bytes(f.size);
-        out.push_str(&format!(
-            "- `{}` ({}, {}) — path: {}\n",
-            f.name,
-            f.mime_type,
-            size,
-            f.local_path.display(),
-        ));
+         tools when relevant; paths are absolute.\n\n{lines}\n"
+    )
+}
+
+/// The one concatenation convention for [`format_attachments_prelude`]:
+/// prelude BEFORE the user's text (the model reads the attachment list
+/// first, then the instruction), text unchanged when no line applies.
+/// Every lane that composes a deliverable message from text + attachments
+/// goes through here so the delivered shape stays identical across lanes.
+pub fn text_with_attachments_prelude(text: &str, attachments: &[AgentAttachment]) -> String {
+    let prelude = format_attachments_prelude(attachments);
+    if prelude.is_empty() {
+        text.to_string()
+    } else {
+        format!("{prelude}{text}")
     }
-    out.push('\n');
-    out
 }
 
 fn human_bytes(n: u64) -> String {
@@ -1826,11 +1866,20 @@ pub trait ExternalAgent: Send + Sync {
     }
 
     /// Send a user message with a heterogeneous list of attachments
-    /// (images + files). Default implementation routes images through
-    /// `send_message_with_images` and prepends a prelude describing any
-    /// file attachments at stable paths. Backends that grow a native
+    /// (images + files). Default implementation prepends the stored-path
+    /// prelude for EVERY attachment with an on-disk file — images included
+    /// (`[attachment stored: …]` lines, see
+    /// [`format_attachments_prelude`]) — then routes images through
+    /// `send_message_with_images`. On backends without image input the
+    /// path line is therefore the whole image delivery (the
+    /// `send_message_with_images` default forwards text only); on
+    /// image-capable backends the model gets the content block AND the
+    /// stored path it can reference. Backends that grow a native
     /// "document" content block later can override this to pass files
-    /// through the wire protocol instead of staging + pointing.
+    /// through the wire protocol instead of staging + pointing — overrides
+    /// must keep the stored-path prelude (compose via
+    /// [`text_with_attachments_prelude`]) so the reference contract holds
+    /// on every backend.
     async fn send_message_with_attachments(
         &mut self,
         thread: &AgentThread,
@@ -1844,21 +1893,7 @@ pub trait ExternalAgent: Send + Sync {
                 AgentAttachment::File(_) => None,
             })
             .collect();
-        let files: Vec<&AgentFileAttachment> = attachments
-            .iter()
-            .filter_map(|a| match a {
-                AgentAttachment::File(f) => Some(f),
-                AgentAttachment::Image(_) => None,
-            })
-            .collect();
-        let prelude = format_file_attachments_prelude(&files);
-        // Prelude comes BEFORE the user's message so the model reads the
-        // attachment list first, then the actual instruction.
-        let augmented = if prelude.is_empty() {
-            message.to_string()
-        } else {
-            format!("{}{}", prelude, message)
-        };
+        let augmented = text_with_attachments_prelude(message, attachments);
         self.send_message_with_images(thread, &augmented, &images)
             .await
     }
@@ -2868,5 +2903,234 @@ mod tests {
             }
             other => panic!("expected ExternalAgent error, got {other:?}"),
         }
+    }
+
+    fn stored_image(path: &str) -> AgentAttachment {
+        AgentAttachment::Image(AgentImageAttachment::from_frame_path(
+            PathBuf::from(path),
+            "aGk=".to_string(),
+            "image/png".to_string(),
+        ))
+    }
+
+    fn stored_file(name: &str, path: &str, size: u64) -> AgentAttachment {
+        AgentAttachment::File(AgentFileAttachment {
+            local_path: PathBuf::from(path),
+            name: name.to_string(),
+            mime_type: "application/pdf".to_string(),
+            size,
+        })
+    }
+
+    /// The stored-path prelude names every attachment with an on-disk file
+    /// — images included — via the stable `[attachment stored: …]` marker;
+    /// an in-memory image (no stored file) gets no line.
+    #[test]
+    fn attachments_prelude_names_stored_files_and_images() {
+        let attachments = vec![
+            stored_file("report.pdf", "/store/uploads/s1/ab12__report.pdf", 2048),
+            stored_image("/store/uploads/s1/cd34__shot.png"),
+            AgentAttachment::Image(AgentImageAttachment::from_image_data(&ImageData {
+                media_type: "image/jpeg".to_string(),
+                data: "aGk=".to_string(),
+            })),
+        ];
+        let prelude = format_attachments_prelude(&attachments);
+        assert!(
+            prelude.contains(&format!(
+                "{ATTACHMENT_STORED_MARKER}/store/uploads/s1/ab12__report.pdf]"
+            )),
+            "file line missing: {prelude}"
+        );
+        assert!(
+            prelude.contains(&format!(
+                "{ATTACHMENT_STORED_MARKER}/store/uploads/s1/cd34__shot.png]"
+            )),
+            "image line missing: {prelude}"
+        );
+        assert!(
+            prelude.contains("`cd34__shot.png` (image/png)"),
+            "image line should carry the on-disk name and mime: {prelude}"
+        );
+        assert!(
+            prelude.contains("`report.pdf` (application/pdf, 2.0 KB)"),
+            "file line should keep name/mime/size: {prelude}"
+        );
+        assert_eq!(
+            prelude.matches(ATTACHMENT_STORED_MARKER).count(),
+            2,
+            "the pathless in-memory image must not mint a stored line: {prelude}"
+        );
+
+        // Nothing stored → empty prelude, text passes through unchanged.
+        let pathless = vec![AgentAttachment::Image(
+            AgentImageAttachment::from_image_data(&ImageData {
+                media_type: "image/png".to_string(),
+                data: "aGk=".to_string(),
+            }),
+        )];
+        assert_eq!(format_attachments_prelude(&pathless), "");
+        assert_eq!(format_attachments_prelude(&[]), "");
+        assert_eq!(
+            text_with_attachments_prelude("do the thing", &pathless),
+            "do the thing"
+        );
+
+        // Composition convention: prelude BEFORE the user's text.
+        let composed = text_with_attachments_prelude("do the thing", &attachments);
+        assert!(composed.ends_with("do the thing"), "got: {composed}");
+        assert!(composed.starts_with("The user attached the following file(s)."));
+    }
+
+    /// Recorder for the delivery seam: captures the final wire text and how
+    /// many images were forwarded alongside it.
+    #[derive(Default, Clone)]
+    struct SentRecord {
+        text: String,
+        images: usize,
+    }
+
+    struct RecordingBackend {
+        image_capable: bool,
+        sent: std::sync::Arc<std::sync::Mutex<Vec<SentRecord>>>,
+    }
+
+    #[async_trait]
+    impl ExternalAgent for RecordingBackend {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        async fn initialize(
+            &mut self,
+            _config: AgentConfig,
+        ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, CallerError> {
+            Err(CallerError::ExternalAgent("not used in this test".into()))
+        }
+
+        async fn start_thread(&mut self) -> Result<AgentThread, CallerError> {
+            Err(CallerError::ExternalAgent("not used in this test".into()))
+        }
+
+        async fn send_message(
+            &mut self,
+            _thread: &AgentThread,
+            message: &str,
+        ) -> Result<(), CallerError> {
+            self.sent.lock().unwrap().push(SentRecord {
+                text: message.to_string(),
+                images: 0,
+            });
+            Ok(())
+        }
+
+        async fn send_message_with_images(
+            &mut self,
+            thread: &AgentThread,
+            message: &str,
+            images: &[AgentImageAttachment],
+        ) -> Result<(), CallerError> {
+            if !self.image_capable {
+                // Mirror the trait default: text only.
+                return self.send_message(thread, message).await;
+            }
+            self.sent.lock().unwrap().push(SentRecord {
+                text: message.to_string(),
+                images: images.len(),
+            });
+            Ok(())
+        }
+
+        fn supports_image_input(&self) -> bool {
+            self.image_capable
+        }
+
+        async fn resolve_approval(
+            &mut self,
+            _request_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), CallerError> {
+            Err(CallerError::ExternalAgent("not used in this test".into()))
+        }
+
+        async fn shutdown(&mut self) -> Result<(), CallerError> {
+            Ok(())
+        }
+    }
+
+    /// Image-capable backend: the delivered message carries BOTH the image
+    /// content block and the stored-path line naming the same file.
+    #[tokio::test]
+    async fn attachment_delivery_image_backend_gets_block_and_path_line() {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut backend = RecordingBackend {
+            image_capable: true,
+            sent: sent.clone(),
+        };
+        let thread = AgentThread {
+            thread_id: "t1".to_string(),
+        };
+        backend
+            .send_message_with_attachments(
+                &thread,
+                "look at this",
+                &[stored_image("/store/uploads/s1/cd34__shot.png")],
+            )
+            .await
+            .unwrap();
+        let records = sent.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].images, 1, "image block must still be forwarded");
+        assert!(
+            records[0].text.contains(&format!(
+                "{ATTACHMENT_STORED_MARKER}/store/uploads/s1/cd34__shot.png]"
+            )),
+            "delivered text must name the stored path: {}",
+            records[0].text
+        );
+        assert!(records[0].text.ends_with("look at this"));
+    }
+
+    /// Backend without image input: the stored-path line is the whole image
+    /// delivery — no silent drop.
+    #[tokio::test]
+    async fn attachment_delivery_text_backend_gets_path_line_as_whole_delivery() {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut backend = RecordingBackend {
+            image_capable: false,
+            sent: sent.clone(),
+        };
+        let thread = AgentThread {
+            thread_id: "t1".to_string(),
+        };
+        backend
+            .send_message_with_attachments(
+                &thread,
+                "look at this",
+                &[
+                    stored_image("/store/uploads/s1/cd34__shot.png"),
+                    stored_file("report.pdf", "/store/uploads/s1/ab12__report.pdf", 2048),
+                ],
+            )
+            .await
+            .unwrap();
+        let records = sent.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].images, 0, "text-only lane forwards no blocks");
+        assert!(
+            records[0].text.contains(&format!(
+                "{ATTACHMENT_STORED_MARKER}/store/uploads/s1/cd34__shot.png]"
+            )),
+            "the image's stored path must survive on a text-only backend: {}",
+            records[0].text
+        );
+        assert!(
+            records[0].text.contains(&format!(
+                "{ATTACHMENT_STORED_MARKER}/store/uploads/s1/ab12__report.pdf]"
+            )),
+            "file attachments keep their stored-path line: {}",
+            records[0].text
+        );
+        assert!(records[0].text.ends_with("look at this"));
     }
 }

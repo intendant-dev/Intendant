@@ -546,6 +546,104 @@ function agendaThreadBlock(item) {
   return parts.length ? `<div class="agenda-item-thread">${parts.join('')}</div>` : '';
 }
 
+// ---- G2 graph presentation: hub roll-ups, placement, adjacency. ALL
+// derived at render from the ordinary snapshot — never stored, never on
+// the wire — and placement NEVER hides an item: the flat lens stays the
+// default, grouping is an opt-in reorder of the same cards (anti-hiding
+// rule). No transitive semantics: a hub completing over open children
+// wears a render-level flag only.
+
+let agendaGroupByHub = false;
+
+function agendaChildrenOf(id) {
+  return (agendaItems || []).filter(
+    (it) => it.part_of && it.part_of.parent_id === id
+  );
+}
+
+function agendaHubChip(item) {
+  const children = agendaChildrenOf(item.id);
+  if (!children.length) return '';
+  const open = children.filter((c) => c.status === 'open').length;
+  const doneOverOpen = item.status === 'done' && open > 0;
+  const flag = doneOverOpen
+    ? `<span class="agenda-hub-open-flag" title="This hub is done but ${open} of its children are still open — completion never cascades">· open children</span>`
+    : '';
+  return `<span class="agenda-chip hub" title="${children.length} item(s) placed under this one">⌂ ${open}/${children.length} open</span>${flag}`;
+}
+
+function agendaPlacementChip(item) {
+  if (!item.part_of) return '';
+  const parent = agendaFindItem(item.part_of.parent_id);
+  const label = parent ? parent.title : `${item.part_of.parent_id.slice(0, 10)}… (missing)`;
+  const short = label.length > 28 ? `${label.slice(0, 28)}…` : label;
+  return `<span class="agenda-chip placement">
+    <a href="#agenda" class="agenda-item-jump" data-jump="${escapeHtml(item.part_of.parent_id)}" title="Placed under: ${escapeHtml(label)}">in ${escapeHtml(short)}</a>
+    <button type="button" class="agenda-place-remove" data-id="${escapeHtml(item.id)}" data-parent="${escapeHtml(item.part_of.parent_id)}" aria-label="Remove placement" title="Un-place (history stays in the log)">×</button>
+  </span>`;
+}
+
+// The undirected adjacency union: edges stored on this item plus edges
+// other items store pointing here, deduped.
+function agendaRelationsBlock(item) {
+  const partners = new Set((item.relates_to || []).map((e) => e.target_id));
+  (agendaItems || []).forEach((other) => {
+    if ((other.relates_to || []).some((e) => e.target_id === item.id)) {
+      partners.add(other.id);
+    }
+  });
+  if (!partners.size) return '';
+  const chips = [...partners].map((pid) => {
+    const target = agendaFindItem(pid);
+    const label = target ? target.title : `${pid.slice(0, 10)}…`;
+    const short = label.length > 30 ? `${label.slice(0, 30)}…` : label;
+    return `<span class="agenda-relation">
+      <a href="#agenda" class="agenda-item-jump" data-jump="${escapeHtml(pid)}" title="${escapeHtml(label)}">↔ ${escapeHtml(short)}</a>
+      <button type="button" class="agenda-relation-remove" data-id="${escapeHtml(item.id)}" data-target="${escapeHtml(pid)}" aria-label="Remove relation" title="Remove relation (either side may — the daemon resolves the stored edge)">×</button>
+    </span>`;
+  });
+  return `<div class="agenda-relations">${chips.join('')}</div>`;
+}
+
+// Scroll-and-flash navigation to another item's card in this tab.
+function agendaJumpToItem(id) {
+  const selector = `.agenda-item[data-item-id="${window.CSS && CSS.escape ? CSS.escape(id) : id}"]`;
+  let card = document.querySelector(selector);
+  if (!card) {
+    // The target sits outside the current filter — widen to All.
+    agendaFilter = 'all';
+    document.querySelectorAll('#agenda-filters .agenda-filter').forEach((b) =>
+      b.classList.toggle('active', b.dataset.filter === 'all'));
+    agendaRenderTab();
+    card = document.querySelector(selector);
+  }
+  if (!card) return;
+  card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  card.classList.add('agenda-jump-flash');
+  setTimeout(() => card.classList.remove('agenda-jump-flash'), 2400);
+}
+
+// Grouped ordering (the by-hub lens): the SAME filtered cards, reordered
+// so children follow their parent (depth-indented). Roots keep the
+// newest-first order; an item whose parent is outside the filtered set
+// renders as a root — everything filtered stays visible, always.
+function agendaGroupedOrder(filtered) {
+  const inSet = new Map(filtered.map((item) => [item.id, item]));
+  const roots = filtered
+    .filter((item) => !(item.part_of && inSet.has(item.part_of.parent_id)))
+    .sort((a, b) => (a.id < b.id ? 1 : -1));
+  const out = [];
+  const emit = (item, depth) => {
+    out.push({ item, depth });
+    agendaChildrenOf(item.id)
+      .filter((child) => inSet.has(child.id))
+      .sort((a, b) => (a.id < b.id ? 1 : -1))
+      .forEach((child) => emit(child, Math.min(depth + 1, 6)));
+  };
+  roots.forEach((root) => emit(root, 0));
+  return out;
+}
+
 // ---- G1 typed references: chips + per-ref rows. Refs are POINTERS —
 // labels and locators are data, rendered escaped, never followed by
 // machinery. A must-read is rendered prominent for whoever picks the item
@@ -1372,7 +1470,15 @@ function agendaRenderTab() {
     return;
   }
   // Newest first reads best in a review list; ULIDs sort by creation.
-  const rows = filtered.slice().sort((a, b) => (a.id < b.id ? 1 : -1)).map((item) => {
+  // The by-hub lens reorders the SAME cards (children nested under
+  // parents) — the flat order stays the default and the guarantee.
+  const ordered = agendaGroupByHub
+    ? agendaGroupedOrder(filtered)
+    : filtered
+        .slice()
+        .sort((a, b) => (a.id < b.id ? 1 : -1))
+        .map((item) => ({ item, depth: 0 }));
+  const rows = ordered.map(({ item, depth }) => {
     const tags = (item.tags || [])
       .map((tag) => `<span class="agenda-chip">#${escapeHtml(tag)}</span>`)
       .join('');
@@ -1431,14 +1537,16 @@ function agendaRenderTab() {
     const headOpenAttrs = openRichAsk
       ? ` agenda-item-head-openable" data-open-ask="${escapeHtml(item.id)}" role="button" tabindex="0" title="Open the question panel`
       : '';
-    return `<div class="agenda-item" data-status="${escapeHtml(item.status)}">
+    const indent = depth > 0 ? ` agenda-item-nested` : '';
+    const indentStyle = depth > 0 ? ` style="--agenda-nest-depth:${depth}"` : '';
+    return `<div class="agenda-item${indent}" data-status="${escapeHtml(item.status)}" data-item-id="${escapeHtml(item.id)}"${indentStyle}>
       <div class="agenda-item-head${headOpenAttrs}">
         ${agendaGlyph(item.status, item.kind)}
         <span class="agenda-item-kind">${escapeHtml(item.kind)}</span>
         <span class="agenda-item-title">${escapeHtml(item.title)}</span>
-        ${blockedChip}${dismissedChip}${pickupChip}${agendaDueChip(item)}${agendaRefsChip(item)}${tags}
+        ${blockedChip}${dismissedChip}${pickupChip}${agendaDueChip(item)}${agendaHubChip(item)}${agendaPlacementChip(item)}${agendaRefsChip(item)}${tags}
       </div>
-      ${body}${answerBlock}${agendaRefsBlock(item)}${agendaThreadBlock(item)}${agendaEffectBlock(item)}
+      ${body}${answerBlock}${agendaRefsBlock(item)}${agendaRelationsBlock(item)}${agendaThreadBlock(item)}${agendaEffectBlock(item)}
       <div class="agenda-item-foot">
         <span class="agenda-item-meta">${agendaProvenanceLine(item)}</span>
         <span class="agenda-item-actions">${agendaActionButtons(item)}</span>
@@ -1510,6 +1618,25 @@ function agendaRenderTab() {
   list.querySelectorAll('button.agenda-edge-remove').forEach((btn) => {
     btn.addEventListener('click', () =>
       agendaSendOp({ op: 'remove_relies_on', id: btn.dataset.id, target_id: btn.dataset.target }, btn));
+  });
+  // G2 graph wiring: item jumps, un-place, relation removal.
+  list.querySelectorAll('a.agenda-item-jump').forEach((link) => {
+    link.addEventListener('click', (e) => {
+      e.preventDefault();
+      agendaJumpToItem(link.dataset.jump);
+    });
+  });
+  list.querySelectorAll('button.agenda-place-remove').forEach((btn) => {
+    btn.addEventListener('click', () =>
+      agendaSendOp({
+        op: 'remove_part_of', id: btn.dataset.id, parent_id: btn.dataset.parent,
+      }, btn));
+  });
+  list.querySelectorAll('button.agenda-relation-remove').forEach((btn) => {
+    btn.addEventListener('click', () =>
+      agendaSendOp({
+        op: 'remove_relates_to', id: btn.dataset.id, target_id: btn.dataset.target,
+      }, btn));
   });
   // G1 refs wiring: remove, on-demand drift verify, Memory claim jumps.
   list.querySelectorAll('button.agenda-ref-remove').forEach((btn) => {
@@ -1695,6 +1822,15 @@ function agendaPositionCard() {
           agendaRenderTab();
         });
       });
+      const group = document.getElementById('agenda-group-toggle');
+      if (group) {
+        group.addEventListener('click', () => {
+          agendaGroupByHub = !agendaGroupByHub;
+          group.classList.toggle('active', agendaGroupByHub);
+          group.setAttribute('aria-pressed', agendaGroupByHub ? 'true' : 'false');
+          agendaRenderTab();
+        });
+      }
     }
     const addBtn = document.getElementById('agenda-add-btn');
     const addTitle = document.getElementById('agenda-add-title');

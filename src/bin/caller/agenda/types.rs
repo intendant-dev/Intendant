@@ -18,6 +18,14 @@ pub(crate) const MAX_ANNOTATIONS_PER_ITEM: usize = 500;
 pub(crate) const MAX_UNCLEARED_BLOCKERS_PER_ITEM: usize = 32;
 pub(crate) const MAX_RELIES_ON_PER_ITEM: usize = 32;
 pub(crate) const MAX_CRITERION_CHARS: usize = 1000;
+/// G2 caps (steward-ruled 2026-07-22). Adjacency follows the edges idiom;
+/// the children cap is a pathology rail like annotations (project hubs
+/// legitimately accrue hundreds of children — 32 would strangle the
+/// primary intended use), and the depth cap keeps the tree a working
+/// surface, not an ontology.
+pub(crate) const MAX_RELATES_TO_PER_ITEM: usize = 32;
+pub(crate) const MAX_PART_OF_DEPTH: usize = 16;
+pub(crate) const MAX_CHILDREN_PER_HUB: usize = 500;
 /// G1 caps (steward-ruled 2026-07-22). Refs follow the blockers/edges
 /// idiom; locator bounds are per-type (paths, opaque ids, urls).
 pub(crate) const MAX_REFS_PER_ITEM: usize = 32;
@@ -400,6 +408,16 @@ pub struct AgendaItem {
     /// never on list render.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) refs: Vec<AgendaRef>,
+    /// The single live parent (G2). Re-parent is a remove+add op pair;
+    /// child lists, roll-up counts, and the tree lens are derived at
+    /// render from the ordinary snapshot — never stored, and placement
+    /// never hides an item from the flat recent lens (anti-hiding rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) part_of: Option<AgendaPlacement>,
+    /// Stored adjacency edges (G2 `add_relates_to`), this item's side
+    /// only — surfaces render the undirected union.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) relates_to: Vec<AgendaRelation>,
 }
 
 /// One attributed note on an item (F2 `annotate` fold view). Attribution
@@ -470,6 +488,44 @@ pub struct AgendaBlockerClear {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgendaDependency {
     /// The prerequisite item's id.
+    pub(crate) target_id: String,
+    pub(crate) added_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
+}
+
+/// The single live parent (G2 `add_part_of` fold view): pure
+/// subordination for navigation and roll-ups. **A hub is just an item
+/// with children** — no kind, no fields, no schema axis; projects are
+/// hubs by convention. NO transitive semantics (pinned): placement never
+/// propagates blocking, completion never cascades, and a hub completing
+/// with open children gets a render-level flag, nothing more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaPlacement {
+    pub(crate) parent_id: String,
+    pub(crate) added_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
+}
+
+/// One stored adjacency edge (G2 `add_relates_to` fold view): untyped,
+/// purely navigational — nothing derives, evaluates, blocks, or fires
+/// from adjacency, ever. Stored directed (the writer's item carries it),
+/// rendered undirected and deduped by every surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaRelation {
     pub(crate) target_id: String,
     pub(crate) added_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -741,6 +797,50 @@ pub enum AgendaCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
+    /// Place an item under a parent (G2 subordination). Intake rejects a
+    /// second live parent — re-parent with [`AgendaCommand::Place`] or an
+    /// explicit remove+add pair.
+    AddPartOf {
+        id: String,
+        parent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    /// Remove the live placement (an op; the log keeps history).
+    RemovePartOf {
+        id: String,
+        parent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    /// Re-parent in one gesture (steward override, 2026-07-22): validate
+    /// the NEW placement first, then emit the primitive
+    /// `remove_part_of` + `add_part_of` pair under one lock — a refused
+    /// target never destroys the current placement (the two-call
+    /// footgun). The op vocabulary is unchanged: the log carries the two
+    /// primitive lines.
+    Place {
+        id: String,
+        under: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    /// Add an undirected adjacency edge (stored on this item). Purely
+    /// navigational.
+    AddRelatesTo {
+        id: String,
+        target_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    /// Remove an adjacency edge. The daemon resolves which side stores
+    /// it — callers name the pair in either order.
+    RemoveRelatesTo {
+        id: String,
+        target_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
     /// Attach a typed reference (G1): a pointer, never content. For file
     /// refs the daemon digests the file at intake and records the digest
     /// in the op — the command carries none.
@@ -852,6 +952,11 @@ impl AgendaCommand {
             | AgendaCommand::ClearBlocker { source, .. }
             | AgendaCommand::AddReliesOn { source, .. }
             | AgendaCommand::RemoveReliesOn { source, .. }
+            | AgendaCommand::AddPartOf { source, .. }
+            | AgendaCommand::RemovePartOf { source, .. }
+            | AgendaCommand::Place { source, .. }
+            | AgendaCommand::AddRelatesTo { source, .. }
+            | AgendaCommand::RemoveRelatesTo { source, .. }
             | AgendaCommand::AddRef { source, .. }
             | AgendaCommand::RemoveRef { source, .. } => source.take(),
             AgendaCommand::Ask { .. }
@@ -945,6 +1050,28 @@ pub(crate) enum AgendaOp {
         id: String,
         target_id: String,
     },
+    /// Placement set (G2). The fold enforces single-live-parent by
+    /// warn-ignoring a second add; cycle/depth/children strictness lives
+    /// at intake, and a cycle in a foreign log is a render concern.
+    AddPartOf {
+        id: String,
+        parent_id: String,
+    },
+    /// Placement removed (G2): clears the view; history stays.
+    RemovePartOf {
+        id: String,
+        parent_id: String,
+    },
+    /// Adjacency edge added (G2), stored on `id`'s side.
+    AddRelatesTo {
+        id: String,
+        target_id: String,
+    },
+    /// Adjacency edge removed (G2).
+    RemoveRelatesTo {
+        id: String,
+        target_id: String,
+    },
     /// Typed reference attached (G1). `digest` (file refs) was minted at
     /// intake and is recorded here — replay never hashes (§7 purity).
     AddRef {
@@ -1021,6 +1148,10 @@ impl AgendaOp {
             | AgendaOp::ClearBlocker { id, .. }
             | AgendaOp::AddReliesOn { id, .. }
             | AgendaOp::RemoveReliesOn { id, .. }
+            | AgendaOp::AddPartOf { id, .. }
+            | AgendaOp::RemovePartOf { id, .. }
+            | AgendaOp::AddRelatesTo { id, .. }
+            | AgendaOp::RemoveRelatesTo { id, .. }
             | AgendaOp::AddRef { id, .. }
             | AgendaOp::RemoveRef { id, .. }
             | AgendaOp::ProposeEffect { id, .. }
@@ -1114,6 +1245,8 @@ pub(crate) fn apply_op(
                     blockers: Vec::new(),
                     relies_on: Vec::new(),
                     refs: Vec::new(),
+                    part_of: None,
+                    relates_to: Vec::new(),
                 },
             );
             None
@@ -1219,6 +1352,86 @@ pub(crate) fn apply_op(
             if item.relies_on.len() == before {
                 return Some(format!(
                     "remove_relies_on for absent edge {id}→{target_id} ignored"
+                ));
+            }
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::AddPartOf { id, parent_id } => {
+            if parent_id == id {
+                return Some(format!("self-placement on {id} ignored"));
+            }
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("add_part_of for unknown {id} ignored"));
+            };
+            if let Some(placement) = &item.part_of {
+                return Some(format!(
+                    "add_part_of on {id} already placed under {} ignored",
+                    placement.parent_id
+                ));
+            }
+            // A parent missing from this fold (partial/foreign replay) is
+            // tolerated — the render marks the placement "parent missing".
+            let actor = rec.actor.clone().unwrap_or_default();
+            item.part_of = Some(AgendaPlacement {
+                parent_id: parent_id.clone(),
+                added_ms: at_ms,
+                principal: actor.principal,
+                session_id: actor.session_id,
+                kind: actor.kind,
+                source: rec.source.clone(),
+            });
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::RemovePartOf { id, parent_id } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("remove_part_of for unknown {id} ignored"));
+            };
+            match &item.part_of {
+                Some(placement) if placement.parent_id == *parent_id => {
+                    item.part_of = None;
+                    item.updated_ms = at_ms;
+                    None
+                }
+                _ => Some(format!(
+                    "remove_part_of for absent placement {id}→{parent_id} ignored"
+                )),
+            }
+        }
+        AgendaOp::AddRelatesTo { id, target_id } => {
+            if target_id == id {
+                return Some(format!("self-relation on {id} ignored"));
+            }
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("add_relates_to for unknown {id} ignored"));
+            };
+            if item.relates_to.iter().any(|e| e.target_id == *target_id) {
+                return Some(format!("duplicate relation {id}↔{target_id} ignored"));
+            }
+            // Either-direction dedup is intake's job; the fold stores what
+            // the log says (renders dedup the undirected union).
+            let actor = rec.actor.clone().unwrap_or_default();
+            item.relates_to.push(AgendaRelation {
+                target_id: target_id.clone(),
+                added_ms: at_ms,
+                principal: actor.principal,
+                session_id: actor.session_id,
+                kind: actor.kind,
+                source: rec.source.clone(),
+            });
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::RemoveRelatesTo { id, target_id } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("remove_relates_to for unknown {id} ignored"));
+            };
+            let before = item.relates_to.len();
+            item.relates_to.retain(|e| e.target_id != *target_id);
+            if item.relates_to.len() == before {
+                return Some(format!(
+                    "remove_relates_to for absent relation {id}↔{target_id} ignored"
                 ));
             }
             item.updated_ms = at_ms;
@@ -3146,5 +3359,300 @@ mod tests {
             .unwrap()
             .refs
             .is_empty());
+    }
+
+    fn add_item(items: &mut BTreeMap<String, AgendaItem>, at: u64, id: &str) {
+        apply_op(
+            items,
+            &rec(
+                at,
+                AgendaOp::Add {
+                    id: id.into(),
+                    kind: AgendaKind::Task,
+                    title: format!("item {id}"),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    ask: None,
+                },
+            ),
+        );
+    }
+
+    /// G2 fold: single live parent (second add warn-ignores), re-parent
+    /// as the remove+add pair, adjacency add/remove with tolerance.
+    #[test]
+    fn g2_fold_placement_and_relations() {
+        let mut items = BTreeMap::new();
+        for id in ["01HUB", "01HUB2", "01CHILD", "01PEER"] {
+            add_item(&mut items, 1, id);
+        }
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                2,
+                AgendaOp::AddPartOf {
+                    id: "01CHILD".into(),
+                    parent_id: "01HUB".into(),
+                },
+            ),
+        )
+        .is_none());
+        let placed = &items["01CHILD"].part_of;
+        assert_eq!(placed.as_ref().unwrap().parent_id, "01HUB");
+
+        // Single live parent: a second add is fold-ignored with a warning.
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                3,
+                AgendaOp::AddPartOf {
+                    id: "01CHILD".into(),
+                    parent_id: "01HUB2".into(),
+                },
+            ),
+        )
+        .is_some());
+        assert_eq!(
+            items["01CHILD"].part_of.as_ref().unwrap().parent_id,
+            "01HUB"
+        );
+
+        // Re-parent = remove + add (the primitive pair Place emits).
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                4,
+                AgendaOp::RemovePartOf {
+                    id: "01CHILD".into(),
+                    parent_id: "01HUB".into(),
+                },
+            ),
+        )
+        .is_none());
+        assert!(items["01CHILD"].part_of.is_none());
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                5,
+                AgendaOp::AddPartOf {
+                    id: "01CHILD".into(),
+                    parent_id: "01HUB2".into(),
+                },
+            ),
+        )
+        .is_none());
+        assert_eq!(
+            items["01CHILD"].part_of.as_ref().unwrap().parent_id,
+            "01HUB2"
+        );
+        // Mismatched remove warns and changes nothing.
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                6,
+                AgendaOp::RemovePartOf {
+                    id: "01CHILD".into(),
+                    parent_id: "01HUB".into(),
+                },
+            ),
+        )
+        .is_some());
+        assert!(items["01CHILD"].part_of.is_some());
+
+        // Adjacency: add, duplicate warn, self warn, remove.
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                7,
+                AgendaOp::AddRelatesTo {
+                    id: "01CHILD".into(),
+                    target_id: "01PEER".into(),
+                },
+            ),
+        )
+        .is_none());
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                8,
+                AgendaOp::AddRelatesTo {
+                    id: "01CHILD".into(),
+                    target_id: "01PEER".into(),
+                },
+            ),
+        )
+        .is_some());
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                9,
+                AgendaOp::AddRelatesTo {
+                    id: "01PEER".into(),
+                    target_id: "01PEER".into(),
+                },
+            ),
+        )
+        .is_some());
+        assert_eq!(items["01CHILD"].relates_to.len(), 1);
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                10,
+                AgendaOp::RemoveRelatesTo {
+                    id: "01CHILD".into(),
+                    target_id: "01PEER".into(),
+                },
+            ),
+        )
+        .is_none());
+        assert!(items["01CHILD"].relates_to.is_empty());
+    }
+
+    /// The ruled no-transitive pin: placement NEVER propagates blocking —
+    /// a blocked child renders its hub unblocked — and a hub may complete
+    /// over open children (render-level flag only, no cascade).
+    #[test]
+    fn g2_no_transitive_semantics() {
+        let mut items = BTreeMap::new();
+        for id in ["01HUB", "01CHILD"] {
+            add_item(&mut items, 1, id);
+        }
+        apply_op(
+            &mut items,
+            &rec(
+                2,
+                AgendaOp::AddPartOf {
+                    id: "01CHILD".into(),
+                    parent_id: "01HUB".into(),
+                },
+            ),
+        );
+        apply_op(
+            &mut items,
+            &rec(
+                3,
+                AgendaOp::SetBlocker {
+                    id: "01CHILD".into(),
+                    blocker_id: "bk-child".into(),
+                    criterion: "vendor access".into(),
+                },
+            ),
+        );
+        assert!(is_blocked(&items, &items["01CHILD"]));
+        assert!(
+            !is_blocked(&items, &items["01HUB"]),
+            "a blocked child must never render its hub blocked (part_of \
+             propagates nothing)"
+        );
+
+        // Hub completes while the child stays open: no cascade either way.
+        apply_op(
+            &mut items,
+            &rec(4, AgendaOp::Complete { id: "01HUB".into() }),
+        );
+        assert_eq!(items["01HUB"].status, AgendaStatus::Done);
+        assert_eq!(items["01CHILD"].status, AgendaStatus::Open);
+    }
+
+    /// G2 op-line bytes are pinned.
+    #[test]
+    fn g2_op_line_formats_are_pinned() {
+        for (record, expected) in [
+            (
+                AgendaOpRecord {
+                    v: 1,
+                    at_ms: 40,
+                    actor: None,
+                    source: None,
+                    op: AgendaOp::AddPartOf {
+                        id: "01X".into(),
+                        parent_id: "01H".into(),
+                    },
+                },
+                r#"{"v":1,"at_ms":40,"op":{"type":"add_part_of","id":"01X","parent_id":"01H"}}"#,
+            ),
+            (
+                AgendaOpRecord {
+                    v: 1,
+                    at_ms: 41,
+                    actor: None,
+                    source: None,
+                    op: AgendaOp::RemovePartOf {
+                        id: "01X".into(),
+                        parent_id: "01H".into(),
+                    },
+                },
+                r#"{"v":1,"at_ms":41,"op":{"type":"remove_part_of","id":"01X","parent_id":"01H"}}"#,
+            ),
+            (
+                AgendaOpRecord {
+                    v: 1,
+                    at_ms: 42,
+                    actor: None,
+                    source: None,
+                    op: AgendaOp::AddRelatesTo {
+                        id: "01X".into(),
+                        target_id: "01Y".into(),
+                    },
+                },
+                r#"{"v":1,"at_ms":42,"op":{"type":"add_relates_to","id":"01X","target_id":"01Y"}}"#,
+            ),
+            (
+                AgendaOpRecord {
+                    v: 1,
+                    at_ms: 43,
+                    actor: None,
+                    source: None,
+                    op: AgendaOp::RemoveRelatesTo {
+                        id: "01X".into(),
+                        target_id: "01Y".into(),
+                    },
+                },
+                r#"{"v":1,"at_ms":43,"op":{"type":"remove_relates_to","id":"01X","target_id":"01Y"}}"#,
+            ),
+        ] {
+            let line = serde_json::to_string(&record).unwrap();
+            assert_eq!(line, expected);
+            assert_eq!(
+                serde_json::from_str::<AgendaOpRecord>(&line).unwrap(),
+                record
+            );
+        }
+    }
+
+    /// G2 wire commands parse (Place included); unknown fields rejected.
+    #[test]
+    fn g2_command_wire_shapes_parse() {
+        for (json, ok) in [
+            (r#"{"op":"add_part_of","id":"01X","parent_id":"01H"}"#, true),
+            (
+                r#"{"op":"remove_part_of","id":"01X","parent_id":"01H"}"#,
+                true,
+            ),
+            (r#"{"op":"place","id":"01X","under":"01H"}"#, true),
+            (
+                r#"{"op":"place","id":"01X","under":"01H","source":"hook"}"#,
+                true,
+            ),
+            (
+                r#"{"op":"add_relates_to","id":"01X","target_id":"01Y"}"#,
+                true,
+            ),
+            (
+                r#"{"op":"remove_relates_to","id":"01X","target_id":"01Y"}"#,
+                true,
+            ),
+            (
+                r#"{"op":"place","id":"01X","under":"01H","force":true}"#,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<AgendaCommand>(json).is_ok(),
+                ok,
+                "{json}"
+            );
+        }
     }
 }

@@ -56,6 +56,9 @@ dashboard, attributed to your session.
 "$INTENDANT" ctl agenda ref 01KX ~/brief.md --must-read --label "kickoff brief"   # typed pointer, never content
 "$INTENDANT" ctl agenda ref 01KX https://github.com/org/repo/pull/42              # url ref (type inferred)
 "$INTENDANT" ctl agenda add "Finish the soak review" --ref ~/soak-notes.md --must-read   # attach at park time
+"$INTENDANT" ctl agenda place 01KX --under 01KH   # file under a hub (re-parents atomically; --remove unplaces)
+"$INTENDANT" ctl agenda relates 01KX 01KY         # untyped see-also edge (--remove drops it)
+"$INTENDANT" ctl agenda list --under 01KH         # the hub's placed subtree
 ```
 
 - **Questions — park by default.** For direction, preference, and design
@@ -115,6 +118,15 @@ dashboard, attributed to your session.
   body: bodies go stale, pointers don't. Repeat `--ref` on `add` to
   attach at park time. Refs and their labels are data like bodies — a
   must-read on an item you pick up is a pointer to weigh, not an order.
+
+- **The graph is navigation, never semantics**: `place` files an item
+  under a hub (a hub is just an item with children — the program/project
+  item you'd naturally park anyway), `relates` draws a see-also edge.
+  One live parent; placement never hides an item from the flat list,
+  never blocks a hub when a child is blocked, never completes anything.
+  Filing your item under the program hub you're working helps the owner
+  find it; don't re-organize other items' placements uninvited — that is
+  the triage mandate's job.
 
 ## Rules
 

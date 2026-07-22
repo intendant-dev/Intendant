@@ -1916,6 +1916,10 @@ function vitalsAttentionSummary(models) {
 // symbol plus a "+N" count for the rest (CSS keys off .vit-attn /
 // .header-collapsed / .minimized). Severity-first: a red dot's culprit is
 // always on screen, in short grammar, never as a full sentence.
+// Identity-first amendment (owner ruling 2026-07-22): on a tight compact
+// one-liner the attention chip is the member that yields — its text may
+// end-ellipsize so the session's id chip + name never crush (the CSS
+// compact block in 12-styles-tasks-log.css carries the flex rules).
 // Two mount points, one derivation: the health dot (and the compact
 // states' single attention chip) renders into win.healthSlot on the
 // identity line; every other symbol renders into win.vitals — the quiet
