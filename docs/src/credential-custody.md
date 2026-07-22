@@ -487,6 +487,11 @@ account id, and expiry (not the ID token). The parent directory is private,
 the file is 0600 on Unix / owner-private on Windows, replacement is atomic,
 and a process plus file lock serializes refresh with login/logout. Symlink,
 reparse-point, non-regular, oversized, and unknown-version stores fail closed.
+On macOS, the runtime Seatbelt profile also denies the entire login-custody
+`auth/` subtree even though ordinary runtime reads remain open. Linux's broad
+Landlock read grant and Windows' same-user process boundary cannot express the
+same read subtraction; prefer a custody lease there when the model-driven
+runtime must not be able to read standing on-box provider authority.
 The OAuth issuer and token endpoints are fixed reviewed constants rather than
 environment overrides. `logout` attempts provider revocation but removes local
 authority even when that network call fails. This is a deliberate durable

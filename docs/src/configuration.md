@@ -452,8 +452,9 @@ closed. One controller-edge caveat remains: if startup cannot encode the
 write-grant environment, it currently logs the error, removes the sandbox
 variable, and continues; a Windows ACE-stamping failure instead leaves the
 restricted runtime unable to write. Reads stay open except the credential
-carve-outs (macOS denies `~/.ssh`, `~/.gnupg`, the intendant config home, and
-the `.env` search path at the OS layer; on Linux, Landlock cannot express read
+carve-outs (macOS denies `~/.ssh`, `~/.gnupg`, the intendant config home, the
+`.env` search path, and the native ChatGPT `auth/` store at the OS layer; on
+Linux, Landlock cannot express read
 carve-outs under a broad read grant, so project/config `.env` files remain
 readable — credential custody is the tracked fix).
 

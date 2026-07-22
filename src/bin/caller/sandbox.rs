@@ -138,6 +138,7 @@ pub(crate) fn seatbelt_credential_deny_clause() -> Result<String, String> {
     deny_dirs.push(state_root.join("access-certs"));
     deny_dirs.push(state_root.join("leased-auth"));
     deny_dirs.push(state_root.join("claude-auth"));
+    deny_dirs.push(state_root.join("auth"));
     // Per-boot loopback admission tokens: reading one from a sandboxed
     // shell would re-open the loopback owner surface the port guard
     // closes (loopback_token.rs documents the envelope).
@@ -1319,7 +1320,7 @@ mod tests {
             "state root must never be granted wholesale: {:?}",
             config.write_paths
         );
-        for secret in ["access-certs", "leased-auth", "claude-auth"] {
+        for secret in ["access-certs", "leased-auth", "claude-auth", "auth"] {
             assert!(
                 !path_within_grants(&state_root.join(secret), &config.write_paths),
                 "{secret} must sit outside every write grant"
@@ -1335,7 +1336,7 @@ mod tests {
     fn credential_deny_clause_covers_the_state_root_secrets() {
         let clause = seatbelt_credential_deny_clause().unwrap();
         let state_root = canonicalize_for_profile(&crate::platform::intendant_home());
-        for secret in ["access-certs", "leased-auth", "claude-auth"] {
+        for secret in ["access-certs", "leased-auth", "claude-auth", "auth"] {
             assert!(
                 clause.contains(&format!(
                     "(subpath \"{}\")",
@@ -1345,6 +1346,36 @@ mod tests {
             );
         }
         assert!(clause.contains("custody-audit.jsonl"), "{clause}");
+    }
+
+    /// The native ChatGPT login is controller authority, not runtime input.
+    /// Exercise the live kernel profile so a path-list assertion cannot hide
+    /// a malformed or ineffectual Seatbelt rule.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn credential_deny_clause_blocks_native_chatgpt_store_via_kernel() {
+        let auth_dir = crate::platform::intendant_home().join("auth");
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        let secret = tempfile::NamedTempFile::new_in(&auth_dir).unwrap();
+        std::fs::write(secret.path(), "not-a-real-token").unwrap();
+        let profile = format!(
+            "(version 1)\n(allow default)\n{}",
+            seatbelt_credential_deny_clause().unwrap()
+        );
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("/usr/bin/head")
+            .arg("-c")
+            .arg("1")
+            .arg(secret.path())
+            .output()
+            .expect("sandbox-exec runs");
+        assert!(
+            !output.status.success(),
+            "native ChatGPT store remained readable: {} / {profile}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     /// The loopback guard rule is enforced by the real Seatbelt kernel:
