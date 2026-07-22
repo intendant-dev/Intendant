@@ -859,7 +859,23 @@ pub(crate) struct ChangeRecord {
     diff_available: bool,
     reason: Option<String>,
     diff: Option<String>,
+    /// Which lane produced the record: `None` for session-scoped sources
+    /// (the rewind baseline, the external agent diff log — the tab's
+    /// "session edits"), `Some(WORKING_TREE_ORIGIN)` for the git
+    /// working-tree lane. Serialized as `origin` only when set, so the
+    /// session-record shapes stay byte-identical.
+    origin: Option<&'static str>,
 }
+
+/// `origin` marker for records the git working-tree lane produced.
+pub(crate) const WORKING_TREE_ORIGIN: &str = "working_tree";
+
+/// Ceiling on working-tree records in one list response. The summary's
+/// `total` still states the full dirty count (the chip's number); the
+/// cap only bounds the per-file rows (and their per-file stat work) so a
+/// pathological checkout (thousands of untracked files) cannot balloon
+/// the response. `truncated` says the cap actually cut entries.
+pub(crate) const WORKING_TREE_LIST_CAP: usize = 200;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ChangesRequestTarget {
@@ -868,12 +884,18 @@ pub(crate) struct ChangesRequestTarget {
     include_project_external_logs: bool,
 }
 
+/// Registry-less request entry — the head-lane shape with no session
+/// targeting and no live locus (the working-tree lane then rides the
+/// given project root). Production goes through
+/// [`handle_changes_request_for_home`]; this remains the direct-lane
+/// contract's test seam.
+#[cfg(test)]
 pub(crate) fn handle_changes_request(
     request_line: &str,
     snapshot_dir: Option<&Path>,
     project_root: Option<&Path>,
 ) -> (&'static str, String) {
-    handle_changes_request_inner(request_line, snapshot_dir, project_root, false)
+    handle_changes_request_inner(request_line, snapshot_dir, project_root, false, None)
 }
 
 pub(crate) fn handle_changes_request_for_home(
@@ -881,19 +903,47 @@ pub(crate) fn handle_changes_request_for_home(
     snapshot_dir: Option<&Path>,
     project_root: Option<&Path>,
     home: &Path,
+    git_targets: Option<&crate::session_vitals::GitVitalsTargets>,
 ) -> (&'static str, String) {
+    // The working-tree lane's root: the target session's EFFECTIVE
+    // git-vitals probe target — the checkout the dirty chip is counting,
+    // activity locus included. A session that entered a worktree by
+    // absolute path has a locus differing from its registered root; the
+    // chip counts the locus, so the tab must list the locus (resolving
+    // the on-disk row root here rendered the owner-visible "5 dirty" /
+    // "No file changes yet" dead end). `None` — no registry published
+    // (tests), or none of the request's ids registered — falls back to
+    // the target row's root below.
+    let locus_root = git_targets.and_then(|targets| {
+        changes_request_target_id_candidates(request_line)
+            .into_iter()
+            .find_map(|id| targets.effective_for(&id))
+    });
     if let Some(target) = changes_request_target_from_home(request_line, home) {
         if should_use_live_changes_for_target(request_line, &target, snapshot_dir, project_root) {
-            return handle_changes_request(request_line, snapshot_dir, project_root);
+            return handle_changes_request_inner(
+                request_line,
+                snapshot_dir,
+                project_root,
+                false,
+                locus_root.as_deref(),
+            );
         }
         return handle_changes_request_inner(
             request_line,
             Some(&target.snapshot_dir),
             Some(&target.project_root),
             target.include_project_external_logs,
+            locus_root.as_deref(),
         );
     }
-    handle_changes_request(request_line, snapshot_dir, project_root)
+    handle_changes_request_inner(
+        request_line,
+        snapshot_dir,
+        project_root,
+        false,
+        locus_root.as_deref(),
+    )
 }
 
 pub(crate) fn handle_changes_request_inner(
@@ -901,6 +951,7 @@ pub(crate) fn handle_changes_request_inner(
     snapshot_dir: Option<&Path>,
     project_root: Option<&Path>,
     include_project_external_logs: bool,
+    git_root: Option<&Path>,
 ) -> (&'static str, String) {
     let (snapshot_dir, project_root) = match (snapshot_dir, project_root) {
         (Some(s), Some(p)) => (s, p),
@@ -911,6 +962,10 @@ pub(crate) fn handle_changes_request_inner(
             );
         }
     };
+    // Working-tree lane root: the session's live probe target when the
+    // registry knows one, else the resolved project root (same checkout
+    // the chip probes for registry-less targets).
+    let git_root = git_root.unwrap_or(project_root);
 
     let baseline_dir = snapshot_dir.join("baseline");
     // Extract the request target from `GET <target> HTTP/1.1`, then trim the
@@ -921,28 +976,15 @@ pub(crate) fn handle_changes_request_inner(
         let records =
             load_external_change_records(snapshot_dir, project_root, !file_path.is_empty(), true);
         if file_path.is_empty() {
-            let mut changes: Vec<_> = records.iter().map(change_record_summary_json).collect();
-            if changes.is_empty() {
-                // No session-scoped record source (native sessions have
-                // no external diff log, and this target never ran a
-                // watcher): answer from the working tree itself — the
-                // same git state the vitals dirty chip counted.
-                changes = git_fallback_change_records(project_root)
-                    .iter()
-                    .map(change_record_summary_json)
-                    .collect();
-            }
-            return (
-                "200 OK",
-                serde_json::to_string(&changes).unwrap_or_else(|_| "[]".to_string()),
-            );
+            let changes: Vec<_> = records.iter().map(change_record_summary_json).collect();
+            return ("200 OK", changes_list_body(changes, Some(git_root)));
         }
 
         let decoded = url_path_decode(file_path);
         if let Some(record) = records.into_iter().find(|record| record.path == decoded) {
             return ("200 OK", change_record_detail_json(&record).to_string());
         }
-        if let Some(record) = git_fallback_change_record_detail(project_root, &decoded) {
+        if let Some(record) = git_fallback_change_record_detail(git_root, &decoded) {
             return ("200 OK", change_record_detail_json(&record).to_string());
         }
         return (
@@ -960,6 +1002,7 @@ pub(crate) fn handle_changes_request_inner(
                 &baseline_dir,
                 project_root,
                 include_project_external_logs,
+                Some(git_root),
             ),
         )
     } else {
@@ -970,6 +1013,7 @@ pub(crate) fn handle_changes_request_inner(
             &baseline_dir,
             project_root,
             include_project_external_logs,
+            git_root,
         )
     }
 }
@@ -1027,6 +1071,25 @@ pub(crate) fn changes_request_target_id(request_line: &str) -> Option<String> {
     .find_map(|key| query_param(request_line, key))
     .map(|value| value.trim().to_string())
     .filter(|value| !value.is_empty())
+}
+
+/// EVERY session-id spelling the request carries, in the same key order
+/// as [`changes_request_target_id`]. The git-vitals registry keys on
+/// whichever member of the identity group the launch/resume lane
+/// registered (wrapper id at launch, backend-native on some resumes), so
+/// the locus lookup tries each spelling instead of only the first.
+pub(crate) fn changes_request_target_id_candidates(request_line: &str) -> Vec<String> {
+    [
+        "session_id",
+        "target_session_id",
+        "backend_session_id",
+        "intendant_session_id",
+    ]
+    .into_iter()
+    .filter_map(|key| query_param(request_line, key))
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+    .collect()
 }
 
 pub(crate) fn session_row_matches_changes_target(
@@ -1133,15 +1196,20 @@ pub(crate) fn best_changes_request_target(
 pub(crate) fn changes_request_target_score(target: &ChangesRequestTarget) -> usize {
     let baseline_dir = target.snapshot_dir.join("baseline");
     if baseline_dir.exists() {
+        // Session-edit evidence only: the working-tree lane is skipped
+        // (`working_tree_root: None`) — every candidate for one session
+        // shares the checkout's dirt, so counting it would inflate all
+        // scores equally at a git-subprocess cost per candidate, and a
+        // candidate with real session records must outrank one whose
+        // root merely happens to be dirty.
         let body = handle_changes_list(
             &target.snapshot_dir,
             &baseline_dir,
             &target.project_root,
             target.include_project_external_logs,
+            None,
         );
-        let count = serde_json::from_str::<Vec<serde_json::Value>>(&body)
-            .map(|items| items.len())
-            .unwrap_or(0);
+        let count = changes_list_files(&body).len();
         if count > 0 {
             return 2_000 + count;
         }
@@ -1448,6 +1516,7 @@ pub(crate) fn load_external_change_records(
                     diff_available: true,
                     reason,
                     diff: include_diff.then_some(block),
+                    origin: None,
                 },
             );
         }
@@ -1458,40 +1527,129 @@ pub(crate) fn load_external_change_records(
     records
 }
 
-/// Working-tree (git) fallback for the Changes surfaces. The vitals
-/// dirty chip counts `git status` entries for a session's checkout and
-/// its action navigates to the Changes tab — so when the tab's
-/// session-scoped sources (the rewind baseline, the external agent diff
-/// log) have no records while git says the checkout is dirty, the tab
-/// must not contradict the chip with an empty pane. These records derive
-/// from the SAME status invocation and parse the chip's count derives
-/// from (`session_vitals::git_working_tree_status`), so the two surfaces
+/// Working-tree (git) lane for the Changes surfaces. The vitals dirty
+/// chip counts `git status` entries for a session's checkout and its
+/// action navigates to the Changes tab — so the tab lists that same
+/// dirty set alongside the session-scoped records (the rewind baseline,
+/// the external agent diff log), instead of contradicting the chip with
+/// an empty or partial pane. These records derive from the SAME status
+/// invocation and parse the chip's count derives from
+/// (`session_vitals::git_working_tree_status`), so the two surfaces
 /// state the same file set by construction.
+///
+/// `session_paths` are the rel-path keys already served as session
+/// records: those rows stay session-origin (the session's own story for
+/// the file), and the summary's `listed` honestly undercounts `total`
+/// by the overlap. Records are capped at [`WORKING_TREE_LIST_CAP`]
+/// BEFORE the per-file stat work so a pathological checkout stays
+/// cheap; `total` always states the full dirty count (the chip's
+/// number).
 ///
 /// Line stats for tracked entries come from one `git diff HEAD
 /// --numstat` pass (`--no-renames` so every path keys exactly);
 /// untracked files synthesize created-file stats from their content.
-fn git_fallback_change_records(project_root: &Path) -> Vec<ChangeRecord> {
+///
+/// `None` when `git_root` is not inside a git checkout or git itself
+/// fails — the response then carries no working-tree section, exactly
+/// like the chip's failed probe.
+fn working_tree_change_list(
+    git_root: &Path,
+    session_paths: &HashSet<String>,
+) -> Option<(Vec<ChangeRecord>, serde_json::Value)> {
     // Status paths are toplevel-relative whatever the invocation cwd, so
     // every filesystem join and `--` pathspec below must use the checkout
     // toplevel — the same resolution the vitals prober keys its probes by
     // (a project root that is a subdirectory of a checkout probes, and
     // now lists, that checkout).
-    let Some(toplevel) = git_checkout_toplevel(project_root) else {
-        return Vec::new();
-    };
-    let Some(facts) = crate::session_vitals::git_working_tree_status(&toplevel) else {
-        return Vec::new();
-    };
-    if facts.entries.is_empty() {
-        return Vec::new();
-    }
-    let numstat = git_diff_head_numstat(&toplevel);
-    facts
+    let toplevel = git_checkout_toplevel(git_root)?;
+    let facts = crate::session_vitals::git_working_tree_status(&toplevel)?;
+    let total = facts.dirty_files();
+    let outside_session: Vec<&crate::session_vitals::GitStatusEntry> = facts
         .entries
         .iter()
-        .map(|entry| git_status_change_record(&toplevel, entry, numstat.get(&entry.path)))
-        .collect()
+        .filter(|entry| !session_paths.contains(&entry.path))
+        .collect();
+    let truncated = outside_session.len() > WORKING_TREE_LIST_CAP;
+    let kept = &outside_session[..outside_session.len().min(WORKING_TREE_LIST_CAP)];
+    let records: Vec<ChangeRecord> = if kept.is_empty() {
+        Vec::new()
+    } else {
+        let numstat = git_diff_head_numstat(&toplevel);
+        kept.iter()
+            .map(|&entry| {
+                let mut record =
+                    git_status_change_record(&toplevel, entry, numstat.get(&entry.path));
+                record.origin = Some(WORKING_TREE_ORIGIN);
+                record
+            })
+            .collect()
+    };
+    let summary = serde_json::json!({
+        "checkout": toplevel
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        "branch": facts.branch,
+        "total": total,
+        "listed": records.len(),
+        "truncated": truncated,
+    });
+    Some((records, summary))
+}
+
+/// Compose one changes-list response body: the session-scoped records
+/// plus — when `working_tree_root` is given — the git working-tree lane
+/// for that checkout. The body is the envelope
+/// `{"files": [...], "working_tree": {...}?}`; `working_tree` is present
+/// exactly when the root probes as a git checkout (a CLEAN checkout
+/// reports `total: 0` so the tab can affirm clean, matching the chip's
+/// quiet state). `None` root skips the git lane entirely — the
+/// candidate-scoring path, which ranks session-edit evidence only.
+fn changes_list_body(
+    session_records: Vec<serde_json::Value>,
+    working_tree_root: Option<&Path>,
+) -> String {
+    let session_paths: HashSet<String> = session_records
+        .iter()
+        .filter_map(|value| {
+            value
+                .get("path")
+                .and_then(|path| path.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    let mut files = session_records;
+    let mut working_tree = None;
+    if let Some(root) = working_tree_root {
+        if let Some((records, summary)) = working_tree_change_list(root, &session_paths) {
+            files.extend(records.iter().map(change_record_summary_json));
+            working_tree = Some(summary);
+        }
+    }
+    let mut body = serde_json::json!({ "files": files });
+    if let Some(summary) = working_tree {
+        body["working_tree"] = summary;
+    }
+    body.to_string()
+}
+
+/// The record rows of one changes-list body — the envelope's `files`
+/// (bare-array bodies, the pre-envelope shape, pass through for
+/// robustness). Internal readers (candidate scoring, tests) use this so
+/// none of them re-encodes the envelope's layout.
+pub(crate) fn changes_list_files(body: &str) -> Vec<serde_json::Value> {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    match parsed {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(mut map) => match map.remove("files") {
+            Some(serde_json::Value::Array(items)) => items,
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
 }
 
 /// The checkout containing `root` (`rev-parse --show-toplevel`), the
@@ -1574,6 +1732,7 @@ fn git_status_change_record(
             diff_available: !binary,
             reason: binary.then(|| "binary file (no textual diff)".to_string()),
             diff: None,
+            origin: None,
         };
     }
     if entry.path.ends_with('/') {
@@ -1595,6 +1754,7 @@ fn git_status_change_record(
             diff_available: true,
             reason: None,
             diff: None,
+            origin: None,
         },
         Ok(crate::file_watcher::InspectedFile::Unsupported(snapshot)) => {
             unsupported_change_record(&entry.path, kind, snapshot.reason)
@@ -1607,16 +1767,28 @@ fn git_status_change_record(
             diff_available: true,
             reason: None,
             diff: None,
+            origin: None,
         },
     }
 }
 
-/// Single-file detail for the git fallback lane. Only paths git itself
-/// listed as dirty are served (the status entry set is the lookup key,
-/// so no request-supplied path ever reaches the filesystem directly).
-/// Tracked entries diff against HEAD (staged + unstaged in one body);
-/// untracked files synthesize a created-file diff from content.
+/// Single-file detail for the git working-tree lane. Only paths git
+/// itself listed as dirty are served (the status entry set is the
+/// lookup key, so no request-supplied path ever reaches the filesystem
+/// directly). Tracked entries diff against HEAD (staged + unstaged in
+/// one body); untracked files synthesize a created-file diff from
+/// content.
 fn git_fallback_change_record_detail(project_root: &Path, decoded: &str) -> Option<ChangeRecord> {
+    git_fallback_change_record_detail_inner(project_root, decoded).map(|mut record| {
+        record.origin = Some(WORKING_TREE_ORIGIN);
+        record
+    })
+}
+
+fn git_fallback_change_record_detail_inner(
+    project_root: &Path,
+    decoded: &str,
+) -> Option<ChangeRecord> {
     let toplevel = git_checkout_toplevel(project_root)?;
     let facts = crate::session_vitals::git_working_tree_status(&toplevel)?;
     let entry = facts.entries.iter().find(|entry| entry.path == decoded)?;
@@ -1648,6 +1820,7 @@ fn git_fallback_change_record_detail(project_root: &Path, decoded: &str) -> Opti
             diff_available: true,
             reason: None,
             diff: Some(diff),
+            origin: None,
         });
     }
     // Untracked (invisible to `diff HEAD`): synthesize the created-file
@@ -1664,6 +1837,7 @@ fn git_fallback_change_record_detail(project_root: &Path, decoded: &str) -> Opti
                 diff_available: true,
                 reason: None,
                 diff: Some(diff),
+                origin: None,
             })
         }
         Ok(crate::file_watcher::InspectedFile::Unsupported(snapshot)) => Some(
@@ -1833,6 +2007,7 @@ pub(crate) fn unsupported_change_record(
         diff_available: false,
         reason: Some(reason),
         diff: None,
+        origin: None,
     }
 }
 
@@ -1868,6 +2043,7 @@ pub(crate) fn compute_change_record(
                 diff_available: true,
                 reason: None,
                 diff,
+                origin: None,
             })
         }
         (false, _, _, Some(ChangeFileState::Unsupported { reason, .. })) => Some(
@@ -1884,6 +2060,7 @@ pub(crate) fn compute_change_record(
                 diff_available: true,
                 reason: None,
                 diff,
+                origin: None,
             })
         }
         (true, false, _, None) => {
@@ -1908,6 +2085,7 @@ pub(crate) fn compute_change_record(
                 diff_available: true,
                 reason: None,
                 diff,
+                origin: None,
             })
         }
         (true, true, Some(base), Some(ChangeFileState::Unsupported { hash, reason })) => {
@@ -1936,18 +2114,22 @@ pub(crate) fn compute_change_record(
 }
 
 pub(crate) fn change_record_summary_json(record: &ChangeRecord) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "path": record.path.clone(),
         "kind": record.kind,
         "lines_added": record.lines_added,
         "lines_removed": record.lines_removed,
         "diff_available": record.diff_available,
         "reason": record.reason.clone(),
-    })
+    });
+    if let Some(origin) = record.origin {
+        value["origin"] = serde_json::Value::String(origin.to_string());
+    }
+    value
 }
 
 pub(crate) fn change_record_detail_json(record: &ChangeRecord) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "path": record.path.clone(),
         "kind": record.kind,
         "diff": record.diff.clone().unwrap_or_default(),
@@ -1955,10 +2137,19 @@ pub(crate) fn change_record_detail_json(record: &ChangeRecord) -> serde_json::Va
         "lines_removed": record.lines_removed,
         "diff_available": record.diff_available,
         "reason": record.reason.clone(),
-    })
+    });
+    if let Some(origin) = record.origin {
+        value["origin"] = serde_json::Value::String(origin.to_string());
+    }
+    value
 }
 
-/// List all files that have changed since the session baseline.
+/// List all files that have changed since the session baseline, plus —
+/// when `working_tree_root` is given — the checkout's uncommitted set
+/// (see [`changes_list_body`]): the vitals dirty chip counts git-status
+/// entries and links here, so uncommitted state the session-scoped
+/// sources don't cover (pre-daemon dirt captured by the baseline, other
+/// tools' edits) must still be listed instead of contradicting the chip.
 ///
 /// When the live watcher covers exactly this (project_root, snapshot_dir),
 /// the changed-key set comes from watcher state and only changed files are
@@ -1969,6 +2160,7 @@ pub(crate) fn handle_changes_list(
     baseline_dir: &Path,
     project_root: &Path,
     include_project_external_logs: bool,
+    working_tree_root: Option<&Path>,
 ) -> String {
     let mut changes =
         changes_list_summaries_via_live_watcher(snapshot_dir, baseline_dir, project_root)
@@ -1992,18 +2184,7 @@ pub(crate) fn handle_changes_list(
             changes.push(change_record_summary_json(&record));
         }
     }
-    if changes.is_empty() {
-        // The session-scoped sources are empty (nothing changed since the
-        // rewind baseline, no external diff log entries) — but the vitals
-        // dirty chip may still be pointing here for uncommitted state that
-        // predates the baseline. Fall back to the working tree so the two
-        // surfaces agree; a genuinely clean checkout stays empty.
-        changes = git_fallback_change_records(project_root)
-            .iter()
-            .map(change_record_summary_json)
-            .collect();
-    }
-    serde_json::to_string(&changes).unwrap_or_else(|_| "[]".to_string())
+    changes_list_body(changes, working_tree_root)
 }
 
 /// Legacy change-list body: read and hash every file under the project
@@ -2103,13 +2284,17 @@ fn changes_list_summaries_from_index(
     changes
 }
 
-/// Return a unified diff for a single file.
+/// Return a unified diff for a single file. `git_root` is the
+/// working-tree lane's checkout (the session's effective git-vitals
+/// target) — the list lane hands out its dirty paths, so the detail
+/// lane must resolve them against the same checkout.
 pub(crate) fn handle_changes_file_diff(
     file_path: &str,
     snapshot_dir: &Path,
     baseline_dir: &Path,
     project_root: &Path,
     include_project_external_logs: bool,
+    git_root: &Path,
 ) -> (&'static str, String) {
     let decoded = url_path_decode(file_path);
     // Reject path traversal.
@@ -2213,9 +2398,9 @@ pub(crate) fn handle_changes_file_diff(
             }
             // Not a session-scoped change: serve the working-tree diff if
             // git lists the file as dirty (the state the vitals chip
-            // counted) — the list lane's git fallback hands out exactly
-            // these paths.
-            if let Some(record) = git_fallback_change_record_detail(project_root, &decoded) {
+            // counted) — the list lane's working-tree section hands out
+            // exactly these paths, resolved against the same checkout.
+            if let Some(record) = git_fallback_change_record_detail(git_root, &decoded) {
                 return ("200 OK", change_record_detail_json(&record).to_string());
             }
             (
@@ -3093,15 +3278,23 @@ pub(crate) async fn handle_history_prune(
 /// (tunnel twin `api_session_current_changes`): the change list / one
 /// file's unified diff under the session json tail. The request line
 /// arrives transport-decoded — HTTP passes it verbatim, the tunnel
-/// synthesizes it from its path/query params.
+/// synthesizes it from its path/query params. The transport edge also
+/// resolves the daemon's published git-vitals registry, so the
+/// working-tree lane lists the checkout the target session's dirty chip
+/// is actually probing.
 pub(crate) fn session_current_changes_api_response(
     request_line: &str,
     snapshot_dir: Option<&Path>,
     project_root: Option<&Path>,
     home: &Path,
 ) -> ApiResponse {
-    let (status, body) =
-        handle_changes_request_for_home(request_line, snapshot_dir, project_root, home);
+    let (status, body) = handle_changes_request_for_home(
+        request_line,
+        snapshot_dir,
+        project_root,
+        home,
+        crate::session_vitals::published_git_vitals_targets(),
+    );
     session_json_response(status_line_code(status), body)
 }
 
@@ -5742,14 +5935,11 @@ mod tests {
             Some(snapshot.path()),
             Some(project.path()),
         );
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let files = changes_list_files(&body);
 
         assert_eq!(status, "200 OK");
-        assert!(
-            json.as_array().is_some(),
-            "list endpoint should return an array"
-        );
-        assert_eq!(json[0]["path"], "src/main.rs");
+        assert_eq!(files.len(), 1, "{body}");
+        assert_eq!(files[0]["path"], "src/main.rs");
     }
 
     #[test]
@@ -5766,14 +5956,14 @@ mod tests {
             Some(snapshot.path()),
             Some(project.path()),
         );
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let files = changes_list_files(&body);
 
         assert_eq!(status, "200 OK");
-        assert_eq!(json.as_array().unwrap().len(), 1);
-        assert_eq!(json[0]["path"], "src/new.rs");
-        assert_eq!(json[0]["kind"], "created");
-        assert_eq!(json[0]["lines_added"], 1);
-        assert_eq!(json[0]["diff_available"], true);
+        assert_eq!(files.len(), 1, "{body}");
+        assert_eq!(files[0]["path"], "src/new.rs");
+        assert_eq!(files[0]["kind"], "created");
+        assert_eq!(files[0]["lines_added"], 1);
+        assert_eq!(files[0]["diff_available"], true);
     }
 
     #[cfg(unix)]
@@ -5828,14 +6018,14 @@ mod tests {
             Some(&snapshot_dir),
             Some(project.path()),
         );
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let files = changes_list_files(&body);
 
         assert_eq!(status, "200 OK");
-        assert_eq!(json.as_array().unwrap().len(), 1);
-        assert_eq!(json[0]["path"], external_display.as_ref());
-        assert_eq!(json[0]["kind"], "external");
-        assert_eq!(json[0]["lines_added"], 2);
-        assert!(json[0]["reason"]
+        assert_eq!(files.len(), 1, "{body}");
+        assert_eq!(files[0]["path"], external_display.as_ref());
+        assert_eq!(files[0]["kind"], "external");
+        assert_eq!(files[0]["lines_added"], 2);
+        assert!(files[0]["reason"]
             .as_str()
             .unwrap()
             .contains("outside tracked project root"));
@@ -5904,19 +6094,18 @@ mod tests {
             Some(default_snapshot.path()),
             Some(default_project.path()),
             home.path(),
+            None,
         );
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let paths: Vec<_> = json
-            .as_array()
-            .unwrap()
+        let files = changes_list_files(&body);
+        let paths: Vec<_> = files
             .iter()
             .filter_map(|item| item.get("path").and_then(|path| path.as_str()))
             .collect();
 
         assert_eq!(status, "200 OK");
         assert_eq!(paths, vec!["created.txt", "tracked.txt"]);
-        assert_eq!(json[0]["kind"], "created");
-        assert_eq!(json[1]["kind"], "modified");
+        assert_eq!(files[0]["kind"], "created");
+        assert_eq!(files[1]["kind"], "modified");
 
         let request = format!(
             "GET /api/session/current/changes/created.txt?session_id={backend_id} HTTP/1.1"
@@ -5926,6 +6115,7 @@ mod tests {
             Some(default_snapshot.path()),
             Some(default_project.path()),
             home.path(),
+            None,
         );
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
 
@@ -5976,13 +6166,14 @@ mod tests {
             Some(live_snapshot.path()),
             Some(project.path()),
             home.path(),
+            None,
         );
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let files = changes_list_files(&body);
 
         assert_eq!(status, "200 OK");
-        assert_eq!(json.as_array().unwrap().len(), 1);
-        assert_eq!(json[0]["path"], "created.txt");
-        assert_eq!(json[0]["kind"], "created");
+        assert_eq!(files.len(), 1, "{body}");
+        assert_eq!(files[0]["path"], "created.txt");
+        assert_eq!(files[0]["kind"], "created");
 
         let request = format!(
             "GET /api/session/current/changes/created.txt?session_id={backend_id} HTTP/1.1"
@@ -5992,6 +6183,7 @@ mod tests {
             Some(live_snapshot.path()),
             Some(project.path()),
             home.path(),
+            None,
         );
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
 
@@ -6094,31 +6286,38 @@ mod tests {
             Some(live_snapshot.path()),
             Some(live_project.path()),
             home.path(),
+            None,
         );
         assert_eq!(status, "200 OK");
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let listed: Vec<(&str, &str)> = json
-            .as_array()
-            .unwrap()
+        let files = changes_list_files(&body);
+        let listed: Vec<(&str, &str, &str)> = files
             .iter()
             .map(|item| {
                 (
                     item["path"].as_str().unwrap(),
                     item["kind"].as_str().unwrap(),
+                    item["origin"].as_str().unwrap_or(""),
                 )
             })
             .collect();
         assert_eq!(
             listed,
-            vec![("a.txt", "modified"), ("new.txt", "created")],
+            vec![
+                ("a.txt", "modified", "working_tree"),
+                ("new.txt", "created", "working_tree"),
+            ],
             "the session's worktree dirt must be listed: {body}"
         );
 
         // Derive-don't-mirror pin: the tab's row count IS the vitals dirty
-        // count — both surfaces come from one status parse of one root.
+        // count — both surfaces come from one status parse of one root —
+        // and the envelope's summary states the same total.
         let facts = crate::session_vitals::git_working_tree_status(&wt)
             .expect("worktree probes like the vitals chip");
-        assert_eq!(json.as_array().unwrap().len() as u32, facts.dirty_files());
+        assert_eq!(files.len() as u32, facts.dirty_files());
+        let envelope: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(envelope["working_tree"]["total"], facts.dirty_files());
+        assert_eq!(envelope["working_tree"]["truncated"], false);
 
         // Single-file diffs: the tracked change diffs against HEAD, the
         // untracked file synthesizes a created-file diff.
@@ -6129,6 +6328,7 @@ mod tests {
             Some(live_snapshot.path()),
             Some(live_project.path()),
             home.path(),
+            None,
         );
         assert_eq!(status, "200 OK");
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -6144,6 +6344,7 @@ mod tests {
             Some(live_snapshot.path()),
             Some(live_project.path()),
             home.path(),
+            None,
         );
         assert_eq!(status, "200 OK");
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -6159,6 +6360,7 @@ mod tests {
             Some(live_snapshot.path()),
             Some(live_project.path()),
             home.path(),
+            None,
         );
         assert_eq!(status, "404 Not Found");
 
@@ -6172,9 +6374,15 @@ mod tests {
             Some(live_snapshot.path()),
             Some(live_project.path()),
             home.path(),
+            None,
         );
         assert_eq!(status, "200 OK");
-        assert_eq!(body, "[]");
+        assert_eq!(changes_list_files(&body).len(), 0, "{body}");
+        let envelope: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            envelope["working_tree"]["total"], 0,
+            "the summary affirms clean — the chip's quiet state: {body}"
+        );
     }
 
     /// The live head lane's empty-list fallback: a baseline that already
@@ -6202,10 +6410,11 @@ mod tests {
             Some(repo.path()),
         );
         assert_eq!(status, "200 OK");
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json.as_array().unwrap().len(), 1, "{body}");
-        assert_eq!(json[0]["path"], "a.txt");
-        assert_eq!(json[0]["kind"], "modified");
+        let files = changes_list_files(&body);
+        assert_eq!(files.len(), 1, "{body}");
+        assert_eq!(files[0]["path"], "a.txt");
+        assert_eq!(files[0]["kind"], "modified");
+        assert_eq!(files[0]["origin"], "working_tree");
 
         let (status, body) = handle_changes_request(
             "GET /api/session/current/changes/a.txt HTTP/1.1",
@@ -6217,8 +6426,10 @@ mod tests {
         let diff = json["diff"].as_str().unwrap();
         assert!(diff.contains("-one") && diff.contains("+two"), "{diff}");
 
-        // Session-scoped changes take precedence: once the watcher lane
-        // has a record, the list is the session's own change set again.
+        // Both realms coexist: the watcher lane's record stays a session
+        // edit (it owns its path — no working-tree duplicate), while the
+        // pre-daemon dirt the baseline swallowed is still listed from the
+        // working tree. The summary's total counts the whole dirty set.
         std::fs::write(repo.path().join("b.txt"), "b\n").unwrap();
         std::fs::write(baseline.join("b.txt"), "old-b\n").unwrap();
         let (_, body) = handle_changes_request(
@@ -6226,14 +6437,222 @@ mod tests {
             Some(snapshot.path()),
             Some(repo.path()),
         );
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let listed: Vec<&str> = json
-            .as_array()
-            .unwrap()
+        let files = changes_list_files(&body);
+        let listed: Vec<(&str, &str)> = files
             .iter()
-            .map(|item| item["path"].as_str().unwrap())
+            .map(|item| {
+                (
+                    item["path"].as_str().unwrap(),
+                    item["origin"].as_str().unwrap_or("session"),
+                )
+            })
             .collect();
-        assert_eq!(listed, vec!["b.txt"], "{body}");
+        assert_eq!(
+            listed,
+            vec![("b.txt", "session"), ("a.txt", "working_tree")],
+            "{body}"
+        );
+        let envelope: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // a.txt (tracked, modified) + b.txt (untracked) are both dirty;
+        // only a.txt is listed under the working tree (b.txt is the
+        // session's own row).
+        assert_eq!(envelope["working_tree"]["total"], 2);
+        assert_eq!(envelope["working_tree"]["listed"], 1);
+    }
+
+    /// OWNER-REPORTED regression (2026-07-22): an external session whose
+    /// registered root was the repo root but which worked inside a linked
+    /// worktree showed "5 dirty" — the vitals prober follows write
+    /// activity/cwd echoes into the worktree checkout — while "View the
+    /// changes" rendered "No file changes yet": the Changes lane resolved
+    /// the on-disk row root (clean) instead of the checkout the chip was
+    /// counting. The lane must resolve its working-tree list through the
+    /// SAME live registry target the prober probes.
+    #[test]
+    fn changes_list_rides_the_sessions_git_vitals_locus() {
+        let home = tempfile::TempDir::new().unwrap();
+        let root = tempfile::TempDir::new().unwrap();
+        let base = root.path().join("base");
+        let wt = root.path().join("wt");
+        std::fs::create_dir_all(&base).unwrap();
+        test_git(&base, &["init", "-q", "-b", "main"]);
+        std::fs::write(base.join("a.txt"), "one\n").unwrap();
+        test_git(&base, &["add", "."]);
+        test_git(&base, &["commit", "-qm", "base"]);
+        test_git(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "locus-branch",
+            ],
+        );
+        // Dirty the WORKTREE only; the registered root stays clean, so a
+        // row-root resolution yields an empty list and fails the test.
+        std::fs::write(wt.join("a.txt"), "two\n").unwrap();
+        std::fs::write(wt.join("fresh.txt"), "fresh\n").unwrap();
+
+        // Session row: registered at the BASE root, no worktree meta —
+        // the shape of a session that entered the worktree by absolute
+        // path without registering it.
+        let session_id = "locus-session";
+        let session_dir = home.path().join(".intendant/logs").join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": session_id,
+                "created_at": "2026-07-22T10:00:00",
+                "project_root": base.to_string_lossy(),
+                "task": "locus session",
+                "status": "idle",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("session.jsonl"),
+            serde_json::json!({"event": "info", "message": "Session started"}).to_string(),
+        )
+        .unwrap();
+
+        // The live registry: registered at base, activity locus followed
+        // into the worktree — exactly what the dirty chip probes.
+        let targets = crate::session_vitals::GitVitalsTargets::default();
+        targets.register(session_id, base.clone());
+        targets.seed_locus(session_id, &wt);
+
+        let live_snapshot = tempfile::TempDir::new().unwrap();
+        let live_project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(live_snapshot.path().join("baseline")).unwrap();
+        let request = format!("GET /api/session/current/changes?session_id={session_id} HTTP/1.1");
+
+        // WITHOUT the registry the lane resolves the row root — clean —
+        // and the list is empty: the exact owner-visible dead end.
+        let (_, body) = handle_changes_request_for_home(
+            &request,
+            Some(live_snapshot.path()),
+            Some(live_project.path()),
+            home.path(),
+            None,
+        );
+        assert_eq!(
+            changes_list_files(&body).len(),
+            0,
+            "row root is clean: {body}"
+        );
+
+        // WITH the registry the list states the locus checkout's dirt —
+        // the chip's exact file set, and the summary names the checkout.
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(live_snapshot.path()),
+            Some(live_project.path()),
+            home.path(),
+            Some(&targets),
+        );
+        assert_eq!(status, "200 OK");
+        let files = changes_list_files(&body);
+        let listed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|item| {
+                (
+                    item["path"].as_str().unwrap(),
+                    item["origin"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            vec![("a.txt", "working_tree"), ("fresh.txt", "working_tree")],
+            "{body}"
+        );
+        let facts = crate::session_vitals::git_working_tree_status(&wt)
+            .expect("worktree probes like the vitals chip");
+        let envelope: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(envelope["working_tree"]["total"], facts.dirty_files());
+        assert_eq!(
+            envelope["working_tree"]["checkout"],
+            wt.file_name().unwrap().to_string_lossy().as_ref()
+        );
+
+        // The single-file detail rides the same checkout.
+        let request =
+            format!("GET /api/session/current/changes/a.txt?session_id={session_id} HTTP/1.1");
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(live_snapshot.path()),
+            Some(live_project.path()),
+            home.path(),
+            Some(&targets),
+        );
+        assert_eq!(status, "200 OK");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let diff = json["diff"].as_str().unwrap();
+        assert!(diff.contains("-one") && diff.contains("+two"), "{diff}");
+        assert_eq!(json["origin"], "working_tree");
+    }
+
+    /// The working-tree list is bounded: a checkout with more dirty
+    /// files than the cap lists the first cap entries and says so, while
+    /// `total` still states the chip's full count.
+    #[test]
+    fn working_tree_list_caps_and_reports_truncation() {
+        let repo = tempfile::TempDir::new().unwrap();
+        test_git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("seed.txt"), "seed\n").unwrap();
+        test_git(repo.path(), &["add", "."]);
+        test_git(repo.path(), &["commit", "-qm", "base"]);
+        for index in 0..(WORKING_TREE_LIST_CAP + 5) {
+            std::fs::write(repo.path().join(format!("untracked-{index:04}.txt")), "x\n").unwrap();
+        }
+
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(repo.path()),
+        );
+        assert_eq!(status, "200 OK");
+        let files = changes_list_files(&body);
+        assert_eq!(files.len(), WORKING_TREE_LIST_CAP);
+        let envelope: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            envelope["working_tree"]["total"],
+            (WORKING_TREE_LIST_CAP + 5) as u64
+        );
+        assert_eq!(envelope["working_tree"]["listed"], WORKING_TREE_LIST_CAP);
+        assert_eq!(envelope["working_tree"]["truncated"], true);
+    }
+
+    /// Internal readers parse both the envelope and the pre-envelope
+    /// bare-array body (robustness across mixed-build peers).
+    #[test]
+    fn changes_list_files_reads_envelope_and_legacy_array() {
+        let envelope = r#"{"files":[{"path":"a"}],"working_tree":{"total":1}}"#;
+        assert_eq!(changes_list_files(envelope).len(), 1);
+        assert_eq!(
+            changes_list_files(r#"[{"path":"a"},{"path":"b"}]"#).len(),
+            2
+        );
+        assert_eq!(changes_list_files("not json").len(), 0);
+        assert_eq!(changes_list_files(r#"{"error":"x"}"#).len(), 0);
+    }
+
+    #[test]
+    fn changes_request_target_id_candidates_lists_every_spelling() {
+        let request = "GET /api/session/current/changes?session_id=wrapper&backend_session_id=native&intendant_session_id=wrapper2 HTTP/1.1";
+        assert_eq!(
+            changes_request_target_id_candidates(request),
+            vec!["wrapper", "native", "wrapper2"]
+        );
+        assert!(
+            changes_request_target_id_candidates("GET /api/session/current/changes HTTP/1.1")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -6316,11 +6735,10 @@ mod tests {
             Some(default_snapshot.path()),
             Some(default_project.path()),
             home.path(),
+            None,
         );
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let paths: Vec<_> = json
-            .as_array()
-            .unwrap()
+        let files = changes_list_files(&body);
+        let paths: Vec<_> = files
             .iter()
             .filter_map(|item| item.get("path").and_then(|path| path.as_str()))
             .collect();
@@ -6341,14 +6759,14 @@ mod tests {
             Some(snapshot.path()),
             Some(project.path()),
         );
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let files = changes_list_files(&body);
 
         assert_eq!(status, "200 OK");
-        assert_eq!(json.as_array().unwrap().len(), 1);
-        assert_eq!(json[0]["path"], "empty.txt");
-        assert_eq!(json[0]["kind"], "created");
-        assert_eq!(json[0]["lines_added"], 0);
-        assert_eq!(json[0]["lines_removed"], 0);
+        assert_eq!(files.len(), 1, "{body}");
+        assert_eq!(files[0]["path"], "empty.txt");
+        assert_eq!(files[0]["kind"], "created");
+        assert_eq!(files[0]["lines_added"], 0);
+        assert_eq!(files[0]["lines_removed"], 0);
     }
 
     #[test]
@@ -6365,12 +6783,12 @@ mod tests {
             Some(snapshot.path()),
             Some(project.path()),
         );
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let files = changes_list_files(&body);
 
         assert_eq!(status, "200 OK");
-        assert_eq!(json[0]["path"], "empty.txt");
-        assert_eq!(json[0]["kind"], "modified");
-        assert_eq!(json[0]["lines_added"], 1);
+        assert_eq!(files[0]["path"], "empty.txt");
+        assert_eq!(files[0]["kind"], "modified");
+        assert_eq!(files[0]["lines_added"], 1);
     }
 
     #[test]
@@ -6384,10 +6802,10 @@ mod tests {
             Some(snapshot.path()),
             Some(project.path()),
         );
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let files = changes_list_files(&body);
 
         assert_eq!(status, "200 OK");
-        assert_eq!(json.as_array().unwrap().len(), 0);
+        assert_eq!(files.len(), 0, "{body}");
     }
 
     #[test]
@@ -6404,10 +6822,10 @@ mod tests {
             Some(snapshot.path()),
             Some(project.path()),
         );
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let files = changes_list_files(&body);
 
         assert_eq!(status, "200 OK");
-        assert_eq!(json.as_array().unwrap().len(), 0);
+        assert_eq!(files.len(), 0, "{body}");
     }
 
     #[test]
@@ -6426,13 +6844,13 @@ mod tests {
             Some(snapshot.path()),
             Some(project.path()),
         );
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let files = changes_list_files(&body);
 
         assert_eq!(status, "200 OK");
-        assert_eq!(json[0]["path"], "src/main.rs");
-        assert_eq!(json[0]["kind"], "modified");
-        assert_eq!(json[0]["diff_available"], false);
-        assert_eq!(json[0]["reason"], "binary file");
+        assert_eq!(files[0]["path"], "src/main.rs");
+        assert_eq!(files[0]["kind"], "modified");
+        assert_eq!(files[0]["diff_available"], false);
+        assert_eq!(files[0]["reason"], "binary file");
 
         let (status, body) = handle_changes_request(
             "GET /api/session/current/changes/src/main.rs HTTP/1.1",

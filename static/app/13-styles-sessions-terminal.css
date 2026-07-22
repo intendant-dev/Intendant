@@ -2005,6 +2005,52 @@ button.wt-session-chip:focus-visible {
   padding: 6px;
   background: var(--mantle);
 }
+/* Two-realm list: labeled sections split the session's own edits from
+   the checkout's uncommitted (working-tree) files. */
+.changes-section-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 8px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--overlay0);
+}
+.changes-section-label + .changes-section-label,
+.changes-file-entry + .changes-section-label,
+.changes-empty-note + .changes-section-label {
+  margin-top: 8px;
+  border-top: 1px solid var(--surface1);
+}
+.changes-section-count {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--subtext0);
+  background: var(--surface0);
+  border-radius: 8px;
+  padding: 0 6px;
+}
+.changes-section-checkout {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--overlay0);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.changes-empty-note {
+  padding: 4px 8px 8px;
+  font-size: 11px;
+  color: var(--overlay0);
+}
+.changes-file-entry.working-tree .changes-file-name { font-weight: 500; }
 .changes-file-entry {
   display: grid;
   grid-template-columns: 24px minmax(0, 1fr) auto;

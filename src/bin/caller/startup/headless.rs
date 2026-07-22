@@ -494,6 +494,12 @@ pub(crate) async fn run_headless_mode(
         None
     };
     let vitals_git_targets = vitals.as_ref().map(|(targets, _)| targets.clone());
+    // Publish for read-side lanes (the Changes tab's working-tree list) —
+    // mirrors daemon boot: the tab resolves a session's checkout through
+    // the same effective target the dirty chip probes.
+    if let Some(registry) = vitals_git_targets.as_ref() {
+        session_vitals::publish_git_vitals_targets(registry);
+    }
     // Restored sessions, mirroring daemon boot: with the dashboard on,
     // the store's idle session windows keep their git/health chips here
     // too, and their vitals hydrate from disk (this shape falls through

@@ -257,8 +257,14 @@ Five visible views (the first retains the internal `log` id for compatibility):
 - **Context** — the agent's current working context (what it is operating on).
 - **Managed** — operator console for managed-Codex context maintenance (see
   below).
-- **Changes** — file changes / diffs produced during the session (with its own
-  badge when new changes land).
+- **Changes** — file changes / diffs, in two labeled realms: the session's own
+  tracked edits (rewind baseline / external diff log) and **Uncommitted in
+  working tree** — the target session's checkout's git-dirty set (the same
+  status parse, and the same effective checkout, the vitals dirty chip counts,
+  activity locus included; capped at 200 rows with an honest truncation note).
+  The empty state only claims "no changes" when both realms are empty, and
+  affirms a clean working tree when that is known. Has its own badge when new
+  changes land.
 - **Control** — direct controls for steering the run.
 
 Session-window headers carry a **vitals chip** (the operator-statusline
@@ -1880,6 +1886,7 @@ response omits the header.
 | GET | `/api/agenda` | AgendaRead | own origin | none | Agenda ledger snapshot: items (oldest first) plus status counts |
 | POST | `/api/agenda/op` | AgendaWrite | own origin | ≤ 16 MiB | Apply one agenda command (add, ask, answer, patch, transitions, or scheduled-session propose/approve/revoke) |
 | GET | `/api/agenda/blobs/{item_id}/{blob_id}/raw` | AgendaRead | own origin | none | Fetch one parked-ask preview blob's raw bytes (attachment; MIME sniffing disabled) |
+| GET | `/api/agenda/items/{item_id}/refs/drift` | AgendaRead | own origin | none | Re-hash one item's file refs against their attach digests (expand-time drift check) |
 | POST | `/api/agenda/reminders/policy` | Settings | own origin | bounded | Merge-patch the agenda reminder policy (quiet hours, urgency, per-item overrides) |
 | GET | `/api/memory/search` | MemoryRead | own origin | none | Bounded Memory claim search (q, limit, candidates); results carry derived status |
 | GET | `/api/memory/claim` | MemoryRead | own origin | none | Read one Memory claim by id prefix (id); status derived at read time |
