@@ -171,6 +171,75 @@ fn subagent_meta_task_tool_use_id(meta_path: &Path, session_id: &str) -> Option<
         .map(str::to_string)
 }
 
+/// A store id safe to place in a path segment: the Claude Code ids this
+/// probe joins with (backend session uuids, subagent `task_id`s) are
+/// ASCII alphanumerics with `-`/`_`; anything else — separators, dots —
+/// is refused rather than probed, since both ids arrive from the wire.
+fn is_path_safe_store_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Durable spawn binding for one in-band task: the sidecar meta Claude
+/// Code writes at spawn (`agent-<task_id>.meta.json`, under the PARENT
+/// thread's own store dir) carries the spawning `toolUseId`. This is the
+/// correlation that survives supervisor/process rotation — a fresh
+/// reader can map a task terminal's stable `task_id` back to the child
+/// window even though the in-memory registration died with the previous
+/// process (`CcReader::task_spawn_resolver`). Direct probe, no store
+/// walk: `projects/<alias>/<backend_session_id>/subagents/` for each
+/// project alias (a relocated store can carry the parent under several
+/// aliases — S0b Q1 — and any copy serves).
+pub(crate) fn claude_task_spawn_binding(
+    home: &Path,
+    backend_session_id: &str,
+    task_id: &str,
+) -> Option<crate::external_agent::claude_code::CcTaskSpawnBinding> {
+    if !is_path_safe_store_id(backend_session_id) || !is_path_safe_store_id(task_id) {
+        return None;
+    }
+    let projects = home.join(".claude").join("projects");
+    for project in std::fs::read_dir(&projects).ok()?.flatten() {
+        let meta_path = project
+            .path()
+            .join(backend_session_id)
+            .join("subagents")
+            .join(format!("agent-{task_id}.meta.json"));
+        if std::fs::metadata(&meta_path)
+            .map(|m| !m.is_file() || m.len() > SUBAGENT_META_READ_LIMIT)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&meta_path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        let Some(tool_use_id) = meta
+            .get("toolUseId")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        return Some(crate::external_agent::claude_code::CcTaskSpawnBinding {
+            tool_use_id: tool_use_id.to_string(),
+            description: meta
+                .get("description")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        });
+    }
+    None
+}
+
 // ---------------------------------------------------------------------
 // Completed-terminal synthesis
 //
@@ -194,8 +263,12 @@ fn subagent_meta_task_tool_use_id(meta_path: &Path, session_id: &str) -> Option<
 /// event id, so signature dedupe never pairs them).
 pub(crate) const SUBAGENT_TERMINAL_KIND: &str = "subagent_terminal";
 
-const TASK_NOTIFICATION_OPEN: &str = "<task-notification>";
-const TASK_NOTIFICATION_CLOSE: &str = "</task-notification>";
+// The block grammar (`<task-notification>` markers + tag extraction) is
+// owned by the wire parser — `external_agent::claude_code` — and shared
+// here so the live lane and this hydration lane can never drift apart.
+use crate::external_agent::claude_code::{
+    task_notification_tag_text as xml_tag_text, TASK_NOTIFICATION_CLOSE, TASK_NOTIFICATION_OPEN,
+};
 
 /// One `<task-notification>` block's terminal facts as persisted in the
 /// parent transcript, stamped with the carrying record's timestamp.
@@ -311,15 +384,6 @@ fn task_notification_facts(text: &str, needle: &str) -> Option<(String, Option<S
     let status = xml_tag_text(block, "status")?;
     let summary = xml_tag_text(block, "summary");
     Some((status, summary))
-}
-
-fn xml_tag_text(block: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = block.find(&open)? + open.len();
-    let end = block[start..].find(&close)? + start;
-    let text = block[start..end].trim();
-    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// One-line, bounded summary — the same shaping the live emit applies
@@ -520,6 +584,51 @@ mod tests {
             find_claude_task_subagent_transcript(home.path(), &minted),
             Some(transcript)
         );
+    }
+
+    #[test]
+    fn spawn_binding_resolves_task_id_to_spawning_tool_use() {
+        let home = tempfile::tempdir().unwrap();
+        write_subagent(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            "a0343c7095a040965",
+            TOOL_USE_ID,
+            &fixture_lines(),
+        );
+        let binding = claude_task_spawn_binding(home.path(), PARENT, "a0343c7095a040965")
+            .expect("the sidecar meta binds the task to its spawn");
+        assert_eq!(binding.tool_use_id, TOOL_USE_ID);
+        assert_eq!(
+            binding.description.as_deref(),
+            Some("content-aware turn alignment")
+        );
+        // Unknown task ids and foreign parents miss cleanly.
+        assert!(claude_task_spawn_binding(home.path(), PARENT, "zz404").is_none());
+        assert!(
+            claude_task_spawn_binding(home.path(), "other-parent-uuid", "a0343c7095a040965")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn spawn_binding_refuses_path_unsafe_ids() {
+        // Both ids arrive from the wire; anything that could escape the
+        // store dir is refused before any filesystem probe.
+        let home = tempfile::tempdir().unwrap();
+        write_subagent(
+            home.path(),
+            "-repo-project",
+            PARENT,
+            "a0343c7095a040965",
+            TOOL_USE_ID,
+            &fixture_lines(),
+        );
+        assert!(claude_task_spawn_binding(home.path(), PARENT, "../a0343c7095a040965").is_none());
+        assert!(claude_task_spawn_binding(home.path(), "..", "a0343c7095a040965").is_none());
+        assert!(claude_task_spawn_binding(home.path(), PARENT, "a/b").is_none());
+        assert!(claude_task_spawn_binding(home.path(), PARENT, "").is_none());
     }
 
     #[test]

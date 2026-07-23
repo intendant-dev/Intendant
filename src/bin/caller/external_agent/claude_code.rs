@@ -836,6 +836,90 @@ fn is_task_tool(name: &str) -> bool {
     name == "Agent" || name == "Task"
 }
 
+/// Durable spawn-binding facts for one in-band task, resolved from the
+/// Claude Code store's subagent sidecar meta (`agent-<task_id>.meta.json`
+/// carries the spawning `toolUseId`). This is the correlation that
+/// survives supervisor/process rotation: `task_children` and `task_ids`
+/// live in the per-process reader, so a terminal arriving in a LATER
+/// process than the registration finds nothing in memory — the sidecar
+/// meta is the only place the spawn binding outlives the process.
+#[derive(Debug, Clone)]
+pub(crate) struct CcTaskSpawnBinding {
+    /// The spawning tool_use id — the key child envelopes carry as
+    /// `parent_tool_use_id`, and the input to `task_tool_child_id`.
+    pub(crate) tool_use_id: String,
+    /// The spawn's `description`, for the synthesized terminal's context.
+    pub(crate) description: Option<String>,
+}
+
+/// Injected resolver: stable `task_id` → durable spawn binding. Production
+/// injects a Claude-store probe closure at the transport edge
+/// (`ClaudeCodeAgent::initialize` resolves home there — the parser itself
+/// never touches the real environment); tests inject map-backed closures.
+pub(crate) type CcTaskSpawnResolver = Arc<dyn Fn(&str) -> Option<CcTaskSpawnBinding> + Send + Sync>;
+
+/// `<task-notification>` block markers, shared with the session catalog's
+/// hydration-lane synthesis (`web_gateway::session_catalog::task_threads`)
+/// so the wire grammar has exactly one owner.
+pub(crate) const TASK_NOTIFICATION_OPEN: &str = "<task-notification>";
+pub(crate) const TASK_NOTIFICATION_CLOSE: &str = "</task-notification>";
+
+/// `<tag>text</tag>` extraction inside one notification block — the same
+/// tolerant, non-greedy read the hydration lane uses.
+pub(crate) fn task_notification_tag_text(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = block.find(&open)? + open.len();
+    let end = block[start..].find(&close)? + start;
+    let text = block[start..end].trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// One queue-delivered `<task-notification>` block's terminal facts.
+/// Claude Code has TWO wire shapes for a task's end: the live
+/// `system:task_notification` stream event, and — when the CLI queues the
+/// notification and injects it as a plain user message (observed live
+/// 2026-07-22: every agent-task terminal of the evening arrived ONLY this
+/// way, as `queue-operation` enqueue/dequeue plus a string-content `user`
+/// envelope) — this XMLish block inside user text. Both must terminate
+/// the child window.
+#[derive(Debug, Clone)]
+struct CcInjectedTaskNotification {
+    task_id: Option<String>,
+    tool_use_id: Option<String>,
+    status: String,
+    summary: Option<String>,
+    output_file: Option<String>,
+}
+
+/// Every well-formed `<task-notification>` block in `text`, in order. A
+/// block without a `<status>` carries no terminal fact and is skipped.
+fn cc_injected_task_notifications(text: &str) -> Vec<CcInjectedTaskNotification> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(TASK_NOTIFICATION_OPEN) {
+        let after_open = &rest[start + TASK_NOTIFICATION_OPEN.len()..];
+        let (block, next) = match after_open.find(TASK_NOTIFICATION_CLOSE) {
+            Some(end) => (
+                &after_open[..end],
+                &after_open[end + TASK_NOTIFICATION_CLOSE.len()..],
+            ),
+            None => (after_open, ""),
+        };
+        if let Some(status) = task_notification_tag_text(block, "status") {
+            found.push(CcInjectedTaskNotification {
+                task_id: task_notification_tag_text(block, "task-id"),
+                tool_use_id: task_notification_tag_text(block, "tool-use-id"),
+                status,
+                summary: task_notification_tag_text(block, "summary"),
+                output_file: task_notification_tag_text(block, "output-file"),
+            });
+        }
+        rest = next;
+    }
+    found
+}
+
 /// One short line (~60 chars) describing a background task, for the
 /// armed-set vitals and the wake-attribution log row.
 fn bg_desc_snippet(text: &str) -> Option<String> {
@@ -1195,6 +1279,14 @@ struct CcReader {
     /// seed fires once per distinct working directory, not per init.
     cwd_echo: Option<String>,
     announced_session_id: Option<String>,
+    /// Durable `task_id` → spawn-binding lookup (Claude-store sidecar
+    /// metas), consulted when a task terminal arrives for ids this
+    /// process never registered — the cross-process strand class: the
+    /// registration lived in a previous reader instance (usage-limit
+    /// kill, wrapper rotation), and dropping the terminal left child
+    /// windows running forever. None in readers without a store
+    /// (unit tests by default).
+    task_spawn_resolver: Option<CcTaskSpawnResolver>,
 }
 
 impl CcReader {
@@ -1229,7 +1321,26 @@ impl CcReader {
             effort_echo: None,
             cwd_echo: None,
             announced_session_id: None,
+            task_spawn_resolver: None,
         }
+    }
+
+    /// Attach the durable spawn-binding resolver (see the field docs).
+    fn with_task_spawn_resolver(mut self, resolver: CcTaskSpawnResolver) -> Self {
+        self.task_spawn_resolver = Some(resolver);
+        self
+    }
+
+    /// Durable spawn binding for `task_id`, when a resolver is attached
+    /// and the store knows the task.
+    fn resolve_task_spawn(&self, task_id: &str) -> Option<CcTaskSpawnBinding> {
+        let resolver = self.task_spawn_resolver.as_ref()?;
+        resolver(task_id)
+            .filter(|binding| !binding.tool_use_id.trim().is_empty())
+            .map(|binding| CcTaskSpawnBinding {
+                tool_use_id: binding.tool_use_id.trim().to_string(),
+                description: binding.description,
+            })
     }
 
     /// Track the wire-echoed model and surface a config-facts update when
@@ -1875,10 +1986,22 @@ impl CcReader {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         if let Some(task_id) = task_id {
+            // First-write repair across process rotation: in a FRESH
+            // reader the first task_started for a task may be a RESUME
+            // segment (the original spawn ran in a previous process), so
+            // trusting its tool_use id would burn the binding on the
+            // segment id and strand the real child window. The durable
+            // sidecar meta states the true spawn id — prefer it.
+            let durable_spawn = if self.task_ids.contains_key(task_id) {
+                None
+            } else {
+                self.resolve_task_spawn(task_id)
+                    .map(|binding| binding.tool_use_id)
+            };
             let spawn_tool_use_id = self
                 .task_ids
                 .entry(task_id.to_string())
-                .or_insert_with(|| tool_use_id.to_string());
+                .or_insert_with(|| durable_spawn.unwrap_or_else(|| tool_use_id.to_string()));
             // A task_started re-announcing a known task under a NEW
             // tool_use id describes a later run segment of the same task
             // (a resume), never a second spawn. Registering or arming
@@ -1980,23 +2103,80 @@ impl CcReader {
             .get("task_id")
             .and_then(|v| v.as_str())
             .map(str::trim)
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let tool_use_id = msg
             .get("tool_use_id")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or_else(|| task_id.and_then(|task_id| self.task_ids.get(task_id).cloned()));
-        let Some(tool_use_id) = tool_use_id else {
-            return;
-        };
+            .map(str::to_string);
         let status = msg
             .get("status")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("completed");
+            .unwrap_or("completed")
+            .to_string();
+        let summary = msg.get("summary").and_then(|v| v.as_str());
+        let output_file = msg.get("output_file").and_then(|v| v.as_str());
+        self.apply_task_notification(
+            task_id.as_deref(),
+            tool_use_id,
+            &status,
+            summary,
+            output_file,
+            out,
+        );
+    }
+
+    /// Queue-delivered task notifications: when the CLI cannot (or does
+    /// not) fire the live `system:task_notification`, the terminal
+    /// arrives as a `<task-notification>` block inside a string-content
+    /// `user` envelope (the queue injection the transcript records as
+    /// `queue-operation` + `user`). Observed live 2026-07-22: every
+    /// agent-task terminal of an evening's usage-limit strand arrived
+    /// ONLY this way, so ignoring the shape left nine child windows
+    /// running forever. Parses every block and routes each through the
+    /// same application path as the system event; the block grammar is
+    /// precise (`<status>` required), so ordinary user prose never
+    /// matches, and a duplicate delivery of a live-fired notification
+    /// dedupes on the child's terminal latch.
+    fn handle_injected_task_notifications(&mut self, text: &str, out: &mut CcLineOutcome) {
+        for note in cc_injected_task_notifications(text) {
+            self.apply_task_notification(
+                note.task_id.as_deref(),
+                note.tool_use_id.clone(),
+                &note.status,
+                note.summary.as_deref(),
+                note.output_file.as_deref(),
+                out,
+            );
+        }
+    }
+
+    /// Shared terminal application for BOTH task-notification wire shapes
+    /// (the `system:task_notification` stream event and the queue-injected
+    /// `<task-notification>` user block): disarm/wake background
+    /// commands, resolve the child window across run segments AND process
+    /// rotations, and emit the terminal exactly once. Never silent — an
+    /// unresolvable terminal logs its drop instead of vanishing (the
+    /// pre-2026-07-22 silent early return is the bug that stranded child
+    /// windows at "running" forever).
+    fn apply_task_notification(
+        &mut self,
+        task_id: Option<&str>,
+        tool_use_id: Option<String>,
+        status: &str,
+        summary: Option<&str>,
+        output_file: Option<&str>,
+        out: &mut CcLineOutcome,
+    ) {
+        let tool_use_id =
+            tool_use_id.or_else(|| task_id.and_then(|task_id| self.task_ids.get(task_id).cloned()));
+        let Some(tool_use_id) = tool_use_id else {
+            return;
+        };
         // An armed background command ended. Between turns a completion or
         // failure wakes the agent (live-probed: the CLI immediately opens a
         // self-initiated round) — attribute the wake in the log BEFORE the
@@ -2018,7 +2198,7 @@ impl CcReader {
                     session,
                     &tool_use_id,
                     crate::background_tasks::BackgroundTaskStatus::from_wire_terminal(status),
-                    bg_wire_output_path(msg.get("output_file").and_then(|v| v.as_str())),
+                    bg_wire_output_path(output_file),
                     crate::session_activity::epoch_seconds(),
                 );
             }
@@ -2044,26 +2224,78 @@ impl CcReader {
         // message's id), while the child stays keyed by the spawn tool_use
         // and the task_id stays stable across runs. When the notification's
         // id misses the children, resolve through the first-write spawn
-        // binding so the resumed run terminates the original child window.
-        // Unknown tool_use AND unknown task_id stays a silent no-op
-        // (`emit_task_terminal` drops ids it never registered).
+        // binding — and past this process's memory, through the durable
+        // sidecar-meta binding, since the spawn may have been observed by
+        // a PREVIOUS supervisor process entirely.
+        let mut resolved_binding: Option<CcTaskSpawnBinding> = None;
         let tool_use_id = if self.task_children.contains_key(&tool_use_id) {
             tool_use_id
+        } else if let Some(spawn) = task_id
+            .and_then(|task_id| self.task_ids.get(task_id).cloned())
+            .filter(|spawn| self.task_children.contains_key(spawn))
+        {
+            spawn
+        } else if let Some(binding) = task_id.and_then(|task_id| self.resolve_task_spawn(task_id)) {
+            let spawn = binding.tool_use_id.clone();
+            resolved_binding = Some(binding);
+            spawn
         } else {
-            task_id
-                .and_then(|task_id| self.task_ids.get(task_id).cloned())
-                .unwrap_or(tool_use_id)
+            tool_use_id
         };
+        if !self.task_children.contains_key(&tool_use_id) {
+            // The terminal outlived its registration: the spawn was
+            // observed by a previous reader instance (usage-limit kill,
+            // wrapper rotation), so this process has no in-memory child
+            // for it. With durable spawn evidence (the sidecar meta) the
+            // child is re-derived and the terminal still lands; without
+            // it the drop is logged, never silent — an unarmed bash
+            // task's notification legitimately ends here.
+            let Some(binding) = resolved_binding
+                .take()
+                .or_else(|| task_id.and_then(|task_id| self.resolve_task_spawn(task_id)))
+                .filter(|binding| binding.tool_use_id == tool_use_id)
+            else {
+                out.log(
+                    "debug",
+                    format!(
+                        "task_notification for unknown task dropped (task_id {}, tool_use {tool_use_id}, status {status})",
+                        task_id.unwrap_or("-"),
+                    ),
+                );
+                return;
+            };
+            let child_id = task_tool_child_id(&binding.tool_use_id);
+            // Silent registration: no `inProgress` announcement rides the
+            // synthesis — the terminal SubAgentToolCall below carries the
+            // child route itself, and an inProgress here would open a
+            // spurious parent turn (the same reasoning as the re-arm path
+            // in `task_scope_for`).
+            self.task_children.insert(
+                binding.tool_use_id.clone(),
+                CcTaskChild {
+                    child_id: child_id.clone(),
+                    terminal: false,
+                },
+            );
+            if let Some(task_id) = task_id {
+                self.task_ids
+                    .entry(task_id.to_string())
+                    .or_insert_with(|| binding.tool_use_id.clone());
+            }
+            out.log(
+                "info",
+                format!(
+                    "Reconciled sub-agent {child_id} from a previous supervisor process; applying its \"{status}\" terminal"
+                ),
+            );
+        }
         let (outer_status, state_status) = match status {
             "completed" | "success" => ("completed", "completed"),
             "failed" | "error" | "errored" => ("failed", "errored"),
             "killed" | "stopped" | "cancelled" | "interrupted" => ("interrupted", "interrupted"),
             other => (other, other),
         };
-        let summary = msg
-            .get("summary")
-            .and_then(|v| v.as_str())
-            .and_then(task_summary_snippet);
+        let summary = summary.and_then(task_summary_snippet);
         self.emit_task_terminal(&tool_use_id, outer_status, state_status, summary, out);
     }
 
@@ -2311,7 +2543,7 @@ impl CcReader {
         &mut self,
         msg: &serde_json::Value,
         out: &mut CcLineOutcome,
-        _child_scope: Option<&str>,
+        child_scope: Option<&str>,
     ) {
         // An async Agent spawn acknowledges immediately with internal launch
         // metadata (envelope-level `tool_use_result.status =
@@ -2324,6 +2556,22 @@ impl CcReader {
                     || r.get("isAsync").and_then(|b| b.as_bool()) == Some(true)
             })
             .unwrap_or(false);
+        // STRING-content user envelopes are the CLI's own injections (queue
+        // deliveries), not tool results. The one shape that matters is the
+        // queued `<task-notification>` — the child-terminal signal that
+        // otherwise never reaches this reader (see
+        // `handle_injected_task_notifications`). Main thread only: a block
+        // quoted inside a child's conversation is prose, not a delivery.
+        if let Some(text) = msg
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+        {
+            if child_scope.is_none() && text.contains(TASK_NOTIFICATION_OPEN) {
+                self.handle_injected_task_notifications(text, out);
+            }
+            return;
+        }
         let Some(content) = msg
             .get("message")
             .and_then(|m| m.get("content"))
@@ -3819,11 +4067,32 @@ impl ExternalAgent for ClaudeCodeAgent {
             },
         });
 
+        // Durable spawn-binding resolver: the transport edge resolves the
+        // real home once; the reader consults the store only when a task
+        // terminal arrives for an id no in-memory registration covers
+        // (spawned under a previous CLI process — see
+        // `CcReader::task_spawn_resolver`). Reads the CURRENT backend
+        // session id at call time, so it works both for resumed sessions
+        // (seeded) and fresh ones (announced by the first stream line,
+        // always before any task can end).
+        let spawn_resolver: CcTaskSpawnResolver = {
+            let home = crate::platform::home_dir();
+            let shared = Arc::clone(&self.shared);
+            Arc::new(move |task_id: &str| {
+                let backend_session_id = shared.session_id()?;
+                crate::web_gateway::session_catalog::claude_task_spawn_binding(
+                    &home,
+                    &backend_session_id,
+                    task_id,
+                )
+            })
+        };
         let reader_state = CcReader::new(
             Arc::clone(&self.shared),
             Arc::clone(&self.pending_approvals),
             web_port.is_some(),
-        );
+        )
+        .with_task_spawn_resolver(spawn_resolver);
         let handle = tokio::spawn(reader_task(
             stdout,
             event_tx,
@@ -6394,17 +6663,268 @@ mod tests {
     }
 
     #[test]
-    fn unknown_notification_ids_stay_silent() {
-        // Neither the tool_use id nor the task_id is known: silent no-op —
-        // no spurious terminal, no panic, the real child untouched.
+    fn unknown_notification_ids_log_instead_of_vanishing() {
+        // Neither the tool_use id nor the task_id resolves (no durable
+        // spawn evidence either): no spurious terminal, no panic, the
+        // real child untouched — but the drop is LOGGED, never silent.
+        // The silent early return was the 2026-07-22 strand bug.
         let mut reader = test_reader();
         spawn_task(&mut reader);
         let out = reader.process_line(
             r#"{"type":"system","subtype":"task_notification","task_id":"zz404","tool_use_id":"toolu_01NEVERSEEN0000000","status":"failed","summary":"whose task is this","session_id":"s1"}"#,
         );
         assert!(
-            out.events.is_empty(),
-            "unknown ids must no-op: {:?}",
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })),
+            "unknown ids must not mint terminals: {:?}",
+            out.events
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Log { level, message }
+                    if level == "debug" && message.contains("toolu_01NEVERSEEN0000000")
+            )),
+            "the drop must be logged: {:?}",
+            out.events
+        );
+        assert!(!reader.task_children["toolu_01AAABBBCCCDDDEEE"].terminal);
+    }
+
+    /// Map-backed resolver standing in for the Claude-store sidecar probe.
+    fn map_spawn_resolver(entries: &[(&str, &str)]) -> CcTaskSpawnResolver {
+        let map: HashMap<String, CcTaskSpawnBinding> = entries
+            .iter()
+            .map(|(task_id, tool_use_id)| {
+                (
+                    task_id.to_string(),
+                    CcTaskSpawnBinding {
+                        tool_use_id: tool_use_id.to_string(),
+                        description: Some("probe echo".to_string()),
+                    },
+                )
+            })
+            .collect();
+        Arc::new(move |task_id: &str| map.get(task_id).cloned())
+    }
+
+    fn assert_completed_terminal_for_task_child(out: &CcLineOutcome, summary: &str) {
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Scoped { thread_id, event, .. }
+                    if thread_id.as_deref() == Some(TASK_CHILD)
+                        && matches!(
+                            event.as_ref(),
+                            AgentEvent::SubAgentToolCall { item_id, status, agents, .. }
+                                if item_id == "toolu_01AAABBBCCCDDDEEE"
+                                    && status == "completed"
+                                    && agents.len() == 1
+                                    && agents[0].thread_id == TASK_CHILD
+                                    && agents[0].status == "completed"
+                                    && agents[0].message.as_deref() == Some(summary)
+                        )
+            )),
+            "terminal must land on the spawn child: {:?}",
+            out.events
+        );
+    }
+
+    #[test]
+    fn cross_process_spawn_keyed_terminal_synthesizes_and_emits() {
+        // The strand class of 2026-07-22: the spawn was registered by a
+        // PREVIOUS reader instance (usage-limit kill, wrapper rotation);
+        // the terminal arrives in a FRESH instance keyed by the spawn
+        // tool_use id. With durable spawn evidence the child is
+        // re-derived and the terminal still emits.
+        let mut fresh = test_reader()
+            .with_task_spawn_resolver(map_spawn_resolver(&[("a6ae09", "toolu_01AAABBBCCCDDDEEE")]));
+        let out = fresh.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"a6ae09","tool_use_id":"toolu_01AAABBBCCCDDDEEE","status":"completed","summary":"landed the PR","session_id":"s1"}"#,
+        );
+        assert_completed_terminal_for_task_child(&out, "landed the PR");
+        // The synthesis is announced (once), not silent.
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { level, message }
+                if level == "info" && message.contains(TASK_CHILD)
+        )));
+        // No spurious inProgress registration rides the synthesis — the
+        // terminal itself carries the child route.
+        assert!(!out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SubAgentToolCall { status, .. } if status == "inProgress"
+        )));
+        assert!(fresh.task_children["toolu_01AAABBBCCCDDDEEE"].terminal);
+    }
+
+    #[test]
+    fn cross_process_segment_keyed_terminal_resolves_via_durable_binding() {
+        // A resumed run's notification is keyed by the RESUME segment's
+        // tool_use id; in a fresh reader the in-memory spawn binding is
+        // gone, so resolution must go through the durable sidecar
+        // binding (task_id → spawn toolu) — never mint a ghost child
+        // under the segment id.
+        let mut fresh = test_reader()
+            .with_task_spawn_resolver(map_spawn_resolver(&[("a6ae09", "toolu_01AAABBBCCCDDDEEE")]));
+        let out = fresh.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"a6ae09","tool_use_id":"toolu_01RESUMESEGMENT000","status":"completed","summary":"second run done","session_id":"s1"}"#,
+        );
+        assert_completed_terminal_for_task_child(&out, "second run done");
+        assert!(!fresh.task_children.contains_key("toolu_01RESUMESEGMENT000"));
+    }
+
+    #[test]
+    fn cross_process_task_started_binds_durable_spawn_id() {
+        // A fresh reader's FIRST task_started for a resumed task carries
+        // the resume segment's tool_use id. Without the durable binding,
+        // first-write-wins would burn task_ids on the segment id and the
+        // run's notification could never find the child again.
+        let mut fresh = test_reader()
+            .with_task_spawn_resolver(map_spawn_resolver(&[("a6ae09", "toolu_01AAABBBCCCDDDEEE")]));
+        let out = fresh.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"a6ae09","tool_use_id":"toolu_01RESUMESEGMENT000","description":"probe echo","subagent_type":"general-purpose","task_type":"local_agent","session_id":"s1"}"#,
+        );
+        assert_eq!(
+            fresh.task_ids.get("a6ae09").map(String::as_str),
+            Some("toolu_01AAABBBCCCDDDEEE"),
+            "the durable spawn binding must win over the segment id"
+        );
+        assert!(
+            !fresh.task_children.contains_key("toolu_01RESUMESEGMENT000"),
+            "segment id must not ghost a child"
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })),
+            "segment re-announce stays silent: {:?}",
+            out.events
+        );
+        // The run's end (keyed by task_id alone) resolves to the spawn
+        // child through the repaired binding.
+        let out = fresh.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"a6ae09","status":"completed","summary":"resumed run done","session_id":"s1"}"#,
+        );
+        assert_completed_terminal_for_task_child(&out, "resumed run done");
+    }
+
+    #[test]
+    fn synthesized_terminal_rearms_on_stream_and_reterminates() {
+        // A synthesized (cross-process) terminal must not break the
+        // deliberate re-arm semantics: the stream flowing into the child
+        // again proves a resume, and the resumed run's own end emits.
+        let mut fresh = test_reader()
+            .with_task_spawn_resolver(map_spawn_resolver(&[("a6ae09", "toolu_01AAABBBCCCDDDEEE")]));
+        fresh.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"a6ae09","tool_use_id":"toolu_01AAABBBCCCDDDEEE","status":"failed","summary":"limit killed","session_id":"s1"}"#,
+        );
+        assert!(fresh.task_children["toolu_01AAABBBCCCDDDEEE"].terminal);
+        fresh.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"resumed"}]},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        assert!(
+            !fresh.task_children["toolu_01AAABBBCCCDDDEEE"].terminal,
+            "stream re-entry must re-arm the synthesized child"
+        );
+        let out = fresh.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"a6ae09","tool_use_id":"toolu_01RESUMESEGMENT000","status":"completed","summary":"second run done","session_id":"s1"}"#,
+        );
+        assert_completed_terminal_for_task_child(&out, "second run done");
+    }
+
+    #[test]
+    fn queue_injected_task_notification_ends_the_child() {
+        // The CLI's SECOND terminal shape: a queued notification injected
+        // as a string-content user envelope (observed live 2026-07-22 —
+        // every agent-task terminal of the evening arrived only this
+        // way). The block must terminate the child like the system
+        // event does.
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a6ae09</task-id>\n<tool-use-id>toolu_01AAABBBCCCDDDEEE</tool-use-id>\n<status>failed</status>\n<summary>Agent failed: API error</summary>\n</task-notification>"},"session_id":"s1"}"#,
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Scoped { thread_id, event, .. }
+                    if thread_id.as_deref() == Some(TASK_CHILD)
+                        && matches!(
+                            event.as_ref(),
+                            AgentEvent::SubAgentToolCall { status, agents, .. }
+                                if status == "failed" && agents[0].status == "errored"
+                        )
+            )),
+            "queue-delivered terminal must end the child: {:?}",
+            out.events
+        );
+        // A duplicate delivery (live event + queue injection) dedupes on
+        // the terminal latch.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"a6ae09","tool_use_id":"toolu_01AAABBBCCCDDDEEE","status":"failed","session_id":"s1"}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })));
+    }
+
+    #[test]
+    fn queue_injected_notification_synthesizes_across_processes() {
+        // Queue delivery AND process rotation together (the exact
+        // 2026-07-22 anatomy): fresh reader, segment-keyed block, durable
+        // binding — the terminal still lands on the spawn child.
+        let mut fresh = test_reader()
+            .with_task_spawn_resolver(map_spawn_resolver(&[("a6ae09", "toolu_01AAABBBCCCDDDEEE")]));
+        let out = fresh.process_line(
+            r#"{"type":"user","message":{"role":"user","content":"Before the block.\n<task-notification>\n<task-id>a6ae09</task-id>\n<tool-use-id>toolu_01RESUMESEGMENT000</tool-use-id>\n<status>completed</status>\n<summary>shipped it</summary>\n</task-notification>\nAfter the block."},"session_id":"s1"}"#,
+        );
+        assert_completed_terminal_for_task_child(&out, "shipped it");
+    }
+
+    #[test]
+    fn queue_injected_bash_notification_disarms_and_wakes() {
+        // The queue shape serves background commands too: an armed bash
+        // task's queued completion must disarm the parked claim and
+        // attribute the wake, exactly like the live system event.
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bgq1","name":"Bash","input":{"command":"sleep 2 && echo hi","run_in_background":true,"description":"probe sleep"}}]},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"bq1","tool_use_id":"toolu_bgq1","description":"probe sleep","task_type":"local_bash","session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>bq1</task-id>\n<tool-use-id>toolu_bgq1</tool-use-id>\n<status>completed</status>\n<summary>Background command completed</summary>\n</task-notification>"},"session_id":"s1"}"#,
+        );
+        assert!(
+            log_rows(&out)
+                .iter()
+                .any(|row| row.contains("Woken by background task: probe sleep")),
+            "queued completion must wake: {:?}",
+            log_rows(&out)
+        );
+        assert!(reader.bg_armed.is_empty());
+    }
+
+    #[test]
+    fn child_scoped_user_text_never_parses_notifications() {
+        // A child conversation QUOTING a notification block is prose, not
+        // a delivery — only main-thread injections count.
+        let mut reader = test_reader();
+        spawn_task(&mut reader);
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>zz9</task-id>\n<tool-use-id>toolu_01AAABBBCCCDDDEEE</tool-use-id>\n<status>completed</status>\n</task-notification>"},"parent_tool_use_id":"toolu_01AAABBBCCCDDDEEE","session_id":"s1"}"#,
+        );
+        assert!(
+            !out.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Scoped { event, .. }
+                    if matches!(event.as_ref(), AgentEvent::SubAgentToolCall { .. })
+            )),
+            "child-scoped quotes must not terminate: {:?}",
             out.events
         );
         assert!(!reader.task_children["toolu_01AAABBBCCCDDDEEE"].terminal);
@@ -6502,11 +7022,19 @@ mod tests {
         assert!(!reader
             .task_children
             .contains_key("toolu_01SLOWBASH00000000"));
-        // Its notification stays silent too (no child to end).
+        // Its notification ends no child either — the drop is logged
+        // (debug), never a terminal.
         let out = reader.process_line(
             r#"{"type":"system","subtype":"task_notification","task_id":"b7mlg8ym4","tool_use_id":"toolu_01SLOWBASH00000000","status":"completed","output_file":"","summary":"Slow foreground probe loop","session_id":"s1"}"#,
         );
-        assert!(out.events.is_empty());
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })));
+        assert!(out
+            .events
+            .iter()
+            .all(|e| matches!(e, AgentEvent::Log { level, .. } if level == "debug")));
     }
 
     #[test]
