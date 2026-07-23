@@ -115,6 +115,55 @@ function agendaOpenParkedAsk(itemId) {
   if (typeof setQuestionMinimized === 'function') setQuestionMinimized(false);
 }
 
+// "View question" on a DONE ask-backed item: the same panel, rendered
+// READ-ONLY from the retained payload — the record stays fully viewable
+// (recorded picks selected, follow-ups and anchored notes as content,
+// preview cards from the retained blobs; blobs are deleted only on
+// retire, and a missing one degrades to a named placeholder). Close
+// returns here; "Reopen to change answer" rides the existing reopen op.
+function agendaViewAnsweredAsk(itemId) {
+  const item = agendaFindItem(itemId);
+  if (!item || item.status !== 'done' || !item.ask
+    || !Array.isArray(item.ask.questions) || !item.ask.questions.length) {
+    return;
+  }
+  if (typeof showUserQuestion !== 'function') return;
+  if (typeof switchTab === 'function') switchTab('activity');
+  const answer = item.answer || null;
+  showUserQuestion(item.ask.ask_id, item.ask.questions, '', undefined, false, {
+    agendaBacked: true,
+    archive: {
+      itemId: item.id,
+      resolution: (answer && answer.structured) || {},
+      plainText: (answer && answer.text) || '',
+      answered: !!answer,
+      answeredAtMs: answer ? answer.at_ms : (item.completed_ms || item.updated_ms || 0),
+      answeredLabel: answer ? agendaActorLabel(answer) : '',
+      onReopen: () => agendaReopenAnsweredAsk(item.id),
+    },
+  });
+}
+
+// The record viewer's "Reopen to change answer": the EXISTING reopen op
+// (the daemon re-announces the ask on its own), then the live panel opens
+// as an ordinary open ask — the panel's same-id dedupe makes the event
+// lane's re-delivery harmless in either order.
+async function agendaReopenAnsweredAsk(itemId) {
+  const ok = await agendaSendOp({ op: 'reopen', id: itemId });
+  if (!ok) return false;
+  agendaOpenParkedAsk(itemId);
+  return true;
+}
+
+// Head-click router for ask-backed items: an OPEN item's head opens the
+// live panel, a DONE item's head opens the read-only record.
+function agendaOpenAskPanel(itemId) {
+  const item = agendaFindItem(itemId);
+  if (!item) return;
+  if (item.status === 'open') agendaOpenParkedAsk(itemId);
+  else if (item.status === 'done') agendaViewAnsweredAsk(itemId);
+}
+
 // Live update from the event lane: merge the changed item, adopt counts.
 function agendaObserveServerMessage(d) {
   if (!d || !d.item || !d.item.id) return;
@@ -1552,9 +1601,12 @@ function agendaRenderTab() {
     // right here; answered ones show it (data, rendered escaped). Rich
     // (ask-backed) questions lead with the panel — options and previews
     // live there; the inline input stays as an explicit plain-text path,
-    // never the only door.
+    // never the only door. Done rich asks keep a "View question" door to
+    // the same panel rendered read-only — the record stays fully viewable.
     let answerBlock = '';
     const openRichAsk = item.kind === 'question' && item.status === 'open'
+      && item.ask && Array.isArray(item.ask.questions) && item.ask.questions.length;
+    const doneRichAsk = item.kind === 'question' && item.status === 'done'
       && item.ask && Array.isArray(item.ask.questions) && item.ask.questions.length;
     if (item.kind === 'question' && item.status === 'open') {
       const richAsk = openRichAsk;
@@ -1576,6 +1628,12 @@ function agendaRenderTab() {
       // rich asks, the joined text otherwise (agendaAnswerBlock).
       answerBlock = agendaAnswerBlock(item);
     }
+    if (doneRichAsk) {
+      answerBlock = `<div class="agenda-answer-row agenda-ask-open-row">
+          <button type="button" class="agenda-btn agenda-view-ask-btn" data-id="${escapeHtml(item.id)}">View question</button>
+          <span class="agenda-ask-hint">the full question as asked${item.ask.questions.some((q) => (q.previews || []).length) ? ' — previews included' : ''}, with the recorded answer</span>
+        </div>${answerBlock}`;
+    }
     const blockedChip = agendaItemIsBlocked(item)
       ? '<span class="agenda-chip blocked">blocked</span>'
       : '';
@@ -1593,12 +1651,12 @@ function agendaRenderTab() {
       && item.answer.delivered === false
       ? '<span class="agenda-chip pickup" title="The answer was recorded, but the asking session was gone and no successor was live. The next session’s agenda check picks it up.">answered · awaiting pickup</span>'
       : '';
-    // Open rich asks: the whole head is the affordance — clicking the
-    // question opens its panel (the obvious gesture; the explicit button
-    // below remains for discoverability). role/tabindex make it a real
-    // control for keyboard and assistive tech.
-    const headOpenAttrs = openRichAsk
-      ? ` agenda-item-head-openable" data-open-ask="${escapeHtml(item.id)}" role="button" tabindex="0" title="Open the question panel`
+    // Rich asks: the whole head is the affordance — clicking the question
+    // opens its panel (live for open items, the read-only record for done
+    // ones; the explicit button below remains for discoverability).
+    // role/tabindex make it a real control for keyboard and assistive tech.
+    const headOpenAttrs = openRichAsk || doneRichAsk
+      ? ` agenda-item-head-openable" data-open-ask="${escapeHtml(item.id)}" role="button" tabindex="0" title="${openRichAsk ? 'Open the question panel' : 'View the answered question'}`
       : '';
     const indent = depth > 0 ? ` agenda-item-nested` : '';
     const indentStyle = depth > 0 ? ` style="--agenda-nest-depth:${depth}"` : '';
@@ -1626,12 +1684,15 @@ function agendaRenderTab() {
   list.querySelectorAll('.agenda-open-ask-btn').forEach((btn) => {
     btn.addEventListener('click', () => agendaOpenParkedAsk(btn.dataset.id));
   });
+  list.querySelectorAll('.agenda-view-ask-btn').forEach((btn) => {
+    btn.addEventListener('click', () => agendaViewAnsweredAsk(btn.dataset.id));
+  });
   list.querySelectorAll('.agenda-item-head-openable').forEach((head) => {
     const open = (e) => {
       // Chips/links inside the head keep their own behavior.
       if (e.target.closest('button, a, input, select')) return;
       e.preventDefault();
-      agendaOpenParkedAsk(head.dataset.openAsk);
+      agendaOpenAskPanel(head.dataset.openAsk);
     };
     head.addEventListener('click', open);
     head.addEventListener('keydown', (e) => {

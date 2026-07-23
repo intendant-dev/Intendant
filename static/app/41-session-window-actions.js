@@ -4111,9 +4111,21 @@ function updateQuestionProgress() {
 // authentication is ambient (mTLS client cert → IAM principal), so agent
 // markup executing with dashboard-origin authority could drive the daemon
 // API as the operator. Pinned by question_preview_iframe_sandbox_is_pinned.
-function appendQuestionPreviews(block, q, qIndex) {
+//
+// `archive` (the answered-ask record viewer, showUserQuestion opts.archive)
+// reuses this renderer with the input affordances swapped for the record:
+// no Choose/annotate controls; cards the recorded answer picked wear a
+// "✓ picked" chip and recorded anchored notes render as content. Focus/
+// Grid stays — zooming a preview is part of reading the record. A deleted
+// blob (retire prunes them) degrades to the same named "unavailable"
+// placeholder, never a broken card.
+function appendQuestionPreviews(block, q, qIndex, archive) {
   const previews = Array.isArray(q.previews) ? q.previews : [];
   if (!previews.length) return;
+  const recordedPicks = archive ? questionArchiveSelections(archive, q) : [];
+  const recordedNotes = archive
+    ? (((archive.resolution || {}).annotations || {})[q.question] || [])
+    : [];
   const strip = document.createElement('div');
   strip.className = 'question-previews';
   strip.dataset.mode = 'grid';
@@ -4160,41 +4172,58 @@ function appendQuestionPreviews(block, q, qIndex) {
     caption.appendChild(captionText);
     const capActions = document.createElement('span');
     capActions.className = 'question-preview-cap-actions';
-    // When an option shares this card's label, offer the pick right where
-    // the user is looking (same selection path as the option buttons).
-    const optIndex = (q.options || []).findIndex((o) => o.label === p.label);
-    if (optIndex >= 0) {
-      const choose = document.createElement('button');
-      choose.type = 'button';
-      choose.className = 'question-preview-choose';
-      choose.textContent = `Choose ${p.label}`;
-      choose.addEventListener('click', () => {
-        questionOptionClicked(qIndex, optIndex);
-        const btns = document.querySelectorAll(
-          `#question-content .question-block[data-q="${qIndex}"] .question-option`
-        );
-        choose.classList.toggle('chosen', !!btns[optIndex]?.classList.contains('selected'));
-      });
-      capActions.appendChild(choose);
+    const cardLabel = p.label || `#${pIndex + 1}`;
+    if (archive) {
+      // Record view: the recorded pick badges the card it chose; no
+      // selection or annotation inputs exist here.
+      if (recordedPicks.includes(p.label)) {
+        const picked = document.createElement('span');
+        picked.className = 'question-preview-picked';
+        picked.textContent = '✓ picked';
+        picked.title = 'The recorded answer chose this one';
+        capActions.appendChild(picked);
+      }
+    } else {
+      // When an option shares this card's label, offer the pick right where
+      // the user is looking (same selection path as the option buttons).
+      const optIndex = (q.options || []).findIndex((o) => o.label === p.label);
+      if (optIndex >= 0) {
+        const choose = document.createElement('button');
+        choose.type = 'button';
+        choose.className = 'question-preview-choose';
+        choose.textContent = `Choose ${p.label}`;
+        choose.addEventListener('click', () => {
+          questionOptionClicked(qIndex, optIndex);
+          const btns = document.querySelectorAll(
+            `#question-content .question-block[data-q="${qIndex}"] .question-option`
+          );
+          choose.classList.toggle('chosen', !!btns[optIndex]?.classList.contains('selected'));
+        });
+        capActions.appendChild(choose);
+      }
     }
     // Anchored annotation: a note that returns attached to THIS card by
-    // label ("B: rails too faint"), instead of floating in free text.
-    const noteInput = document.createElement('input');
-    noteInput.type = 'text';
-    noteInput.className = 'question-preview-note hidden';
-    noteInput.placeholder = `Note on ${p.label || 'this preview'}…`;
-    noteInput.dataset.previewLabel = p.label || `#${pIndex + 1}`;
-    const noteBtn = document.createElement('button');
-    noteBtn.type = 'button';
-    noteBtn.className = 'question-preview-note-btn';
-    noteBtn.textContent = '✎';
-    noteBtn.title = `Annotate ${p.label || 'this preview'} — the note returns anchored to this card`;
-    noteBtn.addEventListener('click', () => {
-      const hidden = noteInput.classList.toggle('hidden');
-      noteBtn.classList.toggle('open', !hidden);
-      if (!hidden) noteInput.focus();
-    });
-    capActions.appendChild(noteBtn);
+    // label ("B: rails too faint"), instead of floating in free text. In
+    // the record view the recorded notes render as content instead.
+    let noteInput = null;
+    if (!archive) {
+      noteInput = document.createElement('input');
+      noteInput.type = 'text';
+      noteInput.className = 'question-preview-note hidden';
+      noteInput.placeholder = `Note on ${p.label || 'this preview'}…`;
+      noteInput.dataset.previewLabel = cardLabel;
+      const noteBtn = document.createElement('button');
+      noteBtn.type = 'button';
+      noteBtn.className = 'question-preview-note-btn';
+      noteBtn.textContent = '✎';
+      noteBtn.title = `Annotate ${p.label || 'this preview'} — the note returns anchored to this card`;
+      noteBtn.addEventListener('click', () => {
+        const hidden = noteInput.classList.toggle('hidden');
+        noteBtn.classList.toggle('open', !hidden);
+        if (!hidden) noteInput.focus();
+      });
+      capActions.appendChild(noteBtn);
+    }
     const focusBtn = document.createElement('button');
     focusBtn.type = 'button';
     focusBtn.className = 'question-preview-focus';
@@ -4207,7 +4236,18 @@ function appendQuestionPreviews(block, q, qIndex) {
     capActions.appendChild(focusBtn);
     caption.appendChild(capActions);
     card.appendChild(caption);
-    card.appendChild(noteInput);
+    if (noteInput) card.appendChild(noteInput);
+    // Recorded notes anchored to this card ("B: rails too faint") come
+    // back attached where they were written. Data, rendered as text.
+    recordedNotes
+      .filter((note) => note.preview === cardLabel)
+      .forEach((note) => {
+        const recorded = document.createElement('div');
+        recorded.className = 'question-preview-note-recorded';
+        recorded.textContent = `✎ ${note.note}`;
+        recorded.title = 'Recorded note, anchored to this preview';
+        card.appendChild(recorded);
+      });
 
     if (p.kind === 'html' && p.url) {
       const frame = document.createElement('iframe');
@@ -4398,6 +4438,30 @@ function stopQuestionDeadlineTicker() {
   }
 }
 
+// ── Answered-ask record helpers (showUserQuestion opts.archive) ──
+// The archive object carries the resolved agenda item's recorded answer:
+// { itemId, resolution (AgendaAskResolution maps keyed by question text),
+//   plainText, answered, answeredAtMs, answeredLabel, onReopen }.
+
+// The recorded option labels picked for one question (typed free text
+// rides here too, as a label matching no option).
+function questionArchiveSelections(archive, q) {
+  const selections = (archive.resolution || {}).selections || {};
+  return Array.isArray(selections[q.question]) ? selections[q.question] : [];
+}
+
+// Engaged = the recorded resolution mentions the question in any map —
+// the same rule the daemon's text summary walks.
+function questionArchiveEngaged(archive, q) {
+  const r = archive.resolution || {};
+  return !!(
+    (r.answers && q.question in r.answers)
+    || (r.selections && q.question in r.selections)
+    || (r.followups && q.question in r.followups)
+    || (r.annotations && q.question in r.annotations)
+  );
+}
+
 function showUserQuestion(id, questions, sessionId, expiresAtMs, held, opts) {
   if (processingLogReplay) return;
   const list = Array.isArray(questions) ? questions : [];
@@ -4408,31 +4472,41 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held, opts) {
   // current-session fallback would mark an unrelated window "waiting"
   // and expose the detached-session submit guard).
   const agendaBacked = !!(opts && opts.agendaBacked);
+  // Archive mode: the read-only record of a RESOLVED agenda ask (the
+  // Agenda tab's "View question" on a done item). Nothing is pending —
+  // pendingQuestion stays null so every input/submit path stays inert —
+  // and the panel renders the recorded resolution as content, with Close
+  // and "Reopen to change answer" for actions. A later live ask (or the
+  // reopen's own re-announce) rebuilds right over it.
+  const archive = (opts && opts.archive) || null;
   // Same-id re-delivery — a reconnect's state-line replay, the presence
   // bootstrap, the agenda boot announce, or the waiter's hold-flip
   // refresh. The question content is immutable per id: fold in the
   // countdown state and leave the built panel (including the user's
   // tuck-away) untouched. Only a genuinely new question id rebuilds and
-  // force-surfaces the panel.
-  if (pendingQuestion?.id === id
+  // force-surfaces the panel. (An archive view always rebuilds — it is a
+  // user gesture, never a re-delivery.)
+  if (!archive && pendingQuestion?.id === id
       && document.getElementById('question-panel')?.classList.contains('visible')) {
     applyQuestionDeadline(expiresAtMs, held);
     return;
   }
   hideAllPanels();
-  pendingQuestion = {
-    id,
-    sessionId: agendaBacked
-      ? ''
-      : (sessionId
-        || approvalSessionIds.get(String(id))
-        || currentSessionFullId
-        || ''),
-    questions: list,
-  };
-  if (pendingQuestion.sessionId) {
-    ensureSessionWindow(pendingQuestion.sessionId, { phase: 'waiting' });
-    focusSessionWindow(pendingQuestion.sessionId);
+  if (!archive) {
+    pendingQuestion = {
+      id,
+      sessionId: agendaBacked
+        ? ''
+        : (sessionId
+          || approvalSessionIds.get(String(id))
+          || currentSessionFullId
+          || ''),
+      questions: list,
+    };
+    if (pendingQuestion.sessionId) {
+      ensureSessionWindow(pendingQuestion.sessionId, { phase: 'waiting' });
+      focusSessionWindow(pendingQuestion.sessionId);
+    }
   }
 
   const content = document.getElementById('question-content');
@@ -4441,34 +4515,74 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held, opts) {
   const title = document.createElement('div');
   title.className = 'approval-title question-title-row';
   const titleText = document.createElement('span');
-  titleText.textContent = multi
-    ? `The agent has ${list.length} questions`
-    : 'The agent has a question';
+  titleText.textContent = archive
+    ? (multi ? `Answered questions (${list.length})` : 'Answered question')
+    : multi
+      ? `The agent has ${list.length} questions`
+      : 'The agent has a question';
   title.appendChild(titleText);
-  const deadlineChip = document.createElement('span');
-  deadlineChip.id = 'question-deadline';
-  deadlineChip.className = 'question-deadline hidden';
-  title.appendChild(deadlineChip);
-  const holdBtn = document.createElement('button');
-  holdBtn.type = 'button';
-  holdBtn.id = 'question-hold';
-  holdBtn.className = 'question-hold hidden';
-  holdBtn.addEventListener('click', () => {
-    if (!pendingQuestion) return;
-    // Truth stays with the waiter: disable until its refresh (the same-id
-    // re-emission) lands and renderQuestionDeadline re-enables.
-    holdBtn.disabled = true;
-    sendQuestionHold(!pendingQuestion.held);
-  });
-  title.appendChild(holdBtn);
-  const tuck = document.createElement('button');
-  tuck.type = 'button';
-  tuck.className = 'question-tuck';
-  tuck.textContent = '–';
-  tuck.title = 'Tuck away — the question stays pending; a chip brings it back';
-  tuck.addEventListener('click', () => setQuestionMinimized(true));
-  title.appendChild(tuck);
+  if (archive) {
+    // No countdown, hold, or tuck on a record — just a way out.
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'question-tuck';
+    close.textContent = '×';
+    close.title = 'Close this record';
+    close.addEventListener('click', () => hidePanel('question-panel'));
+    title.appendChild(close);
+  } else {
+    const deadlineChip = document.createElement('span');
+    deadlineChip.id = 'question-deadline';
+    deadlineChip.className = 'question-deadline hidden';
+    title.appendChild(deadlineChip);
+    const holdBtn = document.createElement('button');
+    holdBtn.type = 'button';
+    holdBtn.id = 'question-hold';
+    holdBtn.className = 'question-hold hidden';
+    holdBtn.addEventListener('click', () => {
+      if (!pendingQuestion) return;
+      // Truth stays with the waiter: disable until its refresh (the same-id
+      // re-emission) lands and renderQuestionDeadline re-enables.
+      holdBtn.disabled = true;
+      sendQuestionHold(!pendingQuestion.held);
+    });
+    title.appendChild(holdBtn);
+    const tuck = document.createElement('button');
+    tuck.type = 'button';
+    tuck.className = 'question-tuck';
+    tuck.textContent = '–';
+    tuck.title = 'Tuck away — the question stays pending; a chip brings it back';
+    tuck.addEventListener('click', () => setQuestionMinimized(true));
+    title.appendChild(tuck);
+  }
   content.appendChild(title);
+
+  if (archive) {
+    // The banner makes the mode unmistakable: this is the archive, not a
+    // live ask. Relative age reads fast; the tooltip keeps the instant.
+    const banner = document.createElement('div');
+    banner.className = 'question-archive-banner';
+    const when = Number(archive.answeredAtMs) || 0;
+    const rel = when ? sessionRelativeLabel(new Date(when).toISOString()) : '';
+    banner.textContent = archive.answered
+      ? `✓ Answered ${rel || 'earlier'}`
+        + `${archive.answeredLabel ? ` by ${archive.answeredLabel}` : ''} — read-only record`
+      : `✓ Resolved ${rel || 'earlier'} without a recorded answer — read-only record`;
+    if (when) banner.title = new Date(when).toLocaleString();
+    content.appendChild(banner);
+    // A plain-text reply (typed in the Agenda tab's inline input) has no
+    // structured maps — the record then leads with the reply verbatim.
+    const r = archive.resolution || {};
+    const structured = ['answers', 'selections', 'followups', 'annotations']
+      .some((key) => r[key] && Object.keys(r[key]).length);
+    if (archive.answered && !structured && archive.plainText) {
+      const plain = document.createElement('div');
+      plain.className = 'question-archive-plain';
+      plain.textContent = `↳ ${archive.plainText}`;
+      plain.title = 'The recorded reply (plain text)';
+      content.appendChild(plain);
+    }
+  }
 
   // Pinned index (3+ questions): one chip per header, kept above the
   // scroll region; tapping a chip jumps to its question, and
@@ -4486,6 +4600,9 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held, opts) {
       chip.textContent = q.header || `Q${qIndex + 1}`;
       chip.title = q.question;
       chip.addEventListener('click', () => scrollQuestionIntoView(qIndex));
+      // Record view: ticks come from the recorded resolution, not the DOM
+      // (updateQuestionProgress never runs here).
+      if (archive && questionArchiveEngaged(archive, q)) chip.classList.add('answered');
       index.appendChild(chip);
     });
     content.appendChild(index);
@@ -4520,8 +4637,9 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held, opts) {
     text.textContent = q.question;
     block.appendChild(text);
 
-    appendQuestionPreviews(block, q, qIndex);
+    appendQuestionPreviews(block, q, qIndex, archive);
 
+    const recordedPicks = archive ? questionArchiveSelections(archive, q) : [];
     const options = document.createElement('div');
     options.className = 'question-options';
     (q.options || []).forEach((opt, optIndex) => {
@@ -4529,7 +4647,13 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held, opts) {
       btn.className = 'question-option';
       btn.type = 'button';
       btn.dataset.label = opt.label;
-      btn.addEventListener('click', () => questionOptionClicked(qIndex, optIndex));
+      if (archive) {
+        // Recorded picks render selected; every option is inert.
+        btn.disabled = true;
+        if (recordedPicks.includes(opt.label)) btn.classList.add('selected');
+      } else {
+        btn.addEventListener('click', () => questionOptionClicked(qIndex, optIndex));
+      }
       const label = document.createElement('span');
       label.className = 'question-option-label';
       label.textContent = opt.label;
@@ -4544,11 +4668,54 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held, opts) {
     });
     block.appendChild(options);
 
-    // Multi-pick questions carry a live "n/max selected" counter.
-    if (bounds.max > 1) {
+    // Multi-pick questions carry a live "n/max selected" counter (an input
+    // aid — the record view shows the picks themselves instead).
+    if (!archive && bounds.max > 1) {
       const counter = document.createElement('span');
       counter.className = 'question-pick-count';
       block.appendChild(counter);
+    }
+
+    if (archive) {
+      // A typed answer recorded for this question (free text, or a plain
+      // reply on an option-less question) — shown as the inert input it
+      // was typed into, only when one exists.
+      const optionLabels = new Set((q.options || []).map((o) => o.label));
+      let typed = recordedPicks.filter((label) => !optionLabels.has(label)).join(', ');
+      if (!recordedPicks.length) {
+        const answers = (archive.resolution || {}).answers || {};
+        if (answers[q.question]) typed = answers[q.question];
+      }
+      if (typed) {
+        const free = document.createElement('input');
+        free.className = 'question-free-text';
+        free.type = 'text';
+        free.value = typed;
+        free.disabled = true;
+        free.title = 'The recorded typed answer';
+        block.appendChild(free);
+      }
+      // The recorded follow-up and any notes whose preview card is gone
+      // render as content — the record shows everything that was sent.
+      const followup = ((archive.resolution || {}).followups || {})[q.question];
+      if (followup !== undefined) {
+        const recorded = document.createElement('div');
+        recorded.className = 'question-followup-recorded';
+        recorded.textContent = `↩ Follow-up: ${followup}`;
+        block.appendChild(recorded);
+      }
+      const cardLabels = new Set(
+        (q.previews || []).map((p, pIndex) => p.label || `#${pIndex + 1}`));
+      (((archive.resolution || {}).annotations || {})[q.question] || [])
+        .filter((note) => !cardLabels.has(note.preview))
+        .forEach((note) => {
+          const recorded = document.createElement('div');
+          recorded.className = 'question-followup-recorded';
+          recorded.textContent = `✎ Note on ${note.preview}: ${note.note}`;
+          block.appendChild(recorded);
+        });
+      scroll.appendChild(block);
+      return;
     }
 
     if (questionFreeTextAllowed(q)) {
@@ -4596,33 +4763,67 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held, opts) {
   content.appendChild(scroll);
   // Counters resolve via the live DOM — initialize them only once the
   // scroll region is attached.
-  list.forEach((_, qIndex) => updateQuestionPickCounter(qIndex));
+  if (!archive) list.forEach((_, qIndex) => updateQuestionPickCounter(qIndex));
 
   const actions = document.createElement('div');
   actions.className = 'approval-actions';
-  const submit = document.createElement('button');
-  submit.className = 'approve';
-  submit.textContent = 'Submit answer';
-  submit.addEventListener('click', () => sendQuestionAnswer());
-  actions.appendChild(submit);
-  const skip = document.createElement('button');
-  skip.textContent = 'Skip';
-  skip.title = 'Dismiss without answering (the agent proceeds on its own judgment)';
-  skip.addEventListener('click', () => sendQuestionAnswer({ skip: true }));
-  actions.appendChild(skip);
-  if (multi) {
-    const progress = document.createElement('span');
-    progress.className = 'question-progress';
-    progress.id = 'question-progress';
-    actions.appendChild(progress);
+  if (archive) {
+    // The record's actions: leave, or reopen to change the answer (the
+    // existing reopen op — the ask re-surfaces live; the log keeps this
+    // answer as history).
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = 'Close';
+    closeBtn.addEventListener('click', () => hidePanel('question-panel'));
+    actions.appendChild(closeBtn);
+    const reopenBtn = document.createElement('button');
+    reopenBtn.textContent = 'Reopen to change answer';
+    reopenBtn.title =
+      'Reopens the agenda question and re-surfaces the live panel for a fresh answer '
+      + '— the recorded reply stays in the item log as history';
+    reopenBtn.addEventListener('click', async () => {
+      if (typeof archive.onReopen !== 'function') return;
+      reopenBtn.disabled = true;
+      const ok = await archive.onReopen();
+      // On success the live panel replaced this record; on failure the
+      // record stays up and the button re-arms.
+      if (ok === false) reopenBtn.disabled = false;
+    });
+    actions.appendChild(reopenBtn);
+    if (multi) {
+      const progress = document.createElement('span');
+      progress.className = 'question-progress';
+      const engaged = list.filter((q) => questionArchiveEngaged(archive, q)).length;
+      progress.textContent = `${engaged} of ${list.length} answered`;
+      actions.appendChild(progress);
+    }
+  } else {
+    const submit = document.createElement('button');
+    submit.className = 'approve';
+    submit.textContent = 'Submit answer';
+    submit.addEventListener('click', () => sendQuestionAnswer());
+    actions.appendChild(submit);
+    const skip = document.createElement('button');
+    skip.textContent = 'Skip';
+    skip.title = 'Dismiss without answering (the agent proceeds on its own judgment)';
+    skip.addEventListener('click', () => sendQuestionAnswer({ skip: true }));
+    actions.appendChild(skip);
+    if (multi) {
+      const progress = document.createElement('span');
+      progress.className = 'question-progress';
+      progress.id = 'question-progress';
+      actions.appendChild(progress);
+    }
   }
   content.appendChild(actions);
-  updateQuestionProgress();
+  if (!archive) updateQuestionProgress();
 
-  // Station surfaces the question through the existing human-question rail.
-  const extra = list.length > 1 ? ` [+${list.length - 1} more]` : '';
-  stationCurrentHumanQuestion = `${list[0].question}${extra}`;
-  stationScheduleUpdate();
+  // Station surfaces a LIVE question through the existing human-question
+  // rail; a record raises no attention anywhere.
+  if (!archive) {
+    const extra = list.length > 1 ? ` [+${list.length - 1} more]` : '';
+    stationCurrentHumanQuestion = `${list[0].question}${extra}`;
+    stationScheduleUpdate();
+  }
   revealActivityLogPanel();
   const panel = document.getElementById('question-panel');
   // Preview-bearing questions escape the reading-column measure — the
@@ -4631,13 +4832,16 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held, opts) {
     'has-previews',
     list.some((entry) => Array.isArray(entry.previews) && entry.previews.length)
   );
+  panel.classList.toggle('question-archive', !!archive);
   // A genuinely new question always surfaces, even if an earlier one was
   // tucked away (same-id re-deliveries return early above and never reach
   // this).
   setQuestionMinimized(false);
   panel.classList.add('visible');
-  setApprovalIndicator(true);
-  applyQuestionDeadline(expiresAtMs, held);
+  if (!archive) {
+    setApprovalIndicator(true);
+    applyQuestionDeadline(expiresAtMs, held);
+  }
 }
 
 function clearPendingQuestion() {
@@ -4646,9 +4850,9 @@ function clearPendingQuestion() {
   stationCurrentHumanQuestion = '';
   stationScheduleUpdate();
   setApprovalIndicator(false);
-  // Resolved: drop the tucked-away chip and the wide-panel state.
+  // Resolved: drop the tucked-away chip and the wide-panel/archive state.
   setQuestionMinimized(false);
-  document.getElementById('question-panel')?.classList.remove('has-previews');
+  document.getElementById('question-panel')?.classList.remove('has-previews', 'question-archive');
 }
 
 function showPanel(id) { hideAllPanels(); document.getElementById(id).classList.add('visible'); }
