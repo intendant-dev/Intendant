@@ -4,7 +4,8 @@
 // on the human — fed from the same server events the panels render
 // (approval_required / user_question / approval_resolved, plus session
 // terminations), keyed by (kind, session, id) so future kinds (display
-// requests, agent notify) drop in cheaply.
+// requests, agent notify, the coordination radar's retractable overlap
+// flag) drop in cheaply.
 //
 // Surfaces, in escalation order:
 //   1. document-title prefix `(N)` + favicon count badge — default ON
@@ -131,6 +132,18 @@ function attentionApplyEvent(d, live) {
     if ((urgency === 'attention' || urgency === 'urgent') && live && document.hidden) {
       attentionAdd('notify', d.session_id, d.id, live);
     }
+  } else if (ev === 'coordination_radar') {
+    // Collision-radar flag (Track C §2.8): retractable BY DESIGN —
+    // 'raised' adds, 'resolved' retracts the same (session, id) item,
+    // which is why the radar has its own kind instead of riding
+    // fire-and-forget notifications. Like 'display', the flag's
+    // lifecycle is the radar's, not the turn's.
+    if (d.state === 'raised') {
+      attentionAdd('radar', d.session_id, d.id, live);
+    } else if (d.state === 'resolved') {
+      attentionRemove('radar', d.session_id, d.id);
+      attentionRepaint();
+    }
   } else if (ev === 'approval_resolved') {
     // Approvals and questions share the id space; resolve either.
     attentionRemove('approval', d.session_id, d.id);
@@ -140,10 +153,13 @@ function attentionApplyEvent(d, live) {
     // The blocked loop returned — approvals/questions in that session no
     // longer wait (some exit paths skip approval_resolved). A display
     // request survives: its waiter is the blocked MCP call, not the turn;
-    // it clears via display_request_resolved or session_ended.
+    // it clears via display_request_resolved or session_ended. A radar
+    // flag survives for the same reason: the files still overlap until
+    // the radar says 'resolved' (or session_ended).
     const sessionKey = attentionSessionKey(d.session_id);
     for (const [key, item] of [...attentionItems]) {
-      if (attentionSessionKey(item.sessionId) === sessionKey && item.kind !== 'display') {
+      if (attentionSessionKey(item.sessionId) === sessionKey
+          && item.kind !== 'display' && item.kind !== 'radar') {
         attentionItems.delete(key);
       }
     }
@@ -239,11 +255,13 @@ function attentionShowNotification(items) {
   const questions = items.filter((i) => i.kind === 'question').length;
   const displayRequests = items.filter((i) => i.kind === 'display').length;
   const notifies = items.filter((i) => i.kind === 'notify').length;
+  const radars = items.filter((i) => i.kind === 'radar').length;
   let title;
   if (items.length === 1) {
     title = questions ? 'Intendant: the agent has a question'
       : displayRequests ? 'Intendant: agent asks to view your screen'
       : notifies ? 'Intendant: the agent sent a notification'
+      : radars ? 'Intendant: sessions are overlapping on files'
       : 'Intendant: approval needed';
   } else {
     const parts = [];
@@ -251,6 +269,7 @@ function attentionShowNotification(items) {
     if (questions) parts.push(`${questions} question${questions > 1 ? 's' : ''}`);
     if (displayRequests) parts.push(`${displayRequests} display request${displayRequests > 1 ? 's' : ''}`);
     if (notifies) parts.push(`${notifies} notification${notifies > 1 ? 's' : ''}`);
+    if (radars) parts.push(`${radars} overlap alert${radars > 1 ? 's' : ''}`);
     title = `Intendant: ${parts.join(' and ')} waiting`;
   }
   const total = attentionItems.size;
