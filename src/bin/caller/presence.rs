@@ -1146,7 +1146,10 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         // Peer-delegation delivery receipts are wire-facing correlation
         // events (OutboundEvent::TaskReceived); the accepted task
         // narrates itself through its own session lifecycle.
-        | AppEvent::TaskReceived { .. } => None,
+        | AppEvent::TaskReceived { .. }
+        // Radar flags are dashboard attention items; the flagged
+        // session's own injected block is what the model narrates from.
+        | AppEvent::CoordinationRadar { .. } => None,
     }
 }
 

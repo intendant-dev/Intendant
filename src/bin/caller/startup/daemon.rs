@@ -161,9 +161,11 @@ pub(crate) async fn run_daemon(
     // Collision radar (Track C, C2 — ruled §2.1): periodic zero-LLM
     // detection over bus declarations ∪ observed git status (the same
     // registry the vitals prober probes) ∪ open-PR file sets; publishes
-    // per-space snapshots for the injection seam and writes deduplicated
-    // radar notes to flagged parties.
-    let _radar_task = crate::coordination::radar::spawn_radar_task(vitals_git_targets.clone());
+    // per-space snapshots for the injection seam, writes deduplicated
+    // radar notes to flagged parties, and broadcasts the §2.8 rail-badge
+    // raise/resolve transitions on the bus.
+    let _radar_task =
+        crate::coordination::radar::spawn_radar_task(vitals_git_targets.clone(), bus.clone());
     // Restored sessions: a restart empties the target registry, so idle
     // session windows lose their git/health chips until the next resume.
     // One bounded walk (newest-first, insert-if-absent — see

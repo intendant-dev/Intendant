@@ -32,7 +32,14 @@
 //!
 //! Zero-LLM and deterministic: identical inputs render byte-identical
 //! blocks; every collection consumed is pre-sorted by the radar.
-#![cfg_attr(not(test), allow(dead_code))] // C2 staging: consumed by the per-turn injection seam + delivery lanes (PR E). Drop as that wiring lands.
+//!
+//! The second product here is the **external ALERT steer line** (§2.8):
+//! [`render_alert_steers`] renders one schema-rendered single line per
+//! distinct overlap set per session pair (or per open PR) for the
+//! supervised-external delivery lane. Ambient content — presence,
+//! messages, invalid counts — has no path into that lane by
+//! construction: the function consumes the snapshot's overlap
+//! collections only (R8: ambient is never pushed at externals).
 
 use std::collections::BTreeMap;
 
@@ -389,6 +396,154 @@ fn assemble(c: &Candidates) -> Option<(String, bool)> {
     }
     text.push_str(MARKER);
     Some((text, take_overlaps > 0))
+}
+
+/// §2.8: byte bound for one external ALERT steer line (self-enforced —
+/// nothing downstream truncates steer text either).
+pub(crate) const STEER_LINE_MAX_BYTES: usize = 512;
+/// Overlap paths listed on one steer line; the remainder renders as the
+/// fixed `(+<n> more)` template token.
+pub(crate) const STEER_MAX_PATHS_LISTED: usize = 4;
+
+/// One external ALERT steer (§2.8): a schema-rendered single line for
+/// one distinct overlap set, plus the set's canonical hash — the
+/// identity the daemon-side [`super::radar::ExternalSteerLedger`] keys
+/// its one-steer-per-set dedup on. The hash covers the counterparty and
+/// the sorted path set, deliberately NOT the evidence sources, so a
+/// declared→declared+git shift alone does not remint a steer (the
+/// radar-note lane's canon, `messages::write_radar_note`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AlertSteer {
+    pub text: String,
+    pub set_hash: u64,
+}
+
+/// Render the §2.8 external ALERT steer lines for one session: one per
+/// counterparty session pair (paths grouped into the pair's set) and
+/// one per open PR. Every token passes its §2.3 validator; invalid
+/// tokens are skipped (a set with no valid path renders nothing — the
+/// external lane has no `invalid:` channel, and the native block
+/// already surfaces the counts). Empty when the session has no ALERT
+/// overlaps — ambient snapshot content cannot reach this lane because
+/// nothing here reads it.
+pub(crate) fn render_alert_steers(
+    snapshot: &SpaceRadarSnapshot,
+    own_writer_id: &str,
+) -> Vec<AlertSteer> {
+    if !valid_space_key_label(&snapshot.space_key) {
+        return Vec::new(); // nothing safe to say at all (§2.3)
+    }
+    let mut steers = Vec::new();
+
+    // Pair sets: group this session's pair overlaps per counterparty.
+    #[derive(Default)]
+    struct PairSet<'a> {
+        paths: std::collections::BTreeSet<&'a str>,
+        declared: bool,
+        git: bool,
+    }
+    let mut pairs: BTreeMap<&str, PairSet<'_>> = BTreeMap::new();
+    for o in &snapshot.pair_overlaps {
+        let other = if o.a == own_writer_id {
+            &o.b
+        } else if o.b == own_writer_id {
+            &o.a
+        } else {
+            continue; // someone else's collision (§2.7 own-scope)
+        };
+        if !valid_id(other) || !scan::valid_rel_path(&o.path) {
+            continue;
+        }
+        let entry = pairs.entry(other.as_str()).or_default();
+        entry.paths.insert(o.path.as_str());
+        entry.declared |= o.declared;
+        entry.git |= o.git;
+    }
+    for (other, set) in &pairs {
+        let sources = match (set.declared, set.git) {
+            (true, true) => "declared+git",
+            (true, false) => "declared",
+            (false, true) => "git",
+            (false, false) => continue, // sourceless set: nothing to claim
+        };
+        let tail = format!(" — with {} ({sources})", id8(other));
+        if let Some(text) = assemble_steer_line(&snapshot.space_key, &set.paths, &tail) {
+            steers.push(AlertSteer {
+                text,
+                set_hash: steer_set_hash(&format!("pair:{other}"), &set.paths),
+            });
+        }
+    }
+
+    // PR sets: group this session's PR overlaps per PR number.
+    let mut prs: BTreeMap<u32, std::collections::BTreeSet<&str>> = BTreeMap::new();
+    for o in &snapshot.pr_overlaps {
+        if o.writer != own_writer_id || !scan::valid_rel_path(&o.path) {
+            continue;
+        }
+        prs.entry(o.pr).or_default().insert(o.path.as_str());
+    }
+    for (pr, paths) in &prs {
+        let tail = format!(" — pr#{pr}");
+        if let Some(text) = assemble_steer_line(&snapshot.space_key, paths, &tail) {
+            steers.push(AlertSteer {
+                text,
+                set_hash: steer_set_hash(&format!("pr:{pr}"), paths),
+            });
+        }
+    }
+    steers
+}
+
+/// Canonical overlap-set identity for the ledger: counterparty (or PR)
+/// plus the sorted path set; sources excluded (see [`AlertSteer`]).
+fn steer_set_hash(counterparty: &str, paths: &std::collections::BTreeSet<&str>) -> u64 {
+    let canonical = format!(
+        "steer:{counterparty};paths={}",
+        paths.iter().copied().collect::<Vec<_>>().join(",")
+    );
+    super::fnv1a_64(canonical.as_bytes())
+}
+
+/// Assemble one steer line under [`STEER_LINE_MAX_BYTES`]: the §2.2
+/// header vocabulary + the ALERT marker + up to
+/// [`STEER_MAX_PATHS_LISTED`] display-bounded paths + the fixed
+/// `(+<n> more)` count for the rest + the pair/PR tail. Paths drop from
+/// the back (into the count) under byte pressure; `None` only when no
+/// path in the set survives its validator.
+fn assemble_steer_line(
+    space_key: &str,
+    paths: &std::collections::BTreeSet<&str>,
+    tail: &str,
+) -> Option<String> {
+    let displayed: Vec<String> = paths.iter().filter_map(|p| display_path(p)).collect();
+    if displayed.is_empty() {
+        return None;
+    }
+    let total = displayed.len();
+    let mut listed = displayed.len().min(STEER_MAX_PATHS_LISTED);
+    loop {
+        let mut line = format!(
+            "[System] coordination v1 space={space_key} ! overlap {}",
+            displayed[..listed].join(", ")
+        );
+        if total > listed {
+            line.push_str(&format!(" (+{} more)", total - listed));
+        }
+        line.push_str(tail);
+        if line.len() <= STEER_LINE_MAX_BYTES {
+            debug_assert!(!line.contains('\n'), "steer lines are single-line");
+            return Some(line);
+        }
+        if listed == 1 {
+            // A single display-bounded path always fits: header ≤ ~130
+            // bytes, path ≤ 120 chars, tail ≤ ~40. Defensive fallback
+            // rather than an unreachable!: drop the line, never emit an
+            // over-bound steer.
+            return None;
+        }
+        listed -= 1;
+    }
 }
 
 #[cfg(test)]
@@ -962,5 +1117,186 @@ mod tests {
             render_block(&snapshot, OWN, None, 0, 7).unwrap().text
         };
         assert_eq!(make(&observed_a), make(&observed_b));
+    }
+
+    // ── §2.8 external ALERT steer lines ──
+
+    /// RULED binding (R8): ambient content cannot reach the external
+    /// steer lane. A snapshot rich in every ambient signal — presence,
+    /// broadcast and addressed messages, invalid counts — but with no
+    /// ALERT overlap renders ZERO steers; the native block for the same
+    /// snapshot happily renders the ambient lines. Type-level backstop:
+    /// `render_alert_steers` reads only the overlap collections, so
+    /// there is no code path from ambient fields into a steer.
+    #[test]
+    fn ambient_content_never_reaches_the_steer_lane() {
+        let mut s = base_snapshot();
+        s.sessions.push(presence("s-other", Some("codex"), false));
+        s.sessions.push(presence("s-tired", None, true));
+        s.messages.push(message("s-peer", "m-0123456789ab", None));
+        s.messages
+            .push(message("s-peer", "m-0123456789ac", Some(OWN)));
+        s.invalid = 7;
+        assert!(
+            render_block(&s, OWN, None, 0, 0).is_some(),
+            "the native block DOES carry this ambient signal"
+        );
+        assert!(
+            render_alert_steers(&s, OWN).is_empty(),
+            "no ALERT ⇒ no steer, ever"
+        );
+
+        // Foreign pairs and foreign PR overlaps are someone else's
+        // alerts — still nothing for this session's lane.
+        s.pair_overlaps
+            .push(pair("src/foreign.rs", "s-xx", "s-yy", true, false));
+        s.pr_overlaps.push(RadarPrOverlap {
+            path: "docs/theirs.md".to_string(),
+            writer: "s-other".to_string(),
+            pr: 9,
+        });
+        assert!(render_alert_steers(&s, OWN).is_empty());
+    }
+
+    /// One steer per distinct overlap set per session pair / per PR,
+    /// schema-shaped, paths grouped and sorted, ambient tokens absent.
+    #[test]
+    fn steer_lines_group_sets_per_pair_and_pr() {
+        let mut s = base_snapshot();
+        s.sessions.push(presence("s-other-one", Some("codex"), false));
+        s.messages.push(message("s-peer", "m-0123456789ab", None));
+        s.pair_overlaps
+            .push(pair("src/b.rs", OWN, "s-other-one", true, false));
+        s.pair_overlaps
+            .push(pair("src/a.rs", "s-other-one", OWN, false, true));
+        s.pair_overlaps
+            .push(pair("src/c.rs", OWN, "s-second", false, true));
+        s.pr_overlaps.push(RadarPrOverlap {
+            path: "docs/mine.md".to_string(),
+            writer: OWN.to_string(),
+            pr: 566,
+        });
+        let steers = render_alert_steers(&s, OWN);
+        assert_eq!(steers.len(), 3, "{steers:?}");
+        assert_eq!(
+            steers[0].text,
+            format!(
+                "[System] coordination v1 space={SPACE} ! overlap src/a.rs, src/b.rs — with s-other- (declared+git)"
+            )
+        );
+        assert_eq!(
+            steers[1].text,
+            format!("[System] coordination v1 space={SPACE} ! overlap src/c.rs — with s-second (git)")
+        );
+        assert_eq!(
+            steers[2].text,
+            format!("[System] coordination v1 space={SPACE} ! overlap docs/mine.md — pr#566")
+        );
+        for steer in &steers {
+            assert!(!steer.text.contains('\n'), "single line");
+            assert!(
+                !steer.text.contains("messages:") && !steer.text.contains("sessions:"),
+                "ambient vocabulary never rides a steer: {}",
+                steer.text
+            );
+        }
+        // Distinct sets ⇒ distinct hashes; a pure evidence shift on the
+        // same set ⇒ the SAME hash (radar-note canon).
+        assert_ne!(steers[0].set_hash, steers[1].set_hash);
+        let mut shifted = base_snapshot();
+        shifted
+            .pair_overlaps
+            .push(pair("src/b.rs", OWN, "s-other-one", false, true));
+        shifted
+            .pair_overlaps
+            .push(pair("src/a.rs", "s-other-one", OWN, false, true));
+        let shifted = render_alert_steers(&shifted, OWN);
+        assert_eq!(shifted[0].set_hash, steers[0].set_hash);
+        assert_ne!(shifted[0].text, steers[0].text, "sources still render");
+        assert!(shifted[0].text.ends_with("(git)"), "{}", shifted[0].text);
+    }
+
+    /// Hostile tokens are skipped, never rendered; a set with no valid
+    /// path renders nothing at all.
+    #[test]
+    fn steer_lines_drop_hostile_tokens() {
+        let mut s = base_snapshot();
+        s.pair_overlaps
+            .push(pair("evil path.rs", OWN, "s-other", true, false));
+        s.pair_overlaps
+            .push(pair("ansi\u{1b}[31m.rs", OWN, "s-other", true, false));
+        s.pair_overlaps
+            .push(pair("src/fine.rs", OWN, "UPPER ID", true, false));
+        s.pr_overlaps.push(RadarPrOverlap {
+            path: "-dash.rs".to_string(),
+            writer: OWN.to_string(),
+            pr: 3,
+        });
+        assert!(
+            render_alert_steers(&s, OWN).is_empty(),
+            "nothing valid to say"
+        );
+
+        s.pair_overlaps
+            .push(pair("src/ok.rs", OWN, "s-other", false, true));
+        let steers = render_alert_steers(&s, OWN);
+        assert_eq!(steers.len(), 1);
+        assert!(steers[0].text.contains("src/ok.rs"));
+        for hostile in ["evil path", "\u{1b}", "UPPER", "-dash.rs"] {
+            assert!(!steers[0].text.contains(hostile), "{hostile:?} leaked");
+        }
+
+        let mut hostile_key = base_snapshot();
+        hostile_key.space_key = "Bad Key!".to_string();
+        hostile_key
+            .pair_overlaps
+            .push(pair("src/ok.rs", OWN, "s-other", true, true));
+        assert!(render_alert_steers(&hostile_key, OWN).is_empty());
+    }
+
+    /// The steer line holds its own byte wall: many long paths list at
+    /// most [`STEER_MAX_PATHS_LISTED`], the rest fold into the fixed
+    /// `(+<n> more)` token, and byte pressure drops listed paths from
+    /// the back rather than overflowing.
+    #[test]
+    fn steer_lines_hold_the_byte_cap() {
+        let mut s = base_snapshot();
+        let long_paths: Vec<String> = (0..12)
+            .map(|i| format!("src/{i:02}{}", "p".repeat(110)))
+            .collect();
+        for p in &long_paths {
+            s.pair_overlaps.push(pair(p, OWN, "s-other", true, true));
+        }
+        let steers = render_alert_steers(&s, OWN);
+        assert_eq!(steers.len(), 1);
+        let text = &steers[0].text;
+        assert!(
+            text.len() <= STEER_LINE_MAX_BYTES,
+            "{} bytes: {text}",
+            text.len()
+        );
+        assert!(text.contains(" more)"), "{text}");
+        let listed = text.matches("src/").count();
+        assert!(listed >= 1 && listed <= STEER_MAX_PATHS_LISTED, "{text}");
+        assert!(
+            text.contains(&format!("(+{} more)", 12 - listed)),
+            "count stays exact: {text}"
+        );
+        assert!(text.ends_with("— with s-other (declared+git)"), "{text}");
+    }
+
+    /// Determinism: same snapshot, same steer bytes and hashes.
+    #[test]
+    fn steer_rendering_is_deterministic() {
+        let mut s = base_snapshot();
+        s.pair_overlaps
+            .push(pair("src/y.rs", OWN, "s-other", true, false));
+        s.pair_overlaps
+            .push(pair("src/x.rs", OWN, "s-other", false, true));
+        let a = render_alert_steers(&s, OWN);
+        let b = render_alert_steers(&s, OWN);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 1);
+        assert!(a[0].text.contains("src/x.rs, src/y.rs"), "{}", a[0].text);
     }
 }

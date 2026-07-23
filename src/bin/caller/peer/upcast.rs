@@ -632,7 +632,10 @@ impl AppEventUpcaster {
             // nor its ask outcomes (delivery is a local-supervisor act).
             | AppEvent::AgendaChanged { .. }
             | AppEvent::AgendaAskOutcome { .. }
-            | AppEvent::MemoryChanged { .. } => vec![],
+            | AppEvent::MemoryChanged { .. }
+            // Coordination-radar flags are box-local attention state
+            // (the bus never leaves the box).
+            | AppEvent::CoordinationRadar { .. } => vec![],
 
             AppEvent::UserMessageEditStatus {
                 user_turn_index,
@@ -2109,6 +2112,9 @@ impl WireEventUpcaster {
             | OutboundEvent::BrowserWorkspaceChanged { .. }
             | OutboundEvent::SessionRenameResult { .. }
             | OutboundEvent::SessionAgentConfigResult { .. }
+            // A peer's coordination-radar flags are its own box-local
+            // attention state (same class as the AppEvent twin above).
+            | OutboundEvent::CoordinationRadar { .. }
             | OutboundEvent::PeerAdded { .. }
             | OutboundEvent::PeerRemoved { .. }
             | OutboundEvent::PeerStateChanged { .. }

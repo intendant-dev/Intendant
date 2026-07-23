@@ -553,6 +553,20 @@ pub enum AppEvent {
     /// the session log for replay, never injected into any model context,
     /// and never blocking. `urgency` escalates delivery (attention center,
     /// Connect nudge) — see [`crate::types::NotificationUrgency`].
+    /// Collision-radar flag transition for a supervised session (Track C
+    /// §2.8, R8), emitted by the daemon radar task when the session's
+    /// ALERT overlap set first appears (`raised`) and when it clears or
+    /// the session goes away (`resolved`). `id` is the flag's stable
+    /// identity — the session's coordination space key — so a resolve
+    /// always retracts the raise it pairs with. Display-only: frontends
+    /// map it to the retractable `radar` attention kind; the external
+    /// ALERT steer lane polls radar state on its own cooldown-gated
+    /// cadence and never keys deliveries off this event.
+    CoordinationRadar {
+        session_id: String,
+        id: String,
+        state: crate::types::CoordinationRadarState,
+    },
     UserNotification {
         session_id: Option<String>,
         id: String,
@@ -3077,6 +3091,15 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             text: text.clone(),
             urgency: *urgency,
             ts: *ts,
+        }),
+        AppEvent::CoordinationRadar {
+            session_id,
+            id,
+            state,
+        } => Some(OutboundEvent::CoordinationRadar {
+            session_id: session_id.clone(),
+            id: id.clone(),
+            state: *state,
         }),
         AppEvent::AutoApproved { preview } => Some(OutboundEvent::AutoApproved {
             preview: preview.clone(),
