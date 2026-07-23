@@ -3728,6 +3728,13 @@ pub(crate) async fn run_external_agent_mode(
         }
     }
 
+    // The supervised span is over: reconcile sub-agent children that never
+    // reported a terminal (their processes die with the backend). The
+    // reader's own EOF sweep cannot cover this — `shutdown()` below aborts
+    // the reader task before it can see EOF — and a child resumed by the
+    // next wrapper re-arms through its own stream.
+    sweep_stranded_external_subagents(&drain_config, &mut stats);
+
     if let Err(e) = agent.shutdown().await {
         slog(&session_log, |l| {
             l.warn(&format!("Agent shutdown error: {}", e))

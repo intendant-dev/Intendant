@@ -3111,6 +3111,41 @@ pub(crate) fn emit_external_subagent_terminal(
     }
 }
 
+/// The supervised backend is going away with sub-agent children still
+/// open: close every child this drain announced that never reported a
+/// terminal state, so frontends don't show them running forever. In-band
+/// children die with their backend process, so at drain end "no terminal
+/// seen" IS the terminal fact.
+///
+/// This is the supervisor-side twin of the reader's
+/// `close_open_task_children`: the reader's sweep only runs when its task
+/// survives to see stdout EOF, and `shutdown()` aborts the reader first —
+/// on every orderly stop/restart the reader sweep never runs (the
+/// 2026-07-22 strand: nine children left at "running" across wrapper
+/// rotations). `LoopStats` lives for the whole supervised span, so this
+/// sweep sees children across every process the wrapper cycled through.
+/// A child genuinely resumed by the NEXT wrapper re-arms through its own
+/// stream (`note_external_subagent_liveness` clears the terminal dedupe),
+/// so closing here never strands a real resume.
+pub(crate) fn sweep_stranded_external_subagents(config: &DrainConfig<'_>, stats: &mut LoopStats) {
+    let mut open: Vec<String> = stats
+        .codex_subagent_sessions
+        .iter()
+        .filter(|child| !stats.codex_subagent_terminal_sessions.contains(*child))
+        .cloned()
+        .collect();
+    open.sort();
+    for child in open {
+        let state = external_agent::SubAgentState {
+            thread_id: child,
+            status: "shutdown".to_string(),
+            message: Some("backend ended before the sub-agent reported a result".to_string()),
+        };
+        emit_external_subagent_state(config, &state);
+        emit_external_subagent_terminal(config, stats, &state);
+    }
+}
+
 /// A substantive scoped event from a child thread already marked terminal
 /// proves the thread is alive again — a Claude Code Task resume streams new
 /// envelopes into the same child window — so clear the terminal dedupe and
@@ -5750,6 +5785,99 @@ mod tests {
                 .any(|op| op == "side-close"),
             "side-close must only be advertised on side relationships"
         );
+    }
+
+    #[test]
+    fn stranded_subagent_sweep_closes_only_open_children() {
+        // Drain teardown: children announced during the supervised span
+        // that never reported a terminal are closed as "shutdown";
+        // already-terminal children stay quiet, and a second sweep is a
+        // no-op (the terminal dedupe latches).
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("cc-parent".to_string()),
+            alias_session_id: None,
+            backend_thread_id: None,
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Claude Code".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+            reload_credentials: None,
+            coordination_declaration: None,
+        };
+        let mut stats = LoopStats::default();
+        stats
+            .codex_subagent_sessions
+            .insert("task-OPEN1".to_string());
+        stats
+            .codex_subagent_sessions
+            .insert("task-DONE1".to_string());
+        stats
+            .codex_subagent_terminal_sessions
+            .insert("task-DONE1".to_string());
+
+        sweep_stranded_external_subagents(&config, &mut stats);
+
+        let mut ended = Vec::new();
+        let mut log_lines = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::SessionEnded {
+                    session_id, reason, ..
+                } => ended.push((session_id, reason)),
+                AppEvent::LogEntry {
+                    session_id,
+                    content,
+                    ..
+                } => log_lines.push((session_id, content)),
+                _ => {}
+            }
+        }
+        assert_eq!(ended.len(), 1, "only the open child closes: {ended:?}");
+        assert_eq!(ended[0].0, "task-OPEN1");
+        assert!(
+            ended[0].1.contains("subagent shut down"),
+            "shutdown vocabulary: {}",
+            ended[0].1
+        );
+        assert!(
+            log_lines
+                .iter()
+                .any(|(sid, content)| sid.as_deref() == Some("task-OPEN1")
+                    && content.contains("Session ended:")),
+            "the child window needs its terminal log line: {log_lines:?}"
+        );
+        assert!(stats
+            .codex_subagent_terminal_sessions
+            .contains("task-OPEN1"));
+
+        // Idempotent: the next sweep has nothing left to close.
+        sweep_stranded_external_subagents(&config, &mut stats);
+        let mut second = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, AppEvent::SessionEnded { .. }) {
+                second += 1;
+            }
+        }
+        assert_eq!(second, 0, "a second sweep must be a no-op");
     }
 
     #[test]

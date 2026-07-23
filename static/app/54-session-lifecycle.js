@@ -108,7 +108,16 @@ function onSessionEnded(sessionId, reason, errorKind) {
     meta.relationshipKind === 'side' ||
     String(reason || '').toLowerCase().includes('side conversation closed')
   );
-  const keepExternalDetached = sid && !!externalSource && !shouldRemoveSideWindow && !explicitStop;
+  // A sub-agent child (Claude Code Task window, Codex collab child) is
+  // fire-and-forget: its SessionEnded IS its terminal DONE, so it must
+  // take the done path below — never the external idle+detached parking
+  // that keeps a resumable top-level backend around. Before this fork,
+  // a Task child's terminal left the row un-done (and the "Awaiting
+  // model…"/"Running Agent" pill standing), so finished children were
+  // never offered as closable.
+  const isSubagentChild = sid && meta.relationshipKind === 'subagent';
+  const keepExternalDetached = sid && !!externalSource && !shouldRemoveSideWindow &&
+    !explicitStop && !isSubagentChild;
   if (shouldRemoveSideWindow) {
     clearPendingFollowUpsForSession(sid, 'side conversation closed');
     removeSessionRelationshipsForSession(sid);
