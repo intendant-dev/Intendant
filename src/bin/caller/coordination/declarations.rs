@@ -11,7 +11,8 @@ use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 
 use super::scan::{
-    self, DefensiveRead, LivenessScan, ScanReject, REJECT_GRAMMAR, REJECT_NOT_REGULAR,
+    self, DefensiveRead, LivenessScan, ReadBudget, ScanReject, REJECT_GRAMMAR, REJECT_NOT_REGULAR,
+    REJECT_READ_BUDGET,
 };
 use super::{io_err, restrict_dir_modes, sanitize_key, CoordinationError};
 
@@ -286,10 +287,28 @@ pub(crate) fn scan_dir(
     dir: &Path,
     now_ms: u64,
 ) -> Result<LivenessScan<SessionDeclaration>, CoordinationError> {
+    scan_dir_budgeted(dir, now_ms, &mut ReadBudget::unbounded())
+}
+
+/// [`scan_dir`] under a §1.6 whole-space read budget (the radar's
+/// entry): entries the budget refuses are surfaced as
+/// `read-budget` rejections without ever being opened.
+pub(crate) fn scan_dir_budgeted(
+    dir: &Path,
+    now_ms: u64,
+    budget: &mut ReadBudget,
+) -> Result<LivenessScan<SessionDeclaration>, CoordinationError> {
     let (found, mut rejected) = scan::scan_liveness_dir(dir)?;
     let mut entries = Vec::with_capacity(found.len());
     for entry in found {
         let name = format!("{}.md", entry.stem);
+        if !budget.admit(entry.meta.len()) {
+            rejected.push(ScanReject {
+                name,
+                reason: REJECT_READ_BUDGET,
+            });
+            continue;
+        }
         let bytes = match scan::open_liveness(&entry.path)? {
             DefensiveRead::Ok(bytes) => bytes,
             DefensiveRead::Vanished => continue,
@@ -531,6 +550,30 @@ mod tests {
         let d = &scan.entries[0];
         assert_eq!(d.dirty, vec!["src/ok.rs".to_string()]);
         assert_eq!(d.dirty_dropped, 3, "hostile paths counted, never kept");
+    }
+
+    #[test]
+    fn budgeted_scan_skips_unread_entries_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ds = space(&tmp);
+        for id in ["s-a", "s-b", "s-c"] {
+            ds.write_own(&input(id, "x", &[])).unwrap();
+        }
+        let dir = tmp.path().join("space/sessions");
+        let mut budget = ReadBudget::new(2, u64::MAX);
+        let scan = scan_dir_budgeted(&dir, super::super::now_ms(), &mut budget).unwrap();
+        assert_eq!(scan.entries.len(), 2, "budgeted prefix parses");
+        assert_eq!(scan.rejected.len(), 1);
+        assert_eq!(scan.rejected[0].reason, REJECT_READ_BUDGET);
+        assert_eq!(
+            scan.rejected[0].name, "s-c.md",
+            "deterministic (sorted) drop order"
+        );
+        // Byte budget bites the same way.
+        let mut tight = ReadBudget::new(usize::MAX, 1);
+        let scan = scan_dir_budgeted(&dir, super::super::now_ms(), &mut tight).unwrap();
+        assert!(scan.entries.is_empty());
+        assert_eq!(scan.rejected.len(), 3);
     }
 
     #[test]
