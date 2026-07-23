@@ -327,7 +327,17 @@ the native runtime and all four external backends, pointing at the space
 directory, so children in isolated worktrees land in their parent's
 space. Everything else resolves the space keylessly with
 `intendant coordination dir [--root <path>]` (an administrative local
-computation, like `org` — no daemon reach). The `intendant-coordination`
+computation, like `org` — no daemon reach). The message lane has the
+same keyless surface: `intendant coordination messages` lists message
+metadata one record per line (summaries only — never bodies),
+`read <writer> <id>` prints one message (its summary line, then the body
+verbatim — quoted data), `send [--to <writer>] [--ttl-s <secs>]
+[--as <writer>] [--] [body…]` writes one (body from stdin when no argv;
+identity is `--as` if given, else the inherited `INTENDANT_SESSION_ID`
+mapped to its bus writer id, else a refusal that teaches minting one
+`guest-<id>` and reusing it), and `delete <id>` removes your own —
+never the reserved daemon lane. All verbs take `--root <path>` and honor
+`INTENDANT_COORDINATION_DIR`. The `intendant-coordination`
 skill, installed machine-wide with the other built-ins, teaches the
 read/declare/message recipes and carries a python3 zero-binary fallback
 for the derivation, pinned against the Rust implementation by a parity
