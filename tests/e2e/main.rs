@@ -109,6 +109,11 @@ impl TestRig {
             // here would write this rig's session declarations into the
             // HOST's live bus space instead of the fresh HOME below.
             .env_remove("INTENDANT_COORDINATION_DIR")
+            // The mock provider's request tap is per-test opt-in (the
+            // coordination prefix e2e sets it on its own daemon); an
+            // inherited path would make unrelated rigs cross-write one
+            // dump file.
+            .env_remove("INTENDANT_MOCK_REQUEST_DUMP")
             // The suite is display-free by contract, but a host with a live
             // X session at :0 (a self-hosted runner doubling as a desktop)
             // breaks that hermeticity: the caller's vision probe finds the
@@ -4769,6 +4774,276 @@ async fn supervised_session_writes_task_ask_human_and_steer_message_rows() {
             "Round one done, payload chosen.",
             "Steered round two.",
         ],
+    );
+}
+
+/// Track C C2, RULED binding (§2.6/R6): the coordination radar block
+/// arrives as a NEW tail message and the prior request's serialized
+/// message prefix stays byte-identical — the prefix-cache proof
+/// enacted through the real binaries. Round 1 runs before any bus
+/// signal exists; two fixture declarations sharing a dirty path then
+/// hand the daemon radar a §2.7 overlap, whose radar-note file on disk
+/// is the observable "a tick saw it" gate (the same tick publishes the
+/// snapshot right after writing notes); the steered round 2's first
+/// turn injects the block, gated a second time by the mock script's
+/// own transcript expectation. Request payloads come from the mock
+/// provider's opt-in tap (INTENDANT_MOCK_REQUEST_DUMP): each record's
+/// `messages_json` is the exact serde serialization of that request's
+/// message Vec, so "nothing before the tail changed" is a literal
+/// `starts_with` over bytes.
+#[tokio::test]
+async fn coordination_radar_block_injects_as_a_pure_tail_append() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    let script = rig.write_script(&serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Radar round one.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round one" } }] },
+                { "expect_transcript_contains": "[System] coordination v1",
+                  "content": "Radar block received.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round two" } }] }
+            ]
+        }]
+    }));
+    let session_project = tempfile::tempdir().expect("session project dir");
+    let dump_path = rig.home.path().join("mock-requests.jsonl");
+
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script)
+        .env("INTENDANT_MOCK_REQUEST_DUMP", &dump_path)
+        .args(["--no-tls", "--web", "0"]);
+    let mut child = cmd.spawn().expect("spawn intendant daemon");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let _stderr_drain = drain_pipe_into(child.stderr.take().expect("stderr"), stderr_buf.clone());
+    let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
+    let daemon_log = {
+        let stderr_buf = stderr_buf.clone();
+        move || stderr_buf.lock().map(|b| tail(&b, 4000)).unwrap_or_default()
+    };
+
+    let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
+    let port: u16 = stderr_so_far
+        .lines()
+        .find_map(|line| {
+            let url = line.strip_prefix("Dashboard: http://")?;
+            url.rsplit(':').next()?.trim().parse().ok()
+        })
+        .expect("parse the dashboard port from the startup line");
+    // Gateway readiness (the hand-spawn twin of spawn_daemon's poll), so
+    // a single create_session suffices.
+    let client = reqwest::Client::new();
+    let card_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
+    poll_until(
+        "the gateway to serve the agent card",
+        DAEMON_START_TIMEOUT,
+        || {
+            let client = client.clone();
+            let card_url = card_url.clone();
+            async move { http_get_json(&client, &card_url).await }
+        },
+        &daemon_log,
+    )
+    .await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?token={}",
+        rig_loopback_token(&rig, port)
+    ))
+    .await
+    .expect("connect /ws");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "create_session",
+            "task": "coordinate the radar prefix run",
+            "project_root": session_project.path().to_string_lossy(),
+            "direct": true,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send create_session");
+    let started = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_started")
+            && json.get("task").and_then(|v| v.as_str())
+                == Some("coordinate the radar prefix run")
+    })
+    .await
+    .unwrap_or_else(|| panic!("session never started:\n{}", daemon_log()));
+    let session_id = started
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("started session id")
+        .to_string();
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| panic!("round 1 never completed:\n{}", daemon_log()));
+
+    // The parked session's own §1.5 declaration marks the live space.
+    let coordination_root = rig.home.path().join(".intendant").join("coordination");
+    let space_dir = poll_until(
+        "the session's coordination space to appear",
+        RUN_TIMEOUT,
+        || {
+            let root = coordination_root.clone();
+            async move {
+                std::fs::read_dir(&root).ok()?.flatten().map(|e| e.path()).find(|p| {
+                    std::fs::read_dir(p.join("sessions"))
+                        .is_ok_and(|mut entries| entries.next().is_some())
+                })
+            }
+        },
+        &daemon_log,
+    )
+    .await;
+    let space_key = space_dir
+        .file_name()
+        .expect("space dir basename")
+        .to_string_lossy()
+        .to_string();
+
+    // Two fixture declarations sharing a dirty path: the §2.7 pair
+    // overlap the radar flags. Written AFTER round 1, so round 1's
+    // request predates any coordination signal by construction.
+    for id in ["s-fake-a", "s-fake-b"] {
+        let doc = format!(
+            "---\nv: 1\nkind: session-declaration\nid: {id}\nbackend: native\ncreated_ms: 1\n---\n\
+             ## intent\noccupying the same space\n\n## dirty\n- shared/hot.rs\n"
+        );
+        std::fs::write(space_dir.join("sessions").join(format!("{id}.md")), doc)
+            .expect("write fixture declaration");
+    }
+    // The radar's deduplicated note write is the tick-completion proof:
+    // once an rn-* note exists, the same tick's snapshot publish (which
+    // follows the note writes) is microseconds behind — long past by
+    // the time the steer round-trips below.
+    poll_until(
+        "a radar note for the fixture overlap",
+        RUN_TIMEOUT,
+        || {
+            let notes_dir = space_dir.join("messages").join("daemon");
+            async move {
+                std::fs::read_dir(&notes_dir)
+                    .ok()?
+                    .flatten()
+                    .find(|e| e.file_name().to_string_lossy().starts_with("rn-"))
+                    .map(|_| ())
+            }
+        },
+        &daemon_log,
+    )
+    .await;
+
+    // Round 2 via the parked-steer fallback; the mock's own transcript
+    // expectation gates on the injected block.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "steer",
+            "session_id": session_id,
+            "id": "steer-radar-1",
+            "text": "continue with round two",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send steer");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "steered round 2 never completed:\n{}\nsession logs:\n{}",
+            daemon_log(),
+            tail(&rig.session_logs(), 6000)
+        )
+    });
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({ "action": "stop_session", "session_id": session_id })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send stop_session");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_ended")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| panic!("stopped session never ended:\n{}", daemon_log()));
+    let _ = child.kill().await;
+
+    // ---- The §2.6 byte proof, from the provider-side request tap ----
+    let dumped = std::fs::read_to_string(&dump_path).expect("request dump exists");
+    let records: Vec<serde_json::Value> = dumped
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("dump line parses"))
+        .collect();
+    assert_eq!(
+        records.len(),
+        2,
+        "one request per round, nothing else:\n{dumped}"
+    );
+    let first = records[0]["messages_json"].as_str().expect("first request");
+    let second = records[1]["messages_json"].as_str().expect("second request");
+    let first_open = first.strip_suffix(']').expect("array serialization");
+    assert!(
+        second.starts_with(first_open),
+        "round 2's request must extend round 1's byte-for-byte:\n{first}\n{second}"
+    );
+    assert_eq!(
+        second.as_bytes()[first_open.len()],
+        b',',
+        "the extension is a pure append after the prior tail"
+    );
+
+    let first_messages: Vec<serde_json::Value> =
+        serde_json::from_str(first).expect("first request parses");
+    let second_messages: Vec<serde_json::Value> =
+        serde_json::from_str(second).expect("second request parses");
+    assert!(second_messages.len() > first_messages.len());
+    let expected_block = format!(
+        "[System] coordination v1 space={space_key}\n\
+         sessions: 2 active, 0 stale — s-fake-a(native), s-fake-b(native)"
+    );
+    let tail_message = second_messages.last().expect("non-empty request");
+    assert_eq!(tail_message["role"].as_str(), Some("user"));
+    assert_eq!(
+        tail_message["content"].as_str(),
+        Some(expected_block.as_str()),
+        "the §2.2 block is the NEW tail message"
+    );
+    assert!(
+        !first_messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("[System] coordination v1 space="))),
+        "round 1 predates the signal — no block before the tail append"
+    );
+
+    // ---- §2.9: the block's conversation row in the turn record ----
+    let log_dir = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("logs")
+        .join(&session_id);
+    let rows = parsed_session_rows(&log_dir);
+    let messages = canonical_message_rows(&rows);
+    let block_row = user_message_row(&messages, &expected_block);
+    assert_eq!(
+        msg_field(block_row, "provenance").as_str(),
+        Some("system_injection"),
+        "the ruled steer-shaped record carries the injection provenance"
     );
 }
 
