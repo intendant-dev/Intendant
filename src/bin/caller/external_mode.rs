@@ -1383,6 +1383,30 @@ pub(crate) async fn run_external_agent_mode(
                                 );
                                 continue;
                             }
+                            Ok(AppEvent::CoordinationRadar {
+                                session_id,
+                                state: crate::types::CoordinationRadarState::Raised,
+                                ..
+                            }) if event_targets_session_or_alias(
+                                &Some(session_id.clone()),
+                                &live_session_id,
+                                &drain_config.alias_session_id,
+                            ) => {
+                                // Coordination radar, external ALERT lane
+                                // (§2.8): an alert raised while this
+                                // session parks queues the schema line as
+                                // the targeted-ContextInjection fallback —
+                                // merged into the NEXT turn's prompt, never
+                                // an immediate turn of its own. The ledger
+                                // inside dedups sets and holds the 10-min
+                                // cooldown.
+                                queue_external_coordination_alert_steers(
+                                    &context_injection,
+                                    live_session_id.as_deref(),
+                                    &session_log,
+                                );
+                                continue;
+                            }
                             Ok(AppEvent::SteerRequested {
                                 session_id,
                                 text,
