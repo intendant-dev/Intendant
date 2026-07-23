@@ -1626,7 +1626,10 @@ impl SessionLog {
     /// (task / resume task / follow-up / delivered steer / askHuman answer).
     /// Emitted only where text genuinely enters the worker conversation;
     /// system injections, tool output, and context summaries are
-    /// deliberately absent. `text` is the RAW user text — attachment
+    /// deliberately absent — with one RULED exception: the coordination
+    /// radar block (Track C §2.9) logs here with `SystemInjection`
+    /// provenance so dashboard replay and the C2 acceptance can assert
+    /// its schema in the turn record. `text` is the RAW user text — attachment
     /// preludes and `[Session resumed]`/`[New Task]`/`[User]` wrappers are
     /// the conversation's concern, not the record's. `ref_seq` marks a
     /// projection: the text entered the conversation inside another entry

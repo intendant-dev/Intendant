@@ -1125,6 +1125,10 @@ pub(crate) async fn run_agent_loop(
     // round loop): each turn boundary is a heartbeat tick (§1.5 cadence —
     // throttled internally, no timers here).
     coordination_declaration: Option<&coordination::lifecycle::SessionDeclarationGuard>,
+    // The radar injection seam's per-session state (§2.1/§2.5), owned by
+    // the round loop so dedup survives round boundaries. `None` when the
+    // session has no id (no bus identity → no space to consult).
+    mut radar_seam: Option<&mut CoordinationRadarSeam>,
 ) -> Result<(LoopStats, LoopExitReason), CallerError> {
     let mut budget_warning_shown = false;
     let mut empty_command_streak = 0usize;
@@ -1391,6 +1395,16 @@ pub(crate) async fn run_agent_loop(
                     });
                 }
             }
+        }
+
+        // Coordination radar (Track C §2.1, R6): the FRESH-READ sibling
+        // consult at the same seam — each turn reads the published radar
+        // state and appends at most one `[System] coordination v1` block
+        // as a tail user message (same provenance, same logging shape as
+        // the drain above). Fresh-read, not queued: the task-start purge
+        // above can never drop it, and dedup (§2.5) self-paces it.
+        if let Some(seam) = radar_seam.as_deref_mut() {
+            inject_coordination_radar_block(seam, conversation, &session_log);
         }
 
         // Turn boundary = the native declaration's heartbeat tick
@@ -3491,28 +3505,26 @@ fn native_session_intent(conversation: &Conversation) -> String {
 /// Coordination-bus declaration for a native supervised session (Track C
 /// §1.5): written at session start, heartbeat at turn boundaries, removed
 /// by the guard's Drop on any orderly loop exit — a crash-abandoned copy
-/// ages out by TTL. Space resolution follows the B1 seam (env override →
-/// derived worktree-normalized key), so a sub-agent session in an
-/// isolated worktree lands in its main repo's space. Advisory: bus
-/// trouble logs and the session runs undeclared; a session without an id
-/// has no writer identity and declares nothing.
+/// ages out by TTL. The space arrives resolved (the B1 seam: env override
+/// → derived worktree-normalized key — `run_round_loop` resolves once and
+/// shares it with the radar seam), so a sub-agent session in an isolated
+/// worktree lands in its main repo's space. Advisory: bus trouble logs
+/// and the session runs undeclared; a session without an id has no
+/// writer identity and declares nothing.
 fn declare_native_session_on_bus(
     local_session_id: &Option<String>,
+    space_dir: &std::path::Path,
+    space_key: &str,
     project: &Project,
     conversation: &Conversation,
     session_log: &SharedSessionLog,
 ) -> Option<coordination::lifecycle::SessionDeclarationGuard> {
     let session_id = local_session_id.as_deref()?;
-    let (space_dir, space_key) = coordination::paths::resolve_space_dir(
-        coordination::paths::env_override().as_deref(),
-        &crate::platform::intendant_home(),
-        &project.root,
-    );
     let intent = native_session_intent(conversation);
     match coordination::lifecycle::SessionDeclarationGuard::declare(
         coordination::lifecycle::DeclareParams {
-            space_dir: &space_dir,
-            space_key: &space_key,
+            space_dir,
+            space_key,
             session_id,
             backend: "native",
             project_root: &project.root,
@@ -3529,6 +3541,83 @@ fn declare_native_session_on_bus(
             None
         }
     }
+}
+
+/// Per-session state for the coordination-radar injection seam (Track C
+/// §2.1, R6): the session's resolved space + bus writer identity plus
+/// the §2.5 dedup pair (hash of the last block injected, when it was).
+/// Owned by the round loop and threaded into `run_agent_loop` like the
+/// loop's other per-session state — dedup and the 30-minute reminder
+/// floor are per SESSION, so this must survive round boundaries (a
+/// per-round reset would re-inject an unchanged block at every
+/// follow-up).
+pub(crate) struct CoordinationRadarSeam {
+    space_key: String,
+    writer_id: String,
+    last_hash: Option<u64>,
+    last_injected_ms: u64,
+}
+
+impl CoordinationRadarSeam {
+    fn new(session_id: &str, space_key: String) -> Self {
+        CoordinationRadarSeam {
+            space_key,
+            writer_id: coordination::lifecycle::writer_id_for_session(session_id),
+            last_hash: None,
+            last_injected_ms: 0,
+        }
+    }
+}
+
+/// The §2.1 FRESH-READ consult, one call per turn at the injection seam:
+/// read the daemon-published radar state for this session's space and,
+/// when the ruled renderer has something new to say, append exactly ONE
+/// `[System] coordination v1` block as a tail user message with
+/// `SystemInjection` provenance — the same `add_user` path the drain
+/// above uses, so every prefix-cache proof of §2.6 holds (no earlier
+/// message is touched; quiet turns append nothing). Degrades to a
+/// silent no-op wherever no daemon published radar state (direct /
+/// headless shapes — ruled). §2.9: the block also logs the steer-shaped
+/// `conversation_message_user` record so replay and acceptance can
+/// assert the schema in the turn record.
+fn inject_coordination_radar_block(
+    seam: &mut CoordinationRadarSeam,
+    conversation: &mut Conversation,
+    session_log: &SharedSessionLog,
+) {
+    let Some(state) = coordination::radar::published_radar_state() else {
+        return;
+    };
+    let Some(snapshot) = state.space(&seam.space_key) else {
+        return;
+    };
+    let now_ms = coordination::now_ms();
+    let Some(block) = coordination::render::render_block(
+        &snapshot,
+        &seam.writer_id,
+        seam.last_hash,
+        seam.last_injected_ms,
+        now_ms,
+    ) else {
+        return;
+    };
+    let seq = conversation.add_user(MessageProvenance::SystemInjection, block.text.clone());
+    slog(session_log, |l| {
+        let _ = l.conversation_message_user(
+            seq,
+            MessageProvenance::SystemInjection,
+            &block.text,
+            None,
+            &[],
+        );
+        l.info(&format!(
+            "Coordination radar block injected ({} bytes{})",
+            block.text.len(),
+            if block.has_alert { ", ALERT" } else { "" }
+        ));
+    });
+    seam.last_hash = Some(block.hash);
+    seam.last_injected_ms = now_ms;
 }
 
 /// Wraps `run_agent_loop` in a multi-round loop that waits for follow-up messages
@@ -3573,9 +3662,32 @@ pub(crate) async fn run_round_loop(
     let mut delivered_steer_ids: HashSet<String> = HashSet::new();
     // This loop IS the native session: declare on the coordination bus
     // for its whole span (all rounds + parked waits); the guard's Drop
-    // removes the declaration on any orderly exit.
-    let coordination_declaration =
-        declare_native_session_on_bus(&local_session_id, project, conversation, &session_log);
+    // removes the declaration on any orderly exit. The space resolution
+    // (B1 seam) happens once here and feeds both the declaration and the
+    // radar injection seam's per-session state.
+    let coordination_space = local_session_id.as_ref().map(|_| {
+        coordination::paths::resolve_space_dir(
+            coordination::paths::env_override().as_deref(),
+            &crate::platform::intendant_home(),
+            &project.root,
+        )
+    });
+    let coordination_declaration = coordination_space.as_ref().and_then(|(space_dir, space_key)| {
+        declare_native_session_on_bus(
+            &local_session_id,
+            space_dir,
+            space_key,
+            project,
+            conversation,
+            &session_log,
+        )
+    });
+    let mut radar_seam = match (&local_session_id, &coordination_space) {
+        (Some(session_id), Some((_, space_key))) => {
+            Some(CoordinationRadarSeam::new(session_id, space_key.clone()))
+        }
+        _ => None,
+    };
 
     loop {
         let (stats, exit_reason) = run_agent_loop(
@@ -3598,6 +3710,7 @@ pub(crate) async fn run_round_loop(
             orchestration,
             runtime_mcp_env,
             coordination_declaration.as_ref(),
+            radar_seam.as_mut(),
         )
         .await?;
 
