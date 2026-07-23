@@ -409,7 +409,7 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("    ctl                   Control a running Intendant daemon over MCP");
     println!("    access                Configure dashboard TLS/mTLS access certificates");
-    println!("    coordination          Print the coordination-space directory for this checkout");
+    println!("    coordination          Coordination bus, keyless: space dir + message list/read/send/delete");
     println!("    custody               Show, migrate, or restore OS-keystore custody of access private keys");
     println!("    hosted-verify         Verify a rendezvous serves the code its transparency log commits to (--releases: app release artifacts)");
     println!("    org                   Create or print a local org root key");
@@ -3209,38 +3209,20 @@ async fn main() -> Result<(), CallerError> {
         };
     }
 
-    // Intercept `intendant coordination dir [--root <path>]` — prints the
-    // resolved coordination-space directory for the cwd (or --root). Keyless
-    // and daemonless like `org` (ruled §3.6/R5: local computation, no IAM
-    // surface) — the floor for sessions the daemon didn't launch. Honors
-    // INTENDANT_COORDINATION_DIR so every consumer shares one resolution
-    // rule. Exactly one line to stdout.
+    // Intercept `intendant coordination …` — the keyless, daemonless
+    // administrative surface over the coordination bus: `dir` prints the
+    // resolved space directory; the C3 message-lane verbs (`messages`,
+    // `read`, `send`, `delete`) go straight to the space's stores. Like
+    // `org` (ruled §3.6/R5 + the C3 slice): local computation and direct
+    // file access, no daemon reach, no IAM surface — the floor for sessions
+    // the daemon didn't launch. Honors INTENDANT_COORDINATION_DIR so every
+    // consumer shares one resolution rule; env/cwd/stdin are read inside
+    // `coordination::cli::run`, the one process edge.
     if env::args().nth(1).as_deref() == Some("coordination") {
         let argv: Vec<String> = env::args().skip(2).collect();
-        match coordination::paths::parse_dir_cli(&argv) {
-            Ok(root) => {
-                let root = match root {
-                    Some(explicit) => explicit,
-                    None => match env::current_dir() {
-                        Ok(cwd) => cwd,
-                        Err(e) => {
-                            eprintln!("error: cannot resolve the current directory: {e}");
-                            std::process::exit(1);
-                        }
-                    },
-                };
-                let (space_dir, _) = coordination::paths::resolve_space_dir(
-                    coordination::paths::env_override().as_deref(),
-                    &platform::intendant_home(),
-                    &root,
-                );
-                println!("{}", space_dir.display());
-                return Ok(());
-            }
-            Err(usage) => {
-                eprintln!("{usage}");
-                std::process::exit(2);
-            }
+        match coordination::cli::run(&argv) {
+            0 => return Ok(()),
+            code => std::process::exit(code),
         }
     }
 
