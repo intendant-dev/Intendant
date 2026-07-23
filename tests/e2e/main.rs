@@ -4823,7 +4823,12 @@ async fn coordination_radar_block_injects_as_a_pure_tail_append() {
     let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
     let daemon_log = {
         let stderr_buf = stderr_buf.clone();
-        move || stderr_buf.lock().map(|b| tail(&b, 4000)).unwrap_or_default()
+        move || {
+            stderr_buf
+                .lock()
+                .map(|b| tail(&b, 4000))
+                .unwrap_or_default()
+        }
     };
 
     let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
@@ -4870,8 +4875,7 @@ async fn coordination_radar_block_injects_as_a_pure_tail_append() {
     .expect("send create_session");
     let started = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
         json.get("event").and_then(|v| v.as_str()) == Some("session_started")
-            && json.get("task").and_then(|v| v.as_str())
-                == Some("coordinate the radar prefix run")
+            && json.get("task").and_then(|v| v.as_str()) == Some("coordinate the radar prefix run")
     })
     .await
     .unwrap_or_else(|| panic!("session never started:\n{}", daemon_log()));
@@ -4895,10 +4899,14 @@ async fn coordination_radar_block_injects_as_a_pure_tail_append() {
         || {
             let root = coordination_root.clone();
             async move {
-                std::fs::read_dir(&root).ok()?.flatten().map(|e| e.path()).find(|p| {
-                    std::fs::read_dir(p.join("sessions"))
-                        .is_ok_and(|mut entries| entries.next().is_some())
-                })
+                std::fs::read_dir(&root)
+                    .ok()?
+                    .flatten()
+                    .map(|e| e.path())
+                    .find(|p| {
+                        std::fs::read_dir(p.join("sessions"))
+                            .is_ok_and(|mut entries| entries.next().is_some())
+                    })
             }
         },
         &daemon_log,
@@ -4995,7 +5003,9 @@ async fn coordination_radar_block_injects_as_a_pure_tail_append() {
         "one request per round, nothing else:\n{dumped}"
     );
     let first = records[0]["messages_json"].as_str().expect("first request");
-    let second = records[1]["messages_json"].as_str().expect("second request");
+    let second = records[1]["messages_json"]
+        .as_str()
+        .expect("second request");
     let first_open = first.strip_suffix(']').expect("array serialization");
     assert!(
         second.starts_with(first_open),

@@ -3672,16 +3672,19 @@ pub(crate) async fn run_round_loop(
             &project.root,
         )
     });
-    let coordination_declaration = coordination_space.as_ref().and_then(|(space_dir, space_key)| {
-        declare_native_session_on_bus(
-            &local_session_id,
-            space_dir,
-            space_key,
-            project,
-            conversation,
-            &session_log,
-        )
-    });
+    let coordination_declaration =
+        coordination_space
+            .as_ref()
+            .and_then(|(space_dir, space_key)| {
+                declare_native_session_on_bus(
+                    &local_session_id,
+                    space_dir,
+                    space_key,
+                    project,
+                    conversation,
+                    &session_log,
+                )
+            });
     let mut radar_seam = match (&local_session_id, &coordination_space) {
         (Some(session_id), Some((_, space_key))) => {
             Some(CoordinationRadarSeam::new(session_id, space_key.clone()))

@@ -1117,7 +1117,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 // (the density-steer precedent), and the cooldown ledger
                 // inside keeps quiet consults free.
                 if coordination_consult_at
-                    .map_or(true, |t| t.elapsed() >= EXTERNAL_COORDINATION_CONSULT_INTERVAL)
+                    .is_none_or(|t| t.elapsed() >= EXTERNAL_COORDINATION_CONSULT_INTERVAL)
                 {
                     coordination_consult_at = Some(tokio::time::Instant::now());
                     steer_external_coordination_alerts(agent, config).await;

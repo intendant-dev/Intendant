@@ -1499,8 +1499,7 @@ mod tests {
         // A space move mid-raise resolves the old id before raising the
         // new one, so raise/resolve always pair by id.
         tracker.observe_tick(&obs(true));
-        let moved =
-            tracker.observe_tick(&[("sess-1".to_string(), "space-b".to_string(), true)]);
+        let moved = tracker.observe_tick(&[("sess-1".to_string(), "space-b".to_string(), true)]);
         assert_eq!(
             moved
                 .iter()
@@ -1518,7 +1517,10 @@ mod tests {
         let ledger = ExternalSteerLedger::default();
         let t0: u64 = 1_000_000;
         assert!(ledger.admit("sess-1", 11, t0), "first set admits");
-        assert!(!ledger.admit("sess-1", 11, t0 + 1), "same set never repeats");
+        assert!(
+            !ledger.admit("sess-1", 11, t0 + 1),
+            "same set never repeats"
+        );
         assert!(
             !ledger.admit("sess-1", 22, t0 + 1),
             "different set cools down"
@@ -1598,7 +1600,10 @@ mod tests {
                 Err(e) => panic!("no CoordinationRadar after the alerting tick: {e:?}"),
             }
         };
-        assert_eq!(raised, ("sess-radar-a".to_string(), key.clone(), State::Raised));
+        assert_eq!(
+            raised,
+            ("sess-radar-a".to_string(), key.clone(), State::Raised)
+        );
         // The same tick published the snapshot the delivery lanes read.
         assert!(task.state.space_with_alerts_for(&writer).is_some());
 

@@ -1163,7 +1163,8 @@ mod tests {
     #[test]
     fn steer_lines_group_sets_per_pair_and_pr() {
         let mut s = base_snapshot();
-        s.sessions.push(presence("s-other-one", Some("codex"), false));
+        s.sessions
+            .push(presence("s-other-one", Some("codex"), false));
         s.messages.push(message("s-peer", "m-0123456789ab", None));
         s.pair_overlaps
             .push(pair("src/b.rs", OWN, "s-other-one", true, false));
@@ -1186,7 +1187,9 @@ mod tests {
         );
         assert_eq!(
             steers[1].text,
-            format!("[System] coordination v1 space={SPACE} ! overlap src/c.rs — with s-second (git)")
+            format!(
+                "[System] coordination v1 space={SPACE} ! overlap src/c.rs — with s-second (git)"
+            )
         );
         assert_eq!(
             steers[2].text,
