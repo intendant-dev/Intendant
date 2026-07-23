@@ -186,6 +186,54 @@ pub(crate) async fn handle_agenda_list(
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
+/// Transport-neutral core of `GET /api/agenda/ops` (tunnel twin
+/// `api_agenda_ops`): one page of the raw append-only op log, for honest
+/// per-item history and manifest-revision diffs. `since` is a 0-based
+/// line cursor, `item` filters to one item's ops, `limit` defaults to
+/// [`crate::agenda::AGENDA_OPS_DEFAULT_LIMIT`] and is clamped by the
+/// store. Lines this build cannot fold are served verbatim with
+/// `known:false` — never hidden (see [`crate::agenda::AgendaStore::read_ops`]).
+pub(crate) async fn agenda_ops_api_response(
+    since: u64,
+    item: Option<&str>,
+    limit: Option<u64>,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+) -> ApiResponse {
+    let Some(agenda) = agenda_handle(mcp_server).await else {
+        return ApiResponse::json_error(503, "agenda unavailable on this daemon");
+    };
+    let limit = limit
+        .map(|v| usize::try_from(v).unwrap_or(usize::MAX))
+        .unwrap_or(crate::agenda::AGENDA_OPS_DEFAULT_LIMIT);
+    let page: crate::agenda::AgendaOpsPage = match agenda.read_ops(since, item, limit) {
+        Ok(page) => page,
+        Err(err) => {
+            return ApiResponse::json_error(500, format!("reading agenda op log: {err}"));
+        }
+    };
+    match serde_json::to_value(&page) {
+        Ok(value) => ApiResponse::json(200, JsonBody::Value(value)),
+        Err(err) => ApiResponse::json_error(500, format!("encoding agenda op page: {err}")),
+    }
+}
+
+pub(crate) async fn handle_agenda_ops(
+    stream: DemuxStream,
+    request_line: &str,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let since = query_param(request_line, "since")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let item = query_param(request_line, "item").filter(|v| !v.is_empty());
+    let limit = query_param(request_line, "limit").and_then(|v| v.parse().ok());
+    let response =
+        agenda_ops_api_response(since, item.as_deref(), limit, mcp_server.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

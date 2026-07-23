@@ -71,6 +71,33 @@ const KNOWN_OPS: [&str; 24] = [
 
 const LOG_FILE: &str = "agenda.jsonl";
 
+/// Default page size for [`AgendaStore::read_ops`] when the caller names
+/// none; the clamp ceiling is [`AGENDA_OPS_MAX_LIMIT`].
+pub(crate) const AGENDA_OPS_DEFAULT_LIMIT: usize = 500;
+/// Hard page-size ceiling for [`AgendaStore::read_ops`].
+pub(crate) const AGENDA_OPS_MAX_LIMIT: usize = 2000;
+
+/// One page of the raw op log, as `GET /api/agenda/ops` serves it.
+/// Serializes to exactly the response body:
+/// `{"ops":[…],"next_since":…,"log_len":…,"filtered":…}`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct AgendaOpsPage {
+    /// Served entries, in log order. Each is
+    /// `{"seq":N,"known":bool,"op":<the line's JSON, verbatim>}`, or
+    /// `{"seq":N,"known":false,"unparseable":true,"raw":"<line>"}` for a
+    /// line that is not JSON at all.
+    pub(crate) ops: Vec<serde_json::Value>,
+    /// Resume cursor: the first seq this scan did not consume — last
+    /// returned seq + 1 when the page filled, otherwise `log_len`.
+    pub(crate) next_since: u64,
+    /// Total lines in the log right now. A value below a client's cursor
+    /// means the append-only contract was broken externally (the same
+    /// shrink [`AgendaStore::refresh_if_stale`] refolds through).
+    pub(crate) log_len: u64,
+    /// True when an `item` filter was applied to this page.
+    pub(crate) filtered: bool,
+}
+
 /// Start-now's default goal statement: the item quoted as data with its id
 /// so the spawned session's own (attributed) `ctl` can act on it. The
 /// confirm sheet's editable text replaces exactly this part; the mode coda
@@ -1607,6 +1634,111 @@ impl AgendaStore {
 
     pub(crate) fn counts(&self) -> AgendaCounts {
         counts(&self.items)
+    }
+
+    /// One page of the raw op log (read-only; `GET /api/agenda/ops`).
+    ///
+    /// `since` is a 0-based line cursor into `agenda.jsonl`. The log is
+    /// append-only — the daemon never truncates or rewrites it — so a
+    /// line index is a stable sequence number: line N today is line N
+    /// forever, and a cursor survives restarts and refolds. (External
+    /// tampering that shrinks the file surfaces as `log_len` dropping
+    /// below the cursor.)
+    ///
+    /// The fold's forward-compatibility rule extends to reads: a line
+    /// whose op vocabulary this build does not fold (`op.type` outside
+    /// [`KNOWN_OPS`], a newer line version) is still served VERBATIM,
+    /// marked `known:false` — an older server never HIDES history it
+    /// cannot parse, just as an older binary never destroys history it
+    /// cannot read. A line that is not JSON at all (crash-torn tail,
+    /// hand edit) is served as
+    /// `{"seq":N,"known":false,"unparseable":true,"raw":"<line>"}`.
+    ///
+    /// `item` filters to lines whose `op.id` equals it; lines carrying
+    /// no `op.id` (unparseable lines, foreign envelopes) are excluded
+    /// under the filter — they reference no item. `limit` is clamped to
+    /// [1, [`AGENDA_OPS_MAX_LIMIT`]]. Whitespace-only lines keep their
+    /// seq slot but are never served (fold parity: they are padding,
+    /// not history).
+    ///
+    /// Torn reads: the caller ([`super::AgendaHandle`]) holds the same
+    /// store lock every append completes under (`write_all` + flush
+    /// before release), so an in-process line can never be observed
+    /// half-written; cross-process appends are whole-line `O_APPEND`
+    /// writes — exactly the exposure [`Self::refresh_if_stale`]'s own
+    /// read path already carries.
+    pub(crate) fn read_ops(
+        &mut self,
+        since: u64,
+        item: Option<&str>,
+        limit: usize,
+    ) -> std::io::Result<AgendaOpsPage> {
+        // Converge with disk first (terminates a foreign torn tail and
+        // refreshes the fold), like every other read through the handle.
+        self.refresh_if_stale()?;
+        let limit = limit.clamp(1, AGENDA_OPS_MAX_LIMIT);
+        let bytes = match std::fs::read(&self.log_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let mut ops: Vec<serde_json::Value> = Vec::new();
+        let mut log_len = 0u64;
+        // The first seq the scan did not consume; log_len unless the
+        // page filled mid-log.
+        let mut next_since: Option<u64> = None;
+        for (index, raw_line) in text.lines().enumerate() {
+            let seq = index as u64;
+            log_len = seq + 1;
+            if next_since.is_some() || seq < since {
+                continue;
+            }
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let entry = match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(value) => {
+                    if let Some(want) = item {
+                        let referenced = value
+                            .get("op")
+                            .and_then(|op| op.get("id"))
+                            .and_then(serde_json::Value::as_str);
+                        if referenced != Some(want) {
+                            continue;
+                        }
+                    }
+                    let known = value
+                        .get("op")
+                        .and_then(|op| op.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|tag| KNOWN_OPS.contains(&tag));
+                    serde_json::json!({ "seq": seq, "known": known, "op": value })
+                }
+                Err(_) => {
+                    if item.is_some() {
+                        continue; // no op.id — excluded under the filter
+                    }
+                    serde_json::json!({
+                        "seq": seq,
+                        "known": false,
+                        "unparseable": true,
+                        "raw": line,
+                    })
+                }
+            };
+            ops.push(entry);
+            if ops.len() >= limit {
+                next_since = Some(seq + 1);
+            }
+        }
+        Ok(AgendaOpsPage {
+            ops,
+            next_since: next_since.unwrap_or(log_len),
+            log_len,
+            filtered: item.is_some(),
+        })
     }
 
     #[cfg(test)]
@@ -3887,5 +4019,225 @@ mod tests {
         // The foreign line survives on disk verbatim.
         let text = std::fs::read_to_string(dir.path().join(LOG_FILE)).unwrap();
         assert!(text.contains("sigil"));
+    }
+
+    /// Seed the read_ops fixture through the real command path (two
+    /// parks, one annotate, one complete — lines 0..=3), then append a
+    /// newer build's op referencing item A (4), an item-less foreign op
+    /// (5), and a non-JSON line (6) directly, as another binary or a
+    /// hand edit would. Returns `(store, item_a_id, item_b_id)`.
+    fn seeded_ops_store(dir: &Path) -> (AgendaStore, String, String) {
+        let mut store = AgendaStore::open(dir).unwrap();
+        let a = store
+            .apply_command(add_cmd("first"), owner(), 1000)
+            .unwrap();
+        let b = store.apply_command(add_cmd("second"), None, 2000).unwrap();
+        store
+            .apply_command(
+                AgendaCommand::Annotate {
+                    id: a.id.clone(),
+                    text: "progress note".into(),
+                    source: None,
+                },
+                None,
+                3000,
+            )
+            .unwrap();
+        store
+            .apply_command(
+                AgendaCommand::Complete {
+                    id: b.id.clone(),
+                    source: None,
+                },
+                None,
+                4000,
+            )
+            .unwrap();
+        let foreign = format!(
+            "{{\"v\":1,\"at_ms\":5000,\"op\":{{\"type\":\"journal_curate\",\"id\":\"{}\",\"note\":\"from a newer build\"}}}}\n\
+             {{\"v\":1,\"at_ms\":6000,\"op\":{{\"type\":\"compact_marker\"}}}}\n\
+             this line is not JSON at all\n",
+            a.id
+        );
+        let mut log = std::fs::File::options()
+            .append(true)
+            .open(store.log_path())
+            .unwrap();
+        log.write_all(foreign.as_bytes()).unwrap();
+        (store, a.id, b.id)
+    }
+
+    /// `GET /api/agenda/ops` mechanics (a, c, d): the full page serves
+    /// every line — known ops as full envelopes, unknown vocabulary
+    /// verbatim with `known:false`, non-JSON as `unparseable` — and the
+    /// since/limit window keeps `next_since`/`log_len` exact.
+    #[test]
+    fn read_ops_serves_every_line_and_windows_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, a, _b) = seeded_ops_store(dir.path());
+
+        let page = store.read_ops(0, None, 500).unwrap();
+        assert_eq!(page.log_len, 7);
+        assert_eq!(page.next_since, 7);
+        assert!(!page.filtered);
+        assert_eq!(page.ops.len(), 7);
+        for (index, entry) in page.ops.iter().enumerate() {
+            assert_eq!(entry["seq"].as_u64(), Some(index as u64));
+        }
+        // The four command-path lines are full envelopes this build
+        // folds: they round-trip through the typed record, so nothing
+        // partial was served.
+        for entry in &page.ops[..4] {
+            assert_eq!(entry["known"], serde_json::Value::Bool(true));
+            let record: AgendaOpRecord = serde_json::from_value(entry["op"].clone()).unwrap();
+            assert!(record.at_ms > 0);
+        }
+        assert_eq!(page.ops[0]["op"]["op"]["type"], "add");
+        assert_eq!(page.ops[2]["op"]["op"]["type"], "annotate");
+        assert_eq!(page.ops[3]["op"]["op"]["type"], "complete");
+        // (c) Unknown vocabulary: served VERBATIM, marked unknown.
+        assert_eq!(page.ops[4]["known"], serde_json::Value::Bool(false));
+        assert_eq!(page.ops[4]["op"]["op"]["type"], "journal_curate");
+        assert_eq!(page.ops[4]["op"]["op"]["id"], a.as_str());
+        assert_eq!(page.ops[4]["op"]["op"]["note"], "from a newer build");
+        assert_eq!(page.ops[5]["known"], serde_json::Value::Bool(false));
+        assert_eq!(page.ops[5]["op"]["op"]["type"], "compact_marker");
+        // (d) Non-JSON: unparseable, raw text preserved string-escaped.
+        assert_eq!(page.ops[6]["known"], serde_json::Value::Bool(false));
+        assert_eq!(page.ops[6]["unparseable"], serde_json::Value::Bool(true));
+        assert_eq!(page.ops[6]["raw"], "this line is not JSON at all");
+
+        // (a) Window math: a mid-log page fills and resumes exactly.
+        let page = store.read_ops(2, None, 3).unwrap();
+        let seqs: Vec<u64> = page
+            .ops
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![2, 3, 4]);
+        assert_eq!(page.next_since, 5);
+        assert_eq!(page.log_len, 7);
+        let page = store.read_ops(page.next_since, None, 500).unwrap();
+        let seqs: Vec<u64> = page
+            .ops
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![5, 6]);
+        assert_eq!(page.next_since, 7);
+        // A cursor at (or past) the tail returns an empty page that
+        // keeps pointing at the tail.
+        let page = store.read_ops(7, None, 500).unwrap();
+        assert!(page.ops.is_empty());
+        assert_eq!(page.next_since, 7);
+        let page = store.read_ops(100, None, 500).unwrap();
+        assert!(page.ops.is_empty());
+        assert_eq!(page.next_since, 7);
+        // The limit clamp floor: 0 is not "unbounded" and not "nothing".
+        let page = store.read_ops(0, None, 0).unwrap();
+        assert_eq!(page.ops.len(), 1);
+        assert_eq!(page.next_since, 1);
+    }
+
+    /// (b) The `item` filter serves exactly the lines whose `op.id` is
+    /// the requested item — unknown vocabulary included — and excludes
+    /// lines carrying no item reference (foreign item-less ops,
+    /// unparseable lines). The cursor stays a LINE cursor under the
+    /// filter, so a truncated filtered page resumes without re-serving.
+    #[test]
+    fn read_ops_item_filter_includes_only_that_items_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, a, b) = seeded_ops_store(dir.path());
+
+        let page = store.read_ops(0, Some(&a), 500).unwrap();
+        assert!(page.filtered);
+        assert_eq!(page.log_len, 7);
+        assert_eq!(page.next_since, 7);
+        let seqs: Vec<u64> = page
+            .ops
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect();
+        // A's add (0), A's annotate (2), the newer build's op on A (4);
+        // never B's lines, the item-less op (5), or the non-JSON line (6).
+        assert_eq!(seqs, vec![0, 2, 4]);
+        for entry in &page.ops {
+            assert_eq!(entry["op"]["op"]["id"], a.as_str());
+        }
+        assert_eq!(page.ops[2]["known"], serde_json::Value::Bool(false));
+
+        let page = store.read_ops(0, Some(&b), 500).unwrap();
+        let seqs: Vec<u64> = page
+            .ops
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![1, 3]);
+
+        // Truncated filtered page: next_since is the line after the last
+        // served line, and resuming there serves the rest exactly once.
+        let page = store.read_ops(0, Some(&a), 2).unwrap();
+        let seqs: Vec<u64> = page
+            .ops
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![0, 2]);
+        assert_eq!(page.next_since, 3);
+        let page = store.read_ops(page.next_since, Some(&a), 500).unwrap();
+        let seqs: Vec<u64> = page
+            .ops
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![4]);
+        assert_eq!(page.next_since, 7);
+
+        // An id nothing references filters to an empty (but honest) page.
+        let page = store
+            .read_ops(0, Some("01NOSUCHITEMEVERPARKED0000"), 500)
+            .unwrap();
+        assert!(page.ops.is_empty());
+        assert!(page.filtered);
+        assert_eq!(page.next_since, 7);
+    }
+
+    /// (e) Reads interleaved with appends never serve a torn line: every
+    /// page taken between appends holds only complete envelopes, and the
+    /// tail advances by exactly one line per op. (The lock discipline
+    /// this relies on — reads and appends under one store mutex — is
+    /// exercised cross-thread in `handle.rs`.)
+    #[test]
+    fn read_ops_between_appends_never_serves_a_torn_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let id = store.apply_command(add_cmd("host"), None, 1).unwrap().id;
+        let mut last_len = store.read_ops(0, None, 500).unwrap().log_len;
+        assert_eq!(last_len, 1);
+        for round in 0..20u64 {
+            store
+                .apply_command(
+                    AgendaCommand::Annotate {
+                        id: id.clone(),
+                        text: format!("note {round}"),
+                        source: None,
+                    },
+                    None,
+                    2 + round,
+                )
+                .unwrap();
+            let page = store.read_ops(0, None, 2000).unwrap();
+            assert_eq!(page.log_len, last_len + 1);
+            assert_eq!(page.next_since, page.log_len);
+            assert_eq!(page.ops.len(), page.log_len as usize);
+            for entry in &page.ops {
+                // Complete lines only: every one parses as the typed
+                // record — a torn/partial line could not.
+                assert_eq!(entry["known"], serde_json::Value::Bool(true));
+                let record: AgendaOpRecord = serde_json::from_value(entry["op"].clone()).unwrap();
+                assert_eq!(record.op.item_id(), id);
+            }
+            last_len = page.log_len;
+        }
     }
 }

@@ -5836,6 +5836,7 @@ mod tests {
             ("api_session_current_history", Row, Some(Op::SessionManage)),
             ("api_session_current_rollback", Row, Some(Op::SessionManage)),
             ("api_agenda_list", Row, Some(Op::AgendaRead)),
+            ("api_agenda_ops", Row, Some(Op::AgendaRead)),
             ("api_agenda_op", Row, Some(Op::AgendaWrite)),
             ("api_agenda_ref_drift", Row, Some(Op::AgendaRead)),
             ("api_agenda_reminder_policy", Row, Some(Op::Settings)),

@@ -366,6 +366,8 @@ pub(crate) enum RouteHandlerId {
     DashboardTabs,
     /// Agenda ledger snapshot (items + counts).
     AgendaList,
+    /// Raw op-log page (since/item/limit cursor; unknown ops verbatim).
+    AgendaOps,
     /// Apply one agenda command (add/ask/answer/patch/transitions/effects).
     AgendaOp,
     /// Raw bytes of one parked-ask preview blob (agenda blob store).
@@ -909,6 +911,20 @@ pub(crate) static ROUTES: &[Route] = &[
         "Agenda ledger snapshot: items (oldest first) plus status counts",
     )
     .with_tunnel(tunnel_method("api_agenda_list")),
+    // The raw append-only op log behind the fold, read-only: per-item
+    // history and manifest-revision diffs need the ops themselves, not
+    // the fold product. Lines this build cannot fold are served verbatim
+    // with known:false — an older server never hides history it cannot
+    // parse (the fold's preserve-don't-destroy rule, extended to reads).
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/agenda/ops"),
+        PeerOperation::AgendaRead,
+        BodyPolicy::None,
+        RouteHandlerId::AgendaOps,
+        "Raw agenda op-log page (since/item/limit cursor; unknown ops served verbatim)",
+    )
+    .with_tunnel(tunnel_method("api_agenda_ops")),
     // Capped above Default: the rich-ask park command (`op:"ask"`)
     // legitimately carries the ≤8 MB preview budget as base64 JSON.
     op_route(
