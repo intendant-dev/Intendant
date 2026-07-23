@@ -670,26 +670,130 @@ function renderSessionWindowGoal(win, goal) {
 
 // Published-PR chip: latest PR (+ count when several). Hyperlinks ONLY
 // when the daemon validated the URL (pr.url present) — an unvalidated
-// entry still renders as text, never as a link.
+// entry still renders as text, never as a link. One PR keeps the
+// zero-friction direct open; several turn the chip into a button that
+// opens the published-PR list panel, where every PR is reachable (a
+// direct href would only ever reach the newest one).
 function renderSessionWindowPr(win, prs) {
   if (!win?.prChip) return;
+  wireSessionWindowPrChip(win);
+  const chip = win.prChip;
   const list = Array.isArray(prs) ? prs.filter((p) => p && p.number) : [];
+  const listMode = list.length > 1;
+  if (!listMode) {
+    // Single/empty: back to plain-anchor semantics (list mode strips the
+    // href and carries button semantics instead).
+    delete chip.dataset.prList;
+    chip.removeAttribute('role');
+    chip.removeAttribute('tabindex');
+    chip.removeAttribute('aria-haspopup');
+  }
   if (!list.length) {
-    win.prChip.className = 'session-window-pr hidden';
-    win.prChip.textContent = '';
-    win.prChip.removeAttribute('href');
-    win.prChip.title = '';
+    chip.className = 'session-window-pr hidden';
+    chip.textContent = '';
+    chip.removeAttribute('href');
+    chip.title = '';
     return;
   }
   const latest = list[list.length - 1];
-  const extra = list.length > 1 ? ` +${list.length - 1}` : '';
-  win.prChip.className = 'session-window-pr';
-  win.prChip.textContent = `PR #${latest.number}${extra}`;
-  if (latest.url) win.prChip.setAttribute('href', latest.url);
-  else win.prChip.removeAttribute('href');
-  win.prChip.title = list
-    .map((p) => `${p.repo || p.provider || ''}#${p.number}${p.url ? `\n${p.url}` : ''}`)
-    .join('\n');
+  chip.className = 'session-window-pr';
+  chip.textContent = `PR #${latest.number}${listMode ? ` +${list.length - 1}` : ''}`;
+  if (listMode) {
+    chip.removeAttribute('href');
+    chip.dataset.prList = '1';
+    chip.setAttribute('role', 'button');
+    chip.setAttribute('tabindex', '0');
+    chip.setAttribute('aria-haspopup', 'dialog');
+    chip.title = [
+      `${list.length} published PRs — click to list`,
+      ...list.slice().reverse().map((p) => `${p.repo || p.provider || ''}#${p.number}`),
+    ].join('\n');
+    return;
+  }
+  if (latest.url) chip.setAttribute('href', latest.url);
+  else chip.removeAttribute('href');
+  chip.title = `${latest.repo || latest.provider || ''}#${latest.number}${latest.url ? `\n${latest.url}` : ''}`;
+}
+
+// One wiring per chip node (built once with the window; renders only
+// mutate attributes). In list mode a click/Enter/Space opens the panel;
+// in single-PR mode the native <a> behavior stands untouched.
+function wireSessionWindowPrChip(win) {
+  const chip = win?.prChip;
+  if (!chip || chip.dataset.prWired) return;
+  chip.dataset.prWired = '1';
+  const open = (event) => {
+    if (!chip.dataset.prList) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openSessionPrListPanel(win.sessionId, chip);
+  };
+  chip.addEventListener('click', open);
+  chip.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') open(event);
+  });
+}
+
+// ── Published-PR list panel: what the chip opens when a session has
+// published several PRs. Reuses the vitals explainer host (popover on
+// fine pointers, bottom sheet on coarse/narrow) — one overlay system,
+// same dismissal grammar. Rows are real <a> elements when the daemon
+// validated the URL (native open, long-press/right-click copy); an
+// unvalidated entry renders as plain text with the slug — never a link,
+// the same posture as the chip itself.
+function sessionPublishedPrList(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const meta = sessionMetadataById.get(sid) || {};
+  return Array.isArray(meta.publishedPrs)
+    ? meta.publishedPrs.filter((p) => p && p.number)
+    : [];
+}
+
+function vxPublishedPrRow(pr) {
+  const validated = typeof pr.url === 'string' && !!pr.url;
+  const row = vxEl(validated ? 'a' : 'div', 'vx-row vx-pr-row');
+  if (validated) {
+    row.setAttribute('href', pr.url);
+    row.target = '_blank';
+    row.rel = 'noopener noreferrer';
+    // Close on activation; the native navigation proceeds untouched (no
+    // preventDefault — target=_blank opens the tab either way).
+    row.addEventListener('click', (event) => {
+      event.stopPropagation();
+      closeVitalsExplainer();
+    });
+  }
+  const line = vxEl('div', 'vx-pr-line');
+  line.appendChild(vxEl('span', 'vx-label', `#${pr.number}`));
+  const slug = String(pr.repo || pr.provider || '').trim();
+  if (slug) line.appendChild(vxEl('span', 'vx-pr-repo', slug));
+  // Additive fields: today's wire carries number/repo/provider/url only,
+  // but a widened event (state, title) renders without edits here — and
+  // is never fetched from the forge by the dashboard.
+  const state = String(pr.state || pr.status || '').trim();
+  if (state) line.appendChild(vxEl('span', 'vx-pr-state', state));
+  row.appendChild(line);
+  const title = String(pr.title || '').trim();
+  if (title) row.appendChild(vxEl('div', 'vx-desc', title));
+  if (!validated) row.appendChild(vxEl('div', 'vx-desc vx-pr-unverified', 'link not verified'));
+  return row;
+}
+
+function openSessionPrListPanel(sessionId, anchor) {
+  const prs = sessionPublishedPrList(sessionId);
+  if (!prs.length) return;
+  const host = ensureVitalsExplainerHost();
+  const panel = host.querySelector('.vx-panel');
+  // Same epoch bump as the vitals pane: async enrichers parked by a
+  // previous open must not append to this content.
+  panel.dataset.vxEpoch = String((Number(panel.dataset.vxEpoch) || 0) + 1);
+  panel.setAttribute('aria-label', 'Published pull requests');
+  const scroller = vxEl('div', 'vx-scroll');
+  // Latest first: the chip names the newest, the list continues from it.
+  for (const pr of prs.slice().reverse()) scroller.appendChild(vxPublishedPrRow(pr));
+  panel.replaceChildren(vxHeader(`Published PRs (${prs.length})`), scroller);
+  host._vxTick = null; // nothing time-derived in this content
+  presentVitalsPanel(host, panel, anchor);
 }
 
 function applySessionPrPublished(raw = {}) {
@@ -2119,10 +2223,11 @@ function ensureVitalsExplainerHost() {
     if (event.key === 'Escape' && !host.hidden) closeVitalsExplainer();
   });
   // Capture phase: dismiss on any outside press without racing the
-  // chip handlers (a chip tap re-opens with fresh content instead).
+  // chip handlers (a chip tap — vitals or the multi-PR chip — re-opens
+  // with fresh content instead).
   document.addEventListener('pointerdown', (event) => {
     if (host.hidden) return;
-    if (event.target.closest?.('#vitals-explainer .vx-panel, .vit-chip')) return;
+    if (event.target.closest?.('#vitals-explainer .vx-panel, .vit-chip, .session-window-pr[data-pr-list]')) return;
     closeVitalsExplainer();
   }, true);
   return host;
@@ -2887,6 +2992,8 @@ function openVitalsGlossary(sessionId, anchor, focusId = '') {
   const meta = sessionMetadataById.get(String(sessionId || '').trim()) || {};
   const host = ensureVitalsExplainerHost();
   const panel = host.querySelector('.vx-panel');
+  // Shared host: restore this surface's label (the PR-list panel relabels).
+  panel.setAttribute('aria-label', 'Vitals explanation');
   // Content epoch: async enrichers (the background-task rows) must not
   // append to a panel that has since shown something else.
   panel.dataset.vxEpoch = String((Number(panel.dataset.vxEpoch) || 0) + 1);
@@ -3023,12 +3130,19 @@ function refanSessionVitalsForIdentityGroup(sessionId) {
 // assert backend parity on these. vitalsApply is the injection twin
 // (sessionWindowSweeps.build's convention): it routes a synthetic
 // session_vitals event through the real applySessionVitals lane so
-// harness probes can render real chips and click through to the pane.
+// harness probes can render real chips and click through to the pane;
+// prPublishedApply does the same for session_pr_published, so probes can
+// render the PR chip and its list panel. publishedPrs is its readback.
 window.qa = Object.assign(window.qa || {}, {
   vitalsApply: (evt) => {
     applySessionVitals(evt || {});
     return true;
   },
+  prPublishedApply: (evt) => {
+    applySessionPrPublished(evt || {});
+    return true;
+  },
+  publishedPrs: (sessionId) => sessionPublishedPrList(sessionId),
   vitalsChips: (sessionId) => vitalsModelsForSession(sessionId).map((m) => ({
     id: m.id,
     key: m.key,

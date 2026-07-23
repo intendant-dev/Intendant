@@ -1381,9 +1381,16 @@ body.context-focus-active {
   white-space: nowrap;
   text-decoration: none;
 }
-.session-window-pr[href]:hover {
+.session-window-pr[href]:hover,
+.session-window-pr[data-pr-list]:hover {
   border-color: color-mix(in srgb, var(--mauve) 55%, transparent);
   background: color-mix(in srgb, var(--mauve) 16%, transparent);
+}
+/* Several PRs: the chip is a button (opens the list panel), not a link. */
+.session-window-pr[data-pr-list] { cursor: pointer; }
+.session-window-pr[data-pr-list]:focus-visible {
+  outline: 2px solid var(--lavender);
+  outline-offset: 1px;
 }
 .session-window-pr.hidden { display: none; }
 .session-window-goal.paused,
@@ -1748,6 +1755,43 @@ body.context-focus-active {
   padding: 4px 10px;
   font-size: 11px;
 }
+/* ── Published-PR list rows (the PR chip's panel): whole-row links when
+   the daemon validated the URL — real <a> elements, so native open /
+   right-click / long-press copy all work — and plain text (never a
+   link) otherwise. Sheet rows grow to comfortable touch height. */
+.vx-pr-row {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
+a.vx-pr-row { cursor: pointer; }
+a.vx-pr-row:hover { background: color-mix(in srgb, var(--lavender) 8%, transparent); }
+a.vx-pr-row:hover .vx-label { color: var(--lavender); }
+a.vx-pr-row:focus-visible { outline: 2px solid var(--lavender); outline-offset: -2px; }
+.vx-pr-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.vx-pr-repo {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--subtext0);
+  font-size: 11px;
+}
+.vx-pr-state {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  font-size: 10px;
+  color: var(--subtext1);
+}
+.vx-pr-unverified { color: var(--subtext0); font-style: italic; }
+#vitals-explainer.sheet .vx-pr-row { padding: 13px 6px; }
 
 /* ── Background-task inspector: task rows inside the activity explainer,
    and the read-only output viewer. Buttons, not hover affordances —
