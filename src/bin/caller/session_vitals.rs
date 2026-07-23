@@ -70,13 +70,17 @@ const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// network filesystem, a wedged lock) must fail its probe — feeding the
 /// existing `demote_locus` fallback — instead of freezing the sequential
 /// producer loop, and with it every session's git chip, forever.
-const GIT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// `pub(crate)`: the coordination radar's observed-dirty scans run under
+/// the same ceiling.
+pub(crate) const GIT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Run one git subprocess under the anti-wedge guards: `kill_on_drop` so
 /// a timed-out child is reaped instead of orphaned, and `timeout` so no
 /// single invocation can stall the producer loop. `None` on spawn failure
 /// or timeout — callers treat both like the command failing.
-async fn run_git(
+/// `pub(crate)`: shared with the coordination radar (same guards, same
+/// reasons — its detection tick must survive a wedged checkout).
+pub(crate) async fn run_git(
     program: &std::ffi::OsStr,
     timeout: std::time::Duration,
     cwd: &Path,
@@ -121,11 +125,13 @@ fn git_version_at_least(version_line: &str, want_major: u32, want_minor: u32) ->
 /// on the next tick — cheap insurance against daemon-lifetime growth.
 const PROBER_CACHE_CAP: usize = 256;
 
-/// The one `git status` invocation both dirty-state surfaces run: the
-/// vitals prober (async, per-tick) and the Changes tab's working-tree
-/// lane (sync, per request) spawn exactly these arguments and feed
-/// the output to [`parse_status_v2`], so "what counts as dirty" — the
-/// chip's count and the tab's file list — is a single definition.
+/// The one `git status` invocation every dirty-state surface runs: the
+/// vitals prober (async, per-tick), the Changes tab's working-tree
+/// lane (sync, per request), and the coordination radar's observed
+/// working sets spawn exactly these arguments and feed the output to
+/// [`parse_status_v2`], so "what counts as dirty" — the chip's count,
+/// the tab's file list, and the radar's overlap domain — is a single
+/// definition.
 pub(crate) const GIT_STATUS_ARGS: [&str; 4] = [
     "--no-optional-locks",
     "status",

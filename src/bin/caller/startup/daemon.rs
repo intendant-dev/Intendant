@@ -158,6 +158,12 @@ pub(crate) async fn run_daemon(
     // effective target the dirty chip probes (activity locus included),
     // so the chip and the tab can never state different checkouts.
     session_vitals::publish_git_vitals_targets(&vitals_git_targets);
+    // Collision radar (Track C, C2 — ruled §2.1): periodic zero-LLM
+    // detection over bus declarations ∪ observed git status (the same
+    // registry the vitals prober probes) ∪ open-PR file sets; publishes
+    // per-space snapshots for the injection seam and writes deduplicated
+    // radar notes to flagged parties.
+    let _radar_task = crate::coordination::radar::spawn_radar_task(vitals_git_targets.clone());
     // Restored sessions: a restart empties the target registry, so idle
     // session windows lose their git/health chips until the next resume.
     // One bounded walk (newest-first, insert-if-absent — see

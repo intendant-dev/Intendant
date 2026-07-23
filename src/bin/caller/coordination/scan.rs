@@ -24,6 +24,47 @@ pub(crate) const REJECT_FOREIGN_ENTRY: &str = "foreign-entry";
 pub(crate) const REJECT_NOT_REGULAR: &str = "not-regular-file";
 pub(crate) const REJECT_FOREIGN_OWNER: &str = "foreign-owner";
 pub(crate) const REJECT_OVERSIZE_DOC: &str = "oversize-doc";
+/// C2 addition to the §1.11 vocabulary: an entry skipped unread because
+/// the pass's §1.6 whole-space read budget (512 files / 8 MiB) ran out.
+/// Counted like every other rejection — loud, never silent.
+pub(crate) const REJECT_READ_BUDGET: &str = "read-budget";
+
+/// §1.6's whole-space read budget, charged per document BEFORE it is
+/// opened (the enumeration lstat already knows the size). One budget
+/// spans a whole radar/injection pass over a space — both liveness
+/// kinds draw from the same allowance. Entries refused by the budget
+/// surface as [`REJECT_READ_BUDGET`] rejections and are never read.
+#[derive(Debug)]
+pub(crate) struct ReadBudget {
+    files: usize,
+    bytes: u64,
+}
+
+impl ReadBudget {
+    pub(crate) fn new(files: usize, bytes: u64) -> Self {
+        ReadBudget { files, bytes }
+    }
+
+    /// No-limit budget for callers outside a budgeted pass (GC, the
+    /// per-store scans) — the per-dir scan bound still applies.
+    pub(crate) fn unbounded() -> Self {
+        ReadBudget {
+            files: usize::MAX,
+            bytes: u64::MAX,
+        }
+    }
+
+    /// Charge one file of `bytes` length. `false` leaves the budget
+    /// untouched — the caller must skip the read and count the entry.
+    pub(crate) fn admit(&mut self, bytes: u64) -> bool {
+        if self.files == 0 || self.bytes < bytes {
+            return false;
+        }
+        self.files -= 1;
+        self.bytes -= bytes;
+        true
+    }
+}
 
 /// One surfaced-by-name rejection from a liveness scan.
 #[derive(Debug, Clone)]
@@ -464,6 +505,17 @@ mod tests {
         }
         let err = scan_liveness_dir(&dir).unwrap_err();
         assert!(err.to_string().contains("scan bound"), "{err}");
+    }
+
+    #[test]
+    fn read_budget_charges_files_and_bytes() {
+        let mut b = ReadBudget::new(2, 100);
+        assert!(b.admit(60));
+        assert!(!b.admit(50), "byte budget refuses without charging");
+        assert!(b.admit(40), "refused admit left the budget intact");
+        assert!(!b.admit(0), "file budget exhausted");
+        let mut unlimited = ReadBudget::unbounded();
+        assert!(unlimited.admit(u64::MAX));
     }
 
     #[test]

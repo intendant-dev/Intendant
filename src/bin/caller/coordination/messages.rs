@@ -10,7 +10,10 @@
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 
-use super::scan::{self, DefensiveRead, LivenessScan, ScanReject, REJECT_FOREIGN_ENTRY};
+use super::scan::{
+    self, DefensiveRead, LivenessScan, ReadBudget, ScanReject, REJECT_FOREIGN_ENTRY,
+    REJECT_READ_BUDGET,
+};
 use super::{io_err, restrict_dir_modes, sanitize_key, CoordinationError};
 
 pub(crate) const KIND_MESSAGE: &str = "message";
@@ -26,6 +29,14 @@ pub(crate) const MESSAGE_TTL_MIN_S: u32 = 60;
 pub(crate) const MESSAGE_TTL_MAX_S: u32 = 604_800;
 /// Reserved for the daemon's C2 lanes.
 pub(crate) const RESERVED_DAEMON_WRITER: &str = "daemon";
+/// Radar-note spam guard (the §2.8 cooldown precedent applied to the
+/// bus lane): at most one radar note lands on a recipient per window,
+/// on top of the per-overlap-set dedup by note id.
+pub(crate) const RADAR_NOTE_COOLDOWN_MS: u64 = 10 * 60 * 1000;
+/// Overlap paths listed in one radar-note body; the remainder is
+/// counted in the note's fixed template line (bounds are write-side
+/// too — rule 6 — and the §1.5 dirty-cap spirit applies here).
+pub(crate) const RADAR_NOTE_MAX_PATHS: usize = 64;
 
 /// Frontmatter-only view (listing/radar); `body` costs a `read`.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -50,6 +61,25 @@ pub(crate) struct MessageInput<'a> {
     pub to: Option<&'a str>,
     pub ttl_s: Option<u32>,
     pub body: &'a str,
+}
+
+/// Input for [`MessageSpace::write_radar_note`] — every field is a
+/// machine value the writer re-validates (§2.3): grammar ids, the
+/// closed source flags, a u32 PR number, repo-relative paths.
+pub(crate) struct RadarNoteInput<'a> {
+    /// The flagged party this note is addressed to (`to:`).
+    pub to: &'a str,
+    /// All flagged parties (`parties:`), recipient included.
+    pub parties: &'a [&'a str],
+    /// Overlap evidence: declared working sets / observed git status.
+    pub declared: bool,
+    pub git: bool,
+    /// Open-PR overlap, when the counterpart is a PR's file set.
+    pub pr: Option<u32>,
+    /// The overlapping repo-relative paths (full parse grammar, not
+    /// the renderer's display bound — the note body is exact).
+    pub paths: &'a [String],
+    pub ttl_s: Option<u32>,
 }
 
 /// The `messages/` store for one coordination space (resolved dir in,
@@ -174,6 +204,218 @@ impl MessageSpace {
         })
     }
 
+    /// The daemon's privileged radar-note lane (§2.8, R9): writes
+    /// `kind: radar-note` under the reserved `daemon` writer dir to the
+    /// flagged party. The public [`Self::write`] keeps refusing the
+    /// `daemon` writer — this entry point is the only path in, and its
+    /// body is schema-rendered from validated tokens only (§2.3
+    /// grammars; no free text): an `## overlap` section of
+    /// grammar-valid repo-relative paths plus a fixed template
+    /// paragraph whose only variable tokens are validated ids, the
+    /// closed `sources` enum, and decimal counts.
+    ///
+    /// Spam discipline, both layers tested:
+    /// - one live note per distinct overlap set per flagged pair — the
+    ///   note id is `rn-<hash>` over (recipient, parties, pr, full
+    ///   path set), so an existing file (even expired, until GC) means
+    ///   this exact situation was already delivered → `Ok(None)`;
+    /// - at most one note per recipient per
+    ///   [`RADAR_NOTE_COOLDOWN_MS`] regardless of set — a churning
+    ///   working set must not mint a note stream → `Ok(None)`.
+    ///
+    /// TTL takes the normal clamp (default when `None`); the per-writer
+    /// live cap applies to the daemon dir like any other writer.
+    pub(crate) fn write_radar_note(
+        &self,
+        input: &RadarNoteInput<'_>,
+    ) -> Result<Option<MessageMeta>, CoordinationError> {
+        let to = input.to;
+        if to.is_empty() || sanitize_key(to) != to {
+            return Err(CoordinationError::WriteRefused(format!(
+                "radar-note recipient {to:?} is outside the filename grammar"
+            )));
+        }
+        if input.parties.is_empty() || input.parties.len() > 8 {
+            return Err(CoordinationError::WriteRefused(format!(
+                "radar-note parties count {} is outside 1..=8",
+                input.parties.len()
+            )));
+        }
+        for p in input.parties {
+            if p.is_empty() || sanitize_key(p) != *p {
+                return Err(CoordinationError::WriteRefused(format!(
+                    "radar-note party {p:?} is outside the filename grammar"
+                )));
+            }
+        }
+        if !input.parties.contains(&to) {
+            return Err(CoordinationError::WriteRefused(
+                "radar-note recipient must be one of its parties".into(),
+            ));
+        }
+        if !input.declared && !input.git && input.pr.is_none() {
+            return Err(CoordinationError::WriteRefused(
+                "radar-note needs at least one source (declared/git/pr)".into(),
+            ));
+        }
+        if input.paths.is_empty() {
+            return Err(CoordinationError::WriteRefused(
+                "radar-note needs at least one overlapping path".into(),
+            ));
+        }
+        for p in input.paths {
+            if !scan::valid_rel_path(p) {
+                return Err(CoordinationError::WriteRefused(format!(
+                    "radar-note path {p:?} is outside the repo-relative grammar"
+                )));
+            }
+        }
+        let ttl_s = input
+            .ttl_s
+            .unwrap_or(MESSAGE_TTL_DEFAULT_S)
+            .clamp(MESSAGE_TTL_MIN_S, MESSAGE_TTL_MAX_S);
+
+        // Canonical identity of this overlap situation → the note id.
+        // Sorted, deduplicated paths make the hash order-independent;
+        // sources are deliberately excluded so an evidence shift alone
+        // (declared → declared+git) does not mint a new note.
+        let mut paths: Vec<&str> = input.paths.iter().map(String::as_str).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        let mut parties: Vec<&str> = input.parties.to_vec();
+        parties.sort_unstable();
+        let canonical = format!(
+            "to={to};parties={};pr={};paths={}",
+            parties.join(","),
+            input.pr.map(|n| n.to_string()).unwrap_or_default(),
+            paths.join(",")
+        );
+        let id = format!("rn-{:016x}", super::fnv1a_64(canonical.as_bytes()));
+
+        let writer_dir = self.dir.join(RESERVED_DAEMON_WRITER);
+        if writer_dir.join(format!("{id}.md")).exists() {
+            return Ok(None); // this exact overlap set was already delivered
+        }
+        let now_ms = super::now_ms();
+        if !writer_dir.is_dir() {
+            let (dirs, _) = writer_dirs(&self.dir)?;
+            if dirs.len() >= MAX_WRITER_DIRS {
+                return Err(CoordinationError::WriteRefused(format!(
+                    "space holds {} writer dirs; the bound is {MAX_WRITER_DIRS}",
+                    dirs.len()
+                )));
+            }
+        }
+        std::fs::create_dir_all(&writer_dir).map_err(io_err)?;
+        restrict_dir_modes(&writer_dir)?;
+        let (live, _) = scan::scan_liveness_dir(&writer_dir)?;
+        if live.len() >= MAX_MESSAGES_PER_WRITER {
+            return Err(CoordinationError::WriteRefused(format!(
+                "writer {RESERVED_DAEMON_WRITER:?} holds {} messages; the bound is \
+                 {MAX_MESSAGES_PER_WRITER} — expiry GC must catch up first",
+                live.len()
+            )));
+        }
+        // Recipient cooldown over the daemon dir's live notes.
+        for entry in &live {
+            let meta = match scan::open_liveness(&entry.path)? {
+                DefensiveRead::Ok(bytes) => scan::parse_doc(bytes, &entry.stem, MESSAGE_KINDS)
+                    .ok()
+                    .and_then(|doc| {
+                        meta_from_doc(&doc, &entry.stem, RESERVED_DAEMON_WRITER, now_ms)
+                    }),
+                _ => None,
+            };
+            let Some(meta) = meta else { continue };
+            if meta.kind == KIND_RADAR_NOTE
+                && !meta.expired
+                && meta.to.as_deref() == Some(to)
+                && now_ms.saturating_sub(meta.created_ms) < RADAR_NOTE_COOLDOWN_MS
+            {
+                return Ok(None); // recipient was noted moments ago — don't spam
+            }
+        }
+
+        let mut sources: Vec<&str> = Vec::new();
+        if input.declared {
+            sources.push("declared");
+        }
+        if input.git {
+            sources.push("git");
+        }
+        if input.pr.is_some() {
+            sources.push("pr");
+        }
+        let sources = sources.join(",");
+
+        let mut doc = String::new();
+        doc.push_str("---\n");
+        doc.push_str("v: 1\n");
+        doc.push_str(&format!("kind: {KIND_RADAR_NOTE}\n"));
+        doc.push_str(&format!("id: {id}\n"));
+        doc.push_str(&format!("space: {}\n", self.space));
+        doc.push_str(&format!("from: {RESERVED_DAEMON_WRITER}\n"));
+        doc.push_str(&format!("to: {to}\n"));
+        doc.push_str(&format!("parties: {}\n", parties.join(",")));
+        doc.push_str(&format!("sources: {sources}\n"));
+        if let Some(pr) = input.pr {
+            doc.push_str(&format!("pr: {pr}\n"));
+        }
+        doc.push_str(&format!("created_ms: {now_ms}\n"));
+        doc.push_str(&format!("ttl_s: {ttl_s}\n"));
+        doc.push_str("attribution: unverified-same-uid\n");
+        doc.push_str("---\n");
+        doc.push_str("## overlap\n");
+        let listed = paths.len().min(RADAR_NOTE_MAX_PATHS);
+        for p in &paths[..listed] {
+            doc.push_str(p);
+            doc.push('\n');
+        }
+        doc.push('\n');
+        let mut who = parties.join(" and ");
+        if let Some(pr) = input.pr {
+            who.push_str(&format!(" and open pr#{pr}"));
+        }
+        doc.push_str(&format!(
+            "Working-set overlap between {who} (sources: {sources}). \
+             Coordinate in this space before touching the paths above."
+        ));
+        if paths.len() > listed {
+            doc.push_str(&format!(
+                " {} further paths were not listed.",
+                paths.len() - listed
+            ));
+        }
+        doc.push('\n');
+        if doc.len() > super::MAX_DOC_BYTES {
+            return Err(CoordinationError::WriteRefused(format!(
+                "radar-note document is {} bytes; the §9 bound is {}",
+                doc.len(),
+                super::MAX_DOC_BYTES
+            )));
+        }
+
+        let path = writer_dir.join(format!("{id}.md"));
+        let tmp = writer_dir.join(format!(".{id}.tmp"));
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(io_err)?;
+            f.write_all(doc.as_bytes()).map_err(io_err)?;
+            f.sync_all().map_err(io_err)?;
+        }
+        super::restrict_file_modes(&tmp)?;
+        std::fs::rename(&tmp, &path).map_err(io_err)?;
+
+        Ok(Some(MessageMeta {
+            id,
+            writer: RESERVED_DAEMON_WRITER.to_string(),
+            kind: KIND_RADAR_NOTE.to_string(),
+            to: Some(to.to_string()),
+            created_ms: now_ms,
+            ttl_s,
+            expired: false,
+        }))
+    }
+
     /// Every message's frontmatter across all writers, rule-5 liveness
     /// posture. Expired entries are returned flagged — GC removes,
     /// radar decides.
@@ -282,6 +524,17 @@ pub(crate) fn scan_meta_dir(
     dir: &Path,
     now_ms: u64,
 ) -> Result<LivenessScan<MessageMeta>, CoordinationError> {
+    scan_meta_dir_budgeted(dir, now_ms, &mut ReadBudget::unbounded())
+}
+
+/// [`scan_meta_dir`] under a §1.6 whole-space read budget (the radar's
+/// entry — one budget spans the declarations and messages of a pass):
+/// budget-refused entries surface as `read-budget` rejections, unread.
+pub(crate) fn scan_meta_dir_budgeted(
+    dir: &Path,
+    now_ms: u64,
+    budget: &mut ReadBudget,
+) -> Result<LivenessScan<MessageMeta>, CoordinationError> {
     let (dirs, mut rejected) = writer_dirs(dir)?;
     let mut entries = Vec::new();
     for WriterDir {
@@ -296,6 +549,13 @@ pub(crate) fn scan_meta_dir(
         }));
         for entry in found {
             let name = format!("{writer}/{}.md", entry.stem);
+            if !budget.admit(entry.meta.len()) {
+                rejected.push(ScanReject {
+                    name,
+                    reason: REJECT_READ_BUDGET,
+                });
+                continue;
+            }
             let bytes = match scan::open_liveness(&entry.path)? {
                 DefensiveRead::Ok(bytes) => bytes,
                 DefensiveRead::Vanished => continue,
@@ -489,6 +749,189 @@ mod tests {
         assert_eq!(scan.entries.len(), 1, "forged copy rejected");
         assert_eq!(scan.rejected.len(), 1);
         assert!(scan.rejected[0].name.starts_with("s-forger/"));
+    }
+
+    fn note<'a>(to: &'a str, parties: &'a [&'a str], paths: &'a [String]) -> RadarNoteInput<'a> {
+        RadarNoteInput {
+            to,
+            parties,
+            declared: true,
+            git: true,
+            pr: None,
+            paths,
+            ttl_s: None,
+        }
+    }
+
+    #[test]
+    fn radar_note_writes_under_daemon_and_reads_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ms = space(&tmp);
+        let paths = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        let meta = ms
+            .write_radar_note(&note("s-alpha", &["s-alpha", "s-beta"], &paths))
+            .unwrap()
+            .expect("first note lands");
+        assert_eq!(meta.writer, RESERVED_DAEMON_WRITER);
+        assert_eq!(meta.kind, KIND_RADAR_NOTE);
+        assert_eq!(meta.to.as_deref(), Some("s-alpha"));
+        assert_eq!(meta.ttl_s, MESSAGE_TTL_DEFAULT_S, "normal TTL clamp");
+        assert!(meta.id.starts_with("rn-"), "{}", meta.id);
+        assert_eq!(sanitize_key(&meta.id), meta.id, "id obeys the grammar");
+
+        // The scan lists it like any message; the full read shows the
+        // schema-rendered body: `## overlap` paths + template line.
+        let now = super::super::now_ms();
+        let scan = ms.scan_meta(now).unwrap();
+        assert!(scan.rejected.is_empty(), "{:?}", scan.rejected);
+        assert_eq!(scan.entries.len(), 1);
+        let full = ms
+            .read(RESERVED_DAEMON_WRITER, &meta.id, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            full.body,
+            "## overlap\nsrc/a.rs\nsrc/b.rs\n\nWorking-set overlap between s-alpha and s-beta \
+             (sources: declared,git). Coordinate in this space before touching the paths above."
+        );
+        let raw = std::fs::read_to_string(
+            tmp.path()
+                .join("space/messages/daemon")
+                .join(format!("{}.md", meta.id)),
+        )
+        .unwrap();
+        assert!(raw.contains("from: daemon\n"), "{raw}");
+        assert!(raw.contains("parties: s-alpha,s-beta\n"), "{raw}");
+        assert!(raw.contains("sources: declared,git\n"), "{raw}");
+        assert!(raw.contains("attribution: unverified-same-uid\n"));
+    }
+
+    #[test]
+    fn radar_note_pr_variant_carries_pr_and_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ms = space(&tmp);
+        let paths = vec!["docs/x.md".to_string()];
+        let meta = ms
+            .write_radar_note(&RadarNoteInput {
+                to: "s-alpha",
+                parties: &["s-alpha"],
+                declared: false,
+                git: true,
+                pr: Some(566),
+                paths: &paths,
+                ttl_s: Some(3600),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.ttl_s, 3600);
+        let now = super::super::now_ms();
+        let full = ms
+            .read(RESERVED_DAEMON_WRITER, &meta.id, now)
+            .unwrap()
+            .unwrap();
+        assert!(
+            full.body.contains("s-alpha and open pr#566"),
+            "{}",
+            full.body
+        );
+        assert!(full.body.contains("(sources: git,pr)"), "{}", full.body);
+        let raw = std::fs::read_to_string(
+            tmp.path()
+                .join("space/messages/daemon")
+                .join(format!("{}.md", meta.id)),
+        )
+        .unwrap();
+        assert!(raw.contains("pr: 566\n"), "{raw}");
+    }
+
+    #[test]
+    fn radar_note_dedups_by_overlap_set_and_cools_down_per_recipient() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ms = space(&tmp);
+        let paths = vec!["src/a.rs".to_string()];
+        let parties = ["s-alpha", "s-beta"];
+        let first = ms
+            .write_radar_note(&note("s-alpha", &parties, &paths))
+            .unwrap();
+        assert!(first.is_some());
+        // Same set again (paths in any order): deduped by id.
+        let again = ms
+            .write_radar_note(&note("s-alpha", &parties, &paths))
+            .unwrap();
+        assert!(again.is_none(), "identical overlap set never re-notes");
+        // A different set for the same recipient: suppressed by the
+        // 10-minute recipient cooldown, not written.
+        let other_paths = vec!["src/z.rs".to_string()];
+        let cooled = ms
+            .write_radar_note(&note("s-alpha", &parties, &other_paths))
+            .unwrap();
+        assert!(cooled.is_none(), "recipient cooldown holds");
+        // The OTHER flagged party is a distinct recipient: lands.
+        let beta = ms
+            .write_radar_note(&note("s-beta", &parties, &paths))
+            .unwrap();
+        assert!(beta.is_some(), "each flagged party gets its own note");
+        let scan = ms.scan_meta(super::super::now_ms()).unwrap();
+        assert_eq!(scan.entries.len(), 2, "one per recipient, no spam");
+    }
+
+    #[test]
+    fn radar_note_refusals_are_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ms = space(&tmp);
+        let good = vec!["src/a.rs".to_string()];
+        let hostile = vec!["../etc/passwd".to_string()];
+        for (input, needle) in [
+            (note("Bad Id", &["Bad Id"], &good), "grammar"),
+            (note("s-a", &["s-b"], &good), "one of its parties"),
+            (note("s-a", &[], &good), "1..=8"),
+            (note("s-a", &["s-a"], &hostile), "repo-relative"),
+            (
+                RadarNoteInput {
+                    to: "s-a",
+                    parties: &["s-a"],
+                    declared: false,
+                    git: false,
+                    pr: None,
+                    paths: &good,
+                    ttl_s: None,
+                },
+                "at least one source",
+            ),
+            (
+                RadarNoteInput {
+                    to: "s-a",
+                    parties: &["s-a"],
+                    declared: true,
+                    git: false,
+                    pr: None,
+                    paths: &[],
+                    ttl_s: None,
+                },
+                "at least one overlapping path",
+            ),
+        ] {
+            let err = ms.write_radar_note(&input).unwrap_err().to_string();
+            assert!(err.contains(needle), "{err}");
+        }
+    }
+
+    #[test]
+    fn budgeted_meta_scan_skips_unread_messages_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ms = space(&tmp);
+        for body in ["one", "two", "three"] {
+            ms.write("s-a", &msg(body)).unwrap();
+        }
+        let dir = tmp.path().join("space/messages");
+        let mut budget = ReadBudget::new(1, u64::MAX);
+        let scan = scan_meta_dir_budgeted(&dir, super::super::now_ms(), &mut budget).unwrap();
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.rejected.len(), 2);
+        assert!(scan
+            .rejected
+            .iter()
+            .all(|r| r.reason == REJECT_READ_BUDGET && r.name.starts_with("s-a/")));
     }
 
     #[test]

@@ -70,6 +70,14 @@
 //! remove on clean end) the native and wrapper loops own. The
 //! consumers — collision radar, daemon-rendered prompt lanes, the
 //! CLI — are C2/C3.
+//!
+//! Track C (C2) adds the radar's detection half: `radar.rs` (the
+//! daemon's periodic zero-LLM overlap detection over declared sets ∪
+//! observed git status ∪ open-PR file sets, published per space) and
+//! `render.rs` (the pure per-session renderer of the ruled §2.2
+//! `[System] coordination v1` block, byte-capped and deduplicated).
+//! The per-turn injection wiring and the dashboard/external delivery
+//! lanes consume them next.
 
 use std::path::{Path, PathBuf};
 
@@ -80,6 +88,8 @@ pub(crate) mod gc;
 pub(crate) mod lifecycle;
 pub(crate) mod messages;
 pub(crate) mod paths;
+pub(crate) mod radar;
+pub(crate) mod render;
 pub(crate) mod scan;
 
 /// Per-document byte cap (frontmatter + body).
@@ -261,6 +271,21 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// FNV-1a-64 with the STANDARD constants — the radar's render-dedup
+/// hash and radar-note id hash (deterministic, non-cryptographic; a
+/// collision is a dedup nuisance, never a boundary). Deliberately NOT
+/// shared with [`space_key`], whose nonstandard multiplier is pinned
+/// forever by C1 erratum 3 (on-disk spaces key by it — do-not-fix);
+/// new hashing uses the textbook prime.
+pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// R5 rider (ruled): the `intendant-coordination` skill ships a python3
