@@ -66,6 +66,24 @@ pub(crate) fn env_override() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+pub(crate) const DIR_CLI_USAGE: &str = "usage: intendant coordination dir [--root <path>]";
+
+/// Argv parse for the keyless `intendant coordination …` administrative
+/// subcommand (§3.6/R5 of the ruled protocol — `dir` is the only verb;
+/// no daemon reach, no IAM surface). Input is everything after the
+/// `coordination` word. `Ok(None)` = resolve for the cwd, `Ok(Some)` =
+/// resolve for the explicit root. The single output line feeds scripts,
+/// so any unrecognized noise is a usage error rather than a
+/// plausible-but-wrong line.
+pub(crate) fn parse_dir_cli(argv: &[String]) -> Result<Option<PathBuf>, String> {
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    match argv.as_slice() {
+        ["dir"] => Ok(None),
+        ["dir", "--root", root] if !root.is_empty() => Ok(Some(PathBuf::from(root))),
+        _ => Err(DIR_CLI_USAGE.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +111,26 @@ mod tests {
         let odd = tmp.path().join("Weird Space！");
         let (_, label) = resolve_space_dir(Some(&odd), tmp.path(), tmp.path());
         assert_eq!(label, "weird-space");
+    }
+
+    #[test]
+    fn dir_cli_parses_the_one_verb_and_refuses_noise() {
+        let args = |raw: &[&str]| raw.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_dir_cli(&args(&["dir"])).unwrap(), None);
+        assert_eq!(
+            parse_dir_cli(&args(&["dir", "--root", "/some/proj"])).unwrap(),
+            Some(PathBuf::from("/some/proj"))
+        );
+        for bad in [
+            &[] as &[&str],
+            &["gc"],
+            &["dir", "--root"],
+            &["dir", "--root", ""],
+            &["dir", "extra"],
+            &["dir", "--root", "/x", "trailing"],
+        ] {
+            let err = parse_dir_cli(&args(bad)).unwrap_err();
+            assert_eq!(err, DIR_CLI_USAGE, "{bad:?}");
+        }
     }
 }

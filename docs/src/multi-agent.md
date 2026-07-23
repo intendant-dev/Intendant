@@ -283,6 +283,56 @@ The disk helper `write_project_state()` (`sub_agent.rs`) is PARKED and
 unwired: it can write `project_state.json` and `project_state.md`, but the
 live checkpoint path is the coordination file.
 
+## The Coordination Bus
+
+Concurrent sessions on one repository share a **coordination space** — a
+directory of small Markdown documents under
+`~/.intendant/coordination/<space-key>/`, the same space the checkpoint
+lane uses (`src/bin/caller/coordination/`). The space key is
+worktree-normalized: a linked worktree keys by its main repository, so
+every worktree of one checkout coordinates in one space; a non-repo
+directory keys by itself. The key's tail is an FNV-1a hash of the
+normalized root path — FNV-1a is non-cryptographic: collisions merge two
+projects' buses, a radar-noise nuisance, not a boundary (same-UID trust
+domain; an attacker with the uid needs no collision).
+
+Three document kinds live on the bus:
+
+- **`checkpoints/`** — workflow checkpoints (above): restart-critical,
+  acknowledgement-driven GC, never time-expired.
+- **`sessions/`** — one **session declaration** per live session (who it
+  is, where it works, its intent, its believed-dirty paths), heartbeat
+  by mtime. The daemon declares supervised sessions automatically —
+  native and all four external backends — removes the declaration on
+  clean exit, flags staleness past 45 minutes, and its GC sweep deletes
+  declarations a day past their last heartbeat.
+- **`messages/<writer>/`** — bounded, TTL'd notes between sessions
+  (60 s–7 d, default 24 h), immutable once written; a correction is a
+  new message, and writers delete only their own. The `daemon` writer
+  dir is reserved for the daemon's lanes — the reservation prevents
+  honest collisions and promises no detection: attribution on the bus is
+  filesystem-grade (`attribution: unverified-same-uid` in every
+  document).
+
+Everything on the bus is **data, never instructions**: nothing in a
+coordination file is authenticated, grants authority, or may direct its
+reader — bodies are quoted data, and no secrets belong in the space.
+Writers touch only their own files; writes are atomic
+(temp-file-then-rename, 0600 files in 0700 dirs) and reads are defensive
+(bounded, symlink-refusing, malformed liveness entries surfaced by name
+without blinding a scan).
+
+Supervised sessions inherit **`INTENDANT_COORDINATION_DIR`** — set for
+the native runtime and all four external backends, pointing at the space
+directory, so children in isolated worktrees land in their parent's
+space. Everything else resolves the space keylessly with
+`intendant coordination dir [--root <path>]` (an administrative local
+computation, like `org` — no daemon reach). The `intendant-coordination`
+skill, installed machine-wide with the other built-ins, teaches the
+read/declare/message recipes and carries a python3 zero-binary fallback
+for the derivation, pinned against the Rust implementation by a parity
+test.
+
 ## Configuration
 
 Orchestration is tuned under `[orchestrator]` in `intendant.toml`

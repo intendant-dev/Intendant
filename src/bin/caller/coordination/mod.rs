@@ -262,3 +262,233 @@ pub(crate) fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+/// R5 rider (ruled): the `intendant-coordination` skill ships a python3
+/// zero-binary fallback — a DUPLICATED derivation and writer that can
+/// drift silently, and a drifted guest writes to a wrong space and
+/// splits the bus. This pin extracts the canonical snippet from the
+/// shipped SKILL.md (failing loudly if the fence moves) and holds it
+/// against the Rust implementation: same space key on fixture roots,
+/// and python-written documents parsing byte-perfectly through the
+/// Rust scanners. Skips LOUDLY when no python is on PATH (the CI fleet
+/// carries one). Hermetic: tempdir spaces passed as argv, no env
+/// mutation.
+#[cfg(test)]
+mod skill_parity_tests {
+    use super::declarations::DeclarationSpace;
+    use super::messages::{MessageSpace, MESSAGE_TTL_DEFAULT_S};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// The one canonical ```python fence in the skill.
+    fn canonical_snippet() -> String {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/intendant-coordination/SKILL.md");
+        let md =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let mut blocks = md.split("```python\n").skip(1);
+        let block = blocks.next().unwrap_or_else(|| {
+            panic!(
+                "SKILL.md lost its ```python fence — the R5 parity pin needs the canonical snippet"
+            )
+        });
+        assert!(
+            blocks.next().is_none(),
+            "more than one ```python fence in SKILL.md — keep ONE canonical snippet for the parity pin"
+        );
+        block
+            .split("\n```")
+            .next()
+            .expect("fence terminated")
+            .to_string()
+    }
+
+    fn python() -> Option<&'static str> {
+        ["python3", "python"].into_iter().find(|candidate| {
+            Command::new(candidate)
+                .arg("--version")
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        })
+    }
+
+    fn run_snippet(py: &str, script: &Path, cwd: &Path, args: &[&str]) -> String {
+        let out = Command::new(py)
+            .arg(script)
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("python spawns");
+        assert!(
+            out.status.success(),
+            "python {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .expect("snippet output is UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn skill_snippet_matches_rust_derivation_and_parsers() {
+        let Some(py) = python() else {
+            eprintln!(
+                "SKIPPED: neither `python3` nor `python` on PATH — the R5 \
+                 skill-snippet parity pin DID NOT RUN"
+            );
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("bus.py");
+        std::fs::write(&script, canonical_snippet()).unwrap();
+
+        // 1. Space-key derivation parity (R5's condition). Non-repo
+        //    roots exercise sanitize + FNV over the canonical path; the
+        //    repo + linked worktree pair exercises the git-common-dir
+        //    normalization on both sides.
+        let mut fixtures: Vec<PathBuf> = Vec::new();
+        for name in ["My Project X", "plain", "héllo wörld 42"] {
+            let root = tmp.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            fixtures.push(root);
+        }
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_ready = git(&repo, &["init", "-q", "-b", "main"])
+            && git(
+                &repo,
+                &[
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "seed",
+                ],
+            );
+        let wt = tmp.path().join("wt");
+        if repo_ready && git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]) {
+            fixtures.push(repo);
+            fixtures.push(wt);
+        } else {
+            eprintln!("SKIPPED git fixtures: no usable `git` on PATH — non-repo parity still ran");
+        }
+        for root in &fixtures {
+            let line = run_snippet(py, &script, tmp.path(), &["dir", root.to_str().unwrap()]);
+            let py_key = Path::new(&line)
+                .file_name()
+                .expect("printed dir has a basename")
+                .to_string_lossy()
+                .to_string();
+            assert_eq!(
+                py_key,
+                super::space_key(root),
+                "python derivation drifted from space_key for {}",
+                root.display()
+            );
+        }
+
+        // 2. Guest writer id: minted once, grammar-idempotent, off the
+        //    supervised `s-` and reserved `daemon` namespaces.
+        let writer = run_snippet(py, &script, tmp.path(), &["mint"]);
+        assert!(writer.starts_with("guest-"), "{writer}");
+        assert_eq!(super::sanitize_key(&writer), writer, "id obeys the grammar");
+
+        // 3. Written-document parity: the python declaration and message
+        //    parse byte-perfectly through the Rust scanners — ids,
+        //    fields, intent, body, zero rejects.
+        let space = tmp.path().join("parity-space");
+        let space_arg = space.to_str().unwrap();
+        let intent = "refactor the encoder pool; hands off crates/intendant-display";
+        run_snippet(
+            py,
+            &script,
+            tmp.path(),
+            &[
+                "declare",
+                space_arg,
+                &writer,
+                intent,
+                "src/a.rs",
+                "docs/plan.md",
+            ],
+        );
+        let now = super::now_ms();
+        let ds = DeclarationSpace::open(&space, "parity-space").unwrap();
+        let scan = ds.scan(now).unwrap();
+        assert!(scan.rejected.is_empty(), "{:?}", scan.rejected);
+        assert_eq!(scan.entries.len(), 1);
+        let d = &scan.entries[0];
+        assert_eq!(d.id, writer);
+        assert_eq!(d.intent, intent);
+        assert_eq!(
+            d.dirty,
+            vec!["src/a.rs".to_string(), "docs/plan.md".to_string()]
+        );
+        assert_eq!(d.dirty_dropped, 0);
+        assert_eq!(d.backend.as_deref(), Some("guest"));
+        assert!(
+            d.root.as_deref().is_some_and(super::scan::valid_abs_path),
+            "declared root is a grammar-valid absolute path: {:?}",
+            d.root
+        );
+        assert!(!d.stale);
+
+        let body = "heads up: coordination/mod.rs is mid-carve; land after #560.";
+        let mid = run_snippet(
+            py,
+            &script,
+            tmp.path(),
+            &["message", space_arg, &writer, body, "s-native-7f2a", "3600"],
+        );
+        let ms = MessageSpace::open(&space, "parity-space").unwrap();
+        let scan = ms.scan_meta(now).unwrap();
+        assert!(scan.rejected.is_empty(), "{:?}", scan.rejected);
+        assert_eq!(scan.entries.len(), 1);
+        let m = &scan.entries[0];
+        assert_eq!(m.id, mid);
+        assert_eq!(m.writer, writer);
+        assert_eq!(m.to.as_deref(), Some("s-native-7f2a"));
+        assert_eq!(m.ttl_s, 3600);
+        assert!(!m.expired);
+        let full = ms
+            .read(&writer, &mid, now)
+            .unwrap()
+            .expect("message reads back");
+        assert_eq!(full.body, body);
+
+        // Broadcast + snippet-default TTL lane.
+        let mid2 = run_snippet(
+            py,
+            &script,
+            tmp.path(),
+            &["message", space_arg, &writer, "broadcast note"],
+        );
+        let scan = ms.scan_meta(super::now_ms()).unwrap();
+        assert!(scan.rejected.is_empty(), "{:?}", scan.rejected);
+        let m2 = scan
+            .entries
+            .iter()
+            .find(|m| m.id == mid2)
+            .expect("broadcast listed");
+        assert_eq!(m2.to, None);
+        assert_eq!(m2.ttl_s, MESSAGE_TTL_DEFAULT_S);
+    }
+}

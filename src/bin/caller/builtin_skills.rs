@@ -26,6 +26,11 @@ pub(crate) const BUILTIN_SKILLS: &[BuiltinSkill] = &[
         support_files: &[],
     },
     BuiltinSkill {
+        name: "intendant-coordination",
+        skill_md: include_str!("../../../skills/intendant-coordination/SKILL.md"),
+        support_files: &[],
+    },
+    BuiltinSkill {
         name: "intendant-log-search",
         skill_md: include_str!("../../../skills/intendant-log-search/SKILL.md"),
         support_files: &[
