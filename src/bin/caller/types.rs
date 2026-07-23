@@ -314,6 +314,17 @@ pub enum NotificationUrgency {
     Urgent,
 }
 
+/// Collision-radar flag lifecycle (Track C §2.8, R8). `raised` adds the
+/// dashboard's retractable `radar` attention item; `resolved` retracts
+/// it — the retraction is why the radar has its own attention kind
+/// instead of riding fire-and-forget `user_notification`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoordinationRadarState {
+    Raised,
+    Resolved,
+}
+
 impl NotificationUrgency {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -490,6 +501,17 @@ pub enum OutboundEvent {
         #[serde(default)]
         urgency: NotificationUrgency,
         ts: u64,
+    },
+    /// Collision-radar flag for one session (Track C §2.8, R8): the
+    /// daemon radar task raises it while ALERT overlaps name the
+    /// session and resolves it when they clear. `id` is the flag's
+    /// stable identity (the session's coordination space key), so a
+    /// resolve always retracts the raise it pairs with; the dashboard
+    /// maps the pair to the retractable `radar` attention kind.
+    CoordinationRadar {
+        session_id: String,
+        id: String,
+        state: CoordinationRadarState,
     },
     TaskComplete {
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1235,6 +1235,134 @@ impl DrainConfig<'_> {
 
 pub(crate) const EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How often the turn drain consults the radar for §2.8 ALERT steers —
+/// the radar itself republishes on `coordination::radar::RADAR_TICK`,
+/// so a faster consult would only re-read identical snapshots.
+pub(crate) const EXTERNAL_COORDINATION_CONSULT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The external ALERT-only delivery lane's gate (Track C §2.8, R8):
+/// consult the daemon-published radar state for this session's alerts,
+/// render the schema-rendered single-line steers for its distinct
+/// overlap sets ([`coordination::render::render_alert_steers`] — ALERT
+/// overlaps only; ambient content has no path in), and admit them
+/// through the daemon-side cooldown ledger (one steer per set per pair,
+/// 10-minute per-session cooldown; suppressed sets retry on a later
+/// consult). Admitted steers are RECORDED — the caller must deliver
+/// each: mid-turn through the backend's `steer_turn` lane, otherwise as
+/// the targeted-`ContextInjection` between-turns fallback
+/// ([`queue_external_coordination_alert_steers`], merged into the next
+/// outgoing prompt by `drain_steer_queue_as_followup`). Returns nothing
+/// outside a radar-publishing daemon (foreground `--agent` shapes) —
+/// the ruled degrade-to-no-op.
+pub(crate) fn admit_external_coordination_alert_steers(
+    session_id: Option<&str>,
+) -> Vec<coordination::render::AlertSteer> {
+    let Some(session_id) = session_id else {
+        return Vec::new();
+    };
+    let Some(state) = coordination::radar::published_radar_state() else {
+        return Vec::new();
+    };
+    let writer_id = coordination::lifecycle::writer_id_for_session(session_id);
+    let Some(snapshot) = state.space_with_alerts_for(&writer_id) else {
+        return Vec::new();
+    };
+    let steers = coordination::render::render_alert_steers(&snapshot, &writer_id);
+    if steers.is_empty() {
+        return steers;
+    }
+    let now_ms = coordination::now_ms();
+    let ledger = coordination::radar::external_steer_ledger();
+    steers
+        .into_iter()
+        .filter(|steer| ledger.admit(session_id, steer.set_hash, now_ms))
+        .collect()
+}
+
+/// Between-turns half of the §2.8 lane: queue admitted steers as
+/// session-TARGETED system context injections; the external follow-up
+/// path (`drain_steer_queue_as_followup`) merges them verbatim above
+/// the next outgoing prompt. Deliberately NO steer lifecycle events —
+/// a supervisor-originated radar line is not a user steer (the
+/// managed-context density steer's altitude); the session log carries
+/// the delivery fact instead. Returns how many lines were queued.
+pub(crate) fn queue_external_coordination_alert_steers(
+    context_injection: &event::ContextInjectionQueue,
+    session_id: Option<&str>,
+    session_log: &SharedSessionLog,
+) -> usize {
+    let steers = admit_external_coordination_alert_steers(session_id);
+    if steers.is_empty() {
+        return 0;
+    }
+    let queued = steers.len();
+    if let Ok(mut queue) = context_injection.lock() {
+        for steer in steers {
+            slog(session_log, |l| {
+                l.info(&format!(
+                    "Coordination radar ALERT queued for the next turn: {}",
+                    steer.text
+                ))
+            });
+            queue.push(event::ContextInjection {
+                text: steer.text,
+                images: Vec::new(),
+                source: event::InjectionSource::System,
+                target_session_id: session_id.map(str::to_string),
+                steer_id: None,
+            });
+        }
+    }
+    queued
+}
+
+/// Mid-turn half of the §2.8 lane, called from the turn drain on its
+/// consult cadence: admitted steers go through the backend's native
+/// `steer_turn`; a backend that cannot take one right now (turn just
+/// ended, RPC trouble) falls back to the queued between-turns shape so
+/// the line still reaches the model exactly once.
+pub(crate) async fn steer_external_coordination_alerts(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    config: &DrainConfig<'_>,
+) {
+    let steers = admit_external_coordination_alert_steers(config.session_id.as_deref());
+    for steer in steers {
+        match agent.steer_turn(&steer.text).await {
+            Ok(()) => {
+                let content = format!(
+                    "Coordination radar ALERT steered into the running {} turn: {}",
+                    agent.name(),
+                    steer.text
+                );
+                slog(config.session_log, |l| l.info(&content));
+                config.bus.send(AppEvent::LogEntry {
+                    session_id: config.session_id.clone(),
+                    level: "info".to_string(),
+                    source: "Intendant".to_string(),
+                    content,
+                    turn: None,
+                });
+            }
+            Err(e) => {
+                slog(config.session_log, |l| {
+                    l.debug(&format!(
+                        "Coordination radar steer fell back to the next-turn queue ({e})"
+                    ))
+                });
+                if let Ok(mut queue) = config.context_injection.lock() {
+                    queue.push(event::ContextInjection {
+                        text: steer.text,
+                        images: Vec::new(),
+                        source: event::InjectionSource::System,
+                        target_session_id: config.session_id.clone(),
+                        steer_id: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ExternalContextSnapshotState {
     pub(crate) emitted_keys: std::collections::HashSet<u64>,

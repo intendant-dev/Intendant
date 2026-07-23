@@ -423,7 +423,6 @@ impl RadarState {
 
     /// One space's latest snapshot — the injection seam's read
     /// (`render::render_block` consumes it per session).
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by the C2 injection wiring (PR E)
     pub(crate) fn space(&self, space_key: &str) -> Option<Arc<SpaceRadarSnapshot>> {
         self.spaces
             .read()
@@ -431,6 +430,197 @@ impl RadarState {
             .get(space_key)
             .cloned()
     }
+
+    /// Delivery-lane read (§2.8): the snapshot of the space whose ALERT
+    /// overlaps name this writer. A session lives in exactly one space,
+    /// so the first hit wins (iteration over the handful of live
+    /// spaces); `None` means nothing is alerting on this writer
+    /// anywhere — the external steer lane's cheap no-op.
+    pub(crate) fn space_with_alerts_for(&self, writer_id: &str) -> Option<Arc<SpaceRadarSnapshot>> {
+        self.spaces
+            .read()
+            .expect("radar state lock")
+            .values()
+            .find(|snapshot| session_has_alerts(snapshot, writer_id))
+            .cloned()
+    }
+}
+
+/// Whether any ALERT overlap in the snapshot names this writer — the
+/// raise/resolve predicate for the §2.8 rail-badge flag and the
+/// external lane's "anything to say at all" gate. Ambient content
+/// (presence, messages, invalid counts) is invisible here by
+/// construction.
+pub(crate) fn session_has_alerts(snapshot: &SpaceRadarSnapshot, writer_id: &str) -> bool {
+    snapshot
+        .pair_overlaps
+        .iter()
+        .any(|o| o.a == writer_id || o.b == writer_id)
+        || snapshot.pr_overlaps.iter().any(|o| o.writer == writer_id)
+}
+
+/// One §2.8 rail-badge transition to broadcast as
+/// [`crate::event::AppEvent::CoordinationRadar`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RadarFlagTransition {
+    pub session_id: String,
+    /// The flag's stable identity: the session's space key at raise
+    /// time, so a resolve always retracts the raise it pairs with.
+    pub id: String,
+    pub state: crate::types::CoordinationRadarState,
+}
+
+/// Raise/resolve bookkeeping for the §2.8 rail badge: one retractable
+/// flag per supervised session, raised while any ALERT overlap names
+/// the session, resolved when none does — including when the session
+/// disappears from the tick (ended, registry pruned, space GC'd), so a
+/// gone session can never hold a raised flag. A pure state machine the
+/// task feeds full-tick observations; it returns the transitions to
+/// broadcast (raise once, resolve once — no re-raise chatter while a
+/// flag stays up).
+#[derive(Default)]
+pub(crate) struct RadarFlagTracker {
+    /// session id → flag id of the outstanding raise.
+    raised: HashMap<String, String>,
+}
+
+impl RadarFlagTracker {
+    /// Fold one tick's complete observation set — every supervised
+    /// session the radar saw, with its space key and whether that
+    /// space's snapshot names it in an ALERT — and return the
+    /// transitions. A session moving spaces mid-raise resolves the old
+    /// flag before raising the new one (ids must pair exactly).
+    pub(crate) fn observe_tick(
+        &mut self,
+        observed: &[(String, String, bool)],
+    ) -> Vec<RadarFlagTransition> {
+        use crate::types::CoordinationRadarState as State;
+        let mut transitions = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for (session_id, space_key, alerted) in observed {
+            seen.insert(session_id.as_str());
+            let outstanding = self.raised.get(session_id).cloned();
+            match (outstanding, alerted) {
+                (None, true) => {
+                    self.raised.insert(session_id.clone(), space_key.clone());
+                    transitions.push(RadarFlagTransition {
+                        session_id: session_id.clone(),
+                        id: space_key.clone(),
+                        state: State::Raised,
+                    });
+                }
+                (Some(id), false) => {
+                    self.raised.remove(session_id);
+                    transitions.push(RadarFlagTransition {
+                        session_id: session_id.clone(),
+                        id,
+                        state: State::Resolved,
+                    });
+                }
+                (Some(id), true) if id != *space_key => {
+                    self.raised.insert(session_id.clone(), space_key.clone());
+                    transitions.push(RadarFlagTransition {
+                        session_id: session_id.clone(),
+                        id,
+                        state: State::Resolved,
+                    });
+                    transitions.push(RadarFlagTransition {
+                        session_id: session_id.clone(),
+                        id: space_key.clone(),
+                        state: State::Raised,
+                    });
+                }
+                _ => {}
+            }
+        }
+        // Sessions that vanished from the tick resolve, in stable order.
+        let mut gone: Vec<(String, String)> = self
+            .raised
+            .iter()
+            .filter(|(session_id, _)| !seen.contains(session_id.as_str()))
+            .map(|(session_id, id)| (session_id.clone(), id.clone()))
+            .collect();
+        gone.sort();
+        for (session_id, id) in gone {
+            self.raised.remove(&session_id);
+            transitions.push(RadarFlagTransition {
+                session_id,
+                id,
+                state: State::Resolved,
+            });
+        }
+        transitions
+    }
+}
+
+/// §2.8: the external ALERT steer lane's cooldown window — at most one
+/// steer per recipient session per window, regardless of overlap set.
+pub(crate) const EXTERNAL_STEER_COOLDOWN_MS: u64 = 10 * 60 * 1000;
+/// Delivered-set entries kept per session / sessions kept in the ledger
+/// before the cheap clear (the radar task's own cache-cap shape). A
+/// clear's worst case is one repeat steer per pair, still cooldown-paced.
+const STEER_LEDGER_MAX_SETS: usize = 256;
+const STEER_LEDGER_MAX_SESSIONS: usize = 512;
+
+#[derive(Default)]
+struct SessionSteerLedger {
+    last_steer_ms: u64,
+    delivered_sets: HashSet<u64>,
+}
+
+/// Spam discipline for the external ALERT steer lane (§2.8), mirroring
+/// the radar-note lane's two layers (`messages::write_radar_note`):
+/// one steer per **distinct overlap set** per session pair —
+/// `set_hash` is the steer's canonical set identity from
+/// [`super::render::render_alert_steers`] — plus at most one steer per
+/// recipient session per [`EXTERNAL_STEER_COOLDOWN_MS`] regardless of
+/// set. A cooldown-suppressed set stays unrecorded, so the periodic
+/// consult retries it once the window clears (the note lane's
+/// tick-retry shape — deferred, not dropped). Daemon-side state beside
+/// the radar task's published snapshots (the ruled altitude); ambient
+/// content never reaches this ledger because only ALERT steers carry a
+/// set hash at all.
+#[derive(Default)]
+pub(crate) struct ExternalSteerLedger {
+    sessions: std::sync::Mutex<HashMap<String, SessionSteerLedger>>,
+}
+
+impl ExternalSteerLedger {
+    /// True ADMITS the steer now and records it (set marked delivered,
+    /// cooldown restarted) — the caller must then deliver it, mid-turn
+    /// via `steer_turn` or queued as the between-turns
+    /// `ContextInjection` fallback. False: this exact set was already
+    /// delivered, or the session's cooldown is still running.
+    pub(crate) fn admit(&self, session_id: &str, set_hash: u64, now_ms: u64) -> bool {
+        let mut sessions = self.sessions.lock().expect("steer ledger lock");
+        if sessions.len() >= STEER_LEDGER_MAX_SESSIONS && !sessions.contains_key(session_id) {
+            sessions.clear();
+        }
+        let entry = sessions.entry(session_id.to_string()).or_default();
+        if entry.delivered_sets.contains(&set_hash) {
+            return false;
+        }
+        if entry.last_steer_ms != 0
+            && now_ms.saturating_sub(entry.last_steer_ms) < EXTERNAL_STEER_COOLDOWN_MS
+        {
+            return false; // cooling down; the set stays unrecorded and retries later
+        }
+        if entry.delivered_sets.len() >= STEER_LEDGER_MAX_SETS {
+            entry.delivered_sets.clear();
+        }
+        entry.delivered_sets.insert(set_hash);
+        entry.last_steer_ms = now_ms;
+        true
+    }
+}
+
+/// The daemon's steer-cooldown ledger (process-wide like the published
+/// radar state: both external drain halves — mid-turn and idle — must
+/// share one view of what was already delivered).
+static EXTERNAL_STEER_LEDGER: OnceLock<ExternalSteerLedger> = OnceLock::new();
+
+pub(crate) fn external_steer_ledger() -> &'static ExternalSteerLedger {
+    EXTERNAL_STEER_LEDGER.get_or_init(ExternalSteerLedger::default)
 }
 
 /// The daemon's live radar state, published once at startup. Tests
@@ -442,8 +632,10 @@ pub(crate) fn publish_radar_state(state: &RadarState) {
 }
 
 /// The published state, when a daemon startup path wired one — where
-/// the injection seam (PR E) reads each session's space snapshot from.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by the C2 injection wiring (PR E)
+/// the native injection seam reads each session's space snapshot from
+/// (`agent_loop`), and the external ALERT steer lane its alert view
+/// (`external_supervision`). `None` in every non-daemon shape, which is
+/// exactly the ruled degrade-to-no-op.
 pub(crate) fn published_radar_state() -> Option<&'static RadarState> {
     PUBLISHED_RADAR_STATE.get()
 }
@@ -573,6 +765,10 @@ struct RadarTask {
     coordination_root: PathBuf,
     state: RadarState,
     targets: GitVitalsTargets,
+    /// The daemon event bus, for the §2.8 rail-badge transitions
+    /// ([`RadarFlagTracker`] → `AppEvent::CoordinationRadar`).
+    bus: crate::event::EventBus,
+    flags: RadarFlagTracker,
     git_program: std::ffi::OsString,
     /// `gh` participation — disabled only in tests via [`RadarTask`]
     /// construction (unit tests never spawn the task at all).
@@ -681,13 +877,17 @@ impl RadarTask {
         let now_ms = super::now_ms();
         // Registry members grouped by space: every supervised session
         // participates in git-scan detection, declared or not (§2.8).
-        let mut members_by_space: BTreeMap<String, Vec<(String, PathBuf)>> = BTreeMap::new();
+        // Session ids ride along for the rail-badge flags — the bus
+        // works in writer ids, the dashboard in session ids.
+        let mut members_by_space: BTreeMap<String, Vec<(String, String, PathBuf)>> =
+            BTreeMap::new();
         for (session_id, root) in self.targets.snapshot() {
             let key = self.space_key_for(&root);
+            let writer_id = writer_id_for_session(&session_id);
             members_by_space
                 .entry(key)
                 .or_default()
-                .push((writer_id_for_session(&session_id), root));
+                .push((session_id, writer_id, root));
         }
         for members in members_by_space.values_mut() {
             members.sort();
@@ -697,24 +897,40 @@ impl RadarTask {
         keys.extend(self.disk_spaces());
 
         let mut live: HashSet<String> = HashSet::new();
+        // (session id, space key, alerted) per supervised session — the
+        // full-tick observation set the flag tracker folds at the end.
+        let mut flag_observations: Vec<(String, String, bool)> = Vec::new();
         for key in keys {
             let space_dir = self.coordination_root.join(&key);
+            let members = members_by_space.remove(&key).unwrap_or_default();
             let bus = match read_space_bus(&space_dir, now_ms) {
                 Ok(bus) => bus,
                 Err(e) => {
                     // Corruption-grade trouble: keep the last snapshot
                     // (don't blind consumers on a transient) and log on
-                    // change.
+                    // change. Flags follow the retained view for the
+                    // same reason — a transient must not flap them.
                     self.note_trouble(format!("{key}/bus"), Some(e.to_string()));
+                    let retained = self.state.space(&key);
+                    for (session_id, writer_id, _) in &members {
+                        let alerted = retained
+                            .as_deref()
+                            .is_some_and(|s| session_has_alerts(s, writer_id));
+                        flag_observations.push((session_id.clone(), key.clone(), alerted));
+                    }
                     live.insert(key);
                     continue;
                 }
             };
             self.note_trouble(format!("{key}/bus"), None);
-            let members = members_by_space.remove(&key).unwrap_or_default();
-            let roots: Vec<PathBuf> = members.iter().map(|(_, root)| root.clone()).collect();
+            let roots: Vec<PathBuf> = members.iter().map(|(_, _, root)| root.clone()).collect();
+            let writer_members: Vec<(String, PathBuf)> = members
+                .iter()
+                .map(|(_, writer_id, root)| (writer_id.clone(), root.clone()))
+                .collect();
             let observed =
-                collect_observed(&self.git_program, &members, &mut self.toplevel_cache).await;
+                collect_observed(&self.git_program, &writer_members, &mut self.toplevel_cache)
+                    .await;
             let pr_sets = self.pr_sets(&key, &roots, now_ms).await;
             let snapshot = compute_space_snapshot(
                 &RadarSpaceInputs {
@@ -732,24 +948,46 @@ impl RadarTask {
                 format!("{key}/notes"),
                 (!note_errors.is_empty()).then(|| note_errors.join("; ")),
             );
+            for (session_id, writer_id, _) in &members {
+                flag_observations.push((
+                    session_id.clone(),
+                    key.clone(),
+                    session_has_alerts(&snapshot, writer_id),
+                ));
+            }
             self.state.publish_space(snapshot);
             live.insert(key);
         }
         self.state.retain_spaces(&live);
+        // Rail-badge transitions (§2.8, R8) — after the publishes, so a
+        // consumer woken by a raise reads the fresh snapshots.
+        for transition in self.flags.observe_tick(&flag_observations) {
+            self.bus.send(crate::event::AppEvent::CoordinationRadar {
+                session_id: transition.session_id,
+                id: transition.id,
+                state: transition.state,
+            });
+        }
     }
 }
 
 /// Spawn the periodic radar task (daemon startup). Resolves the real
 /// coordination root at this edge — everything below takes explicit
 /// paths — publishes the state handle for the read side, and ticks
-/// forever on [`RADAR_TICK`].
-pub(crate) fn spawn_radar_task(targets: GitVitalsTargets) -> tokio::task::JoinHandle<()> {
+/// forever on [`RADAR_TICK`]. `bus` carries the §2.8 rail-badge
+/// transitions to the normal outbound broadcaster path.
+pub(crate) fn spawn_radar_task(
+    targets: GitVitalsTargets,
+    bus: crate::event::EventBus,
+) -> tokio::task::JoinHandle<()> {
     let state = RadarState::default();
     publish_radar_state(&state);
     let mut task = RadarTask {
         coordination_root: super::paths::coordination_root(&crate::platform::intendant_home()),
         state,
         targets,
+        bus,
+        flags: RadarFlagTracker::default(),
         git_program: "git".into(),
         gh_enabled: true,
         space_key_cache: HashMap::new(),
@@ -1181,5 +1419,214 @@ mod tests {
         assert!(state.space("alpha-1").is_none());
         assert!(state.space("beta-2").is_some());
         assert!(state.space("never").is_none());
+    }
+
+    #[test]
+    fn space_with_alerts_finds_only_alerting_writers() {
+        let state = RadarState::default();
+        let mut s = SpaceRadarSnapshot {
+            space_key: "gamma-3".into(),
+            ..Default::default()
+        };
+        s.sessions.push(RadarSessionPresence {
+            writer_id: "s-ambient".into(),
+            backend: None,
+            stale: false,
+        });
+        s.pair_overlaps.push(RadarPairOverlap {
+            path: "src/x.rs".into(),
+            a: "s-hot".into(),
+            b: "s-warm".into(),
+            declared: true,
+            git: false,
+        });
+        s.pr_overlaps.push(RadarPrOverlap {
+            path: "docs/y.md".into(),
+            writer: "s-pr".into(),
+            pr: 4,
+        });
+        state.publish_space(s);
+        for alerted in ["s-hot", "s-warm", "s-pr"] {
+            assert!(
+                state.space_with_alerts_for(alerted).is_some(),
+                "{alerted} alerts"
+            );
+        }
+        // Present but ambient-only, or absent entirely: no alert view —
+        // the external lane sees nothing to say.
+        assert!(state.space_with_alerts_for("s-ambient").is_none());
+        assert!(state.space_with_alerts_for("s-elsewhere").is_none());
+    }
+
+    /// RULED (R8): the rail-badge flag raises once while ALERTs name a
+    /// session, retracts when they clear, retracts when the session
+    /// disappears, and re-pairs correctly across a space move.
+    #[test]
+    fn flag_tracker_raises_and_resolves_per_session() {
+        use crate::types::CoordinationRadarState as State;
+        let mut tracker = RadarFlagTracker::default();
+        let obs = |alerted: bool| vec![("sess-1".to_string(), "space-a".to_string(), alerted)];
+
+        assert!(tracker.observe_tick(&obs(false)).is_empty(), "quiet start");
+        let raised = tracker.observe_tick(&obs(true));
+        assert_eq!(raised.len(), 1);
+        assert_eq!(
+            (
+                raised[0].session_id.as_str(),
+                raised[0].id.as_str(),
+                raised[0].state
+            ),
+            ("sess-1", "space-a", State::Raised)
+        );
+        // Still alerting: NO re-raise chatter.
+        assert!(tracker.observe_tick(&obs(true)).is_empty());
+        // Cleared: exactly one resolve, same flag id.
+        let resolved = tracker.observe_tick(&obs(false));
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            (resolved[0].id.as_str(), resolved[0].state),
+            ("space-a", State::Resolved)
+        );
+        assert!(tracker.observe_tick(&obs(false)).is_empty(), "no double");
+
+        // Raise again, then the session VANISHES from the tick — the
+        // sweep retracts (a gone session never holds a raised flag).
+        tracker.observe_tick(&obs(true));
+        let swept = tracker.observe_tick(&[]);
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].state, State::Resolved);
+
+        // A space move mid-raise resolves the old id before raising the
+        // new one, so raise/resolve always pair by id.
+        tracker.observe_tick(&obs(true));
+        let moved = tracker.observe_tick(&[("sess-1".to_string(), "space-b".to_string(), true)]);
+        assert_eq!(
+            moved
+                .iter()
+                .map(|t| (t.id.as_str(), t.state))
+                .collect::<Vec<_>>(),
+            vec![("space-a", State::Resolved), ("space-b", State::Raised)]
+        );
+    }
+
+    /// §2.8 spam discipline for the external steer lane: one steer per
+    /// distinct set, a 10-minute per-session cooldown that DEFERS (not
+    /// drops) newer sets, and per-session isolation.
+    #[test]
+    fn external_steer_ledger_dedups_and_cools_down() {
+        let ledger = ExternalSteerLedger::default();
+        let t0: u64 = 1_000_000;
+        assert!(ledger.admit("sess-1", 11, t0), "first set admits");
+        assert!(
+            !ledger.admit("sess-1", 11, t0 + 1),
+            "same set never repeats"
+        );
+        assert!(
+            !ledger.admit("sess-1", 22, t0 + 1),
+            "different set cools down"
+        );
+        assert!(
+            !ledger.admit("sess-1", 22, t0 + EXTERNAL_STEER_COOLDOWN_MS - 1),
+            "still cooling"
+        );
+        assert!(
+            ledger.admit("sess-1", 22, t0 + EXTERNAL_STEER_COOLDOWN_MS),
+            "deferred set admits once the window clears"
+        );
+        assert!(
+            !ledger.admit("sess-1", 11, t0 + 10 * EXTERNAL_STEER_COOLDOWN_MS),
+            "delivered sets stay delivered across windows"
+        );
+        // Sessions are independent.
+        assert!(ledger.admit("sess-2", 11, t0));
+    }
+
+    /// The real task tick end to end (hermetic paths, no gh): a bus
+    /// overlap raises the session's flag on the daemon bus; removing
+    /// the neighbor's declaration resolves it. This is the Rust-side
+    /// emission proof for the retractable `radar` attention kind.
+    #[tokio::test]
+    async fn radar_task_tick_emits_raise_then_resolve_on_the_bus() {
+        use crate::types::CoordinationRadarState as State;
+        let tmp = tempfile::tempdir().unwrap();
+        let coordination_root = tmp.path().join("coordination");
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let key = crate::coordination::space_key(&proj);
+        let space_dir = coordination_root.join(&key);
+        let writer = writer_id_for_session("sess-radar-a");
+        let ds = DeclarationSpace::open(&space_dir, &key).unwrap();
+        let dirty = ["src/hot.rs".to_string()];
+        for id in [writer.as_str(), "s-nbr"] {
+            ds.write_own(&DeclarationInput {
+                id,
+                session: None,
+                backend: Some("native"),
+                root: None,
+                branch: None,
+                intent: "overlap fixture",
+                dirty: &dirty,
+            })
+            .unwrap();
+        }
+
+        let targets = GitVitalsTargets::default();
+        targets.register("sess-radar-a", proj.clone());
+        let bus = crate::event::EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let mut task = RadarTask {
+            coordination_root,
+            state: RadarState::default(),
+            targets,
+            bus,
+            flags: RadarFlagTracker::default(),
+            git_program: "git".into(),
+            gh_enabled: false,
+            space_key_cache: HashMap::new(),
+            toplevel_cache: HashMap::new(),
+            pr_cache: HashMap::new(),
+            last_trouble: HashMap::new(),
+        };
+
+        task.tick().await;
+        let raised = loop {
+            match bus_rx.try_recv() {
+                Ok(crate::event::AppEvent::CoordinationRadar {
+                    session_id,
+                    id,
+                    state,
+                }) => break (session_id, id, state),
+                Ok(_) => continue,
+                Err(e) => panic!("no CoordinationRadar after the alerting tick: {e:?}"),
+            }
+        };
+        assert_eq!(
+            raised,
+            ("sess-radar-a".to_string(), key.clone(), State::Raised)
+        );
+        // The same tick published the snapshot the delivery lanes read.
+        assert!(task.state.space_with_alerts_for(&writer).is_some());
+
+        // Quiet ticks: no chatter.
+        task.tick().await;
+        // Neighbor leaves; the overlap clears; the flag retracts.
+        std::fs::remove_file(space_dir.join("sessions/s-nbr.md")).unwrap();
+        task.tick().await;
+        let mut transitions = Vec::new();
+        while let Ok(event) = bus_rx.try_recv() {
+            if let crate::event::AppEvent::CoordinationRadar {
+                session_id,
+                id,
+                state,
+            } = event
+            {
+                transitions.push((session_id, id, state));
+            }
+        }
+        assert_eq!(
+            transitions,
+            vec![("sess-radar-a".to_string(), key, State::Resolved)],
+            "exactly one retraction, nothing between"
+        );
     }
 }

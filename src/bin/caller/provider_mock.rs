@@ -47,6 +47,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 pub const MOCK_SCRIPT_ENV: &str = "INTENDANT_MOCK_SCRIPT";
+/// Opt-in request tap for prefix-stability e2es (coordination §2.6):
+/// when set to a path, every chat call appends one JSONL record
+/// `{"n":…,"messages_json":"…"}` whose `messages_json` field is the
+/// exact serde serialization of the request's message Vec — so two
+/// consecutive requests can be byte-compared for the tail-append-only
+/// property. Test-only and off by default; requests are recorded as
+/// received, before any script bookkeeping.
+pub const MOCK_REQUEST_DUMP_ENV: &str = "INTENDANT_MOCK_REQUEST_DUMP";
 const MOCK_FILE_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +126,8 @@ pub struct MockProvider {
     script: MockScript,
     /// (selected profile, next step) — chosen on first chat() call.
     cursor: Mutex<Option<(usize, usize)>>,
+    /// Per-instance request ordinal for the [`MOCK_REQUEST_DUMP_ENV`] tap.
+    dump_seq: AtomicUsize,
 }
 
 impl MockProvider {
@@ -147,7 +157,38 @@ impl MockProvider {
             model: script.model.clone().unwrap_or_else(|| "mock-1".to_string()),
             script,
             cursor: Mutex::new(None),
+            dump_seq: AtomicUsize::new(0),
         })
+    }
+
+    /// The [`MOCK_REQUEST_DUMP_ENV`] tap: append one JSONL record for a
+    /// request as received. The env read lives at this transport edge;
+    /// tests exercise [`Self::dump_request_to`] with an injected path
+    /// (hermetic — no process-global env mutation).
+    fn dump_request_if_enabled(&self, messages: &[Message]) -> Result<(), CallerError> {
+        match std::env::var(MOCK_REQUEST_DUMP_ENV) {
+            Ok(path) if !path.is_empty() => self.dump_request_to(&path, messages),
+            _ => Ok(()),
+        }
+    }
+
+    /// Append one `{"n":…,"model":…,"messages_json":…}` JSONL record.
+    /// Failures are loud config errors — the tap only exists inside
+    /// tests, where a silent miss would fake a pass.
+    fn dump_request_to(&self, path: &str, messages: &[Message]) -> Result<(), CallerError> {
+        use std::io::Write;
+        let n = self.dump_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let messages_json = serde_json::to_string(messages)
+            .map_err(|e| CallerError::Config(format!("mock request dump serialize: {e}")))?;
+        let record =
+            serde_json::json!({ "n": n, "model": self.model, "messages_json": messages_json });
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| CallerError::Config(format!("mock request dump {path}: {e}")))?;
+        writeln!(file, "{record}")
+            .map_err(|e| CallerError::Config(format!("mock request dump {path}: {e}")))
     }
 
     /// First profile whose `match` appears in the conversation, else the
@@ -182,6 +223,7 @@ impl MockProvider {
 #[async_trait]
 impl ChatProvider for MockProvider {
     async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, CallerError> {
+        self.dump_request_if_enabled(messages)?;
         let transcript: String = messages
             .iter()
             .map(|m| m.content.as_str())
@@ -447,6 +489,56 @@ mod tests {
             .expect("chat task should not panic")
             .expect("released step should answer");
         assert_eq!(response.content, "released");
+    }
+
+    /// The §2.6 request tap: consecutive requests dump their exact
+    /// message-Vec serialization, and a pure tail append shows up as a
+    /// byte-identical prefix (the same mechanism the coordination
+    /// prefix e2e asserts through the real binaries, which set
+    /// [`MOCK_REQUEST_DUMP_ENV`] on the child daemon's environment).
+    #[test]
+    fn request_dump_records_byte_comparable_serializations() {
+        let dir = tempfile::tempdir().expect("dump dir");
+        let dump = dir.path().join("requests.jsonl");
+        let dump_path = dump.to_str().expect("utf-8 temp path");
+        let provider = MockProvider::from_json(
+            r#"{ "profiles": [{ "steps": [ { "content": "one" }, { "content": "two" } ] }] }"#,
+        )
+        .expect("valid script");
+
+        let mut conversation = vec![message("system", "prompt"), message("user", "task")];
+        provider
+            .dump_request_to(dump_path, &conversation)
+            .expect("first dump");
+        conversation.push(message("assistant", "one"));
+        conversation.push(message("user", "[System] coordination v1 space=test tail"));
+        provider
+            .dump_request_to(dump_path, &conversation)
+            .expect("second dump");
+
+        let dumped = std::fs::read_to_string(&dump).expect("dump file");
+        let records: Vec<serde_json::Value> = dumped
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("dump line parses"))
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["n"], 1);
+        assert_eq!(records[1]["n"], 2);
+        let first = records[0]["messages_json"].as_str().expect("first json");
+        let second = records[1]["messages_json"].as_str().expect("second json");
+        let first_open = first.strip_suffix(']').expect("array serialization");
+        assert!(
+            second.starts_with(first_open),
+            "prior request must be a byte prefix:\n{first}\n{second}"
+        );
+        assert_eq!(second.as_bytes()[first_open.len()], b',', "pure append");
+        let second_messages: Vec<serde_json::Value> =
+            serde_json::from_str(second).expect("second parses");
+        assert_eq!(
+            second_messages.last().and_then(|m| m["content"].as_str()),
+            Some("[System] coordination v1 space=test tail"),
+            "the appended tail is the last message"
+        );
     }
 
     #[test]

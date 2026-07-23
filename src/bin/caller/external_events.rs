@@ -254,6 +254,9 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
         EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
     );
     context_snapshot_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // §2.8 ALERT steer consult spacing: rides the snapshot tick but at
+    // the radar's own cadence (`None` = consult on the first tick).
+    let mut coordination_consult_at: Option<tokio::time::Instant> = None;
     let post_turn_sleep = tokio::time::sleep(EXTERNAL_POST_TURN_DRAIN_GRACE);
     tokio::pin!(post_turn_sleep);
     let mut post_turn_sleep_active = false;
@@ -1108,6 +1111,17 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     &mut context_snapshot_state,
                 )
                 .await;
+                // Coordination radar, external ALERT lane (§2.8): poll
+                // the published radar state on the radar's own cadence —
+                // mid-turn deliveries ride the backend's `steer_turn`
+                // (the density-steer precedent), and the cooldown ledger
+                // inside keeps quiet consults free.
+                if coordination_consult_at
+                    .is_none_or(|t| t.elapsed() >= EXTERNAL_COORDINATION_CONSULT_INTERVAL)
+                {
+                    coordination_consult_at = Some(tokio::time::Instant::now());
+                    steer_external_coordination_alerts(agent, config).await;
+                }
                 continue;
             }
             maybe_event = event_rx.recv() => {

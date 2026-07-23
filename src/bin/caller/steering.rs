@@ -112,6 +112,31 @@ pub(crate) fn queued_steer_targets_session(
     session_id == Some(target) || alias_session_id == Some(target)
 }
 
+/// A system injection explicitly TARGETED at this external session —
+/// today only the coordination radar's §2.8 between-turns ALERT
+/// fallback pushes these. Only explicitly targeted entries qualify:
+/// untargeted system injections (display take/release, presence
+/// annotations) belong to the native drain path and stay queued. These
+/// entries merge verbatim (their text carries its own `[System] …`
+/// provenance marker) and never trigger empty flush turns
+/// ([`has_queued_steers_for_session`] deliberately ignores them — an
+/// advisory radar line waits for the next real turn).
+pub(crate) fn queued_system_injection_targets_session(
+    injection: &event::ContextInjection,
+    session_id: Option<&str>,
+    alias_session_id: Option<&str>,
+) -> bool {
+    if injection.steer_id.is_some() || injection.source != event::InjectionSource::System {
+        return false;
+    }
+    injection
+        .target_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .is_some_and(|target| session_id == Some(target) || alias_session_id == Some(target))
+}
+
 pub(crate) fn has_queued_steers_for_session(
     context_injection: &event::ContextInjectionQueue,
     session_id: Option<&str>,
@@ -343,19 +368,28 @@ pub(crate) fn mark_pending_runtime_steers_delivered_at_model_checkpoint(
 /// Drain queued steer items from `context_injection` and merge them into a
 /// follow-up user message bound for an external agent.
 ///
-/// Only drains items whose `steer_id` is `Some(_)` — those are the entries
-/// that the steer fallback path pushed. Other queue sources (display
-/// takeover, presence annotations) are left in place for the native
-/// drain-between-turns path used by the internal agent loop.
+/// Two entry classes drain here:
+/// - items whose `steer_id` is `Some(_)` — the entries the steer fallback
+///   path pushed. Each emits `AppEvent::SteerDelivered { mid_turn: false }`
+///   so the dashboard can retire its pending-steer UI row, and merges
+///   prefixed with `[User]`;
+/// - system items explicitly TARGETED at this session
+///   ([`queued_system_injection_targets_session`] — today the coordination
+///   radar's §2.8 between-turns ALERT fallback). These merge VERBATIM
+///   (their text carries its own `[System] …` provenance marker) and emit
+///   no steer lifecycle events — a supervisor-originated radar line is not
+///   a user steer.
 ///
-/// For each drained item, emits `AppEvent::SteerDelivered { mid_turn: false }`
-/// so the dashboard can retire its pending-steer UI row. The returned
-/// string interleaves queued steers (prefixed with `[User]`) above the
-/// caller's `followup` text — the result is sent as a single external agent
+/// Untargeted non-steer entries (display takeover, presence annotations)
+/// are left in place for the native drain-between-turns path used by the
+/// internal agent loop.
+///
+/// The returned string interleaves the drained lines above the caller's
+/// `followup` text — the result is sent as a single external agent
 /// message so the agent sees both in the same turn's input.
 ///
-/// When `followup` is empty and queued steer text exists, the queued steer
-/// text becomes the whole follow-up. When both are empty, the return is
+/// When `followup` is empty and queued text exists, the queued text
+/// becomes the whole follow-up. When both are empty, the return is
 /// `None`, meaning "nothing to send".
 pub(crate) fn drain_steer_queue_as_followup(
     context_injection: &event::ContextInjectionQueue,
@@ -366,8 +400,8 @@ pub(crate) fn drain_steer_queue_as_followup(
 ) -> Option<String> {
     let mut prefix_lines: Vec<String> = Vec::new();
     if let Ok(mut q) = context_injection.lock() {
-        // Partition: keep non-steer entries and steers for other sessions,
-        // pull out steer entries for this session.
+        // Partition: keep foreign/untargeted entries, pull out this
+        // session's steers and targeted system injections.
         let mut kept = Vec::with_capacity(q.len());
         for inj in q.drain(..) {
             if queued_steer_targets_session(&inj, session_id, alias_session_id) {
@@ -382,6 +416,8 @@ pub(crate) fn drain_steer_queue_as_followup(
                     id,
                     mid_turn: false,
                 });
+            } else if queued_system_injection_targets_session(&inj, session_id, alias_session_id) {
+                prefix_lines.push(inj.text.clone());
             } else {
                 kept.push(inj);
             }
@@ -612,6 +648,56 @@ mod tests {
             .expect("should produce a message");
         assert_eq!(merged, "follow-up");
         assert_eq!(queue.lock().unwrap().len(), 1, "non-steer entry preserved");
+    }
+
+    #[tokio::test]
+    async fn drain_steer_queue_merges_targeted_system_injections_verbatim() {
+        // The coordination radar's §2.8 between-turns fallback: a
+        // session-TARGETED system injection merges verbatim (its text
+        // carries its own [System] marker), emits NO steer lifecycle
+        // events, and never counts as a queued steer (no empty flush
+        // turn). Untargeted system entries stay for the native drain.
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let queue = event::ContextInjectionQueue::default();
+        {
+            let mut q = queue.lock().unwrap();
+            q.push(event::ContextInjection {
+                text: "[System] coordination v1 space=s-1 ! overlap src/a.rs — with s-peer (git)"
+                    .into(),
+                images: vec![],
+                source: event::InjectionSource::System,
+                target_session_id: Some("session-b".into()),
+                steer_id: None,
+            });
+            q.push(event::ContextInjection {
+                text: "[System] coordination v1 space=s-1 ! overlap src/b.rs — pr#7".into(),
+                images: vec![],
+                source: event::InjectionSource::System,
+                target_session_id: Some("session-other".into()),
+                steer_id: None,
+            });
+            q.push(event::ContextInjection::text("display grant".into()));
+        }
+        assert!(
+            !has_queued_steers_for_session(&queue, Some("session-b"), None),
+            "targeted system injections must not arm the empty flush turn"
+        );
+
+        let merged = drain_steer_queue_as_followup(&queue, "main", &bus, Some("session-b"), None)
+            .expect("merged");
+        assert_eq!(
+            merged,
+            "[System] coordination v1 space=s-1 ! overlap src/a.rs — with s-peer (git)\nmain"
+        );
+        let remaining = queue.lock().unwrap();
+        assert_eq!(remaining.len(), 2, "foreign + untargeted entries stay");
+        assert!(remaining.iter().any(|inj| inj.text == "display grant"));
+        drop(remaining);
+        assert!(
+            rx.try_recv().is_err(),
+            "no steer lifecycle events for radar lines"
+        );
     }
 
     #[tokio::test]
