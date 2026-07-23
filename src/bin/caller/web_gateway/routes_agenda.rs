@@ -1,8 +1,9 @@
-//! The agenda's HTTP surface: `GET /api/agenda` (ledger snapshot) and
-//! `POST /api/agenda/op` (apply one command), plus the transport-neutral
-//! cores their dashboard-control tunnel twins reuse. The IAM gate
-//! (`agenda.read` / `agenda.write`) runs pre-dispatch off the route rows;
-//! mutations funnel through the daemon's single-writer
+//! The agenda's HTTP surface: `GET /api/agenda` (ledger snapshot),
+//! `GET /api/agenda/ops` (raw op-log page), and `POST /api/agenda/op`
+//! (apply one command), plus the transport-neutral cores their
+//! dashboard-control tunnel twins reuse. The IAM gate (`agenda.read` /
+//! `agenda.write`) runs pre-dispatch off the route rows; mutations
+//! funnel through the daemon's single-writer
 //! [`crate::agenda::AgendaHandle`], which broadcasts `agenda_changed`.
 
 use super::*;
