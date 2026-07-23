@@ -515,11 +515,10 @@ function switchActivitySubtab(name) {
   if (name === 'changes') {
     const badge = document.getElementById('badge-changes');
     if (badge) { badge.style.display = 'none'; badge.textContent = ''; }
-    refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true });
-    // Populate the timeline on first view in case the user opened the
-    // Changes tab after a session had already racked up history
-    // (refreshHistory is a no-op when the endpoint 404s).
-    if (typeof refreshHistory === 'function') refreshHistory();
+    // The shared activation fetch (list + timeline) — the same call the
+    // cold-boot re-arm paths in 37-uicommand-changes-control.js and
+    // 36-voice-wasm-init.js reuse.
+    refreshChangesForActivation();
   }
   if (name === 'control') {
     refreshControlPane();
