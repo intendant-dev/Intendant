@@ -4777,6 +4777,202 @@ async fn supervised_session_writes_task_ask_human_and_steer_message_rows() {
     );
 }
 
+/// Track C C3, RULED acceptance (the slice mapping's "round-trip incl.
+/// daemonless writer"): the keyless `intendant coordination` message
+/// verbs round-trip through the real binary with NO daemon, no keys,
+/// and no env identity — send as an explicit guest → meta listed
+/// (summaries only — body bytes must not reach the listing) → read
+/// returns the exact body → delete. Also the edge behaviors only the
+/// binary exercises: writer identity from INTENDANT_SESSION_ID through
+/// the one session→writer mapping, the refuse-don't-mint identity
+/// usage (exit 2), the reserved daemon writer surfacing the store's
+/// error (exit 1), and the stdin body lane.
+#[tokio::test]
+async fn coordination_message_verbs_daemonless_round_trip() {
+    let rig = TestRig::new();
+    // One invocation = one short-lived keyless process. The host may
+    // itself run under a supervised Intendant shell, so scrub the
+    // identity/state env the verbs would otherwise inherit; the rig's
+    // command() already scrubs INTENDANT_COORDINATION_DIR.
+    let run_verb = |args: Vec<String>, stdin_body: Option<String>, session_env: Option<String>| {
+        let mut cmd = rig.command();
+        cmd.env_remove("INTENDANT_SESSION_ID")
+            .env_remove("INTENDANT_HOME");
+        if let Some(session_id) = session_env {
+            cmd.env("INTENDANT_SESSION_ID", session_id);
+        }
+        cmd.arg("coordination").args(args);
+        if stdin_body.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        async move {
+            let mut child = cmd.spawn().expect("spawn coordination verb");
+            if let Some(body) = stdin_body {
+                use tokio::io::AsyncWriteExt;
+                let mut stdin = child.stdin.take().expect("piped stdin");
+                stdin
+                    .write_all(body.as_bytes())
+                    .await
+                    .expect("write stdin body");
+                drop(stdin); // EOF ends the bounded slurp
+            }
+            tokio::time::timeout(RUN_TIMEOUT, child.wait_with_output())
+                .await
+                .expect("coordination verb exits")
+                .expect("collect verb output")
+        }
+    };
+    let argv = |raw: &[&str]| raw.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    // `dir` (the moved C1 verb): exactly one line, under the rig home.
+    let out = run_verb(argv(&["dir"]), None, None).await;
+    assert!(out.status.success(), "{}", text_of(&out));
+    let space_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let expected_root = rig.home.path().join(".intendant").join("coordination");
+    assert!(
+        Path::new(&space_dir).starts_with(&expected_root),
+        "space dir {space_dir} must live under {}",
+        expected_root.display()
+    );
+
+    // Guest send through the full flag grammar; stdout is the id.
+    const BODY: &str = "XYZZY_BODY_SENTINEL hands off tools.rs until #560 lands";
+    let out = run_verb(
+        argv(&[
+            "send",
+            "--as",
+            "guest-e2e-writer",
+            "--to",
+            "s-native-7f2a",
+            "--ttl-s",
+            "3600",
+            BODY,
+        ]),
+        None,
+        None,
+    )
+    .await;
+    assert!(out.status.success(), "{}", text_of(&out));
+    let guest_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(guest_id.starts_with("m-"), "{}", text_of(&out));
+
+    // Listing: the meta record, scripts-stable — and the ruled
+    // summary-not-content pin at the binary level (sentinel absent).
+    let out = run_verb(argv(&["messages"]), None, None).await;
+    assert!(out.status.success(), "{}", text_of(&out));
+    let listing = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        listing.contains(&format!(
+            "id={guest_id} from=guest-e2e-writer to=s-native-7f2a kind=message age_s="
+        )) && listing.contains(" ttl_s=3600 expired=false"),
+        "listing record drifted:\n{listing}"
+    );
+    assert!(
+        !listing.contains("XYZZY") && !listing.contains("hands off"),
+        "listing leaked body bytes:\n{listing}"
+    );
+
+    // The explicit lazy read: summary line, then the body verbatim.
+    let out = run_verb(argv(&["read", "guest-e2e-writer", &guest_id]), None, None).await;
+    assert!(out.status.success(), "{}", text_of(&out));
+    let read = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        read.starts_with(&format!("id={guest_id} from=guest-e2e-writer ")),
+        "summary line first:\n{read}"
+    );
+    assert!(
+        read.ends_with(&format!("\n{BODY}\n")),
+        "body verbatim:\n{read}"
+    );
+
+    // No identity, no --as: refuse (exit 2) and teach the guest form —
+    // never mint one implicitly.
+    let out = run_verb(argv(&["send", "an", "orphan", "note"]), None, None).await;
+    assert_eq!(out.status.code(), Some(2), "{}", text_of(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--as guest-"),
+        "identity refusal must name the guest form:\n{}",
+        text_of(&out)
+    );
+
+    // Supervised lane: INTENDANT_SESSION_ID resolves through the one
+    // session→writer mapping (sanitized, s- prefixed).
+    let out = run_verb(
+        argv(&["send", "supervised", "broadcast"]),
+        None,
+        Some("E2E-Sess-9".to_string()),
+    )
+    .await;
+    assert!(out.status.success(), "{}", text_of(&out));
+    let supervised_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let out = run_verb(argv(&["messages"]), None, None).await;
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("from=s-e2e-sess-9 to=* "),
+        "supervised writer mapping drifted:\n{}",
+        text_of(&out)
+    );
+
+    // Reserved writer: the store's refusal surfaces, exit 1.
+    let out = run_verb(argv(&["send", "--as", "daemon", "forged"]), None, None).await;
+    assert_eq!(out.status.code(), Some(1), "{}", text_of(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("reserved"),
+        "{}",
+        text_of(&out)
+    );
+
+    // Stdin body lane: multiline bodies arrive byte-exact.
+    let stdin_body = "line one\nline two with XYZZY_STDIN_SENTINEL";
+    let out = run_verb(
+        argv(&["send", "--as", "guest-e2e-writer"]),
+        Some(stdin_body.to_string()),
+        None,
+    )
+    .await;
+    assert!(out.status.success(), "{}", text_of(&out));
+    let stdin_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let out = run_verb(argv(&["read", "guest-e2e-writer", &stdin_id]), None, None).await;
+    assert!(
+        String::from_utf8_lossy(&out.stdout).ends_with(&format!("\n{stdin_body}\n")),
+        "stdin body must round-trip verbatim:\n{}",
+        text_of(&out)
+    );
+
+    // Deletes: own-writer via --as and via the supervised env identity;
+    // a second delete reports absence (exit 1).
+    for (id, session_env) in [
+        (&guest_id, None),
+        (&stdin_id, None),
+        (&supervised_id, Some("E2E-Sess-9".to_string())),
+    ] {
+        let mut args = vec!["delete".to_string(), id.clone()];
+        if session_env.is_none() {
+            args.extend(["--as".to_string(), "guest-e2e-writer".to_string()]);
+        }
+        let out = run_verb(args, None, session_env).await;
+        assert!(out.status.success(), "delete {id}: {}", text_of(&out));
+    }
+    let out = run_verb(
+        argv(&["delete", &guest_id, "--as", "guest-e2e-writer"]),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(out.status.code(), Some(1), "{}", text_of(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no message"),
+        "{}",
+        text_of(&out)
+    );
+    let out = run_verb(argv(&["messages"]), None, None).await;
+    assert!(out.status.success(), "{}", text_of(&out));
+    assert!(
+        out.stdout.is_empty(),
+        "emptied space lists nothing:\n{}",
+        text_of(&out)
+    );
+}
+
 /// Track C C2, RULED binding (§2.6/R6): the coordination radar block
 /// arrives as a NEW tail message and the prior request's serialized
 /// message prefix stays byte-identical — the prefix-cache proof
