@@ -4910,7 +4910,9 @@ mod provenance_parity {
         let add_user = concat!(".add_", "user(");
         let add_user_with_images = concat!(".add_", "user_with_images(");
         for (file, users, with_images) in [
-            ("agent_loop.rs", 9usize, 2usize),
+            // agent_loop's 10th site is the coordination radar block
+            // (§2.1 seam, SystemInjection — consciously added, C2).
+            ("agent_loop.rs", 10usize, 2usize),
             ("main.rs", 16, 1),
             ("run_modes.rs", 4, 3),
             ("display_glue.rs", 1, 2),
