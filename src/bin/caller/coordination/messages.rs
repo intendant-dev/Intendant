@@ -4,8 +4,10 @@
 //! data — never an instruction channel: bodies are DATA the reader
 //! weighs, and expiry is advisory until GC removes the file. The
 //! `daemon` writer name is reserved for the daemon's own lanes
-//! (C2 radar notes); plain writers are refused it here.
-#![cfg_attr(not(test), allow(dead_code))] // C1 staging: GC already consumes the scan side; the write/read lanes are C2 (radar notes) / C3 (messages + skill). Drop as that wiring lands.
+//! (C2 radar notes); plain writers are refused it here — on write AND
+//! on delete (GC's direct sweep is the daemon lane's only cleanup).
+//! Consumers: GC (scan), the C2 radar (budgeted scan + radar notes),
+//! and the C3 keyless CLI (`cli.rs` — write/read/delete).
 
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
@@ -98,6 +100,18 @@ impl MessageSpace {
             dir,
             space: space.to_string(),
         })
+    }
+
+    /// Read/delete-side handle: no directory creation. The keyless CLI
+    /// list/read/delete verbs must not mkdir a space they merely
+    /// inspect — every read path below already treats a missing
+    /// directory as an empty space (scan) or an absent message
+    /// (read/delete).
+    pub(crate) fn open_existing(space_dir: &Path, space: &str) -> Self {
+        MessageSpace {
+            dir: space_dir.join("messages"),
+            space: space.to_string(),
+        }
     }
 
     /// Leave one message (atomic, bounded, 0600). TTL hints clamp
@@ -454,11 +468,20 @@ impl MessageSpace {
     }
 
     /// A writer deletes its own message (read receipts / retraction).
+    /// The reserved daemon writer is refused like at [`Self::write`]:
+    /// plain writers never delete under the daemon's lane, and the
+    /// daemon's own cleanup is GC's direct sweep — no caller deletes as
+    /// `daemon` through this path.
     pub(crate) fn delete_own(&self, writer: &str, id: &str) -> Result<bool, CoordinationError> {
         if sanitize_key(writer) != writer || sanitize_key(id) != id {
             return Err(CoordinationError::WriteRefused(
                 "writer/id outside the filename grammar".into(),
             ));
+        }
+        if writer == RESERVED_DAEMON_WRITER {
+            return Err(CoordinationError::WriteRefused(format!(
+                "writer {RESERVED_DAEMON_WRITER:?} is reserved for the daemon's lanes"
+            )));
         }
         match std::fs::remove_file(self.dir.join(writer).join(format!("{id}.md"))) {
             Ok(()) => Ok(true),
@@ -716,6 +739,55 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("grammar"));
+    }
+
+    #[test]
+    fn delete_refuses_the_reserved_daemon_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ms = space(&tmp);
+        let paths = vec!["src/a.rs".to_string()];
+        let meta = ms
+            .write_radar_note(&note("s-alpha", &["s-alpha", "s-beta"], &paths))
+            .unwrap()
+            .expect("note lands");
+        let err = ms.delete_own(RESERVED_DAEMON_WRITER, &meta.id).unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
+        assert!(
+            tmp.path()
+                .join("space/messages/daemon")
+                .join(format!("{}.md", meta.id))
+                .is_file(),
+            "the daemon's note survives a plain-writer delete attempt"
+        );
+    }
+
+    #[test]
+    fn open_existing_never_creates_and_reads_honestly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let space_dir = tmp.path().join("space");
+        let ms = MessageSpace::open_existing(&space_dir, "test-space");
+        // Absent space: empty scan, absent read, false delete — and no
+        // directory materializes from any of them.
+        assert!(ms
+            .scan_meta(super::super::now_ms())
+            .unwrap()
+            .entries
+            .is_empty());
+        assert!(ms
+            .read("s-a", "m-1", super::super::now_ms())
+            .unwrap()
+            .is_none());
+        assert!(!ms.delete_own("s-a", "m-1").unwrap());
+        assert!(!space_dir.exists(), "read paths must not mkdir");
+
+        // The same handle sees what the creating store writes.
+        let writing = space(&tmp);
+        let m = writing.write("s-a", &msg("visible")).unwrap();
+        let seen = ms
+            .read("s-a", &m.id, super::super::now_ms())
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen.body, "visible");
     }
 
     #[test]

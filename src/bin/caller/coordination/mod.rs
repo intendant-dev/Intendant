@@ -64,25 +64,33 @@
 //! sessions; the `daemon` writer name is reserved for the daemon's
 //! lanes). `scan.rs` carries the shared rule-5 liveness machinery and
 //! field grammars, `paths.rs` the space-dir resolution seam
-//! (`INTENDANT_COORDINATION_DIR` override → derived key), `gc.rs` the
-//! rule-8 liveness sweep, and `lifecycle.rs` the supervised-session
-//! declaration glue (declare at start / heartbeat at loop boundaries /
-//! remove on clean end) the native and wrapper loops own. The
-//! consumers — collision radar, daemon-rendered prompt lanes, the
-//! CLI — are C2/C3.
+//! (`INTENDANT_COORDINATION_DIR` override → derived key) plus the
+//! keyless-CLI argv grammar, `gc.rs` the rule-8 liveness sweep, and
+//! `lifecycle.rs` the supervised-session declaration glue (declare at
+//! start / heartbeat at loop boundaries / remove on clean end) the
+//! native and wrapper loops own.
 //!
 //! Track C (C2) adds the radar's detection half: `radar.rs` (the
 //! daemon's periodic zero-LLM overlap detection over declared sets ∪
 //! observed git status ∪ open-PR file sets, published per space) and
 //! `render.rs` (the pure per-session renderer of the ruled §2.2
-//! `[System] coordination v1` block, byte-capped and deduplicated).
-//! The per-turn injection wiring and the dashboard/external delivery
-//! lanes consume them next.
+//! `[System] coordination v1` block, byte-capped and deduplicated),
+//! consumed by the per-turn injection seam and the dashboard/external
+//! delivery lanes.
+//!
+//! Track C (C3) closes the message lane's surface: `cli.rs` — the
+//! keyless `intendant coordination` verbs (`dir`, `messages`, `read`,
+//! `send`, `delete`) over these stores. Direct filesystem access with
+//! no daemon reach and no IAM surface (the ruled §3.6 posture); argv
+//! grammar in `paths.rs`; env/cwd/stdin read only at the process edge.
+//! Listings are summaries only — a message body costs an explicit
+//! `read` (§2.2's lazy read; summary-not-content pinned by test).
 
 use std::path::{Path, PathBuf};
 
 mod checkpoint;
 pub(crate) use checkpoint::*;
+pub(crate) mod cli;
 pub(crate) mod declarations;
 pub(crate) mod gc;
 pub(crate) mod lifecycle;
