@@ -838,3 +838,89 @@ html.ui-v2 #agent-signin-section .agent-signin-countdown {
   padding: 18px 20px;
 }
 #vault-v1-note { font-size: 12px; }
+
+/* ── GitHub App integration section (Track PR) ──
+   Its own scope, mirroring the vault section's form vocabulary — the
+   vault rules above are deliberately id-scoped, so this section carries
+   the same essentials under its own id rather than widening theirs.
+   Layout is self-contained (the base stylesheets' vault rules are also
+   id-scoped and never reach this mount). */
+html.ui-v2 #access-github-integration-section .vault-status-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 12px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+html.ui-v2 #access-github-integration-section .vault-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line-2);
+  background: var(--surface-3);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-2);
+}
+html.ui-v2 #access-github-integration-section .vault-chip.ok {
+  background: rgba(var(--green-rgb), .12);
+  border-color: rgba(var(--green-rgb), .26);
+  color: var(--green);
+}
+html.ui-v2 #access-github-integration-section .vault-chip.warn {
+  background: rgba(var(--amber-rgb), .14);
+  border-color: rgba(var(--amber-rgb), .26);
+  color: var(--amber);
+}
+html.ui-v2 #access-github-integration-section .vault-form-grid {
+  display: grid;
+  grid-template-columns: minmax(120px, 170px) 1fr;
+  gap: 10px 12px;
+  align-items: center;
+  margin: 4px 0 10px;
+}
+html.ui-v2 #access-github-integration-section .vault-form-grid label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+html.ui-v2 #access-github-integration-section .vault-form-grid input,
+html.ui-v2 #access-github-integration-section .vault-phrase-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 36px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-ctl);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  padding: 8px 12px;
+  outline: none;
+}
+html.ui-v2 #access-github-integration-section .vault-phrase-input {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  resize: vertical;
+}
+html.ui-v2 #access-github-integration-section .vault-form-grid input::placeholder,
+html.ui-v2 #access-github-integration-section .vault-phrase-input::placeholder {
+  color: var(--text-3);
+}
+html.ui-v2 #access-github-integration-section .vault-form-grid input:focus-visible,
+html.ui-v2 #access-github-integration-section .vault-phrase-input:focus-visible {
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+html.ui-v2 #access-github-integration-section .vault-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}

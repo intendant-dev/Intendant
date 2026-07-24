@@ -25,5 +25,6 @@
 - [Station](./station.md)
 - [MCP Server](./mcp-server.md)
 - [Integrations](./integrations.md)
+- [GitHub PR Integration](./github-pr-integration.md)
 - [Session Logging](./session-logging.md)
 - [Windows Support](./windows-support.md)

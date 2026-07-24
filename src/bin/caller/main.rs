@@ -41,6 +41,7 @@ mod dashboard_control;
 mod debug;
 mod diagnostics;
 mod display_requests;
+mod github_pr;
 pub(crate) use intendant_core::error;
 pub(crate) use intendant_display as display;
 mod display_peer_ids;

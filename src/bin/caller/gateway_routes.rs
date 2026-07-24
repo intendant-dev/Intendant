@@ -204,6 +204,10 @@ pub(crate) const MCP_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
 /// `/mcp` lane the ctl park path rides.
 pub(crate) const AGENDA_OP_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
 
+/// The GitHub App configure payload: a ~3 KB PEM plus ids and a watch
+/// list. Anything near this cap is not a legitimate configure gesture.
+pub(crate) const GITHUB_INTEGRATION_BODY_CAP_BYTES: usize = 64 * 1024;
+
 /// Body cap for the visual-freshness diagnostics sink (NDJSON transcript
 /// batches).
 pub(crate) const DIAGNOSTICS_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
@@ -297,6 +301,12 @@ pub(crate) enum RouteHandlerId {
     SettingsGet,
     ApiKeysPost,
     ApiKeyStatus,
+    /// GitHub App integration: seal credentials + set the watch list.
+    GithubIntegrationSave,
+    /// Integration presence + last-exchange state (never unseals).
+    GithubIntegrationStatus,
+    /// Delete the sealed credentials (idempotent, audited).
+    GithubIntegrationRemove,
     /// Claude sign-in ceremony: start `claude auth login` on a private PTY.
     ClaudeAuthStart,
     /// Ceremony state + validated sign-in URL + account info on success.
@@ -1596,6 +1606,40 @@ pub(crate) static ROUTES: &[Route] = &[
         "Which provider keys are configured (presence only)",
     )
     .with_tunnel(tunnel_method("api_key_status")),
+    // ── GitHub App integration (Track PR): credentials seal into
+    //    OS-keystore custody (`github-app/credentials`, born in custody —
+    //    no env/file lane), the watch list is non-secret config. Write
+    //    and remove ride the provider-key gate (CredentialsManage);
+    //    status is presence + last-exchange state and never unseals.
+    //    Capped tight: an App key PEM is ~3 KB; 64 KiB leaves room for
+    //    ids + a watch list, and nothing legitimate is bigger.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/integrations/github"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::Capped(GITHUB_INTEGRATION_BODY_CAP_BYTES),
+        RouteHandlerId::GithubIntegrationSave,
+        "Configure the GitHub App integration (seal credentials into custody, set the watch list)",
+    )
+    .with_tunnel(tunnel_method("api_github_integration_save")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/integrations/github/status"),
+        PeerOperation::Settings,
+        BodyPolicy::None,
+        RouteHandlerId::GithubIntegrationStatus,
+        "GitHub App integration status (presence + last exchange; never unseals)",
+    )
+    .with_tunnel(tunnel_method("api_github_integration_status")),
+    op_route(
+        RouteMethod::Delete,
+        PathPattern::Exact("/api/integrations/github"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::GithubIntegrationRemove,
+        "Remove the GitHub App integration credentials from custody",
+    )
+    .with_tunnel(tunnel_method("api_github_integration_remove")),
     // ── Same-home sibling loopback-token handoff (ratified 2026-07-20):
     //    the response contains per-boot loopback admission tokens, so
     //    the route rides the credential-custody operation like the

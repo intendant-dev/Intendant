@@ -1572,6 +1572,70 @@ pub(crate) async fn serve_http_request(
                 return handle_api_key_status(stream, route.cors, fleet_cors_origin.as_deref())
                     .await;
             }
+            RouteHandlerId::GithubIntegrationSave => {
+                // Custody-audit attribution mirrors ApiKeysPost: the
+                // pre-dispatch IAM gate bound this principal
+                // (CredentialsManage); origin class matches the tunnel
+                // grant's custody_origin_class.
+                let cert_dir = crate::access::backend::select_backend().cert_dir();
+                let hosted_origins = crate::access::iam::load_state_cached_arc(&cert_dir)
+                    .map(|state| state.hosted_origins.clone())
+                    .unwrap_or_else(|_| crate::access::iam::default_hosted_origins());
+                let audit_origin = crate::access::iam::session_origin_class(
+                    &hosted_origins,
+                    &http_access_context.principal,
+                );
+                let settings_root = runtime_settings
+                    .settings_root
+                    .clone()
+                    .or_else(|| project_root.clone());
+                return handle_github_integration_save(
+                    stream,
+                    route_body.as_bytes(),
+                    settings_root,
+                    http_access_context.principal.id.clone(),
+                    audit_origin.to_string(),
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::GithubIntegrationStatus => {
+                let settings_root = runtime_settings
+                    .settings_root
+                    .clone()
+                    .or_else(|| project_root.clone());
+                return handle_github_integration_status(
+                    stream,
+                    settings_root,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::GithubIntegrationRemove => {
+                let cert_dir = crate::access::backend::select_backend().cert_dir();
+                let hosted_origins = crate::access::iam::load_state_cached_arc(&cert_dir)
+                    .map(|state| state.hosted_origins.clone())
+                    .unwrap_or_else(|_| crate::access::iam::default_hosted_origins());
+                let audit_origin = crate::access::iam::session_origin_class(
+                    &hosted_origins,
+                    &http_access_context.principal,
+                );
+                let settings_root = runtime_settings
+                    .settings_root
+                    .clone()
+                    .or_else(|| project_root.clone());
+                return handle_github_integration_remove(
+                    stream,
+                    settings_root,
+                    http_access_context.principal.id.clone(),
+                    audit_origin.to_string(),
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::ClaudeAuthStart => {
                 return handle_claude_auth_start(
                     stream,

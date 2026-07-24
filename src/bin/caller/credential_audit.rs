@@ -56,6 +56,12 @@ pub const EVENT_KEY_STORED: &str = "key_custody_stored";
 /// every boot and dial, and `intendant custody status` labels the estate
 /// instead.)
 pub const EVENT_KEY_DENIED: &str = "key_custody_denied";
+/// A born-in-custody entry was deleted at the owner's request (the
+/// integration's Remove gesture). For entries that never existed as
+/// files there is no tombstone to leave — deletion is the honest
+/// terminal record, and the backend treats deleting an absent entry as
+/// success (a desired end state, not an observation).
+pub const EVENT_KEY_REMOVED: &str = "key_custody_removed";
 
 /// How many events the in-memory tail keeps (and the file is trimmed
 /// to on rewrite).

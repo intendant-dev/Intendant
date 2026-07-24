@@ -593,6 +593,7 @@ storage:
 | `daemon-identity/` | `ed25519.pk8` | signs browser-control sessions, hosted-control leases, doorbell caller-ID |
 | `access-certs/org/<handle>/` | `root.pk8`, `issuer.pk8` | org root/issuer keys — sign grant documents and revocation lists |
 | daemon `.env` | provider `*_API_KEY` lines | class-2 native provider keys (the dashboard-managed `.env` only; project and cwd `.env` files stay operator-owned) |
+| `github-app/` | `credentials` (sealed JSON: App ID, installation id, RS256 private key) | the GitHub App integration's identity — **born in custody**: it never exists as a plaintext file, has no env/file lane, and there is nothing to tombstone; Remove is the backend's idempotent delete plus a `key_custody_removed` trail event (see [GitHub PR integration](./github-pr-integration.md)) |
 
 `intendant custody migrate` (keyless, local, never run implicitly)
 relocates each present artifact: store into a sealed blob
