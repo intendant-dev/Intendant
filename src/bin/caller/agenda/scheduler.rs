@@ -33,6 +33,17 @@ const DELEGATION_PREFIX: &str = "agenda-occ-";
 /// non-scheduled sessions whose receipts never come — the cap simply
 /// bounds that residue; eviction is oldest-first.
 const EARLY_OUTCOME_CAP: usize = 64;
+/// Bound on remembered session-address pairs (`SessionIdentity` events);
+/// generous — a pair is only ever needed between a receipt and its
+/// terminal.
+const SESSION_ALIAS_CAP: usize = 64;
+/// Re-send an un-receipted dispatch after this long (at-least-once
+/// delivery; the supervisor's delegation dedup makes duplicates safe).
+const DISPATCH_RETRY_AFTER_MS: u64 = 30_000;
+/// Give up on an un-receipted dispatch after this long: journal the
+/// fail-closed `unknown` (never auto-retried past this point) and free
+/// the effect's in-flight slot.
+const DISPATCH_ABANDON_AFTER_MS: u64 = 10 * 60_000;
 
 /// A session's terminal event observed BEFORE its `TaskReceived` receipt
 /// — the fast-spawn inversion: `start_new_session` dispatches the child
@@ -50,13 +61,31 @@ struct EarlyOutcome {
     note: String,
 }
 
+/// A dispatched occurrence still waiting for its `TaskReceived` receipt,
+/// with what a re-send needs. The scheduler is an at-least-once
+/// delegator: a `StartTask` emitted while the session supervisor is not
+/// yet subscribed (the boot window — hit live 2026-07-24, a run-now
+/// seventeen seconds after restart dispatched into the void and wedged
+/// the request slot) is re-sent with the SAME delegation id, and the
+/// supervisor's delegation dedup makes retries exactly-once: a duplicate
+/// re-acks the original session instead of double-spawning.
+struct PendingDispatch {
+    spawn: SpawnOccurrence,
+    /// The project resolved at first dispatch — retries reuse it rather
+    /// than re-resolving (the manifest the owner approved has one
+    /// resolution instant).
+    project_root: String,
+    first_attempt_ms: u64,
+    last_attempt_ms: u64,
+}
+
 /// In-flight scheduled-session bookkeeping (in-memory; the journal is the
 /// durable truth, and a restart resolves both maps fail-closed).
 #[derive(Default)]
 struct SchedulerState {
     /// Dispatched, awaiting the `TaskReceived` receipt: occurrence →
-    /// its spawn facts.
-    awaiting: HashMap<String, SpawnOccurrence>,
+    /// its dispatch (spawn facts + retry bookkeeping).
+    awaiting: HashMap<String, PendingDispatch>,
     /// Receipt seen, session running: session id → spawn facts.
     running: HashMap<String, SpawnOccurrence>,
     /// Terminal events that arrived before their receipt, session id →
@@ -64,6 +93,14 @@ struct SchedulerState {
     /// [`EarlyOutcome`]). First terminal per session wins; consumed by
     /// the receipt.
     early_outcomes: Vec<(String, EarlyOutcome)>,
+    /// Session-address pairs observed on the bus: an external wrapper's
+    /// primary address upgrades to its backend-native id mid-turn
+    /// (Claude Code's first turn), and the terminal events that follow
+    /// carry the UPGRADED id while the receipt registered the original
+    /// (live-rig find, 2026-07-24: the DoneSignal arrived under the
+    /// native id and the occurrence sat `started` forever). Both
+    /// directions resolve; bounded, oldest evicted, newest pair wins.
+    session_aliases: Vec<(String, String)>,
 }
 
 impl SchedulerState {
@@ -80,6 +117,7 @@ impl SchedulerState {
     fn in_flight_effects(&self) -> HashSet<String> {
         self.awaiting
             .values()
+            .map(|p| &p.spawn)
             .chain(self.running.values())
             .map(|s| s.effect_id.clone())
             .collect()
@@ -105,6 +143,52 @@ impl SchedulerState {
             .position(|(id, _)| id == session_id)?;
         Some(self.early_outcomes.remove(index).1)
     }
+
+    /// Consume the early outcome recorded under `session_id` OR its
+    /// aliased address (the fast-spawn inversion can race the address
+    /// upgrade too: the terminal then sits under the native id while the
+    /// receipt names the original).
+    fn take_early_outcome_aliased(&mut self, session_id: &str) -> Option<EarlyOutcome> {
+        if let Some(outcome) = self.take_early_outcome(session_id) {
+            return Some(outcome);
+        }
+        let counterpart = self.alias_counterpart(session_id)?.to_string();
+        self.take_early_outcome(&counterpart)
+    }
+
+    fn note_session_alias(&mut self, a: &str, b: &str) {
+        if a.is_empty() || b.is_empty() || a == b {
+            return;
+        }
+        self.session_aliases.push((a.to_string(), b.to_string()));
+        if self.session_aliases.len() > SESSION_ALIAS_CAP {
+            self.session_aliases.remove(0);
+        }
+    }
+
+    fn alias_counterpart(&self, id: &str) -> Option<&str> {
+        self.session_aliases.iter().rev().find_map(|(a, b)| {
+            if a == id {
+                Some(b.as_str())
+            } else if b == id {
+                Some(a.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The key `running` actually holds for this session address — the
+    /// address itself, or its aliased counterpart. Terminal handling
+    /// resolves through this so completion survives the upgrade.
+    fn running_key(&self, id: &str) -> Option<String> {
+        if self.running.contains_key(id) {
+            return Some(id.to_string());
+        }
+        self.alias_counterpart(id)
+            .filter(|counterpart| self.running.contains_key(*counterpart))
+            .map(str::to_string)
+    }
 }
 
 pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task::JoinHandle<()> {
@@ -125,6 +209,11 @@ pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task
         loop {
             let next_wake_ms = run_pass(&handle, &mut journal, &mut state).await;
             let now = now_ms();
+            let retry_wake_ms = sweep_pending_dispatches(&handle, &mut journal, &mut state, now);
+            let next_wake_ms = match (next_wake_ms, retry_wake_ms) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (wake, None) | (None, wake) => wake,
+            };
             let sleep_for = next_wake_ms
                 .map(|wake| std::time::Duration::from_millis(wake.saturating_sub(now)))
                 .map_or(SAFETY_TICK, |until| until.min(SAFETY_TICK));
@@ -158,7 +247,8 @@ pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task
 /// still visible in the Sessions tab.
 fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal) {
     let unresolved = journal.started_unresolved();
-    if unresolved.is_empty() {
+    let lost_dispatches = journal.prepared_unresolved();
+    if unresolved.is_empty() && lost_dispatches.is_empty() {
         return;
     }
     let (items, _, _) = handle.snapshot();
@@ -208,6 +298,52 @@ fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal)
             session_id.as_deref().unwrap_or("?")
         );
     }
+    // The lost-dispatch shape: `prepared` with no receipt and no terminal
+    // belongs to a previous process whose StartTask died with it. Same
+    // fail-closed `unknown`, written back via the item id the journal
+    // rows retained (there is no `last_run` lineage to match — the
+    // occurrence never started); v1's one-effect-per-item names the
+    // effect. Never auto-retried; the owner sees `unknown` and decides.
+    for (occurrence_id, item_id) in lost_dispatches {
+        let _ = journal.append(&OccurrenceRecord {
+            v: 1,
+            at_ms: now_ms(),
+            occurrence_id: occurrence_id.clone(),
+            item_id: item_id.clone().unwrap_or_default(),
+            due_ms: 0,
+            state: OccurrenceState::Unknown,
+            urgency: None,
+            session_id: None,
+        });
+        if let Some(item) = item_id
+            .as_deref()
+            .and_then(|id| items.iter().find(|item| item.id == id))
+        {
+            if let Some(effect) = item.effects.first() {
+                if let Err(err) = handle.record_occurrence(OccurrenceWriteBack {
+                    item_id: &item.id,
+                    effect_id: &effect.effect_id,
+                    occurrence_id: &occurrence_id,
+                    state: "unknown",
+                    session_id: None,
+                    note: Some(
+                        "daemon restarted before the session dispatched — outcome \
+                         unknown"
+                            .to_string(),
+                    ),
+                }) {
+                    eprintln!(
+                        "[agenda] occurrence write-back failed (unknown on {}): {err}",
+                        item.id
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "[agenda] occurrence {occurrence_id} resolved to unknown \
+             (daemon restarted before its session dispatched)"
+        );
+    }
 }
 
 /// A broadcast lag means one or more launch receipts or terminal events may
@@ -225,7 +361,7 @@ fn resolve_lagged_occurrences(
     let awaiting: Vec<(String, SpawnOccurrence)> = state
         .awaiting
         .iter()
-        .map(|(occurrence_id, spawn)| (occurrence_id.clone(), spawn.clone()))
+        .map(|(occurrence_id, pending)| (occurrence_id.clone(), pending.spawn.clone()))
         .collect();
     for (occurrence_id, spawn) in awaiting {
         if resolve_lagged_occurrence(handle, journal, &spawn, None, now) {
@@ -378,6 +514,27 @@ fn dispatch_session(
     // orchestrate (`direct` outranks `orchestrate` at launch, so forcing
     // it unconditionally made orchestrate manifests run Direct — the
     // defect the agenda chapter documented).
+    let project_root = project_root.to_string_lossy().into_owned();
+    send_start_task(handle, &spawn, &project_root);
+    let now = now_ms();
+    state.awaiting.insert(
+        spawn.occurrence_id.clone(),
+        PendingDispatch {
+            spawn,
+            project_root,
+            first_attempt_ms: now,
+            last_attempt_ms: now,
+        },
+    );
+}
+
+/// The occurrence's `StartTask`, identical on first send and every
+/// retry — the delegation id is the occurrence id, so the supervisor's
+/// dedup collapses duplicates onto the original session.
+fn send_start_task(handle: &AgendaHandle, spawn: &SpawnOccurrence, project_root: &str) {
+    // Interactive spawns mirror the composer's launch shape; goal runs
+    // stay explicit (`direct` outranks `orchestrate` at launch — see the
+    // agenda chapter).
     let (orchestrate, direct) = if spawn.interactive {
         (spawn.orchestrate.then_some(true), None)
     } else {
@@ -390,7 +547,7 @@ fn dispatch_session(
             task: spawn.goal.clone(),
             orchestrate,
             direct,
-            project_root: Some(project_root.to_string_lossy().into_owned()),
+            project_root: Some(project_root.to_string()),
             reference_frame_ids: Vec::new(),
             display_target: None,
             attachments: Vec::new(),
@@ -407,7 +564,51 @@ fn dispatch_session(
                 .map(|config| *config)
                 .unwrap_or_default(),
         }));
-    state.awaiting.insert(spawn.occurrence_id.clone(), spawn);
+}
+
+/// At-least-once delivery for un-receipted dispatches: re-send stale
+/// ones (same delegation id — the supervisor dedups), abandon to the
+/// fail-closed `unknown` after the bound. Returns the earliest instant
+/// this sweep next needs to run, so the scheduler's sleep never
+/// oversleeps a pending retry.
+fn sweep_pending_dispatches(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    state: &mut SchedulerState,
+    now: u64,
+) -> Option<u64> {
+    let mut abandoned = Vec::new();
+    for (occurrence_id, pending) in state.awaiting.iter_mut() {
+        if now.saturating_sub(pending.first_attempt_ms) >= DISPATCH_ABANDON_AFTER_MS {
+            abandoned.push(occurrence_id.clone());
+        } else if now.saturating_sub(pending.last_attempt_ms) >= DISPATCH_RETRY_AFTER_MS {
+            eprintln!(
+                "[agenda] occurrence {occurrence_id} has no dispatch receipt after {}s — re-sending \
+                 (the supervisor's delegation dedup makes this exactly-once)",
+                now.saturating_sub(pending.first_attempt_ms) / 1000
+            );
+            send_start_task(handle, &pending.spawn, &pending.project_root);
+            pending.last_attempt_ms = now;
+        }
+    }
+    for occurrence_id in abandoned {
+        let Some(pending) = state.awaiting.remove(&occurrence_id) else {
+            continue;
+        };
+        resolve_spawnless(
+            handle,
+            journal,
+            &pending.spawn,
+            OccurrenceState::Unknown,
+            now,
+            "session never dispatched — no supervisor receipt; check the daemon log",
+        );
+    }
+    state
+        .awaiting
+        .values()
+        .map(|p| p.last_attempt_ms + DISPATCH_RETRY_AFTER_MS)
+        .min()
 }
 
 /// Receipt + completion correlation, factored for tests.
@@ -425,7 +626,7 @@ fn observe_event(
             let Some(occurrence_id) = delegation_id.strip_prefix(DELEGATION_PREFIX) else {
                 return;
             };
-            let Some(spawn) = state.awaiting.remove(occurrence_id) else {
+            let Some(PendingDispatch { spawn, .. }) = state.awaiting.remove(occurrence_id) else {
                 return;
             };
             session_record(
@@ -440,13 +641,26 @@ fn observe_event(
             // The session's terminal event can beat this receipt onto the
             // bus (the fast-spawn inversion — see [`EarlyOutcome`]): a
             // remembered outcome resolves the occurrence now, keeping the
-            // journal arc in order (started, then the terminal).
-            if let Some(early) = state.take_early_outcome(session_id) {
+            // journal arc in order (started, then the terminal). The
+            // aliased lookup covers a terminal that arrived under an
+            // already-upgraded address.
+            if let Some(early) = state.take_early_outcome_aliased(session_id) {
                 match early.failed {
                     None => complete_running(handle, journal, state, session_id, early.note),
                     Some(reason) => fail_running(handle, journal, state, session_id, &reason),
                 }
             }
+        }
+        // External sessions upgrade their primary address to the
+        // backend-native id mid-turn; the terminal events that follow
+        // carry the upgraded id while the receipt registered the
+        // original. Remember the pair so either address resolves.
+        AppEvent::SessionIdentity {
+            session_id,
+            backend_session_id,
+            ..
+        } => {
+            state.note_session_alias(session_id, backend_session_id);
         }
         // The two normal-completion shapes: `signal_done` exits emit
         // DoneSignal (the common case — proven live), while no-commands
@@ -456,8 +670,8 @@ fn observe_event(
             message,
         } => {
             let note = message.clone().unwrap_or_else(|| "done".to_string());
-            if state.running.contains_key(session_id) {
-                complete_running(handle, journal, state, session_id, note);
+            if let Some(key) = state.running_key(session_id) {
+                complete_running(handle, journal, state, &key, note);
             } else {
                 state.remember_early_outcome(session_id, EarlyOutcome { failed: None, note });
             }
@@ -476,12 +690,12 @@ fn observe_event(
             // summary is the agent's last words, honest only for
             // completions.
             let failed = matches!(outcome, crate::event::TaskOutcome::Failed);
-            if state.running.contains_key(session_id) {
+            if let Some(key) = state.running_key(session_id) {
                 if failed {
-                    fail_running(handle, journal, state, session_id, reason);
+                    fail_running(handle, journal, state, &key, reason);
                 } else {
                     let note = summary.clone().unwrap_or_else(|| reason.clone());
-                    complete_running(handle, journal, state, session_id, note);
+                    complete_running(handle, journal, state, &key, note);
                 }
             } else if failed {
                 state.remember_early_outcome(
@@ -505,8 +719,8 @@ fn observe_event(
             // same end is remembered as a failed outcome (first terminal
             // per session wins, so a done session's later end never
             // downgrades its completion).
-            if state.running.contains_key(session_id) {
-                fail_running(handle, journal, state, session_id, reason);
+            if let Some(key) = state.running_key(session_id) {
+                fail_running(handle, journal, state, &key, reason);
             } else {
                 state.remember_early_outcome(
                     session_id,
@@ -1793,8 +2007,11 @@ mod tests {
             delegation
         }
 
-        // Occurrence 1: receipt, then a Failed-class TaskComplete (the
-        // external wrapper-death shape) — must journal `failed`.
+        // Occurrence 1: clean completion under the UPGRADED address (the
+        // live-rig defect, 2026-07-24): the receipt registers the wrapper
+        // id, a SessionIdentity upgrades it to the backend-native id, and
+        // the DoneSignal arrives under the native id — the occurrence
+        // must journal `completed`, never sit `started` forever.
         let delegation = fire(&handle, &mut journal, &mut state, &config)
             .await
             .expect("the approved standing manifest fires");
@@ -1811,11 +2028,19 @@ mod tests {
             &handle,
             &mut journal,
             &mut state,
-            &AppEvent::TaskComplete {
-                session_id: Some("sess-x1".into()),
-                reason: "Claude Code process closed stdout".into(),
-                summary: None,
-                outcome: crate::event::TaskOutcome::Failed,
+            &AppEvent::SessionIdentity {
+                session_id: "sess-x1".into(),
+                source: "claude".into(),
+                backend_session_id: "native-x1".into(),
+            },
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::DoneSignal {
+                session_id: Some("native-x1".into()),
+                message: Some("done".into()),
             },
         );
         let effect_of = |handle: &AgendaHandle| {
@@ -1823,11 +2048,15 @@ mod tests {
             items.iter().find(|i| i.id == item.id).unwrap().effects[0].clone()
         };
         let effect = effect_of(&handle);
-        assert_eq!(effect.last_run.as_ref().unwrap().state, "failed");
-        assert_eq!(effect.consecutive_failures, 1);
+        assert_eq!(
+            effect.last_run.as_ref().unwrap().state,
+            "completed",
+            "a terminal under the upgraded address must resolve the occurrence"
+        );
+        assert_eq!(effect.consecutive_failures, 0);
 
-        // Occurrence 2 (owner run-now): a SessionEnded while running —
-        // the shipped failure shape — keeps counting.
+        // Occurrence 2 (owner run-now): a Failed-class TaskComplete (the
+        // external wrapper-death shape) — must journal `failed`.
         handle
             .apply(
                 AgendaCommand::RequestOccurrence {
@@ -1852,16 +2081,19 @@ mod tests {
             &handle,
             &mut journal,
             &mut state,
-            &AppEvent::SessionEnded {
-                session_id: "sess-x2".into(),
-                reason: "error: backend crashed".into(),
-                error_kind: None,
+            &AppEvent::TaskComplete {
+                session_id: Some("sess-x2".into()),
+                reason: "Claude Code process closed stdout".into(),
+                summary: None,
+                outcome: crate::event::TaskOutcome::Failed,
             },
         );
-        assert_eq!(effect_of(&handle).consecutive_failures, 2);
+        let effect = effect_of(&handle);
+        assert_eq!(effect.last_run.as_ref().unwrap().state, "failed");
+        assert_eq!(effect.consecutive_failures, 1);
 
-        // Occurrence 3: the Failed terminal beats the receipt (the
-        // fast-spawn inversion) and still journals `failed`.
+        // Occurrence 3: a SessionEnded while running — the shipped
+        // failure shape — keeps counting.
         handle
             .apply(
                 AgendaCommand::RequestOccurrence {
@@ -1877,8 +2109,53 @@ mod tests {
             &handle,
             &mut journal,
             &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id: delegation,
+                session_id: "sess-x3".into(),
+            },
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::SessionEnded {
+                session_id: "sess-x3".into(),
+                reason: "error: backend crashed".into(),
+                error_kind: None,
+            },
+        );
+        assert_eq!(effect_of(&handle).consecutive_failures, 2);
+
+        // Occurrence 4: the Failed terminal beats the receipt (the
+        // fast-spawn inversion) AND rides the upgraded address — the
+        // aliased early-outcome lookup still journals `failed`.
+        handle
+            .apply(
+                AgendaCommand::RequestOccurrence {
+                    id: item.id.clone(),
+                },
+                owner(),
+            )
+            .unwrap();
+        let delegation = fire(&handle, &mut journal, &mut state, &config)
+            .await
+            .expect("the third requested occurrence fires");
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::SessionIdentity {
+                session_id: "sess-x4".into(),
+                source: "claude".into(),
+                backend_session_id: "native-x4".into(),
+            },
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
             &AppEvent::TaskComplete {
-                session_id: Some("sess-x3".into()),
+                session_id: Some("native-x4".into()),
                 reason: "recovery required".into(),
                 summary: None,
                 outcome: crate::event::TaskOutcome::Failed,
@@ -1890,7 +2167,7 @@ mod tests {
             &mut state,
             &AppEvent::TaskReceived {
                 delegation_id: delegation,
-                session_id: "sess-x3".into(),
+                session_id: "sess-x4".into(),
             },
         );
         let effect = effect_of(&handle);
@@ -1924,6 +2201,167 @@ mod tests {
         );
     }
 
+    /// The scheduler is an at-least-once delegator: an un-receipted
+    /// dispatch re-sends the SAME delegation id after the retry window
+    /// (the supervisor's dedup makes duplicates exactly-once — the boot
+    /// window hit live 2026-07-24), and past the abandon bound it
+    /// resolves fail-closed to `unknown` with the write-back landing on
+    /// the item, freeing the effect's in-flight slot.
+    #[tokio::test]
+    async fn unreceipted_dispatch_retries_then_abandons_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "retry me".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        handle
+            .apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                    goal: None,
+                    project_root: None,
+                    interactive: Some(false),
+                    agent_config: None,
+                },
+                owner(),
+            )
+            .unwrap();
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut first = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                delegation_id: Some(id),
+                ..
+            }) = event
+            {
+                first = Some(id);
+            }
+        }
+        let first = first.expect("the occurrence dispatches");
+        assert_eq!(state.awaiting.len(), 1);
+
+        // Not yet stale: the sweep re-sends nothing.
+        let now = now_ms();
+        sweep_pending_dispatches(&handle, &mut journal, &mut state, now);
+        assert!(
+            rx.try_recv().is_err(),
+            "a fresh dispatch must not be re-sent"
+        );
+
+        // Age past the retry window: the sweep re-sends the SAME
+        // delegation id.
+        for pending in state.awaiting.values_mut() {
+            pending.last_attempt_ms = now.saturating_sub(DISPATCH_RETRY_AFTER_MS + 1);
+        }
+        sweep_pending_dispatches(&handle, &mut journal, &mut state, now);
+        let mut resent = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                delegation_id: Some(id),
+                ..
+            }) = event
+            {
+                resent = Some(id);
+            }
+        }
+        assert_eq!(
+            resent.as_deref(),
+            Some(first.as_str()),
+            "the retry carries the same delegation id for the supervisor's dedup"
+        );
+        assert_eq!(state.awaiting.len(), 1, "still awaiting the receipt");
+
+        // Age past the abandon bound: fail-closed `unknown`, written
+        // back, slot freed.
+        for pending in state.awaiting.values_mut() {
+            pending.first_attempt_ms = now.saturating_sub(DISPATCH_ABANDON_AFTER_MS + 1);
+        }
+        sweep_pending_dispatches(&handle, &mut journal, &mut state, now);
+        assert!(state.awaiting.is_empty(), "abandoned dispatches are freed");
+        let (items, _, _) = handle.snapshot();
+        let run = items.iter().find(|i| i.id == item.id).unwrap().effects[0]
+            .last_run
+            .clone()
+            .unwrap();
+        assert_eq!(run.state, "unknown");
+    }
+
+    /// Boot recovery's lost-dispatch twin: a `prepared`-without-receipt
+    /// journal entry from a dead process resolves to `unknown` at the
+    /// next boot with the write-back landing via the retained item id —
+    /// the request slot unwedges instead of pending forever.
+    #[tokio::test]
+    async fn boot_resolves_lost_dispatches_to_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "lost dispatch".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        handle
+            .apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                    goal: None,
+                    project_root: None,
+                    interactive: Some(false),
+                    agent_config: None,
+                },
+                owner(),
+            )
+            .unwrap();
+        // Dispatch journals `prepared`; the process "dies" before any
+        // receipt (we simply drop the in-memory state).
+        run_pass(&handle, &mut journal, &mut state).await;
+        drop(state);
+
+        // Next boot: a fresh journal fold sees prepared-without-started.
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        resolve_lost_sessions(&handle, &mut journal);
+        let (items, _, _) = handle.snapshot();
+        let run = items.iter().find(|i| i.id == item.id).unwrap().effects[0]
+            .last_run
+            .clone()
+            .unwrap();
+        assert_eq!(run.state, "unknown");
+        assert!(
+            run.note
+                .as_deref()
+                .unwrap_or("")
+                .contains("before the session dispatched"),
+            "the write-back names the lost-dispatch shape: {:?}",
+            run.note
+        );
+    }
+
     #[tokio::test]
     async fn event_lag_resolves_awaiting_and_running_occurrences_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1937,7 +2375,7 @@ mod tests {
         run_pass(&handle, &mut journal, &mut state).await;
         assert_eq!(state.awaiting.len(), 2);
         let running_occurrence = state.awaiting.keys().next().unwrap().clone();
-        let running_item = state.awaiting[&running_occurrence].item_id.clone();
+        let running_item = state.awaiting[&running_occurrence].spawn.item_id.clone();
         observe_event(
             &handle,
             &mut journal,
@@ -1948,7 +2386,7 @@ mod tests {
             },
         );
         let awaiting_occurrence = state.awaiting.keys().next().unwrap().clone();
-        let awaiting_item = state.awaiting[&awaiting_occurrence].item_id.clone();
+        let awaiting_item = state.awaiting[&awaiting_occurrence].spawn.item_id.clone();
 
         assert_eq!(
             resolve_lagged_occurrences(&handle, &mut journal, &mut state),
