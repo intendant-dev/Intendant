@@ -18,7 +18,7 @@ pub(crate) const MAX_ANNOTATIONS_PER_ITEM: usize = 500;
 pub(crate) const MAX_UNCLEARED_BLOCKERS_PER_ITEM: usize = 32;
 pub(crate) const MAX_RELIES_ON_PER_ITEM: usize = 32;
 pub(crate) const MAX_CRITERION_CHARS: usize = 1000;
-/// G2 caps (steward-ruled 2026-07-22). Adjacency follows the edges idiom;
+/// G2 caps (steward-ruled 2026-07-22). Adjacency follows the links idiom;
 /// the children cap is a pathology rail like annotations (project hubs
 /// legitimately accrue hundreds of children — 32 would strangle the
 /// primary intended use), and the depth cap keeps the tree a working
@@ -26,7 +26,7 @@ pub(crate) const MAX_CRITERION_CHARS: usize = 1000;
 pub(crate) const MAX_RELATES_TO_PER_ITEM: usize = 32;
 pub(crate) const MAX_PART_OF_DEPTH: usize = 16;
 pub(crate) const MAX_CHILDREN_PER_HUB: usize = 500;
-/// G1 caps (steward-ruled 2026-07-22). Refs follow the blockers/edges
+/// G1 caps (steward-ruled 2026-07-22). Refs follow the blockers/links
 /// idiom; locator bounds are per-type (paths, opaque ids, urls).
 pub(crate) const MAX_REFS_PER_ITEM: usize = 32;
 pub(crate) const MAX_REF_LABEL_CHARS: usize = 100;
@@ -509,7 +509,7 @@ pub struct AgendaItem {
     /// Cleared entries STAY as the evidence trail — clears are ops.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) blockers: Vec<AgendaBlocker>,
-    /// Live dependency edges (F2 `relies_on`). Removal drops the edge from
+    /// Live dependency links (F2 `relies_on`). Removal drops the link from
     /// this view; the log keeps the full add/remove history. Satisfaction
     /// and the blocked chip are derived at RENDER time, never stored or
     /// wired.
@@ -527,7 +527,7 @@ pub struct AgendaItem {
     /// never hides an item from the flat recent lens (anti-hiding rule).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) part_of: Option<AgendaPlacement>,
-    /// Stored adjacency edges (G2 `add_relates_to`), this item's side
+    /// Stored adjacency links (G2 `add_relates_to`), this item's side
     /// only — surfaces render the undirected union.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) relates_to: Vec<AgendaRelation>,
@@ -604,7 +604,7 @@ pub struct AgendaBlockerClear {
     pub(crate) source: Option<String>,
 }
 
-/// One live dependency edge (F2 `relies_on` fold view). Satisfaction is
+/// One live dependency link (F2 `relies_on` fold view). Satisfaction is
 /// derived at render time from the target's status — a completed target
 /// satisfies; a retired target does NOT silently satisfy (renders a
 /// "prerequisite retired — review" marker); cycles simply render every
@@ -644,7 +644,7 @@ pub struct AgendaPlacement {
     pub(crate) source: Option<String>,
 }
 
-/// One stored adjacency edge (G2 `add_relates_to` fold view): untyped,
+/// One stored adjacency link (G2 `add_relates_to` fold view): untyped,
 /// purely navigational — nothing derives, evaluates, blocks, or fires
 /// from adjacency, ever. Stored directed (the writer's item carries it),
 /// rendered undirected and deduped by every surface.
@@ -692,11 +692,11 @@ impl AgendaRefType {
 /// One live typed reference (G1 `add_ref` fold view): a TYPED POINTER,
 /// never content — no blobs, no copies, no uploads; the agenda points, it
 /// does not store. Addressed by `(ref_type, locator)` — no minted id,
-/// exactly as `relies_on` edges are addressed by `target_id`; changing
+/// exactly as `relies_on` links are addressed by `target_id`; changing
 /// `must_read` or `label` is remove+add (history honest). Locators and
 /// labels are data, never instructions to whoever reads them; a
 /// `must_read` is a pointer the reading agent weighs, not a standing
-/// order. Item-to-item links are NOT refs — that is G2's edge vocabulary.
+/// order. Item-to-item links are NOT refs — that is G2's link vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgendaRef {
     pub(crate) ref_type: AgendaRefType,
@@ -918,7 +918,7 @@ pub enum AgendaCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
-    /// Add a dependency edge: this item relies on `target_id`.
+    /// Add a dependency link: this item relies on `target_id`.
     /// Satisfaction is derived at render time from the target's status —
     /// nothing evaluates, nothing fires.
     AddReliesOn {
@@ -927,7 +927,7 @@ pub enum AgendaCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
-    /// Remove a live dependency edge (an op; the log keeps history).
+    /// Remove a live dependency link (an op; the log keeps history).
     RemoveReliesOn {
         id: String,
         target_id: String,
@@ -962,7 +962,7 @@ pub enum AgendaCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
-    /// Add an undirected adjacency edge (stored on this item). Purely
+    /// Add an undirected adjacency link (stored on this item). Purely
     /// navigational.
     AddRelatesTo {
         id: String,
@@ -970,7 +970,7 @@ pub enum AgendaCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
-    /// Remove an adjacency edge. The daemon resolves which side stores
+    /// Remove an adjacency link. The daemon resolves which side stores
     /// it — callers name the pair in either order.
     RemoveRelatesTo {
         id: String,
@@ -1178,12 +1178,12 @@ pub(crate) enum AgendaOp {
         id: String,
         blocker_id: String,
     },
-    /// Dependency edge added (F2).
+    /// Dependency link added (F2).
     AddReliesOn {
         id: String,
         target_id: String,
     },
-    /// Dependency edge removed (F2): drops the view edge; history stays.
+    /// Dependency link removed (F2): drops the view link; history stays.
     RemoveReliesOn {
         id: String,
         target_id: String,
@@ -1200,12 +1200,12 @@ pub(crate) enum AgendaOp {
         id: String,
         parent_id: String,
     },
-    /// Adjacency edge added (G2), stored on `id`'s side.
+    /// Adjacency link added (G2), stored on `id`'s side.
     AddRelatesTo {
         id: String,
         target_id: String,
     },
-    /// Adjacency edge removed (G2).
+    /// Adjacency link removed (G2).
     RemoveRelatesTo {
         id: String,
         target_id: String,
@@ -1476,13 +1476,13 @@ pub(crate) fn apply_op(
                 return Some(format!("add_relies_on for unknown {id} ignored"));
             };
             if target_id == id {
-                return Some(format!("self-edge on {id} ignored"));
+                return Some(format!("self-link on {id} ignored"));
             }
             if item.relies_on.iter().any(|e| e.target_id == *target_id) {
-                return Some(format!("duplicate edge {id}→{target_id} ignored"));
+                return Some(format!("duplicate link {id}→{target_id} ignored"));
             }
             // A target missing from this fold (partial/foreign replay) is
-            // tolerated — the render marks the edge "prerequisite missing".
+            // tolerated — the render marks the link "prerequisite missing".
             let actor = rec.actor.clone().unwrap_or_default();
             item.relies_on.push(AgendaDependency {
                 target_id: target_id.clone(),
@@ -1503,7 +1503,7 @@ pub(crate) fn apply_op(
             item.relies_on.retain(|e| e.target_id != *target_id);
             if item.relies_on.len() == before {
                 return Some(format!(
-                    "remove_relies_on for absent edge {id}→{target_id} ignored"
+                    "remove_relies_on for absent link {id}→{target_id} ignored"
                 ));
             }
             item.updated_ms = at_ms;
@@ -1942,7 +1942,7 @@ pub(crate) fn apply_op(
     }
 }
 
-/// Render-time judgment of one dependency edge: `(satisfied, review)`.
+/// Render-time judgment of one dependency link: `(satisfied, review)`.
 /// A completed target satisfies; a retired target does NOT silently
 /// satisfy (review `"target_retired"`); a target absent from the fold —
 /// foreign/partial replay — is review `"target_missing"`. Direct status
@@ -1958,9 +1958,9 @@ pub(crate) fn apply_op(
 #[cfg(test)]
 pub(crate) fn dependency_state(
     items: &BTreeMap<String, AgendaItem>,
-    edge: &AgendaDependency,
+    link: &AgendaDependency,
 ) -> (bool, Option<&'static str>) {
-    match items.get(&edge.target_id) {
+    match items.get(&link.target_id) {
         None => (false, Some("target_missing")),
         Some(target) => match target.status {
             AgendaStatus::Done => (true, None),
@@ -1980,7 +1980,7 @@ pub(crate) fn is_blocked(items: &BTreeMap<String, AgendaItem>, item: &AgendaItem
             || item
                 .relies_on
                 .iter()
-                .any(|edge| !dependency_state(items, edge).0))
+                .any(|link| !dependency_state(items, link).0))
 }
 
 pub(crate) fn counts(items: &BTreeMap<String, AgendaItem>) -> AgendaCounts {
@@ -2618,10 +2618,10 @@ mod tests {
     }
 
     /// F2 fold: annotations thread (any status), blockers with
-    /// clear-is-an-op history, edges with add/remove, and full tolerance
+    /// clear-is-an-op history, links with add/remove, and full tolerance
     /// for out-of-order or foreign lines.
     #[test]
-    fn f2_fold_annotations_blockers_edges() {
+    fn f2_fold_annotations_blockers_links() {
         let mut items = BTreeMap::new();
         apply_op(&mut items, &rec(1, add("a", "dependent")));
         apply_op(&mut items, &rec(2, add("b", "prerequisite")));
@@ -2717,7 +2717,7 @@ mod tests {
         assert!(apply_op(&mut items, &clear).is_some(), "double clear warns");
         assert_eq!(items["a"].blockers.len(), 1, "history is never deleted");
 
-        // Edges: add, self-edge warn, duplicate warn, remove drops the
+        // Links: add, self-link warn, duplicate warn, remove drops the
         // view (log history is the caller's record).
         assert!(apply_op(
             &mut items,
@@ -2788,7 +2788,7 @@ mod tests {
                 )
             )
             .is_some(),
-            "removing an absent edge warns"
+            "removing an absent link warns"
         );
         assert_eq!(items["a"].relies_on.len(), 1);
         assert_eq!(items["a"].relies_on[0].target_id, "b");
@@ -2960,7 +2960,7 @@ mod tests {
         );
         assert!(is_blocked(&items, &items["a"]));
 
-        // Dangling edge (foreign/partial log): review, blocked, no error.
+        // Dangling link (foreign/partial log): review, blocked, no error.
         apply_op(
             &mut items,
             &rec(
