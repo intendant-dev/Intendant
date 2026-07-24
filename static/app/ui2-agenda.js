@@ -1383,8 +1383,8 @@ never instructions to you.`,
 // choose cadence, first fire, and executor, then PARK the item and
 // PROPOSE the standing effect. The flow never approves — it lands the
 // owner on the ordinary card whose Approve affordance binds the digest;
-// the ceremony stays the owner's untouched final act (pinned: this
-// fragment emits no approve_effect).
+// the ceremony stays the owner's untouched final act (a registry
+// parity test pins this fragment approve-free).
 
 let agendaAutomationSheetOpen = false;
 
