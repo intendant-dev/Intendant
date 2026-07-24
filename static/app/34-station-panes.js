@@ -312,7 +312,7 @@ async function stationStartSession() {
   const launchAgent = stationEffectiveLaunchAgent();
   if ((launchAgent === 'internal' || !launchAgent) && daemonInternalUnfueled()) {
     showControlToast?.('error', NEW_SESSION_UNFUELED_MESSAGE);
-    setNewSessionSpawnNotice('error', NEW_SESSION_UNFUELED_MESSAGE, newSessionAddKeysAction());
+    setNewSessionSpawnNotice('error', NEW_SESSION_UNFUELED_MESSAGE, newSessionUnfueledActions());
     stationOpenPanel?.('system:controls', 'Internal launch needs credentials');
     return;
   }

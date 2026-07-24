@@ -1094,7 +1094,8 @@ html.ui-v2 #tab-sessions .sessions-unfueled-banner::before {
   box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .14);
   animation: ui2-pulse 2s infinite;
 }
-html.ui-v2 #tab-sessions .sessions-unfueled-add-keys {
+html.ui-v2 #tab-sessions .sessions-unfueled-add-keys,
+html.ui-v2 #tab-sessions .sessions-unfueled-signin {
   border: 0;
   border-radius: 8px;
   padding: 7px 14px;
@@ -1102,7 +1103,8 @@ html.ui-v2 #tab-sessions .sessions-unfueled-add-keys {
   color: var(--on-accent);
   font-weight: 800;
 }
-html.ui-v2 #tab-sessions .sessions-unfueled-add-keys:hover:not(:disabled) {
+html.ui-v2 #tab-sessions .sessions-unfueled-add-keys:hover:not(:disabled),
+html.ui-v2 #tab-sessions .sessions-unfueled-signin:hover:not(:disabled) {
   background: var(--amber);
   border-color: transparent;
   filter: brightness(1.08);

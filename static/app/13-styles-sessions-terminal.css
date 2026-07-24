@@ -666,6 +666,11 @@
 .sessions-spawn-action:hover {
   background: color-mix(in srgb, var(--blue) 28%, var(--surface0));
 }
+/* With peer actions (Add API keys + Sign in an agent) only the first
+   carries the auto margin, so the pair sits together on the right. */
+.sessions-spawn-action ~ .sessions-spawn-action {
+  margin-left: 0;
+}
 .sessions-unfueled-banner {
   display: flex;
   align-items: center;
@@ -682,10 +687,14 @@
 .sessions-unfueled-banner.hidden {
   display: none;
 }
-.sessions-unfueled-add-keys {
+.sessions-unfueled-add-keys,
+.sessions-unfueled-signin {
   flex: none;
-  margin-left: auto;
   white-space: nowrap;
+}
+/* First of the peer pair right-aligns the group. */
+.sessions-unfueled-add-keys {
+  margin-left: auto;
 }
 .sessions-host-strip {
   display: flex;
