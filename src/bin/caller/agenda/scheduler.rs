@@ -2057,6 +2057,12 @@ mod tests {
 
         // Occurrence 2 (owner run-now): a Failed-class TaskComplete (the
         // external wrapper-death shape) — must journal `failed`.
+        // Requested instants mint the occurrence identity from the
+        // intake clock; on a fast runner two requests (with the round's
+        // in-memory fail between them) can land in one millisecond and
+        // collide with the terminal occurrence — the planner would
+        // rightly treat the instant as spent (CI flake, 2026-07-24).
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         handle
             .apply(
                 AgendaCommand::RequestOccurrence {
@@ -2094,6 +2100,12 @@ mod tests {
 
         // Occurrence 3: a SessionEnded while running — the shipped
         // failure shape — keeps counting.
+        // Requested instants mint the occurrence identity from the
+        // intake clock; on a fast runner two requests (with the round's
+        // in-memory fail between them) can land in one millisecond and
+        // collide with the terminal occurrence — the planner would
+        // rightly treat the instant as spent (CI flake, 2026-07-24).
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         handle
             .apply(
                 AgendaCommand::RequestOccurrence {
@@ -2129,6 +2141,12 @@ mod tests {
         // Occurrence 4: the Failed terminal beats the receipt (the
         // fast-spawn inversion) AND rides the upgraded address — the
         // aliased early-outcome lookup still journals `failed`.
+        // Requested instants mint the occurrence identity from the
+        // intake clock; on a fast runner two requests (with the round's
+        // in-memory fail between them) can land in one millisecond and
+        // collide with the terminal occurrence — the planner would
+        // rightly treat the instant as spent (CI flake, 2026-07-24).
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         handle
             .apply(
                 AgendaCommand::RequestOccurrence {
