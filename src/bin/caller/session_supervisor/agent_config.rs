@@ -571,6 +571,141 @@ impl SessionAgentSelection {
     }
 }
 
+/// Intake validation of an [`crate::event::AgentLaunchConfig`] for lanes
+/// that record the config now and spawn LATER (the agenda's digest-bound
+/// manifests): reject at propose time exactly what the launch path would
+/// deterministically reject at spawn time, by the same rules and in the
+/// same words, so a reviewed-and-approved manifest never dies at 03:00 on
+/// a contradiction that was knowable at intake. Deliberately no stricter
+/// than spawn: pins under a `Configured` (absent) agent selection resolve
+/// against the daemon default at fire time by design, so only an explicit
+/// selection can contradict a pin here; fire-time mismatches journal as
+/// the occurrence's named `failed` outcome instead.
+pub(crate) fn validate_launch_config(
+    config: &crate::event::AgentLaunchConfig,
+) -> Result<(), String> {
+    use external_agent::AgentBackend;
+    let selection = SessionAgentSelection::from_wire(config.agent.as_deref())?;
+    let pinned = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_some()
+    };
+    // (field, its backend family, that family's spawn-gate wording.)
+    let families: [(&str, bool, AgentBackend, &str); 4] = [
+        (
+            "Claude Code",
+            pinned(&config.claude_model)
+                || pinned(&config.claude_permission_mode)
+                || pinned(&config.claude_effort),
+            AgentBackend::ClaudeCode,
+            "claude_model/claude_permission_mode/claude_effort",
+        ),
+        (
+            "Kimi",
+            pinned(&config.kimi_model)
+                || pinned(&config.kimi_thinking)
+                || pinned(&config.kimi_permission_mode)
+                || pinned(&config.kimi_allowed_tools)
+                || config.kimi_plan_mode.is_some()
+                || config.kimi_swarm_mode.is_some(),
+            AgentBackend::Kimi,
+            "kimi_* launch pins",
+        ),
+        (
+            "Pi",
+            pinned(&config.pi_model)
+                || pinned(&config.pi_thinking)
+                || pinned(&config.pi_allowed_tools),
+            AgentBackend::Pi,
+            "pi_* launch pins",
+        ),
+        (
+            "Codex",
+            pinned(&config.codex_model)
+                || pinned(&config.codex_reasoning_effort)
+                || pinned(&config.codex_sandbox)
+                || pinned(&config.codex_approval_policy)
+                || pinned(&config.codex_managed_context)
+                || pinned(&config.codex_context_archive)
+                || pinned(&config.codex_service_tier),
+            AgentBackend::Codex,
+            "codex_* launch pins",
+        ),
+    ];
+    match &selection {
+        SessionAgentSelection::Configured => {}
+        SessionAgentSelection::Internal => {
+            if pinned(&config.agent_command) {
+                return Err("agent_command requires an external agent".to_string());
+            }
+            for (name, any_pinned, _, fields) in &families {
+                if *any_pinned {
+                    return Err(format!("{fields} require {name} (agent is internal)"));
+                }
+            }
+        }
+        SessionAgentSelection::External(backend) => {
+            for (name, any_pinned, family, fields) in &families {
+                if *any_pinned && family != backend {
+                    return Err(format!(
+                        "{fields} require {name} (agent is {})",
+                        backend.as_short_str()
+                    ));
+                }
+            }
+            if let Some(command) = config
+                .agent_command
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            {
+                if let Some(owner) = crate::session_config::agent_command_conflicts_with_source(
+                    backend.as_short_str(),
+                    command,
+                ) {
+                    return Err(format!(
+                        "agent command '{}' is the {} CLI but the session's agent is {}",
+                        command,
+                        owner,
+                        backend.as_short_str()
+                    ));
+                }
+            }
+            if *backend == AgentBackend::Codex {
+                if let Some(effort) = config
+                    .codex_reasoning_effort
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                {
+                    let Some(normalized) = crate::project::normalize_reasoning_effort(Some(effort))
+                    else {
+                        return Err(format!("unsupported Codex reasoning effort: {effort}"));
+                    };
+                    if let Some(model) = config
+                        .codex_model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty())
+                    {
+                        if let Some(entry) = crate::project::codex_model_catalog_entry(model) {
+                            if !entry.reasoning_efforts.contains(&normalized.as_str()) {
+                                return Err(format!(
+                                    "Codex model {model} does not support reasoning effort {normalized}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn codex_fast_new_session_agent(agent: Option<&str>) -> Result<String, String> {
     match SessionAgentSelection::from_wire(agent)? {
         SessionAgentSelection::Configured => Ok("codex".to_string()),
@@ -1809,5 +1944,112 @@ mod tests {
         );
         assert_eq!(normalize_session_name_option(Some("   ")).unwrap(), None);
         assert_eq!(normalize_session_name_option(None).unwrap(), None);
+    }
+
+    /// The dry intake validator (Track AU) accepts exactly what the
+    /// launch path would accept and names exactly what it would
+    /// deterministically reject — and stays deliberately silent on
+    /// `Configured`-selection pins, whose backend resolves against the
+    /// daemon default at fire time by design.
+    #[test]
+    fn validate_launch_config_mirrors_the_launch_gates() {
+        use crate::event::AgentLaunchConfig;
+        let ok = |config: AgentLaunchConfig| {
+            validate_launch_config(&config).unwrap_or_else(|e| panic!("expected accept, got {e}"))
+        };
+        let rejects = |config: AgentLaunchConfig, needle: &str| {
+            let err = validate_launch_config(&config).unwrap_err();
+            assert!(err.contains(needle), "wanted {needle:?} in {err:?}");
+        };
+
+        ok(AgentLaunchConfig::default());
+        ok(AgentLaunchConfig {
+            agent: Some("claude-code".into()),
+            claude_model: Some("fable-5".into()),
+            claude_effort: Some("max".into()),
+            ..Default::default()
+        });
+        // Configured selection: pins ride to fire-time resolution.
+        ok(AgentLaunchConfig {
+            claude_effort: Some("max".into()),
+            ..Default::default()
+        });
+        // Whitespace-only pins are not pins (the launch path's filter).
+        ok(AgentLaunchConfig {
+            agent: Some("internal".into()),
+            claude_effort: Some("   ".into()),
+            ..Default::default()
+        });
+        ok(AgentLaunchConfig {
+            agent: Some("codex".into()),
+            codex_model: Some("gpt-5.6-sol".into()),
+            codex_reasoning_effort: Some("ultra".into()),
+            ..Default::default()
+        });
+
+        rejects(
+            AgentLaunchConfig {
+                agent: Some("warp-drive".into()),
+                ..Default::default()
+            },
+            "unknown agent",
+        );
+        rejects(
+            AgentLaunchConfig {
+                agent: Some("internal".into()),
+                agent_command: Some("codex".into()),
+                ..Default::default()
+            },
+            "agent_command requires an external agent",
+        );
+        rejects(
+            AgentLaunchConfig {
+                agent: Some("internal".into()),
+                kimi_model: Some("k2".into()),
+                ..Default::default()
+            },
+            "require Kimi",
+        );
+        rejects(
+            AgentLaunchConfig {
+                agent: Some("claude-code".into()),
+                pi_model: Some("gpt-5.2".into()),
+                ..Default::default()
+            },
+            "require Pi",
+        );
+        rejects(
+            AgentLaunchConfig {
+                agent: Some("kimi".into()),
+                codex_sandbox: Some("workspace-write".into()),
+                ..Default::default()
+            },
+            "require Codex",
+        );
+        rejects(
+            AgentLaunchConfig {
+                agent: Some("codex".into()),
+                codex_reasoning_effort: Some("warp".into()),
+                ..Default::default()
+            },
+            "unsupported Codex reasoning effort",
+        );
+        rejects(
+            AgentLaunchConfig {
+                agent: Some("codex".into()),
+                codex_model: Some("gpt-5.6-luna".into()),
+                codex_reasoning_effort: Some("ultra".into()),
+                ..Default::default()
+            },
+            "does not support reasoning effort",
+        );
+        rejects(
+            AgentLaunchConfig {
+                agent: Some("kimi".into()),
+                agent_command: Some("claude".into()),
+                ..Default::default()
+            },
+            "is the claude-code CLI but the session's agent is kimi",
+        );
     }
 }

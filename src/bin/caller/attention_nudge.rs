@@ -775,6 +775,7 @@ mod tests {
             session_id: sid.clone(),
             reason: "done".to_string(),
             summary: None,
+            outcome: crate::event::TaskOutcome::Completed,
         });
         assert!(state
             .pending
@@ -810,6 +811,7 @@ mod tests {
             session_id: None,
             reason: "Denied by user".to_string(),
             summary: None,
+            outcome: crate::event::TaskOutcome::Completed,
         });
         assert!(state.pending.is_empty());
     }
@@ -985,6 +987,7 @@ mod tests {
             session_id: Some("abc12345-XYZ".to_string()),
             reason: "done".to_string(),
             summary: None,
+            outcome: crate::event::TaskOutcome::Completed,
         });
         assert_eq!(state.escalations.len(), 1);
         let now = now_unix_ms() + 1;
@@ -1014,6 +1017,7 @@ mod tests {
             session_id: Some("abc".to_string()),
             reason: "done".to_string(),
             summary: None,
+            outcome: crate::event::TaskOutcome::Completed,
         });
         let now = now_unix_ms() + 1;
         assert_eq!(state.take_due_escalations(now, false, None).len(), 1);
@@ -1027,6 +1031,7 @@ mod tests {
             session_id: Some("abc".to_string()),
             reason: "done".to_string(),
             summary: None,
+            outcome: crate::event::TaskOutcome::Completed,
         });
         assert!(state.take_due_escalations(later, false, None).is_empty());
     }
@@ -1041,6 +1046,7 @@ mod tests {
             session_id: Some("abc".to_string()),
             reason: "done".to_string(),
             summary: None,
+            outcome: crate::event::TaskOutcome::Completed,
         });
         assert_eq!(state.escalations.len(), 1);
         state.observe(&AppEvent::SessionEnded {
@@ -1119,6 +1125,7 @@ mod tests {
             session_id: Some("backend-1".to_string()),
             reason: "done".to_string(),
             summary: None,
+            outcome: crate::event::TaskOutcome::Completed,
         });
         assert!(state.pending.is_empty());
     }
@@ -1223,6 +1230,7 @@ mod tests {
             session_id: Some("def".to_string()),
             reason: "done".to_string(),
             summary: None,
+            outcome: crate::event::TaskOutcome::Completed,
         });
         assert_eq!(state.escalations.len(), 1);
     }
