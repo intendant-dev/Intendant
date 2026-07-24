@@ -53,6 +53,16 @@ restarts; the v1 contract is not a guarantee against sudden power loss. The
 delivery-critical occurrence journal has a stronger rule: it is synced before
 a notification or session launch is attempted.
 
+The occurrence journal is served the same way, read-only, at
+`GET /api/agenda/occurrences` (`agenda.read`; tunnel twin
+`api_agenda_occurrences`): the per-occurrence delivery and dispatch record
+(`prepared`, `delivered`, `suppressed`, `missed`, `started`, `completed`,
+`failed`, `unknown`), where downtime-skipped instants show up honestly as
+journal silence. The journal is append-only — nothing compacts or rewrites
+it — so the same `since` line cursor, `item_id` filter, and `limit` paging
+apply, with the same honesty rules: records a newer build wrote are served
+verbatim with `known: false`, non-JSON lines as `unparseable: true`.
+
 ### Items and transitions
 
 An item is a `note`, `task`, or `question`. Its lifecycle is derived from the
@@ -637,6 +647,7 @@ routes:
 |---|---|---|
 | `GET /api/agenda` | `agenda.read` | Items, status counts, skipped-line count, and the session-resolution join map |
 | `GET /api/agenda/ops` | `agenda.read` | Raw op-log page: `since` line cursor, `item` filter, unfoldable lines served verbatim |
+| `GET /api/agenda/occurrences` | `agenda.read` | Raw occurrence-journal page: same cursor and verbatim-honesty rules |
 | `POST /api/agenda/op` | `agenda.write` | Apply one validated Agenda command |
 | `POST /api/agenda/reminders/policy` | `settings.manage` | Change owner reminder policy |
 

@@ -559,6 +559,26 @@ impl AgendaHandle {
         }
     }
 
+    /// Run `f` with the handle's journal reader (lazily opened, its own
+    /// mutex — never nested with the store lock). `None` when the
+    /// journal cannot be opened; callers degrade honestly.
+    fn with_journal<T>(&self, f: impl FnOnce(&mut OccurrenceJournal) -> T) -> Option<T> {
+        let mut guard = match self.decoration_journal.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.is_none() {
+            match OccurrenceJournal::open(&self.dir) {
+                Ok(journal) => *guard = Some(journal),
+                Err(err) => {
+                    eprintln!("[agenda] opening occurrence journal failed: {err}");
+                    return None;
+                }
+            }
+        }
+        guard.as_mut().map(f)
+    }
+
     /// Stamp the display-only planner derivations
     /// (`effects[].next_fire_ms`, `deferred_until`) onto freshly folded
     /// item clones, with the clock of this read — the serving seam for
@@ -569,36 +589,43 @@ impl AgendaHandle {
     /// undecorated items (absence claims nothing). Never called under
     /// the store lock — the journal reader has its own.
     fn decorate_items(&self, items: &mut [AgendaItem]) {
-        let mut guard = match self.decoration_journal.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if guard.is_none() {
-            match OccurrenceJournal::open(&self.dir) {
-                Ok(journal) => *guard = Some(journal),
-                Err(err) => {
-                    eprintln!("[agenda] opening journal for decoration failed: {err}");
-                    return;
-                }
+        let policy = self.reminder_policy();
+        let now_ms = now_ms();
+        self.with_journal(|journal| {
+            if let Err(err) = journal.refresh_if_stale() {
+                eprintln!("[agenda] journal refresh for decoration failed: {err}");
             }
-        }
-        let Some(journal) = guard.as_mut() else {
-            return;
-        };
-        if let Err(err) = journal.refresh_if_stale() {
-            eprintln!("[agenda] journal refresh for decoration failed: {err}");
-        }
-        super::reminders::decorate_planner_fields(
-            items,
-            journal,
-            &self.reminder_policy(),
-            now_ms(),
-            &super::scheduler::local_minute_of_day_at,
-        );
+            super::reminders::decorate_planner_fields(
+                items,
+                journal,
+                &policy,
+                now_ms,
+                &super::scheduler::local_minute_of_day_at,
+            );
+        });
     }
 
     fn decorate_item(&self, item: &mut AgendaItem) {
         self.decorate_items(std::slice::from_mut(item));
+    }
+
+    /// One page of the raw occurrence journal (read-only; the
+    /// `GET /api/agenda/occurrences` surface). Runs under the handle's
+    /// journal mutex — see [`OccurrenceJournal::read_page`] for the
+    /// cursor contract and why a page never splits a concurrent
+    /// scheduler append.
+    pub(crate) fn read_occurrences(
+        &self,
+        since: u64,
+        item: Option<&str>,
+        limit: usize,
+    ) -> std::io::Result<super::reminders::AgendaOccurrencesPage> {
+        self.with_journal(|journal| journal.read_page(since, item, limit))
+            .unwrap_or_else(|| {
+                Err(std::io::Error::other(
+                    "occurrence journal unavailable on this daemon",
+                ))
+            })
     }
 }
 
@@ -1821,5 +1848,73 @@ mod tests {
         let store = AgendaStore::open(dir.path()).unwrap();
         let raw = store.snapshot();
         assert_eq!(raw[0].effects[0].next_fire_ms, None);
+    }
+
+    /// The occurrence-journal read surface converges on scheduler writes:
+    /// records appended through a SEPARATE writer instance (the
+    /// production topology) are served by the handle's reader with exact
+    /// cursor math and the item filter, and a foreign non-JSON line is
+    /// surfaced as `unparseable` rather than hidden.
+    #[test]
+    fn read_occurrences_serves_scheduler_writes() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        // Prime the handle's reader first, so convergence-on-growth is
+        // what this test exercises (not first-open).
+        let page = handle.read_occurrences(0, None, 500).unwrap();
+        assert_eq!(page.log_len, 0);
+
+        let mut writer = super::super::reminders::OccurrenceJournal::open(dir.path()).unwrap();
+        for (round, item) in [(0u64, "01ITEMA"), (1, "01ITEMB"), (2, "01ITEMA")] {
+            writer
+                .append(&super::super::reminders::OccurrenceRecord {
+                    v: 1,
+                    at_ms: round + 1,
+                    occurrence_id: format!("occ-{round}"),
+                    item_id: item.into(),
+                    due_ms: round,
+                    state: super::super::reminders::OccurrenceState::Delivered,
+                    urgency: None,
+                    session_id: None,
+                })
+                .unwrap();
+        }
+
+        let page = handle.read_occurrences(0, None, 500).unwrap();
+        assert_eq!(page.log_len, 3);
+        assert_eq!(page.next_since, 3);
+        assert_eq!(page.occurrences.len(), 3);
+        assert!(page
+            .occurrences
+            .iter()
+            .all(|e| e["known"] == serde_json::Value::Bool(true)));
+
+        let page = handle.read_occurrences(0, Some("01ITEMA"), 500).unwrap();
+        assert!(page.filtered);
+        let seqs: Vec<u64> = page
+            .occurrences
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![0, 2]);
+
+        // A foreign non-JSON line (hand edit, torn tail) is served as
+        // unparseable history, never dropped.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("occurrences.jsonl"))
+            .unwrap()
+            .write_all(b"garbage tail\n")
+            .unwrap();
+        let page = handle.read_occurrences(3, None, 500).unwrap();
+        assert_eq!(page.log_len, 4);
+        assert_eq!(page.occurrences.len(), 1);
+        assert_eq!(
+            page.occurrences[0]["unparseable"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(page.occurrences[0]["raw"], "garbage tail");
     }
 }

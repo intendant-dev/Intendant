@@ -249,6 +249,9 @@ pub(crate) async fn control_request_frame(
         }
         "api_agenda_list" => api_agenda_list_response(id, &runtime).await,
         "api_agenda_ops" => api_agenda_ops_response(id, params.as_ref(), &runtime).await,
+        "api_agenda_occurrences" => {
+            api_agenda_occurrences_response(id, params.as_ref(), &runtime).await
+        }
         "api_agenda_op" => api_agenda_op_response(id, params.as_ref(), &runtime).await,
         "api_agenda_ref_drift" => {
             api_agenda_ref_drift_response(id, params.as_ref(), &runtime).await
@@ -1330,6 +1333,39 @@ pub(crate) async fn api_agenda_ops_response(
         )
         .await,
         "agenda ops",
+    )
+}
+
+/// Tunnel twin of `GET /api/agenda/occurrences` — `{since, item, limit}`
+/// ride `params` (all optional, same semantics as the query string);
+/// reuses the transport-neutral core.
+pub(crate) async fn api_agenda_occurrences_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let since = params
+        .and_then(|p| p.get("since"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let item = params
+        .and_then(|p| p.get("item"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let limit = params
+        .and_then(|p| p.get("limit"))
+        .and_then(serde_json::Value::as_u64);
+    frame_api_response(
+        id,
+        crate::web_gateway::agenda_occurrences_api_response(
+            since,
+            item.as_deref(),
+            limit,
+            runtime.mcp_server.as_ref(),
+        )
+        .await,
+        "agenda occurrences",
     )
 }
 
