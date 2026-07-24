@@ -689,6 +689,8 @@
 .ui-empty-btn:hover { background: var(--sapphire); }
 .ui-empty-hint code { color: var(--blue); }
 .ui-empty-actions { display: flex; gap: 8px; margin-top: 6px; }
+/* The row already carries the top gap — don't double it per button. */
+.ui-empty-actions .ui-empty-btn { margin-top: 0; }
 /* Compact variant for empty slots inside cards (lists, small panes). */
 .ui-empty.compact { padding: 18px 16px; }
 .ui-section-sub code { color: var(--blue); }
