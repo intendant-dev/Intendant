@@ -15,10 +15,23 @@ reclaim a container without producing the orderly disconnect expected from a
 durable Intendant daemon. A terminal provider task therefore never proves that
 a live attachment still exists.
 
+```text
+ provider lane (codex cloud CLI)         attachment lane (broker/operator)
+ ───────────────────────────────         ─────────────────────────────────
+ queued → running → finished             not requested → awaiting → connected
+                  ↘ failed                    │               │        │
+                  ↘ cancelled                 │      terminal task      │ TTL lapses or
+                                              │      or broker loss     │ terminal + stale
+                                              ▼               ▼        ▼
+                                          (unchanged)   disconnected → expired
+```
+
 ## Controller commands
 
 The commands below use the user's existing Codex CLI authentication. Intendant
-does not copy Codex credentials into the cloud container.
+does not copy Codex credentials into the cloud container, and every provider
+subprocess runs in a disposable working directory (the upstream CLI writes an
+account-bearing `error.log` into its cwd).
 
 ```bash
 # Verify the CLI and Cloud authentication.
@@ -37,14 +50,53 @@ intendant codex-cloud list --json
 # Inspect a tracked task or its diff.
 intendant codex-cloud status task_e_...
 intendant codex-cloud diff task_e_...
+
+# Bring a finished task home (see below).
+intendant codex-cloud pull task_e_...
+
+# Drop terminal leases with no live attachment (default: older than 7 days).
+intendant codex-cloud prune
+intendant codex-cloud prune --all
 ```
+
+`list` shows the provider's current window **plus** any tracked lease with a
+live attachment (`awaiting`/`connected`) that has fallen out of that window —
+liveness outlives the provider's list. When the provider returns a pagination
+cursor, `list` prints the ready-made `--cursor` invocation for the next page,
+and `--json` carries it as `cursor`.
 
 The lease store defaults to
 `$XDG_DATA_HOME/intendant/codex-cloud/leases.json` (or the platform data
 directory). `INTENDANT_CODEX_CLOUD_STATE` overrides the exact path, and
-`INTENDANT_CODEX_COMMAND` overrides the Codex executable.
+`INTENDANT_CODEX_COMMAND` overrides the Codex executable. Every
+read-modify-write of the store takes a sidecar advisory file lock
+(`leases.json.lock`), so concurrent CLI invocations, the daemon's MCP tools,
+and the dashboard route cannot clobber each other's updates — and each
+terminal transition is observed by exactly one refresher.
 
-An attachment broker or operator can update the independent attachment state:
+## Pulling results home
+
+`pull` closes the loop: it fetches the task's unified diff through the Codex
+CLI (in the disposable directory, never inside your repository) and applies it
+with `git apply --3way` onto a fresh branch in a new git worktree under
+`.intendant/worktrees/`:
+
+```bash
+intendant codex-cloud pull task_e_...              # branch codex-cloud/task_e_...
+intendant codex-cloud pull task_e_... --attempt 2  # best-of-N: pick an attempt
+intendant codex-cloud pull task_e_... --branch fix/cloud-result --dir ../review
+```
+
+Nothing is committed: the worktree is left for review, and a conflicted
+three-way apply leaves standard conflict markers with the conflicting paths
+listed. A diff that applies nowhere removes the branch and worktree again. The
+upstream `codex cloud apply` command is deliberately not wrapped — it would
+either run in the disposable cwd (a no-op) or inside your repository (the
+`error.log` hazard); piping `diff` into our own `git` sidesteps both.
+
+## Attachment lifecycle
+
+An attachment broker or operator records the independent attachment state:
 
 ```bash
 intendant codex-cloud attachment task_e_... awaiting
@@ -52,16 +104,51 @@ intendant codex-cloud attachment task_e_... connected
 intendant codex-cloud attachment task_e_... disconnected
 ```
 
-The daemon's full MCP tool profile also exposes
-`list_codex_cloud_workers` and `submit_codex_cloud_task`. This lets an
-Intendant agent refresh worker state or delegate a task using the daemon
-host's authenticated Codex CLI. These tools are intentionally omitted from
-the compact/core tool profile; agents can discover and invoke them through
-`intendant ctl tools list` and `intendant ctl tools call`.
+Refreshes age attachments by three rules:
 
-When a disconnected attachment's provider task is terminal, the next refresh
-changes it to `expired`. Connected attachments on terminal tasks remain visible
-with a warning because reachability must be checked independently.
+- `awaiting` or `disconnected` on a terminal task becomes `expired` — the
+  broker is gone or will never arrive.
+- `connected` carries `attached_at_unix_ms` and expires after a staleness TTL
+  (`INTENDANT_CODEX_CLOUD_ATTACH_TTL_S`, default 3600) unless re-asserted:
+  recording `connected` again restarts the clock. This is the stopgap until a
+  broker owns liveness — a crashed broker cannot leave a lease `connected`
+  forever.
+- `connected` within the TTL survives even a terminal provider task, because
+  reachability must be checked independently of provider state.
+
+## Terminal transitions land on the Agenda
+
+Whoever refreshes the store and observes a task leave the live states —
+`queued`/`running` → `finished`/`failed`/`cancelled` — parks a note on the
+daemon's [Agenda](./agenda-and-memory.md): the task title, its URL, and the
+ready-made `pull` command. The store lock guarantees each edge is observed
+exactly once, so one finished task produces one note, whichever lane (CLI,
+MCP tool, dashboard) happened to see it first. The bare CLI parks through the
+local daemon's lane when a daemon is up; without one, the printed notice is
+the whole delivery. A task first seen already-terminal is history, not an
+edge, and is never parked.
+
+## Dashboard card
+
+The dashboard's **Sessions → Cloud** subtab renders the lease store: provider
+chip and attachment chip per lease (independent, like everything else here),
+the provider's task link, and the ready-made `pull` command for terminal
+tasks. The default paint is a cached read; **Sync with provider** hits
+`GET /api/codex-cloud/workers?refresh=1`, which re-syncs through the daemon
+host's Codex CLI and parks agenda notes for any transitions it observes. A
+failed sync degrades to the cached view with the error shown — the card never
+goes blank because the provider CLI is missing.
+
+## MCP tools
+
+The daemon's full MCP tool profile exposes `list_codex_cloud_workers` and
+`submit_codex_cloud_task`. This lets an Intendant agent refresh worker state
+or delegate a task using the daemon host's authenticated Codex CLI. These
+tools are intentionally omitted from the compact/core tool profile; agents
+can discover and invoke them through `intendant ctl tools list` and
+`intendant ctl tools call`. The list tool reports the same shape as
+`list --json` (window, tracked-active, cursor, transitions) plus how many
+agenda notes it parked.
 
 ## Environment bootstrap
 
@@ -120,6 +207,41 @@ available to setup scripts but are removed before the agent phase, so cached
 setup state is the wrong place for a per-task identity or enrollment secret.
 See the official [Codex Cloud environments
 documentation](https://learn.chatgpt.com/docs/environments/cloud-environment).
+
+## Toward visual workers: display streaming and computer use
+
+Nothing about a cloud worker changes Intendant's display architecture — it
+only moves the daemon to the far side of an attachment. Once a supervisor
+inside the container starts an Intendant daemon and connects it out through
+the enrollment broker, that daemon is an ordinary (if short-lived) federated
+peer: the [peer display pipeline](./peer-federation.md) can stream a display
+it owns, and [computer use](./computer-use-and-audio.md) can drive that
+display, exactly as on any headless Linux box.
+
+```text
+ Codex Cloud container                     your machine
+ ┌───────────────────────────────┐        ┌───────────────────────────┐
+ │ run-worker.sh (task identity) │        │ Intendant daemon          │
+ │  └─ supervisor (foreground)   │        │  ├─ worker lease store    │
+ │      ├─ intendant daemon      │◄──────►│  ├─ Agenda (transitions)  │
+ │      │   ├─ virtual display   │ tunnel │  └─ dashboard             │
+ │      │   │   (Xvfb + CU)      │ (one-  │      └─ Sessions → Cloud  │
+ │      │   └─ WebRTC encoder    │  time  │          live tile view   │
+ │      └─ outbound transport    │  cred) │          + input          │
+ └───────────────────────────────┘        └───────────────────────────┘
+```
+
+The pieces already exist per-box: virtual display management lives in
+`crates/intendant-platform` (`vision.rs`), capture/encode in
+`intendant-display`, and the cross-machine tile stream plus remote input in
+the peer federation layer. What gates it is the same thing that gates any
+live attachment — the enrollment broker minting one-time credentials and a
+relay route, because a container behind the provider's egress proxy can only
+dial out (agent-phase network is allowlisted, so expect forced-TCP transport
+rather than UDP ICE). Until the broker exists, the lease store, the agenda
+notes, and the dashboard card above are deliberately the shipped surface: the
+job/control plane is reliable today, and the display lane composes onto the
+attachment lane instead of pretending each Cloud task is a static `[[peer]]`.
 
 ## Current boundary
 

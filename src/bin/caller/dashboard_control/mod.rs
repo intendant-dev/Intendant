@@ -5835,6 +5835,7 @@ mod tests {
             ("api_session_delete", Row, Some(Op::SessionManage)),
             ("api_session_current_history", Row, Some(Op::SessionManage)),
             ("api_session_current_rollback", Row, Some(Op::SessionManage)),
+            ("api_codex_cloud_workers", Row, Some(Op::StatsRead)),
             ("api_agenda_list", Row, Some(Op::AgendaRead)),
             ("api_agenda_ops", Row, Some(Op::AgendaRead)),
             ("api_agenda_occurrences", Row, Some(Op::AgendaRead)),

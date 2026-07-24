@@ -364,6 +364,9 @@ pub(crate) enum RouteHandlerId {
     /// Live dashboard connections (tab presence): the tabs registry
     /// snapshot with voice/input-authority ownership joined in.
     DashboardTabs,
+    /// Codex Cloud worker leases (cached store; `?refresh=1` re-syncs via
+    /// the daemon host's Codex CLI and parks transition notes).
+    CodexCloudWorkers,
     /// Agenda ledger snapshot (items + counts).
     AgendaList,
     /// Raw op-log page (since/item/limit cursor; unknown ops verbatim).
@@ -905,6 +908,19 @@ pub(crate) static ROUTES: &[Route] = &[
         "Roll the current session back to a round (optionally reverting files)",
     )
     .with_tunnel(tunnel_method("api_session_current_rollback")),
+    // Codex Cloud worker leases (docs/src/codex-cloud-workers.md): the
+    // dashboard's read of the provider-owned task/lease store. Read-only
+    // toward the provider; `?refresh=1` re-syncs the store through the
+    // daemon host's authenticated Codex CLI.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/codex-cloud/workers"),
+        PeerOperation::StatsRead,
+        BodyPolicy::None,
+        RouteHandlerId::CodexCloudWorkers,
+        "Codex Cloud worker leases from the cached store (`?refresh=1` re-syncs via the Codex CLI)",
+    )
+    .with_tunnel(tunnel_method("api_codex_cloud_workers")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/agenda"),

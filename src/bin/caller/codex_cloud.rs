@@ -776,7 +776,12 @@ async fn pull_task(
         .unwrap_or_else(|| format!("codex-cloud/{task_id}"));
     if run_git(
         &repo_root,
-        &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
     )
     .await
     .is_ok()
@@ -786,12 +791,9 @@ async fn pull_task(
         ));
     }
 
-    let worktree_dir = dir_override.map(Path::to_path_buf).unwrap_or_else(|| {
-        repo_root
-            .join(".intendant")
-            .join("worktrees")
-            .join(&branch)
-    });
+    let worktree_dir = dir_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| repo_root.join(".intendant").join("worktrees").join(&branch));
     if worktree_dir.exists() {
         return Err(format!(
             "{} already exists; pass --dir for a fresh location",
@@ -847,8 +849,11 @@ async fn pull_task(
             if unmerged.is_empty() {
                 // Nothing applied at all: remove the worktree and branch so a
                 // failed pull leaves no residue.
-                let _ = run_git(&repo_root, &["worktree", "remove", "--force", &worktree_str])
-                    .await;
+                let _ = run_git(
+                    &repo_root,
+                    &["worktree", "remove", "--force", &worktree_str],
+                )
+                .await;
                 let _ = run_git(&repo_root, &["branch", "-D", &branch]).await;
                 return Err(format!("apply the task diff: {apply_error}"));
             }
@@ -887,7 +892,11 @@ async fn run_git(cwd: &Path, args: &[&str]) -> Result<CommandOutput, String> {
         Err(if detail.is_empty() {
             format!("git {} exited with {}", args.join(" "), output.status)
         } else {
-            format!("git {} exited with {}: {detail}", args.join(" "), output.status)
+            format!(
+                "git {} exited with {}: {detail}",
+                args.join(" "),
+                output.status
+            )
         })
     }
 }
@@ -1312,7 +1321,9 @@ fn sync_store(
                 .as_ref()
                 .and_then(|lease| lease.attached_at_unix_ms)
                 .or(Some(now_ms)),
-            _ => existing.as_ref().and_then(|lease| lease.attached_at_unix_ms),
+            _ => existing
+                .as_ref()
+                .and_then(|lease| lease.attached_at_unix_ms),
         };
         let attachment_state = next_attachment_state(
             existing_attachment,
@@ -1479,10 +1490,7 @@ impl Drop for StoreLock {
 }
 
 fn store_lock_path(store_path: &Path) -> PathBuf {
-    let mut name = store_path
-        .file_name()
-        .unwrap_or_default()
-        .to_os_string();
+    let mut name = store_path.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
     store_path.with_file_name(name)
 }
@@ -1800,7 +1808,12 @@ mod tests {
         let mut disconnected = lease("task_e_123");
         disconnected.attachment_state = AttachmentState::Disconnected;
         let mut store = store_with(vec![disconnected]);
-        sync_store(&mut store, &[task("task_e_123", "error")], 1_000, TEST_TTL_MS);
+        sync_store(
+            &mut store,
+            &[task("task_e_123", "error")],
+            1_000,
+            TEST_TTL_MS,
+        );
         assert_eq!(
             store.leases["task_e_123"].attachment_state,
             AttachmentState::Expired
@@ -1878,7 +1891,12 @@ mod tests {
     #[test]
     fn terminal_transition_reported_exactly_once() {
         let mut store = store_with(vec![lease("task_e_123")]);
-        let first = sync_store(&mut store, &[task("task_e_123", "ready")], 1_000, TEST_TTL_MS);
+        let first = sync_store(
+            &mut store,
+            &[task("task_e_123", "ready")],
+            1_000,
+            TEST_TTL_MS,
+        );
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].task_id, "task_e_123");
         assert_eq!(first[0].provider_state, ProviderLeaseState::Finished);
@@ -1886,15 +1904,24 @@ mod tests {
         // sends an empty one.
         assert_eq!(first[0].title, "old");
 
-        let second = sync_store(&mut store, &[task("task_e_123", "ready")], 2_000, TEST_TTL_MS);
+        let second = sync_store(
+            &mut store,
+            &[task("task_e_123", "ready")],
+            2_000,
+            TEST_TTL_MS,
+        );
         assert!(second.is_empty(), "terminal → terminal is not an edge");
     }
 
     #[test]
     fn first_sight_terminal_is_history_not_a_transition() {
         let mut store = store_with(vec![]);
-        let transitions =
-            sync_store(&mut store, &[task("task_e_done", "ready")], 1_000, TEST_TTL_MS);
+        let transitions = sync_store(
+            &mut store,
+            &[task("task_e_done", "ready")],
+            1_000,
+            TEST_TTL_MS,
+        );
         assert!(transitions.is_empty());
         assert_eq!(
             store.leases["task_e_done"].provider_state,
@@ -1911,7 +1938,12 @@ mod tests {
         let mut store = store_with(vec![known]);
         // The real provider shape can return an empty title and null
         // environment/url fields.
-        sync_store(&mut store, &[task("task_e_123", "running")], 1_000, TEST_TTL_MS);
+        sync_store(
+            &mut store,
+            &[task("task_e_123", "running")],
+            1_000,
+            TEST_TTL_MS,
+        );
         let lease = &store.leases["task_e_123"];
         assert_eq!(lease.title, "My submitted task");
         assert_eq!(lease.environment_id.as_deref(), Some("env_42"));
@@ -2158,8 +2190,18 @@ EOF
         scrubbed_git(&repo, &["init", "--quiet"]).await;
         std::fs::write(repo.join("README.md"), "hello\n").unwrap();
         scrubbed_git(&repo, &["add", "README.md"]).await;
-        scrubbed_git(&repo, &["-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "init"])
-            .await;
+        scrubbed_git(
+            &repo,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "init",
+            ],
+        )
+        .await;
 
         let diff = "diff --git a/greeting.txt b/greeting.txt\n\
 new file mode 100644\n\
@@ -2223,8 +2265,18 @@ index 0000000..ce01362\n\
         scrubbed_git(&repo, &["init", "--quiet"]).await;
         std::fs::write(repo.join("README.md"), "hello\n").unwrap();
         scrubbed_git(&repo, &["add", "README.md"]).await;
-        scrubbed_git(&repo, &["-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "init"])
-            .await;
+        scrubbed_git(
+            &repo,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "init",
+            ],
+        )
+        .await;
 
         let codex = fake_codex_emitting(dir.path(), "this is not a diff at all");
         let error = pull_task(

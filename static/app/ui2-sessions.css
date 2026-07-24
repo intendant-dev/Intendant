@@ -1758,3 +1758,60 @@ html.ui-v2 #tab-sessions .session-card .sc-id { font-family: var(--mono); }
 /* New Session project status: the outside-project-root note carries its
    own quiet warn tint; the status text keeps its ok/warn/error tone. */
 .sessions-project-status .sessions-project-outside-note { color: var(--yellow, #f9e2af); }
+
+/* ── Cloud workers (Sessions → Cloud): ephemeral Codex Cloud leases ──
+   Two independent chips per row — provider task state and live-attachment
+   state — because the whole model is that neither implies the other. */
+.cloud-workers-hint {
+  color: var(--text-3);
+  font-size: 12px;
+  max-width: 72ch;
+  margin-top: 4px;
+}
+.cloud-workers-hint code { font-family: var(--mono); font-size: 11px; }
+.cloud-workers-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.cloud-workers-status-error { color: var(--yellow, #f9e2af); }
+.cloud-worker-row { padding: 10px 12px; }
+.cloud-worker-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cloud-worker-title { font-weight: 600; color: var(--text); flex: 1; min-width: 12ch; }
+.cloud-worker-chip {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.cloud-worker-provider.is-running { color: var(--iris, var(--blue, #89b4fa)); border-color: currentColor; }
+.cloud-worker-provider.is-queued { color: var(--text-2); }
+.cloud-worker-provider.is-finished { color: var(--green, #a6e3a1); border-color: currentColor; }
+.cloud-worker-provider.is-failed,
+.cloud-worker-provider.is-cancelled { color: var(--rose, #f38ba8); border-color: currentColor; }
+.cloud-worker-attachment.is-connected { color: var(--green, #a6e3a1); border-color: currentColor; }
+.cloud-worker-attachment.is-awaiting { color: var(--yellow, #f9e2af); border-color: currentColor; }
+.cloud-worker-attachment.is-disconnected,
+.cloud-worker-attachment.is-expired { color: var(--text-3); }
+.cloud-worker-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.cloud-worker-id { font-family: var(--mono); font-size: 11px; }
+.cloud-worker-link { color: var(--iris, var(--blue, #89b4fa)); text-decoration: none; }
+.cloud-worker-link:hover { text-decoration: underline; }
+.cloud-worker-pull {
+  margin-top: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-2);
+  background: var(--surface-2);
+  border: 1px dashed var(--line-2);
+  border-radius: 6px;
+  padding: 4px 8px;
+  width: fit-content;
+  user-select: all;
+}

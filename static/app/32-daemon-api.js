@@ -178,6 +178,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_session_current_changes: { verb: 'GET', path: '/api/session/current/changes', pathSuffix: 'path', rawQuery: 'query' },
   api_session_current_history: { verb: 'GET', path: '/api/session/current/history' },
   api_session_current_rollback: { verb: 'POST', path: '/api/session/current/rollback' },
+  api_codex_cloud_workers: { verb: 'GET', path: '/api/codex-cloud/workers', query: ['refresh'] },
   api_agenda_list: { verb: 'GET', path: '/api/agenda' },
   api_agenda_op: { verb: 'POST', path: '/api/agenda/op' },
   api_agenda_ref_drift: { verb: 'GET', path: '/api/agenda/items/{item_id}/refs/drift' },

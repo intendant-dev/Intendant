@@ -21,7 +21,9 @@ impl IntendantServer {
         .await
         {
             Ok(outcome) => {
-                let agenda_parked = self.park_codex_cloud_transitions(&outcome.transitions).await;
+                let agenda_parked = self
+                    .park_codex_cloud_transitions(&outcome.transitions)
+                    .await;
                 serde_json::json!({
                     "ok": true,
                     "workers": outcome.workers,

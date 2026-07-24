@@ -247,6 +247,9 @@ pub(crate) async fn control_request_frame(
         "api_session_context_snapshot" => {
             api_session_context_snapshot_response(id, params.as_ref()).await
         }
+        "api_codex_cloud_workers" => {
+            api_codex_cloud_workers_response(id, params.as_ref(), &runtime).await
+        }
         "api_agenda_list" => api_agenda_list_response(id, &runtime).await,
         "api_agenda_ops" => api_agenda_ops_response(id, params.as_ref(), &runtime).await,
         "api_agenda_occurrences" => {
@@ -1300,6 +1303,25 @@ pub(crate) async fn api_agenda_list_response(
         id,
         crate::web_gateway::agenda_list_api_response(runtime.mcp_server.as_ref()).await,
         "agenda list",
+    )
+}
+
+/// Tunnel twin of `GET /api/codex-cloud/workers` — `{refresh}` rides
+/// `params` (bool or "1"/"true", same semantics as the query string).
+pub(crate) async fn api_codex_cloud_workers_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let refresh = params
+        .and_then(|p| p.get("refresh"))
+        .map(|v| v.as_bool().unwrap_or(false) || matches!(v.as_str(), Some("1") | Some("true")))
+        .unwrap_or(false);
+    frame_api_response(
+        id,
+        crate::web_gateway::codex_cloud_workers_api_response(refresh, runtime.mcp_server.as_ref())
+            .await,
+        "codex cloud workers",
     )
 }
 
