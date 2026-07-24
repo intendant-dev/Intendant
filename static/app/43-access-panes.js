@@ -2525,6 +2525,7 @@ function renderAccessAdminSummaries() {
   // that this fanout provides for the Access pane (lease countdowns,
   // custody freshness).
   renderOrDefer('vault', 'vault-section', renderAccessVaultSection);
+  renderOrDefer('vault', 'github-integration', renderGithubIntegrationSection);
   // Transport ticks call this 17-renderer fanout constantly; skip the DOM
   // work while the Access pane is hidden and run once on the next entry.
   if (!paneIsVisible('access')) {

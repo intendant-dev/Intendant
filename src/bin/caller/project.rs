@@ -93,6 +93,31 @@ pub struct ExperimentalConfig {
     pub cu_first_routing: bool,
 }
 
+/// `[integrations]` in intendant.toml — non-secret configuration for
+/// external service integrations. Credentials never live here: the
+/// GitHub App key and ids are sealed in OS-keystore custody
+/// (`key_custody::GITHUB_APP_ENTRY`); this section carries only what an
+/// operator could state aloud — which repos to watch, how often to poll.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IntegrationsConfig {
+    #[serde(default)]
+    pub github: GithubIntegrationConfig,
+}
+
+/// `[integrations.github]`: the GitHub App integration's watch set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GithubIntegrationConfig {
+    /// Repositories to watch, as `"owner/repo"` strings. The effective
+    /// watch set is this list ∩ the App installation's repos; the status
+    /// surface shows both sides rather than silently skipping.
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// Poll cadence override in minutes (default 5, floor 1) — consumed
+    /// by the PR scanner slice.
+    #[serde(default)]
+    pub poll_minutes: Option<u64>,
+}
+
 /// Computer use configuration: provider/model overrides for tasks that involve
 /// visual grounding (reference frames). Configured via `[computer_use]` in
 /// intendant.toml or `CU_PROVIDER`/`CU_MODEL` env vars.
@@ -814,6 +839,10 @@ pub struct ProjectConfig {
     /// but must not shape production behavior. See [`ExperimentalConfig`].
     #[serde(default)]
     pub experimental: ExperimentalConfig,
+    /// `[integrations]` section — non-secret external-integration
+    /// configuration (watch lists, cadences). See [`IntegrationsConfig`].
+    #[serde(default)]
+    pub integrations: IntegrationsConfig,
     /// `[server]` section in intendant.toml — daemon-level settings
     /// for what this Intendant advertises to peers. See [`ServerConfig`].
     #[serde(default)]

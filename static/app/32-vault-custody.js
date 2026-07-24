@@ -3548,6 +3548,12 @@ function ui2VaultAdoptSections() {
   }
   if (custodyHead?.classList.contains('acc-section-head')) host.appendChild(custodyHead);
   host.appendChild(custodyMount);
+  const githubMount = document.getElementById('access-github-integration-section');
+  if (githubMount) {
+    const githubHead = githubMount.previousElementSibling;
+    if (githubHead?.classList.contains('acc-section-head')) host.appendChild(githubHead);
+    host.appendChild(githubMount);
+  }
   const pagehead = document.getElementById('ui2-vault-pagehead');
   if (pagehead) pagehead.hidden = false;
   const v1Note = document.getElementById('vault-v1-note');
@@ -4277,3 +4283,200 @@ function stationStatus(text) {
   }
   el.textContent = value;
 }
+
+/* ── GitHub App integration (Track PR): the configuration surface for
+   the daemon-custody-sealed App credentials. This is TRACK-K DAEMON
+   CUSTODY, not the browser vault above — the key seals into the
+   daemon's OS keystore (born in custody: no file, env, or browser-vault
+   lane), status reads never unseal, and Remove is the idempotent
+   audited delete. The section renders on the Vault tab beside the
+   custody trail (adopted by ui2VaultAdoptSections). ── */
+const githubIntegrationState = {
+  fetchedAt: 0,
+  data: null,
+  busy: false,
+  notice: null, // { text, cls } — the last action's outcome, transient
+  lastError: null,
+  removeArmedAt: 0,
+};
+
+async function githubIntegrationRefresh(force = false) {
+  if (!force && Date.now() - githubIntegrationState.fetchedAt < 30_000) return;
+  githubIntegrationState.fetchedAt = Date.now();
+  try {
+    const data = await daemonApi.request('api_github_integration_status', {});
+    githubIntegrationState.data = data || null;
+    githubIntegrationState.lastError = null;
+  } catch (e) {
+    githubIntegrationState.lastError = String(e?.message || e);
+  }
+  renderGithubIntegrationSection();
+}
+
+function githubIntegrationChip(text, cls) {
+  const chip = document.createElement('span');
+  chip.className = 'vault-chip' + (cls ? ` ${cls}` : '');
+  chip.textContent = text;
+  return chip;
+}
+
+async function githubIntegrationSave(fields) {
+  const payload = {
+    app_id: fields.appId.value.trim(),
+    installation_id: Number(fields.installationId.value || 0),
+    repos: fields.repos.value.split('\n').map(s => s.trim()).filter(Boolean),
+  };
+  const pem = fields.pem.value.trim();
+  if (pem) payload.private_key_pem = pem;
+  const minutes = fields.pollMinutes.value.trim();
+  if (minutes) payload.poll_minutes = Number(minutes);
+  githubIntegrationState.busy = true;
+  githubIntegrationState.notice = null;
+  renderGithubIntegrationSection();
+  try {
+    const data = await daemonApi.request('api_github_integration_save', payload);
+    githubIntegrationState.data = data || githubIntegrationState.data;
+    githubIntegrationState.fetchedAt = Date.now();
+    const status = data?.status || 'saved';
+    githubIntegrationState.notice = {
+      text: status === 'valid'
+        ? `Saved — verified against GitHub${Number.isFinite(data?.verified_open_prs) ? ` (${data.verified_open_prs} open PRs)` : ''}.`
+        : `Saved. Status: ${status}${data?.detail ? ` — ${data.detail}` : ''}`,
+      cls: status === 'valid' ? 'ok' : 'warn',
+    };
+    // The pasted key was sealed daemon-side; drop it from the DOM now.
+    fields.pem.value = '';
+  } catch (e) {
+    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'warn' };
+  }
+  githubIntegrationState.busy = false;
+  renderGithubIntegrationSection();
+}
+
+async function githubIntegrationRemove() {
+  // Two-click arm instead of a blocking dialog: first click arms for 4 s.
+  if (Date.now() - githubIntegrationState.removeArmedAt > 4000) {
+    githubIntegrationState.removeArmedAt = Date.now();
+    renderGithubIntegrationSection();
+    return;
+  }
+  githubIntegrationState.removeArmedAt = 0;
+  githubIntegrationState.busy = true;
+  renderGithubIntegrationSection();
+  try {
+    const data = await daemonApi.request('api_github_integration_remove', {});
+    githubIntegrationState.data = data || githubIntegrationState.data;
+    githubIntegrationState.fetchedAt = Date.now();
+    githubIntegrationState.notice = { text: 'Credentials removed from custody.', cls: 'ok' };
+  } catch (e) {
+    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'warn' };
+  }
+  githubIntegrationState.busy = false;
+  renderGithubIntegrationSection();
+}
+
+function renderGithubIntegrationSection() {
+  const mount = document.getElementById('access-github-integration-section');
+  if (!mount) return;
+  // Never clobber a form mid-edit — the next tick re-renders after blur.
+  if (mount.contains(document.activeElement) && document.activeElement !== document.body) return;
+  githubIntegrationRefresh();
+  const data = githubIntegrationState.data;
+  mount.innerHTML = '';
+
+  const chips = document.createElement('div');
+  chips.className = 'vault-status-line';
+  const status = data?.status || (githubIntegrationState.lastError ? 'unknown' : 'loading');
+  const statusCls = status === 'valid' ? 'ok'
+    : (status === 'denied' || status === 'unreachable') ? 'warn'
+    : '';
+  chips.appendChild(githubIntegrationChip(`status: ${status}`, statusCls));
+  if (data?.configured) {
+    chips.appendChild(githubIntegrationChip('credentials sealed', 'ok'));
+  }
+  const repoCount = Array.isArray(data?.repos) ? data.repos.length : 0;
+  chips.appendChild(githubIntegrationChip(`${repoCount} repo${repoCount === 1 ? '' : 's'} watched`));
+  if (data && data.custody_backend_available === false) {
+    chips.appendChild(githubIntegrationChip('no custody backend on this platform', 'warn'));
+  }
+  if (data?.detail) chips.appendChild(githubIntegrationChip(String(data.detail), 'warn'));
+  if (githubIntegrationState.lastError) {
+    chips.appendChild(githubIntegrationChip(githubIntegrationState.lastError, 'warn'));
+  }
+  if (githubIntegrationState.notice) {
+    chips.appendChild(githubIntegrationChip(githubIntegrationState.notice.text, githubIntegrationState.notice.cls));
+  }
+  mount.appendChild(chips);
+
+  const fold = document.createElement('details');
+  fold.className = 'acc-fold';
+  const summary = document.createElement('summary');
+  summary.textContent = data?.configured ? 'Update the GitHub App' : 'Connect a GitHub App';
+  const body = document.createElement('div');
+  body.className = 'acc-fold-body';
+  const grid = document.createElement('div');
+  grid.className = 'vault-form-grid';
+
+  const field = (labelText, control) => {
+    const label = document.createElement('label');
+    label.textContent = labelText;
+    grid.appendChild(label);
+    grid.appendChild(control);
+    return control;
+  };
+  const appId = document.createElement('input');
+  appId.type = 'text';
+  appId.autocomplete = 'off';
+  appId.placeholder = 'e.g. 123456';
+  field('App ID', appId);
+  const installationId = document.createElement('input');
+  installationId.type = 'number';
+  installationId.placeholder = 'e.g. 987654';
+  field('Installation ID', installationId);
+  const pem = document.createElement('textarea');
+  pem.className = 'vault-phrase-input';
+  pem.rows = 5;
+  pem.placeholder = data?.configured
+    ? '-----BEGIN RSA PRIVATE KEY----- … (leave empty to keep the sealed key)'
+    : '-----BEGIN RSA PRIVATE KEY----- …';
+  field('Private key (PEM)', pem);
+  const repos = document.createElement('textarea');
+  repos.className = 'vault-phrase-input';
+  repos.rows = 3;
+  repos.placeholder = 'owner/repo — one per line';
+  if (Array.isArray(data?.repos) && data.repos.length) repos.value = data.repos.join('\n');
+  field('Watched repos', repos);
+  const pollMinutes = document.createElement('input');
+  pollMinutes.type = 'number';
+  pollMinutes.placeholder = data?.poll_minutes ? String(data.poll_minutes) : '5';
+  field('Poll minutes', pollMinutes);
+
+  const actions = document.createElement('div');
+  actions.className = 'vault-actions';
+  const save = vaultButton('Save & verify', () => {
+    void githubIntegrationSave({ appId, installationId, pem, repos, pollMinutes });
+  }, { primary: true });
+  save.disabled = githubIntegrationState.busy;
+  actions.appendChild(save);
+  if (data?.configured) {
+    const armed = Date.now() - githubIntegrationState.removeArmedAt <= 4000;
+    const remove = vaultButton(armed ? 'Really remove?' : 'Remove', () => {
+      void githubIntegrationRemove();
+    }, { danger: true });
+    remove.disabled = githubIntegrationState.busy;
+    actions.appendChild(remove);
+  }
+  body.appendChild(grid);
+  body.appendChild(actions);
+  fold.appendChild(summary);
+  fold.appendChild(body);
+  mount.appendChild(fold);
+}
+
+window.qa = Object.assign(window.qa || {}, {
+  githubIntegrationStatus: () => ({
+    ...(githubIntegrationState.data || {}),
+    lastError: githubIntegrationState.lastError,
+    busy: githubIntegrationState.busy,
+  }),
+});

@@ -1887,6 +1887,74 @@ pub(crate) async fn api_api_keys_save_response(
     )
 }
 
+async fn github_settings_root(runtime: &ControlRuntime) -> Option<std::path::PathBuf> {
+    let from_session = {
+        let session = runtime.shared_session.read().await;
+        session.runtime_settings.settings_root.clone()
+    };
+    from_session.or_else(|| runtime.project_root.clone())
+}
+
+pub(crate) async fn api_github_integration_save_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+    audit_actor: String,
+    audit_origin: &'static str,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    let settings_root = github_settings_root(runtime).await;
+    frame_api_json_body_response(
+        id,
+        crate::web_gateway::github_integration_save_api_response(
+            body_text.as_bytes(),
+            settings_root.as_deref(),
+            &crate::web_gateway::DaemonGithubAppCustody,
+            crate::github_pr::status::global(),
+            &audit_actor,
+            audit_origin,
+        )
+        .await,
+        "github integration save",
+    )
+}
+
+pub(crate) async fn api_github_integration_status_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let settings_root = github_settings_root(runtime).await;
+    frame_api_json_body_response(
+        id,
+        crate::web_gateway::github_integration_status_api_response(
+            settings_root.as_deref(),
+            &crate::web_gateway::DaemonGithubAppCustody,
+            crate::github_pr::status::global(),
+        ),
+        "github integration status",
+    )
+}
+
+pub(crate) async fn api_github_integration_remove_response(
+    id: String,
+    runtime: &ControlRuntime,
+    audit_actor: String,
+    audit_origin: &'static str,
+) -> serde_json::Value {
+    let settings_root = github_settings_root(runtime).await;
+    frame_api_json_body_response(
+        id,
+        crate::web_gateway::github_integration_remove_api_response(
+            settings_root.as_deref(),
+            &crate::web_gateway::DaemonGithubAppCustody,
+            crate::github_pr::status::global(),
+            &audit_actor,
+            audit_origin,
+        ),
+        "github integration remove",
+    )
+}
+
 /// Hosted-provenance fact for the Claude sign-in twins, from the grant
 /// that opened this control session: the trusted-local surface and peer
 /// daemons are direct by construction; user clients go through the

@@ -722,6 +722,183 @@ fn restore_estate(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// GitHub App credentials (Track PR): the first born-in-custody estate.
+//
+// One sealed entry holds the App's whole identity — App ID, installation
+// id, and the RS256 private key — as a versioned JSON document. The ids
+// are discovery topology on a PUBLIC-origin repo and the key is
+// load-bearing secret material, so they seal together: one entry, one
+// status, one atomic replace, no split-brain. Unlike the migrated estates
+// above, this entry never exists as a plaintext file, so there is no
+// tombstone and no file fallback lane — removal is the backend's
+// idempotent delete plus a named audit event, and a custody deny means
+// the integration is OFF (named, audited), never served stale.
+// Availability checks are blob existence only (the provider-key
+// discipline): dashboard status polls never touch the keystore; material
+// is unsealed only when the client actually mints an App JWT (about once
+// an hour under the installation-token lifetime).
+
+/// The single GitHub App custody entry name (also the seal AAD).
+pub const GITHUB_APP_ENTRY: &str = "github-app/credentials";
+
+/// The GitHub App estate shares the daemon-global provider root
+/// (`<config_dir>/intendant`, blobs under `custody/`).
+fn github_app_blob_path(root: &Path) -> Option<PathBuf> {
+    intendant_custody::sealed_blob_file_name(GITHUB_APP_ENTRY)
+        .ok()
+        .map(|name| root.join(CUSTODY_SUBDIR).join(name))
+}
+
+/// Whether GitHub App credentials are custody-held — blob existence only,
+/// no keystore access (safe for status polls).
+pub fn github_app_in_custody() -> bool {
+    provider_estate_root().is_some_and(|root| github_app_in_custody_at(&root))
+}
+
+pub(crate) fn github_app_in_custody_at(root: &Path) -> bool {
+    github_app_blob_path(root).is_some_and(|blob| blob.is_file())
+}
+
+/// Retrieve the sealed GitHub App credentials document, or `None` when
+/// none are configured. A custody *failure* for a held entry is also
+/// `None` — fail-closed, never stale — but it is audited and logged by
+/// name first; the caller surfaces a generic `denied` status while the
+/// custody trail carries the specific deny.
+pub fn github_app_from_custody() -> Option<Secret> {
+    let root = provider_estate_root()?;
+    // Blob first: an unconfigured integration never touches the keystore.
+    if !github_app_in_custody_at(&root) {
+        return None;
+    }
+    let backend = match platform_backend(&root) {
+        Some(Ok(backend)) => backend,
+        Some(Err(error)) => {
+            audit_denied(GITHUB_APP_ENTRY, &root.join(CUSTODY_SUBDIR), &error);
+            eprintln!("!! github app credentials: {error}");
+            return None;
+        }
+        None => return None,
+    };
+    github_app_from_custody_with(&root, backend.as_ref())
+}
+
+pub(crate) fn github_app_from_custody_with(
+    root: &Path,
+    backend: &dyn CustodyBackend,
+) -> Option<Secret> {
+    match backend.retrieve(GITHUB_APP_ENTRY) {
+        Ok(secret) => Some(secret),
+        Err(error) => {
+            let error = error.to_string();
+            audit_denied(GITHUB_APP_ENTRY, &root.join(CUSTODY_SUBDIR), &error);
+            eprintln!("!! github app credentials: {error}");
+            None
+        }
+    }
+}
+
+/// Seal (or replace) the GitHub App credentials document. `actor` and
+/// `origin` attribute the configuring surface in the custody trail —
+/// this is an owner configure gesture, not a daemon-internal refresh.
+pub fn store_github_app(material: &[u8], actor: &str, origin: &str) -> Result<(), String> {
+    let root = provider_estate_root().ok_or("cannot determine config directory")?;
+    let backend = match platform_backend(&root) {
+        Some(Ok(backend)) => backend,
+        Some(Err(error)) => {
+            audit_denied(GITHUB_APP_ENTRY, &root.join(CUSTODY_SUBDIR), &error);
+            return Err(error);
+        }
+        None => return Err(NO_BACKEND_MESSAGE.to_string()),
+    };
+    store_github_app_with(&root, backend.as_ref(), material, actor, origin)
+}
+
+pub(crate) fn store_github_app_with(
+    root: &Path,
+    backend: &dyn CustodyBackend,
+    material: &[u8],
+    actor: &str,
+    origin: &str,
+) -> Result<(), String> {
+    backend.store(GITHUB_APP_ENTRY, material).map_err(|error| {
+        let error = error.to_string();
+        audit_denied(GITHUB_APP_ENTRY, &root.join(CUSTODY_SUBDIR), &error);
+        format!("custody store {GITHUB_APP_ENTRY}: {error}")
+    })?;
+    credential_audit::record_with_origin(
+        credential_audit::EVENT_KEY_STORED,
+        GITHUB_APP_ENTRY,
+        &root.join(CUSTODY_SUBDIR).display().to_string(),
+        actor,
+        origin,
+        "GitHub App credentials sealed into custody".to_string(),
+    );
+    Ok(())
+}
+
+/// Remove the GitHub App credentials. Idempotent: removing an
+/// unconfigured integration is `Ok` (deletion is a desired end state).
+/// On a platform without a custody backend a leftover blob (a home
+/// copied from another machine) is inert ciphertext and is removed as a
+/// plain file.
+pub fn remove_github_app(actor: &str, origin: &str) -> Result<(), String> {
+    let root = provider_estate_root().ok_or("cannot determine config directory")?;
+    let backend = match platform_backend(&root) {
+        Some(Ok(backend)) => Some(backend),
+        Some(Err(error)) => {
+            audit_denied(GITHUB_APP_ENTRY, &root.join(CUSTODY_SUBDIR), &error);
+            return Err(error);
+        }
+        None => None,
+    };
+    remove_github_app_with(&root, backend.as_deref(), actor, origin)
+}
+
+pub(crate) fn remove_github_app_with(
+    root: &Path,
+    backend: Option<&dyn CustodyBackend>,
+    actor: &str,
+    origin: &str,
+) -> Result<(), String> {
+    let was_present = github_app_in_custody_at(root);
+    match backend {
+        Some(backend) => backend.delete(GITHUB_APP_ENTRY).map_err(|error| {
+            let error = error.to_string();
+            audit_denied(GITHUB_APP_ENTRY, &root.join(CUSTODY_SUBDIR), &error);
+            format!("custody delete {GITHUB_APP_ENTRY}: {error}")
+        })?,
+        None => {
+            if let Some(blob) = github_app_blob_path(root) {
+                match std::fs::remove_file(&blob) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(format!("remove {}: {error}", blob.display())),
+                }
+            }
+        }
+    }
+    if was_present {
+        credential_audit::record_with_origin(
+            credential_audit::EVENT_KEY_REMOVED,
+            GITHUB_APP_ENTRY,
+            &root.join(CUSTODY_SUBDIR).display().to_string(),
+            actor,
+            origin,
+            "GitHub App credentials removed from custody".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Whether this platform can seal custody entries at all — status
+/// labeling for born-in-custody estates (no keystore access). `false`
+/// means configure gestures fail by name until the platform's Track K
+/// backend lands; nothing degrades to a file lane.
+pub fn custody_backend_available() -> bool {
+    platform_backend_kind().is_some()
+}
+
 /// The platform backend kind, without constructing anything — pure
 /// availability for status labeling.
 fn platform_backend_kind() -> Option<BackendKind> {

@@ -5920,6 +5920,20 @@ mod tests {
             // CredentialsManage so no peer profile can rewrite the
             // daemon's provider keys.
             ("api_api_keys_save", Row, Some(Op::CredentialsManage)),
+            // GitHub App integration (Track PR): configure/remove seal
+            // credentials into custody — the provider-key gate; status
+            // is presence-only and rides Settings.
+            (
+                "api_github_integration_save",
+                Row,
+                Some(Op::CredentialsManage),
+            ),
+            ("api_github_integration_status", Row, Some(Op::Settings)),
+            (
+                "api_github_integration_remove",
+                Row,
+                Some(Op::CredentialsManage),
+            ),
             ("api_project_root", Row, Some(Op::Settings)),
             ("api_voice_session", Residue, Some(Op::RuntimeControl)),
             (
@@ -6190,6 +6204,9 @@ mod tests {
             "api_settings_save",
             "api_api_keys_save",
             "api_key_status",
+            "api_github_integration_save",
+            "api_github_integration_status",
+            "api_github_integration_remove",
             "api_claude_auth_start",
             "api_claude_auth_status",
             "api_claude_auth_code",

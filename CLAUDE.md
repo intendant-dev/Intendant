@@ -51,6 +51,7 @@ Read the relevant chapter before changing a subsystem:
 | Station (rendered control canvas): architecture + roadmap to immersive 3D/XR | `docs/src/station.md` |
 | MCP server + client (trust model) | `docs/src/mcp-server.md` |
 | MCP client, external CLIs, audio stack, system tools, control socket, CI | `docs/src/integrations.md` |
+| GitHub App PR integration (custody entry, setup ceremony, status) | `docs/src/github-pr-integration.md` |
 | Full `intendant.toml` + env reference | `docs/src/configuration.md` |
 | Session logging, replay, rehydration | `docs/src/session-logging.md` |
 | Windows backends and gotchas | `docs/src/windows-support.md` |
