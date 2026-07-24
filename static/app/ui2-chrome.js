@@ -732,7 +732,12 @@ function ui2PaletteEntries(q) {
   const filtered = entries.filter((item) => !query || item.label.toLowerCase().includes(query));
   const actions = ui2PaletteActionEntries(q)
     .filter((item) => item.matchless || !query || item.label.toLowerCase().includes(query));
-  return [...filtered, ...ui2PaletteSessionEntries(query), ...ui2PaletteMessageEntries(query), ...actions];
+  // Agenda section (lens destinations + item hits): provided by
+  // ui2-agenda-hood.js under this fragment's convention — cross-fragment
+  // state is read by name at event time with a typeof guard, so the
+  // palette never depends on the agenda fragments being present.
+  const agenda = typeof agendaPaletteEntries === 'function' ? agendaPaletteEntries(query) : [];
+  return [...filtered, ...ui2PaletteSessionEntries(query), ...agenda, ...ui2PaletteMessageEntries(query), ...actions];
 }
 
 const ui2Palette = { open: false, selected: 0, entries: [] };

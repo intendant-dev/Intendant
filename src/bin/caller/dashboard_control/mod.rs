@@ -6166,6 +6166,8 @@ mod tests {
             "api_agenda_op",
             "api_agenda_ref_drift",
             "api_agenda_reminder_policy",
+            "api_agenda_ops",
+            "api_agenda_occurrences",
             "api_memory_search",
             "api_memory_claim",
             "api_memory_propose",
