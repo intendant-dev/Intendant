@@ -566,6 +566,33 @@ html.ui-v2 .ag2-eff-line {
   overflow-wrap: anywhere;
 }
 
+/* ---- Automations lens rows (Track AU) ---- */
+
+html.ui-v2 .ag2-auto-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--subtext0);
+  min-width: 0;
+}
+html.ui-v2 .ag2-auto-dot { opacity: 0.55; }
+html.ui-v2 .ag2-auto-exec {
+  font-weight: 600;
+  color: var(--text);
+  background: rgba(var(--iris-rgb), 0.12);
+  border: 1px solid rgba(var(--iris-rgb), 0.28);
+  border-radius: 999px;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+html.ui-v2 .ag2-auto-last.st-failed,
+html.ui-v2 .ag2-auto-last.st-unknown,
+html.ui-v2 .ag2-auto-streak { color: var(--rose); font-weight: 600; }
+html.ui-v2 .ag2-auto-last.st-completed { color: var(--green); }
+html.ui-v2 .ag2-auto-run { cursor: pointer; text-decoration: underline; }
+
 /* ---- Inline question answering ---- */
 
 html.ui-v2 .ag2-qa {
@@ -1097,16 +1124,20 @@ html.ui-v2 .agenda-card-add input:focus {
    pointers / narrow viewports, anchored popover-card on desktop — the
    #vitals-explainer house mechanics, in the agenda's token vocabulary.
    Nothing here depends on hover. */
-#agenda-start-sheet[hidden] { display: none; }
-#agenda-start-sheet .ags-backdrop { display: none; }
-#agenda-start-sheet.sheet .ags-backdrop {
+#agenda-start-sheet[hidden],
+#agenda-automation-sheet[hidden] { display: none; }
+#agenda-start-sheet .ags-backdrop,
+#agenda-automation-sheet .ags-backdrop { display: none; }
+#agenda-start-sheet.sheet .ags-backdrop,
+#agenda-automation-sheet.sheet .ags-backdrop {
   display: block;
   position: fixed;
   inset: 0;
   z-index: 940;
   background: rgba(0, 0, 0, 0.45);
 }
-#agenda-start-sheet .ags-panel {
+#agenda-start-sheet .ags-panel,
+#agenda-automation-sheet .ags-panel {
   position: fixed;
   z-index: 941;
   display: flex;
@@ -1124,7 +1155,8 @@ html.ui-v2 .agenda-card-add input:focus {
   line-height: 1.5;
   color: var(--text-2);
 }
-#agenda-start-sheet.sheet .ags-panel {
+#agenda-start-sheet.sheet .ags-panel,
+#agenda-automation-sheet.sheet .ags-panel {
   left: 0;
   right: 0;
   bottom: 0;
@@ -1291,3 +1323,22 @@ html.ui-v2 .agenda-card-add input:focus {
   font-weight: 650;
 }
 .ags-btn.ags-start:hover { background: var(--iris-2); border-color: var(--iris-2); }
+
+/* ---- Automate sheet (Track AU create-from-template) ---- */
+
+html.ui-v2 .agsx-panel { max-width: 560px; }
+html.ui-v2 .agsx-templates { margin: 4px 0 8px; }
+html.ui-v2 .agsx-preview {
+  max-height: 220px;
+  overflow: auto;
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--mantle);
+  border: 1px solid var(--surface0);
+  border-radius: 9px;
+  padding: 9px 11px;
+  margin: 2px 0 8px;
+  color: var(--subtext1);
+}

@@ -400,6 +400,29 @@ echoed exactly as a pane-created session's (the persisted launch overlay,
 the vitals Model chip's `model · effort`), so scheduled spawns are
 config-indistinguishable from composer spawns.
 
+**The standing lane expresses the executor too** (Track AU):
+`propose_effect` accepts the same `agent_config` block, and
+`ctl agenda schedule` takes the same launch flags as `start`
+(`--agent/--claude-model/--claude-effort/--codex-model/
+--codex-reasoning-effort/--kimi-model/--kimi-thinking`), so a standing
+mandate can run on a supervised external backend — "triage on supervised
+Claude, Fable 5, max effort" is one schedule invocation. Because the
+block is digest-bound, the approval covers **who** runs the goal as much
+as what and when: swapping the executor revises the manifest and voids
+the standing approval for re-review, and a build that predates the field
+derives a different digest and refuses to fire (the same fail-closed
+degradation recurrence has). Executor pins are validated at propose
+intake by the launch path's own rules — an unknown backend, a
+cross-backend pin (`claude_effort` under `--agent codex`), or an
+off-catalog Codex effort is refused by name when proposed, never
+discovered by a 03:00 spawn; pins under an absent backend selection
+stay legal and resolve against the daemon default at fire time.
+External occurrences complete like native ones: a clean round journals
+`completed`, while an error-class terminal (the wrapper process dying,
+recovery exhausted — emitter-typed on the bus event, never inferred
+from reason prose) journals `failed`, counts the failure streak, and
+suspends the series at the threshold exactly as a native run would.
+
 **Interactive is the default** (`interactive`, additive on the manifest):
 the spawned session opens with the goal as its first user message and then
 waits for the owner, exactly like a session started from the composer
@@ -529,7 +552,9 @@ The walkthrough: park the item once **with the mandate as its body** (the
 same text as the goal template's mandate) — start-now mints its goal from
 title + body, so both firing lanes carry identical marching orders; then
 `schedule` the first pass as a **standing weekly manifest**
-(`--at "next sunday 18:00" --every 7d --suspend-after 3`), review the
+(`--at '2026-08-02 18:00' --every 7d --suspend-after 3` — `--at` takes
+`+45m/+2h/+3d/+1w`, epoch ms, RFC3339, `YYYY-MM-DD`, or
+`'YYYY-MM-DD HH:MM'`), review the
 printed manifest, and `approve` its digest once (or click Approve on the
 card): one approval covers the weekly series until revoked — the ceremony
 matches the decision, and any edit to the manifest still voids it. (The
@@ -568,8 +593,9 @@ separate mandate, and the frontier is both the default and the ceiling):
    all happen where they always did.
 
 Template goal (paste into `ctl agenda schedule <id> --goal … --at
-"next monday 09:00" --every 7d --suspend-after 3`, and into the item body
-so Run now carries identical marching orders):
+'2026-07-27 09:00' --every 7d --suspend-after 3` — the date grammar is
+the same `+3d`/RFC3339/`'YYYY-MM-DD HH:MM'` family `--due` takes — and
+into the item body so Run now carries identical marching orders):
 
 ```text
 Agenda triage pass. Your scope is the UN-TRIAGED FRONTIER and only it:
@@ -639,6 +665,17 @@ curation — blocking questions, pending approvals, suspended standing
 effects, triage-recommended items (in summary order), then recency — a
 pure reorder of the flat list with the same actions and the same rail;
 nothing new to clear, nowhere new to look.
+
+The **Automations** lens (Track AU) answers "what automations do I have,
+are they healthy, when did they last run?" in one place: every item
+carrying a session-manifest effect, grouped needs-approval → suspended →
+running → armed → ended, each row showing the executor
+(backend · model · effort, or "native default"), cadence, last occurrence
+(state + write-back, with a jump to the run's session), the planner's
+served next instant, and the failure streak on suspended rows. It is a
+**view over the agenda snapshot the tab already holds** — no store, no
+new ops or routes — and its buttons are the existing acts: Approve,
+Run now (`request_occurrence`), Revoke, and re-approve-to-re-arm.
 
 ### Surfaces and permissions
 

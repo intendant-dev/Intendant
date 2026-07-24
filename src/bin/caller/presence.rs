@@ -1516,6 +1516,7 @@ mod tests {
             session_id: None,
             reason: "done".to_string(),
             summary: None,
+            outcome: crate::event::TaskOutcome::Completed,
         };
         assert!(filter_event(&event, &mut last_phase).is_some());
 
@@ -1741,6 +1742,7 @@ mod tests {
                 session_id: None,
                 reason: "done_signal".to_string(),
                 summary: None,
+                outcome: crate::event::TaskOutcome::Completed,
             },
             &state,
         );

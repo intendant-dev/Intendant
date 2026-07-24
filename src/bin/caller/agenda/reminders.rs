@@ -330,6 +330,11 @@ pub(crate) struct OccurrenceProgress {
     /// Session id from a `started` record, while no terminal followed.
     pub(crate) started: Option<String>,
     pub(crate) terminal: Option<OccurrenceState>,
+    /// The owning item, retained from the journal rows so boot recovery
+    /// can write a fail-closed outcome back to the item even for
+    /// occurrences that never got past `prepared` (a dispatch lost with
+    /// the process — no `started` row, no `last_run` lineage to match).
+    pub(crate) item_id: Option<String>,
 }
 
 /// The append-only delivery ledger. `prepare` records are fsync'd — the
@@ -392,6 +397,20 @@ impl OccurrenceJournal {
             .iter()
             .filter(|(_, progress)| progress.started.is_some() && progress.terminal.is_none())
             .map(|(id, progress)| (id.clone(), progress.started.clone()))
+            .collect()
+    }
+
+    /// Occurrences a previous process dispatched but never got a receipt
+    /// for: `prepared`, no `started`, no terminal — the lost-dispatch
+    /// shape (the StartTask died with the process). Paired with the
+    /// owning item id retained from the journal rows.
+    pub(crate) fn prepared_unresolved(&self) -> Vec<(String, Option<String>)> {
+        self.state
+            .iter()
+            .filter(|(_, progress)| {
+                progress.prepared && progress.started.is_none() && progress.terminal.is_none()
+            })
+            .map(|(id, progress)| (id.clone(), progress.item_id.clone()))
             .collect()
     }
 
@@ -565,6 +584,9 @@ pub(crate) struct AgendaOccurrencesPage {
 }
 
 fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
+    if !record.item_id.is_empty() && entry.item_id.is_none() {
+        entry.item_id = Some(record.item_id.clone());
+    }
     match record.state {
         OccurrenceState::Prepared => entry.prepared = true,
         OccurrenceState::Started => {
