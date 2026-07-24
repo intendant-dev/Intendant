@@ -45,7 +45,8 @@ the scan (default 500, capped at 2000). The preserve-don't-destroy rule
 extends to this read: a line the serving build cannot fold is returned
 verbatim with `known: false`, and a line that is not JSON at all is returned
 string-escaped with `unparseable: true` — the endpoint never hides history it
-cannot parse.
+cannot parse. From the shell, `intendant ctl agenda ops [ID_PREFIX]` serves
+the same page over the loopback `/api` read lane (local daemon only).
 
 The item log writes and flushes one complete JSON line per operation, but does
 not `fsync` each item operation. It survives ordinary process and daemon
@@ -62,6 +63,8 @@ journal silence. The journal is append-only — nothing compacts or rewrites
 it — so the same `since` line cursor, `item_id` filter, and `limit` paging
 apply, with the same honesty rules: records a newer build wrote are served
 verbatim with `known: false`, non-JSON lines as `unparseable: true`.
+`intendant ctl agenda occurrences [ID_PREFIX]` is the shell view of the same
+page (loopback `/api` read lane, local daemon only).
 
 ### Items and transitions
 

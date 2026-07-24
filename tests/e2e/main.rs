@@ -569,6 +569,54 @@ async fn loopback_token_closes_tokenless_drive_by_on_no_tls_daemons() {
         text_of(&listed)
     );
 
+    // The ctl read verbs ride the loopback /api lane with the same
+    // zero-friction token: the raw op-log page serves the add op just
+    // written, `--json` verbatim.
+    let ops = ctl(&daemon, &["agenda", "ops", "--json"]).await;
+    assert!(ops.status.success(), "{}", text_of(&ops));
+    let ops_stdout = String::from_utf8_lossy(&ops.stdout);
+    let ops_page: serde_json::Value = serde_json::from_str(ops_stdout.trim()).unwrap_or_else(|e| {
+        panic!("agenda ops --json must print the endpoint body: {e}\n{ops_stdout}")
+    });
+    assert!(
+        ops_page["ops"].as_array().is_some_and(|entries| entries
+            .iter()
+            .any(|entry| entry["op"]["op"]["type"] == "add"
+                && entry["op"]["op"]["title"] == "token accepted")),
+        "the op-log page must serve the add op: {ops_page}"
+    );
+    assert!(
+        ops_page["log_len"].as_u64().is_some_and(|len| len >= 1),
+        "{ops_page}"
+    );
+    // The human rendering resolves too (same lane, formatted rows).
+    let ops_human = ctl(&daemon, &["agenda", "ops"]).await;
+    assert!(ops_human.status.success(), "{}", text_of(&ops_human));
+    assert!(
+        String::from_utf8_lossy(&ops_human.stdout).contains("add"),
+        "{}",
+        text_of(&ops_human)
+    );
+    // The occurrence journal serves through the same lane (empty on a
+    // fresh daemon — the page shape is the assertion).
+    let occurrences = ctl(&daemon, &["agenda", "occurrences", "--json"]).await;
+    assert!(occurrences.status.success(), "{}", text_of(&occurrences));
+    let occurrences_stdout = String::from_utf8_lossy(&occurrences.stdout);
+    let occurrences_page: serde_json::Value = serde_json::from_str(occurrences_stdout.trim())
+        .unwrap_or_else(|e| {
+            panic!(
+                "agenda occurrences --json must print the endpoint body: {e}\n{occurrences_stdout}"
+            )
+        });
+    assert!(
+        occurrences_page["occurrences"].is_array(),
+        "{occurrences_page}"
+    );
+    assert!(
+        occurrences_page["next_since"].is_u64(),
+        "{occurrences_page}"
+    );
+
     // Raw HTTP with the discovered token reaches the same surface that
     // refused above.
     let authed = daemon.authed_client();
