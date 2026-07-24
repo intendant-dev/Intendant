@@ -657,6 +657,24 @@ function focusSettingsApiKeys() {
 }
 window.focusSettingsApiKeys = focusSettingsApiKeys;
 
+// Deep link to the Vault tab's "Agent accounts — this daemon" section —
+// the unfueled notices' other remediation ("Sign in an agent"): signing a
+// coding-agent CLI into its subscription account is a first-class
+// alternative to adding a provider API key. Bridged onto window like
+// focusSettingsApiKeys, for inline handlers and the validate harness.
+function focusVaultAgentSignin() {
+  routeTo('vault');
+  requestAnimationFrame(() => {
+    // Scroll to the section head so its title stays visible (the head is
+    // the sign-in mount's previous sibling after the ui-v2 adoption).
+    const section = document.getElementById('agent-signin-section');
+    const head = section?.previousElementSibling;
+    const target = head?.classList?.contains('acc-section-head') ? head : section;
+    if (target?.scrollIntoView) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+}
+window.focusVaultAgentSignin = focusVaultAgentSignin;
+
 // Apply the remembered sub-tab on initial render, before anything
 // else toggles the default.
 function applyInitialSettingsSubtab() {

@@ -49,10 +49,13 @@ What happens next is the whole story in four steps:
    Browser identity-key records are not an active login mechanism in this
    alpha. The hosted Connect tab remains discovery-only; there is no opt-in
    that turns it into a control client.
-4. **Fuel and work.** Open the trusted dashboard: it greets you with *"This daemon
-   has no fuel yet"* and a **Fuel from your vault** button. Grant a time-boxed
+4. **Fuel and work.** Open the trusted dashboard: until a credential lands, the
+   Activity greeting offers **Add API keys** and **Sign in an agent** buttons —
+   and when external coding agents are already signed in, it leads with a
+   *"…ready to work"* headline instead of a blocker. Grant a time-boxed
    API-key lease (or relay provider calls through your browser), configure a
-   local key, or run `intendant auth chatgpt login` for Intendant Native.
+   local key, sign an external agent into its subscription from the Vault tab,
+   or run `intendant auth chatgpt login` for Intendant Native.
    API-key and native ChatGPT leases are memory-only, but this is not a blanket
    disk guarantee: `.env` and the optional private native ChatGPT login store
    are durable, while a full-credential OAuth lease for an external CLI

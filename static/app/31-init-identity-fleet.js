@@ -454,9 +454,10 @@ const LOG_EMPTY_DEFAULT_HINT = 'Send a task below to start the agent, or pick a 
 
 /* External-agent availability (Codex / Claude Code / Kimi Code / Pi): which backends this
    daemon can actually spawn. External agents run on their own accounts,
-   so the fueling nudge must not read as "nothing works" while one is
-   present — and the new-session picker greys out backends whose CLI is
-   missing so a doomed spawn is visible before Start. */
+   so while one is signed in or leased the fueling nudge leads with a
+   "ready to work" headline instead of a blocker — and the new-session
+   picker greys out backends whose CLI is missing so a doomed spawn is
+   visible before Start. */
 let externalAgentAvailability = null; // null = not yet known
 let externalAgentAvailabilityFetch = null;
 function refreshExternalAgentAvailability() {
@@ -478,6 +479,13 @@ function installedExternalAgents() {
   return Array.isArray(externalAgentAvailability)
     ? externalAgentAvailability.filter(agent => agent && agent.installed)
     : [];
+}
+function readyExternalAgents() {
+  // "Ready" = usable with no further credential step: fueled by a
+  // subscription lease, or signed in on the daemon with its own account.
+  return installedExternalAgents().filter(
+    agent => agent.leased || agent.local_login === true
+  );
 }
 function applyExternalAgentAvailabilityToNewSessionPicker() {
   const select = document.getElementById('new-session-agent');
@@ -542,61 +550,129 @@ function applyUnfueledEmptyState(unfueled) {
   const title = empty?.querySelector('.ui-empty-title');
   const hint = empty?.querySelector('.ui-empty-hint');
   if (!empty || !title || !hint) return;
-  const action = document.getElementById('log-empty-fuel');
-  const externalNote = document.getElementById('log-empty-external-agents');
   if (!unfueled) {
     if (empty.dataset.unfueled) {
       delete empty.dataset.unfueled;
       title.textContent = LOG_EMPTY_DEFAULT_TITLE;
       hint.textContent = LOG_EMPTY_DEFAULT_HINT;
-      if (action) action.remove();
-      if (externalNote) externalNote.remove();
+      document.getElementById('log-empty-actions')?.remove();
+      document.getElementById('log-empty-external-agents')?.remove();
     }
     return;
   }
   empty.dataset.unfueled = 'true';
-  // Scope the claim to the built-in agent: an unfueled daemon still runs
-  // external agents (their accounts), terminal, files, and display.
-  title.textContent = 'The built-in agent has no fuel yet';
+  const ready = readyExternalAgents();
+  const leadWithReady = !DASHBOARD_CONNECT_MODE && ready.length > 0;
   if (DASHBOARD_CONNECT_MODE) {
+    // Scope the claim to the built-in agent: an unfueled daemon still runs
+    // external agents (their accounts), terminal, files, and display.
+    title.textContent = 'The built-in agent has no fuel yet';
     hint.textContent = 'This daemon is claimed and connected, but holds no provider '
       + 'credential for the built-in agent. Grant a time-boxed lease from your vault '
       + 'and it can start working.';
-    if (!document.getElementById('log-empty-fuel')) {
-      const btn = document.createElement('button');
-      btn.id = 'log-empty-fuel';
-      btn.className = 'ui-empty-btn';
-      btn.textContent = 'Fuel from your vault';
-      btn.addEventListener('click', () => routeTo('access', 'advanced'));
-      hint.insertAdjacentElement('afterend', btn);
-    }
+  } else if (leadWithReady) {
+    // Signed-in / leased external agents mean this machine can work right
+    // now — lead with that, and demote the built-in agent's missing key to
+    // the explanatory line. The greeting must never read as a blocker
+    // while the daemon is usable.
+    const names = ready.map(agent => agent.label || agent.id);
+    const one = names.length === 1;
+    title.textContent = `${joinAgentNames(names)} ${one ? 'is' : 'are'} ready to work`;
+    hint.textContent = (one
+      ? 'It runs on its own account and needs no fuel — send it a task below. '
+      : 'They run on their own accounts and need no fuel — pick one as the target below and send a task. ')
+      + 'The built-in agent has no fuel yet: add a provider key in Settings → API Keys '
+      + '(applies immediately, no restart), or use a .env key on the daemon or a vault credential lease.';
   } else {
+    // Scope the claim to the built-in agent: an unfueled daemon still runs
+    // external agents (their accounts), terminal, files, and display.
+    title.textContent = 'The built-in agent has no fuel yet';
     hint.textContent = 'The daemon found no provider API key for the built-in agent. '
       + 'Add a provider key in Settings → API Keys — it applies immediately, '
       + 'no restart. (A .env key on the daemon or a vault credential lease works too.)';
-    if (!document.getElementById('log-empty-fuel')) {
-      const btn = document.createElement('button');
-      btn.id = 'log-empty-fuel';
-      btn.className = 'ui-empty-btn';
-      btn.textContent = 'Add API keys';
-      btn.addEventListener('click', () => {
-        if (typeof focusSettingsApiKeys === 'function') focusSettingsApiKeys();
-        else routeTo('settings');
-      });
-      hint.insertAdjacentElement('afterend', btn);
-    }
   }
-  applyUnfueledExternalAgentNote(empty);
+  ensureUnfueledActions(hint);
+  applyUnfueledExternalAgentNote(empty, { omitReady: leadWithReady });
 }
 
-/* The nudge's counterweight: name the external agents that still work,
-   by actual auth posture — a leased or locally-signed-in backend needs
-   no fuel, a signed-out one needs its own login or an oauth lease from
-   the vault. Only rendered while the unfueled state is showing. */
-function applyUnfueledExternalAgentNote(empty) {
+/* The unfueled CTAs, as peers: add a provider API key, or sign an external
+   agent into its subscription account (the Vault tab's "Agent accounts"
+   section). Per page load the row's content is constant — connect mode
+   never changes mid-load, and both direct variants share the same two
+   buttons — so it is built once and removed when fuel lands. */
+function ensureUnfueledActions(hint) {
+  if (document.getElementById('log-empty-actions')) return;
+  const row = document.createElement('div');
+  row.id = 'log-empty-actions';
+  row.className = 'ui-empty-actions';
+  const makeButton = (id, label, onClick) => {
+    const btn = document.createElement('button');
+    btn.id = id;
+    btn.className = 'ui-empty-btn';
+    btn.textContent = label;
+    btn.addEventListener('click', onClick);
+    return btn;
+  };
+  if (DASHBOARD_CONNECT_MODE) {
+    row.appendChild(makeButton('log-empty-fuel', 'Fuel from your vault',
+      () => routeTo('access', 'advanced')));
+  } else {
+    row.appendChild(makeButton('log-empty-fuel', 'Add API keys', () => {
+      if (typeof focusSettingsApiKeys === 'function') focusSettingsApiKeys();
+      else routeTo('settings');
+    }));
+    row.appendChild(makeButton('log-empty-signin', 'Sign in an agent', () => {
+      if (typeof focusVaultAgentSignin === 'function') focusVaultAgentSignin();
+      else routeTo('vault');
+    }));
+  }
+  hint.insertAdjacentElement('afterend', row);
+}
+
+/* "A and B" / "A, B, and C" over agent display names. */
+function joinAgentNames(names) {
+  if (names.length <= 2) return names.join(' and ');
+  return `${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]}`;
+}
+
+/* The nudge's counterweight: name the external agents that still work, by
+   actual auth posture — one sentence per posture class, never one per
+   agent. A leased or locally-signed-in backend needs no fuel; a signed-out
+   one needs its own login or an oauth lease from the vault. `omitReady`
+   drops the two no-fuel classes when the headline already leads with those
+   agents. Only rendered while the unfueled state is showing. */
+function applyUnfueledExternalAgentNote(empty, { omitReady = false } = {}) {
   const installed = installedExternalAgents();
+  const names = agents => joinAgentNames(agents.map(agent => agent.label || agent.id));
+  const leased = installed.filter(agent => agent.leased);
+  const signedIn = installed.filter(agent => !agent.leased && agent.local_login === true);
+  const signedOut = installed.filter(agent => !agent.leased && agent.local_login === false);
+  const ownLogin = installed.filter(
+    agent => !agent.leased && agent.local_login !== true && agent.local_login !== false
+  );
+  const parts = [];
+  if (!omitReady && leased.length) {
+    parts.push(leased.length === 1
+      ? `${names(leased)} is fueled with a subscription lease and ready`
+      : `${names(leased)} are fueled with subscription leases and ready`);
+  }
+  if (!omitReady && signedIn.length) {
+    parts.push(signedIn.length === 1
+      ? `${names(signedIn)} is signed in on the daemon and needs no fuel`
+      : `${names(signedIn)} are signed in on the daemon and need no fuel`);
+  }
+  if (signedOut.length) {
+    parts.push(signedOut.length === 1
+      ? `${names(signedOut)} is installed but signed out — sign it in on the daemon, or lease its subscription from your vault`
+      : `${names(signedOut)} are installed but signed out — sign them in on the daemon, or lease their subscriptions from your vault`);
+  }
+  if (ownLogin.length) {
+    parts.push(ownLogin.length === 1
+      ? `${names(ownLogin)} is installed and runs on its own login — or a subscription lease from your vault`
+      : `${names(ownLogin)} are installed and run on their own logins — or a subscription lease from your vault`);
+  }
   let note = document.getElementById('log-empty-external-agents');
-  if (!installed.length) {
+  if (!parts.length) {
     if (note) note.remove();
     return;
   }
@@ -606,19 +682,6 @@ function applyUnfueledExternalAgentNote(empty) {
     note.className = 'ui-empty-hint';
     empty.appendChild(note);
   }
-  const parts = installed.map(agent => {
-    const name = agent.label || agent.id;
-    if (agent.leased) {
-      return `${name} is fueled with a subscription lease and ready`;
-    }
-    if (agent.local_login === true) {
-      return `${name} is signed in on the daemon and needs no fuel`;
-    }
-    if (agent.local_login === false) {
-      return `${name} is installed but signed out — sign it in on the daemon, or lease its subscription from your vault`;
-    }
-    return `${name} is installed and runs on its own login — or a subscription lease from your vault`;
-  });
   note.textContent = parts.join('. ') + '.';
 }
 // Probe once the transport can answer; in connect mode the data channel
