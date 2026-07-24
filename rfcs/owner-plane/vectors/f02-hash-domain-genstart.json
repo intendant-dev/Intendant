@@ -1,0 +1,17 @@
+{
+  "case_kind": "hash-domain",
+  "expected": {
+    "bytes": "b22887899babac74f189458472f0144fa8419616f2c37f8b3614afbd82f11f0d"
+  },
+  "family": 2,
+  "inputs": {
+    "preimage": "111111111111111111111111111111110000000000000002",
+    "tag": "genstart"
+  },
+  "name": "hash-domain-genstart",
+  "source": "2.2",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}

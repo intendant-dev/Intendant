@@ -1,0 +1,21 @@
+{
+  "case_kind": "crypto-negative",
+  "expected": {
+    "disposition": "storage-quarantine",
+    "outcome": "wrapper-mismatch"
+  },
+  "family": 5,
+  "inputs": {
+    "core": "a4617601626374583a9400f7e6bad683f49bdfb9249a4be67e3a2f865fbb598ca40dd07681cb693e7fd0584502d034114ad94528eba5992dbcb8150ecd45b89675d5b66461656164676132353667636d656e6f6e63654c737373737373737373737373",
+    "kek": "7171717171717171717171717171717171717171717171717171717171717171",
+    "kek_epoch": 1,
+    "wrap": "a4617601696974656d5f6164647258200a8e6bd03310b2b0287a85b35fa1f9ea22dbdc5d58beca9ef0b574eefca1bc346b777261707065645f64656b58300c8c19c8761dbec46241a005520d343cf8550d1b3a9b7fc8218d369f62ce1464896822ec230421ed2e9bb17b78ad178a6e6b65795f777261705f65706f636801"
+  },
+  "name": "wrapper-address-mismatch",
+  "source": "5.3",
+  "surfaces": [
+    "core",
+    "native-crypto",
+    "browser"
+  ]
+}

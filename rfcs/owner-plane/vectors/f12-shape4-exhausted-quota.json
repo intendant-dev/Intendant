@@ -1,0 +1,74 @@
+{
+  "case_kind": "edge-admission",
+  "expected": {
+    "disposition": "edge-deny",
+    "outcome": "quota"
+  },
+  "family": 12,
+  "inputs": {
+    "context": {
+      "devices": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "quota": {
+        "4": {
+          "memory.search": 0
+        }
+      },
+      "revoked": [
+        "cccccccccccccccccccccccccccccccc"
+      ],
+      "sessions": [
+        {
+          "device": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "id": "s-live",
+          "live": true
+        },
+        {
+          "device": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "id": "s-ended",
+          "live": false
+        }
+      ],
+      "tokens": [
+        {
+          "revoked": false,
+          "scope": [
+            "memory.read",
+            "memory.search"
+          ],
+          "session": "s-live",
+          "token": "t-good"
+        },
+        {
+          "revoked": true,
+          "scope": [
+            "memory.read"
+          ],
+          "session": "s-live",
+          "token": "t-revoked"
+        },
+        {
+          "revoked": false,
+          "scope": [
+            "memory.read"
+          ],
+          "session": "s-ended",
+          "token": "t-orphan"
+        }
+      ]
+    },
+    "request": {
+      "op": "memory.search",
+      "session": "s-live",
+      "shape": 4,
+      "token": "t-good"
+    }
+  },
+  "name": "shape4-exhausted-quota",
+  "source": "10.1",
+  "surfaces": [
+    "core"
+  ]
+}

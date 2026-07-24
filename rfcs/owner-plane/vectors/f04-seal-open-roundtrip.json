@@ -1,0 +1,24 @@
+{
+  "case_kind": "hpke-seal-open",
+  "expected": {
+    "result": {
+      "ct": "56b630a24db72813252eacff2819cb558d583547f60475f879a8dcd4c63ea981f8eccfab273fe5cc5323a1e55a60fc80",
+      "enc": "048d9b778586fbf2f9420cca2b0b9a29ff0d8ec567a37af1b3a8c1365a2bc71becae476ecfa7998f78ce1efe2f0badfb804a02975125752a4af107a1d4587d838a",
+      "opened": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+    }
+  },
+  "family": 4,
+  "inputs": {
+    "aad": "636f727075732f616164",
+    "info": "636f727075732f696e666f",
+    "plaintext": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "recipient_pk": "047d4df40f71baad3733f95cebe8d097d6977558e647c4f64e69a0a4bfdf38cc2f583cbd8b484a3db536967f2021c6cadca9b9d99d7a9f40f24f22e8983a748a11",
+    "recipient_sk": "c4ac1d615a42b8455586ebbfae9e6bb38592ae72ebdbd1fb34a906b8ac4327f6"
+  },
+  "name": "seal-open-roundtrip",
+  "source": "2.1",
+  "surfaces": [
+    "native-crypto",
+    "browser"
+  ]
+}

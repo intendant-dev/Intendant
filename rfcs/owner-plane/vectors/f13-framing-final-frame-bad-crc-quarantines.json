@@ -1,0 +1,25 @@
+{
+  "case_kind": "corruption-negative",
+  "expected": {
+    "disposition": "storage-quarantine",
+    "outcome": "log-corrupt"
+  },
+  "family": 13,
+  "inputs": {
+    "mutations": [
+      {
+        "bytes": "9f",
+        "offset": 309
+      }
+    ],
+    "stream": "49504c4f47320200aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb49504c529700000068ffffff15a56176016865726173655f6f7058202222222222222222222222222222222222222222222222222222222222222222696974656d5f6164647258201111111111111111111111111111111111111111111111111111111111111111697461726765745f6f70582033333333333333333333333333333333333333333333333333333333333333336d726574697265645f65706f6368010151438649504c522e000000d1ffffff17a1677468726f756768a36367656e016373657107676c696e65616765504444444444444444444444444444444453727e8a49504c5209000000f6ffffff1aa16565706f636801471ee29e"
+  },
+  "name": "framing-final-frame-bad-crc-quarantines",
+  "source": "6.2",
+  "surfaces": [
+    "browser",
+    "storage-macos",
+    "storage-linux",
+    "storage-windows"
+  ]
+}

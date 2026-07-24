@@ -1,0 +1,20 @@
+{
+  "case_kind": "verify-fixed",
+  "expected": {
+    "result": {
+      "valid": false
+    }
+  },
+  "family": 3,
+  "inputs": {
+    "msg": "74686520706c616e652061636365707473206f6e6c792077686174206576657279207265706c6963612072652d64657269766573",
+    "pk": "042c2bad3ccb8d89257282c1b82b0d4016f19c3f5d32c1f8907c943df795472e312dc827c92b69d030230da8a212793e13209e48d5e6de1d218fd9cd2bae83dfed",
+    "sig": "fd79ac682f1d8969e298e571449c82ab07197cbc5ef611f95c11d32f4884ea8b83ebbc56243821acd66f271b3e6ddadd41a1c19fe4a53abfd2dd3487f661a45a"
+  },
+  "name": "p256-verify-high-s-rejected",
+  "source": "2.3",
+  "surfaces": [
+    "native-crypto",
+    "browser"
+  ]
+}

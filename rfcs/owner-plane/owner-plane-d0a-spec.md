@@ -1,0 +1,4956 @@
+# D0-A: Core + Memory — Normative Specification
+
+*v0.5.24, 2026-07-16 — **the Gate-A STAMPED cut** (§16: stamped by
+the owner 2026-07-16 on the D-206 zero-blocker closure review at pin
+`44b56f96`). Supersedes v0.1–v0.5.23
+**entirely** — self-contained: an independent implementer needs only
+this text plus the cited public standards (RFC 8949, RFC 9180,
+RFC 8439, BIP-39, FIPS 186-5, RFC 8032). Archived drafts:
+`~/agenda-rfc-archive/*d0a-v0.*-as-reviewed.md` (v0.1 through
+v0.5.18; v0.5.19 through v0.5.23 in the program's `archive/`).
+Folds the successive reviews (v0.4 through v0.5.18,
+`~/owner-plane-d0a-spec-v0.5.18-review.md` latest — the terminal
+prose-first round: from here, behavioral findings enter only with a
+failing executable trace) with the
+owner's rulings of 2026-07-11/12 and the ratification decisions
+D-201..D-206 (§15 — an affirmative decision record; nothing
+ratifies by silence; D-204, ratified 2026-07-16 on the Gate-A
+criterion-12 review's executable trace, narrows D-202's convergence
+carrier to shared evidence-arrival structure; D-205, the ff23f1cd
+review's F1 trace under the owner's delegated adjudication of that
+round, completes it with the self-evidence exception to fork
+registration — kept by explicit owner ratification 2026-07-16;
+D-206, the owner's Gate-A closure rule, with the freeze-time D4/D9
+prose and the D-151 row correction executed under the same
+ratification). Gate document under the frozen umbrella RFC
+(`~/agenda-owner-plane-rfc.md`, v3.1/D0).*
+
+> **Gates.** **Gate A (specification freeze):** this document passes a
+> prose↔vector discrepancy audit and every §13 vector family is green
+> on its named surface. **Gate B (implementation readiness):**
+> production custody, encrypted storage crash matrix on
+> macOS/Linux/Windows + named browsers, strict fuzzed parser,
+> integration of reducer/IAM/receipt/projection/migration paths.
+> **Gate B is necessary, not sufficient, for durable P1 Memory
+> writes** — P1 additionally requires the umbrella's P0.5
+> orchestration-checkpoint replacement and the atomic tombed-Memory
+> cutover (RFC §15.2, Appendix A). MUST/NEVER are protocol
+> requirements; SHOULD is strong guidance.
+
+---
+
+## 0. Scope
+
+**This document freezes:** the encoding profile and hard caps; the
+algorithm suite, key encodings, and signature envelopes (receipts
+included); identifiers and reserved constants; every core object
+schema (CDDL, Appendix A — closed, no fixture-defined shapes); the
+**operation registry** (§7.1/§11.1 — every `(tenant, operation_type,
+operation_version)` with body, authority, lane, transition, charge,
+replay rule, and failure disposition); item crypto and the erase state
+machine; the local storage format and its recovery semantics; the
+control reducer incl. bootstrap, hosted ceiling, recovery resolution;
+writer lineages, generations, capability epochs; the signed time/lease
+authority and the solo-plane posture; service-edge IAM shapes and
+portable fold admission with a closed outcome→disposition map; the
+Memory tenant (admission, status fold, classification fold, evidence,
+audit, erase, export/import); vector schema and the surface matrix.
+
+**Later gates own:** segment containers, public manifests + leakage
+documentation, recipient packaging at rest, proof distribution, witness
+networks, multiwriter torture, the Connect plane-store contract (D0-B);
+Agenda reducers (D0-Agenda-Data, D0-Agenda-Effects). D0-A owns types
+consumed later (frontier, receipts); later gates own their transport.
+Replica/backup/distributed-GC guarantees are D0-B; D0-A vectors may use
+local checkpoint/copy simulations.
+
+---
+
+## 1. Encoding profile
+
+All signed or hashed objects use **RFC 8949 §4.2.1 Core Deterministic
+Encoding**, restricted:
+
+- **E1.** Integers shortest-form, unsigned unless stated; **no floats,
+  no bignums**; stated numeric ranges are enforced (uint fields are
+  ≤ 2^53−1 unless a narrower range is given — browser-safe).
+- **E2.** Definite lengths only.
+- **E3.** Map keys are UTF-8 text in `snake_case`, sorted by bytewise
+  lexicographic order of their canonical encodings. Signed objects use
+  text-keyed maps only; binary-keyed collections are sorted arrays of
+  records.
+- **E4.** No CBOR tags, no `null`, no `undefined`. Optional fields
+  (`?` in CDDL) are omitted when absent; **absence carries the exact
+  semantics stated at the field's definition — there are no implied
+  defaults**. Every security-relevant tunable is a required field where
+  it lives (`lineagedef.max_generations` on lineages; `budget` on
+  budgets-posture write grants).
+- **E5.** Hashes/keys/IDs are byte strings; enums are text from closed
+  vocabularies; timestamps are unsigned Unix milliseconds. Text length
+  caps count **UTF-8 bytes**, not code points.
+- **E6.** Every top-level signed/hashed object carries `v` (shape
+  version). Operation bodies are versioned by the envelope's
+  `operation_type` + `operation_version` and carry no `v` of their
+  own. Unknown versions of effectful objects fail closed
+  (`op-unknown`).
+- **E7 (sets and sort keys).** Every array documented as a *set* is
+  duplicate-free and sorted. The default sort key is the member's full
+  canonical encoding; **an object may declare an explicit sort key**
+  (Frontier declares `(lineage, gen)` — §4.6), and the declared key
+  wins. Validators reject unsorted or duplicate members. **Keyed sets
+  (D-68)**: where a set declares a *logical key*, duplicate-freedom
+  and sorting apply to the key, not the full member bytes — two
+  members sharing a key are non-canonical even when byte-distinct.
+  Declared logical keys: grants → `grant_id`; KEK wraps →
+  `(zone_id, epoch, recipient_device)`; ratify cutoffs
+  (`ratifycutoff`) → `(zone_id, lineage, gen)` (D-120);
+  authority closures (`frontierclose`, D-143) →
+  `(zone_id, lineage)` (its `heads` → `gen`); `receipt_cutoffs` →
+  `key_id`; `xferabort.missing` → `rec` (D-148); checkpoint
+  `proof_positions` → tagged issuer; checkpoint `covers`/`retired` →
+  `(lineage, gen)`; checkpoint `fences` → `lineage`;
+  requester `live_heads` → `zone_id`; `adopted_rotations` →
+  `(zone_id, rotation_op)` (D-117); `rotation_refs` → op hash;
+  `erase_manifest` → `item_addr`; export `sources`, erase-request
+  `targets`, `xferdone.completed`/`xferabort.missing` → op hash;
+  bundle `recs` → `op`; `survivorset.pairs` → `item_addr`;
+  `recipientset.pairs` → `device`; `cabandon.seals` → `gen`;
+  `time_witnesses` → value.
+- **E8 (hard caps — deterministic parsing).**
+
+  | Cap | Value |
+  |---|---|
+  | canonical control operation (triple) | ≤ 64 KiB |
+  | canonical tenant operation (triple) | ≤ 256 KiB |
+  | KEK wraps per operation | ≤ 128 (worst-width canonical `kekwrap` = 314 B → ≤ 39.3 KiB; memberships beyond 128 complete via current-epoch `c.wrap_add` before `RewrapComplete` — D-77/D-81) |
+  | `statement` text | ≤ 16 KiB |
+  | other text fields | ≤ 4 KiB |
+  | `causal_references` | ≤ 64 |
+  | `evidence` refs | ≤ 32 |
+  | export `sources` | ≤ 128 |
+  | `Txn` records (§6.1) | ≤ 16 |
+  | audit `result_ids` | ≤ 256 |
+  | erase-request `targets` | ≤ 128 |
+  | rotation `erase_manifest` (typed entries) | ≤ 128 (worst-width `erasemref` = 132 B → ≤ 16.5 KiB; joint worst case 128 wraps + 128 entries + header/signature ≈ 58 KiB < 64 KiB — encoder-exact figures pinned by family 1, D-85; the erase queue drains across successive rotations, §5.4) |
+  | revocation `rotation_refs` | ≤ 64 (continue via `c.revoke_zones`) |
+  | cutoff sets (revocation / epoch-advance closure / `c.cutoff` / renewal `history_cutoffs`) | ≤ 64 each (revocation continues via `c.revoke_zones`; renewal covers further zones via pre-established standalone `c.cutoff`s) |
+  | checkpoint `covers` page | ≤ 256 |
+  | checkpoint `fences` | ≤ 256 |
+  | checkpoint `retired` | ≤ 256 |
+  | checkpoint `proof_positions` | ≤ 64 |
+  | encoded `checkpointobj` (joint) | ≤ 48 KiB (D-96 — the member caps alone are not jointly constructible) |
+  | `ZonePolicy.time_witnesses` | ≤ 64 (matches `proof_positions` — D-96) |
+  | audit `scope.spaces` | ≤ 64 |
+  | recovery `tenant_cutoffs` | ≤ 256 (refinements — an omitted `(zone, lineage)` pair whose lineage was enrolled at or before `base` folds the implicit revivable `"none"` override; a later-enrolled lineage folds normally — D-132/D-138/D-151/D-167; no continuation needed) |
+  | recovery `adopted_renewals` | ≤ 64 (D-150/D-172 — the D-112 adoption pattern for certificate renewals, signing-only links included) |
+  | recovery `retired_keys` | ≤ 256 (D-150 — the portable freshness commitment for cut-branch keys) |
+  | `frontierclose.heads` / `zoneheads.heads` | ≤ 65 (D-152 — 64 open unknown gaps PLUS the current live tip: v0.5.12's 64 could not carry the maximum legal lineage) |
+  | `mimport.proof` | ≤ 7 (D-147/D-156 — 128 record leaves → depth 7; the header leaf is gone) |
+  | frontier heads | ≤ 4096 |
+  | open unknown-gap heads per lineage | ≤ 64 (D-103 — keeps checkpoint paging total; a 65th `w.gen(last_known = "unknown")` rejects) |
+  | recipients per (zone, accepted epoch) | ≤ 256 (D-110/D-125 — a purely control-derived cap enforced across EVERY wrap-bearing operation; admission never reads local Fence progress, so every replica counts the same set, and every possible Fence's `recipientset` stays constructible) |
+  | held zones per device | ≤ 128 (D-109 — a grant/wrap creating the 129th rejects; `held_zones` defined once in §4.3, D-116/D-125/D-133 — control-derived CURRENT membership, wildcard grants contribute nothing, a later epoch's exclusion frees the slot; keeps KEM renewal encodable) |
+  | `c.abandon_writer` seals | ≤ 64 |
+  | recovery `adopted_rotations` | ≤ 64 (D-117 — deeper forks orphan the excess: a stated residual) |
+  | nesting depth | ≤ 8 |
+  | log frame payload | ≤ 1 MiB |
+
+- **E9 (strict decoding).** A conforming implementation uses a strict
+  raw decoder enforcing E1–E8 during parse, or parses duplicate-aware
+  and proves `re-encode(parse(bytes)) == bytes`.
+- **E10 (outcomes).** Every parse/validation failure maps to one member
+  of the closed outcome enums (§10.4) **and** its disposition (§10.5).
+
+**Hash and signature domains.** 
+
+```
+msg(tag, x) = "intendant/" || tag || "/v1" || 0x00 || canonical(x)
+H_tag(x)    = SHA-256(msg(tag, x))
+```
+
+**Closed tag inventory** (hash/signature domains): `genesis`, `cert`,
+`grant`, `op`, `body`, `frontier`, `receipt`, `lease`, `drill`, `kek`,
+`item`, `policy`, `key`, `evrec`, `genstart`, `assertreq`,
+`reauth`, `cutoffreq`, `abandonreq`, `stmtid`, `recips`,
+`survivors`, `brec`, `bnode` (the bundle Merkle domains, D-147 —
+the flat `bundle` domain is retired with `H_bundle`; `bhdr` is
+retired by D-156: self-describing leaves carry the context, so no
+header leaf exists), `mat` (the role-neutral key-material domain,
+D-175: `mat_id = H_mat(SEC1 point bytes)`). Derivation
+domains:
+
+```
+gen_start(lineage, gen)   = H_genstart(lineage || gen_be64)      # §9.3
+assert_req(claim_req_id)  = H_assertreq(claim_req_id)[0..16]     # §11.1
+```
+
+The reserved-prefix rule (N1) applies to **minted** IDs only; derived
+request IDs (`assert_req`) are exempt — a derivation landing in the
+reserved range is legal and carries no reserved meaning.
+
+**Closed info/AAD string inventory** (KDF/AEAD contexts, §2/§5):
+`intendant/item/v1`, `intendant/dekwrap/v1`, `intendant/kek/v1`,
+`intendant/wrapkey/v1`, `intendant/recovery/v1`. No other context
+strings exist; adding one is a version event.
+
+---
+
+## 2. Cryptography
+
+### 2.1 Suite `suite-v1`
+
+| Role | Algorithm | ID |
+|---|---|---|
+| Hash | SHA-256 | — |
+| Signature (native/daemon/recovery) | Ed25519 (RFC 8032) | `ed25519` |
+| Signature (browser-held) | ECDSA P-256 / SHA-256, **low-S** | `p256` |
+| Recipient wrap | HPKE base mode (RFC 9180): DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-256-GCM | `hpke-p256-v1` |
+| Content AEAD | AES-256-GCM | `a256gcm` |
+
+### 2.2 Key and signature encodings (closed)
+
+| Object | Encoding | Length |
+|---|---|---|
+| Ed25519 public key | RFC 8032 | 32 B |
+| Ed25519 signature | RFC 8032 | 64 B |
+| P-256 public key | SEC1 uncompressed `0x04‖X‖Y` | 65 B |
+| P-256 signature | raw `r‖s`, big-endian, **s ≤ n/2** | 64 B |
+| HPKE `enc` | SEC1 uncompressed ephemeral | 65 B |
+| DEK / KEK | raw | 32 B |
+| AES-GCM nonce | raw | 12 B |
+| `key_id` | `H_key({alg, pk})` | 32 B |
+
+Malformed keys/signatures (wrong length, point not on curve, point at
+infinity, high-S) map to outcome `key-malformed` / `sig-invalid`.
+HPKE: P-256 inputs are validated on-curve and non-identity; a DH
+output at infinity fails (`key-malformed`) — RFC 9180 requirements,
+vector-pinned.
+
+- **S1 (low-S rationale).** Operation identity is the hash of exact
+  signed bytes; malleable S would let any relay mint byte-different
+  valid duplicates and frame honest writers for forking. Emitters
+  normalize; validators reject high-S.
+- **S2 (browser reality).** Browser-held keys are non-extractable
+  WebCrypto P-256 (sign) and P-256 ECDH (KEM, used via `deriveBits`
+  inside the HPKE schedule; all HPKE primitives are native WebCrypto;
+  the schedule is library code). Ed25519 *verification* in browsers
+  uses WebCrypto where present, pure-JS fallback otherwise
+  (verification is not custody). Ed25519 key *generation* occurs in
+  library code only at genesis/recovery ceremonies; the phrase, not
+  the key object, is the custody (§8).
+- **S3 (weakest wrap).** A zone remains classically exposed while any
+  recipient wrap is classical; every wrap carries its KEM algorithm ID.
+- **S4 (Rust).** Pure-Rust primitives only (`ring`/`ed25519-dalek`
+  class; RustCrypto `hpke`). No OpenSSL.
+
+### 2.3 Signature envelopes
+
+Everything signed uses one envelope shape:
+
+```
+Signed<T, tag> = { stmt: T, sig: bstr }      # sig over msg(tag, stmt)
+```
+
+Operations (§4.5) sign the header under tag `op`. **Receipts and
+leases are signed objects** (v0.2 shipped them unsigned — void):
+`Signed<ReceiptStmt, "receipt">`, `Signed<LeaseStmt, "lease">` (§4.7).
+Certificates and grants are signed by their enclosing control
+operations, not separately.
+
+**Reconstruction invariant (D-100).** Every input to a signature
+message is either **carried in the signed object's own wire shape**
+or **derivable from an immutable carried reference** (control-chain
+facts like `lineage_version` and `repoch` derive from control
+history; tenant-derived quantities never qualify). A validator must
+be able to reconstruct the exact message bytes from the operation
+plus control history alone — a signature over unreconstructable
+state is a schema defect, not a validation failure mode.
+
+### 2.4 Recovery derivation (BIP-39, exact)
+
+English wordlist; 24 words (256-bit entropy + 8-bit checksum);
+mnemonic and passphrase UTF-8 **NFKD-normalized**; passphrase = `""`.
+`seed = PBKDF2-HMAC-SHA512(mnemonic, "mnemonic", 2048, 64)`.
+`ed25519_seed = HKDF-Expand(HKDF-Extract(salt="intendant/recovery/v1",
+IKM=seed), info="ed25519-seed", L=32)`. Checksum-invalid mnemonics are
+rejected before derivation.
+
+### 2.5 Custody contract
+
+| Holder | Custody |
+|---|---|
+| **Administrative root (genesis/successor)** | **vault-style, domain-separated passkey sealing with mandatory recovery envelopes** (the umbrella §3.1 invariant). Abstract contract frozen here (D-46): the root seed is sealed as an envelope **set** — one or more passkey envelopes (PRF-derived KEK wrapping the seed) plus one recovery envelope (the §2.4 phrase-derived key) — with domain separation per envelope; unlock is a ceremony; rotation = `c.admin_succession`/`c.recovery_succession`; migration = re-sealing inside the enrollment ceremony. **Exact envelope byte formats are a Gate-B artifact** (§16); the degraded file fallback is **prohibited** for the root at both gates. |
+| hosted-browser / owner-browser device keys | non-extractable WebCrypto in IndexedDB (user-agent-managed; not claimed hardware-sealed) |
+| native-app device keys | OS keystore (Keychain / DPAPI / keyctl with persistent keyring) |
+| daemon device keys | passkey-sealed vault where configured, else OS keystore; file fallback is 0600/owner-only-ACL **and marked degraded in certificate evidence** |
+| recovery authority | paper/offline only; never persisted by software |
+
+**Durable plane keys and plane plaintext NEVER enter
+`intendant-runtime`.** Gate B validates the adapters (Windows ACLs vs
+POSIX modes, keyctl persistence, IndexedDB reality); Gate A freezes
+this contract.
+
+---
+
+## 3. Identifiers and reserved constants
+
+- **N1.** 16-byte IDs (ULIDs, random IDs). Real IDs MUST NOT have
+  their first 8 bytes all zero — that range is reserved:
+
+  ```
+  CTRL_ZONE    = h'00000000000000000000000000000001'
+  CTRL_SPACE   = h'00000000000000000000000000000002'
+  CTRL_LINEAGE = h'00000000000000000000000000000003'
+  SYS_SPACE    = h'00000000000000000000000000000004'   # w.gen space, §9.3
+  ```
+
+  The control chain uses these constants with `gen = 1` always
+  (control never uses `w.gen`; a control-chain duplicate sequence is a
+  C2 freeze, §7.4).
+- **N2.** The tracked repository space marker is **`.intendant-space`**
+  (TOML: `version = 1`, `space_id = "<ULID>"`) — a binding request,
+  never authority; the daemon binds with owner/IAM confirmation and
+  keeps the local binding map. Copied-marker rejection and
+  worktree-normalization are required vectors.
+- **N3.** Device classes (closed): `hosted-browser`, `owner-browser`,
+  `native-app`, `daemon`, `mobile-attested`, `mobile`, `other` —
+  the attested/unattested mobile split is in the enum so §7.6's two
+  rows are selectable from the certificate alone (owner ruling D-37).
+- **N4.** Identity derivations: `plane_id = H_genesis(descriptor)`;
+  `device_id` 16 B stable across renewals; `lineage` 16 B
+  control-minted; claim/judgment/pin identity = the emitting
+  operation's `op_hash`.
+
+---
+
+## 4. Core objects
+
+Semantics here; closed CDDL in Appendix A (every shape, including all
+control bodies — **no shape is defined by fixtures**).
+
+### 4.1 GenesisDescriptor
+
+```
+{ v: 1, suite: "suite-v1",
+  root_sig_alg, root_sig_pk,
+  recovery_commitment: bytes32,        # H_drill(recovery pubkey)
+  governance: { v: 1, kind: "single-owner" },
+  provenance: "trusted" / "hosted",
+  created_ms }
+```
+
+The recovery authority appears only as a hash commitment; genesis
+without one is invalid. Initial epochs: **admin epoch 1, recovery
+epoch (`repoch`) 0**. `governance.kind` is versioned for later org
+schemes.
+
+### 4.2 DeviceCertificate
+
+```
+{ v: 1, plane_id, device_id, sig_alg, sig_pk,
+  kem_alg: "hpke-p256-v1", kem_pk,
+  class: devclass (N3), evidence_hash: bytes32,
+  ? evidence_media_type: text,
+  issued_admin_epoch: uint,
+  ? expiry_deadline_ms: ms,            # OPTIONAL (owner ruling D-28):
+                                       # absent ⇒ validity governed by
+                                       # revocation + budgets, no time
+                                       # evidence required
+  revocation_id: bytes16, ? renews: bytes32 }
+```
+
+- Renewal: `c.enroll` with the same `device_id` + `renews`, carrying
+  REQUIRED `history_cutoffs` — admin-signed per-(zone, lineage)
+  **frontier closures** (D-143: full live-head sets; empty `heads`
+  is the zero-history closure). The old certificate becomes
+  **superseded under the authority predicate (D-166/D-174)** —
+  recovery ∩ certificate ∩ grant ∩ epoch closures, each
+  consulted by its own selector (§7.1): operations at or below a
+  zone's supersede frontier remain certificate-valid, and a zone
+  **legitimately omitted** from coverage (its last grant already
+  revoked — D-151/D-159) carries NO supersede frontier: there the
+  grant closure and D-86 position-relative resolution govern alone
+  (v0.5.13's §4.2 read as if supersession rejected everything
+  beyond renewal coverage, contradicting the intersection formula
+  §7.1 had already ratified) — subject to **certificate×grant
+  temporal compatibility (D-174/D-187)**: a certificate that has
+  CEASED being effective — superseded OR revoked, each at its
+  ending operation's control position (for an initially PENDING
+  revocation compound, the COMPLETING carrier's position —
+  D-195) — never
+  admits an operation citing a grant issued after that position
+  (`cert-superseded`; the PROVEN case is reject-permanent within
+  the branch, the missing-evidence case pends — the old key
+  authors nothing new, §7.1). Any replay, incremental or
+  fresh, resolves the old certificate as valid *for those chain
+  positions*, never by reading its current status (this keeps
+  receipt-free solo history alive across renewal). The cutoffs
+  **delimit authorship; they never adjudicate proof**: an operation
+  below the cutoff still admits only through its normal predicates at
+  its own fold position — history cutoffs are not time evidence.
+  **Pending operations are not ratified** — a renewal never
+  adjudicates deadline/lease operations still awaiting proof (D-49);
+  the old key authors nothing new (and never receipts again, T3).
+  Grants bind `device_id`, so renewal never orphans them. Renewal
+  **preserves `revocation_id`** (D-71 — the device-stable custody
+  line; `c.revoke_device` targets it and revokes every certificate
+  bearing it). Renewal
+  **does not touch lineage state** — budgets, cutoffs, and generation
+  counters persist (non-resetting, §9.3). `issued_admin_epoch` (on
+  certificates and grants) is **audit-only provenance** (like
+  `authored_kek_epoch`, D-34): admission never keys on it.
+- Evidence documents are opaque bytes v1 with a declared media type;
+  the class enum itself (N3) carries the attested/unattested
+  distinction — evidence is corroboration, not the selector.
+
+### 4.3 CapabilityGrant
+
+```
+{ v: 1, plane_id, grant_id, subject_device: bytes16,
+  lineage: bytes16,                    # required when ops include any
+                                       # op-authoring verb (§11.1,
+                                       # D-60)
+  tenants: [+ ("memory" / "agenda")],
+  zone: ulid / "*",                    # op-authoring grants (D-60):
+                                       # exactly ONE zone (owner
+                                       # ruling D-32); "*" legal only
+                                       # on read-only grants
+  spaces: [+ ulid] / "*",
+  ops: [+ verb],                       # closed vocabulary, §11.1/§10.4
+  ? kinds: [+ kind],
+  class_ceiling: class,
+  ? can_declassify: bool, ? can_raise: bool,
+  ? raise_quota: uint,                 # required if can_raise (D-31)
+  ? flows: [+ flow],
+  ? budget: { max_ops: uint, max_bytes: uint },
+  online_lease: bool, ? max_age_ms: ms,   # required iff online_lease
+  issued_admin_epoch: uint, capability_epoch: uint,
+  ? expiry_deadline_ms: ms }
+```
+
+`max_bytes` counts canonical SignedOperation triple bytes (plus the
+verb-specific surcharge where a registry row names one — the export
+row's `record_count × 512 B`, D-98); each
+operation cites exactly one grant; budgets account per
+`(grant_id, lineage)` per **budget window** and reset only on an
+admin `c.cap_epoch_bump` (deliberate; a `c.zone_policy` epoch advance
+re-arms nothing, D-79). **Both window selection and consumption are
+canonical (D-86)**: an operation's window is the most recent bump at
+or before the control operation that opened its signed
+`capability_epoch` (a signed anchor — never the fold-current "last
+bump"); within a window, consumption is a pure fold over the
+lineage's operations in **canonical `(gen, seq)` order** — a
+late-arriving earlier operation deterministically displaces
+later-ordered operations past the budget line, and displaced
+operations move to quarantine-reproposal (surfaced through the
+standing quarantine review lane — no bespoke telemetry surface;
+bounded to one lineage; occurs only under real unknown-gap
+concurrency). **The eligible charge set is the accepted set (D-94)**:
+only accepted operations consume budget — a quarantined or displaced
+operation releases its charge, and releases cascade (an operation
+displaced by a consumer whose own proofs later die under a
+compromise cutoff **revives**, with the affected suffix re-derived —
+quarantine is a *derived* fold state, §10.5). Every
+replica therefore converges on the same accepted set regardless of
+arrival order.
+
+**Effect finality (D-94/D-101).** An operation with an external or
+cross-boundary effect — egress release completion, audited-result
+release, same-plane import execution, a transfer's terminal record —
+may **execute** only when its coordinate is *effect-final*: every
+generation of its lineage below it is **closed by an IMMUTABLE
+boundary** — the **eligible** `last_known` incorporation chain
+(only `cap_eligible` incorporations close, D-128 — §7.1), a
+close-purpose
+closure cutoff, or a `c.abandon_writer` seal (D-101). **Growable
+ratify boundaries never confer finality**: a ratify cutoff admits
+history but can later grow and revive operations beyond it, which
+would displace an already-escaped effect — an owner who wants
+effects to flow past an unknown gap **seals** it with a
+`c.abandon_writer` per-generation seal (immutable, D-107; hosted
+planes seal their own lineage via the requester-attested form,
+§7.5) instead of ratifying it. `last_known` incorporation is itself
+an immutable cap (D-107; eligibility per §7.1, D-128): ratification
+can never exceed an
+incorporated generation's **named incorporation position** (a held
+chain position — never a terminality claim, D-188). With the
+lower generations immutably closed, no canonically earlier budget
+consumer can still arrive
+and displace it. A plane with no open unknown-gap (the solo common
+case) is effect-final immediately; an open gap defers dependent
+effects until an **immutable seal or close** (never a growable
+ratify cutoff — D-107) — deterministic, and the deferral is
+surfaced. Admission and effect execution are thereby separate
+events: displacement can always re-order admission, but never an
+escaped effect. **Execution ownership (D-101)**: D0-A owns the
+*authorization* and this gate; the execution itself (the model call,
+the notification, the import write) belongs to the daemon effect
+layer under the umbrella's Agenda-Effects gate — executors MUST be
+idempotent per the **effect key (D-134/D-142/D-148)**: a source
+release's delivery keys by `("deliver", release_op)` and its
+terminal record by `("terminal", release_op, incarnation)` — the
+journal-interval index (D-148: a consume-once deduper would
+otherwise suppress every post-reopen terminal) — namespaced, so a
+shared dedupe store never conflates them; each
+destination import keys by `(from_plane, release_op, source_op)` —
+one release fans out to up to 128 import effects, each its own
+idempotency domain; an audited-result release keys by `read_id`.
+Invalidation discovered after
+an effect escaped (a later compromise cutoff disqualifying the
+proofs it stood on) is an **unavoidable residual**: the fold records
+the retro-quarantine; the escaped bytes are the adversary table's
+problem, not the reducer's. **The generation window lives on the
+lineage alone** (`lineagedef.max_generations`, §9.3) — v0.3's grant
+field is removed so multiple grants cannot multiply openings.
+`kinds` absent means **all kinds the verb rows and class table
+otherwise authorize**; present means exactly the listed kinds.
+Read-only wildcard-zone grants set `capability_epoch = 0` — a
+**reserved value meaning "not epoch-checked"** (read admission checks
+revocation, not epoch currency); write grants MUST NOT use 0.
+**In a zone whose policy is `deadline_fallback = "budgets"`, every
+op-authoring grant MUST carry a finite `budget`** — the solo posture
+is bounded by construction. Wildcards expand at evaluation time.
+**`held_zones(device)` (D-116/D-125/D-133, one definition, every
+consumer)**: the union of the **finite** zones named by the device's
+active grants (a wildcard-zone grant names no finite set and
+contributes nothing — readability there is gated per zone by
+explicit wraps, each of which counts) and the device's
+**current-membership zones** — those where it holds an effective
+(unsuperseded) wrap at the zone's **latest accepted** epoch
+(v0.5.9's any-accepted-epoch rule made historical membership
+permanent, D-133: a device excluded by a later epoch's rotation
+stayed "held", its next KEM renewal was OBLIGED to re-wrap it into
+the excluding epoch — undoing the exclusion — and its Kold could
+never drain). Exclusion by a later accepted epoch frees the zone
+and its cap slot. The set
+is purely control-derived — local Fence retirement never subtracts
+from it (D-125; custody predicates are the local domain, §5.5). The
+≤ 128 cap (E8) counts this union; renewal rewraps exactly its
+**current-membership subset** (the zones of the second kind — never
+grant-only zones, never zones a later epoch excluded).
+
+### 4.4 AuthorizationProof
+
+```
+{ arm: "dev",      cert: bytes32, cap: bytes32 }
+{ arm: "genesis",  genesis: bytes32 }
+{ arm: "admin",    epoch: uint, ctrl_frontier: bytes32 }
+{ arm: "recovery", repoch: uint, recovery_pk: bstr .size 32 }
+```
+
+Ordinary device operations carry `dev`; genesis (control sequence 1
+only), administrative, and recovery control operations carry their
+arms (§7.2). **Reference domains (D-77)**: the dev arm's
+`cert = H_cert(certificate bytes)` and `cap = H_grant(grant bytes)`;
+the header's `signer_key_id` MUST equal
+`H_key({cert.sig_alg, cert.sig_pk})` of the resolved certificate.
+`ctrl_frontier` is diagnostic (stale-root detection),
+never a freshness proof.
+
+### 4.5 SignedOperation
+
+```
+header {
+  v: 1,                                # the protocol version
+  tenant: "memory" / "agenda" / "ctrl",
+  plane_id, zone_id, space_id,
+  authored_kek_epoch: uint,            # AUDIT-ONLY provenance (owner
+                                       # ruling D-34): admission never
+                                       # keys on it; revocation is
+                                       # governed by cutoffs, epochs,
+                                       # and wrap state
+  capability_epoch: uint,
+  signer_alg, signer_key_id,
+  writer: { lineage: bytes16, gen: uint },
+  actor: { kind: "human" / "daemon" / "browser" / "agent-session"
+                / "peer" / "service",
+           id: text, ? attested_by: bytes32 },
+  authorization_proof, request_id: bytes16,
+  writer_sequence: uint, previous_writer_hash: bytes32,
+  causal_references: [* bytes32],      # set
+  created_hlc: [ms, uint],             # chronology only, never authority
+  operation_type: text, operation_version: uint,
+  body_hash: bytes32 }
+SignedOperation = { header, signature, body }
+```
+
+- **O1.** The signature covers `msg("op", header)`; body integrity
+  rides `body_hash = H_body(body)` (canonical plaintext body — never
+  re-decided). Header-only validation and detached-body projections
+  are thereby possible.
+- **O2.** `op_hash = H_op(triple)` — the durable identity; replicas
+  store exact bytes, never verify-after-reserialize.
+- **O3.** Bodies are **not** `{* text => any}` at validation: the
+  operation registry (§7.1, §11.1) binds every
+  `(tenant, operation_type, operation_version)` to a closed CDDL body,
+  and unknown fields/types inside bodies reject exactly as in headers.
+  (The Appendix A `signedop` rule is structural; registry dispatch is
+  the semantic gate.)
+- **O4 (actor evidence).** `actor.kind` is signed but
+  signer-controlled; it is **never authorization by itself**. The
+  portable evidence for a human/owner action is structural (§10.2):
+  a direct device signature (edge shape 1 — no `attested_by`) from a
+  certificate whose class admits human presence
+  (browser/native/daemon/mobile classes — daemon per D-47: the owner
+  physically at the box; class `other` provides no human evidence).
+  Residual, stated: a fully
+  compromised device can act as its human — the same TCB the umbrella
+  admits per lane. Per-op WebAuthn user-verification gestures are an
+  additive later upgrade, not v1.
+- **O5.** Supervised agent sessions hold no durable keys; their
+  controller signs with `actor.attested_by` = its own cert hash.
+  `actor.kind = "service"` is reserved for **device-internal system
+  writers** — on any device class, daemon or browser (the audit writer
+  is the canonical case, §11.1) — and requires `attested_by` = the
+  writing device's own cert hash.
+- **O6 (generations).** Chains are per `(plane, zone, lineage, gen)`.
+  **Generation 1 opens directly**: its first operation has
+  `previous_writer_hash = gen_start(lineage, 1)` and needs no
+  preamble. Generations `g ≥ 2` MUST open with the `w.gen` operation
+  (§9.3) whose `previous_writer_hash = gen_start(lineage, g)`.
+  (v0.2's "every generation starts with w.gen" contradicted genesis
+  and first writes — void.)
+- **O7 (control-header pins).** Tenant-inapplicable header fields on
+  control operations are reserved values: `authored_kek_epoch = 0` and
+  `capability_epoch = 0` (0 is invalid on tenant operations).
+  Signer/actor combinations: genesis operations are signed by the
+  descriptor's root key; admin operations by the **current admin key
+  at their epoch** (the root key IS the epoch-1 admin key;
+  `c.admin_succession` rotates it — D-106 repairs v0.2-era "root
+  key" drift); each with `actor = { kind: "human", id: "owner" }`;
+  recovery operations by the revealed recovery key with the same
+  actor; `attested_by` is absent on control operations.
+- **O8 (actor.id minting, closed — D-63).** `actor.id` is
+  deterministic per kind; any other value is `body-invariant`:
+  `human`, `daemon`, `browser`, `service` → the lowercase hex of the
+  signing device's `device_id` (control operations keep O7's
+  `{ kind: "human", id: "owner" }`); `agent-session` → the
+  controller-assigned session identifier (opaque, stable for the
+  session's life; integrity rides `attested_by`); `peer` → the
+  lowercase hex of the peer plane_id bound by the mediating grant
+  (reserved — peer enrollment is D0-B; v1 planes have no peer
+  actors). Principals (§11.2) are thereby portable: no client
+  convention participates in `self`/`author`.
+
+### 4.6 Frontier
+
+```
+Frontier = { v: 1, zone_id: ulid, heads: [* Head] }
+Head     = { lineage: bytes16, gen: uint, seq: uint, op: bytes32 }
+```
+
+**Frontiers are zone-scoped (D-62)**: chains are per
+`(plane, zone, lineage, gen)` (O6), and one lineage may hold grants
+in several zones, so a plane-wide head set would collide on
+`(lineage, gen)`. One Frontier per zone; `zone_id` sits inside the
+hashed bytes, so `H_frontier` values are never confusable across
+zones (`ReplicaAck` already binds `zone_id`). Explicit sort key (E7):
+ascending `(lineage bytes, gen)`; at most one
+head per `(lineage, gen)`. **Retirement (owner ruling D-33):** once a
+successor generation's `w.gen` (or a control acceptance of the
+lineage's cutoff) **causally incorporates** a prior generation's
+**held chain position** — the `w.gen.last_known` names it, or a
+`c.checkpoint` lists it in `retired` (coverage alone never retires —
+D-88) — the frontier drops **the effective ACCEPTED head at or
+below the incorporated position** (D-76 as amended by
+D-175/D-183/D-188 — §9.3's rule, stated here too: a
+held-but-displaced
+named head retires its accepted predecessor, and NO accepted head
+at or below the position is a **successful no-op** (§9.3 —
+v0.5.16's "never nothing" here contradicted §9.3's own no-op,
+D-188; "terminal head" wording is swept: eligibility is chain
+membership, never terminality): a lineage may hold several live heads
+while `"unknown"` gaps await their cutoffs, bounded by the generation
+window; heads retired by a checkpoint's `retired` list live in that
+checkpoint — immediate `w.gen`/cutoff retirements are simply dropped
+from the live Frontier and never re-listed (D-96/D-113). The live Frontier holds **accepted** heads only (D-80):
+a pending operation occupies no Frontier position — checkpoint
+coverage evaluates its signed coordinates instead (§7.1). The
+frontier is thereby bounded by live lineages (cap E8).
+`H_frontier` is its identity; D0-B adds Merkle compression and witness
+proofs over this exact type.
+
+### 4.7 Receipts and leases (signed)
+
+All statements are wrapped as `Signed<…>` (§2.3). The issuer is a
+**tagged union** — a plane device or a service signer (v0.3's bare
+`issuer_cert` could not represent Connect):
+
+```
+issuer = { src: "device",  cert: bytes32 }
+       / { src: "service", key_id: bytes32 }   # e.g. Connect; must equal
+                                               # the zone policy's
+                                               # connect_service_key
+```
+
+Four closed receipt variants (subject/size semantics enforced by
+shape, not prose), plus the lease — all bound to plane and zone:
+
+```
+StorageRcpt = { v: 1, kind: "storage", issuer: issuer,
+  plane_id: bytes32, zone_id: ulid, subject: bytes32,  # item_addr
+  size: uint, seen_ms: ms, issuer_seq: uint,
+  prev_stmt: bytes32 }   # D-87 feed chain (all five statements):
+                         # stmt_id of this scope's previous statement
+                         # (stmt_id = H_stmtid(complete Signed bytes));
+                         # all-zero at issuer_seq = 1
+AcceptRcpt  = { v: 1, kind: "accept", issuer: issuer,
+  plane_id: bytes32, zone_id: ulid, subject: bytes32,  # item_addr
+  seen_ms: ms, issuer_seq: uint, prev_stmt: bytes32 }
+ReplicaAck  = { v: 1, kind: "replica", issuer: issuer,
+  plane_id: bytes32, zone_id: ulid, frontier_hash: bytes32,
+  seen_ms: ms, issuer_seq: uint, prev_stmt: bytes32 }
+CkptWitness = { v: 1, kind: "witness", issuer: issuer,
+  plane_id: bytes32, zone_id: ulid,
+  checkpoint: bytes32,   # the c.checkpoint OP HASH — the checkpoint
+                         # identity under D-80's embedded object
+  seen_ms: ms, issuer_seq: uint, prev_stmt: bytes32 }
+LeaseStmt   = { v: 1, issuer: issuer, plane_id: bytes32,
+  zone_id: ulid, grant_id: bytes16, lineage: bytes16,
+  issued_ms: ms, expires_ms: ms,
+  ctrl_frontier: bytes32,             # DIAGNOSTIC (declared): records
+                                      # the issuer's view; no freshness
+                                      # predicate reads it
+  issuer_seq: uint, prev_stmt: bytes32 }
+```
+
+- **T1.** Subjects are item addresses — never zone-private `op_hash`;
+  zone members bind item→operation via the local index (§5.6).
+- **T2 (witness qualification).** A receipt qualifies for an
+  operation's time evidence only if the issuer resolves to a
+  **different `device_id`** than the operation's signer — a renewed
+  key cannot receipt its own old-key operations. **One predicate**:
+  zone policy `time_witnesses` lists stable `device_id`s (never
+  renewable cert hashes) and/or the literal `"connect"` — Connect
+  qualifies iff `"connect"` is listed (the separate
+  `accept_connect_time` flag is removed — D-48); `connect_service_key`
+  is REQUIRED iff `"connect"` is listed, and names an installed
+  **service-key descriptor** (`c.service_key`, §7.1) — the descriptor,
+  not the ID, carries the verifiable `{alg, pk}`. **Qualification is
+  anchored at the citing operation's signed capability epoch (D-69,
+  refining D-57/D-48)**: a receipt or lease qualifies for an
+  operation iff `policy(header.capability_epoch)` — the zone policy
+  in force at that epoch (§9.4), its `time_witnesses`, and its
+  service-key leaf resolved against the installed descriptors
+  (D-70) — lists the issuer. The anchor is a **signed input**, so
+  qualification is a pure function of (receipt bytes, operation
+  bytes, control history) — identical on every replica regardless of
+  arrival order; a still-pending operation is judged under its own
+  signed epoch whenever it admits, and epoch currency (§9.4) bounds
+  how stale that anchor may be. A later `c.zone_policy` advances the
+  epoch (D-69) and thereby governs later-signed operations only.
+  **The revisit inventory is derived, never counted (D-114 —
+  hand-numbered enumerations broke three times)**: an admitted
+  operation is revisited exactly by (a) **proof
+  retro-disqualification** — explicit compromise cutoffs (T4),
+  renewal `feed_closure` acceptance (T3/D-124 — the closed scope's
+  statements beyond its `through` retro-disqualify exactly like a
+  compromise cutoff, escaped effects under the stated residual), and
+  issuer-fork **discovery and resolution** (T3/D-115 — discovery
+  freezes both suffixes; the selecting commitment revives the
+  winner); (b) **canonical budget
+  displacement and revival** (§4.3, D-86/D-94 — replay-key
+  claimant displacement, D-155, is the same canonical-order event
+  in the import lane, and replay-key OWNERSHIP is derived fold
+  state like quarantine, never an independent revisit class); and
+  (c) **the
+  boundary events of the cutoff algebra** (§7.1), read through the
+  per-generation effective-state equation (D-121): ratify growth
+  revives; a requester snapshot's override retires; supersede,
+  revoke, close, and recover boundaries, per-generation seals and
+  voids, and incorporation caps quarantine beyond their bounds; a
+  **widening event revives** — ratify growth (D-121) and
+  generation-window reauthorization (`c.lineage_reauth` acceptance
+  revives held `lineage-gen`-quarantined operations under the new
+  window, D-132). **Removal is symmetric and TOTAL (D-131/D-138)**: C3′
+  acceptance re-derives ALL control-derived admission state from
+  the surviving chain — conceptually a fresh fold over
+  `ancestors(base) ∪ {this} ∪ descendants` (incremental
+  implementations MUST converge to the fresh-fold result); every
+  fold input riding a cut operation — commitments, boundaries,
+  closures, eligible caps, grants, reauthorized windows — dissolves
+  and everything its presence derived re-evaluates (a fork whose
+  committed selector dissolves has both suffixes refreeze pending a
+  new selection; a cut reauth re-quarantines the `lineage-gen`
+  bytes it revived; held bytes REJECTED under a control-derived
+  fact that dissolved — a cut retirement's `scope-space`, a cut
+  grant-revocation's `cert-revoked` — re-evaluate too, D-149:
+  reject-permanent is permanent within the branch for
+  control-derived rejecting facts, everywhere for intrinsic byte
+  failures).
+  Nothing else revisits — the enumeration is exhaustive because
+  every admission input is one of the three effective functions
+  (proofs, budgets, boundaries), and every event is an acceptance,
+  a widening, or a branch-cut removal of one of
+  them. Issuer-fork handling
+  is **order-independent (D-115)**: on holding two conflicting
+  statements at one `issuer_seq` — a set property, identical on
+  every replica regardless of arrival order — qualifications from
+  **both** suffixes at or after the fork freeze
+  (quarantine-reproposal, pending selection); a committed boundary
+  (`head_hash` cutoff, renewal closure, checkpoint proof position —
+  one registry per scope, D-124: the first commitment in control
+  order above the fork point IS the selection; a commitment at or
+  below the fork is an ancestor of both suffixes and selects
+  neither) then selects the
+  winner — losing-branch operations stay retro-quarantined, winning-
+  branch operations re-qualify (v0.5.7's quarantine-at-arrival rule
+  diverged replicas on delivery order and is void). Each event is a
+  fold of control state — deterministic on every
+  replica. **Lease issuers** are the same qualified witness set
+  under the same rules (never the lease's own lineage device).
+- **T3 (anti-replay and issuer lifecycle).** `issuer_seq` is
+  **exactly consecutive (dense)** per `(device_id, signing key)`
+  scope for devices and per `(service, key_id)` for service issuers —
+  **one counter per scope, shared by receipts and leases alike,
+  starting at 1, +1 per statement** — persisted in the issuer's own
+  durable store. **Feeds are hash-chained (D-87)**: every statement carries
+  `prev_stmt` = the `stmt_id` of its scope's predecessor
+  (`stmt_id = H_stmtid(complete Signed statement bytes)`; all-zero at
+  seq 1) — the chain, not arrival order, is the finality predicate
+  (v0.5.3's arrival-relative `issuer-gap` rule diverged replicas and
+  is void). Verification: a statement whose predecessor is held must
+  chain to it (`prev_stmt` mismatch = `issuer-fork`); one whose
+  predecessor is absent is `issuer-gap` — **pending-dependency**
+  until the link arrives (never a freeze). A compromise cutoff
+  commits its boundary: `{ key_id, through, head_hash }` with
+  `head_hash` = the `stmt_id` of statement #through (all-zero when
+  `through = 0`). **Boundary gating (D-95)**: once a boundary
+  commitment exists for a scope (a cutoff's `head_hash`, a
+  checkpoint's `proof_positions` entry), a statement at or below
+  `through` **qualifies only when a complete verified chain path
+  connects it to the committed head** — an immediate-link match
+  alone is insufficient (a compromised issuer can mint 51′ chaining
+  to the true 50; only the path to the committed head exposes the
+  branch). A missing forward path is `issuer-gap`
+  (pending-dependency); a path mismatching the committed head is
+  `issuer-fork` — identical on every replica. Honestly delayed
+  statements fill their links and verify. Repeated cutoffs for one
+  scope merge at the **minimum**, and the merge is valid only when
+  the smaller committed head verifies as a chain ancestor of the
+  larger; a renewal's `feed_closure` (D-111) is a boundary
+  commitment in exactly this sense (D-118): statements at or below
+  its `through` gate on the chain path to its `head_hash`, it
+  min-merges with `receipt_cutoffs` for the same key under the same
+  ancestor proof, its **acceptance retro-disqualifies** the closed
+  scope's statements beyond `through` (revisit class (a), D-124 —
+  already-admitted operations resting on them quarantine-reproposal;
+  the closure would otherwise not close the feed), and the closed
+  scope is exempt from checkpoint
+  hardening coverage. **One commitment registry per scope
+  (D-124/D-131)**:
+  a scope's effective commitment set is every accepted boundary
+  commitment from all three carriers — compromise `receipt_cutoffs`,
+  renewal `feed_closure`, checkpoint `proof_positions` — and each
+  NEW commitment MUST be ancestry-compatible with that set: a
+  **verified** chain path placing the two commitments on one branch
+  admits; a missing path is `ref-unresolved` — the carrying
+  operation **pends** until the links arrive (never rejected for
+  evidence not yet held; the split mirrors the D-95 statement
+  rule); a verified path proving divergent suffixes is
+  `body-invariant` (D-131). **A pending commitment reserves its
+  scope (D-131)**: while a carrier pends, later carriers committing
+  for the same scope pend behind it — selection order is control
+  order, preserved through pendency. Two carriers can therefore
+  never
+  commit opposite fork branches: carriers are control operations in
+  one total order, and the first commitment strictly above the
+  **fork point — the suffixes' last common ancestor statement
+  (D-131)** — is
+  the D-115 selection (a commitment at or below the fork point is
+  an ancestor of both suffixes and selects
+  neither); **key renewal restarts the scope at 1** (a new
+  key is a new scope) — also the recovery path after a snapshot
+  rollback: an issuer that cannot trust its own counter renews.
+  **Every non-genesis certificate REQUIRES a fresh signing key** —
+  fresh **plane-wide (D-131/D-141/D-150)**: an enrollment OR
+  renewal whose `sig_pk` equals any key in the plane's **freshness
+  domain** rejects (renewal reuse would resurrect the predecessor's
+  closed
+  scope and its committed boundaries — A→B→A; new-device reuse
+  would let one private key sign operations as D1 and witness them
+  as D2, defeating every device-id-compared self-exclusion rule,
+  T2/T5). **The freshness domain is portable and typed by `key_id` AND
+  role-neutral material identity (D-150/D-158/D-167/D-175)**:
+  every membership comparison is
+  `key_id = H_key({alg, pk})` — never raw key bytes, one identity
+  domain for signing and KEM keys alike (v0.5.13 mixed raw
+  `sig_pk` comparisons into a `key_id` domain) — **and additionally
+  `mat_id = H_mat(SEC1 point bytes)` (D-175)**: the same P-256
+  point under different algorithm tags (`p256` vs `hpke-p256-v1`)
+  is ONE material for freshness and retirement (v0.5.14's
+  role-tagged IDs gave it two — a device's KEM point re-enrolled
+  as another device's SIGNING key escaped the domain, defeating
+  device self-exclusion, and the reverse restored decrypt access);
+  role-tagged `key_id` remains the addressing identity, and a
+  certificate whose `sig_pk` and `kem_pk` are the same point
+  rejects (intra-certificate role reuse); **recovery-portable
+  matching is candidate-side (D-182)**: `retired_keys` and the
+  adopted history carry opaque role-tagged hashes a fresh replica
+  cannot invert, so a CANDIDATE point P is checked under EVERY
+  closed v1 role tag — both `H_key({"p256", P})` and
+  `H_key({"hpke-p256-v1", P})` — against those sets (the same
+  matching runs the D-172 retired-vs-adopted overlap check);
+  equivalence is **exact SEC1 bytes** — P vs −P is NOT
+  canonicalized and arbitrary related-key derivation is
+  undetectable (stated residuals, D-182); the domain = the
+  surviving chain's enrollments ∪ the `retired_keys` committed by
+  accepted recoveries ∪ the **typed key history of adopted
+  renewals** (D-158/D-164 — an adopted renewal's signing key is
+  burned
+  globally and the adopted device's **TERMINAL adopted KEM key**
+  binds to it: same-device recovery re-enrollment with the
+  terminal key is legal, any other device rejects, and an
+  INTERMEDIATE adopted key — K1 of K0→K1→K2 — is rotated-away and
+  burned exactly as in live enrollment (v0.5.13's generic
+  same-device wording read as readmitting it); v0.5.12 left
+  adopted keys OUTSIDE the domain, so a later
+  surviving enrollment could hand an adopted live KEM key to
+  another device — the exact cross-device bypass D-150 forbids)
+  (v0.5.11's fork-inclusive "ever enrolled"
+  read cut-branch certificates some replicas never hold — the
+  freshness check itself diverged; **an uncarried, unadopted
+  cut-branch key NEVER enters the portable burn set — explicit,
+  D-167** — re-usable, a
+  stated, vectored
+  residual: the owner cut that branch and rules its keys) — the
+  restart is safe only because the
+  scope actually changed. Duplicate `(scope, issuer_seq)` with
+  different bytes = `issuer-fork`: qualifications from **both**
+  suffixes at or after the fork freeze until a committed boundary
+  selects a branch (D-115 — arrival order never picks a winner);
+  byte-identical duplicates are
+  idempotent.
+- **T4 (non-circular validation).** A receipt validates against the
+  issuer identity named in its statement, checked against the
+  **fold's control frontier** — device issuers for
+  revocation/supersession, service issuers against the descriptor
+  registry and the anchored policy leaf (D-69/D-70) — never against
+  "certificate state at seen_ms". A device
+  revoked with `mode = "compromise"` (§7.1) is retro-disqualified as
+  an issuer beyond its `receipt_cutoffs` positions; `mode = "exclude"`
+  leaves its past receipts standing. Folds stay deterministic because the control
+  frontier is an explicit fold input.
+- **T5 (lease binding, non-backdateable).** An operation under an
+  `online_lease` grant is accepted only when **both** hold: a valid
+  `LeaseStmt` for `(grant_id, lineage)` with
+  `expires_ms − issued_ms ≤ max_age_ms`, **and** a qualified
+  `accept` receipt for the operation's item with
+  `seen_ms ∈ [issued_ms, expires_ms + skew]`, `skew = 300000` ms
+  fixed. The op is thereby tied to *timely observation by a witness
+  within the lease window*; `created_hlc` plays no role, so
+  post-expiry backdating is inert. **Staleness is evidence-relative
+  and STICKY (D-202)**: a held qualified receipt outside every valid
+  window classifies `(lease-stale, quarantine-reproposal)` on the
+  evidence held at evaluation — terminal where issued; a later
+  timely receipt does not re-open the verdict. **The re-proposal
+  carrier is structure-relative (D-204)**: among replicas sharing
+  the original operation's evidence-arrival structure (which
+  qualified evidence — timely or late — is held at its first
+  evaluation), convergence rides the writer's re-proposed operation
+  at the freed coordinate. A replica holding timely evidence at
+  first evaluation admits the ORIGINAL operation at evaluation, and
+  the same-coordinate re-proposal reaching it contests an OCCUPIED
+  coordinate: D-130 fork evidence — BOTH variants, the admitted
+  original included, freeze (`fork`, `freeze-writer`), reconcilable
+  only by a committed boundary selection (the D-130 lane). The
+  cross-structure divergence of the pair's verdicts is a stated,
+  owner-visible residual of alternative (ii). **Within the
+  late-first class the promise holds on EVERY relative delivery
+  order of original and re-proposal (D-205)**: a late-class
+  original arriving AFTER its re-proposal self-classifies sticky
+  `lease-stale` at the occupied coordinate and registers no fork
+  evidence (the §7.1 self-evidence exception) — it never freezes
+  its own convergence carrier. Held timely evidence
+  beats held late evidence at first evaluation. No receipt at all
+  stays `lease-missing` (pending); a lease whose window exceeds
+  `max_age_ms` is not a lease (the `lease-missing` lane).
+
+---
+
+## 5. Item crypto
+
+### 5.1 DEK and item AEAD (exact)
+
+Per item: fresh random 32-byte DEK, used **exactly once, ever**.
+
+```
+item_ct = AES-256-GCM-Encrypt(key = DEK, nonce = random 12 B,
+            aad = "intendant/item/v1" || 0x00 || plane_id || zone_id,
+            plaintext = exact SignedOperation triple bytes)
+ItemCore = { v: 1, aead: "a256gcm", nonce, ct: item_ct }
+item_addr = H_item(ItemCore)          # covers version+alg+nonce+ct
+```
+
+### 5.2 Zone KEKs and recipient wraps
+
+Per (zone, kek_epoch): 32-byte KEK, epoch 1 at zone creation.
+Distribution:
+
+```
+KekWrap = { v: 1, plane_id: bytes32, zone_id: ulid, epoch: uint,
+            recipient_device: bytes16,
+            recipient_kem_key: bytes32,   # key_id of the cert KEM key —
+                                          # multi-cert recipients select by it
+            kem: "hpke-p256-v1", enc: bstr .size 65,
+            ct: bstr .size 48 }           # 32 B KEK + 16 B tag
+# HPKE base mode Seal to the recipient certificate's KEM key,
+# info = aad = "intendant/kek/v1" || 0x00 || plane_id || zone_id || epoch_be64,
+# plaintext = the 32-byte KEK. Rotation MUST set new_epoch = current + 1
+# with a FRESH random KEK; the wrap is fully self-identifying.
+```
+
+### 5.3 DEK wrapping (exact — per-item wrap keys, D-22 as amended)
+
+The KEK never keys AES-GCM directly: every item gets a **derived
+single-use wrapping key** with a fixed nonce — key/nonce uniqueness by
+construction, no birthday question (v0.3's 96-bit derived nonces under
+one shared KEK are void):
+
+```
+wrap_key    = HKDF-Expand(HKDF-Extract(salt = "intendant/wrapkey/v1",
+                IKM = KEK), info = item_addr, L = 32)
+wrapped_dek = AES-256-GCM-Encrypt(key = wrap_key,
+                nonce = 12 zero bytes,
+                aad = "intendant/dekwrap/v1" || 0x00 || plane_id ||
+                      zone_id || kek_epoch_be64 || item_addr,
+                plaintext = the 32-byte DEK)
+              # ciphertext layout: 32 B ct || 16 B tag = 48 B
+ItemWrap = { v: 1, item_addr, key_wrap_epoch: uint, wrapped_dek }
+```
+
+Each `(KEK, item_addr)` derives one wrap key used for exactly one
+encryption; rewrapping the same pair stays byte-idempotent.
+
+- **I1.** `op_hash` never appears in ItemCore/ItemWrap; it lives only
+  in the local index (§5.6). Shipped records leak ciphertext identity
+  only.
+- **I2 (idempotence is an invariant).** Rewrapping the same
+  `(item_addr, kek_epoch)` is byte-identical by construction. **A
+  differing duplicate wrapper for the same pair is corruption or fork
+  evidence** (outcome `wrapper-mismatch`, disposition: storage
+  quarantine) — it can only occur if the KEK, AAD, or plaintext
+  differed.
+- **I3 (active wrapper).** The served wrapper is the one whose
+  `key_wrap_epoch` equals the zone's **active** KEK epoch — the epoch
+  of the last durable `Fence` in the zone log. Control acceptance
+  *authorizes* a rotation; its Fence *activates* it (D-81); wrappers
+  of retired (pre-Fence) epochs are not served. **Epoch 1 is active
+  from `c.genesis`/`c.zone_create` with no Fence** — creation is its
+  activation (D-92).
+- **I4 (validation after decryption).** Recompute `body_hash`, verify
+  the header signature, recompute `op_hash`, check the index binding —
+  **and check that the enclosing `ItemCommit` frame's plaintext
+  `(lineage, gen, seq)` equals the decrypted header's** (outcome
+  `body-invariant` on mismatch).
+
+### 5.4 Rotation (exclusion and erase — one machine)
+
+Every `KekRotation` — whether for member exclusion or carrying an
+`erase_manifest` — runs the same machine. Erase is two lanes (owner
+ruling D-17): a tenant `m.erase_request` (immediate retrieval
+exclusion, §11.7) accumulating into the next batched rotation
+ceremony. Manifest entries are typed
+`{ item_addr, erase_op, target_op }` (D-66): `erase_op` = the accepted
+`m.erase_request`; `target_op` = the erased claim's op hash, which
+MUST be a member of that request's `targets` — portably checkable at
+rotation admission. The `item_addr ↔ target_op` binding is attested by
+the rotation's author and verifiable by any zone-key holder (index
+rebuild, §5.6). Logical key = `item_addr` (E7): the first accepted
+manifest entry for an item wins; re-appearance in a later rotation is
+an idempotent skip. A queue larger than one manifest (> 128 entries,
+E8) drains across successive rotations — accepted requests persist
+until manifested. **Transfer deferral (D-198)**: a queue entry
+whose item is a source of a NONTERMINAL transfer journal is
+ineligible for a manifest until every referencing journal is
+terminal — retrieval exclusion stays immediate; only the
+cryptographic destruction waits (the owner's remedy against a
+stuck transfer: kill the release, the journal closes, the entry
+becomes eligible).
+
+### 5.5 Crash-safe rotation/erase state machine
+
+```
+1 RotationAccepted   control op durable (new epoch, wrap-adds,
+                     erase_manifest — possibly empty); authorizes
+                     only — activation is the Fence (D-81)
+2 Fenced             zone-log Fence record — persists { kek_epoch,
+                     rotation_op, fence_frontier, control_frontier,
+                     recipients_hash } (D-77/D-97; equal to
+                     RewrapDone's commitment) — old epoch not served;
+                     commits from here use the NEW epoch — post-fence
+                     items are outside the survivor set by
+                     construction, D-67
+3 RewrapProgress     survivor rewraps (idempotent, I2)
+4 RewrapComplete     zone-log record committing to the VERIFIED
+                     wrappers AND the frozen expected membership:
+                     { kek_epoch, rotation_op: bytes32, count: uint,
+                       fence_frontier: bytes32,  # zone Frontier hash
+                                                 # at Fence (D-67)
+                       control_frontier: bytes32,
+                       recipients_hash: bytes32, # = the Fence's
+                                                 # committed intent
+                                                 # (D-97/D-106)
+                       survivors: H_survivors(canonical survivorset —
+                         { v: 1, pairs: [{ item_addr, wrap_hash:
+                           SHA-256(canonical ItemWrap bytes) }] },
+                         keyed by item_addr) }
+                     expected membership (D-73, wrapper-current):
+                     every NON-TOMBSTONED item at or before
+                     fence_frontier that holds, or is required to
+                     hold, a wrapper under the RETIRING epoch —
+                     original commit epoch is irrelevant after a
+                     rewrap — MINUS the rotation's manifest
+                     item_addrs; completeness is provable, not merely
+                     self-consistent
+5 OldKekDestroyed    key-store deletion, then a durable 0x1A
+                     KekDestroyed { epoch } frame — deletion ONLY after
+                     4 is durable AND the recomputed pair set matches
+                     `survivors` AND its membership equals the expected
+                     set derived from fence_frontier and the manifest
+                     (omission of any survivor blocks destruction); crash between deletion and the frame
+                     retries the (idempotent) deletion; local backup
+                     envelopes of the old KEK are removed in this step
+6 Tombstoned         EraseTombstone { v:1, item_addr, erase_op: bytes32,
+                     target_op: bytes32, retired_epoch } per erased
+                     item — recovery finding state 5 without tombstones
+                     re-derives them from the rotation op's typed
+                     erase_manifest: each entry { item_addr, erase_op,
+                     target_op } yields the tombstone with
+                     retired_epoch = new_epoch − 1
+```
+
+The commitment binds the rotation operation and the **actual new
+wrappers**, not addresses alone. Old-KEK destruction before a verified
+RewrapComplete is non-conformant. Crash at any state re-enters at the
+recorded state. Both completeness violations carry one
+classification (D-203): a durable RewrapDone omitting an expected
+survivor, and rotation N+1's Fence landing before rotation N reaches
+state 6 (D-89), classify `(log-corrupt, storage-quarantine)` — the
+store quarantines read-only.
+
+`kek_epoch` in `Fence` and `RewrapDone` is the **new** epoch (D-81).
+**Serialization (D-81/D-89)**: a zone's rotations run strictly in
+control-chain order — rotation N+1's Fence may be written only after
+rotation N completes **state 6** (every tombstone durable; stopping
+at `KekDestroyed` would let N+1's frozen frontier see an erased item
+as neither tombstoned nor wrapped). A crash re-enters the queue at
+the recorded state; control admission stays portable, since epoch
+consecutiveness already orders acceptances — the queue is a local
+storage invariant. **Memberships above 128 (D-81/D-89)**: the
+rotation's bounded wrap set temporarily excludes the remainder;
+`c.wrap_add`s **naming the rotation's epoch** (valid for any
+accepted epoch — a pure control-log fact, D-97; a later rotation's
+acceptance never strands them) re-admit each intended non-target
+holder. **Intent
+closes at the Fence and is committed there (D-89/D-97)**: the
+intended recipient set = the rotation's wraps ∪ wrap-adds for its
+epoch accepted at or before the Fence's committed
+`control_frontier`; the Fence persists `recipients_hash` =
+`H_recips` over that sorted set — a crash before RewrapDone recovers
+the exact intent from the frame, and two replicas Fencing around the
+same wrap-add commit *which* control position they closed at;
+`RewrapComplete` waits until every committed recipient holds that
+epoch's wrap (family-13 vector). **Last-holder
+precondition (D-81)**: an exclusion-shaped rotation must retain ≥ 1
+recipient — excluding a zone's final holder is not expressible as
+exclusion (zone abandonment is a distinct ceremony, out of D0-A
+scope).
+Indexes, views, checkpoints, and backup copies are inside the erasure
+boundary — the erase vector family proves all four unreadable.
+
+### 5.6 Local private index
+
+`op_hash ↔ item_addr` (+ retrieval flags incl. erase-requested):
+local, rebuildable by decrypt-and-scan, inside the plane store;
+removed/rebuilt on revocation and erasure. Box-trust: sequencing
+metadata may be plaintext locally; operation content may not.
+
+---
+
+## 6. Local durable storage
+
+### 6.1 Tenant zone logs (ciphertext-only) and the control log
+
+Tenant logs have **no plaintext-operation record type**. Frame types:
+
+```
+0x11 ItemCommit  { core: ItemCore, wrap: ItemWrap,
+                   lineage: bytes16, gen: uint, seq: uint }
+0x12 ItemRewrap  { wrap: ItemWrap }
+0x13 Fence       { kek_epoch: uint, rotation_op: bytes32,
+                   fence_frontier: bytes32,
+                   control_frontier: bytes32,
+                   recipients_hash: bytes32 }  # D-77/D-97: expected
+                                               # membership AND the
+                                               # closed recipient
+                                               # intent survive a
+                                               # crash before
+                                               # RewrapDone
+0x14 RewrapDone  { kek_epoch: uint, rotation_op: bytes32, count: uint,
+                   fence_frontier: bytes32,
+                   control_frontier: bytes32,
+                   recipients_hash: bytes32,
+                   survivors: bytes32 }   # §5.5 commitment (mirrors
+                                          # A.4 rewrapdone exactly;
+                                          # equals the Fence's intent
+                                          # — D-97)
+0x15 Tombstone   { EraseTombstone }
+0x16 Receipt     { body: signedreceipt / signedlease }  # = A.4
+                                                        # receiptframe
+0x17 OutboxMark  { through: { lineage, gen, seq } }
+0x18 Txn         { records: [+ txnrec] }   # ≤ 16 (E8): ONE frame = one
+                                           # atomic multi-record commit;
+                                           # txnrec = ItemCommit /
+                                           # PendingXfer / XferDone /
+                                           # XferAbort / XferReopen —
+                                           # a closed union (D-140);
+                                           # journal order INSIDE one
+                                           # Txn = the records array
+                                           # index (D-200): sequential
+                                           # validation, all-or-nothing
+                                           # commit
+0x1A KekDestroyed { epoch: uint }          # §5.5 state 5; epoch =
+                                           # the DESTROYED epoch =
+                                           # new_epoch − 1 (D-92)
+```
+
+- **Txn rules**: all records belong to this zone log; ItemCommits come
+  from one writer with contiguous sequences and intact hash links;
+  validation is all-or-nothing; the outbox advances past the whole
+  frame or none of it; the 1 MiB frame cap applies to the complete
+  encoded Txn. `m.assert` is exactly one Txn of two ItemCommits
+  (claim, then its self-accept judgment) — a LOCAL storage-commit
+  rule: replicas receive operations individually, each admissible on
+  its own per §11.1 (the halves are portable; the Txn is not).
+- Sequence allocation + encrypted item + outbox state ride **one
+  frame** (0x11/0x18): no window where a sequence exists without its
+  durable ciphertext.
+- **Cross-zone transfer (same daemon)** is two commits in two zone
+  logs by construction; atomicity is by **completion journal** at
+  record granularity (D-53): the source zone commits one Txn =
+  [release ItemCommit, PendingXfer { export_id, release_op,
+  dest_zone, content_digest, record_count }]; each destination
+  `m.import.claim` (one per released record, replay key
+  `(from_plane, release_op, source_op)` — D-123; `export_id` is
+  correlation only) commits independently; once
+  ALL intended records are imported — **accepted AND effect-final at
+  the destination (D-106)** — the source commits one
+  `XferDone { export_id, release_op, incarnation, completed }` —
+  `completed` = the sorted set
+  of imported `source_op` hashes, equal to the bundle's exact record
+  set (`|completed| == record_count`). Recovery finding a PendingXfer
+  with no terminal record re-derives the bundle **at the release's
+  frozen stamp** — the records and classifications of
+  `{data_frontier, control_frontier, as_of_ms}`, never later status,
+  expiry, or classification (D-85) — in canonical bundle order
+  (sorted by op) and re-runs only the missing imports. **Terminal
+  precedence is state-derived, never order-journaled (D-98)**, and a
+  terminal record is itself an effect — it is written only at an
+  effect-final coordinate (§4.3, D-101, inheriting the release's
+  barrier), **except the release-death cleanup abort
+  (D-119/D-126/D-134, `reason = "release-rejected"`)**: a
+  **resolved-negative release** — reject-permanent, or permanently
+  non-revivable in quarantine (beyond its generation's
+  `immutable_cap` or in a voided generation, §10.5/D-121) — can
+  never be effect-final, so its closing `XferAbort`
+  is **journal cleanup**, outside the finality gate — it requires
+  only that the release's death is immutable; **terminality keys on
+  permanent non-revivability, never on a disposition's name
+  (D-134)** (a destination-side
+  abort — case 3 below — is different: its release is accepted, and
+  its terminal gates at the release's effect-final coordinate like
+  every other terminal, D-126) — recovery evaluates, in this order — after **rebuilding the
+  destination replay index** (destination state is consulted before
+  any source-side terminal is written, D-106), and holding the
+  **`release_op` critical section (D-113/D-123)**: the plane writer
+  serializes destination replay-key observation, in-flight import
+  completion, and the source terminal append per release_op — an
+  import can never commit after the CURRENT interval's XferAbort
+  listed it missing (a
+  local storage invariant, like the rotation queue; a reopened
+  journal starts a new interval — D-157): (1) **replay
+  keys first**: every
+  record already imported → write `XferDone` (even after a source
+  erasure — nothing remained to derive); (2) any source erased →
+  `XferAbort`, `reason = "source-erased"`, `missing` = every
+  un-imported source_op (**reachable only via a C3′-adopted erase
+  manifest, D-198** — the deferral invariant keeps sources live for
+  nonterminal journals on every conforming branch): at the
+  adoption, every attempt not yet EFFECT-FINAL resolves
+  `source-erased` (reject-permanent — the owner's explicit D-112
+  erasure-wins choice inside a recovery ceremony; effect-final
+  imports stand);
+  once **resolved negative** — reject-permanent, fence-hardened, or
+  permanently non-revivable in quarantine (D-134) — the record is
+  eligible `missing` alongside never-arrived records, so the set is
+  total — v0.5.8's no-attempt literal left a one-record
+  reject-permanent transfer unable to write its non-empty abort;
+  a delayed proof
+  can then never admit an import an XferAbort already listed); the
+  flat bundle is underivable — the erased statement's membership in
+  `content_digest` cannot be re-proven; committed imports stand; (3) else destination **resolved-negative**
+  records (reject-permanent or permanently non-revivable, D-134) →
+  recovery completes the completable remainder, then
+  `XferAbort`, `reason = "reject-permanent"` — a true transfer
+  terminal, an effect: it gates at the release's effect-final
+  coordinate exactly like `XferDone` (D-126; only the
+  `"release-rejected"` cleanup abort sits outside that gate) —
+  `missing` = the
+  resolved-negative set. `missing` is always non-empty (an empty residue is
+  case 1). **Dormancy (D-113)**: a PendingXfer whose release is
+  displaced before effect finality goes **dormant** — no imports run
+  while the release is displaced (D-94 already forbids execution);
+  it revives with the release's re-acceptance (same `release_op`,
+  same journal — the identity is the release's own, never shared,
+  D-123), and if the
+  release resolves negative — reject-permanent or permanently
+  non-revivable (D-134) — the journal closes with the
+  cleanup `XferAbort` (`reason = "release-rejected"`, `missing` =
+  all un-imported records;
+  journal cleanup outside the finality gate — liveness, not
+  authority; D-119/D-126). **Terminal states
+  are two (D-65)**: `XferDone`, or `XferAbort { export_id,
+  release_op, incarnation, reason,
+  missing: [{ rec, ? basis }] }` — written when a remaining import
+  can never complete (a
+  source erased mid-transfer; a destination `reject-permanent`);
+  completed imports stand (candidates with provenance), the missing
+  source_ops are recorded, the journal closes. Egress-endpoint
+  releases write NO PendingXfer — they complete at release acceptance
+  **∧ effect finality** (D-94/D-101: acceptance authorizes; the
+  escape itself waits for the immutable-closure gate; nothing
+  imports). **A PendingXfer clears only on the CURRENT interval's
+  XferDone or XferAbort (D-157)** — never on OutboxMark, which
+  cannot
+  identify a transfer. **Terminal basis and reopen (D-140/D-148/D-157)**: the journal is
+  a
+  **transition fold** — one EFFECTIVE terminal per interval,
+  intervals chained by `XferReopen`. Each `missing` entry carries
+  its own optional `basis` — **the WRITER-CHOSEN sufficient cause,
+  typed and monotone (D-157/D-163/D-179/D-193)**: any one
+  branch-relative
+  fact sufficient at the terminal's writing, carried as an
+  **`opfactref`** (op-kind ONLY, D-193 — v0.5.17 typed bases as the
+  full op-or-statement union in this sentence and the CDDL while
+  D-185 ruled them op-kind; INVALIDATION keeps the full `factref`
+  union, where fork-discovery statements are real) —
+  the journal is replicated log bytes, so the recorded cause IS
+  canonical (every replica reads the same record; verification is
+  fact-held, never order-dependent) and the reopen rule is
+  monotone: the journal reopens when the RECORDED cause dies, even
+  if another sufficient fact now holds — re-derivation at interval
+  n+1 simply re-terminals with the surviving cause (v0.5.14's
+  first-in-fold-order had no cross-feed order; v0.5.15's
+  minimal-hash-at-`at` could not place tenant facts or issuer
+  statements against a control coordinate — both withdrawn,
+  D-179): a control boundary (seal, void,
+  eligible cap, retirement, revocation) OR a tenant fact — the
+  closed cause
+  vocabulary is exactly D-149's branch-relative class, mapped
+  outcome by KIND and total (D-163/D-179/D-185): `cutoff` → the
+  boundary op; retirement-driven `scope-space` → the retirement
+  op, while **static scope/flow/class mismatches are basis-free
+  intrinsic (D-185)** — a wrong-scope grant that was never
+  otherwise, `no-flow`, and class exclusions cite no fact because
+  none exists and none can dissolve; `no-grant` with a revoked
+  grant / fold
+  `cert-revoked` → the
+  revoking op; **proven `cert-superseded` → the certificate-ending
+  op** (the supersession or revocation acceptance, D-187); the
+  ceilings → the ceiling-setting op;
+  fence-hardened `deadline-unreceipted`/`lease-missing`/
+  `causal-missing` → the hardening checkpoint op; control-relative
+  `body-invariant` / `request-fork` → the contradicting/conflicting
+  control op; **basis is ALWAYS op-kind (D-185)** — no reachable
+  trace makes an issuer statement a sufficient terminal cause;
+  stmt-kind factrefs serve INVALIDATION, where they are real (a
+  fork-discovery statement kills a qualification); **
+  `import-collision` is a FOLD outcome, never a
+  terminal cause (D-177)**: the collided record was IMPORTED by
+  its winner (`XferDone` counts it), or the winner is an
+  unresolved attempt and the terminal defers — no reachable trace
+  lists a collision in `missing` (v0.5.15's conjunctive
+  `(winner, freeze_basis)` cause and its abort-reopen vector are
+  withdrawn with the reachability);
+  **the cause table is ONE list (D-193 — v0.5.17 kept two
+  conflicting basis-free lists)**: basis REQUIRED, with its op —
+  `cutoff` (the boundary), retirement `scope-space` (the
+  retirement), revoked-grant `no-grant` / fold `cert-revoked` (the
+  revoking op), proven `cert-superseded` (the ending op), the
+  ceilings (the ceiling op), fence-hardened deadline/lease/causal
+  (the checkpoint), control-relative `body-invariant` /
+  `request-fork` (the contradicting op); basis FORBIDDEN — the
+  intrinsic byte failures, static scope/flow/class mismatches,
+  and `source-erased`; basis
+  presence is thereby the reopenable/stable discriminator
+  (v0.5.11's single scalar could not arbitrate two records
+  negative under independent boundaries). **The invalidation
+  predicate (D-157)**: a recorded basis invalidates when its fact
+  dissolves, displaces, or retro-quarantines
+  (D-128/D-131/D-138/D-155); the
+  plane writer then appends **`XferReopen { export_id, release_op,
+  incarnation, basis, invalidation }`** — citing the invalidated
+  basis and the **factref** of the fact that killed it (an
+  operation hash or an issuer-statement `stmt_id` — D-163/D-185:
+  legality is thereby **verifiable-when-held** — a replica or a
+  fresh rebuild that does not yet hold the cited invalidation
+  PENDS the reopen rather than quarantining it, so feed order
+  never divides replicas; an uncited or unverifiable citation is
+  `log-corrupt`, storage-quarantine — v0.5.13's reopen carried no
+  evidence and its legality was unreconstructible) —
+  and recovery re-derives **per record**:
+  entries whose bases stand remain missing, newly completable
+  records complete, and there is NO implicit abandonment (a
+  terminal must be stable under
+  every allowed future transition, never merely negative on the
+  current branch — v0.5.10's terminals outlived removable bases).
+  **The journal object is frozen (D-192/D-200)**: the transfer
+  journal is
+  the zone log's txnrec projection in **`(frame ordinal, record
+  index)` order** — ONE append
+  authority (the plane writer), the log's physical order the
+  journal order, records inside one Txn validating SEQUENTIALLY
+  against transaction-local state and committing all-or-nothing
+  (D-200 — frame order alone never ordered two journal records
+  inside one Txn), replay = fold in that order (D0-B transports
+  the stream verbatim; the D-179 replicated-bytes reasoning now
+  names its carrier); `XferAbort` and `XferDone` carry explicit
+  `incarnation` (self-describing, matching `XferReopen` — v0.5.17
+  derived intervals from an order no object froze), and an
+  incarnation mismatching the frame-order expectation, like every
+  interval violation, is `log-corrupt`.
+  **The interval machine is pinned (D-157/D-185)**: terminal(n) →
+  `XferReopen(n)` is legal ONLY after terminal(n)'s recorded
+  cause invalidates → interval n+1; **terminal-first reservation
+  (D-185)**: an Abort or Reopen whose cited factref is not yet
+  held is `ref-unresolved` — it PENDS and **reserves
+  `(release_op, incarnation)`**: later journal transitions for the
+  same journal pend behind the earliest pending one (journal order
+  survives pendency — a terminal-first delivery can never
+  double-terminal an interval), with the bounded re-fold applying
+  the reserved transition when its citation arrives; a HELD but
+  invalid citation is `log-corrupt` (storage-quarantine); a reopen
+  naming a wrong or
+  duplicate incarnation, a second terminal inside one interval, or
+  a reopen of `XferDone` violates a local storage invariant
+  (`log-corrupt` → storage-quarantine, like the rotation queue,
+  D-189); every
+  "one terminal", "never after an Abort", and "clears on its
+  terminal" statement reads over the CURRENT interval.
+  The terminal effect key is `("terminal", release_op,
+  incarnation)` (D-148 — a consume-once deduper would otherwise
+  suppress every post-reopen terminal). **`XferDone` never
+  reopens** —
+  completed imports stand as candidates with provenance, and a
+  post-Done removal falls into the stated escaped-effect residual.
+- **Control log**: separate file (`kind = ctrl`), frame type
+  `0x01 CtrlOp { SignedOperation triple bytes }` — legal **only**
+  here. Control operations are plane-wide validation material and are
+  locally plaintext by design.
+
+### 6.2 File framing v2 and recovery (owner ruling D-35)
+
+```
+file  = "IPLOG2" || format_version u8=2 || kind u8 (0=tenant, 1=ctrl)
+        || plane_id (32) || zone_id (16; CTRL_ZONE for the control log)
+frame = SYNC (4 bytes on the wire: 49 50 4C 52 = "IPLR")
+        || len u32-le                # counts type+payload exactly
+        || nlen u32-le               # ones-complement of len: an
+                                     # immediately checkable redundant
+                                     # length — an upward-corrupted len
+                                     # is caught BEFORE seeking, not at
+                                     # EOF
+        || type u8 || payload
+        || crc32c u32-le             # over len || nlen || type || payload
+crc32c: Castagnoli polynomial 0x1EDC6F41, init 0xFFFFFFFF, reflected,
+final XOR 0xFFFFFFFF (RFC 3720 convention). Payloads are the canonical
+CBOR of the frame type's registered CDDL shape.
+```
+
+- SYNC markers give independent resynchronization evidence; `len` is
+  covered twice (complement + trailing CRC).
+- **Recovery:** scan frames. `len ≠ ~nlen`, or a bad SYNC where a
+  frame must start, is corruption evidence: **quarantine** (a resync
+  event is never a silent skip). An **incomplete trailing frame** (EOF
+  inside the frame) truncates — it was torn; the truncation is durably
+  flushed **before** any new append. A **complete final frame with a
+  bad CRC is ambiguous** (torn write vs corrupted committed data): the
+  log **quarantines read-only** (outcome `log-corrupt`) and the store
+  enters replica/index rebuild — never silent truncation. A bad frame
+  followed by valid frames is media corruption: quarantine.
+- **L1 (durability primitive).** Commit = platform flush: Unix
+  `fsync` (file + directory on creation), Windows `FlushFileBuffers`;
+  atomic replace = `rename`/`MoveFileEx(MOVEFILE_REPLACE_EXISTING |
+  MOVEFILE_WRITE_THROUGH)`. Disk-full and flush-failure map to outcome
+  `storage-io` (disposition: writer freezes locally; no partial
+  frames are ever exposed as committed).
+- **L3 (cross-process).** One exclusive advisory lock per plane store
+  (Unix `flock`, Windows `LockFileEx`); losers get read-only
+  (`lock-denied`). Multiple controller processes per box are the
+  normal case.
+
+### 6.3 Browser mapping
+
+Object stores `items`, `wraps`, `receipts`, `frontier`, `index`,
+`meta` — no plaintext tenant-operation store; plaintext lives in
+memory only. One IndexedDB transaction per logical commit (the 0x18
+batch maps to one transaction). IndexedDB durability is a hint —
+request `navigator.storage.persist()` and `durability: "strict"`
+where supported; the degraded floor is the umbrella's zero-daemon
+floor, stated. Web Locks hold the tab writer lease (cooperative, not
+authorization); feature-detect, else read-only. Writer generations per
+§9.3.
+
+---
+
+## 7. Control plane
+
+### 7.1 Operation registry (control tenant)
+
+Every control operation, one row each — **body CDDL in Appendix A.3;
+fixtures instantiate these, never define them**. Common columns:
+lane = control chain (N1 constants, gen 1); replay = byte-identical
+duplicates idempotent, differing duplicates → C2; **`request_id`s are
+consumed (D-59)**: an accepted control operation's `request_id` may
+never recur in a different accepted control operation — reuse with
+differing bytes is outcome `request-fork` (reject-permanent), which
+makes the embedded attestations of `c.lineage_reauth`/`c.cutoff`
+actually single-use rather than merely labeled so; charge = none
+(control ops are uncharged; they are ceremonies).
+
+| operation_type (v1) | Arm | Transition (state effect) | Failure disposition |
+|---|---|---|---|
+| `c.genesis` (seq 1 only) | genesis | installs descriptor; admin epoch 1; repoch 0; **KEK epoch 1 and capability epoch 1** for the `private` zone; creates first cert, lineage (`max_generations = 8` pinned), the zone wrap to the first device, **exactly one `home` space** (space_class `personal`, class_minimum `private` — D-39/D-40 — status_policy `workflow-v1`) **and exactly one `audit` space** (space_class `audit`, class_minimum `private`, status_policy `owner-v1`), the B.1 ZonePolicy template instantiated, the first device grant (finite budget REQUIRED — pinned genesis default `{max_ops: 1000000, max_bytes: 268435456}`; hosted planes: the §7.5 safe verb set; trusted: the **15-verb set** — every verb except reserved `admin` and system-only `audit.write` (D-76)), and the **audit grant** (`ops = ["audit.write"]`, audit space, **the same device lineage** — one live lineage per device, so audit rides it; pinned budget `{max_ops: 1000000, max_bytes: 268435456}`). **Cross-field validity (D-68)**: cert/lineage/wrap/grants all name the same `device_id`; the first certificate's class is provenance-compatible (`hosted` ⇒ `hosted-browser`; `trusted` ⇒ `owner-browser` / `native-app` / `daemon` / `mobile-attested`); both grants carry `issued_admin_epoch = 1`, `capability_epoch = 1`, `tenants = ["memory"]`, the genesis zone, and the device lineage; the ordinary grant's `spaces` = exactly the `home` space (**it does not read the audit space** — audit reads require a later explicit grant and are themselves audited); the audit grant's `spaces` = exactly the `audit` space; `home_space.space_id ≠ audit_space.space_id`; every space names the genesis zone; `zone_policy.zone_id` = the genesis zone; the wrap has `zone_id` = the genesis zone, `epoch = 1`, `recipient_device = cert.device_id`, `recipient_kem_key = H_key({cert.kem_alg, cert.kem_pk})`; `plane_id` fields equal `H_genesis(descriptor)`; budgets and the generation window are positive; **grant completeness (D-76)**: both grants carry `class_ceiling = sensitive` (D-85 — home/audit are private-minimum; a lower ceiling could not operate), no `expiry_deadline_ms`, `online_lease = false`, no `flows`, `kinds` absent (= all), `can_declassify`/`can_raise` absent — `raise`/`declassify` ride the ordinary grant but stay **inert** until a later flagged `c.grant` (deliberate: genesis boots storage and judgments, not classification levers) | reject-permanent |
+| `c.enroll` | admin | a **CDDL union of two shapes discriminated by `cert.renews`** (D-89 — v0.5.3's single shape made the D-84 renewal unencodable). **New device** (`cenrollnew`): cert + `grants[]` + lineage + wraps for granted zones. **Renewal** (`cenrollrenew`): cert + **the predecessor signing key's `feed_closure`** (`{key_id, through, head_hash}` — REQUIRED, supersede purpose, D-111: makes "historical scopes closed" executable) + `history_cutoffs` (≤ 64, MAY be empty when coverage is empty; zones beyond 64 covered by pre-established staged closes — `ccutoff.closes`, D-136: ratify state never counts; union coverage validated over the **authorship domain, D-141**: every zone named by the device's active op-authoring grants at this operation's position — finite by D-32, one zone per op-authoring grant — INDEPENDENT of KEM membership, so a device excluded from a zone's wraps still closes its authored history there; v0.5.10 keyed coverage to current membership and orphaned predecessor authorship in excluded zones; **total by composition (D-151)**: every PAST op-authoring grant is either active (covered here) or revoked — and revocation already carried its own immutable frontier delimiting exactly that authority (D-78/D-143), with position-relative certificate validity (D-86) keeping the pre-boundary prefix standing after supersession — the renewal-after-revocation vectors ride the profile that implements renewal — fail-closed in P1 v1, D-203, none exist yet; the D-151 row correction, 2026-07-16) + replacement wraps **iff the KEM key rotated** (one per zone of the device's **current-membership set** (§4.3, D-125/D-133 — never grant-only zones, never zones a later epoch excluded: a renewal mints no new access and never undoes an exclusion) **at its latest accepted epoch** — older epochs' KEKs are destroyed and queued staging re-targets via its own wrap-adds; the v0.5.5 every-epoch/drain rule was unsatisfiable and is void, D-104; `recipient_kem_key` equal to the renewed certificate's KEM key, superseding by `(zone, epoch, device)`; predecessor-KEM custody retained until every **locally unretired epoch at which the device actually holds an old-KEM effective wrap** gains a wrap targeting the device's **current effective KEM key** (any DESCENDANT of the old key — transitive across overlapping K0→K1→K2 renewals, a K2 wrap satisfies K0's obligation, D-141) or retires locally — absence of a wrap at an epoch never obliges one, so an excluded device's Kold drains as its old-wrap epochs retire, D-133 (v0.5.9's every-epoch-of-every-zone predicate made Kold undeletable across an exclusion; v0.5.8's active-only predicate went true too early — both void; custody is LOCAL state — admission never reads it, D-125); coverage via post-acceptance `c.wrap_add`s; no new-zone acquisition; absent when the KEM key is unchanged) — `grants[]` and `lineage` never appear: renewal mints **no grants and no new-zone access** (D-84/D-97). **The renewed certificate's `class` MUST equal the predecessor's** (a class change is a new enrollment ceremony, never a renewal — D-89); at most one live lineage per device — a second while one lives rejects; **every `grants[]` entry and every wrap targets the enrolled/renewed certificate's `device_id` (D-76)**; a `grants[]` entry creating a destination zone's second active `import`-verb grant rejects (D-139/D-146 — the invariant binds EVERY grant-bearing operation, not `c.grant` alone); **key freshness is plane-wide over the portable TYPED domain (D-141/D-150/D-167/D-175)**: a new OR renewed certificate whose signing or KEM `key_id = H_key({alg, pk})` — **or role-neutral `mat_id = H_mat(SEC1 point)`, D-175: the same P-256 point under different algorithm tags is one material, and a certificate whose `sig_pk` and `kem_pk` are the same point rejects** — is in the freshness domain (T3 — surviving enrollments ∪ recovery-carried `retired_keys` ∪ adopted typed history, D-158/D-164) rejects per the domain's typed rules: another device's KEM key rejects, a same-device KEM key rotated away never returns (K0→K1→K0 rejects; unchanged-KEM same-device renewal stays legal; only the TERMINAL adopted key re-enrolls on its device; an unadopted, uncarried cut-branch key was NEVER burned — explicit residual, D-167; all under EXACT-SEC1 identity — −P and related keys are outside the equivalence, stated §14 residuals, D-190) — without this, an excluded device's reused KEM key inside another device's certificate would decrypt that device's wraps | reject-permanent |
+| `c.revoke_device` | admin | `mode: "exclude" / "compromise"`; cert revoked; grants revoked; lineage cutoff at named head; rotations **by reference** (`rotation_refs` naming separately committed `c.kek_rotate` ops — embedded rotations would overflow the control cap). **Early exclusion is explicitly accepted (D-50)**: referenced rotations are INDEPENDENTLY effectful when accepted — exclusion is monotone-safe, it only ever removes access. **One completion law (D-180/D-186)**: the compound's cert/grant/cutoff effects begin when ALL THREE hold — (1) every reference validates as **linkage** (its rotation's wrap set excludes the target, accepted after the target's last accepted wrap for its zone); (2) the authorship-domain `cutoffs` are total; (3) the target's **decryptable-wrap domain (D-173)** — every zone with at least one accepted epoch at which the target holds an effective (unsuperseded) wrap NOT already followed by an accepted rotation excluding it — is EMPTY at the evaluating position (accepted exclusions shrink it themselves; a `c.wrap_add` re-admission re-enters it pre-completion); incomplete authorship coverage or a nonempty wrap domain holds the compound at **`ref-unresolved`** (awaiting completing exclusions/cutoffs — the context widened, D-195), an unheld reference is `ref-unresolved`, a held-invalid reference is `body-invariant` (v0.5.16 carried the withdrawn references-must-cover law and the D-50-era every-reference-accepted trigger beside the state-derived law — three completion rules in one row, D-186); **the certificate ceases at the COMPLETING acceptance's position (D-195)**: a pending compound ends nothing yet — a grant issued in the window was issued while the certificate was effective and stays compatible (D-187's coordinate for delayed completion, vectored); **the `cutoffs` cover a DIFFERENT domain (D-159)**: the target's **authorship domain** — every zone named by its active op-authoring grants (D-32/D-141), grant-only and later-excluded zones included (v0.5.12 keyed both to wrap zones, so authored-but-unwrapped history escaped the revocation frontier and D-151's pre-covered-by-revocation composition failed there); `compromise` additionally carries **`receipt_cutoffs`** — per signing-key `(key_id, accepted_through issuer_seq)` — because receipt feeds are their own ordering domain (tenant heads cannot delimit them); the device's receipts **and leases** past those cutoffs are retro-disqualified (T4); each entry commits its boundary — `{ key_id, through, head_hash }`, `head_hash` = the `stmt_id` of statement #through (all-zero at 0; D-87) — and repeated cutoffs for one scope merge at the **minimum** effective position. **Exactness (D-68)**: the revocation target is `revocation_id` (D-71) — it equals the target certificate's `revocation_id`, which renewal preserves, and the compound revokes every certificate bearing it; grant revocation is **derived (D-85)**: acceptance revokes every active grant whose `subject_device` bears the target `revocation_id` — no enumeration, unbounded-safe (v0.5.2's complete-set field is removed); each referenced rotation MUST be accepted **after the target's last accepted wrap** for that zone (a stale rotation preceding a re-wrap excludes nothing); `cutoffs` are `frontierclose`s naming the target's lineage exactly (empty `heads` for a lineage with no accepted ops — D-143; selector = every certificate bearing the `revocation_id`) and each carried head belongs to its named zone; continuations (`c.revoke_zones`) may arrive in any order — **the compound completes when the authorship-domain `cutoffs` are total AND the decryptable-wrap domain is EMPTY at the completing position (D-165/D-180)** — emptiness is STATE-DERIVED: accepted exclusion rotations shrink the domain themselves, so `rotation_refs` never discharge coverage (an accepted exclusion removed its zone before any reference was checked — v0.5.15's references-cover-the-domain rule was ceremonial: if the rotation exists the zone is already gone, if the zone remains no citable rotation exists); references are **typed linkage** — each MUST be a valid post-last-wrap exclusion of the target, they carry the D-71 exclusion-freeze linkage, and they are MANDATORY on hosted planes (§7.5) — never coverage proof (`cutoffs` MAY be empty — a zero-authorship device is legally revocable), and the control chain continues past a pending compound (pendency blocks only the revocation's own effects); at most **one live compound per `revocation_id`** (a second while one pends → `body-invariant`); the D-71 exclusion freeze applies on **every** plane, not only hosted | pending-dependency → reject-permanent |
+| `c.revoke_zones` | admin | continuation of a pending `c.revoke_device` (same `revocation_id`) carrying further exclusion-rotation references **and/or further zone cutoffs** (each array in the main operation caps at 64, E8) | reject-permanent |
+| `c.wrap_add` | admin | adds a KekWrap for an enrolled device at the epoch it names — valid for **any accepted epoch** (a pure control-log fact, D-97: control admission never reads local Fence progress; a wrap for a locally retired epoch is inert — its KEK no longer exists for the author to wrap; D-89: a queued rotation's staging survives a later rotation's acceptance); a wrap for an existing `(zone, epoch, device)` logical key **supersedes** the prior wrap; recipient-key equality per the global `kekwrap` rule (D-116/D-125 — the device's effective unsuperseded certificate); a 257th recipient of any accepted epoch rejects (D-110/D-125 — the cap is control-derived, matching this row's own no-Fence-reads rule) | reject-permanent |
+| `c.zone_create` | admin | zone + KEK epoch 1 + **capability epoch 1** + initial wraps (never wrapless) + ZonePolicy | reject-permanent |
+| `c.space_create` | admin | space: zone, name_hash, **space_class** (closed: `workflow` / `personal` / `project` / `audit`), class_minimum, status_policy (polref w/ hash) | reject-permanent |
+| `c.space_policy_set` | admin | rebind class_minimum / status_policy / space_class | reject-permanent |
+| `c.space_retire` | admin | space retired — **an epoch event with MANDATORY closure (D-132/D-138)**: acceptance **advances the zone's capability epoch by 1** (§9.4) and binds the retirement to that epoch — a write naming the space and signed at or beyond it rejects (`scope-space`); because a writer can deliberately sign an older epoch (epoch staleness is not an admission predicate, and lenient zones keep old-epoch writing open by design), retirement additionally REQUIRES **frontier-close coverage** of **every live lineage of the zone (D-151), regardless of strictness** (inline `closes` on the body ∪ the zone's UNCONSUMED staged `ccutoff.closes` (D-153), materialized with selector = epochs below the retirement — incomplete coverage rejects; old-epoch backdating dies on the immutable frontier, not on the epoch anchor; v0.5.10's anchor-only rule was backdateable by design, and v0.5.11's scalar leaked lower live generations, D-143); reads/status unaffected | reject-permanent |
+| `c.zone_policy` | admin | install full ZonePolicy (versioned; explicit — policy NEVER changes implicitly, incl. on witness arrival; owner ruling D-28); **acceptance advances the zone's capability epoch by 1 (D-69)** — operations signed at older epochs keep their old policy anchor (§9.4); `deadline_fallback = "fail-closed"` REQUIRES `require_cert_deadlines = true` (cross-field, D-76); **closure entries (D-78/D-93/D-136/D-143)**: MAY carry `cutoffs` — **`frontierclose`s** closing old-epoch writing per lineage (selector = epochs below this advance; total-override semantics end lower live generations AND future generation-opening — v0.5.11's lex scalar did neither) — under `strict`, the **union** of this operation's entries and the zone's UNCONSUMED staged frontiers (`ccutoff.closes` — consumption is automatic, total, and one-shot, D-153: prior advances' materialized entries NEVER count) MUST cover every live lineage (D-151: those with an active op-authoring grant — revoked ones are pre-covered by their revocation frontiers; ratify state never counts; a >64-lineage zone stages `ccutoff.closes` first); each entry names this zone and a live lineage | reject-permanent |
+| `c.service_key` | admin | installs a **service-key descriptor** `{ service: "connect", alg, pk }` into the plane's append-only **descriptor registry** (keyed by `key_id = H_key({alg, pk})`; byte-identical re-install idempotent; any number per admin epoch). Descriptors are verification **history** — installing a successor never invalidates a predecessor (D-70); which key is *qualified* is decided solely by the zone policy's `connect_service_key` leaf at the operation's epoch anchor (D-69), so **rotation = install + explicit `c.zone_policy` rebind** (which advances the epoch); operations anchored at older epochs keep resolving the older leaf. **Compromise (D-58 as amended by D-70)**: MAY carry `receipt_cutoffs` (set, keyed by `key_id`) targeting **any** installed service key — that key's receipts **and leases** with `issuer_seq` beyond the cutoff are retro-disqualified (T4); admitted operations resting solely on them → quarantine-reproposal (D-69); pre-cutoff history stands (stated residual) | reject-permanent |
+| `c.grant` / `c.revoke_grant` | admin | issue / revoke capability; issuance to a device whose `revocation_id` is revoked **rejects** (`body-invariant`, D-92); **one active `import`-verb grant per destination zone (D-139)**: issuing a second while one is active rejects (`body-invariant`; the genesis grant counts) — imports thereby ride ONE lineage per zone, giving the import replay key a canonical total order; issuance creating a device's **129th held zone** rejects (D-109/D-133 — `held_zones` counts current membership, so a later epoch's exclusion frees the slot; keeps KEM renewal encodable under the 128-wrap cap); **revoking an op-authoring grant carries a REQUIRED `frontierclose` (D-78/D-143)** naming **that grant's zone and lineage** (equality, D-93) — a **revoke** boundary (selector = the revoked grant), immutable once accepted (no later ratify cutoff extends the revoked authority); the grant's operations at or below the carried heads stand, beyond them — or in uncarried generations — quarantine (`cutoff`); read-only revocation is edge-effective (no chain impact) | reject-permanent |
+| `c.cap_epoch_bump` | admin | zone capability epoch +1 — body `new_epoch` MUST equal the zone's current capability epoch + 1 (`body-invariant`; §9.4 consecutiveness, consumed at validation); opens a new budget window (D-79); closure `cutoffs` (`frontierclose`s) per the D-78/D-93/D-136/D-143/D-153 union-coverage rule (UNCONSUMED staged `ccutoff.closes` count — one-shot, never a prior advance's entries, never ratify state; each entry names this zone and a live lineage, D-151) | reject-permanent |
+| `c.lineage_reauth` | admin (hosted: own lineage only, §7.5) | opens a new `max_generations` window on the lineage; **budgets and cutoffs persist**; body carries a REQUIRED **requester attestation** `Sign(device_sk, msg("reauth", { plane_id, lineage, max_generations, request_id, ctrl_frontier, lineage_version, repoch }))` — bound to this operation's `request_id` (single-use, D-59), the lineage's monotonic `lineage_version` (0 at creation; never resets on the surviving branch), and the current `repoch` (defeats the C3′ branch-cut path — D-87); every bound value is control-plane and monotone (the reconstruction invariant, D-100 — v0.5.5's tenant-derived `gens_total` was signed-but-not-carried AND non-monotone under D-94 displacement, and is removed). **Posture (D-100)**: a reauth attestation is **durable one-shot assent** — later tenant writes do not invalidate it (an exhausted window cannot move, and an early-signed request applied later merely opens the window later, which delayed acceptance could do anyway); admission requires equality with both bound values at this operation's control position; the admin-arm header alone cannot prove "own lineage"; **acceptance is a widening event of the derived revisit inventory (D-132)**: held operations quarantined `lineage-gen` revive under the new window | reject-permanent |
+| `c.kek_rotate` | admin | §5.5 machine; wrap-adds (≤ 128, E8 — larger memberships complete via current-epoch `c.wrap_add` before `RewrapComplete`, D-77); optional typed erase_manifest (≤ 128 entries, E8 — the erase queue drains across successive rotations, §5.4) | reject-permanent |
+| `c.cutoff` | admin (hosted: own lineage only, §7.5) | a **set** of per-generation **ratify** cutoffs (`ratifycutoff`, App A.3 — boundary purpose D-93; ≤ 64, keyed `(zone_id, lineage, gen)`, D-120: each entry binds exactly one generation with `accepted_through.gen == gen` — `accepted_through` is always a Head, the `"none"` arm is REMOVED (D-136: requester form requires equality with a carried head, D-129, and requesterless `"none"` became a pure no-op once coverage moved to scalar close state — an assertion with no effect is unencodable, E4; zero-history retirement rides the total snapshot override, D-135, or seal/close authority) — one operation still retires several unknown-gap heads, D-80; v0.5.8's gen-less `(zone_id, lineage)` key made two generations of one lineage non-canonical in one operation and is void); MAY carry a **requester attestation** `Sign(device_sk, msg("cutoffreq", { plane_id, cutoffs, live_heads, request_id, ctrl_frontier, lineage_version, repoch }))` — REQUIRED on hosted planes (D-54); **when the requester is present — on ANY plane — every entry names the requester's own lineage** (D-120: the signature binds one scalar `lineage_version`; a trusted multi-lineage ceremony goes requesterless); `requester.device_cert` resolves to a certificate whose `device_id` owns that lineage and the signature verifies under that certificate's key (D-77); bound to this operation's `request_id` (single-use, D-59), the lineage's monotonic `lineage_version` + current `repoch` (D-82/D-87; `gens_total` removed — D-100), and the requester's **carried `live_heads`** (App A.3 — the full per-zone live-head *sets*, plural for unknown-gap lineages; the signed message reconstructs from the body plus control history, D-100). **Snapshot-wins (D-108/D-114/D-135)**: the carried `live_heads` ARE the boundary, and the override is **TOTAL over generations** — a carried generation overrides to its carried head, an UNCARRIED generation to `"none"` — so every uncarried successor AND every uncarried generation retires deterministically at this operation's fold position, on every replica, regardless of arrival order (v0.5.6's equality-against-current-heads check was fold-relative and is void; v0.5.10's carried-only override retired nothing under an empty carry); an extra head a validator already holds is not staleness, it is simply beyond the boundary; **coherence is equality (D-114/D-129)**: each `cutoffs` entry names a generation present in the carried `live_heads` for its zone with `accepted_through` **equal to** that carried head (`body-invariant` on any mismatch — v0.5.9's ≤ made below-snapshot entries admission-inert) — the entries ARE the snapshot's per-generation ratifications, byte-checkable against the carried set; `cutoffs` MAY be empty when the requester is present (a pure snapshot-retirement ceremony — the representable zero-history form: an empty `heads` entry inside a named zone overrides EVERY generation to `"none"`, D-129/D-135; the requester's `live_heads` itself MUST be non-empty — a requester with no `zoneheads` entry names no boundary and rejects, D-151) or when `closes` is non-empty (a pure staging operation, D-136) — an operation with neither entries nor closes nor requester is `body-invariant`; **requesterless (trusted planes, D-120)**: no snapshot boundary exists and the equality check does not run — entries fold directly (first = `Bounded`, later max-compose, D-135) and validate against the effective-state equation alone (D-121: seal and incorporation clamps, referenced-head resolution); **`closes` staging lane (D-136/D-143)**: the operation MAY carry `closes` — **`frontierclose`s** (full live-head frontiers), INERT until a consuming advance/renewal/retirement materializes them with its selector (D-143) — the staging lane for wide-zone coverage; requesterless/trusted only (`closes` alongside a requester, or under the hosted ceiling, is `body-invariant` — hosted `c.cutoff` stays ratify-only); **a carried head the validator does not yet hold pends** (`ref-unresolved`, D-102 — never `sig-invalid`); residual, stated: the requester is its lineage's only writer, so its own unpublished writes beyond the named heads are knowingly retired | reject-permanent |
+| `c.abandon_writer` | admin (hosted: own lineage only, §7.5 — D-107) | **per-generation seals** (D-107): a set of `{gen, at}` entries (≤ 64, keyed by gen; `at = "none"` voids the whole generation) sealing exactly the named generations — operations beyond a seal quarantine permanently (no ratify revival — a later-in-control-order ratify cutoff may never exceed it, `body-invariant`); **repeated seals for one generation compose at the minimum** (`"none"` strongest — they min-fold into the generation's `immutable_cap` alongside incorporation caps, D-121); **unnamed generations are untouched** (an old gap closes while the live branch survives); the seal confers **effect finality** for the generations it closes (D-101); seal authority is control-authorized and receipt-independent (never revisited) — its acceptance is a retirement event of the derived inventory (D-114); **truncation posture (D-114)**: sealing below accepted history and `at = "none"` voids are deliberate owner-grade truncation — the admin arm already holds recovery-grade authority, and the hosted self-seal is scoped to the requester's own lineage; legal, product-surfaced, vector-pinned, with escaped effects under the stated residual (a carried lower bound was rejected as non-portable — it would reintroduce the fold-current comparison D-108 removed); an unheld named Head is `ref-unresolved` (pending, D-102); the hosted form carries the D-54 requester attestation `Sign(device_sk, msg("abandonreq", { plane_id, zone_id, lineage, seals, request_id, ctrl_frontier, lineage_version, repoch }))` — snapshot-wins, own lineage only | reject-permanent |
+| `c.checkpoint` | admin | **zone-scoped (D-62), embedded (D-80), paged (D-88)**: the body IS the checkpoint object (App A.2 `checkpointobj`, no `v` — E6); the operation hash is its identity, the control log its carriage. `prev_checkpoint` chains the zone's checkpoints (`"genesis"` first); `covers` = a **page** of accepted heads (≤ 256; the zone's effective coverage = the latest entry per `(lineage, generation)`, omission never removal — D-111/D-118; one operation never carries a full 4096-head Frontier); `fences` = per-lineage coordinates ≥ that lineage's covers head — **pending operations compare against `fences`, not accepted heads** (a pending op always sits beyond the accepted head, so v0.5.3's covers-relative rule could never fire — D-88); a fence coordinate asserts the author waited past it. `retired` = **the retirements this checkpoint causes** (≤ 256; D-96 — not an event log): each member live in **this operation's pre-state**, ≤ its lineage's fence, incorporation-eligible (D-76) — the fold removes exactly `retired`, never bare coverage; immediate `w.gen`/cutoff retirements happen at their own operations and are never re-listed; an omitted eligible head simply stays live for a later page. **Page semantics (D-96/D-103/D-111)**: replacement is keyed per **`(lineage, generation)`** — a later page's entry for `(L, g)` replaces the earlier `(L, g)`; entries for L's other generations persist until replaced or retired, and **omission is never removal** (removal rides `retired` alone — v0.5.6's per-lineage wording was ambiguous for multi-head lineages and is void); a later fence for L MUST be ≥ the earlier and a later covers head for `(L, g)` ≥ the earlier (`body-invariant` — coverage and fences never regress); fence ordering uses the D-102 comparator **projected to `(gen, seq)`** (`fencecoord` carries no op hash — D-111); a page whose three head arrays are all empty is legal (a pure proof-positions checkpoint; it touches no coverage); successive `proof_positions` for one issuer are ancestor-consistent and nondecreasing (D-103) **and ancestry-compatible with the scope's full commitment registry — compromise cutoffs and renewal closures included (missing evidence pends `ref-unresolved` and reserves the scope; proven divergence is `body-invariant` — D-124/D-131)**; a renewed witness key is a **new issuer identity** — its predecessor scope is closed by the renewal's own feed closure (D-111), and **closed scopes are exempt from hardening coverage** (a fence need not name them; delayed old-key receipts verify against the closure, post-renewal mints die on it). `proof_positions` = currently qualified issuers only (≤ 64, `head_hash`-committed per D-87/D-95; closed feeds live behind their cutoffs). **Joint budget (D-96)**: the encoded `checkpointobj` MUST fit **48 KiB** (the four member caps are not jointly constructible at their maxima; the author balances pages within the budget — encoder-exact family-1 vector). **Hardening (narrowed, D-77/D-88)**: a checkpoint whose lineage fence covers a pending operation's signed `(lineage, gen, seq)` AND whose committed proof feeds cover every qualified witness hardens `deadline-unreceipted`/`lease-missing` to quarantine; `causal-missing` hardens when the fence covers the missing predecessor's coordinates and it is absent; `cert-superseded`/`policy-missing` never fence-harden | reject-permanent |
+| `c.admin_succession` | admin(e), epoch = e+1 | admin key rotation | reject-permanent / freeze on duplicate (C2) |
+| `c.recovery_succession` | recovery | §7.4 C3′ | freeze on same-repoch competition |
+| `c.drill` | recovery | records a successful drill. Admission is the recovery-arm signature alone — **"trusted lane" is product guidance, not a portable admission predicate** (replicas cannot verify where bytes were authored; the phrase-never-in-hosted-code rule is enforced by the clients, same as the ceiling lift) | reject-permanent |
+
+**Cutoff algebra (D-93).** Every cutoff carries the **boundary
+purpose** of its carrying operation — the purposes are disjoint
+authorities, never composed across kinds:
+
+- **ratify** (`c.cutoff` only): grows the
+  ratified-history boundary — **per generation (D-114/D-120)**: a
+  `ratifycutoff` binds exactly its named generation (`gen` explicit
+  on the wire — v0.5.8's gen-less `zonecutoff` could not carry two
+  generations of one lineage past the E7 key and is void); multiple
+  accepted ratify cutoffs compose at the **maximum**
+  `accepted_through` per `(zone, lineage, gen)`, and quarantine and
+  revival are per-generation derived fold state — a later, larger
+  same-generation boundary revives previously quarantined
+  operations (cascading, deterministic re-derivation); other
+  generations are untouched (v0.5.7's scalar lineage-wide boundary
+  collided with per-generation caps and is void). Ratify never
+  confers effect finality (D-101). The remaining purposes ride the
+  **frontier-closure shape** (`frontierclose`, D-143): a full
+  live-head set with total-override semantics — v0.5.11's lex
+  scalar could neither bound several live generation chains (a
+  lower live generation kept writing below the scalar) nor end
+  future generation-opening, and D-120's "one scalar head ending
+  everything beyond it" was false for multi-head lineages.
+- **supersede** (renewal `history_cutoffs` — `frontierclose`,
+  selector = **the predecessor certificate**, D-143): delimits the
+  predecessor's authorship; **immutable once accepted** (D-102 — a
+  later generic ratify cutoff never widens a superseded
+  certificate's boundary; v0.5.5 pooled these with ratify, which
+  reopened exactly the widening D-93 closed for grants).
+- **revoke** (`c.revoke_device` cutoffs; `c.revoke_grant.cutoff` —
+  `frontierclose`, selector = **the revoked grant / every
+  certificate bearing the revocation_id** (D-143);
+  service/device `receipt_cutoffs`): an authority-ending boundary,
+  **immutable once accepted** — never composed, never widened; a
+  later ratify cutoff at a higher head does NOT extend the revoked
+  authority (the revoke boundary binds the revoked cert/grant/key
+  alone; the equality pins below scope it). Receipt cutoffs
+  reconcile with T3 so: each accepted cutoff is individually
+  immutable; the scope's **effective** boundary is their
+  intersection — the minimum (D-102).
+- **close** (`c.zone_policy` / `c.cap_epoch_bump` /
+  `c.space_retire` closure entries — `frontierclose`, selector =
+  **capability epochs below the advance** (D-143)):
+  ends old-epoch writing per lineage; immutable once accepted.
+- **abandon** (`c.abandon_writer.seals`): seals **named
+  generations** at named heads (per-generation, D-107 — an old gap
+  closes while later live branches survive; v0.5.6's single scalar
+  Head could not express that and is void); **immutable once
+  accepted** (D-101) — a later ratify cutoff may never exceed an
+  abandonment boundary (`body-invariant`); abandonment is the
+  effect-finality seal for unknown gaps. Seal **authority** is
+  control-authorized and receipt-independent — never itself
+  revisited; seal **acceptance** is a retirement boundary event of
+  the derived revisit inventory (D-114): operations beyond it
+  quarantine permanently.
+
+- **recover** (`c.recovery_succession.tenant_cutoffs` —
+  `frontierclose`, selector = **global/unqualified** (D-143):
+  a branch cut truncates history for every authority): branch-cut
+  boundaries; immutable once accepted.
+
+**Incorporation cap (D-107/D-114/D-122/D-128)**: a
+`w.gen(last_known = H)` is itself an immutable boundary — it
+permanently caps ratification of the incorporated generation at
+`H`. **Provenance is held bytes, never acceptance history
+(D-122)**: the cap exists for every **held, cap-eligible** `w.gen`
+— budget acceptance,
+displacement, and revival never
+create or remove it (v0.5.8's once-accepted rule was an
+arrival-history fact: a replica that accepted the `w.gen` before
+its displacer arrived kept a cap a displacer-first replica never
+created, and a fresh fold sided with the second — the defect class
+D-108/D-115 removed; a held-bytes fact is a set property, identical
+wherever the bytes are, stable under budget events, and
+restriction-only, so over-inclusion fails closed).
+**`cap_eligible` (D-128 — signature possession is NOT truncation
+authority; v0.5.9's signature-only predicate let a revoked or
+wrong-lineage signer permanently truncate another principal's
+history)**: the `w.gen` is admissible under its own signed anchors
+with only budget consumption and deadline/lease receipts ignored —
+strict parse and body hash; certificate installed, unrevoked, and
+unsuperseded at the signed anchor (position-relative, D-86); the
+device owns the named lineage; an op-authoring grant valid at the
+signed capability epoch; generation arithmetic over the held
+canonical chain (`g` = highest opened + 1); and same-zone/lineage
+**chain-membership validity** of `last_known` — the named Head is a
+valid position ON the held canonical chain of its generation,
+**never terminality (D-144)**: v0.5.11 left the evaluation stratum
+undefined (in W's pre-state H5 was terminal; in an all-held fold a
+delayed successor H6 de-terminalized it; judging H6 under W's own
+cap was circular — arrival orders diverged). `last_known` is the
+writer's **truncation assertion**: the cap quarantines later
+same-generation successors deliberately (the D-114 truncation
+posture; W-first, H6-first, and fresh folds converge on the cap
+winning). Every input is a portable
+fold of held bytes and control history — never budget state. **The
+deadline/lease exemption is a ratified residual (D-141)**: an
+expired or off-lease writer's otherwise-eligible `w.gen` still caps
+and still closes — requiring receipts would hang an immutable
+boundary on revisable proof state, the exact class D-108/D-115
+removed; deliberate, named, vectored. An
+unheld eligibility input (certificate, grant, chain prefix, the
+named Head — D-188) leaves the cap **pending** (`ref-unresolved` lane) —
+it clamps once resolvable. **Dissolution is derived (D-128/D-141)**: cap existence is a
+DERIVED function of `cap_eligible` over current held bytes and
+control history — ANY event changing an eligibility input
+re-derives it (an explicit compromise cutoff retro-disqualifying
+the certificate; a tenant-fork selection or C3′ branch cut
+changing the held chain — the named cases are instances, never the
+list), and dissolution re-derives what the cap clamped — the
+owner's remedy against an adversary-minted cap; an effect that
+escaped
+through the incorporation-finality closure before dissolution is
+the stated adversary-table residual. An **eligible** cap confers
+the D-101 incorporation finality closure regardless of the
+`w.gen`'s budget outcome; cap-bearing bytes persist
+because D0-A logs are **append-only** — operations are never
+truncated (distributed GC and bounded retention are D0-B's, §0), so
+retention needs no special rule here; the 64-open-gap E8 cap bounds
+**pending** caps only — closed historical caps grow with
+reauthorized generations, and D0-B's retention design must carry
+them (v0.5.10 claimed the open-gap bound covered all cap evidence —
+false, D-141). **Caps clamp within their
+generation, each
+kind by its own mechanism (D-114/D-122)**: a *seal* is a control
+operation, totally ordered against every cutoff, so a
+later-in-control-order ratify exceeding a seal is `body-invariant`;
+an *incorporation cap* rides a TENANT operation with no total order
+against control cutoffs, so it clamps **at evaluation** — a ratify
+entry above the cap is not rejected, its effect truncates to the
+cap (`admit_bound` evaluates `min` the cap,
+D-121/D-135; v0.5.8's `body-invariant` here was arrival-relative: the
+same ratify was admitted or rejected depending on whether the
+`w.gen` had arrived yet). Cutoffs in other generations are legal
+and unaffected (advancement past a cap's generation is normal;
+revival past the bound inside it is impossible by construction).
+**Control-authored boundaries are immutable within their branch
+(D-122)**: seals, close, supersede, revoke, and recover boundaries
+ride control operations — never budget-displaced, never
+retro-quarantined; only a C3′ branch cut (the recover authority)
+removes the cut branch's boundaries (dissolution re-derives,
+D-131), and that is the owner's
+explicit ceremony.
+
+**Effective per-generation state (D-121/D-135 — the composition
+equation
+every boundary event folds into).** Per `(zone, lineage, gen)`,
+**two** components, each deterministic in the control order
+(v0.5.10's third — `ratified_through` — lost its last consumer when
+coverage moved to scalar close state, D-136, and is removed):
+
+- **`admit_bound`** — the revivable admission boundary, a **tagged
+  state** `Unbounded / Bounded(v)` with `v ∈ "none" ∪ Head`
+  (D-135 — v0.5.10 initialized a max-fold at `Top`, so the FIRST
+  requesterless ratification computed `max(Top, H) = Top` and
+  changed nothing: the retirement machinery D-80 promises — the
+  `cutoff` outcome beyond a boundary — never engaged). Transitions,
+  in control order: `Unbounded` → `Bounded(value)` on the first
+  accepted ratify entry or snapshot override for the generation;
+  `Bounded(B)` + a ratify entry at `H` → `Bounded(max(B, H))`; ANY
+  state + a requester snapshot → `Bounded(the override value)`.
+  **The snapshot override is TOTAL over generations (D-135)**: a
+  carried generation overrides to its carried head; an UNCARRIED
+  generation overrides to `"none"` — a pure function of the carried
+  set, identical on every replica, and exactly D-108's
+  uncarried-successor retirement restated per generation (an empty
+  carried `heads` entry therefore overrides EVERY generation of
+  that zone's lineage to `"none"` — the pure-snapshot zero-history
+  ceremony is genuinely total; v0.5.10's carried-only override
+  retired nothing). Under `Unbounded`, everything the chain and
+  budget rules admit is admissible; beyond a `Bounded` value,
+  operations quarantine (revivable). **Entry/snapshot coherence is
+  equality (D-129)**: a requester entry MUST equal its generation's
+  carried head (`body-invariant` below or above it) — the entries
+  ARE the snapshot's ratifications, byte-checkable against the
+  carried set (v0.5.9's ≤ made below-snapshot entries
+  admission-inert). A later ratify above
+  the override is genuine **growth** and revives; override then
+  growth is the legal shrink-and-regrow cycle. Requesterless
+  entries fold directly (first = `Bounded(H)`, later = max; the
+  `"none"` arm no longer exists on the ratify wire — D-136).
+- **`immutable_cap`** — initial `Top` (the min-fold identity, never
+  a wire value — D-129); the **minimum** over the generation's
+  accepted abandon seals and its eligible incorporation caps
+  (D-128) — the **authority-agnostic** boundaries only (`"none"`/
+  void strongest; repeated seals min-compose here — the same rule
+  receipt cutoffs use); never grows, never composed with
+  `admit_bound` — it clamps it. Close, supersede, revoke, and
+  recover boundaries are NOT entries here — they live in the
+  **authority-closure map** (below, D-143): v0.5.11 folded them in
+  authority-blind, so a strict epoch advance carrying closes at
+  current heads permanently quarantined ALL later writes — the
+  successor certificate, new-epoch writers, every strict zone
+  bricked on its first advance — while a lower live generation
+  still leaked below the lex scalar.
+
+Effective admission for a position `p`: admissible iff
+`admit_bound` is `Unbounded` or `p ≤` its `Bounded` value, AND
+`p ≤ immutable_cap` (`Top` clamps nothing), AND no **matching
+authority closure** bounds it out (below). Quarantine at
+`p > immutable_cap`, or anywhere in a voided generation, is
+**permanent within the branch**; quarantine beyond `admit_bound`
+alone is
+**revivable** by later growth — §10.5 splits the dispositions on
+exactly this line.
+
+**Authority closures (D-143).** Each accepted close, supersede,
+revoke, or recover boundary is a pair **(selector, frontier)**: the
+frontier is a `frontierclose` — the ended authority's full
+live-head set, with **total-override semantics** (the D-135
+pattern: a carried generation admits at or below its head; an
+uncarried or later-opened generation admits nothing) — and the
+selector derives from the carrying operation (never carried):
+**close** → operations signed at capability epochs below the
+advance; **supersede** → operations of the predecessor certificate;
+**revoke** → operations citing the revoked grant, or of
+certificates bearing the revocation_id; **recover** →
+global/unqualified. An operation is quarantined by a closure iff
+the selector MATCHES its signed context (capability epoch /
+resolved certificate / cited grant) AND its position is beyond the
+frontier — beyond its generation's carried head, or in an uncarried
+generation. This quarantine is **permanent within the branch**
+(D-140's lattice); non-matching operations are untouched — the
+successor certificate, new-epoch writers, and unaffected spaces
+continue freely. **The authority predicate (D-159/D-166/D-174)**:
+admission = **recovery closure ∩ certificate closure ∩ grant
+closure ∩ epoch
+closure** (v0.5.14's published equation omitted the recover axis
+its own algebra defined — an H6 beyond a named recovery frontier
+was rejected by the general rule and admitted by the formula) — an
+operation admits only within the bounds of
+EVERY closure whose selector matches it; the ABSENCE of a closure
+for some (authority, zone, lineage) leaves position-relative
+validity (D-86) governing that axis — this is the
+renewal-after-revocation
+formula (D-151): a revoked grant's frontier preserves its
+at-or-below prefix by its own selector, independently of a later
+certificate supersession whose history coverage legitimately
+omitted that zone. **Certificate×grant temporal compatibility
+(D-174/D-181)**: an operation citing certificate C and grant G is
+rejected (`cert-superseded`) **iff G was issued strictly AFTER C
+ceased being effective** (superseded or revoked) — the UPPER bound
+only (D-181: v0.5.15's within-span requirement rejected every
+renewed certificate's INHERITED grants — grants bind `device_id`
+and deliberately survive renewal, so current C1 citing G0 failed
+both arms of the old rule; the four closure axes independently
+bound the operation's position, so only the resurrection
+direction needs a check — old C0 with post-supersession G1 still
+dies, and "the old key authors nothing new" holds; both
+inputs are control facts, fully portable). A PROVEN incompatible
+pair is reject-permanent within the branch; `cert-superseded` for
+MISSING renewal evidence stays pending-dependency — one outcome,
+two contextual lifecycles (D-181, the §10.5 star pattern). §4.2 and the §10.2 cert
+stage cite THIS formula
+(v0.5.13's mirrors contradicted it — D-166).
+
+**Boundary comparator (D-102, total, reused by checkpoint fences)**:
+`"none"` precedes every Head; Heads order by lex `(gen, seq)`; equal
+coordinates with a different `op` hash are never ordered — they are
+fork evidence, resolved by **boundary selection (D-130)**: the
+first committed boundary in control order naming one of the
+coordinate's byte-variants **selects it** — the other variant's
+suffix quarantines as the losing branch (never `body-invariant`
+against the boundary: v0.5.9 rejected the cutoff on whichever
+replica held the other bytes first, an arrival-relative durable
+divergence); a later boundary naming a different variant at an
+already-selected coordinate is `body-invariant` (it conflicts the
+committed selection — the D-124 pattern extended to tenant forks).
+**The self-evidence exception (D-205)**: an arriving byte-variant
+whose OWN held evidence already classifies it `(lease-stale,
+quarantine-reproposal)` (T5/D-202) takes that sticky terminal
+classification instead and registers NO fork evidence — D-112's
+no-precedence-for-failed-operations posture extended to fork
+registration: a condemned original never freezes the writer's
+re-proposed convergence carrier (D-204's late-first class thereby
+converges on every relative delivery order of original and
+re-proposal). An arriving variant holding no qualified evidence, or
+timely evidence, remains fork evidence as above.
+
+**Equality pins**: a grant-revocation cutoff MUST name the revoked
+grant's zone and lineage; closure entries MUST name the advancing
+operation's zone and one of its live lineages. **Referenced-Head
+lifecycle**: a cutoff naming a tenant Head not yet held is outcome
+**`ref-unresolved`** (pending-dependency, D-102) until the exact
+bytes arrive at that chain position — later control operations pass
+a pending reference (only the referencing operation waits) —
+**except later selectors (D-137/D-145/D-154)**: a PENDING boundary
+that
+names a Head RESERVES the full **`(zone, lineage)` scope** — later
+boundaries naming ANY coordinate of that lineage
+pend behind the reservation, released when the reserving operation
+resolves, rejects permanently, or is removed by C3′ (v0.5.10 let a
+later committed selector win against an earlier pending one;
+v0.5.11 reserved only the exact coordinate; v0.5.12 reserved the
+generation — but a LATER generation opened with
+`w.gen(last_known = …)` on the unresolved branch hangs on the same
+selection: the `last_known` dependency cone crosses generations,
+and with ancestry unresolved no narrower safe cone is knowable, so
+the whole lineage waits — the D-131
+scope-reservation rule at its final width). Bytes
+at the coordinate differing from the named hash are fork evidence
+resolved by **selection** (D-130, the comparator rule above): the
+committed cutoff selects its named variant whenever it is the
+coordinate's first committed selector in control order — identical
+on both arrival orders and on a fresh fold — and is
+`body-invariant` only against a PRIOR committed selection of a
+different variant. **Scalable strict closure (D-136/D-143/D-153)**: coverage is
+validated over the **union** of the advancing operation's own
+entries (≤ 64) and the zone's **unconsumed** staged frontiers
+(`ccutoff.closes`); **a prior advance's materialized entries NEVER
+count** (D-153 — a materialized frontier carries ITS consumer's
+selector: keeping it open leaves the newly stale epoch unclosed,
+re-materializing it retro-truncates the history written since);
+**ratify state
+never counts** (v0.5.10's some-generation-ratified coverage
+under-closed) — a 65-lineage zone stages `ccutoff.closes`
+first, then
+advances with the residue; operations arriving beyond a staged
+frontier are quarantined-derived exactly as after the advance
+consumes it. **A live lineage (D-151)** — the domain strict
+coverage and retirement must cover — is one named by an ACTIVE
+op-authoring grant for the zone at the advancing position: a
+revoked grant's lineage is pre-covered by the revocation's own
+mandatory frontier (D-78/D-143), so active-grant coverage is total
+by composition.
+**Consumed-boundary promotion (D-111/D-136/D-143/D-153)**:
+coverage is
+always an **explicit frontier closure per consumed lineage** —
+inline on the consuming operation (`closure cutoffs` /
+`history_cutoffs`) or staged (`ccutoff.closes`). A staged frontier
+is **inert until consumed** — coverage material only;
+**consumption is automatic, one-shot, and APPLICABLE-scoped
+(D-153/D-176)**: the
+zone's next consuming
+operation (epoch advance, renewal, retirement) consumes every
+unconsumed stage **whose `(zone, lineage)` lies within the
+consumer's own coverage domain — and only those** (an advance or
+retirement covers the zone's live lineages; a renewal covers its
+predecessor's authorship domain; v0.5.15's take-everything rule
+let lineage B's renewal BURN lineage A's stage under B's
+predecessor-certificate selector — inert for A, one-shot-spent
+before A's applicable boundary arrived) and MATERIALIZES
+each as
+an authority closure with the **consumer's selector** at the
+consuming control position (inline entries materialize
+identically); a consumed stage never counts again — every later
+advance needs fresh coverage at current heads — and the consumed
+boundary can never afterwards be
+widened — the frontier's total-override semantics also end FUTURE
+generation-opening for the ended authority (v0.5.11's lex scalar
+did neither: a lower live generation leaked below it, D-143).
+v0.5.10's per-generation freeze stays **withdrawn (D-136)**;
+per-generation ratify state remains ordinary revivable
+`admit_bound` state below the closure. No duplicate wire value
+is carried. **The stage state machine (D-160/D-168)**: a stage
+EXISTS
+only at its carrier's acceptance — a held, `ref-unresolved`
+carrier registers nothing, and every **required-coverage
+consumer** — a strict-zone advance, ANY space retirement (whose
+coverage is mandatory regardless of strictness, D-138), or a
+RENEWAL (its authorship-domain coverage is mandatory and the
+>64-zone case rides staged closes — v0.5.15's enumeration omitted
+it, D-176) — whose
+coverage
+would be satisfied by that held-but-pending APPLICABLE carrier
+**pends behind
+it** (outcome `ref-unresolved`, D-176) (pending-dependency — the reservation pattern: control order
+survives pendency, so incremental and fresh folds agree once the
+carrier resolves; a LENIENT advance carries no coverage
+requirement and never pends — v0.5.14's strict-only wording
+contradicted retirement's own strictness-independent rule); **a
+late-accepted carrier mandates the bounded suffix re-fold
+(D-168)**: exactly the consumers positioned between the carrier
+and its consumption re-derive, materializing the stage under the
+position-correct consumer's selector (v0.5.14 implied this via
+reconstruct-from-positions but never obligated the incremental
+transition); a stage whose lineage leaves the coverage domain is
+consumed **vacuously BY the authority-ending frontier itself
+(D-196)**: the revocation (or other immutable close) that removes
+the lineage from every future consumer's applicable domain is the
+consuming event — one-shot-spent at its acceptance, materializing
+nothing (v0.5.17 said dead stages are consumed vacuously while the
+applicable relation excluded them from every consumer: never
+consumed, a revoke-then-regrant could resurrect the old frontier
+under new authority); no expiry or
+cancellation machinery exists — fresh folds reconstruct stage
+state purely from acceptance and consumption positions.
+
+### 7.2 Arm admissibility
+
+`genesis`: `c.genesis` at control sequence 1 only. `admin(e)`: every
+row marked admin, at the current epoch. `recovery`:
+`c.recovery_succession`, `c.drill` only. `dev`: no control operation,
+ever; `ctrl` is never a grantable tenant.
+
+### 7.3 Bootability invariant (normative walkthrough)
+
+> After `c.genesis` alone: the first device writes a Memory claim into
+> `private/home` and reads it back — **accepted**, because the genesis
+> ZonePolicy (Appendix B.1) sets `deadline_fallback = "budgets"` and
+> the first certificate carries no `expiry_deadline_ms` (solo posture,
+> owner ruling D-28: a solo plane cannot possess independent time
+> evidence; the bounded non-time lane is a defined authority posture).
+> Then: `c.enroll` adds a second device (wrap-add) which reads the
+> same history; `c.revoke_device` excludes it such that nothing
+> written after its rotation is decryptable by it. Policy upgrades to
+> witness-backed deadlines happen **only** via explicit
+> `c.zone_policy`.
+
+Vectors walk this on trusted-solo, hosted-solo, and multi-device
+planes (family 7), including the solo→multi policy transition and
+witness-loss return.
+
+### 7.4 Epochs, precedence, forks, recovery
+
+- **C1.** Admin epochs are consecutive integers from 1;
+  `c.admin_succession` valid only from `admin(e)` with `epoch = e+1`
+  extending the current head.
+- **C2.** Duplicate control `(seq)` with different bytes = control
+  fork: control plane freezes (no further control ops on either
+  branch; tenant writes continue under the last uncontested frontier);
+  only recovery resolves. Honest forks included (owner ruling D-19).
+  A control operation arriving while the plane is frozen classifies
+  **`(ctrl-fork, freeze-control)`** — only the resolving recovery
+  admits — and the earlier pipeline stages keep their own outcomes
+  (D-76 first-failing-stage: a signature-invalid arrival stays
+  `sig-invalid`, a body-invalid arrival stays `body-invariant` — a
+  forgery or malformed body is never fork evidence; the audit's D4,
+  owner-ratified 2026-07-16).
+- **C3′ (recovery resolution, deterministic).**
+  `c.recovery_succession` body:
+
+  ```
+  { base: { seq: uint, op: bytes32 },
+    epoch: uint, repoch: uint,
+    new_admin: { alg, pk }, new_recovery_commitment: bytes32,
+    tenant_cutoffs: [* frontierclose], # zone-qualified (App A.3)
+    ? adopted_renewals: [...],         # D-150: see below
+    ? retired_keys: [...],             # D-150: freshness commitment
+    adopted_rotations: [* { zone_id, rotation_op, fence_frontier,
+                            control_frontier, recipients_hash }] }
+                                       # D-97/D-112: see below
+  ```
+
+  Placement is **frozen**: header `writer_sequence = base.seq + 1`,
+  `previous_writer_hash = base.op`. **Precedence exception:** at that
+  sequence, a valid recovery op does not trigger C2 against ops on cut
+  branches — recovery wins and everything outside
+  `ancestors(base) ∪ {this} ∪ descendants(this)` is retired. Validity:
+  recovery-arm signature matching the current commitment;
+  `repoch = current + 1`; `epoch >` the epoch at base. Two valid
+  recovery ops at the same repoch = plane-compromise freeze (out of
+  band by definition). Branch-cut default strict (owner ruling D-20), **total over
+  omission (D-132/D-138/D-151)**: `tenant_cutoffs` entries are
+  explicit
+  branch-cut boundaries — recover-purpose `frontierclose`s (global
+  selector, immutable, D-143) — naming the
+  history the owner PRESERVES (at or before each carried head); the
+  complement domain is **`(zone, lineage)` pairs (D-151)**: a pair
+  with an entry follows the entry; a pair WITHOUT one folds the
+  implicit **revivable `"none"` override** — every generation,
+  universally — quarantining
+  its entire tenant history fail-closed (v0.5.10's "entirely past
+  `base`" was unportable — `base` is a control coordinate, tenant
+  operations carry no control frontier, and a delayed pre-fork
+  write was indistinguishable from a post-fork mint on a fresh
+  fold; the `"none"` override needs no tenant-side coordinate at
+  all). Post-recovery ratify ceremonies revive what the owner
+  re-admits — the blanket, unlike the named entries, is revivable
+  (D-121), so a wide plane needs no continuation operation: the
+  ≤ 256 entries (E8) are refinements. **Naming terminates; omission
+  continues (D-159)**: a named entry is an IMMUTABLE termination
+  beyond its carried heads — the preserve-and-continue ritual is
+  omission (the revivable blanket) plus post-recovery ratify
+  ceremonies through the vouched heads; **the blanket's domain** =
+  `(zone, lineage)` pairs whose lineage was enrolled at or before
+  `base` in control order (a lineage enrolled AFTER the recovery is
+  new authority under the surviving chain and folds normally).
+  C3′ acceptance also triggers
+  the **total re-fold (D-138/D-149)**: all control-derived
+  admission
+  state re-derives from the surviving chain (T2 — cut grants,
+  reauths, commitments, closures, and caps dissolve with everything
+  they derived, and held bytes rejected under dissolved facts
+  re-evaluate); replay-key ownership, a derived state, re-derives
+  with them (D-155 — no materialized freeze exists to adopt or
+  cut). Control operations on the CUT branch classify `(cutoff,
+  quarantine-reproposal)` (D-203) — permanence per the D-140
+  boundary-purpose split (a recover boundary: permanent within the
+  branch, re-entry only as new operations).
+  **Storage adoption (D-97/D-104/D-112)**: recovery whose base
+  precedes an accepted `c.kek_rotate` either lists it in
+  `adopted_rotations` — one entry per adopted rotation, each
+  carrying that rotation's **complete Fence-frame identity**
+  (`fence_frontier` + `control_frontier` + `recipients_hash`, so a
+  replica active at ANY adopted rotation, predecessor or highest,
+  validates its own activation; the zone's entries form a
+  contiguous chain) — or leaves it cut: a replica whose activation
+  is unadopted **or mismatches its entry** transitions to outcome
+  `storage-orphaned` (storage-quarantine: its post-Fence ciphertext
+  is under an activation the surviving control state does not
+  carry). **Dependency closure (D-112/D-117)**: certificates and
+  descriptors the adopted commitments reference survive as
+  validation material — never as authority; the **effective
+  wrap-add map** through each adopted `control_frontier` survives as
+  storage state (what makes adopted ciphertext readable); and
+  adopted rotations' erase manifests stand (erasure wins). Entries
+  cap at 64 (E8) — a deeper fork orphans the excess (stated
+  residual); accepted-but-unFenced cut rotations are never adopted
+  (nothing activated — re-issue on the surviving branch).
+  **`adopted_renewals` follow the same discipline (D-158/D-172)**:
+  the bounded list carries **every renewal of the adopted chain —
+  signing-only links included** (v0.5.14's prose said each entry is
+  KEM-rotating while the CDDL, D-164, and the vectors required
+  signing-only members: an entry was simultaneously required and
+  disallowed); each entry adopts its cut renewal — certificate,
+  and replacement wraps where KEM-rotating, as validation material
+  and storage state, its
+  keys joining the typed freshness history (T3) — the per-device
+  chain contiguous by construction; chains deeper than the 64-cap
+  orphan the excess (the D-117 deep-fork pattern — a stated
+  residual, D-172); a wrong-device or non-renewal `renewal_op`, an entry
+  whose renewal is not strictly AFTER `base` on the cut branch
+  (D-164 — v0.5.13's "does not precede base" negative was INVERTED:
+  it rejected exactly the valid adoptions), or a noncontiguous
+  chain
+  is `body-invariant`; an unheld `renewal_op` is `ref-unresolved`.
+  All adoption references — rotations AND renewals —
+  resolve **before** C3′ precedence (D-105/D-158); an unheld
+  reference is
+  `ref-unresolved` and confers no precedence while pending. The
+  choice is the owner's, explicit and signed — recovery never
+  silently strands activated storage.
+- **C4.** Control ops from `admin(e)` are invalid once `admin(e+1)` is
+  accepted; grant validity is explicit (revocation/epochs), never
+  implicit in succession.
+- **C5.** Replay: byte-identical = idempotent; differing at one sequence = C2; `request_id` reuse across different accepted operations = `request-fork` (D-59, §7.1).
+
+### 7.5 Hosted-plane ceiling
+
+While `genesis.provenance == hosted` and no `c.recovery_succession`
+has been accepted — **the lift is portable by definition (D-42): any
+valid recovery succession lifts the ceiling**, because the revealed
+recovery key is the authority and never re-enters hosted code; the
+trusted lane is where the ceremony *runs* (product rule), not a fact
+replicas could verify from bytes. Post-lift trusted-class enrollment
+still satisfies the §7.6/evidence rules:
+
+- **(a)** only `hosted-browser` certificates may be enrolled;
+- **(b)** grants may carry `class_ceiling` up to `sensitive` for
+  storage verbs (D-14); grantable verbs are the hosted-safe set of
+  §11.1 (`search, read, evidence.read, propose, assert, judge.safe,
+  pin.safe, erase.request, raise`) **plus the system-only
+  `audit.write`** (service actors only, §11.1 — the genesis audit
+  grant is exactly this); never grantable: `export`,
+  `import`, `declassify`, `judge.full`, `pin.full`,
+  `curate.instruction`, any Agenda effect verb, `admin`;
+- **(c)** admissible control operations: `c.enroll` (hosted-browser,
+  compound — the new browser leaves with cert + grant + lineage +
+  wrap), `c.revoke_device` (compound), **`c.kek_rotate` only as an
+  exclusion-shaped rotation (D-71, non-cyclic — rotation-first, as
+  D-50 always was; v0.5.1's compound-first rule required an
+  unconstructible hash cycle and is void)**: its `erase_manifest` is
+  empty **and** it adds no new recipient authority — its wrap
+  recipients resolve exactly to already-enrolled, unrevoked devices
+  holding current-epoch wraps, each `recipient_kem_key` equal to that
+  device's certificate KEM key, **minus at least one enrolled
+  device** (the exclusion targets); the completing `c.revoke_device`
+  follows, naming the rotation in `rotation_refs`. **Freeze rule
+  (D-71)**: a device excluded by an accepted exclusion-shaped
+  rotation receives no new grants or wraps until either a
+  `c.revoke_device` naming that rotation completes the exclusion or
+  a `c.wrap_add` re-admits it (abandonment). No standalone rotation
+  otherwise (`c.revoke_zones` is unreachable here: a hosted plane
+  cannot create zones, so the single genesis zone never needs a
+  continuation),
+  `c.wrap_add` between enrolled hosted browsers,
+  **`c.lineage_reauth` and `c.cutoff` limited to the requesting
+  device's own lineage** (both requester-attested — self-service
+  continuity and unknown-head retirement, non-resetting; owner rulings
+  D-30/D-54; the `closes` staging lane is OUTSIDE the ceiling —
+  hosted `c.cutoff` is ratify-only, D-136), `c.drill` (recovery-arm admission; trusted-lane custody
+  is product guidance, §7.1), and **`c.recovery_succession` itself —
+  the operation whose acceptance lifts this ceiling** (its authority
+  is the recovery arm, never a hosted key). **No destructive
+  maintenance**: no checkpoints/GC fences, no `c.kek_rotate` with a
+  non-empty erase manifest, no `c.abandon_writer` **except the requester-attested self-seal** (own lineage only, per-generation — D-107/D-121: the motivating case is gap finality — without it a hosted plane that takes one unknown gap could never restore effect finality before re-root, bricking its own audited reads — but the authority granted is the row's FULL truncation semantics on the requester's own lineage, below-history seals and `at = "none"` voids included, named honestly: self-truncation is as self-limiting as the D-54 self-cutoff; D-15's no-destructive-authority rule is amended exactly this far). Hosted planes therefore get
+  retrieval-exclusion erasure only; cryptographic erasure arrives with
+  the first trusted client — key destruction by the admitted hosted
+  TCB would be theater. **`c.zone_policy` is not admissible either:
+  hosted planes remain on the genesis budgets posture until re-root
+  (D-43)** — nor is `c.service_key`: a hosted plane cannot acquire
+  Connect time witnesses pre-recovery (product copy must not promise
+  them). Enrolling more hosted browsers changes nothing about time
+  authority. **No standalone hosted grant-narrowing exists; grant
+  changes ride the enroll/revoke compounds only** (D-15 discipline).
+
+### 7.6 Device-class ceilings (every plane)
+
+| Class | Max `class_ceiling` | Never-grantable verbs |
+|---|---|---|
+| hosted-browser | sensitive | export, import, declassify, judge.full, pin.full, curate.instruction, effects, admin |
+| owner-browser | sensitive | — (trusted client) |
+| native-app / daemon / mobile-attested | sensitive | — |
+| mobile / other | internal | export, import, declassify, judge.*, pin.*, curate.instruction, raise, effects, admin |
+
+Owner-class actorhood (§11.4) requires a class with no exclusions.
+Hosted-safe rights (D-29) exist precisely so hosted humans can operate
+their diary without owner-class.
+
+---
+
+## 8. Recovery
+
+- **R1.** The recovery authority is an offline Ed25519 keypair derived
+  from a 24-word BIP-39 phrase (§2.4); only its commitment
+  (`H_drill(pk)`) lives in genesis. **R2.** v1 custodian: the owner,
+  offline; thresholds are governance v2+. **R3.** No online component
+  stores phrase or key; genesis generates, displays once, commits,
+  discards (hosted genesis displays inside the admitted TCB — why
+  re-root mints a fresh phrase on the trusted client).
+- **Loss** (admin gone, phrase held): `c.recovery_succession` from a
+  trusted client — fresh admin key AND fresh recovery commitment
+  (both rotate, always). **Compromise**: same op; C3′ precedence cuts
+  the attacker branch; pre-cutoff attacker tenant ops are quarantined
+  evidence. **Phrase loss with healthy admin**: v1 = plane migration
+  (owner ruling D-18); deliberately not smoothed. **Both lost**:
+  unrecoverable by design, stated in product copy.
+- **Drill** (`c.drill`): recovery-signed nonce statement; proves the
+  phrase still derives the committed key without rotating anything;
+  reveals the public key (harmless — custody is the secret);
+  trusted-lane custody is product guidance (§7.1 row — admission is
+  the recovery arm alone). Its recovery arm cites the **current**
+  `repoch` (a drill proves, never advances — C3′ alone uses
+  current + 1; D-203).
+
+---
+
+## 9. Time, budgets, lineages, epochs
+
+### 9.1 Acceptance deadlines
+
+Where a cited grant **or certificate** carries `expiry_deadline_ms =
+D`: the operation is accepted iff a **qualified** signed `accept`
+receipt (T2/T4, anchored per D-69) exists with `seen_ms ≤ D` — **a
+present deadline always binds, in every posture** (D-12 preserved;
+D-56). ("Covering checkpoint witness" acceptance is removed from
+D0-A — its operation-coverage predicate belongs to D0-B.) Otherwise:
+outcome `deadline-unreceipted`, disposition **pending-dependency** —
+reordering may still deliver the receipt; it hardens to
+quarantine-reproposal only when a `c.checkpoint` GC fence covers
+**both** the operation's position **and** every qualified witness
+feed without one (§7.1 — the same two-part condition governs
+`lease-missing`). Where the deadline field is absent (D-28): no time
+evidence is required; validity is governed by revocation, epochs,
+cutoffs, and budgets.
+
+`ZonePolicy.deadline_fallback` **selects which lane newly issued
+authority may use — the postures are operative at issuance, not at
+admission (D-56)**. `"budgets"` (solo posture — genesis default,
+Appendix B.1) authorizes the deadline-*absent* lane, and **every
+effective deadline-free write path carries a finite budget** —
+including a grandfathered deadline-free certificate after the zone
+flips to `"fail-closed"` (its operations admit only through
+finite-budget grants; the grandfathered lane stays a named, tested
+residual — D-54). `"fail-closed"` (multi-device recommended) requires
+`expiry_deadline_ms` on **newly issued grants and newly enrolled
+certificates** from the policy's acceptance forward
+(`require_cert_deadlines = true` is its certificate half; D-56 adds
+the grant half). **Witnessless zones**: where the zone policy lists
+no qualified witness, no accept receipt and no lease can ever qualify
+(T2 excludes the signer), so deadline-bearing items and `online_lease`
+grants are unusable-by-construction until a qualified witness is
+installed by explicit `c.zone_policy` — stated and vector-pinned
+(family 9). Posture transitions only by explicit `c.zone_policy`.
+**Dropped witnesses (D-88)**: a pending deadline/lease operation
+whose epoch-anchored qualified witness is no longer listed by later
+policy stays pending until that witness's proof arrives, the witness
+is re-listed, or an applicable feed/epoch cutoff closes it — a
+named, deterministic **forever-pending lane** (current policy never
+stands in for the operation's anchored policy; product copy
+surfaces it; family-9 vector).
+
+### 9.2 Local time
+
+Only live-request gates read validator clocks (T5 skew); the
+replicated fold never does. Semantic claim expiry evaluates at the
+projection's explicit `as_of_ms` (§11.7).
+
+### 9.3 Lineages and generations
+
+- Lineages: control-authorized, bound to `device_id`; **created in
+  `c.enroll`, reauthorized in `c.lineage_reauth`** (one path each,
+  §7.1); **no lineage event resets budgets or cutoffs** (renewal, reauthorization, and
+  generations are all non-resetting — required vector);
+  **reauthorization is a widening event of the derived revisit
+  inventory (D-132)**: held operations quarantined `lineage-gen`
+  revive under the new window (revival of held bytes, never
+  mandatory reproposal).
+- **`w.gen`** (registry §11.1): the charged operation opening
+  generation `g ≥ 2` of `(zone, lineage)`; body
+  `{ last_known: { gen, seq, op } / "unknown" }`;
+  `previous_writer_hash = gen_start(lineage, g)`;
+  `space_id = SYS_SPACE` (pinned, N1); **`g` MUST equal the lineage's
+  highest opened generation in the zone + 1** (generation 1 exists by
+  definition; a jump or repeat → `lineage-gen`). Implicit right of
+  every op-authoring grant (§11.1 verb classes, D-60), charged 1 op
+  against it — **with an explicit
+  scope exception**: `w.gen` admission bypasses the grant's `spaces`
+  axis and the inapplicable `kinds` axis, and retains the tenant,
+  zone, grant, lineage, generation-window, and budget checks (a
+  space-scoped grant can always open its own next generation;
+  family-10 vector). **The generation
+  window is the lineage's alone** (`lineagedef.max_generations`, set
+  at enroll/reauth — grants carry no window, so multiple grants cannot
+  multiply openings); beyond it → `lineage-gen`, remedy
+  `c.lineage_reauth`. **Accounting (exact)**: the window counts
+  accepted `w.gen` operations per `(zone, lineage)` since the
+  lineage's last `c.lineage_reauth` (or creation). Frontier effect
+  (D-76, reconciling D-33): accepting `w.gen(g, last_known = head)`
+  retires **the effective ACCEPTED head at or below the named
+  head's canonical position** (D-175 — the admission predicate
+  accepts held-but-displaced heads while the Frontier holds
+  accepted heads only: v0.5.14 retired the named head verbatim, a
+  no-op for a displaced head that leaked the stale accepted head
+  below it into every checkpoint; no accepted head at or below =
+  a defined successful no-op, the generation has nothing to
+  retire) — `last_known` MUST be a valid
+  **chain-membership position** of its generation on the HELD
+  canonical chain — never ACCEPTANCE either (D-167: a canonical but
+  budget-displaced head stays incorporable; v0.5.13's accepted
+  requirement split cap eligibility — held-chain, displacement-
+  stable — from body validity on the same head)
+  (the D-144 anchor, extended by D-159 — NEVER terminality:
+  v0.5.12 kept the terminal check in ordinary admission, so an
+  H6-first replica rejected W as `body-invariant` before W's cap
+  could quarantine H6, re-opening exactly the stratum circularity
+  D-144 closed; a later same-generation successor beyond the head
+  quarantines under the eligible cap instead — truncation, D-144),
+  in the same zone
+  and lineage, with its gen < g, else `body-invariant`; heads left by
+  an `"unknown"` opening are never retired transitively. With
+  `last_known = "unknown"`, prior
+  heads persist until a cutoff or abandonment closes them — a
+  lineage may hold at most **64 open unknown-gap heads** in a zone
+  (E8, D-103): a 65th unknown opening → `lineage-gen` (close gaps
+  before opening more; keeps every legal lineage representable in
+  one checkpoint page) — and
+  **hosted planes can issue that cutoff for the device's own lineage**
+  (requester-attested, §7.5 — D-54), so unknown heads cannot
+  permanently grow a hosted frontier. Operations arriving for a
+  retired generation: quarantine-reproposal.
+- Budgets, cutoffs, quarantines: keyed by **lineage**, summed across
+  generations (the v0.1 evasion stays closed; vector-pinned);
+  consumption order and window selection are canonical per §4.3
+  (D-86 — `(gen, seq)` fold with deterministic displacement).
+- **Chain arithmetic (exact, D-68)**: within `(zone, lineage, gen)`,
+  `writer_sequence` starts at 1 and increments by exactly 1;
+  `previous_writer_hash` = `gen_start(lineage, gen)` at seq 1, else
+  the op hash of seq − 1. A (seq, previous) pair contradicting an
+  accepted op at the same coordinates = `fork`; a successor citing an
+  unknown predecessor = `causal-missing` (pending); a first op not at
+  seq 1 = `gen-first-op`.
+
+### 9.4 Capability epochs
+
+Per zone; consecutive; advanced by `c.cap_epoch_bump`, **by
+`c.zone_policy` acceptance (D-69 — a policy change is an epoch
+event), or by `c.space_retire` acceptance (D-132/D-138 —
+retirement is an epoch event; like a bare bump it carries
+`policy(e−1)` forward)**. **Policy anchoring (D-69)**: `policy(e)` = the ZonePolicy
+in force when epoch `e` opened (genesis / `c.zone_create` for epoch
+1; the advancing operation thereafter — a bare bump carries
+`policy(e−1)` forward). Witness-policy and service-leaf selection
+for an operation's proofs read `policy(header.capability_epoch)`
+(T2). Op-authoring grants name exactly one zone (D-32), so the
+grant's scalar
+`capability_epoch` is well-defined; read-only wildcard grants use the
+reserved value 0 (§4.3 — not epoch-checked; read admission checks
+revocation, not epoch currency). Rules, each consumed — **every comparison is signed-vs-signed or
+control-chain content; no admission rule reads the fold's current
+state (D-78 — v0.5.2's fold-relative currency diverged replicas on
+arrival order and is void)**:
+
+- **Opening**: an op citing epoch `e` admits only once the control
+  chain has opened `e` — until then, outcome `epoch-unopened`
+  (pending-dependency; converges because the control chain
+  converges). The fold-relative "future = reject-permanent" rule is
+  void.
+- **Chain monotonicity**: within a writer chain,
+  `capability_epoch` is ≥ the chain predecessor's (across a `w.gen`
+  boundary, the named `last_known` head's; `"unknown"` imposes no
+  bound) — violation → `capability-epoch`.
+- **Grant slack**: `grant.capability_epoch ≤ op.capability_epoch`
+  (the lower bound comes first, D-93 — an epoch-5 grant can never
+  authorize an epoch-1 operation, and the subtraction below is
+  well-defined) **and** `op.capability_epoch −
+  grant.capability_epoch ≤ grant_epoch_slack` (absent = unbounded) —
+  all operands signed, fully portable; violation of either →
+  `capability-epoch` (family-10 negative).
+- **Closure is explicit**: staleness against the zone's *current*
+  epoch is not an admission predicate. Hygiene rides control
+  operations: the epoch-advancing ops (`c.cap_epoch_bump`,
+  `c.zone_policy`, `c.space_retire`) MAY carry closure entries (a
+  `frontierclose` set, D-143 — full live-head frontiers with
+  total-override semantics for the old epochs)
+  that deterministically close old-epoch writing per lineage, and in
+  a `strictness = "strict"` zone they MUST cover every live lineage
+  (§7.1 D-151 — the policy in force at acceptance governs the
+  requirement; **space retirement's coverage is mandatory
+  regardless of strictness**, D-138/D-168); the
+  same explicit-frontier rule already governs certificate
+  revocation,
+  and `c.revoke_grant` carries one too (§7.1). `lenient_epochs`
+  is removed — its comparison died with the fold-current rule.
+
+At issuance, `grant.capability_epoch` MUST equal the zone's current
+capability epoch at the issuing operation's control-chain position
+(totally ordered — deterministic). `flow.kinds` absent means
+all kinds the flow's ceilings otherwise admit — the same rule as
+`grant.kinds`. **Budgets and raise quotas reset only on
+`c.cap_epoch_bump` (D-79)**: accounting sums per
+`(grant_id, lineage)` across all epochs since the last bump — a
+`c.zone_policy` advance re-arms nothing (§4.3).
+
+---
+
+## 10. Plane IAM
+
+### 10.1 Service-edge access shapes
+
+| # | Shape | Local components intersected (beyond plane capability + request + class/provenance ceilings) |
+|---|---|---|
+| 1 | Direct enrolled device (human owner on browser/native/daemon) | none — the device certificate is the identity |
+| 2 | Controller-attested native supervised session | daemon-local session grant (controller-enforced; `actor.attested_by` set) |
+| 3 | External process-tree bearer | live session token (unrevoked, session live, op ∈ scope) |
+| 4 | Mediated peer / low-trust session | peer/session grant + token (RFC §6.4) |
+
+A component that cannot exist for a shape is not part of that shape's
+rule. Edge read/search **quotas** are per-shape service policy,
+separate from writer budgets. **Human/owner action evidence** is
+structural: shape 1 with no `attested_by`, from a class admitting
+human presence — with the stated residual (§4.5 O4).
+
+### 10.2 Portable fold admission
+
+Replica-independent; only portable inputs (certs, grants, control
+state, signed attestations, signed receipts, body/causal invariants):
+
+```
+admit(op, control_state, receipts):
+  parse  E1–E10                                → parse outcomes
+  cert   resolve signer cert by device — **position-relative
+         (D-86)**: status is evaluated for the op's signed
+         (zone, lineage, gen, seq) coordinates against the control
+         chain's explicit boundaries **under the authority
+         predicate (D-166/D-174): recovery ∩ certificate ∩ grant ∩
+         epoch closures,
+         each by its own selector — a missing closure on one axis
+         leaves D-86 governing that axis, so the cert stage never
+         rejects a prefix a matching grant boundary preserves —
+         plus the certificate×grant temporal-compatibility check
+         (a cert citing a grant issued after it ceased effective —
+         superseded OR revoked, at the ending op's position =
+         `cert-superseded`; proven = permanent within the branch,
+         D-174/D-187) — and unresolved references PEND
+         (D-199): a cited certificate or grant not yet held is
+         `ref-unresolved` — indefinitely if need be (a portable
+         absence proof is D0-B's; v0.5.18's dense-prefix
+         nonexistence proof read an upper bound the envelope never
+         signs — the anchor epoch is a LOWER bound, an object can
+         issue later in the same epoch, and C1→I→C2 vs C1→C2→I
+         reached different permanent states — withdrawn, D-199)** —
+         an op at or below its matching boundaries resolves VALID on
+         any replay, incremental or fresh; no stage reads
+         fold-current status. Class table §7.6; signer_alg ==
+         cert.sig_alg ∧ signer_key_id == H_key({alg, pk}) (D-85)
+                                               → cert outcomes
+  sig    verify signature over msg("op", header) under the resolved
+         key                                   → sig-invalid
+  proof  arm §7.2; dev-arm grant scope (tenant∧zone∧space∧op∧kind;
+         `w.gen` bypasses the space and kind axes — §9.3); grant
+         validity is position-relative like cert status (D-86): a
+         grant revoked with a cutoff stays valid for ops at or
+         before it; lineage binding; ceilings §7.5/§7.6
+                                               → authz outcomes
+  chain  chain intact per (zone,lineage,gen); O6 gen rules;
+         generation window; cutoffs; capability epoch §9.4;
+         lineage-summed budgets                → chain outcomes
+  time   deadlines §9.1 (only where deadline fields exist);
+         leases T5                             → time outcomes
+  body   body_hash; registry row exists; body CDDL; body invariants
+         (§11.1); causal refs present          → body outcomes
+```
+
+No tokens, no session grants, no local clocks. The reducer runs
+admission; the edge rule runs before it on live requests only.
+**Precedence (D-76)**: stages run in the listed order and the first
+failing stage's outcome is THE outcome — a multi-fault input has
+exactly one (outcome, disposition); within a stage, checks run in
+their listed order. **Control operations run a dedicated arm-indexed pipeline (D-91)**
+— the tenant cert stage cannot resolve control signers:
+
+```
+admit_ctrl(op, control_state):
+  parse  E1–E10                                → parse outcomes
+  arm    resolve the signer BY ARM: genesis → the descriptor's
+         root_sig_pk (self-contained; control seq 1 only);
+         admin(e) → the admin key at epoch e; recovery → the revealed
+         key, H_drill(pk) == the current recovery_commitment
+                                               → cert/authz outcomes
+  sig    verify msg("op", header); signer_alg/signer_key_id equality
+         with the resolved key                 → sig-invalid
+  body   body_hash; registry row for the arm; body CDDL
+                                               → body outcomes
+  prec   C3′ precedence-field validity (base/epoch/repoch/commitment
+         — from the now-validated body) **and, for the recovery arm,
+         resolution of every state-dependent reference**
+         (adopted rotations, adopted renewals, cutoff Heads —
+         D-105/D-158: an unresolved
+         reference is `ref-unresolved`, pending-dependency, and the
+         operation exerts NO precedence effect while pending — C2
+         evaluates as if it were absent); ONLY THEN placement C1–C5 +
+         arm admissibility (§7.2): a validly signed header over
+         malformed or mismatched body bytes never suppresses C2
+         (D-99 — v0.5.4 granted precedence before authenticating the
+         body that carries the precedence facts)
+                                               → authz/chain outcomes
+  state  remaining state-dependent invariants + transition (§7.1) —
+         any outcome family may surface here (a malformed
+         `new_admin` key is `key-malformed`, D-112)
+                                               → remaining outcomes
+
+**Precedence selection is pure and provisional (D-112)**: it commits
+only through the final `state` transition — an operation failing any
+later stage resolves its failure outcome having exerted **no**
+precedence (C2 and placement re-evaluate as if it were absent);
+transition-last already prevents divergence, this pins it.
+```
+
+### 10.3 Edge inputs the caller cannot choose
+
+The evaluation policy comes from the space's control-bound
+`status_policy`; effective classification is service-derived (§11.6);
+`actor.kind` is evidence-checked (§10.1), never trusted alone.
+
+### 10.4 Closed outcome enums
+
+```
+parse:   malformed, oversized, depth, non-canonical, unknown-version
+cert:    no-cert, cert-revoked, cert-superseded,
+         class-excluded, key-malformed
+authz:   proof-arm, no-grant, scope-tenant, scope-zone, scope-space,
+         scope-op, scope-kind, class-ceiling, provenance-ceiling,
+         hosted-ceiling, no-flow, sig-invalid
+chain:   fork, gen-first-op, lineage-gen, cutoff, capability-epoch,
+         epoch-unopened, budget, duplicate, request-fork, ctrl-fork,
+         recovery-competition, ref-unresolved, import-collision
+time:    deadline-unreceipted, lease-missing, lease-stale,
+         issuer-fork, issuer-gap
+body:    body-hash, op-unknown, body-invariant, causal-missing,
+         policy-missing, source-erased
+storage: log-corrupt, lock-denied, storage-io, wrapper-mismatch,
+         aead-fail, storage-orphaned
+edge:    no-session, session-ended, no-token, token-scope,
+         token-revoked, quota, audit-unavailable
+```
+
+### 10.5 Disposition map (one lifecycle per outcome and context — starred outcomes are edge-deny live, reject-permanent in the fold)
+
+| Disposition | Outcomes |
+|---|---|
+| **reject-permanent** (never re-enters within the branch — **the split is by the rejecting fact, D-149**: intrinsic byte failures (malformed, oversized, depth, non-canonical, sig-invalid, body-hash, key-malformed, proof-arm, gen-first-op, source-erased) never re-enter ANYWHERE; rejections whose fact is a control operation (no-grant, scope-*, cert-revoked-in-fold, provenance/hosted-ceiling, control-relative body-invariant instances) re-evaluate under the C3′ total re-fold when that fact dissolves — D-138; import-collision moved to the derived lane, D-196) | malformed, oversized, depth, non-canonical, sig-invalid, body-hash, body-invariant, key-malformed, proof-arm, no-grant, scope-*, class-*, provenance-ceiling, hosted-ceiling, no-flow, gen-first-op, request-fork (surfaced as fork evidence), source-erased (an import whose source died under a C3′-ADOPTED erase manifest — the deferral invariant keeps sources live otherwise; intrinsic, the source is cryptographically gone; D-189/D-198), cert-superseded (the PROVEN-incompatible context: a grant issued after the certificate ceased effective — D-187; the awaiting-renewal-chain context stays pending-dependency) |
+| **pending-dependency** (held until the referenced input arrives; fence-hardening per §7.1 `c.checkpoint` — deadline/lease/causal only, D-77) | causal-missing, cert-superseded (awaiting renewal chain — the PROVEN-incompatible context is reject-permanent, D-187), policy-missing, deadline-unreceipted, lease-missing (§9.1), epoch-unopened (awaiting the epoch-opening control op — D-78), issuer-gap (awaiting the missing chain link — D-87), ref-unresolved (awaiting a referenced Head / rotation / adoption target / an applicable staged carrier — D-176 / an unheld journal citation, which reserves its interval — D-185 / a provisional import claim's freeze — D-189 / a cited certificate or grant not yet held — D-199 / a revocation compound's completing exclusions and cutoffs — D-195/D-200; D-102) |
+| **quarantine-reproposal** (RFC §4.5 lane; a **derived** fold state, D-93/D-94 — ratify-boundary growth and displacement-charge release revive members deterministically. **`import-collision` lives here (D-196)**: permanent WHILE the frozen owner's basis stands within the branch; the basis's death re-derives the claimant fold including former losers (v0.5.17's reject-permanent contradicted the unfreeze re-derivation; an order-loser against an UNFROZEN owner is ordinary displacement — arrival-invariant, D-161). **Permanence attaches to the effective immutable bound (D-114/D-121)**: operations beyond a generation's `immutable_cap` — its min-composed seals and incorporation caps — or anywhere in a voided generation never revive; their content re-enters only as new operations. Quarantine at or below the bound — snapshot-override and displacement quarantine included — stays revivable by later growth. **The `cutoff` outcome splits by boundary purpose (D-140)**: beyond a ratify boundary or the recovery-omission blanket = revivable; beyond a supersede/revoke/close/recover boundary = permanent within the branch — those purposes are immutable, re-entry only via C3′ removal; v0.5.8's blanket under-a-sealed-generation permanence contradicted the algebra's below-bound revival and is void) | capability-epoch, cutoff, lease-stale, budget, lineage-gen, import-collision (D-196) |
+| **duplicate-idempotent** | duplicate (byte-identical) |
+| **freeze-control** | ctrl-fork (C2), recovery-competition (same-repoch, §7.4) |
+| **freeze-writer** | fork (tenant writer), issuer-fork (that issuer's feed) |
+| **storage-quarantine** (local read-only + rebuild) | log-corrupt (incl. journal invariant violations: wrong/duplicate incarnation, a second terminal in one interval, reopen-after-Done, a HELD-invalid citation — D-185/D-189), wrapper-mismatch, aead-fail, storage-orphaned (activation the surviving control state does not carry — D-104) |
+| **storage-freeze** (local writer freezes; retry after remedy — transient, no rebuild) | storage-io |
+| **edge-deny** (live request only; nothing replicated) | unknown-version*, no-cert*, cert-revoked*, op-unknown*, no-session, session-ended, no-token, token-scope, token-revoked, quota, lock-denied, audit-unavailable |
+
+(*when raised at the edge; the same outcome inside the fold is
+reject-permanent.) Vectors assert **outcome and disposition** for
+every negative case.
+
+---
+
+## 11. Memory tenant
+
+### 11.1 Operation registry (memory tenant)
+
+Closed grant-verb vocabulary:
+`search, read, evidence.read, propose, assert, judge.safe, judge.full,
+pin.safe, pin.full, erase.request, raise, declassify, export, import,
+curate.instruction, audit.write, admin`. **`audit.write` is
+system-only**: grantable on any device class (hosted included — every
+device audits its own audited reads, D-64), but an operation citing it
+admits only with `actor.kind = "service"` and `attested_by` = the
+writing device's own certificate; no other verb accepts a service
+actor. Hosted-safe subset per §7.5(b).
+
+**Verb classes (D-60)** — two names, two jobs. **Op-authoring
+verbs** = `{propose, assert, judge.safe, judge.full, pin.safe,
+pin.full, erase.request, raise, declassify, export, import,
+audit.write}`: the verbs whose operations append tenant chain state —
+a grant carrying any of them REQUIRES `lineage` and exactly one zone
+(D-32), participates in budgets, and holds the implicit `w.gen`
+right. **Claim-authoring verbs** = `{propose, assert}`: the subset
+that authors claims — author relations (the retract/supersede rows
+below) key on these. `curate.instruction` is a **co-authorizer** (it
+rides the `judge.full`/`pin.full` rows; no standalone operation).
+`admin` is **reserved (D-61)**: it has no v1 consumer — a v1 grant
+carrying it rejects at issuance (`body-invariant`); the name is held
+for D0-B delegation. `search, read, evidence.read` are edge verbs (no
+chain append, no lineage).
+
+Registry
+(lane = the grant's zone; replay, scoped to the writer's
+`(zone, lineage)`: byte-identical `request_id` reuse → `duplicate`
+(idempotent); differing bytes under one `request_id` →
+`request-fork` (reject-permanent, surfaced as fork evidence — D-76);
+disposition on admission failure per §10.5):
+
+| op_type v1 | Verb | Body (App A.5) | Invariants | Transition | Charge |
+|---|---|---|---|---|---|
+| `m.claim` | propose | mclaim | kind ∈ grant.kinds; sensitivity ≤ ceilings; evidence valid §11.5; `decision` kind is propose-only (D-24) | claim exists (candidate) | 1 op + bytes |
+| `m.claim` + self-accept | assert | mclaim + mjudge | kind ∈ {observation, episode}; space_class == workflow; `P(claim) == P(judgment)` (§11.2 — the principal restatement of same-actor-and-session); emitted as one `Txn` (two ItemCommits: claim, then its judgment); judgment request_id = `assert_req(claim.request_id)`; judgment causal_references include the claim. Each half is individually admissible on replicas: the claim half alone stands as an ordinary propose; the judgment half admits only with its claim present (else `causal-missing`, pending-dependency); re-submission completes a missing half idempotently | claim + counting self-accept | 2 ops + bytes |
+| `m.judge` accept/retire/dispute (safe) | judge.safe | mjudge | target kind ∈ {observation, episode}; target in grant scope; **direct-human evidence (§10.1)** | judgment appended; counting per policy | 1 op |
+| `m.judge` accept/dispute/retract/retire/supersede | judge.full | mjudge | owner-class actor; **excludes raise_class/declassify** (those ride their own verbs + flags — no bypass); acceptance of `procedure`/`preference` kinds additionally requires the `curate.instruction` verb | judgment appended | 1 op |
+| `m.judge` retract | any claim-authoring verb ({propose, assert}) with relation `author` / judge.full | mjudge | authoring principal (relation `author`, §11.2) or owner-class; **no un-retract in v1** | retired | 1 op |
+| `m.judge` supersede | judge.full; or any claim-authoring verb ({propose, assert}) on own claims within workflow (relation `author` — the workflow-v1 session/author row) | mjudge | replacement ref required | supersession edge | 1 op |
+| `m.judge` raise_class | raise | mjudge | grant.can_raise; ≤ raise_quota per budget window (§4.3, D-79); target in scope | raised floor (mutable component) | 1 op, counts against raise_quota |
+| `m.judge` declassify | declassify | mjudge | owner-class + can_declassify | lowers mutable component per §11.6 | 1 op |
+| `m.pin` (safe) | pin.safe | mpin | **direct-human evidence required**; target kind ∈ {observation, episode}; target status accepted; destination.role = "context", destination.space ∈ the same zone's personal/workflow spaces; **never procedure/preference** (a pin can compile auto-context influence — hosted pinning stays non-instruction-grade) | pin live | 1 op |
+| `m.unpin` (safe) | pin.safe | munpin | direct-human evidence; target_pin authored by the **same principal** (relation `self`, §11.2) — hosted writers can undo their own pins | pin revoked | 1 op |
+| `m.pin` / `m.unpin` | pin.full | mpin/munpin | owner-class; pins targeting `procedure`/`preference` additionally require `curate.instruction`; unpin targets a pin op | pin live / revoked | 1 op |
+| `m.erase_request` | erase.request | merasereq | **direct-human evidence required**; `targets` = **claim op hashes** (D-66), each in grant scope | targets flagged **retrieval-excluded immediately** on acceptance; status unchanged; queued for next `c.kek_rotate` manifest; tombstone metadata after rotation | 1 op |
+| `m.export.release` | export | mexportrel | §11.8 | release recorded; PendingXfer journal (plane endpoints only — egress journals nothing, D-65) | 1 op + `record_count × 512 B` (D-98/D-106) |
+| `m.import.claim` | import | mimport | §11.8 | candidate claim w/ import provenance | 1 op + bytes |
+| `m.audit` | **audit.write** (the genesis audit grant, §7.1 — grantable to service actors only) | maudit | actor.kind == service; attested_by == the writing device's own cert; space == audit; works on **any device class** (a zero-daemon browser audits its own audited reads). **Trigger (D-64/D-74, three branches)**: a read/search is audited iff its scope includes a space with `class_minimum = sensitive`, **or** its result set contains any item whose *effective* classification is `sensitive`, **or** its scope includes the audit space (audit reads are always audited; writing the resulting row is a write, not a read — recursion terminates). At genesis no space is sensitive-minimum, so branches 1–2 first fire with sensitive content — by design. **Body (D-74)**: typed `principal` (the §10.1 shape plus its identifiers — never free text; the mediated shape distinguishes peer vs session variants), `read_id` (fresh random per read — all rows of one read share it, one `principal`, one canonical `scope`), `chunk {index, count}` with indexes exactly `0..count−1`, disjoint result sets whose union equals the released results, `result_ids` = **op hashes of the returned records** (audit rows included — they are operations), `scope.spaces` a bounded set (≤ 64 — one audit partition covers a multi-space search); **an audit row contradicting its read's established partition — a duplicate chunk index, a changed `principal`, `scope`, or `count`, or a result set overlapping another row's — is `(body-invariant, reject-permanent)` on every arrival order (the chain proves it; the audit's D9, owner-ratified 2026-07-16)**; **one read = one zone (D-83)** — a cross-zone search is one read, with its own `read_id` and partition, per zone; a zero-result audited read writes exactly one chunk `{index: 0, count: 1}` with empty `result_ids`; `at_ms` = **diagnostic local time** (chronology, never authority). **Physical rule**: one read's audit rows ride **one `Txn`**; the edge caps result sets at 4096 IDs per request (16 records × 256 IDs, E8) so that Txn always fits; results release only after it is durable **and the read's coordinate is effect-final (§4.3, D-101)**. **Failure/availability rules (D-52)**: an audited read whose audit Txn cannot durably commit **fails closed** with the dedicated outcome `audit-unavailable` — a read-only replica (lock loser, §6.2 L3) therefore cannot serve audited reads, and audit-budget exhaustion is a visible, owner-remediable denial, never a silent darkening (**hosted remedy = re-root**, D-64: no in-ceiling budget refresh exists; product copy warns near exhaustion) | audit rows appended (one Txn per read) | 1 op per row |
+| `w.gen` | implicit in any op-authoring verb (D-60) | wgen | §9.3 | opens generation g ≥ 2 | 1 op |
+| `memory.search/read/evidence.read` | respective | — (edge) | edge quotas | — | — |
+
+**Diary compound (D-40).** On `personal` spaces the hosted pair
+propose + safe-accept rides one `Txn` with the assert linkage —
+judgment `request_id = assert_req(claim.request_id)`, judgment
+`causal_references` include the claim, a missing half completes
+idempotently — but under its own verbs (`propose`, `judge.safe`; the
+`assert` verb stays workflow-only, D-40). Each half keeps its own row
+invariants (the judgment half needs direct-human evidence).
+
+### 11.2 Judgment counting and status fold
+
+**Authoring principal** (portable, from signed header fields):
+`P(op) = (writer.lineage, actor.kind, actor.id)`. Policy `relation`
+(D-45) evaluates against it, principal-level (D-51): `self` =
+`P(judgment) == P(target)` (session actors carry the session id in
+`actor.id`, so same-session is automatic); `author` = `P` equality
+**or** (same `writer.lineage` ∧ the judging actor has direct-human
+evidence, §10.1); `any` = unconstrained. Device-level authorship was
+rejected: shared device custody never silently becomes shared
+authorship — one session cannot retract another's work on a shared
+controller. Humans sharing one enrolled device DO share its
+device-derived principal (O8) — the principal-layer form of O4's
+admitted shared-custody residual (D-76).
+
+`authorized(j)` = admission passed **and** the space's bound policy
+counts `(verdict, target.kind, space_class, actor_class(j),
+relation(j, target))` — a judgment failing its matching rule's
+`relation` is recorded and surfaced, never status-changing.
+Anti-suppression: `dispute` counts toward status only from the actor
+classes the space's bound policy lists — in `workflow-v1`: owner and
+safe-human; in `owner-v1`: owner **only** (B.2/B.3 are the authority;
+a session-class dispute is recorded and surfaced, never
+status-changing). Fold
+precedence (all inputs defined above — self-contained):
+
+```
+status(c, F, pol, as_of):          # pol = the bound status_policy
+ 1 authorized retract|retire            → retired
+ 2 authorized supersede(c→r), status(r)==accepted, no cycle
+                                        → superseded   (cycles → disputed)
+ 3 authorized dispute d with no authorized owner/safe-human accept a
+   with d ∈ ancestors(a)                → disputed
+ 4 authorized accept                    → accepted
+ 5 else                                 → candidate
+```
+
+Revival on replacement loss is automatic and surfaced (D-21). Retract
+vs Retire surface distinctly; derived views carry
+`retired_via: "retract" / "retire"` (the counting verdict) and
+`retired_by: "author" / "curator"` (the authoring principal's retract
+vs any other authorized retract/retire) on retired claims.
+`mclaim.supersedes[]` is advisory — views MAY render the lineage
+links; it never enters the fold (supersession is judgment-only).
+
+### 11.3 Policies
+
+`polref = { id: text, version: uint, hash: bytes32 }` — the content
+hash rides every judgment and pin (a name collision cannot smuggle a
+different rule table). Spaces bind `status_policy` by polref;
+projections stamp it. The two built-ins (`workflow-v1`, `owner-v1`)
+are published as exact rule tables in **Appendix B.2/B.3**, their
+canonical bytes and hashes pinned by vector family 11. Policy or
+space-minimum changes take effect **from their control acceptance
+point forward**: a projection evaluated at an earlier stamped control
+frontier is unchanged; re-evaluation at a later frontier applies the
+new binding (deterministic in the stamp).
+
+### 11.4 Actor classes (derived)
+
+`owner`: human evidence (§10.1) on a §7.6 class with no exclusions,
+citing a grant with `judge.full`/`pin.full`/`curate.instruction`
+rights. `safe-human`: human evidence on any class, hosted included.
+`session`: shape 2. `external`: shape 3. `peer`: shape 4. `service`:
+§4.5 O5. Derivation is normative; no free-text roles. A bare
+non-human unattested writer (an autonomous daemon or browser under
+its own certificate, no `attested_by`) has **no class and no vote
+(D-201)**: its judgments are recordable where authoring verbs admit
+them and count toward no §11.2 rule — status influence requires
+attestation (the session path).
+
+### 11.5 Evidence
+
+As Appendix A.5 `evref`: plane refs
+(`{ns:"plane", op, zone, ? plane_id, ? span, class_floor}` —
+`plane_id` present for cross-plane refs) and external refs
+(`{ns:"external", scheme, locator_hash, digest, class_floor}` —
+`locator_hash` binds the resolver input, single domain defined below;
+`digest` = SHA-256 of the referenced content bytes). Taint depth 1.
+Plane refs are **verified**: their taint is
+`evidence_effective_floor = max(effective_shallow(source), recorded
+class_floor)`, where `effective_shallow(source)` is §11.6 `effective`
+computed **without the source's own evidence term** —
+max(space_minimum, import class_floor if present, mutable(source)) —
+at the projection's stamped frontier (depth 1 is thereby exact: one
+hop of verified floor, no recursion). **A dangling or unresolvable reference of
+either namespace taints as `sensitive`** (owner ruling D-36 — a
+claimant's recorded floor is not verification). Cross-plane plane
+refs (`plane_id` present) are always unresolvable in v1 — `sensitive`
+until D0-B defines the verification transport (D-44). Resolvable
+external refs contribute their recorded `class_floor`, stated as a
+trust boundary (external content has no verifiable class). Locator
+canonicalization: `url` = the WHATWG-normalized absolute URL;
+`session-log` = `"session-log:" || session_id || "#" || span`;
+`file` = the absolute NFC path;
+`locator_hash = H_evrec(canonical locator text)`. Judgment `evidence`
+fields are `evref`s too, not bare hashes. `memory.evidence.read`
+authorizes dereference; refs confer no read authority.
+
+### 11.6 Classification fold (deterministic, floor-preserving)
+
+```
+immutable_floor(c) = max( space_minimum(space @ control frontier),
+                          max over VERIFIED evidence floors,
+                          import class_floor if present )
+declared(c)        = max( c.sensitivity,
+                          all authorized raise_class values )
+mutable(c)         = declared(c), unless qualifying declassify
+                     judgments exist. d qualifies iff it causally
+                     descends EVERY authorized raise_class on c and
+                     the claim itself. Among qualifying judgments,
+                     first select the CAUSALLY MAXIMAL set (those not
+                     ancestors of another qualifying d) — a later
+                     sequential declassify thereby supersedes an
+                     earlier one — then take max(new_class) among the
+                     concurrent maxima (conservative pick).
+effective(c)       = max( immutable_floor(c), mutable(c) )
+```
+
+v0.2's formula could cross floors and is void. A concurrent
+(non-descending) raise defeats any declassify. Space-minimum changes
+follow §11.3's stamping rule. Requests never carry trusted
+classification.
+
+### 11.7 Views, expiry, auto-context, audit
+
+- Projections stamp `{data frontier, control frontier, reducer
+  version, polrefs, key epoch, as_of_ms}`. Temporal eligibility at
+  `as_of_ms`: claims with `valid_from_ms > as_of` or past
+  `valid_until`/`expires_at` are ineligible for retrieval **and for
+  rule 2's replacement check** — a temporally ineligible or erased
+  replacement does not hold supersession, so the predecessor revives
+  (`status(c, F, pol, as_of)` consumes `as_of` through exactly these
+  two uses). Acceptance evidence (§9.1) governs only log entry.
+- **Erased claims**: after a tombstone, derived status is the
+  terminal value **`erased`**; judgments and pins targeting it are
+  inert; supersession edges pointing at it are inert (revival per the
+  rule above); evidence refs to it are dangling (`sensitive`, §11.5);
+  views show the tombstone. Accepted `m.erase_request` targets are
+  **retrieval-excluded** — part of the normative
+  read/search/auto-context predicate, not UI courtesy.
+- Auto-context: status accepted ∧ live pin ∧ the pin's
+  `accepted_under` judgment still counts ∧ no unresolved
+  dispute/retract/supersede/expiry — and **per-item `memory.read`
+  authorization for the receiving session** (a pin selects; it never
+  grants).
+- Audit: audited reads/searches (trigger D-64/D-74, §11.1:
+  sensitive-minimum space in scope, any effective-sensitive item in
+  the results, or the audit space in scope) append `m.audit` rows (App A.5 `maudit` — typed
+  principal, `read_id`, chunked) to the genesis `audit` space via the
+  device's service writer (§11.1) — ID-only, never queries or
+  content.
+
+### 11.8 Export/import (two authorities, exact bundle)
+
+```
+bundle / bundlerec — normative CDDL in App A.5 (versioned; recs =
+                     keyed set by op, EXACTLY the release's sources;
+                     each rec's class_floor = that source's effective
+                     classification at the release's stamped
+                     evaluation point; statement verbatim)
+content_digest = the MERKLE ROOT (D-147/D-156/D-162):
+  leaf_i = H_brec(canonical bundleleaf_i)
+                             # bundleleaf: the NAMED, VERSIONED
+                             #   production (App A.5, D-162 —
+                             #   v0.5.13's inline object fixed no
+                             #   canonical bytes); self-describing:
+                             #   export_id + ordinal inside every
+                             #   leaf, no header leaf (bhdr retired)
+  parents = H_bnode(left || right); an odd node promotes unchanged
+```
+
+**Per-record durable proof (D-147/D-156)**: v0.5.11's flat
+`H_bundle(bundle bytes)` lost committed partial imports their
+proof — bundles are never persisted, so one ERASED sibling made
+the digest underivable and a committed record's binding to its
+release unverifiable on rebuild (acceptance-history dependence) —
+and v0.5.12's header-leaf design proved only MEMBERSHIP: a path
+reaches the root without showing the expected header or layout was
+inside the opaque sibling subtrees (D-156). Each leaf is therefore
+**self-describing**: it binds `export_id` and its ordinal, and
+`rec_index` MUST equal the record's **rank in the release's
+signed, sorted `sources` set** (0-based — the verifier computes
+the expected rank from `source_op` against the signed body;
+`record_count = the source-set size` is likewise a signed fact, so
+no header leaf is needed). Each `mimport` carries `rec_index` and
+the Merkle
+`proof` path (≤ 7 siblings under the 128-rec cap): folding the
+leaf up the path — siblings bottom-up, exact consumption (leftover
+or missing siblings fail), odd nodes promoting unchanged — MUST
+reach `release.content_digest`, else `body-invariant` —
+per-record, durable, erasure-proof validation material that also
+pins the layout.
+
+**One validator (D-162/D-170/D-178/D-184)**: admission is
+**per-record,
+always** —
+the leaf + path against the signed root, plus byte equality of
+`rec` against the source-derived bundlerec — and **sources stay live for
+nonterminal transfers (D-198)**: cryptographic erasure of an item
+that is a source of ANY nonterminal transfer journal **defers** —
+its erase-queue entry is ineligible for a rotation manifest until
+every referencing journal reaches its terminal (the queue already
+drains across successive rotations, §5.4; retrieval exclusion at
+erase-request acceptance stays IMMEDIATE — only the destruction of
+an already-released item waits for its copy to complete, and the
+owner holds the liveness remedy: a dead release closes its journal
+and the deferral lifts). Source equality is therefore ALWAYS
+checkable against the live source for every admissible import.
+v0.5.18's `ImportCommitted` marker, its `(source_zone, source_op)`
+exclusion, and tombstone-order survival are **WITHDRAWN (D-198)**:
+the marker's crash contract promised to re-commit a destination
+import from bytes NO durable object held (the marker carried three
+hashes; destination durability IS the commit that had not
+happened) — the opening of a prepared-import WAL protocol, a new
+mechanism family; the deferral deletes the problem instead — with
+the source live there is no window to order — and erasure-wins
+(v0.5.16) retires with it: a pending import never races an erasure
+on a conforming branch. **The residual (D-198/D-112)**: a C3′
+recovery ADOPTING a cut rotation's erase manifest erases
+regardless (adopted erasure stands — the owner's explicit
+ceremony); a journal whose source died that way takes the
+`source-erased` terminal — the sole remaining reachability.
+v0.5.15's stored-binding repair is WITHDRAWN as carrier-less: no
+`txnrec` member, frame, or authenticated record held the binding —
+prose storage is not storage, and an importer-mintable or
+rebuild-local cache proves nothing (D-178); the
+signed-leaf-authoritative alternative stays
+REJECTED (a security downgrade: an export-authorized signer
+could substitute statement/kind/floor bytes). Whole-bundle root
+re-derivation is
+TRANSPORT INTEGRITY, never admission law (v0.5.13 kept the
+all-or-nothing exact-bundle rule beside the proof path — two
+validators that disagreed after a sibling erasure; under the
+deferral the answer never changes — A imports on its own proof
+and source equality both times; B′ never imports: its
+source equality fails against the live source, which stays live
+for every nonterminal journal on every schedule, D-198).
+
+**The hash graph is acyclic by construction (D-127)**: the release
+body commits to the bundle (`content_digest`), never the reverse —
+the bundle carries **no** `release_op` (v0.5.9's bundle-carried
+`release_op` was an infeasible fixed point — no producer could mint
+the release).
+The signed release triple **travels alongside** the bundle; the
+destination verifies the release chain, validates **per record**
+(leaf + path, D-162 — whole-root re-derivation is transport
+integrity only), and
+**derives** `release_op = H_op(release triple)` — every
+post-signing consumer (journal records, replay keys, provenance,
+terminals) uses the derived value; a construct-and-rederive vector
+is REQUIRED (sources + keys → release → independently re-derived
+root, paths, and `release_op`).
+
+Bundles are **never persisted or framed** — re-derived
+deterministically on demand (size bounded by the `sources` and
+`statement` caps; operation and frame caps do not apply — D-75).
+
+Each `m.import.claim` binds to **one released record**: it carries
+`source_op`, and its `statement`/`kind`/`class_floor` MUST equal that
+record's (destination-verified against the received bundle bytes; the
+floor binds by equality, not ≥); one release of up to 128 records
+maps to up to 128 imports.
+
+`m.export.release`: read authority on every source ∧ flow grant
+matching the typed endpoint ∧ `class_floor = max effective(sources)`
+≤ min(flow ceiling, grant ceiling), evaluated at the release's
+stamped `{data_frontier, control_frontier, as_of_ms}` (carried in
+`mexportrel` — the complete classification evaluation point, §11.7's
+stamp shape, portable not replica-local). **The stamp is final for
+the source read (D-106)**: later displacement, revival, or status
+change outside that frozen frontier never retroactively invalidates
+what the release read (family-11 vector) — the release operation's
+own admission remains subject to the derived revisit inventory
+(T2, D-114) like any operation. **Sources** are claims
+(never judgments or pins), a keyed set (no duplicates), each readable
+under the citing grant and neither erased nor retrieval-excluded at
+the stamp. **Transfer identity is `release_op` (D-123, superseding
+D-65's plane-wide rule)**: `export_id` is a client-chosen
+**correlation label** with no fold semantics — the fold never
+enforces cross-release uniqueness (v0.5.8's ever-accepted
+consumption was an arrival-history fact: a replica that accepted a
+release before its displacer arrived and one that saw the displacer
+first disagreed forever; an edge MAY courtesy-reject a live reuse —
+edge-deny, nothing replicated). Journal records, destination replay
+keys, the writer critical section, dormancy, and terminal matching
+all key by the authorizing `release_op` — unique by construction —
+so a displaced release's revival finds its own journal unshared and
+two releases can never collide. **Plane destinations are complete**: a plane
+endpoint names all of `(plane_id, zone_id, space_id)` (App A.5).
+**Flow bound and matching (D-75)**: the release's
+`expiry_deadline_ms` MUST be ≤ the matching flow's
+`expiry_deadline_ms` (delegated authority never extends), and
+matching is **existential and whole** — at least one flow entry
+admits the release on every axis simultaneously (source coverage,
+endpoint equality, kinds admitting every record, class_ceiling ≥ the
+release `class_floor`, the deadline bound); axes never combine
+across different flows. **Charge (D-75/D-98)**: the release charges its canonical operation
+bytes **plus `record_count × 512 B`** against the grant's
+`max_bytes`, where **`record_count = |sources|`** (pinned, D-106 —
+`mexportrel` carries no count field; `pendingxfer.record_count` MUST
+equal it) — a deterministic, content-independent surcharge; **a
+record-rate bound, not an egress-byte bound (named posture, D-106)**:
+the content bytes were charged at each claim's own admission
+(v0.5.4's writer-signed `bundle_size` is removed: a signature proves
+what the writer asserted, not that anyone checked it, and the
+adversary table admits compromised signers — the content bytes were
+already budget-charged at each claim's own admission, so the
+surcharge bounds export rate without trusting the exporter).
+`content_digest` remains destination-verified against the received
+bundle bytes. Release completion and import execution sit behind the
+**effect-finality barrier** (§4.3, D-94).
+Egress endpoints require a **governed profile**: `{ egress: { kind: "model-provider" /
+"embedding" / "reflection", provider_id: text, profile_hash:
+bytes32 } }` — the content-addressed retention/training policy
+document being approved, not a bare provider name.
+`m.import.claim`: import verb; the destination holds the received
+bundle bytes and the signed release triple (D-127), verifies the
+release chain, checks `content_digest`, and **derives**
+`release_op` — `export_id` rides along as correlation (D-123).
+**v1 verification posture**: an integrated daemon
+holding both zones verifies the release chain directly (same-plane
+cross-zone); **cross-plane import FAILS CLOSED until D0-B defines
+foreign-chain verification transport (D-44)** — no mediator lane
+exists, because no portable mediator proof exists yet. Import yields
+a **candidate** with `provenance.import`; **v1 import content is
+fully derived (D-134)**: `sensitivity = class_floor` exactly, the
+optional temporal fields absent, `provenance` exactly the import
+triple, `labels` and `evidence` absent (annotation and raising
+happen post-import as ordinary judgments — two valid imports of one
+record can then differ only in header identity); replay keys on
+`(from_plane, release_op, source_op)`
+(record-level, D-53/D-123); byte-identical replay is idempotent
+(`duplicate`). **Import identity (D-139/D-146)**: v1 pins **one
+active `import`-verb grant per destination zone**, enforced on
+EVERY grant-bearing operation (`c.grant` AND `c.enroll.grants[]` —
+a second active grant rejects at issuance, like the one-live-lineage
+rule), so imports ride one lineage at a time. Replay-key ownership
+is **wholly derived (D-146/D-155)** — never materialized, so C3′
+portability is free (the re-fold re-derives it like quarantine;
+v0.5.12's "frozen at effect finality" had no durable carrier, and
+incremental and fresh folds could disagree after a recovery cut
+the finality basis). **The claimant order is total and portable
+(D-155)**: claimants order by
+`(the import grant's control position, gen, seq)` — the zone's
+import grants are control-ordered, so claimants across grant
+turnover compare exactly (v0.5.11's one-active-grant lemma alone
+was false twice over — grant turnover put claimants on
+incomparable chains, and one lineage's open unknown-gap
+generations admitted late canonically EARLIER claimants). The
+effective owner at any fold position is the order's first
+surviving claimant; ownership **freezes** when a derived predicate
+holds — the owner is effect-final (D-94's closure IS the
+no-late-claimant proof), or a matching authority-ending frontier
+has closed its authority's remaining claim room (an at-or-below
+preserved claimant after grant revocation is thereby CLASSIFIED:
+frozen by the frontier that forecloses its competitors, D-155) —
+**and no held order-earlier claimant that is not PERMANENTLY
+incapable of winning exists (D-161/D-169)**: a claimant pending
+proof AND a claimant in revivable quarantine both RESERVE the key
+against freezing (held-bytes facts — portable; v0.5.14's
+unresolved-only reservation let a later owner freeze past a
+budget-displaced earlier claimant that then REVIVED); only
+claimants that cannot win while the current state stands release
+the reservation —
+reject-permanent, collision losers WHILE the freezing basis
+stands (their release re-derives if it dies, D-196), or
+permanently non-revivable quarantine
+(D-177/D-200 — replacing v0.5.15's undefined "frozen-out" label;
+v0.5.18's "NEVER win" overstated the collision case its own
+re-derivation revives) —
+so a later owner can hold provisionally but never freeze past
+a claimant that could still win —
+and a frozen owner's later dissolution (proof
+retro-disqualification, C3′ removal of the freezing basis)
+UNFREEZES the key: the fold re-derives the next owner by the same
+total order, identically on incremental and fresh folds; an effect
+that already escaped is the standing residual. Pre-freeze, **loser disposition derives from the final claimant
+relation, never arrival (D-161)**: the order-loser is ALWAYS
+quarantine-reproposal — whether it arrived first and was displaced
+by the order-winner or arrived second against the already-held
+winner (v0.5.13 gave the same final bytes displacement-revivable
+in one order and reject-permanent in the other — the fold-relative
+class again), revivable if the winner later dies; judgments, pins,
+or erase
+requests targeting a provisional import claim are
+**pending-dependency** until it freezes; `import-collision`
+narrows to claims against a FROZEN owner — **a derived fold state,
+permanent WHILE the freezing basis stands within the branch
+(D-196)**: the basis's death (proof retro-disqualification, C3′)
+unfreezes the key and the claimant fold re-derives INCLUDING
+former collision losers (v0.5.17 made collision reject-permanent
+while its own unfreeze rule required the loser to re-enter — a
+permanently rejected claimant cannot re-derive).
+v0.5.10's
+lowest-`op_hash` rule stays
+**void**: it let a later, lower-hash — and grindable — claimant
+DISPLACE an accepted, effect-final, referenced claim, while claim
+identity is the emitting `op_hash` that judgments, pins, and erase
+requests target; a FROZEN identity never moves while its freezing
+basis stands within the branch (D-161 — the C3′/dissolution
+unfreeze is the basis dying, never the identity moving under a
+live basis). Federated
+multi-writer
+import identity is D0-B's (cross-plane import already fails closed,
+D-44). **Mirror equality (D-134/D-142)**: one
+transfer's `export_id` is byte-equal across release, bundle,
+journal records, `provenance.import`, and terminals; its
+`release_op` — derived once from the signed release (D-127), then
+carried as a **signed mirror of the derived value** where the
+carrier is itself a signed operation (`mimport`) — is byte-equal
+across journal records,
+`provenance.import`, replay keys, and terminals;
+`provenance.import.from_plane == release.header.plane_id`;
+`provenance.import.digest == release.body.content_digest ==
+pendingxfer.content_digest`;
+`pendingxfer.dest_zone == release.body.to.zone_id`;
+`pendingxfer.record_count == |sources| == |bundle.recs|`. For plane
+endpoints the import operation's header `plane_id`/`zone_id`/
+`space_id` MUST equal the endpoint's three coordinates (D-75). Same-plane cross-zone re-encrypts as new items in
+the destination zone (§6.1 journal — one EFFECTIVE terminal
+`XferDone` or `XferAbort` per journal interval, D-65/D-148 —
+intervals chain via `XferReopen`; egress endpoints journal
+nothing).
+Release `expiry_deadline_ms` follows §9.1 acceptance-deadline
+semantics **for each import operation** (the import is the qualified
+operation — pinned): the proof is a qualified `accept` receipt whose
+`zone_id` = the **destination** zone and `subject` = the import's
+`item_addr`, with qualification evaluated under the **source zone's**
+`policy(release.header.capability_epoch)` (D-69/D-85 — the release's
+signed epoch is the portable selector; the flow is source-governed). **Egress releases consume the deadline at release
+acceptance**: the release operation itself requires the qualified
+receipt by `D` — that receipt's `zone_id` = the **source** zone and
+`subject` = the release operation's own `item_addr` (D-75; no import
+ever exists). Witnessless zones:
+deadline-bearing flows are unusable until a qualified witness exists
+(§9.1, D-56).
+
+---
+
+## 12. Migration and versioning
+
+- **M1.** Operations are immutable and never re-signed; containers,
+  wrappers, and projections may be rewritten; P1→P2 migration
+  re-encapsulates exact stored operation bytes (byte-equality vector).
+- **M2.** The envelope's `v` is the protocol version; object shapes
+  version via their own `v`; op semantics via `operation_version`.
+- **M3.** Frozen-by-vector: built-in policy bytes/hashes, reserved
+  constants, tag + info-string inventories, outcome/disposition
+  enums, verb vocabulary. All additions are append-only version
+  events.
+
+---
+
+## 13. Vectors
+
+### 13.1 Vector file schema (JSON Schema Draft 2020-12, normative — valid JSON)
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://intendant.dev/schemas/d0a-vector.v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["family", "name", "case_kind", "source", "surfaces", "inputs", "expected"],
+  "properties": {
+    "family": { "type": "integer", "minimum": 1, "maximum": 14 },
+    "name": { "type": "string", "maxLength": 120 },
+    "case_kind": { "type": "string", "maxLength": 80 },
+    "source": { "type": "string", "description": "normative section, e.g. 9.1" },
+    "surfaces": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": { "enum": ["core", "native-crypto", "browser", "storage-macos", "storage-linux", "storage-windows"] }
+    },
+    "rng": {
+      "type": "object", "additionalProperties": false,
+      "required": ["algorithm", "key", "nonce", "draw_order"],
+      "properties": {
+        "algorithm": { "const": "chacha20" },
+        "key": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "nonce": { "type": "string", "pattern": "^[0-9a-f]{24}$" },
+        "draw_order": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["name", "nbytes"],
+            "properties": {
+              "name": { "type": "string" },
+              "nbytes": { "type": "integer", "minimum": 1 }
+            }
+          }
+        }
+      }
+    },
+    "inputs": { "type": "object" },
+    "expected": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "bytes": { "type": "string", "pattern": "^([0-9a-f]{2})*$" },
+        "result": {},
+        "outcome": { "type": "string" },
+        "disposition": { "type": "string" }
+      },
+      "oneOf": [
+        { "required": ["bytes"] },
+        { "required": ["result"] },
+        { "required": ["outcome", "disposition"] }
+      ]
+    }
+  }
+}
+```
+
+Conventions: byte inputs are lowercase even-length hex; integers stay
+within E1 ranges; text is UTF-8. The RNG is **ChaCha20 (RFC 8439)**
+with the given 32-byte key and 12-byte nonce, initial counter 0; the
+keystream is one byte stream, draws taken in the order given by the
+vector's `draw_order` array of `{name, nbytes}` entries (explicit
+names AND byte counts — JSON object property order is not portable,
+and draw sizes must never depend on schema inference). `outcome`/`disposition` stay plain strings in the
+schema deliberately: the harness cross-validates them against
+§10.4/§10.5, so there is no duplicated enum to drift. **Typed cases
+(D-85/D-91)**: the container schema above is deliberately generic;
+the per-case contracts live in a **normative companion schema**,
+`d0a-vector-cases.v1.json`
+(`$id: https://intendant.dev/schemas/d0a-vector-cases.v1.json`) —
+for every family, a closed `case_kind` vocabulary and, per
+case_kind, the exact `inputs` and `expected.result` field schemas
+(object inputs are lowercase hex of canonical CBOR bytes; results
+are canonical encodings or closed-enum strings). The companion is
+**authored before any fixture** (the first corpus artifact), every
+vector must validate against container AND companion (a vector
+failing either is invalid — a harness never invents family
+semantics), and the companion is in scope for the Gate-A
+prose↔vector discrepancy audit. `draw_order` names are unique within
+a vector. Where browser WebCrypto cannot inject randomness (P-256
+signing), vectors supply **fixed signatures to verify**, never signing
+draws. Every negative vector asserts outcome **and** disposition
+(§10.5). The converge standard's **fresh fold of the union commits
+to no arrival order (D-203)**: a conforming reducer converges on
+every order, so the harness's choice is unobservable. **The one
+stated exception is the evidence-lifecycle case kind
+(D-202/D-204/D-205)**: arrival order is that lane's semantic input,
+so no fresh-fold or generated-order convergence applies — the
+vector declares its `evidence_class` (companion amendment #7:
+which qualified evidence is held at the original operation's first
+evaluation), every listed delivery must realize that class and
+derive identical final verdicts (on every relative delivery order
+of original and re-proposal, D-205), and convergence across classes
+is not promised (the D-204 residual).
+
+### 13.2 Surface matrix
+
+| Surface | Work | Lane |
+|---|---|---|
+| Shared Rust/WASM core | canonical bytes, hashes, admission, control + Memory folds, classification, dispositions | **required CI** |
+| Native crypto adapters | sign/verify, HPKE, AEAD, custody integration | required CI (Rust) |
+| Browser WebCrypto (Chromium ≥ 120 headless) | import/sign/verify/encrypt/decrypt paths, IndexedDB/Web Locks transactions | **required CI** |
+| Firefox ≥ 121, Safari ≥ 17 | same browser suites | manual acceptance pre-Gate-B |
+| Native storage (macOS/Linux/Windows) | framing, flush, locks, crash/corruption matrix | required CI per-OS (fleet lanes) |
+| IndexedDB eviction/degraded floor | eviction simulation, persist() behavior | Gate B manual |
+
+Family × required surfaces (R = required lane for Gate A):
+
+| Family | core | native-crypto | browser | storage per-OS |
+|---|---|---|---|---|
+| 1 encoding/caps | R | — | R | — |
+| 2 domains/key-ids | R | — | R | — |
+| 3 signatures | — | R | R | — |
+| 4 HPKE | — | R | R | — |
+| 5 item crypto | R | R | R | — |
+| 6 frontier | R | — | — | — |
+| 7 control fold | R | — | — | — |
+| 8 recovery derivation | — | R | R | — |
+| 9 time/lease | R | — | — | — |
+| 10 lineage/budget | R | — | — | — |
+| 11 Memory fold | R | — | — | — |
+| 12 IAM | R | — | — | — |
+| 13 storage | — | — | R (IndexedDB Txn subset) | R |
+| 14 migration/projection | R | — | — | R |
+
+### 13.3 Families
+
+1 encoding+caps (incl. encoder-exact generated-size joint fits —
+the pinned 314 B/132 B worst-width figures, the 128+128 rotation
+fit, and the 48-KiB checkpoint joint budget — D-96);
+2 domains/key-ids;
+3 signatures (low-S);
+4 HPKE (incl. malformed-point/identity-DH); 5 item crypto (per-item wrap-key derivation +
+rewrap byte-idempotence + `wrapper-mismatch`); 6 frontier (sort key,
+retirement, cap); 7 control fold (trusted-solo/hosted-solo/multi
+bootability walkthroughs; solo→multi policy transition; witness loss;
+C2 freeze; C3′ incl. placement + precedence exception +
+unknown-branch cut; hosted ceiling incl. safe-verb grants accepted,
+excluded verbs rejected, the system-only audit grant booting,
+exclusion-shaped rotation admitted vs standalone rejected +
+freeze-rule vectors, recovery-succession admissibility, attested
+multi-head self-cutoff, lineage_reauth self-service, consumed
+request_ids (`request-fork`), drill acceptance;
+zone-policy-advances-epoch + two-replica arrival-order equivalence
+(now provable under D-78's portable currency); position-relative
+authorization (D-86): grant-revoked-with-cutoff two-replica
+equivalence, renewal-superseded cert replay; strict-zone closure
+(advance without covering cutoffs rejects; closed-lineage old-epoch
+op quarantines); grant-revocation cutoff + issuance-to-revoked-device
+negative (D-92); hosted cross-lineage attested-cutoff negative;
+cutoff max-compose; renewal-mints-no-grants
+negative (D-84) + renewal union shapes (KEM-rotated wraps vs
+unchanged; class-change rejection — D-89);
+one-live-compound-per-revocation_id; derived grant
+revocation; the arm-indexed control pipeline (per-arm signer
+resolution; body-before-precedence — a valid header over garbage
+bytes never suppresses C2, D-99); cutoff algebra (D-93): a ratify
+cutoff cannot widen a revoke boundary, staged strict closure via
+union coverage, unheld-Head pending → mismatched-hash reject;
+device revocation of an authored-but-unwrapped zone (the
+authorship-domain frontier covers it; rotation refs are typed
+linkage over the wrap domain, never coverage — D-159/D-180/D-186);
+revocation constructibility (a 0-author/0-wrap
+device revokes with empty `cutoffs`; a 65-author/0-wrap compound
+completes ONLY when authorship coverage is total — the incomplete
+compound holds at (`ref-unresolved`, pending-dependency), never a
+bare "fails" (D-200); 0-author/65-wrap under the
+DECRYPTABLE-WRAP domain: prior exclusion rotations shrink it,
+`wrap_add` re-admission re-enters it pre-completion, and
+completion is STATE-DERIVED emptiness — references never
+discharge coverage — D-165/
+D-173/D-180);
+recovery storage adoption (a replica at ANY adopted rotation —
+predecessor or highest — validates its own Fence-frame entry;
+mismatched or unadopted activation → `storage-orphaned`; contiguous
+chain required; dependency closure; unheld adoption reference =
+`ref-unresolved` with NO precedence effect — D-104/D-105/D-112);
+provisional precedence (a recovery failing at `state` exerted no
+precedence — D-112); abandon-seal vectors (per-generation: an old
+gap seals while the later live branch survives; ratify past a seal
+is body-invariant, past an incorporation cap clamps at evaluation —
+D-101/D-107/D-122); the hosted
+composition (unknown gap → ratify cleanup → effects still blocked →
+requester-attested self-seal → effects restored — D-107);
+snapshot-wins cutoff five ways (control-first / tenant-first /
+behind / missing-carried / extra-held — D-108) + snapshot/scalar
+composition negatives (an entry exceeding its carried head, or
+naming an uncarried generation — D-114); the multi-generation
+ratify ceremony (one `c.cutoff`, two `ratifycutoff` entries for one
+lineage's g1/g3 — canonical under the `(zone_id, lineage, gen)`
+key; a gen/head mismatch rejects — D-120) + the
+requester-form equality negatives (below-head, above-head — both
+`body-invariant`, D-129; a ratify `"none"` entry is structurally
+unencodable, D-136) + the total-override pure-snapshot ceremony
+(empty `cutoffs`, empty carried `heads` — EVERY generation
+overrides to `"none"`; an uncarried-generation head retires while
+a carried one survives — D-135) + the close-staging ceremony
+(requesterless `closes`-only `c.cutoff`; the closes-with-requester
+and hosted-closes negatives — D-136)
++ the requester-present cross-lineage negative on a trusted plane +
+the requesterless equation-only ceremony (D-120); the
+override/growth cycle (ratify through H3 → snapshot carrying H2
+retires beyond-H2 → a later ratify at H3 is growth and revives —
+`admit_bound` override then growth, identical on both arrival
+orders — D-121) + tagged-state probes (the FIRST requesterless
+ratify transitions `Unbounded → Bounded(H)` and RETIRES beyond H —
+v0.5.10's `max(Top, H)` no-op MUST fail — D-135) + repeated-seal
+min-compose (`"none"` strongest —
+D-121); per-generation ratify
+(same-generation revival past a cap is inert — clamped at
+evaluation, D-122; later-generation
+advancement legal — D-114); owner truncation (a seal below accepted
+history + a generation void, both legal and product-surfaced —
+D-114); the held-bytes incorporation cap (two replicas —
+cap-then-displacer vs displacer-first — converge, a fresh fold
+agrees, and the cap survives displacement of its `w.gen` — D-122)
++ cap eligibility (revoked / wrong-lineage / superseded-cert /
+bad-arithmetic `w.gen`s mint NO cap; the valid-but-budget-displaced
+`w.gen` does; the off-lease/expired eligible cap stands — the
+D-141 ratified residual; a compromise cutoff dissolves an
+adversary cap and the clamped suffix re-derives, and a tenant-fork
+selection changing the held chain re-derives eligibility — derived
+dissolution, D-128/D-141);
+adoption bound (65th entry rejects; deep-fork orphaning —
+D-117) + accepted-but-unFenced non-adoption (cut and re-issued,
+nothing activated — D-117); consumed-boundary
+promotion as frontier materialization (the consuming advance's
+coverage — inline ∪ staged `closes` — materializes with the
+consumer's selector; ratify-as-coverage MUST fail; the
+multi-head closure trace: live g1/g2 heads, close carrying both →
+a later `(g1, seq+1)` old-epoch append dies on the frontier —
+v0.5.11's lex scalar admitted it — while the SUCCESSOR
+certificate's and new-epoch writers' appends pass untouched
+(selector mismatch; v0.5.11's authority-blind `immutable_cap`
+bricked them); the maximum-lineage bound (64 open unknown gaps +
+the live tip = 65 heads carried in one `frontierclose` — D-152);
+the one-shot staging cycle (stage H5 → the 1→2 advance consumes it
+→ epoch-2 history H6..H9 → the 2→3 advance REQUIRES fresh
+coverage: H5 neither re-counts under its old selector nor
+re-materializes — D-153) + the stage state machine (a PENDING
+carrier registers no stage and its dependent required-coverage
+consumer pends
+behind it — strict advance, lenient-zone retirement, AND a
+renewal whose authorship coverage depends on it, both
+orders + fresh fold; a LENIENT advance never pends; the
+late-accepted carrier re-folds the bounded consumer suffix —
+incremental equals fresh; the applicable-consumer negative
+(lineage B's renewal takes NO stage of lineage A — A's stage
+survives for A's own boundary, D-176); a staged lineage revoked
+before consumption is consumed VACUOUSLY **by the revocation
+frontier itself** (revoke → regrant: the stage is spent, the new
+authority needs fresh stages — both folds, D-196); the
+delayed-completion cessation (a grant issued between a pending
+`c.revoke_device` and its completing continuation was issued while
+the certificate was EFFECTIVE — compatible forever, D-195); the
+delayed-reference convergence (C1 → I → C2 and C1 → C2 → I: the
+unheld cited grant pends `ref-unresolved` on either order and I
+admits once C2 arrives — v0.5.18's dense-prefix nonexistence proof
+made the first order permanently reject and diverged from the
+fresh fold, D-199); the
+old-signer resurrection negative (revoked G0, renewed C0→C1 with
+the zone legitimately omitted, fresh G1 — old C0 citing G1 is
+`cert-superseded` by temporal compatibility; current C1 citing
+INHERITED G0 admits, and a co-issued pair admits — v0.5.15's
+within-span rule rejected them and MUST fail here, D-181; the
+proven-incompatible pair is permanent while missing renewal
+evidence pends — two lifecycles, one outcome; H6 beyond a named
+recovery frontier rejects under the four-axis predicate — D-174);
+a post-advance `w.gen`
+opening a NEW generation at the old epoch dies on the frontier's
+total override; below-frontier ratify revival stays legal —
+D-136/D-143) +
+exact-Head fork selection (H_A-first and H_B-first replicas
+converge on the committed cutoff's named branch; a second boundary
+naming the other variant rejects — D-130) + the pending-selector
+reservation race (earlier-pending B1
+vs later-committed B2 naming the other variant, a same-generation
+descendant, OR a head in a LATER generation opened with
+`last_known` on the unresolved branch — B2 pends behind
+the lineage-scope reservation; both orders + fresh fold converge;
+release
+on B1's reject-permanent — D-137/D-145/D-154) + the cap-anchor
+race (W =
+`w.gen(last_known = H5)` vs delayed successor H6: W-first,
+H6-first, and fresh folds all converge on the cap winning —
+chain-membership, never terminality, in BOTH cap eligibility and
+ordinary `w.gen` admission — D-144/D-159); supersede-boundary immutability (a later generic
+ratify never widens a superseded certificate — D-102); comparator
+negatives (equal coordinates, differing hash);
+checkpoint chain
+(prev linkage, this-checkpoint retired, embedded-object fold
+transition, latest-page-wins coverage, fence non-regression,
+fence-vs-pending coverage — D-88/D-96);
+genesis grant completeness (the 15-verb set, sensitive ceilings,
+inert raise/declassify, no deadline/lease); class table incl. mobile-attested vs mobile; renewal
+non-resetting + `history_cutoffs` preserving receipt-free solo
+history; the current-membership renewal set (a grant-only zone gets
+NO renewal wrap and invalidates nothing — D-125; an
+excluded-by-later-epoch zone gets NO renewal wrap: the exclusion
+stands and Kold drains as its old-wrap epochs retire — D-133) +
+authorship-domain history coverage (an excluded zone with authored
+history still gets its history boundary; the two
+renewal-after-revocation composition vectors — last-grant-revoked
+and one-of-two-same-zone-grants-revoked — D-141/D-151) + the
+transitive-custody chain (K0→K1→K2: a K2 wrap satisfies K0's
+obligation; each old secret drains when its tuples are
+descendant-covered or retired — D-141) + KEM-key freshness (a
+certificate reusing another device's KEM key rejects; K0→K1→K0
+rejects; the excluded-device decrypt bypass dies — D-150) +
+role-neutral material identity (the same P-256 point re-enrolled
+across roles — KEM-as-signing and signing-as-KEM — rejects in
+both directions by `mat_id`; a certificate whose `sig_pk` and
+`kem_pk` are one point rejects — D-175) + candidate-side
+alternate-role matching (a cut-branch `retired_keys` entry under
+one role tag rejects the same point proposed under the OTHER tag
+on a fresh replica that never held the cut certificate — both
+directions; the same matching runs the retired-vs-adopted overlap
+— D-182) + the negation-residual acceptance (setup explicit,
+D-197: P is enrolled — or burned in `retired_keys` — FIRST, then
+candidate −P under a named role and device is ACCEPTED — exact-
+SEC1 equality, the deliberate §14 residual, D-190) + the
+effective-certificate wrap negative (a post-renewal wrap-add
+targeting the predecessor KEM key rejects — D-125)); 8 recovery
+derivation (omitted-pair `"none"` override: a `(zone, lineage)`
+pair absent
+from `tenant_cutoffs` quarantines entirely — portable, no base
+coordinate — and revives under post-recovery ratify growth; a
+>256-lineage plane needs no continuation — D-132/D-138/D-151;
+naming-terminates vs omission-continues (a NAMED lineage is
+immutably terminated beyond its carried heads; the
+preserve-and-continue path is omission + post-recovery ratify —
+D-159) + the first write on a post-recovery-enrolled pair folding
+normally (the blanket binds lineages enrolled at or before base —
+D-159); the
+total
+re-fold: a cut reauth re-quarantines the bytes it revived, a cut
+retirement reopens its space AND its formerly `scope-space`
+rejections re-evaluate (D-149), dissolved caps/closures re-derive,
+and a committed fork selector's removal refreezes both suffixes —
+D-131/D-138/D-128; KEM-renewal adoption: base C5 adopting renewal
+C8 — strictly after base, both arrival orders (v0.5.13's inverted
+negative MUST fail — D-164) — with signing-only intermediate links
+riding the bounded list, or
+the
+K0-destroyed device is `storage-orphaned`, never silently
+re-keyed; adopted-key reuse negatives (the TERMINAL adopted KEM
+key re-enrolls on its own device and rejects on any other; an
+INTERMEDIATE adopted key — K1 of K0→K1→K2 — rejects everywhere;
+the adopted signing key
+anywhere rejects; a key in BOTH `retired_keys` and the terminal
+adopted set = `body-invariant` on the recovery —
+D-150/D-158/D-164/D-172); the
+post-recovery-enrollment first write (admits under the main rule,
+E8, AND the CDDL mirror — all three now agree, D-167) + the
+cut-unadopted key differential (one replica holds the cut
+certificate, another never sees it — BOTH accept the reuse: the
+key was never burned, D-167); 9 time/lease (self-receipt
+non-qualification by device; renewed-key self-receipt rejection;
+deadline at/past; deadline-bearing op missing proof (pending →
+fence-hardened) vs deadline-free budget lane — a present deadline
+never becomes advisory (D-56);
+T5 window binding; issuer-fork + recovery-via-renewal;
+missing-receipt pending-dependency hardening at a GC fence;
+service-key descriptor resolution + rotation — Connect qualification
+via `c.service_key`; per-posture issuance (budgets vs fail-closed
+grant/cert requirements); witnessless-zone lease + deadline
+unusability; succession trio (old key valid at old anchor /
+disqualified past its cutoff / two rotations in one admin epoch);
+epoch-anchor qualification across a policy change (two-replica order
+equivalence); attestation freshness (banked replay via version reset
+— defeated by monotonic `lineage_version`; C3′ resurrection —
+defeated by `repoch`; snapshot-wins cutoff boundaries — uncarried
+successors retire, D-108/D-114); chained feeds (missing-link `issuer-gap`
+pending; backfill mint fails the chain → `issuer-fork` identically
+on every replica; **boundary ancestry gating — a correct immediate
+link on the wrong branch does not qualify until the path reaches the
+committed head, D-95**; min-merge requires ancestor proof;
+device compromise cutoffs cover leases — D-87);
+the durable one-shot reauth posture (a banked attestation applied
+after window consumption is LEGAL — D-100); issuer-fork freeze-both (conflicting statements freeze BOTH
+suffixes identically on both delivery orders; a committed boundary
+then selects — losing branch stays quarantined, winning branch
+re-qualifies — D-115); the cross-carrier registry (a checkpoint
+proof position committing branch A, then a compromise cutoff
+naming branch B → `body-invariant` on the second carrier; a
+commitment at or below the fork point — the last common ancestor —
+selects neither; missing-ancestry-first pends `ref-unresolved` and
+admits when the links arrive; an earlier PENDING carrier reserves
+its scope — the later carrier waits, control order preserved
+through pendency — D-124/D-131) + plane-wide signing-key freshness over the PORTABLE domain
+(a renewal OR new-device enrollment reusing a surviving-chain or
+`retired_keys`-committed key rejects — A→B→A scope resurrection
+and the D1-signs/D2-witnesses same-key bypass both die; a
+cut-branch key NOT carried in `retired_keys` re-enrolls — the
+stated residual, vectored with cut-certificate delivery before AND
+after the reuse — D-131/D-141/D-150); renewal feed_closure as a T3 boundary
+(ancestry gating + min-merge + hardening exemption — D-118);
+closure retro-disqualification (receipt #8 qualified an operation;
+a later renewal closes the old feed through #7 → the receipt dies
+and the operation retro-quarantines at the closure's fold
+position — D-124); renewal feed closure (a delayed
+old-key receipt chain-verifies against it; a post-renewal mint dies
+on it — D-111); dropped-witness
+forever-pending lane (D-88)); 10 lineage/budget (generation
+non-reset; window exhaustion; cutoff across generations; epoch bump
+reset — budget windows reset on `c.cap_epoch_bump` only, a
+`c.zone_policy` advance re-arms nothing (D-79); canonical budget
+order (D-86): `(gen, seq)` fold with deterministic displacement —
+the two-generation race converges identically on both arrival
+orders; signed window anchor; eligible-charge set + displacement
+revival cascade (D-94); effect-finality gating (an egress under an
+open unknown-gap defers until an IMMUTABLE seal — a ratify cutoff
+does NOT unlock it, a per-generation `c.abandon_writer` seal does —
+D-101/D-107); the incorporation-cap clamp (a ratify entry past
+`last_known` truncates at evaluation, never rejects — arrival-order
+equivalence vectored — D-107/D-122); the
+64-open-gap cap negative (D-103); the held-zones (129th) and
+zone-recipient (257th) cap negatives (D-109/D-110) + the
+split-brain convergence trace (a Fenced and an unFenced replica
+admit the 257th-recipient wrap identically under the accepted-epoch
+cap — D-125) + the wildcard-grant held-zones exclusion (D-125); the grant-epoch
+lower bound negative (epoch-5 grant / epoch-1 op — D-93); portable
+currency
+(D-78): `epoch-unopened` pending + two-replica equivalence, chain
+epoch monotonicity negative, signed grant slack, closure-cutoff
+quarantine; `w.gen` space/kind-axis bypass — other axes still bind;
+chain arithmetic (first seq, +1 increment, g = max + 1 — one negative
+per axis); `last_known` validation negatives (incl. the
+canonical-but-budget-displaced head: incorporable, never
+`body-invariant` — D-167); effective-accepted-head
+retirement (a displaced named head retires the accepted head at
+or below its position — no stale-live-head leak into checkpoints;
+no accepted head at or below = a successful no-op — D-175) vs
+unknown-gap persistence; reauth-widening revival
+(held `lineage-gen` bytes revive under the new window, both
+arrival orders — D-132); space retirement with mandatory frontier closure
+(a delayed pre-epoch write BELOW its generation's carried head
+admits; a deliberate old-epoch mint beyond it — or in a lower
+still-live generation, or opening a new generation — dies on the
+frontier, not the anchor; a coverage-missing retirement rejects;
+both arrival
+orders — D-132/D-138/D-143));
+11 Memory fold (all §11.2 rows; unauthorized dispute;
+safe-human accept on hosted plane; revival; assert batch + idempotent
+completion; pin.safe target limits; erase-request immediate
+exclusion; classification floor preservation + concurrent-raise-
+beats-declassify + raise-quota exhaustion; dangling-evidence
+sensitive; export/import digest match + mismatch + replay
+idempotence incl. `source_op` statement binding + cross-plane
+fail-closed; record-level transfer — per-record replay keys +
+completed-set XferDone; typed-erase recovery (manifest → derived
+tombstones → `erased` status; `target_op` membership checks);
+actor-id minting per kind (a non-conforming id → body-invariant);
+audit trigger all three branches + typed principal + partition
+exactness (indexes, disjoint union, multi-space scope, zero-result
+single chunk, one-zone-per-read) + result-id
+domain + the 4096 edge cap; flow-deadline bound + whole-flow
+matching; content-independent surcharge accounting (`record_count × 512 B`,
+`record_count = |sources|` — no writer-asserted size, D-98/D-106);
+the three consumer mirrors gated on effect finality (egress /
+audited results / transfer terminals — D-101); the release_op
+critical section (an import can never commit after an XferAbort
+listed it missing — D-113/D-123); PendingXfer dormancy/revival/closure
+(D-113); frozen-stamp
+PendingXfer recovery + the stamp-finality clarification vector
+(later displacement outside the frozen frontier never invalidates
+the source read — D-106); state-derived terminal precedence
+(all-imported → XferDone even post-erasure; erased-source aborts ALL
+remaining; destination-reject completes the rest — D-98);
+release_op identity (two releases sharing an `export_id`
+correlation label never collide — replay keys, journals, terminals
+all disjoint; the displaced-release/second-release two-replica
+trace converges — D-123); the one-record reject-permanent abort
+(the sole record's durable attempt resolves reject-permanent →
+eligible `missing`, non-empty abort at the release's effect-final
+coordinate — D-126) + the reason split (`"release-rejected"`
+cleanup vs `"reject-permanent"` terminal — D-126); release
+construct-and-rederive (sources + keys → release → independently
+re-derived `content_digest` and `release_op` — the hash graph is
+acyclic, D-127); derived import ownership (a second active import
+grant rejects at issuance — on `c.grant` AND `c.enroll.grants[]`;
+an order-earlier claimant in a still-live lower
+generation DISPLACES a provisional owner, and a judgment/pin/
+erase targeting it pends until a freeze predicate holds; the
+at-or-below claimant after grant revocation is FROZEN by the
+frontier that forecloses its competitors, and a new-lineage
+claimant orders after it by grant control position — D-155; the
+C3′ unfreeze trace: recovery cuts the freezing basis → the key
+re-derives its owner by the total order, incremental and fresh
+folds agreeing — D-155; the arrival-invariant loser (B-then-A and
+A-then-B yield the SAME quarantine-reproposal disposition for the
+order-loser B — D-161) + the capable-claimant reservation (an
+order-earlier claimant awaiting proof OR sitting in revivable
+quarantine blocks the later owner's freeze — the
+displaced-then-revived handoff trace: G1's displaced claimant
+revives after Q would have frozen, and the reservation held Q
+provisional — D-161/D-169); a claim
+against a frozen owner is `import-collision` — a fold outcome in
+the DERIVED lane,
+never a terminal cause (D-177/D-196) — and the freeze basis dying
+unfreezes the key at the FOLD level: the claimant fold re-derives
+INCLUDING the former collision loser (A-frozen → B-collision →
+A's proof dies → B re-enters and may own — incremental and fresh
+folds agree,
+D-155/D-196) — D-139/
+D-146/D-155/D-161/D-169/D-177/D-196);
+effect-key granularity (one release, 128 imports
+= 128 idempotency domains; deliver/terminal namespacing;
+incarnation-keyed terminals — D-134/
+D-142/D-148); permanent-quarantine cleanup
+(a release sealed beyond `immutable_cap` closes via the cleanup
+abort; a permanently quarantined destination import becomes
+eligible `missing` — D-134); the reopenable journal fold (two
+missing records under INDEPENDENT bases, dissolved in both
+orders — each reopen re-derives per record, the other basis holds
+its record; a `scope-space` abort whose retirement a later C3′
+cuts → reopen; the collision-terminal unreachability probe (a
+collided record is imported by its winner or its terminal defers —
+no abort ever lists it, D-177); a reopen
+delivered before vs after its cited invalidation (PENDS, then
+applies — never quarantined for feed order; an uncited reopen =
+log-corrupt — D-163); the terminal-first reservation (an Abort
+whose basis is unheld pends `ref-unresolved` and RESERVES
+its interval — no second terminal lands; the re-fold applies it
+when the citation arrives, both orders + fresh fold — D-185) + the
+T0→R0→T1 battery (every delivery order + fresh replay of the
+frame-order journal; a statement-kind terminal basis rejects at
+parse — `opfactref` — while a statement-kind INVALIDATION
+verifies; an incarnation mismatching frame order = `log-corrupt` —
+D-192/D-193); the monotone-cause trace (the RECORDED
+cause dies while another sufficient fact holds → the journal
+reopens and interval n+1 re-terminals with the survivor, both
+orders + fresh fold; a stmt-kind factref INVALIDATION — a
+fork-discovery statement killing the recorded cause's
+qualification — cited and verified; basis stays op-kind —
+D-179/D-185); the deferral
+schedules (an erase request against a live transfer's source:
+retrieval exclusion is IMMEDIATE, the queue entry stays ineligible
+while the journal is nonterminal, and erasure proceeds at the
+terminal — the pending import verifies against the LIVE source
+throughout; the journal-closure remedy: the release dies → the
+deferral lifts; the adopted-erasure residual: a C3′ adoption
+erasing a nonterminal journal's source resolves every
+non-effect-final attempt `source-erased` — both orders + fresh
+rebuild — D-198/D-112);
+Abort→Reopen→Done through a real consume-once dedupe
+store — the incarnation key admits the successor terminal; a
+wrong-incarnation reopen = (`log-corrupt`, storage-quarantine —
+D-189/D-200);
+`XferDone` never reopens — D-140/D-148/D-157); the Merkle-proof battery
+(construct-and-rederive root + paths; partial import, source
+erasure of a sibling, index deletion, fresh rebuild — the
+committed record still validates by leaf + path; a durable
+receipt-pending import whose sibling erases still resolves —
+D-147); the self-describing-leaf battery (1/2/127/128-record
+trees; a wrong `rec_index` — ordinal ≠ the signed-source rank —
+rejects; extra or missing proof siblings reject; the odd-promotion
+path verifies — D-156) + validator equivalence (a two-record
+bundle with a noncanonical sibling B′: B never imports before OR
+after B's erasure, A imports on its own proof and source equality
+both times — one validator, one answer — D-162); the
+`mimport` narrow-shape battery (one valid canonical import + one
+negative per prohibited field + the mirror-matrix equalities
+from_plane/digest/dest_zone/content_digest + independent
+negatives for export_id, derived-vs-signed release_op, the
+three-way record_count equality, endpoint header coordinates, and
+propose/assert-with-import — D-142/D-151);
+relation-principal vectors (self /
+author; cross-session deny on one device — shared custody is never
+shared authorship); `valid_from` / erased-status /
+revival-on-ineligible-replacement; B.2/B.3 literal bytes reproduce
+their pinned hashes; policy hash mismatch → policy-missing); 12 IAM (≥1 per
+outcome member incl. storage/edge enums; ≥6 allow-paths across all
+four shapes; search-allowed/read-denied per surface; audit lane —
+lock-loser audited-read denial + audit-budget exhaustion, both
+`audit-unavailable`; ctrl-fork / recovery-competition / request-fork
+/ epoch-unopened / issuer-gap each enumerated; tenant request-fork;
+multi-fault precedence incl. the sig stage); 13 storage
+(framing v2; incomplete-tail truncate vs complete-bad-CRC quarantine;
+mid-file corruption; SYNC resync + `nlen` mismatch quarantine; Txn
+atomicity; PendingXfer/XferDone/XferAbort
+recovery; zone-scoped frontier + checkpoint incl. fence coverage +
+same-lineage multi-generation omission (an omitted `(L, g)` entry
+persists — omission never removal) + the insufficient-fence
+negative (a lineage fence below one of its generation covers
+rejects — D-118);
+cross-process lock;
+erase crash matrix ×6 states incl. survivor-completeness failure
+blocking KEK destruction, post-Fence crash recovery from the
+persisted Fence fields, and a third-rotation survivor set containing
+an epoch-1-committed item (D-73); rotation-queue serialization on durable state 6 (an N+1 Fence
+before N's tombstones is non-conformant — D-89) + Fence activation
+(I3 serves the last-Fenced epoch; epoch 1 active sans Fence, D-92);
+the staged >128-membership ceremony incl. wrap-adds surviving a
+later rotation's acceptance + committed Fence intent
+(control_frontier + recipients_hash recovered after a crash before
+RewrapDone — D-97; the RewrapComplete mirror carries both — D-106);
+latest-epoch renewal wraps + predecessor-KEM custody until every
+locally unretired epoch at which the device actually holds an
+old-KEM effective wrap gains Knew coverage or retires (the
+active-only predicate stranded queued intermediates; the
+every-epoch-of-every-zone predicate made Kold undeletable across
+an exclusion — both void, D-116/D-125/D-133);
+`storage-orphaned` on mismatched/unadopted activation + the
+effective wrap-add map surviving as storage state (D-117);
+`recipientset` constructibility at the per-(zone, accepted epoch)
+256 cap (D-110/D-125); the durable-attempt deferral (a pending
+import is never aborted missing — D-119); release_op journal
+identity (a displaced release revives into its own journal;
+export_id is correlation only — D-123);
+renewal wrap supersession by (zone, epoch, device);
+erase-covers-index/view/checkpoint/backup); 14 migration/projection
+(re-encapsulation byte-equality; stamp completeness; offline
+confirmation fixture — umbrella RFC App C #2 — with its result
+recorded in §15).
+
+---
+
+## 14. Adversary boundaries
+
+| Mechanism | Defends against | Does not |
+|---|---|---|
+| Domain separation + closed encodings + low-S | cross-context confusion; malleability fork-framing | compromised signer signing bad content |
+| AuthorizationProof + control reducer + C3′ | bootstrap circularity; stale roots; replay; non-deterministic recovery | two holders of the recovery secret (freeze) |
+| Independent recovery authority | later hosted/admin compromise self-succession | genesis-time hosted TCB compromise (admitted); loss of both secrets |
+| Signed receipts, device self-exclusion, lease-window binding | wall-clock forgery; self-receipt backdating; post-expiry backdating | colluding witness quorum (zone policy chooses witnesses); solo planes have no time evidence (declared budget posture) |
+| Role-neutral `mat_id` + candidate-side matching (D-175/D-182) | cross-role P-256 reuse (KEM-as-signing / signing-as-KEM); intra-certificate role reuse | **P-vs-−P negation reuse** (exact-SEC1 equality is deliberate — a holder of scalar d derives −P's scalar, and negation is NOT detected; D-190) and arbitrary related-key derivation — undetectable by any public identifier (the freshness domain bounds literal reuse only) |
+| Item DEK + zone-rotation erase + survivor digest | erased-item recovery on cooperative replicas/backups; premature old-KEK destruction | retained KEKs/ciphertext/plaintext; Connect withholding |
+| Writer lineages | budget/cutoff reset via generation or renewal churn | owner-authorized genuinely new lineages |
+| Typed IAM split | ambient authority; coarse-role leakage; edge/portable confusion | paraphrase egress by an unconstrained session (residual, RFC §6.3) |
+| Memory fold + owner/safe-human dispute rule | poisoning via self-accepted truth; low-trust dispute suppression; classification-lever DoS (raise quota) | bad-but-authorized owner judgments (audited, not prevented) |
+| Effect-finality gate (D-94/D-101) | displacement re-ordering an escaped external effect | bytes already escaped when a LATER compromise cutoff, issuer-fork discovery, or **owner-authorized boundary retirement** (a seal below accepted history, a generation void, a snapshot retiring an executed operation — D-114) disqualifies or retires what they stood on (retro-quarantine recorded; the escape is unrecoverable — stated residual; product copy warns on truncating boundaries) |
+| Framing v2 + quarantine rule | torn-frame acceptance; silent discard of ambiguous committed data | media corruption of history (replicas are the remedy) |
+| Hosted ceiling + safe verbs | hosted acquisition of declassify/instruction/export/effect/admin authority | a compromised hosted browser acting as its human within safe verbs (admitted lane TCB) |
+
+---
+
+## 15. Decision record (affirmative)
+
+| # | Decision | Ruling |
+|---|---|---|
+| D-1 | Deterministic CBOR, text keys | Ratified, owner, 2026-07-11 |
+| D-2 | Header-only signature + body_hash | Ratified, owner, 2026-07-11 |
+| D-3 | Low-S ECDSA mandatory | Ratified, owner, 2026-07-11 |
+| D-4 | Random **item** nonces (wrapper nonces are D-22) | Ratified, owner, 2026-07-11 |
+| D-5 | Reserved control namespace | Ratified, owner, 2026-07-11 |
+| D-6 | Single control chain | Ratified, owner, 2026-07-11 |
+| D-7 | Recovery = owner-held 24-word phrase, commitment-only | Ratified, owner, 2026-07-11 |
+| D-8 | Phrase-loss w/ healthy admin = migration | Ratified, owner, 2026-07-11 |
+| D-9 | `.intendant-space` marker | Ratified, owner, 2026-07-11 |
+| D-10 | Classification ladder: public<internal<private<sensitive | Ratified, owner, 2026-07-11 |
+| D-11 | Two built-in judgment policies | Ratified, owner, 2026-07-11 |
+| D-12 | Acceptance-deadline expiry as normative | Ratified, owner, 2026-07-11 |
+| D-13 | RFC 8949 Core Deterministic (bytewise-lex) | Ratified, owner, 2026-07-11 |
+| D-14 | Hosted planes store private/sensitive; ceiling restricts egress/effects | Ratified, owner, 2026-07-11 |
+| D-15 | Hosted destructive authority: none; grant changes via compounds only — amended exactly once by D-107 (the requester-attested own-lineage self-gap seal) | Ratified, owner, 2026-07-11 |
+| D-16 | Join-time WrapAdd; rotation for exclusion | Ratified, owner, 2026-07-11 |
+| D-17 | Erase = tenant request + batched rotation | Ratified, owner, 2026-07-11 |
+| D-18 | = D-8 (recovery consequence restated) | Ratified, owner, 2026-07-11 |
+| D-19 | Honest control forks require the phrase | Ratified, owner, 2026-07-11 |
+| D-20 | Strict branch-cut default + explicit cutoffs | Ratified, owner, 2026-07-11 |
+| D-21 | Automatic supersession revival, surfaced | Ratified, owner, 2026-07-11 |
+| D-22 | Wrapper crypto — **amended in v0.4**: per-item derived wrap keys with a fixed nonce (uniqueness by construction, no birthday bound) replace deterministic 96-bit nonces | Ratified 2026-07-11; amendment ratified 2026-07-12 |
+| D-23 | Time witnesses = other devices (never op signer) + Connect by policy | Ratified, owner, 2026-07-11 |
+| D-24 | `decision` claims propose-only until a verifier exists | **Ratified, owner, 2026-07-12** (explicit, was "adopted from review") |
+| D-25 | Dispute status-effect: owner-class (+ hosted safe-human per D-29) | **Ratified, owner, 2026-07-12** |
+| D-26 | Two-gate freeze; Gate B necessary-not-sufficient with named P1 deps | **Ratified, owner, 2026-07-12** |
+| D-27 | No un-retract v1; Retract/Retire surfaced distinctly | **Ratified, owner, 2026-07-12** |
+| D-28 | Cert expiry optional; solo genesis = budgets fallback; policy upgrades explicit-only | Ratified, owner, 2026-07-12 |
+| D-29 | Hosted typed safe-owner verbs (judge.safe/pin.safe/erase.request/raise); human evidence = direct device signature; WebAuthn gestures deferred | Ratified, owner, 2026-07-12 |
+| D-30 | Hosted `c.lineage_reauth` self-service, non-resetting | Ratified, owner, 2026-07-12 |
+| D-31 | raise_class = can_raise flag + per-epoch quota | Ratified, owner, 2026-07-12 |
+| D-32 | One zone per write-capable (= op-authoring, D-60) grant | Ratified, owner, 2026-07-12 |
+| D-33 | Frontier retains active head per lineage; retired heads live in checkpoints — retirement made exact by D-76; carriage by D-80's chained delta checkpoints | Ratified, owner, 2026-07-12 |
+| D-34 | authored_kek_epoch is audit-only | Ratified, owner, 2026-07-12 |
+| D-35 | Framing v2 (CRC covers len; SYNC markers); complete-bad-CRC final frame quarantines; atomic-compound record (v0.4: generalized to the `Txn` union per D-47) | Ratified, owner, 2026-07-12 |
+| D-36 | Dangling/unresolvable evidence taints sensitive | Ratified, owner, 2026-07-12 |
+| D-37 | mobile-attested / mobile class split | Ratified, owner, 2026-07-12 |
+| D-38 | Root custody: passkey-sealed + mandatory recovery envelopes; file fallback prohibited for the root | Ratified, owner, 2026-07-12 |
+| D-39 | `home` space `class_minimum = private` (conservative diary default) | Ratified, owner, 2026-07-12 |
+| D-40 | `home` is `space_class = personal`; the built-in policy counts safe-human acceptance/retirement for observation/episode there; assert stays workflow-only (hosted diary = propose + safe-accept in one Txn) | Ratified, owner, 2026-07-12 |
+| D-41/D-42 | Ceiling lift is portable: **any** valid `c.recovery_succession` lifts the hosted ceiling — the revealed recovery key is the authority; the trusted lane is where the ceremony runs | Ratified, owner, 2026-07-12 |
+| D-43 | Hosted planes remain on the genesis budgets posture until re-root (`c.zone_policy` outside the ceiling) | Ratified, owner, 2026-07-12 |
+| D-44 | Cross-plane import **fails closed until D0-B** defines foreign-chain verification (no mediator lane) | Ratified, owner, 2026-07-12 |
+| D-45 | Policy rules carry canonical `relation: self / author / any` (policies stay self-describing and hashable) | Ratified, owner, 2026-07-12 |
+| D-46 | Root envelope abstract contract in D0-A; exact envelope bytes = Gate-B artifact | Ratified, owner, 2026-07-12 |
+| D-47 | Secondary-pins batch: daemon-class direct-human evidence; `assert_req` reserved-prefix exemption; four closed receipt variants + tagged device/service issuers; witness policy by stable `device_id`; finite budgets mandatory in budgets-posture zones; deadline receipts pending-dependency until a GC fence; survivor commitment binds (item_addr, wrap_hash) pairs; framing `nlen` guard + quarantine-not-truncate for ambiguous final frames; `XferDone` completion; `storage-io` = transient freeze distinct from corruption quarantine | Ratified, owner, 2026-07-12 |
+| D-48 | Service witnesses via `c.service_key` descriptors; Connect qualifies iff `"connect" ∈ time_witnesses` (one predicate — `accept_connect_time` removed); receipt-qualification non-retroactivity since refined by D-57/D-69 (the anchor = the citing operation's signed capability epoch) | Ratified, owner, 2026-07-12 |
+| D-49 | Renewal preserves operations at or before the history cutoffs — position-relative per D-86, never a fold-current read (fresh signing key; pendings never ratified by renewal) | Ratified, owner, 2026-07-12 |
+| D-50 | Early exclusion accepted (monotone-safe); invariants: target-excluding wraps + all-decryptable-zones coverage; `rotation_refs` ≤ 64 with `c.revoke_zones` continuation | Ratified, owner, 2026-07-12 |
+| D-51 | Policy `relation` is principal-level: `P = (writer.lineage, actor.kind, actor.id)`; self = P equality; author = P equality ∨ same-lineage direct-human; device-level authorship rejected | Ratified, owner, 2026-07-12 |
+| D-52 | Audit fails closed via `audit-unavailable`: lock losers cannot serve audited reads; results release only after audit rows are durable; genesis audit budget pinned (1e6 ops / 256 MiB) — trigger, chunk identity, and physical rule refined by D-64 | Ratified, owner, 2026-07-12 |
+| D-53 | Record-level transfer identity `(from_plane, export_id, source_op)`; PendingXfer carries `content_digest` + `record_count`; one terminal record per release; bundles re-derived deterministically on recovery — terminality extended by D-65 (XferAbort); replay key re-keyed by `release_op` (D-123); one-terminal re-scoped per journal interval by D-148; `content_digest` made the Merkle root by D-147 | Ratified, owner, 2026-07-12 |
+| D-54 | Hosted self-`c.cutoff` (requester-attested, own lineage only) joins the ceiling; the grandfathered lane is a named, tested residual — `deadline_fallback` semantics since superseded by D-56 (issuance-time); attestation bytes per D-72; abandon joins the self-service set per D-107 | Ratified, owner, 2026-07-12 |
+| D-55 | Mechanical batch: `audit.write` system-only verb; `w.gen` space/kind-axis bypass; capability epoch 1 at genesis/zone creation; zone-qualified cutoffs (`zonecutoff`); single-use requester attestation (request_id + ctrl_frontier bound); one locator-hash domain (`H_evrec`); typed erase manifest + survivor pairs; `wrapped_dek` 48 B; E4 stale-statement fix; `c.drill` portable admission (recovery-arm only); fresh-signing-key renewal; `c.checkpoint` `proof_cutoffs`; `rotation_refs` cap 64; `draw_order` array; O7 control-header pins | Ratified, owner, 2026-07-12 |
+| D-56 | `deadline_fallback` is operative at issuance, not admission: a present deadline always binds (D-12 preserved); `budgets` = the deadline-absent lane with a finite budget on every deadline-free write path; `fail-closed` requires deadlines on newly issued grants AND newly enrolled certificates; witnessless zones cannot use leases or deadline-bearing items until a qualified witness installs | Ratified, owner, 2026-07-12 |
+| D-57 | Receipt/lease qualification anchors at the citing operation — zero new receipt bytes; refines D-48; unifies T2/T4; made portable by D-69 (the anchor = the signed capability epoch, never a local admission event) | Ratified, owner, 2026-07-12 |
+| D-58 | Service-key compromise remedy via rotation cutoffs; pre-cutoff history stands (stated residual) — amended by D-70: the interval rules (epoch equality, same-epoch rejection) are dropped for the registry + policy-leaf succession model; cutoffs target any installed key and cover leases | Ratified, owner, 2026-07-12 |
+| D-59 | Control-chain `request_id`s are consumed: reuse across accepted operations = `request-fork` (reject-permanent) — embedded requester attestations become actually single-use | Ratified, owner, 2026-07-12 |
+| D-60 | Verb classes: **op-authoring** {propose, assert, judge.*, pin.*, erase.request, raise, declassify, export, import, audit.write} (lineage + one zone + budgets + implicit w.gen) vs **claim-authoring** {propose, assert} (author relations); `curate.instruction` = co-authorizer only | Ratified, owner, 2026-07-12 |
+| D-61 | `admin` grant verb reserved: no v1 consumer; a v1 grant carrying it rejects at issuance; name held for D0-B delegation | Ratified, owner, 2026-07-12 |
+| D-62 | Frontier and `c.checkpoint` are zone-scoped (`zone_id` inside the hashed bytes; per-zone fences and proof cutoffs) | Ratified, owner, 2026-07-12 |
+| D-63 | `actor.id` minting closed per kind: device-hex for human/daemon/browser/service; controller-assigned id for agent-session; peer plane-id reserved for D0-B; non-conforming values reject | Ratified, owner, 2026-07-12 |
+| D-64 | Audit exactness: trigger = sensitive-minimum space in scope ∨ effective-sensitive result; typed principal + `read_id` + chunk identity; one-Txn physical rule with the 4096-ID edge cap; `at_ms` diagnostic; hosted audit-budget remedy = re-root (no in-ceiling refresh) — trigger/partition refined by D-74/D-83; the remedy claim made true by D-84 | Ratified, owner, 2026-07-12 |
+| D-65 | Transfer terminality and identity: `XferAbort {export_id, reason, missing}` closes failed transfers; `completed` = the exact bundle record set; `export_id` plane-wide single-use; plane destinations complete (plane, zone, space) with import-header equality; the import is the deadline-qualified operation (destination-zone receipt under source-zone policy); egress deadlines consume at release acceptance; bundle/bundlerec versioned in Appendix A — plane-wide `export_id` single-use superseded by D-123 (correlation label; identity = `release_op`) | Ratified, owner, 2026-07-12 |
+| D-66 | Erase target mapping: `m.erase_request.targets` = claim op hashes; manifest entries and tombstones carry `target_op` (membership-checked against the accepted request); logical key = `item_addr`, first accepted entry wins | Ratified, owner, 2026-07-12 |
+| D-67 | Survivor completeness: `RewrapComplete` freezes `fence_frontier`; expected membership = old-epoch items at the fence minus the manifest; post-fence commits use the new epoch; old-KEK destruction gated on membership equality, not self-consistency — membership formula refined wrapper-current by D-73; activation/serialization by D-81 | Ratified, owner, 2026-07-12 |
+| D-68 | Mechanical batch: keyed-set logical identities (E7); chain arithmetic (seq from 1, +1; g = max + 1); genesis cross-field pins (provenance-compatible first cert class, grant epochs = 1, exact spaces/zone/lineage, wrap↔cert key equality, ordinary grant does NOT read audit space); `issued_admin_epoch` audit-only; zero-history `"none"` sentinel; enroll lineage absent-on-renewal; revocation exactness (complete grant set, rotation-after-last-wrap, any-order continuations); erase-manifest cap (superseded by D-77's regenerated caps); `c.cap_epoch_bump` body validation; `draw_order` {name, nbytes}; drift sweep (zone-qualified recovery cutoffs, enroll/reauth split, drill custody wording, device service writer, T4 receipt_cutoffs, `c.checkpoint` naming, §11.5 evidence ref); grant enumeration since superseded by D-85 (derived revocation) | Ratified, owner, 2026-07-12 |
+| D-69 | Proof-policy anchor = the operation's **signed `capability_epoch`**: `policy(e)` = the ZonePolicy in force when epoch `e` opened; `c.zone_policy` acceptance advances the epoch (a policy change is an epoch event); admitted-operation revisits since enumerated by D-94 (compromise cutoffs + budget displacement + ratify revival) — currency semantics made fully portable by D-78 (the fold-relative staleness rules are void) | Ratified, owner, 2026-07-12 |
+| D-70 | Service-key succession: append-only descriptor registry keyed by `key_id` (installs idempotent, any number per admin epoch; successors never invalidate predecessors); qualification = the policy's `connect_service_key` leaf at the epoch anchor; rotation = install + explicit `c.zone_policy` rebind; compromise `receipt_cutoffs` target any installed key and cover receipts AND leases; hosted planes cannot rotate service keys or rebind policy pre-recovery | Ratified, owner, 2026-07-12 |
+| D-71 | Hosted exclusion is **rotation-first and non-cyclic** (v0.5.1's compound-first rule required an unconstructible hash cycle — void): an exclusion-shaped rotation adds no new recipient authority (recipients = enrolled unrevoked current-epoch devices minus the targets, KEM keys equal to their certificates') with an empty manifest; the completing revoke follows; excluded devices are grant/wrap-frozen until completion or re-admission; the revocation target is `revocation_id`, preserved across renewal | Ratified, owner, 2026-07-12 |
+| D-72 | Requester attestations (`c.lineage_reauth`, `c.cutoff`) bind lineage freshness state — superseded by D-82: the resetting `w.gen` count could re-validate a banked attestation; the monotonic `lineage_version` replaces it | Ratified, owner, 2026-07-12 |
+| D-73 | Survivor membership is **wrapper-current**: every non-tombstoned item at or before the frozen fence Frontier that holds, or is required to hold, a wrapper under the retiring epoch, minus the manifest — original commit epoch is irrelevant after rewrap; third-rotation vector with an epoch-1-committed item required | Ratified, owner, 2026-07-12 |
+| D-74 | Audit exactness v2: third trigger branch (audit-space scope always audits; writing the row is a write, recursion ends); partition = shared `read_id`/principal/scope, indexes `0..count−1`, disjoint sets, union == released results; `result_ids` = op hashes of returned records; `scope.spaces` = bounded set (≤ 64); mediated principal split into peer vs session variants — wire landed by D-83 (one zone per read; `maudit`/`auditprin` CDDL; zero-result chunk) | Ratified, owner, 2026-07-12 |
+| D-75 | Transfer authority: release deadline ≤ the matching flow's deadline; flow matching is existential and whole (one entry admits every axis); release charges op + bundle bytes against `max_bytes`; bundles are never persisted or framed (re-derived); plane-import header equality covers all three endpoint coordinates; egress proof = source-zone receipt on the release's own `item_addr`; bundle/bundlerec normative in App A.5 — the D-85 signed-size charge since replaced by D-98's content-independent surcharge | Ratified, owner, 2026-07-12 |
+| D-76 | Reducer exactness: `w.gen(last_known = head)` retires exactly the named validated head (accepted, terminal, same zone/lineage, gen < g) — unknown-gap heads persist until their cutoff; genesis grants complete (15-verb trusted set; no deadline; `online_lease = false`; no flows; kinds absent; raise/declassify inert until flagged); enroll grants/wraps target the enrolled device only; tenant `request-fork` for differing-byte request_id reuse; `cert-expired` removed (the deadline lane subsumes it); validation precedence = first failing stage; `fail-closed` requires `require_cert_deadlines = true`; shared-device humans share the device principal (stated residual) — the retires-exactly-the-named-head Frontier summary superseded by D-175/D-183 (the effective ACCEPTED predecessor retires) | Ratified, owner, 2026-07-12 |
+| D-77 | Mechanical batch: E8 regenerated from canonical bytes (128 wraps ≈ 38 KiB, 128 manifest entries, joint-fit note; `c.wrap_add` path for larger memberships); Fence persists {kek_epoch, rotation_op, fence_frontier}; versioned Checkpoint object + `H_ckpt` + tagged per-issuer proof cutoffs + fence-coverage semantics (signed coordinates; narrowed hardening — deadline/lease/causal only); frame payload CDDL registered (ItemRewrap/Fence/Receipt/CtrlOp); `cert_ref`/`cap_ref`/`signer_key_id` domain pins; dense `issuer_seq` (backfill denial); versioned keyed `survivorset`; `zonecutoff` global head validity; umbrella App-C reference qualified; D-48/D-54/D-57/D-58 refinement pointers — checkpoint carriage superseded by D-80 (object embedded inline; `H_ckpt`/`ckpt` tag removed) | Ratified, owner, 2026-07-12 |
+| D-78 | Epoch currency is fully portable: signed-vs-signed and control-chain content only — `epoch-unopened` pending until the chain opens the epoch; `capability_epoch` non-decreasing within a writer chain; grant slack compares the op's and the grant's signed epochs; fold-current staleness comparisons are void; closure is explicit via optional `cutoffs` on epoch-advancing ops (REQUIRED covering every live lineage under `strict`; `lenient_epochs` removed); `c.revoke_grant` carries a required cutoff for op-authoring grants — explicit cutoffs, never current-status reads, decide position-relative validity | Ratified, owner, 2026-07-12 |
+| D-79 | Policy epochs are not budget epochs: budgets and raise quotas account per `(grant_id, lineage)` per budget window and reset only on `c.cap_epoch_bump`; a `c.zone_policy` advance re-arms nothing | Ratified, owner, 2026-07-12 |
+| D-80 | Checkpoint embedded and chained: `c.checkpoint`'s body IS the object (versioned by the operation envelope, not an object-local `v` — E6/D-88; op hash = identity; control log = carriage; `H_ckpt` dead); `prev_checkpoint` chains; `retired` = checkpoint-caused retirements removed exactly by the fold (semantics refined by D-96); `proof_positions` = currently qualified issuers (≤ 64); the live Frontier holds accepted heads only; `c.cutoff` carries a bounded cutoff set (multi-head unknown-gap retirement) — covers paged + explicit fences + the E6 `v` fix by D-88; the cutoff set made per-generation (`ratifycutoff`) by D-120 | Ratified, owner, 2026-07-12 |
+| D-81 | Fence activates: control acceptance authorizes a rotation, its durable Fence activates it (I3 serves the last-Fenced epoch); `kek_epoch` in Fence/RewrapDone = the new epoch; per-zone rotations serialize in control order (N+1's Fence only after N's KekDestroyed); >128 memberships = bounded wrap set + `c.wrap_add` re-admission before RewrapComplete; exclusion-shaped rotations retain ≥ 1 recipient (last-holder exclusion is not expressible) — wrap-add epoch scoping, Fence-closed intent, and state-6 serialization by D-89 | Ratified, owner, 2026-07-12 |
+| D-82 | Requester freshness = the monotonic `lineage_version` (count of accepted `c.lineage_reauth` for the lineage; never resets, zone-free) bound into both attestations — supersedes D-72's resetting `window_state`, which could re-validate banked attestations and was zone-ambiguous — `repoch` + per-zone `live_heads` bindings added by D-87 | Ratified, owner, 2026-07-12 |
+| D-83 | Audit wire landed: `maudit.scope` = `{ zone, spaces (set ≤ 64) }` with one read = one zone (cross-zone searches partition per zone); `auditprin` mediated shape split into tagged peer / session variants; zero-result reads write exactly one empty chunk `{0, 1}`; the one-Txn/4096 proof is preserved | Ratified, owner, 2026-07-12 |
+| D-84 | Renewals mint no authority: a `renews` enrollment carries cert + `history_cutoffs` + re-wraps of already-held zones only — `grants[]` and `lineage` absent; new grants ride `c.grant` (absent from the hosted ceiling), so the hosted audit-budget remedy is re-root for an **exhausted existing device** (a genuinely new hosted enrollment legitimately carries its own budget — scope pinned by D-89); CDDL union + custody pins by D-89 | Ratified, owner, 2026-07-12 |
+| D-85 | Mechanical batch: dense-prefix cutoffs (`through` = observed contiguous head, 0 = empty; `issuer-gap` outcome; min-merge; device cutoffs cover leases); derived grant revocation (`revoke_grants` field removed) + one live compound per `revocation_id` + plane-wide exclusion freeze; import proof anchor = source-zone `policy(release.header.capability_epoch)`; signed `bundle_size` (replayable charge) + §4.3 surcharge rule; frozen-stamp PendingXfer recovery with abort-collects-all; genesis `class_ceiling = sensitive`; reference domains (`H_genesis`, `H_cert` for `renews`) + signer alg/key-id equality + explicit sig stage + control-op precedence; contextual §10.5 wording; E7 key corrections (checkpoint issuer/retired keys; bundle/survivor keys); encoder-exact E8 (314 B / 132 B); `case_kind` typed vector contract + unique draw names (companion schema realized by D-91); 0x14/0x16 frame mirrors — erasure recovery superseded by D-90 (abort-remaining); dense-prefix assertion superseded by D-87 (hash-chained feeds) | Ratified, owner, 2026-07-12 |
+| D-86 | Authorization is position-relative and history is canonical: cert/grant status resolves for the operation's signed coordinates against explicit cutoffs (revocation/renewal) — no admission stage reads fold-current status (generalizes D-78 beyond epochs; a fresh replay equals an incremental one); budget windows select by the signed epoch anchor and consume in canonical `(gen, seq)` order with deterministic displacement (displaced → quarantine-reproposal) — eligible-charge set + effect finality by D-94 | Ratified, owner, 2026-07-12 |
+| D-87 | Proof feeds are hash-chained: every receipt/lease carries `prev_stmt` (`stmt_id = H_stmtid(Signed bytes)`; all-zero at seq 1); compromise cutoffs commit `{key_id, through, head_hash}`; `issuer-gap` re-scoped to missing-link **pending-dependency**; backfill mints fail the chain (`issuer-fork`) identically on every replica — v0.5.3's arrival-relative rule void. Attestation freshness hardened: `repoch` bound into both requester attestations (defeats C3′ resurrection); `cutoffreq` binds per-zone `live_heads` (since made snapshot-wins by D-108 — the carried set is the boundary); `lineage_version` = 0 at creation — boundary ancestry gating + carried `live_heads` + `gens_total` by D-95 | Ratified, owner, 2026-07-12 |
+| D-88 | Checkpoints are paged with explicit fences: `covers` = ≤ 256-head page (zone coverage = union of latest page per lineage); `fences` = per-lineage coordinates ≥ the covers head — pending operations compare against fences (accepted heads can never cover a pending op; v0.5.3's rule could not fire); retirement = exactly `retired`, never bare coverage (§4.6 aligned); `checkpointobj` carries no `v` (E6); `proof_positions` gain `head_hash`; dropped witnesses = a named forever-pending lane (anchored policy never replaced by current policy) — monotone page machine (this-checkpoint retirement, latest-page-wins, fence non-regression, 48-KiB joint budget) by D-96 | Ratified, owner, 2026-07-12 |
+| D-89 | Rotation staging and renewal custody: `c.wrap_add` valid for any accepted, unretired epoch (queued staging survives later acceptances); intended recipients close at the Fence; the rotation queue serializes on durable state 6 (tombstones), not KekDestroyed; `c.enroll` = a real CDDL union (new-device / renewal); renewal replacement wraps iff the KEM key rotated — every accepted-unretired epoch of held zones, superseding by `(zone, epoch, device)`; certificate class immutable across renewal; `history_cutoffs` ≤ 64 with standalone-cutoff union coverage — durable Fence intent, control-log wrap-add scoping, recovery adoption, and the KEM-renewal drain precondition by D-97 | Ratified, owner, 2026-07-12 |
+| D-90 | Transfer erasure: a source erasure makes the flat bundle underivable — recovery writes `XferAbort` at once (`missing` = all un-imported records, `reason = "source-erased"`; committed imports stand); a destination `reject-permanent` leaves other records completable; `reason` = the first terminal trigger; `bundle_size`/`content_digest` were declared admission-time-validated signed facts — `bundle_size` since REMOVED by D-98 (self-attested by a budgeted writer; replaced by the content-independent surcharge) and terminal precedence made state-derived | Ratified, owner, 2026-07-12 |
+| D-91 | Control operations run a dedicated arm-indexed pipeline (parse → per-arm signer resolution → signature → placement with C3′ validity-before-precedence → body) — the tenant cert stage cannot resolve control signers; the vector contract is delegated to the normative companion schema `d0a-vector-cases.v1.json` (closed per-family case_kinds + exact input/result schemas), authored before any fixture, harness-enforced, and in scope for the discrepancy audit — **artifact-pending** until the file exists (Open-tracked); pipeline order corrected by D-99 (body before precedence) | Ratified, owner, 2026-07-12 |
+| D-92 | Mechanical pins: epoch 1 active from genesis/zone-create with no Fence; `KekDestroyed.epoch` = the destroyed epoch = new − 1; `RewrapDone.count` = the `survivorset` pair count; `c.grant` issuance to a revoked device rejects; accepted cutoffs for one `(zone, lineage)` compose at the maximum — since RESCOPED by D-93 (ratify boundaries only; revoke/close/recover are immutable); hosted cross-lineage attested-cutoff negative vector; §0 provenance repaired | Ratified, owner, 2026-07-12 |
+| D-93 | Scoped cutoff algebra: every cutoff carries its operation's boundary purpose — ratify (max-compose; quarantine is a derived fold state with cascading revival) vs revoke / close / recover (immutable once accepted; a generic cutoff never amends them); grant-epoch lower bound before slack; unheld referenced Heads pending, differing hash at the coordinate = body-invariant + fork evidence; grant/closure equality pins; strict closure validates union coverage with previously accepted ratify/close cutoffs (staged closure for > 64 lineages) — supersede + abandon purposes split out, the total comparator, T3 reconciliation, and `ref-unresolved` by D-101/D-102; the differing-hash rejection superseded by D-130 (committed-boundary selection) | Ratified, owner, 2026-07-12 |
+| D-94 | Effect finality and eligible charges: only accepted operations consume budget (quarantined/displaced release their charge; releases cascade and revival re-derives the suffix); effect-bearing operations execute only when effect-final (every lower generation of the lineage closed — no canonically earlier consumer can arrive); admitted-operation revisits enumerated: compromise cutoffs, budget displacement, ratify revival (a fourth — feed-fork exposure — added by D-106); displacement surfaces through the standing quarantine review lane — finality closure restricted to immutable boundaries and the three consumer mirrors gated by D-101 | Ratified, owner, 2026-07-12 |
+| D-95 | Boundary ancestry gating: once a feed boundary is committed (`head_hash`), statements at or below it qualify only via a complete verified chain path to the committed head (immediate-link match is insufficient); min-merge requires ancestor proof; `ccutoff.requester` CARRIES `live_heads` (full per-zone live-head sets — the signed message reconstructs from the body); registry and Appendix signing formulas byte-identical; attestations additionally bind `gens_total` — since REMOVED by D-100 (tenant-derived, signed-but-not-carried, and non-monotone under D-94 displacement; the reconstruction invariant is now normative and reauth assent is a declared durable one-shot) | Ratified, owner, 2026-07-12 |
+| D-96 | Checkpoint monotone machine: `retired` = the retirements this checkpoint causes (each live in THIS pre-state; immediate retirements never re-listed); latest-page-wins per lineage; fence non-regression; encoded `checkpointobj` ≤ 48 KiB joint budget (member caps alone are not jointly constructible); `time_witnesses` ≤ 64; E7 inventory carries the covers/fences keys — wide-lineage totality (64-open-gap cap), the comparator, empty pages, and coverage/proof non-regression by D-103 | Ratified, owner, 2026-07-12 |
+| D-97 | Rotation and renewal in durable portable bytes: Fence and RewrapDone commit `{control_frontier, recipients_hash}` (H_recips over the sorted intended recipient set — intent survives crashes and is replica-comparable); `c.wrap_add` epoch validity is a pure control-log fact (locally retired epochs are inert); `c.recovery_succession` carries `adopted_rotations` — recovery either adopts an activated rotation's epoch/wraps or the activating replica storage-quarantines (explicit owner choice; recovery never silently strands activated storage); replacement-wrap KEM equality; empty `history_cutoffs` legal when coverage is empty; renewal "mints no grants and no new-zone access" — the ≤128 drain precondition was unsatisfiable (accepted epochs never leave history) and is REPLACED by D-104 (latest-epoch wraps); adoption made exact (Fence commitment + predecessor chain + `storage-orphaned`) by D-104 | Ratified, owner, 2026-07-12 |
+| D-98 | Transfer verifiability: terminal precedence is state-derived (replay keys first → XferDone even post-erasure; then source-erased; then reject-permanent), `xferabort.missing` non-empty; the writer-signed `bundle_size` is REMOVED — the release charges op bytes + `record_count × 512 B` (deterministic, content-independent; claim content was already charged at its own admission); `content_digest` stays destination-verified; egress/import execution behind the D-94 effect-finality barrier — `record_count` pinned to the source-set size, registry mirrors updated, and the rate-bound posture named by D-106 | Ratified, owner, 2026-07-12 |
+| D-99 | Control pipeline order corrected: parse → arm → sig → body (hash + registry + CDDL) → C3′ precedence-field validity → placement/precedence → state-dependent invariants — a validly signed header over malformed body bytes never suppresses C2; the D-91 companion schema is tracked as an open artifact until authored — recovery state-dependent references also resolve before precedence per D-105 | Ratified, owner, 2026-07-12 |
+| D-100 | Requester snapshot repaired: `gens_total` removed (tenant-derived, signed-but-not-carried, non-monotone under D-94); freshness = `lineage_version` + `repoch` + consumed `request_id` (control-plane, monotone); a reauth attestation is declared **durable one-shot assent** (later tenant writes cannot invalidate it); `cutoffreq` live-head equality gains the pending rule (unheld carried head → `ref-unresolved`, never `sig-invalid`) and the self-attestation residual is stated; the **reconstruction invariant** is normative (§2.3): every signature input carried or derivable from an immutable carried reference — the cutoff's remaining fold-relative equality closed by D-108 (snapshot-wins) | Ratified, owner, 2026-07-12 |
+| D-101 | Effect finality binds to **immutable boundaries only** (`last_known` incorporation, close-purpose cutoffs, abandonment) — growable ratify boundaries never confer finality (revival would displace an escaped effect); `c.abandon_writer` = the **abandon** purpose (immutable seal; a later ratify cutoff may never exceed it; the finality closure for unknown gaps); the three consumer mirrors gated (egress = acceptance ∧ finality; transfer terminals inherit the release barrier; audited results = durable rows ∧ finality); execution ownership named (daemon effect layer, idempotent per export_id/read_id); escaped-evidence-after-compromise is a stated adversary-table residual — the incorporation cap, per-generation seals, and the hosted self-seal by D-107; effect idempotency re-keyed per `release_op` by D-123; incorporation closure narrowed to ELIGIBLE caps by D-128; per-effect keys published by D-134 | Ratified, owner, 2026-07-12 |
+| D-102 | Boundary algebra completed: renewal `history_cutoffs` = the **supersede** purpose (immutable — never pooled with generic ratify); one total boundary comparator (`"none"` minimal; lex `(gen, seq)`; equal coordinates with a different hash are unordered fork evidence), reused by checkpoint fences; T3 reconciled (individual receipt cutoffs immutable; the effective boundary is their intersection = the minimum); missing references get the closed outcome `ref-unresolved` (pending-dependency; later control operations pass a pending reference) — consumed-boundary promotion materialized by D-111; the comparator's naming-fails rule superseded by D-130 (selection) | Ratified, owner, 2026-07-12 |
+| D-103 | Wide-lineage paging made total: ≤ 64 open unknown-gap heads per lineage (E8; a 65th `w.gen(unknown)` → `lineage-gen`), so latest-page-wins covers every legal lineage; fence/coverage ordering = the D-102 comparator with non-regression on both; all-empty pages legal (pure proof-positions checkpoints); successive proof positions ancestor-consistent and nondecreasing; a renewed witness key is a new issuer identity (per-key-scope feed positions) — page replacement keyed (lineage, gen), the fence projection comparator, and the renewal feed closure by D-111 | Ratified, owner, 2026-07-12 |
+| D-104 | Recovery adoption made exact and renewal made satisfiable: `adopted_rotations` entries carry `{zone_id, rotation_op, control_frontier, recipients_hash}` — a specific Fence commitment plus the rotation's predecessor chain (one entry per zone = the highest); a mismatched or unadopted activation is `storage-orphaned` (storage-quarantine); KEM-rotating renewal wraps **the latest accepted epoch per held zone** (v0.5.5's every-epoch/drain rule was unsatisfiable — accepted epochs never leave control history — and is void); queued staging re-targets via its own wrap-adds — custody made activation-based + the zone/recipient caps by D-109/D-110; adoption re-keyed per rotation with full Fence-frame identity by D-112 | Ratified, owner, 2026-07-12 |
+| D-105 | Recovery validity fully precedes precedence: the recovery arm resolves every state-dependent reference (adopted rotations, cutoff Heads) before the C3′ exception; an unresolved reference is `ref-unresolved` (pending) and the operation exerts **no precedence effect while pending** — C2 evaluates as if it were absent; selection pinned pure/provisional with exact stage outcomes by D-112; adopted renewals join the resolve list by D-158 | Ratified, owner, 2026-07-12 |
+| D-106 | Mechanical batch: the **fourth revisit path** (feed-fork exposure — a later-committed boundary revealing a losing-branch qualification retro-quarantines at the commitment's fold position); `record_count` = the source-set size (pinned) + `pendingxfer.record_count` equality + the export registry row's stale charge/transition mirrors fixed + the 512 B surcharge named a record-rate posture; XferDone counts accepted effect-final imports and destination replay-index rebuild precedes source recovery; the RewrapComplete literal aligned with its frame (`control_frontier`, `recipients_hash`); named keyed `recipientset` (≤ 256) + `control_frontier` identity = the op hash of the latest accepted control operation at the Fence; wrap-add outer/inner equality; the frozen release stamp declared final for the source read (+ vector); O7 admin-key wording repaired; D-80 row pointer; `zoneheads.heads` sort key — revisit path 4 broadened to direct discovery by D-113; `recipientset.v` by D-110 | Ratified, owner, 2026-07-12 |
+| D-107 | One immutable gap-finality ceremony: `last_known` incorporation permanently caps ratification — made per-generation (clamping within the incorporated/sealed generation) by D-114; `c.abandon_writer` becomes **per-generation seals** `{gen, at / "none"}` (≤ 64, keyed by gen — an old gap closes while later live branches survive; the v0.5.6 scalar Head is void); seals are control-authorized, receipt-independent, outside the revisit paths; **hosted planes get the requester-attested own-lineage self-gap seal** (D-54 pattern, snapshot-wins — without it one unknown gap bricks a hosted plane's audited reads until re-root; D-15 amended exactly this far) | Ratified, owner, 2026-07-12 |
+| D-108 | Hosted `c.cutoff` is **snapshot-wins**: the carried `live_heads` ARE the boundary — uncarried successors retire deterministically at the operation's fold position on every replica (the fold-relative equality-against-current check diverged control-first vs tenant-first replicas and is void); an extra held head is beyond-boundary, never staleness; a missing carried head stays `ref-unresolved`; five ordering vectors required — snapshot/scalar composition pinned by D-114 (entries ≤ their carried heads, per generation); the snapshot's interaction with a larger prior ratify maximum defined as an `admit_bound` override by D-121 | Ratified, owner, 2026-07-12 |
+| D-109 | KEM-renewal custody is **activation-based**: the device retains the predecessor KEM secret until every held zone's ACTIVE epoch serves a renewed-key wrap (acceptance-based release stranded queued epochs' KEKs — void); interim live epochs get post-acceptance `c.wrap_add`s; `c.wrap_add` gains **current-key equality** (`recipient_kem_key` = an enrolled certificate's KEM key at acceptance — no future-key staging); **held zones per device ≤ 128** (the 129th grant/wrap rejects — keeps renewal encodable under the wrap cap) — custody predicate widened to every accepted unretired epoch, equality made global, and `held_zones` defined by D-116; equality re-anchored to the effective certificate and the cap domains made control-derived by D-125 | Ratified, owner, 2026-07-12 |
+| D-110 | `recipientset` carries `v: 1` (a direct `H_recips` preimage is an E6 top-level hashed object); the 256-recipient zone cap is **enforced at admission** — re-scoped per (zone, accepted unretired epoch) across every wrap-bearing operation by D-116 (a queued epoch is bounded too); E7 key (`device`) and E8 rows added — the unretired qualifier removed (accepted-epoch scope) by D-125 | Ratified, owner, 2026-07-12 |
+| D-111 | Promotion, paging, feed closure: a ratify boundary consumed by an epoch advance or renewal is **materialized as immutable close/supersede state** at the consuming control position (no wire duplicate; the consumed prefix can never re-widen); checkpoint replacement keyed per `(lineage, generation)` with **omission-never-removal**; fence non-regression on the `(gen, seq)` projection; renewal carries the predecessor signing key's REQUIRED **`feed_closure`** `{key_id, through, head_hash}` (supersede purpose) and closed scopes are exempt from hardening coverage — promotion made the per-generation freeze by D-130, then explicit-scalar by D-136 (the freeze withdrawn), then frontier materialization with derived selectors by D-143 | Ratified, owner, 2026-07-12 |
+| D-112 | Recovery exactness: precedence selection is **pure and provisional** — it commits only through the final `state` transition (a recovery failing any later stage exerted no precedence; exact stage arrows pinned, incl. `key-malformed` at `state`); `adopted_rotations` re-keyed per `(zone_id, rotation_op)`, each entry the rotation's **complete Fence-frame identity** (`fence_frontier` + `control_frontier` + `recipients_hash`; contiguous chain required — predecessor-active replicas validate their own entries); dependency closure: referenced certificates/descriptors survive as validation material only, adopted erase manifests stand; the §7.4 literal aligned — E7 key corrected, entries bounded (≤ 64, deep-fork orphaning residual), the effective wrap-add map preserved as storage state, and unFenced-cut-never-adopted by D-117 | Ratified, owner, 2026-07-12 |
+| D-113 | Transfer/feed seams + sweep: the plane writer holds an **`export_id` critical section** across replay-key observation, in-flight completion, and terminal append (an import can never commit after an XferAbort listed it missing); PendingXfer **dormancy** under a displaced release (revives with re-acceptance; closes via XferAbort on reject-permanent); revisit path 4 broadened to direct and boundary-revealed issuer-fork discovery (the arrival-relative direct rule since made freeze-both by D-115; the counted inventory since derived by D-114); §4.6 retired-heads wording, D-80 envelope-versioning note, the `zonecutoff` purpose inventory + `ref-unresolved` naming, `zoneheads.heads` key = `gen`; the peer's cutoff-formula pin rejected (the formula was already correct) — the critical section and journal identity re-keyed by `release_op` (D-123); its never-after-Abort clause re-scoped to the current interval by D-157 | Ratified, owner, 2026-07-12 |
+| D-114 | Boundary algebra per generation + derived revisits: ratify boundaries bind their named head's generation (max-compose, quarantine, revival all per `(zone, lineage, gen)`); incorporation caps and seals clamp within their generation (later-generation advancement legal); snapshot/scalar composition pinned (each snapshot-cutoff entry names a carried generation, ≤ its carried head); the revisit inventory is **derived from the algebra** (proof retro-disqualification; budget displacement/revival; boundary events — ratify growth revives, retirement boundaries quarantine), never hand-counted; seal/void quarantine is **permanent** (ratify-relative stays revivable — split dispositions); truncation is deliberate owner-grade authority (legal, product-surfaced, vectored; carried lower bound rejected as non-portable) with the escaped-effect residual extended; boundary facts are monotone under displacement of their creating operation; stale assent-dies text swept — the once-accepted incorporation-cap rule superseded by D-122 (held-bytes provenance, evaluation clamp); seal/void permanence refined to the effective `immutable_cap` by D-121; the snapshot/entry ≤ composition superseded by D-129 (equality) | Ratified, owner, 2026-07-12 |
+| D-115 | Direct issuer-fork handling is order-independent: holding two conflicting statements at one `issuer_seq` freezes qualifications from BOTH suffixes (a set property — identical on every replica); a committed boundary then selects the winner (losing branch stays quarantined, winning branch re-qualifies); both delivery orders + the selection transition vectored — cross-carrier selection made unique by D-124 (one registry per scope, first-in-control-order) | Ratified, owner, 2026-07-12 |
+| D-116 | Monotone renewal and membership predicates: Kold retained until **every accepted, unretired epoch** of every held zone holds Knew coverage (the active-only predicate stranded queued intermediates — void); wrap recipient-key equality is **global** across every wrap-bearing operation (same-operation enrollment exception only); `held_zones(device)` defined once (grants ∪ effective wraps — §4.3) and cited by every consumer; the recipient cap re-scoped per (zone, accepted unretired epoch) — the cap domains re-split control-vs-custody by D-125 (the unretired qualifier read local Fence state); renewal set = the effective-wrap subset, kekwrap equality anchored to the effective certificate by D-125; membership re-scoped to CURRENT (latest accepted epoch) and custody to actually-held old-wrap epochs by D-133 | Ratified, owner, 2026-07-12 |
+| D-117 | Recovery adoption bounded and dependency-complete: E7 key corrected to `(zone_id, rotation_op)`; entries ≤ 64 (E8) with **deep-fork orphaning** as a stated, vectored residual; the **effective wrap-add map** through each adopted `control_frontier` survives as storage state (never authority); accepted-but-unFenced cut rotations are never adopted (cut and re-issued) | Ratified, owner, 2026-07-12 |
+| D-118 | Checkpoint/feed exactness: effective coverage = the latest entry per `(lineage, generation)` with omission-never-removal (the per-lineage CDDL comment fixed); a lineage fence dominates EVERY generation cover for that lineage; renewal `feed_closure` integrated into T3 (a boundary commitment — ancestry gating, min-merge under ancestor proof, hardening exemption); `cabandon.seals` non-empty; the `c.wrap_add` registry row carries the equality mirror | Ratified, owner, 2026-07-12 |
+| D-119 | Transfer durable attempts and permanent identity: an XferAbort's `missing` may name only never-arrived or reject-permanent records — a durable destination import pending proof DEFERS the terminal until it resolves (a delayed proof can never admit what an abort listed); `export_id` is consumed by **acceptance event** (displacement/dormancy never frees it — a revived release finds its own journal unshared); journal/terminal records carry `release_op`; the reject-permanent closing XferAbort is **journal cleanup** outside the effect-finality gate (a rejected release can never be effect-final) — `export_id` consumption superseded by D-123 (`release_op` identity); the missing-set predicate totalized and the reasons split by D-126 | Ratified, owner, 2026-07-12 |
+| D-120 | Ratify gets its own wire shape: `ratifycutoff = { zone_id, lineage, gen, accepted_through }`, logical key `(zone_id, lineage, gen)` (E7), `accepted_through.gen == gen` when a Head is present, per-generation `"none"` — v0.5.8's gen-less key collided with the per-generation algebra (two generations of one lineage were non-canonical in one operation, unencodable against D-80's multi-head promise); the immutable purposes stay on scalar `zonecutoff` deliberately (authority-ending, lex-comparator delimitation across generations); requester-present cutoffs bind the requester's own lineage on EVERY plane (one scalar `lineage_version`; trusted multi-lineage ceremonies go requesterless); requesterless cutoffs carry no snapshot boundary and skip the composition check — equation-only validation; the per-generation `"none"` re-ruled by D-129 (neutral requesterless, `body-invariant` in requester form; empty `cutoffs` legal with a requester); the `"none"` arm removed from `ratifycutoff` and the `closes` staging lane added by D-136; the scalar `zonecutoff` itself superseded by D-143 (`frontierclose` — the lex scalar could not bound multi-head lineages) | Ratified, owner, 2026-07-12 |
+| D-121 | The per-generation effective-state equation: `ratified_through` (max over accepted ratify entries), `admit_bound` (a control-order fold — ratify composes at the maximum, a requester snapshot OVERRIDES to its carried head, a later larger ratify is growth and revives: override-then-growth is the legal shrink-and-regrow cycle, closing the undefined ratify-max/snapshot interaction), `immutable_cap` (minimum over seals and incorporation caps, `"none"`/void strongest — repeated seals min-compose like receipt cutoffs); admission = `p ≤ min(admit_bound, immutable_cap)`; permanence attaches to the effective immutable bound, never to bare seal existence (§10.5 reworded — below-bound retirement stays revivable); the hosted exception renamed **self-seal**, its full self-limiting truncation authority named honestly — identities (`Absent`/`Top`), entry/snapshot equality coherence, and `ratified_through`'s consumers by D-129; re-founded as the two-component tagged fold by D-135/D-136 (`ratified_through` removed) | Ratified, owner, 2026-07-12 |
+| D-122 | Boundary provenance is held bytes, never acceptance history: an incorporation cap exists for every HELD signature-valid `w.gen(last_known)` — budget acceptance, displacement, revival, and proof retro-disqualification never create or remove it (v0.5.8's once-accepted rule diverged replicas on arrival order; a held-bytes fact is a set property, restriction-only, fail-closed); an incorporation cap clamps ratify AT EVALUATION (min in the D-121 equation — admission-time `body-invariant` was arrival-relative against a tenant-carried cap), while seals are control-ordered against every cutoff and keep the `body-invariant` rejection; control-authored boundaries are immutable within their branch — only a C3′ branch cut (recover authority) removes them; the signature-only cap predicate superseded by D-128 (`cap_eligible` + dissolution) | Ratified, owner, 2026-07-12 |
+| D-123 | Transfer identity is `release_op`; `export_id` demoted to a correlation label with NO fold semantics (the ever-accepted consumption rule was an arrival-history fact and diverged replicas; an edge MAY courtesy-reject a live reuse — edge-deny, nothing replicated): destination replay keys become `(from_plane, release_op, source_op)`; the writer critical section, dormancy, journal and terminal matching, and effect idempotency all key by `release_op` — unique by construction, so a displaced release's revival finds its own journal unshared and two releases never collide; supersedes D-65's plane-wide single-use and re-keys D-53/D-101/D-113 — the bundle-carried `release_op` superseded by D-127 (derived post-signing; the carried field was a hash fixed point); the import collision rule by D-134 | Ratified, owner, 2026-07-12 |
+| D-124 | One commitment registry per issuer scope: the effective commitment set spans all three carriers (compromise `receipt_cutoffs`, renewal `feed_closure`, checkpoint `proof_positions`); every NEW commitment MUST chain-ancestor-verify against the set (`body-invariant` on the carrying operation otherwise), so opposite-branch commitments never coexist — carriers are control operations in one total order, and the first commitment above a fork point IS the D-115 selection (a commitment at or below the fork selects neither suffix); renewal `feed_closure` acceptance joins revisit class (a): the closed scope's statements beyond `through` retro-disqualify like a compromise cutoff, escaped effects under the stated residual — the pending/reservation/fork-point/removal state machine by D-131 | Ratified, owner, 2026-07-12 |
+| D-125 | Admission caps are control-derived; custody is local: the recipient cap re-scoped per (zone, ACCEPTED epoch) and `held_zones` = finite grant-named zones ∪ effective-wrap zones at any accepted epoch, wildcard grants contributing nothing (the `unretired` qualifier read local Fence state and diverged admission across Fenced/unFenced replicas, contradicting `c.wrap_add`'s own no-Fence-reads rule); Kold custody keeps the local accepted-unretired predicate — its correct domain; renewal wraps and history coverage use the effective-wrap-zone set (a grant-only zone gains no access at renewal); `kekwrap` equality anchored to the device's EFFECTIVE unsuperseded certificate at the operation's control position (a superseded predecessor stops qualifying on renewal acceptance — no wrap-back after Kold destruction); the `recipientset` mirror aligned — the any-accepted-epoch membership superseded by D-133 (current membership; custody = actually-held old-wrap epochs) | Ratified, owner, 2026-07-12 |
+| D-126 | Transfer terminals totalized: `missing` = un-imported records with no UNRESOLVED durable destination attempt (pending and accepted-not-effect-final defer; resolved reject-permanent and never-arrived are eligible — the no-attempt literal left a one-record reject-permanent transfer unable to write its non-empty abort); abort reasons split — `"release-rejected"` = journal cleanup outside the finality gate (requires only immutable release rejection) vs `"reject-permanent"` = a true destination-rejection terminal gated at the release's effect-final coordinate like XferDone; prose journal shorthands carry `release_op` — terminality re-keyed to permanent non-revivability by D-134 | Ratified, owner, 2026-07-12 |
+| D-127 | Acyclic transfer construction: the bundle carries NO `release_op` — its digest preimage is `{v, export_id, recs}`; the signed release triple travels ALONGSIDE the bundle; `release_op = H_op(release triple)` is DERIVED post-signing by every consumer (journal, replay keys, provenance, terminals) — v0.5.9's bundle-carried field was an infeasible hash/signature fixed point (`release_op` inside the bundle whose hash the release body commits to: no producer could mint the release); a construct-and-rederive vector is REQUIRED (sources + keys → release → independently re-derived digest and `release_op`) | Ratified, owner, 2026-07-12 |
+| D-128 | Cap eligibility — signature possession is not truncation authority: an incorporation cap exists only for a held `cap_eligible` `w.gen` — admissible under its own signed anchors ignoring ONLY budget consumption and deadline/lease receipts (strict parse + body hash; certificate installed, unrevoked, unsuperseded at the signed anchor, D-86; device owns the lineage; op-authoring grant valid at the signed epoch; generation arithmetic over the held chain; same-zone/lineage terminal-Head validity) — every input a portable fold of held bytes + control history; unheld inputs leave the cap pending (`ref-unresolved`); an explicit compromise cutoff disqualifying the certificate, or a C3′ branch cut (D-131), DISSOLVES the cap and re-derives what it clamped (owner remedy; escaped finality = stated residual); eligible caps confer the D-101 incorporation closure regardless of budget outcome; cap-bearing bytes are GC-exempt boundary evidence (bounded by the 64-open-gap cap) — the deadline/lease exemption ratified as a residual, dissolution made a derived predicate, and the retention claim corrected (append-only permanence; the open-gap bound covers PENDING caps only) by D-141; the terminal-Head premise re-anchored to chain membership by D-144 (terminality was evaluation-stratum-circular) | Ratified, owner, 2026-07-12 |
+| D-129 | Equation totalized: boundary domain `Absent < "none" < Head < Top` — `Absent`/`Top` are fold identities, never wire values (`admit_bound`/`immutable_cap` init `Top`; `ratified_through` init `Absent`); wire `"none"` = explicit assertion, never a default (E4); requester entry/snapshot coherence is EQUALITY — an entry equals its generation's carried head, with below-head, above-head, and `"none"` all `body-invariant` (v0.5.9's ≤ made entries admission-inert and left `"none"`-vs-head contradictions legal); requesterless entries max-compose directly and `"none"` is the neutral element (never retirement — zero-history assertion is seal/void authority); `cutoffs` MAY be empty iff the requester is present (pure snapshot retirement = the representable zero-history form; requesterless-empty rejects); `ratified_through`'s consumers named — coverage predicates and D-111 promotion — the `Top`-init max fold corrected to the tagged state by D-135; `ratified_through`, the requesterless-`"none"` neutral element, and ratify-as-coverage removed by D-136 | Ratified, owner, 2026-07-12 |
+| D-130 | Boundary references select; promotion freezes per generation: differing bytes at a referenced coordinate are fork evidence resolved by SELECTION — the first committed boundary in control order naming a variant selects it (the losing suffix quarantines; a later boundary naming another variant is `body-invariant`; v0.5.9's reject-on-mismatch was arrival-relative) — the D-124 pattern extended to tenant forks; D-111 promotion materializes the consumed lineage's per-generation map (each ratified value min-folds into its generation's `immutable_cap` — the exact no-widening reduction; a scalar lex-max leaves lex-below generations widenable and was rejected); coverage = an explicit scalar entry or `ratified_through ≠ Absent`; unratified generations of a consumed lineage stay under cert supersession + feed closure (named residual); pins: carried requester heads belong to `(zone, requester lineage)`, `cabandon.seals[].at` resolves in the body's outer zone — the per-generation promotion freeze WITHDRAWN by D-136 (explicit scalar carriage; the freeze under-closed future generations and barred legitimate below-close revival); pending selectors gain coordinate reservation by D-137 | Ratified, owner, 2026-07-12 |
+| D-131 | Commitment-registry state machine + symmetric removal: missing ancestry evidence PENDS (`ref-unresolved` — never `body-invariant` for evidence not yet held); a verified divergent path rejects; a PENDING carrier reserves its issuer scope (later carriers pend behind it — selection order is control order through pendency); fork point = the suffixes' last common ancestor statement (a commitment at or below it selects neither); signing-key freshness is plane-wide and forever (a renewal reusing ANY historically enrolled key rejects — A→B→A scope resurrection dies); REMOVAL is symmetric: a C3′ branch cut dissolving a commitment, boundary, closure, or eligible cap re-derives exactly what its presence derived (a fork whose selector dissolves refreezes both suffixes) — the derived revisit inventory gains the removal clause — removal generalized to the total C3′ re-fold by D-138; key freshness widened to every non-genesis certificate by D-141 | Ratified, owner, 2026-07-12 |
+| D-132 | Recovery omission + widening events totalized: `tenant_cutoffs` entries are explicit immutable recover boundaries; an OMITTED cut-branch lineage quarantines entirely past base — a fail-closed blanket, REVIVABLE by post-recovery ratify growth (entries are refinements; ≤ 256 needs no continuation against ≤ 4096 heads); `c.lineage_reauth` acceptance is a WIDENING event of the derived inventory (held `lineage-gen`-quarantined operations revive under the new window — revival of held bytes, never mandatory reproposal); `c.space_retire` is position-relative (the D-69 pattern): acceptance advances the zone's capability epoch and binds retirement to it — pre-epoch-signed writes admit, at-or-beyond writes reject (`scope-space`), strict closure applies as for every epoch advance (v0.5.9's positionless rejection was arrival-relative) — the past-base blanket made the portable `"none"` override and retirement given MANDATORY close coverage by D-138 (the epoch anchor alone was backdateable); the omission domain pinned to `(zone, lineage)` pairs by D-151 and the closes made frontiers by D-143 | Ratified, owner, 2026-07-12 |
+| D-133 | Membership is current, custody is actual: `held_zones`' wrap component = zones holding an effective wrap at the zone's LATEST accepted epoch (current membership — v0.5.9's any-accepted-epoch made historical membership permanent: renewal re-added deliberately excluded devices and Kold never drained); exclusion by a later accepted epoch frees the zone and its cap slot; renewal wraps and history coverage use the current-membership set; Kold custody = the locally unretired epochs at which the device ACTUALLY HOLDS old-KEM effective wraps — absence of a wrap at an epoch never obliges one (an excluded device's Kold drains as its old-wrap epochs retire) — history coverage re-keyed to the authorship domain and custody made transitive by D-141 | Ratified, owner, 2026-07-12 |
+| D-134 | Import identity + terminal totality: v1 import content is fully derived (sensitivity = class_floor; temporal fields absent; provenance = exactly the import triple; labels/evidence absent — annotate post-import); byte-distinct claimants for one replay key resolve by LOWEST `op_hash` (`import-collision`, reject-permanent — cross-lineage claimants have no canonical order, the hash is the key's total order, derived content makes the choice invisible; both arrival orders + fresh fold converge); per-effect idempotency keys published (release delivery/terminal = `release_op`; each import = the record-level triple; audited result = `read_id`); mirror equality pinned (`export_id`, derived `release_op`, `record_count` across release, bundle, journal, provenance, terminals); transfer terminality keys on PERMANENT NON-REVIVABILITY, never a disposition's name — resolved-negative = reject-permanent, beyond `immutable_cap`, or a voided generation (a sealed release closes via the cleanup abort; a permanently quarantined import is eligible `missing`) — the lowest-`op_hash` collision rule superseded by D-139 (single import lineage, identity final); terminal basis + reopen by D-140; the `mimport` shape narrowed by D-142 | Ratified, owner, 2026-07-12 |
+| D-135 | The boundary fold is a tagged state: `admit_bound` ∈ `Unbounded / Bounded(v)` — `Unbounded` transitions to `Bounded` on the FIRST accepted ratify entry or snapshot override, `Bounded` max-composes later ratify entries, a snapshot overrides any state (v0.5.10's `Top`-init max fold made the first requesterless ratification a no-op — `max(Top, H) = Top` — so D-80's beyond-boundary retirement never engaged); the snapshot override is TOTAL over generations — carried → its head, uncarried → `"none"` (a pure function of the carried set: D-108's uncarried-successor retirement restated per generation; an empty carried `heads` entry overrides EVERY generation, making the pure-snapshot zero-history ceremony genuinely total — v0.5.10's carried-only override retired nothing) | Ratified, owner, 2026-07-13 |
+| D-136 | Authority closes are explicit scalars: strict-closure and renewal coverage require an explicit scalar close/supersede boundary per consumed lineage — inline on the consuming operation or staged via the new `ccutoff.closes` lane (close purpose, immutable; requesterless/trusted only, outside the hosted ceiling) — and D-111 promotion materializes exactly those carried scalars; ratify state NEVER counts as coverage (v0.5.10's some-generation-ratified rule under-closed and ended no future old-epoch generation-opening, which now dies on the scalar close by lex order); D-130's per-generation freeze is WITHDRAWN (it under-closed futures and barred legitimate below-close revival); `ratified_through` is removed (its last consumer was coverage) and the `"none"` arm leaves `ratifycutoff` (requester form demands head equality, requesterless `"none"` became a no-op — an assertion with no effect is unencodable, E4) — the scalar close itself superseded by D-143 (authority-qualified frontiers: the lex scalar leaked lower live generations and the authority-blind `immutable_cap` fold bricked successor writers) | Ratified, owner, 2026-07-13 |
+| D-137 | Pending selectors reserve their coordinates: a pending boundary naming a tenant Head coordinate RESERVES it — later boundaries naming that coordinate (either variant) pend behind the reservation, released when the reserving operation resolves reject-permanent or is removed by C3′ (v0.5.10 let a later committed selector beat an earlier pending one: incremental folds picked the later, fresh folds the earlier — the D-131 scope-reservation rule extended from issuer commitments to tenant coordinates, so control order survives pendency everywhere) — widened from the exact coordinate to the full `(zone, lineage, gen)` selection scope by D-145 (a descendant selector on the opposite branch escaped the coordinate reservation), then to the `(zone, lineage)` scope by D-154 (a later generation opened with `last_known` on the unresolved branch escaped the generation) | Ratified, owner, 2026-07-13 |
+| D-138 | Recovery and retirement made portable and total: an omitted `tenant_cutoffs` lineage folds an implicit revivable `"none"` override — every generation's `admit_bound` overrides at the recovery's fold position (v0.5.10's "entirely past base" was unportable: `base` is a control coordinate and tenant operations carry no control frontier); C3′ removal = the TOTAL re-fold — all control-derived admission state re-derives from the surviving chain, incremental implementations MUST converge to the fresh-fold result (a cut reauth re-quarantines what it revived; the D-131 list demoted to instances); `c.space_retire` = an epoch event (§9.4) with MANDATORY scalar close coverage of every live lineage regardless of strictness (`{space_id, ? closes}` + staged `ccutoff.closes`; old-epoch backdating dies on the immutable close, not the gameable epoch anchor — v0.5.10's anchor-only rule was backdateable by design in lenient zones) | Ratified, owner, 2026-07-13 |
+| D-139 | Import identity is final: v1 pins ONE active `import`-verb grant per destination zone (a second rejects at issuance, the one-live-lineage pattern; the genesis grant counts) — every import of a zone rides one lineage, the replay key gains a canonical `(gen, seq)` total order, and the first claimant holds it forever (a later operation can never precede an earlier one in its own chain: no displacement, no late winner, referenced and effect-final imports safe by construction); a later byte-distinct claim against a held key is `import-collision` (reject-permanent, writer self-fault); v0.5.10's lowest-`op_hash` rule is VOID (a later, lower-hash, grindable claimant displaced accepted, effect-final, referenced claims while judgments/pins/erases target the emitting `op_hash`); federated multi-writer identity is D0-B's (cross-plane import fails closed, D-44) — ownership made provisional-until-effect-final, the grant invariant extended to `c.enroll.grants[]`, and handoff serialized on the revocation frontier by D-146 (the one-lineage lemma was false under grant turnover and open unknown-gap generations); made wholly derived with the total claimant order by D-155 | Ratified, owner, 2026-07-13 |
+| D-140 | Terminals are basis-stable: an `XferAbort` whose resolved-negative determination keyed on a boundary records that boundary's op hash as `basis`; a dissolution or C3′ removal invalidating the basis appends `XferReopen { export_id, release_op }` — the journal reopens and recovery re-derives (a terminal must be stable under every allowed future transition, never merely negative on the current branch — v0.5.10's terminals outlived removable bases); reject-permanent and source-erased terminals carry no basis and are stable by construction; `XferDone` never reopens (escaped-effect residual); the §10.5 `cutoff` permanence lattice splits by boundary purpose — beyond ratify or the recovery blanket = revivable, beyond supersede/revoke/close/recover = permanent within the branch — bases made per-record, the journal made a transition fold (one effective terminal per interval), and terminal effect keys incarnation-scoped by D-148 (the scalar basis could not arbitrate independent causes; the consume-once key suppressed successor terminals) — the cause vocabulary closed over D-149's class and the interval machine pinned by D-157 | Ratified, owner, 2026-07-13 |
+| D-141 | Cap and identity closure: the D-128 deadline/lease exemption is a RATIFIED residual (an immutable boundary must never hang on revisable proof state); cap existence is a DERIVED function of `cap_eligible` (compromise cutoffs and branch cuts are instances, never the list); the retention claim corrected — D0-A logs are append-only so cap evidence persists, the 64-open-gap bound covers PENDING caps only, bounded retention is D0-B's; renewal `history_cutoffs` coverage re-keyed to the AUTHORSHIP domain — zones of the device's active op-authoring grants (finite by D-32), independent of KEM membership (exclusion never orphans authored history); KEM custody made TRANSITIVE — any current-descendant-key wrap satisfies ancestor obligations across overlapping K0→K1→K2 renewals; signing-key freshness widened to EVERY non-genesis certificate, plane-wide forever (one key is one device — the D1-signs/D2-witnesses bypass dies), historical keys surviving C3′ as validation material — the fork-inclusive domain made portable by D-150 (surviving chain ∪ recovery-carried `retired_keys`; uncarried cut-branch keys = stated residual); coverage totality by composition pinned by D-151 | Ratified, owner, 2026-07-13 |
+| D-142 | `mimport` narrowed + the mirror matrix: a dedicated CDDL shape with the prohibited fields STRUCTURALLY absent (v0.5.10's broad shape REQUIRED `evidence` while the D-134 prose required its absence — no valid body existed) and `provenance` = exactly the import tuple; equality pins `from_plane == release.header.plane_id`, `digest == release.body.content_digest == pendingxfer.content_digest`, `dest_zone == release.body.to.zone_id`; `release_op` in `mimport` = a signed MIRROR of the derived value (v0.5.10's "never signed input" was wrong — the carrier is signed); release-delivery and source-terminal effect keys namespaced (`"deliver"` / `"terminal"`); `m.propose`/`m.assert` carrying `provenance.import` reject (imports ride `m.import.claim` exclusively) — the dead `mclaim` arm deleted structurally and the mirror battery completed by D-151; per-record Merkle proofs by D-147 | Ratified, owner, 2026-07-13 |
+| D-143 | Authority closures are frontier-shaped and selector-qualified: `frontierclose = { zone_id, lineage, heads }` replaces the scalar `zonecutoff` for close/supersede/revoke/recover — the ended authority's FULL live-head set with total-override semantics (the D-135 pattern: carried gen → at-or-below its head, uncarried or later-opened gen → nothing; the lex scalar could neither bound several live chains — a lower live generation kept writing below it — nor end future generation-opening); the SELECTOR derives from the carrying operation (close → epochs below the advance; supersede → the predecessor certificate; revoke → the revoked grant / certs bearing the revocation_id; recover → global) and matches against the operation's signed context — v0.5.11 folded closures into the authority-blind `immutable_cap`, so a strict advance permanently quarantined ALL later writes (successor cert, new-epoch writers: every strict zone bricked on its first advance); `immutable_cap` keeps only authority-agnostic seals and caps; a staged frontier is INERT until its consumer materializes it with the consumer's selector (D-111 promotion re-founded) — the heads bound raised to 65 by D-152; consumption made automatic/total/one-shot by D-153; selector composition (intersection) formalized by D-159 | Ratified, owner, 2026-07-13 |
+| D-144 | Incorporation-cap eligibility is anchored: `last_known` validity = CHAIN MEMBERSHIP on the held canonical chain of its generation — never terminality (v0.5.11 left the evaluation stratum undefined: pre-state H5 was terminal, an all-held fold with delayed successor H6 de-terminalized it, and judging H6 under W's own cap was circular — arrival orders diverged); `last_known` is the writer's TRUNCATION ASSERTION (D-114 posture): the cap quarantines later same-generation successors deliberately; W-first, H6-first, and fresh folds converge on the cap winning — extended to ordinary `w.gen` admission by D-159 (§9.3 still demanded terminality, re-opening the circularity), then completed by D-167 (acceptance dropped too: a budget-displaced head stays incorporable) | Ratified, owner, 2026-07-13 |
+| D-145 | Pending-selector reservation widened to the selection scope: a pending Head reference reserves the full `(zone, lineage, gen)` scope — later boundaries naming ANY coordinate in that generation pend behind it (v0.5.11 reserved the exact coordinate only, so a later selector naming a DESCENDANT on the opposite branch committed before the earlier-in-control-order reference resolved; with ancestry unresolved no narrower safe cone is knowable); released on resolution, reject-permanent, or C3′ removal | Ratified, owner, 2026-07-13 |
+| D-146 | Import replay-key ownership is provisional until effect finality, frozen there: D-94's finality closure IS the no-late-claimant proof (lower generations immutably closed = no canonically earlier claimant can arrive) — v0.5.11's one-active-grant lemma was false twice (grant turnover put claimants on incomparable chains; open unknown-gap generations admitted late canonically-earlier claimants in one lineage); pre-finality an earlier claimant DISPLACES (standard displacement) and references to a provisional import claim are pending-dependency; `import-collision` = a claim that can never win (later-canonical against a held claim, or against an effect-final claimant); the one-active-import-grant invariant binds EVERY grant-bearing operation (`c.enroll.grants[]` included); handoff serializes on the revocation frontier (old provisional claims die with it, effect-final claims stand immutable) | Ratified, owner, 2026-07-13 |
+| D-147 | Per-record durable transfer proof: `content_digest` = the Merkle root over `H_bhdr({v, export_id, record_count})` + per-rec `H_brec(canonical bundlerec)` leaves (`H_bnode` parents; the flat `H_bundle` domain retired) — v0.5.11's flat digest lost committed partial imports their proof: bundles are never persisted, so one erased sibling made the digest underivable and a committed record's release-binding unverifiable on rebuild (acceptance-history dependence); `mimport` carries `rec_index` + `proof` (≤ 8 siblings): folding the leaf up the path MUST reach `release.content_digest` — durable, per-record, erasure-proof; construct-and-rederive extended to root + paths — leaves made self-describing and the header leaf retired by D-156 (membership alone never proved the layout) | Ratified, owner, 2026-07-13 |
+| D-148 | The transfer journal is a transition fold: one EFFECTIVE terminal per interval, intervals chained by `XferReopen { export_id, release_op, incarnation }`; `missing` entries carry per-record `? basis` (keyed by `rec` — the scalar basis could not arbitrate two records negative under independent boundaries) and basis presence IS the intrinsic/boundary-derived discriminator; reopen fires when ANY recorded basis dissolves and recovery re-derives PER RECORD (no implicit abandonment — entries whose bases stand remain missing); terminal effect keys are incarnation-scoped (`("terminal", release_op, incarnation)` — a consume-once deduper would suppress every post-reopen terminal); one-terminal-per-release mirrors re-scoped per interval (D-53/§11.8) | Ratified, owner, 2026-07-13 |
+| D-149 | Rejection permanence splits by the rejecting fact: intrinsic byte failures (malformed, sig-invalid, body-hash, non-canonical, oversized, depth, key-malformed, proof-arm, gen-first-op) never re-enter ANYWHERE; rejections whose fact is a control operation (no-grant, scope-*, cert-revoked-in-fold, ceilings, import-collision, control-relative body-invariant instances) are permanent WITHIN THE BRANCH and re-evaluate under the C3′ total re-fold when the fact dissolves (v0.5.11's family-8 vector — a cut retirement reopening its space — contradicted §10.5's unconditional never-re-enters for `scope-space`) | Ratified, owner, 2026-07-13 |
+| D-150 | Key lifecycle is recovery-stable: **KEM-key freshness** — a certificate whose `kem_pk` was ever enrolled for a DIFFERENT device rejects, and a same-device KEM key rotated away never returns (K0→K1→K0 rejects; unchanged-KEM same-device renewal stays legal) — without it an excluded device's reused key inside another certificate decrypted that device's wraps; recovery gains **`adopted_renewals`** (the D-112 adoption pattern for KEM renewals: adopt the cut renewal's certificate + replacement wraps as validation material and storage state, or the K0-destroyed device is `storage-orphaned` — v0.5.11's re-fold silently re-keyed to a destroyed secret) and **`retired_keys`** (the portable freshness commitment: the signing/KEM freshness domain = surviving-chain enrollments ∪ recovery-carried retired keys — v0.5.11's fork-inclusive "ever enrolled" diverged on cut-branch certificates some replicas never hold; an uncarried cut-branch key is re-usable, a stated vectored residual) — adopted renewals' keys join the domain TYPED by D-158 (v0.5.12 left them outside it, re-enabling the cross-device bypass) | Ratified, owner, 2026-07-13 |
+| D-151 | Composition pins + hygiene: renewal coverage is total by composition (every past op-authoring grant is active — covered — or revoked, and revocation already carried its immutable frontier; position-relative cert validity keeps the pre-boundary prefix standing; the renewal-after-revocation vector pair rides the profile that implements renewal — renewal machinery is fail-closed in the ratified P1 v1 profile, D-203, so no such vectors exist yet; this row's original "two vectors" claim was stale prose, corrected by owner ratification 2026-07-16 — the composition law itself is unchanged); **a live lineage** = one named by an ACTIVE op-authoring grant for the zone (revoked = pre-covered); the recovery-omission complement domain = `(zone, lineage)` pairs under the universal revivable override; a requester with empty `live_heads` rejects (≥ 1 `zoneheads` entry; empty `heads` INSIDE an entry stays the valid total-none snapshot); the dead `mclaim.provenance.import` arm deleted structurally (the peer's M1); the family-11 mirror battery completed (export_id, derived-vs-signed release_op, three-way count, endpoint coordinates, propose/assert-with-import); §16 Gate A carries an explicit status line (pending — currently false) — the pre-covered-by-revocation composition corrected for device revocation by D-159 (authorship vs wrap domains); the at-or-before-base blanket domain mirrored into E8/CDDL by D-167 | Ratified, owner, 2026-07-13 |
+| D-152 | The live-frontier bound is 65: a maximum legal lineage holds 64 open unknown-gap heads PLUS the current live tip — `frontierclose.heads` and `zoneheads.heads` cap at 65 (v0.5.12 reused the 64 open-gap cap for the closure wire, so the maximum legal lineage could not be closed or snapshotted at all) | Ratified, owner, 2026-07-13 |
+| D-153 | Staged-frontier consumption is automatic, total, and one-shot: the zone's NEXT consuming advance/renewal/retirement consumes EVERY unconsumed stage at its position, materializing each with the consumer's selector; a consumed stage never counts again and a prior advance's materialized entries NEVER satisfy later coverage (keeping the old selector leaves the newly stale epoch open; re-materializing retro-truncates the history written since) — every advance needs fresh coverage at current heads — the stage lifecycle (acceptance-only existence, pending-carrier dependency, vacuous dead-lineage consumption) pinned by D-160; every-stage consumption scoped to APPLICABLE stages by D-176 | Ratified, owner, 2026-07-13 |
+| D-154 | Pending-selector reservation reaches the `(zone, lineage)` scope: the `last_known` dependency cone crosses generations — a later generation opened on the unresolved branch hangs on the same selection (v0.5.12's generation scope let a dependent later-generation head commit before the earlier-in-control-order reference resolved); with ancestry unresolved no narrower safe cone is knowable, so the lineage waits; released on resolution, reject-permanent, or C3′ removal | Ratified, owner, 2026-07-13 |
+| D-155 | Import replay-key ownership is WHOLLY DERIVED with a total portable claimant order `(import-grant control position, gen, seq)`: the zone's import grants are control-ordered, so claimants compare across grant turnover; the effective owner = the order's first surviving claimant; FREEZE is a derived predicate — effect finality, or a matching authority-ending frontier foreclosing the authority's remaining claim room (classifying the at-or-below post-revocation claimant) — and dissolution of the freezing basis UNFREEZES the key, re-deriving the next owner identically on incremental and fresh folds (v0.5.12's frozen-at-finality had no durable carrier across C3′; escaped effects = the standing residual); displaced provisional owners take quarantine-reproposal, waiting references stay pending-dependency; ownership is derived fold state, never a new revisit class (T2) — loser disposition made arrival-invariant, freeze gated on no-pending-earlier-claimant, and frozen-never-moves scoped to a live basis by D-161 | Ratified, owner, 2026-07-13 |
+| D-156 | Merkle leaves are self-describing: `leaf = H_brec({export_id, rec_index, rec})` with `rec_index` REQUIRED to equal the record's rank in the release's signed, sorted `sources` (the verifier computes the expected rank from `source_op`); the header leaf and `bhdr` domain are retired — `export_id` and `record_count` are already signed release facts, and v0.5.12's header leaf proved only MEMBERSHIP (for most positions leaf 0 hid inside opaque sibling subtrees, so a path never showed the expected layout); pins: 0-based origin, bottom-up sibling order, exact consumption, odd promotion unchanged, proof ≤ 7, failure = `body-invariant` — the leaf preimage named and versioned (`bundleleaf`) and the dual-validator residue removed by D-162 | Ratified, owner, 2026-07-13 |
+| D-157 | The terminal cause vocabulary is closed and the interval machine pinned: a `missing` entry's `basis` = the op hash of the FIRST branch-relative fact in fold order that made the record resolved-negative — a control boundary OR a tenant fact (a collision's winning claimant) — exactly D-149's class (v0.5.12's seal/void/cap list could not carry scope or collision causes, and its basis-free-reject-permanent contradicted the branch-relative split); invalidation = the fact dissolves, displaces, or retro-quarantines; terminal(n) → `Reopen(n)` legal only after terminal(n)'s cause invalidates → interval n+1; wrong/duplicate incarnation, double terminals, or reopening a Done = storage-quarantine; every one-terminal/never-after-Abort/clears-on-terminal statement reads over the CURRENT interval — the reopen made citable (basis + invalidation) and the canonical cause made a state function by D-163; this row's first-in-fold-order selection superseded by D-163's minimal-hash (the stale mirrors corrected by D-171) | Ratified, owner, 2026-07-13 |
+| D-158 | Adoption contributes typed key history: an adopted renewal's signing key is burned globally and its KEM key binds to the adopted device (same-device recovery re-enrollment legal; any other device rejects) — v0.5.12 left adopted keys outside the freshness domain, so a later surviving enrollment could assign an adopted LIVE KEM key to another device, the exact bypass D-150 forbids; `adopted_renewals` join the D-105 resolve-before-precedence list; per-device chains are contiguous INCLUDING signing-only intermediate renewals; wrong-device / non-renewal / not-before-base / noncontiguous = `body-invariant`, unheld = `ref-unresolved` — the inverted not-before-base negative corrected (strictly after base), same-device eligibility narrowed to the TERMINAL adopted key, and the bounded list pinned to all chain renewals by D-164 | Ratified, owner, 2026-07-13 |
+| D-159 | Composition and stratum pins: device-revocation `cutoffs` cover the AUTHORSHIP domain (active op-authoring grant zones — authored-but-unwrapped zones included) while `rotation_refs` cover the wrap zones (two domains — v0.5.12 keyed both to wraps and broke D-151's pre-covered composition there); closure composition = INTERSECTION over matching selectors, absence leaving D-86 position-relative validity governing (the renewal-after-revocation formula made explicit); recovery naming TERMINATES a lineage beyond its carried heads while omission + post-recovery ratify is the preserve-and-continue ritual, and the blanket binds lineages enrolled at or before `base` (later enrollments fold normally); ordinary `w.gen` `last_known` validation re-anchored to chain membership (the D-144 rule — §9.3 still demanded terminality); `retired_keys` membership compares `key_id = H_key({alg, pk})`; the stale `mimport` identity comment fixed — the intersection formula published as THE authority predicate and mirrored into §4.2/§10.2 by D-166; device-revocation completion made dual-domain by D-165, then state-derived with refs as typed linkage by D-180/D-195 (this row's refs-cover-wraps framing is historical) | Ratified, owner, 2026-07-13 |
+| D-160 | The staged-frontier state machine: a stage EXISTS only at its carrier's acceptance (a held `ref-unresolved` carrier registers nothing); a strict consumer whose coverage depends on a held-but-pending carrier PENDS behind it (the reservation pattern — control order survives pendency, incremental and fresh folds agree at resolution; v0.5.13 left both readings open and they diverged); a stage whose lineage left the coverage domain (its revoking frontier already closed it) is consumed VACUOUSLY by the one-shot rule; no expiry or cancellation machinery — stage state reconstructs from acceptance and consumption positions alone — the consumer set widened to required-coverage (retirement pends regardless of strictness) and the bounded late-carrier suffix re-fold mandated by D-168 | Ratified, owner, 2026-07-13 |
+| D-161 | Import dispositions are arrival-invariant and freeze is reservation-aware: the order-loser is ALWAYS quarantine-reproposal — displaced or arrived-second, same final bytes, same disposition (v0.5.13 gave reject-permanent in one order and revivable in the other — the fold-relative class in my own dispositions); `import-collision` narrows to claims that can NEVER win (claims against a FROZEN owner); freeze additionally requires NO held, unresolved order-earlier claimant (an admissible earlier claimant pending proof reserves the key — a portable held-bytes fact); "a frozen identity never moves" is scoped to a standing basis within the branch (the C3′ unfreeze is the basis dying) — the reservation set widened to every capable claimant (revivable quarantine reserves) and the collision cause made the (winner, freeze_basis) conjunction by D-169; collision moved to the derived lane (basis-standing permanence) by D-196 | Ratified, owner, 2026-07-13 |
+| D-162 | One per-record validator + canonical leaf bytes: admission is per-record ALWAYS — leaf + path against the signed root, plus source-derived byte equality while the source is derivable; whole-bundle root re-derivation is transport integrity, never admission law (v0.5.13's all-or-nothing exact-bundle rule beside the proof path made two validators that disagreed after a sibling erasure); the leaf preimage is the NAMED, VERSIONED `bundleleaf = { v: 1, export_id, rec_index, rec }` production (`rec` embedded as a map — the inline object fixed no canonical bytes and violated E6's versioning discipline) — the while-derivable equality made erasure-stable by D-170 (the durable attempt stores the source-derived binding) | Ratified, owner, 2026-07-13 |
+| D-163 | Reopens are citable and the canonical cause is a state function: `XferReopen` carries `basis` (the invalidated cause) and `invalidation` (the op hash of the fact that killed it) — legality is verifiable-when-held, an unheld citation PENDS the reopen (feed order never divides replicas), an uncited/unverifiable one is `log-corrupt`; the canonical basis = the MINIMAL op hash among the branch-relative facts sufficient at the terminal's fold position (v0.5.13's first-in-fold-order had no total cross-feed order); the D-149 outcome → basis map published (cutoff/scope → the boundary op; no-grant/cert-revoked → the revoking op; ceilings → the ceiling op; collision → the winning claim; intrinsic/source-erased → none) — the map totalized (fence-hardened negatives, control-relative body-invariant), the evaluation coordinate committed (`at`), and the collision cause made conjunctive by D-169/D-171 | Ratified, owner, 2026-07-13 |
+| D-164 | Adoption order righted and eligibility typed: an adopted renewal is STRICTLY AFTER `base` on the cut branch (v0.5.13's negative — "does not precede base" — was inverted and rejected exactly the valid adoptions, everywhere it appeared); same-device adopted-KEM eligibility = the TERMINAL adopted key only (an intermediate — K1 of K0→K1→K2 — is rotated-away and burned, matching live-enrollment freshness); the bounded `adopted_renewals` list carries ALL chain renewals, signing-only links included — one rule, one 64-cap — the contradicting KEM-rotating prose fixed and the retired/adopted overlap made body-invariant by D-172 | Ratified, owner, 2026-07-13 |
+| D-165 | Device revocation is constructible at both boundaries: `cutoffs` becomes `[*]` (a zero-authorship device is legally revocable — v0.5.13's `[+]` made it unencodable) and completion = authorship-domain coverage AND wrap-domain coverage, checked independently (v0.5.13 completed on wraps alone, so a many-author/zero-wrap ceremony "completed" with no authorship frontier); 0-author/0-wrap, 65-author/0-wrap, and 0-author/65-wrap vectors pinned — the wrap-coverage domain named (decryptable-wrap, with its evaluation position) by D-173; completion made state-derived and references demoted to typed linkage by D-180 | Ratified, owner, 2026-07-13 |
+| D-166 | The authority predicate is published once and mirrored: admission = certificate closure ∩ grant closure ∩ epoch closure, each consulted by its own selector, absence on an axis leaving D-86 position-relative validity governing that axis; §4.2 rewritten to cite it (a zone legitimately omitted from renewal coverage — last grant already revoked — carries no supersede frontier, and the grant boundary governs alone; v0.5.13's §4.2 read as rejecting everything beyond coverage) and the §10.2 cert stage evaluates UNDER the formula (never rejecting a prefix a matching grant boundary preserves); §4.2's stale accepted-through wording updated to the frontier shape — the recovery axis restored to the published equation and certificate×grant temporal compatibility added by D-174 | Ratified, owner, 2026-07-13 |
+| D-167 | Mirror and stratum sweep: the at-or-before-`base` blanket universe and the post-base-enrollment exception mirrored into E8 and the recovery CDDL (v0.5.13's mirrors quarantined the post-recovery first write the main rule admits); every freshness comparison typed to `key_id = H_key({alg, pk})` (raw `sig_pk` comparisons removed); the enrollment mirror includes adopted typed history; "an unadopted, uncarried cut-branch key never enters the portable burn set" stated explicitly; ordinary `w.gen` `last_known` drops the ACCEPTANCE requirement (held-chain membership only — a canonical but budget-displaced head stays incorporable, completing D-144/D-159); the stale terminal-to-reopen prose re-scoped to current-interval language; the fourteen acceptance traces folded into families with outcomes and dispositions — role-neutral material identity and the accepted-Frontier retirement transition by D-175 | Ratified, owner, 2026-07-13 |
+| D-168 | The stage consumer set and re-fold: pendency behind a held-but-pending carrier binds every REQUIRED-COVERAGE consumer — strict-zone advances and ALL space retirements (retirement's coverage is mandatory regardless of strictness; v0.5.14's strict-only wording contradicted the retirement rule and the CDDL's generic wording) — while lenient advances never pend; a late-accepted carrier MANDATES the bounded suffix re-fold: exactly the consumers positioned between the carrier and its consumption re-derive, materializing the stage under the position-correct consumer's selector (v0.5.14 implied it via reconstruct-from-positions but never obligated the incremental transition); §9.4 and the staging CDDL aligned | Ratified, owner, 2026-07-13 |
+| D-169 | Freeze reservation covers every capable claimant and the collision cause is conjunctive: a held order-earlier claimant reserves the replay key unless PERMANENTLY incapable of winning — pending-proof AND revivably-quarantined claimants both reserve (v0.5.14's unresolved-only reservation let a later owner freeze past a budget-displaced claimant that then revived), only reject-permanent/frozen-out release it; an `import-collision` terminal's cause = the typed conjunction (winner, freeze_basis) — the loser is a collision only BECAUSE the winner is frozen, so the terminal invalidates when EITHER member dies (v0.5.14 recorded the winner alone and the freeze basis's removal never invalidated it); `missing` bases become sets (≤ 2 members), reopens cite the invalidated member — the collision terminal proved UNREACHABLE and removed with its conjunction by D-177 (bases revert to one typed cause); the undefined frozen-out label replaced by D-177 | Ratified, owner, 2026-07-13 |
+| D-170 | Source binding is erasure-stable: the durable destination attempt RECORDS the source-derived leaf hash at registration (a durable attempt cannot exist without having verified the release chain and source record), and body validation compares against the STORED binding whenever the source is no longer derivable — v0.5.14's while-derivable conditional was availability-dependent (a malicious B′ pending time proof, its source erased, then proven, skipped equality and imported on a valid path — the exact schedule the family text promised impossible); the signed-leaf-authoritative alternative REJECTED as a security downgrade (an export-authorized signer could substitute statement/kind/floor bytes) — the stored-binding mechanism withdrawn as carrier-less and replaced by erasure-wins (D-178); the signed-leaf rejection stands | Ratified, owner, 2026-07-13 |
+| D-171 | The journal commits its evaluation coordinate: `XferAbort` gains `at` — the control-position op hash at terminal write, verifiable-when-held — and the minimal-hash canonical cause evaluates over facts at or before `at`, reconstructible on any rebuild (v0.5.14 defined the position but carried no coordinate, so a fresh rebuild facing a later lower-hash sufficient fact could not re-derive the recorded basis); the cause map TOTALIZED (fence-hardened deadline/lease/causal → the hardening checkpoint; control-relative `body-invariant` → the contradicting control op); the stale first-in-fold-order mirrors (the D-157 row, the `xferabort` comment) corrected to minimal-hash — `at` and minimal-hash selection themselves withdrawn by D-179 (the replicated journal makes the writer's recorded cause canonical; a control coordinate could not order tenant or issuer facts) | Ratified, owner, 2026-07-13 |
+| D-172 | Adoption membership and overlap pinned: the §7.4 prose carries ALL chain renewals — signing-only links included (v0.5.14's each-entry-is-KEM-rotating prose made a required member disallowed); a key appearing BOTH in `retired_keys` and as a terminal adopted key is `body-invariant` on the recovery operation (self-contradictory owner intent); chains deeper than the 64-cap orphan the excess (the D-117 deep-fork pattern — a stated residual) — the CDDL's KEM-RENEWALS introduction cleaned and the overlap check routed through candidate-side matching by D-182/D-183 | Ratified, owner, 2026-07-13 |
+| D-173 | The revocation wrap-coverage domain is named: the target's DECRYPTABLE-WRAP domain — every zone with at least one accepted epoch at which the target holds an effective (unsuperseded) wrap not already followed by an accepted rotation excluding it — evaluated at the completing operation's control position (the D-50 all-decryptable obligation made exact: prior exclusion rotations shrink the domain, `wrap_add` re-admission re-enters it pre-completion; resolves the v0.5.14 review's 0-author/65-wrap dispute — the ceremony is constructible under the named domain, and the first review's current-membership reading is void) — completion made state-derived emptiness and `rotation_refs` demoted to typed linkage by D-180 (an accepted exclusion removed its zone before any reference was checked: references could never discharge coverage) | Ratified, owner, 2026-07-13 |
+| D-174 | The authority predicate is four-axis with temporal compatibility: admission = recovery ∩ certificate ∩ grant ∩ epoch closures (v0.5.14's published equation omitted the recover axis its own algebra defined); PLUS certificate×grant temporal compatibility — an operation citing certificate C and grant G admits only if G was issued within C's effective span or C holds a supersede frontier covering the position, else `cert-superseded` (absence-as-neutral alone resurrected the old signer: revoked G0, renewed C0→C1 with the zone legitimately omitted, fresh G1 — no closure matched anywhere and old C0 signed new operations; both compatibility inputs are control facts, portable); §4.2 and the §10.2 cert stage mirror the full rule — the within-span requirement INVERTED to the upper bound by D-181 (it rejected every renewed certificate's inherited grants); §4.2's three-axis list corrected to four | Ratified, owner, 2026-07-13 |
+| D-175 | Role-neutral material identity + accepted-Frontier retirement: freshness and retirement additionally compare `mat_id = H_mat(SEC1 point bytes)` — the same P-256 point under `p256` and `hpke-p256-v1` is ONE material (role-tagged `key_id` gave it two IDs: KEM-as-signing defeated device self-exclusion, signing-as-KEM restored decrypt access); role-tagged `key_id` remains the addressing identity; intra-certificate role reuse (sig_pk == kem_pk) rejects; the `mat` domain joins the tag inventory; AND `w.gen(last_known = H)` retires the effective ACCEPTED head at or below H's canonical position (v0.5.14 retired the named head verbatim — a no-op for a held-but-displaced head that leaked the stale accepted head into every checkpoint; no accepted head at or below = a defined successful no-op) — recovery-portable cross-role matching added by D-182 (role-tagged recovery hashes cannot be inverted); the §4.6 mirror swept by D-183 | Ratified, owner, 2026-07-13 |
+| D-176 | Stage consumption is applicable-scoped and renewal pends: a consumer takes only stages whose `(zone, lineage)` lie within ITS coverage domain — advance/retirement = the zone's live lineages, renewal = its predecessor's authorship domain (v0.5.15's take-everything rule let lineage B's renewal BURN lineage A's stage under B's selector — inert for A, one-shot-spent before A's boundary); RENEWAL joins the required-coverage pending consumers (its authorship coverage is mandatory and the >64-zone case rides staged closes — v0.5.15's enumeration omitted it, so a renewal could reject permanently while its completing carrier pended); waiting = `ref-unresolved`, revival rides the D-168 suffix re-fold — the CDDL/D-153 every-stage mirrors swept by D-189's residue pass (v0.5.16 inserted the relation but left the old summaries live) | Ratified, owner, 2026-07-13 |
+| D-177 | `import-collision` is a fold outcome, never a terminal cause: the collided record was IMPORTED by its winner (`XferDone` counts it) or the winner is an unresolved attempt and the terminal defers — no reachable trace lists a collision in `missing`, so the conjunctive `(winner, freeze_basis)` cause and the collision-abort-reopen vector are withdrawn with the reachability (bases revert to ONE typed cause — every remaining cause is a single fact); the undefined "frozen-out" reservation-release label replaced by its definition (claimants that can never win: reject-permanent, order-losers against a frozen owner, permanently non-revivable quarantine) — the stale `mimport` conjunction comment swept by D-189's residue pass; the reject-permanent disposition superseded by D-196 (derived lane — the unfreeze re-derivation required losers to re-enter) | Ratified, owner, 2026-07-13 |
+| D-178 | Erasure wins: a source erasure resolves every NOT-YET-ACCEPTED import of that record negative (eligible `missing`) — the pending-attempt deferral yields to erasure (a genuine delayed import dies with its erased source, which is what source-erased means; accepted-not-yet-effect-final attempts still defer the terminal); v0.5.15's stored-binding repair is WITHDRAWN as carrier-less (no `txnrec`, frame, or authenticated record held it — prose storage is not storage, and an importer-mintable or rebuild-local cache proves nothing); the signed-leaf-authoritative alternative stays rejected — the acceptance boundary superseded by D-184 (the committed ItemCommit: acceptance was itself an uncarried history fact), and erasure-wins itself retired by D-198 (sources stay live for nonterminal transfers — no race exists on a conforming branch) | Ratified, owner, 2026-07-13 |
+| D-179 | The journal cause is writer-chosen, typed, and monotone: `basis` = ONE sufficient branch-relative fact as a tagged `factref` (operation hash or issuer-statement `stmt_id` — invalidations cite the same union); the journal is replicated log bytes, so the recorded cause IS canonical (every replica reads the same record — verification is fact-held, never order-dependent) and reopen fires when the RECORDED cause dies even if another sufficient fact holds (re-derivation re-terminals interval n+1 with the survivor); `XferAbort.at` and minimal-hash selection are withdrawn (a control coordinate could not order tenant facts or issuer statements — v0.5.15 solved a non-problem the replicated journal never had); the cause map completed by KIND (never-issued grants and static class exclusions are basis-free intrinsic; `request-fork` → the conflicting operation) — terminal-first interval reservation, op-kind-only bases, and the static-scope split by D-185; the basis WIRE retyped `opfactref` and the two basis-free lists unified by D-193 (v0.5.17's prose and CDDL kept the full union beside the op-kind rule) | Ratified, owner, 2026-07-13 |
+| D-180 | Revocation completion is state-derived: the compound completes when the authorship-domain `cutoffs` are total AND the decryptable-wrap domain is EMPTY at the completing position — accepted exclusion rotations shrink the domain themselves, so `rotation_refs` NEVER discharge coverage (v0.5.15's references-cover-the-domain rule was ceremonial: if the rotation exists its zone is already gone; if the zone remains no citable rotation exists — the 65-zone reference continuation was dead text); references are typed linkage — valid post-last-wrap exclusions carrying the D-71 freeze linkage, MANDATORY on hosted planes — the registry row rewritten from ONE law by D-186 (v0.5.16 appended the new law beside the withdrawn coverage clause and the D-50-era trigger) | Ratified, owner, 2026-07-13 |
+| D-181 | Certificate×grant compatibility is upper-bounded: reject (`cert-superseded`) iff G was issued strictly AFTER C ceased being effective — v0.5.15's within-span requirement rejected every renewed certificate's INHERITED grants (grants bind `device_id` and deliberately survive renewal: current C1 citing G0 failed both arms), while the four closure axes already bound the operation position, so only the resurrection direction needs the check (old C0 + post-supersession G1 still dies); §4.2's three-axis list corrected to four; `cert-superseded` splits contextually — missing renewal evidence pends, a PROVEN incompatible pair is reject-permanent within the branch (one outcome, two lifecycles — the §10.5 star pattern) — the split actually entered into §10.5's rows, and revocation + the ceasing coordinate mirrored into §4.2/§10.2, by D-187 (v0.5.16 ruled the split without editing the map) | Ratified, owner, 2026-07-13 |
+| D-182 | Freshness matching is candidate-side across the closed v1 role tags: `retired_keys` and adopted history carry opaque role-tagged hashes a fresh replica cannot invert, so a candidate point P is checked under BOTH `H_key({"p256", P})` and `H_key({"hpke-p256-v1", P})` against those sets (recovery-portable — no wire change; the same matching runs the D-172 retired-vs-adopted overlap); the equivalence boundary is EXACT SEC1 bytes — P vs −P is not canonicalized and arbitrary related-key derivation is undetectable (stated residuals) — the residual pinned into §14 and FAMILY 7 (v0.5.17's rows said family 13, which is storage — D-200), and the never-returns prose qualified, by D-190 | Ratified, owner, 2026-07-13 |
+| D-183 | Mirror and shape sweep: §4.6's Frontier retirement aligned to the accepted-predecessor rule (v0.5.15 fixed §9.3 and left §4.6 dropping "exactly the incorporated heads" — two live transitions from one byte set); the D-76 row marked amended; the adoption CDDL's KEM-RENEWALS introduction corrected to all certificate renewals; the `factref` union replaces untyped hashes in journal citations; the eight outstanding E10 states mapped in their ruling texts (staged-consumer waiting = `ref-unresolved`; erased-pending imports = resolved-negative; proven incompatibility = permanent; wrong incarnation/double terminal/reopen-after-Done = storage-quarantine; uncited reopen = log-corrupt) — ruling-text mappings promoted into the authoritative §10.4/§10.5 tables by D-189, and the residual terminal-head/never-nothing mirrors swept by D-188 (a decision row saying cases are mapped is not the mapping) | Ratified, owner, 2026-07-13 |
+| D-184 | The COMMIT is the erasure boundary: a source erasure resolves every import of the record without a committed ItemCommit at the erasure's serialization point to `source-erased` (reject-permanent; eligible `missing`) — the zone log's ItemCommit is authenticated durable bytes written only after source equality passed, and the `release_op` critical section serializes it against erasure, so the order is IN THE LOG and both schedules plus a cold rebuild converge by replay (v0.5.16's erasure-wins keyed on ACCEPTANCE — an uncarried history fact, the same class as the withdrawn stored binding: a proof→accept→erase cold rebuild held no evidence that source equality ever ran); committed-but-not-effect-final imports still defer the terminal; the `mimport.proof` only-validator comment re-scoped to the full §11.8 rule — the serialization claim superseded by D-191 (no erase transition took the `release_op` section, the two commits live in different zone logs, and the lock key was per-release while erasure is per-item: the `ImportCommitted` marker in the SOURCE log carries the order); the boundary question dissolved by D-198 (erasure defers while transfers are nonterminal — no boundary is needed) | Ratified, owner, 2026-07-13 |
+| D-185 | Journal terminal-first reservation + cause roles: an Abort or Reopen citing an unheld factref is `ref-unresolved` — it PENDS and RESERVES `(release_op, incarnation)`, later journal transitions pend behind the earliest pending one (journal order survives pendency; a terminal-first delivery can never double-terminal an interval; bounded re-fold on arrival); a HELD-invalid citation is `log-corrupt`; **basis is ALWAYS op-kind** — no reachable trace makes an issuer statement a sufficient terminal cause (the stmt-cause vector narrowed), while stmt-kind factrefs serve INVALIDATION (fork-discovery statements kill qualifications); the cause map's static split: retirement-driven `scope-space` cites the retirement, static scope/flow/class mismatches and never-issued grants are basis-free intrinsic | Ratified, owner, 2026-07-13 |
+| D-186 | One revocation law: exclusion rotations are independently effectful (D-50's monotone posture); the compound's cert/grant/cutoff effects begin when linkage validates ∧ authorship `cutoffs` are total ∧ the decryptable-wrap domain is empty — the v0.5.16 row carried three completion rules (the withdrawn references-must-cover clause and the D-50-era every-reference-accepted trigger beside the state-derived law: same bytes, different authority state); `c.revoke_zones` continues AUTHORSHIP coverage, its references additional typed linkage only; invalid linkage = `body-invariant`, incomplete coverage / nonempty domain = pending — the CDDL `cutoffs` comment (still carrying authorship-AND-wrap completion and refs-cover-wraps) rewritten and exact outcomes assigned by D-195 (v0.5.17 rewrote the row and left the old law in Appendix A) | Ratified, owner, 2026-07-13 |
+| D-187 | `cert-superseded` lifecycles are in the map: §10.5 carries the contextual dual entry — proven incompatibility (a grant issued after the certificate ceased effective) = reject-permanent within the branch; awaiting-renewal-chain = pending-dependency (v0.5.16 ruled the split but never edited §10.5, so one reducer could hold a proven-dead pair forever and another release it); §4.2 and the §10.2 cert stage name REVOCATION beside supersession with the ceasing coordinate = the ending operation's control position — for a PENDING-then-completing revocation, cessation = the COMPLETING acceptance's position (a window-issued grant stays compatible), pinned by D-195 | Ratified, owner, 2026-07-13 |
+| D-188 | Frontier predicate sweep: "terminal head/Head" eliminated from §4.3, §4.6, and the cap dependency list (eligibility is HELD CHAIN MEMBERSHIP, never terminality — a literal validator rejected W naming held H5 when held H6 made it nonterminal); §4.6's "never nothing" deleted — no accepted head at or below the incorporated position is a SUCCESSFUL NO-OP (§9.3's rule; v0.5.16's two edits contradicted each other) | Ratified, owner, 2026-07-13 |
+| D-189 | E10 completion: `source-erased` joins the closed outcome enum (body class; reject-permanent — intrinsic, the source is cryptographically gone); journal invariant violations (wrong/duplicate incarnation, double terminal, reopen-after-Done, held-invalid citations) = `log-corrupt` → storage-quarantine, named in the map; unheld journal citations and provisional-import references = `ref-unresolved` (the row's description widened); every "negative"/"resolved-negative" prose site now names its outcome — dispositions are not outcomes, and a decision row claiming a mapping is not the mapping — the remaining bare-storage-quarantine CDDL mirrors paired `(log-corrupt, storage-quarantine)` by D-197; `source-erased` re-scoped to the adopted-erasure residual by D-198 (unreachable on a conforming branch under the deferral) | Ratified, owner, 2026-07-13 |
+| D-190 | The P/−P residual is pinned: §14 gains the material-identity row — cross-role and intra-certificate reuse defeated; NEGATION REUSE deliberately undetected (exact-SEC1 equality: a holder of scalar d derives −P's scalar) and arbitrary related-key derivation undetectable by any public identifier; the FAMILY-7 acceptance vector added (−P enrolls; v0.5.17's row said family 13, which is storage — corrected with the explicit setup by D-197); the "never returns" freshness prose qualified to the equivalence boundary | Ratified, owner, 2026-07-13 |
+| D-191 | The import-survival marker: `ImportCommitted { source_op, release_op, leaf_hash }` joins the txnrec union, appended to the SOURCE zone log by the plane writer when source equality passes, inside a `(source_zone, source_op)` exclusion spanning verification → marker append (acquired before the `release_op` section — fixed nesting; per-item, so one source in many releases needs no discovery); the exact erasure point = the item's Tombstone append in the SAME log; survival = marker precedes tombstone in ONE log's frame order — byte-visible, crash-replayable (v0.5.17 asserted the `release_op` section ordered commit against erasure: no erase transition took it, the destination commit lives in another zone log, and the key was per-release; verify→pause→erase→flush was legal and unordered); crash-after-marker recovery re-commits the destination from held `mimport` bytes against `leaf_hash` — the marker is the verifier-authenticated durable record whose missing carrier sank the v0.5.15 binding — **WITHDRAWN by D-198**: the crash contract promised bytes no durable object held (a crash before the destination commit discards the only copy of the signed import — "held" was true of a warm process and false of the cold restart the contract was for), the erase machine never took the named exclusion, and marker retry identity was unpinned — completing it meant a prepared-import WAL, a new mechanism family; the deferral deletes the problem | Ratified, owner, 2026-07-13 |
+| D-192 | The journal object is frozen: the transfer journal = the zone log's txnrec projection in FRAME ORDER — one append authority (the plane writer), physical order = journal order, replay = fold frames in order, D0-B transports the stream verbatim (the D-179 replicated-bytes reasoning now names its carrier); `XferAbort`/`XferDone` gain explicit `incarnation` (self-describing, matching `XferReopen` — v0.5.17 derived intervals from an order no object froze); incarnation/frame-order mismatch, duplicates, and conflicts = `log-corrupt`; the T0→R0→T1 battery under every delivery order + fresh replay — Txn-internal order frozen as `(frame ordinal, record index)` with sequential validation by D-200 | Ratified, owner, 2026-07-13 |
+| D-193 | `opfactref` + one cause table: terminal bases retype to op-kind-only `opfactref` (invalidations keep the full `factref` union — fork-discovery statements are real killers; v0.5.17's D-179 prose and CDDL kept op-or-statement beside D-185's op-kind rule); the two conflicting basis-free lists replaced by ONE table — basis required with its op (cutoff/retirement-scope/revoked-grant/proven-supersession/ceilings/fence-hardened/control-relative body-invariant + request-fork) vs basis forbidden (intrinsic bytes, static scope/flow/class, proven-never-issued, source-erased); statement-basis rejection and statement-invalidation acceptance vectored — `XferReopen.basis` itself retyped `opfactref` and the Appendix absence-list unified by D-200 (v0.5.18 retyped the Abort's basis only) | Ratified, owner, 2026-07-13 |
+| D-194 | Dense-prefix reference proof: a cited certificate or grant ABSENT from the held dense control prefix covering the operation's signed anchor is PROVEN nonexistent (`no-cert`/`no-grant`, reject-permanent — C1 density makes absence a portable fact); a control gap below the anchor is `ref-unresolved` (unheld ≠ nonexistent) — arrival-independent on either delivery order, both vectored — **WITHDRAWN by D-199**: the proof read an upper bound the envelope never signs (the anchor epoch is a LOWER bound — the epoch opener; a certificate or grant can issue later in the same epoch, so C1→I→C2 permanently rejected what C1→C2→I admitted and the fresh fold sided against the incremental one); unheld references pend instead | Ratified, owner, 2026-07-13 |
+| D-195 | Revocation CDDL from one law + the cessation coordinate: the `crevokedev.cutoffs` comment rewritten (the authorship-AND-wrap completion and refs-cover-wraps clauses deleted — v0.5.17 rewrote the registry row and left the old law in Appendix A); the no-continuation claim reconciled (a COVERAGE continuation cannot exist; `crevokezones.rotation_refs` = additional linkage only); exact outcomes — unheld reference `ref-unresolved`, held-invalid `body-invariant`, incomplete authorship / nonempty wrap domain `ref-unresolved` (context widened to awaiting completing exclusions/cutoffs); a certificate revoked by a pending-then-completing compound ceases at the COMPLETING acceptance's position — a window-issued grant was issued while the certificate was effective and stays compatible (D-187's delayed coordinate), vectored | Ratified, owner, 2026-07-13 |
+| D-196 | Dead stages and collision losers re-enter the machine: an authority-ending frontier VACUOUSLY CONSUMES the pending/unconsumed stages of the lineages it removes from the coverage domain — the revocation is the consuming event, one-shot-spent at its acceptance (v0.5.17's applicable relation excluded dead stages from every consumer while the vacuous rule said they were consumed: never both — and an unconsumed stage could resurrect under regrant); `import-collision` moves to the DERIVED quarantine lane — permanent while the freezing basis stands within the branch, the basis's death re-derives the claimant fold including former losers (v0.5.17's reject-permanent contradicted D-155's unfreeze re-derivation); the reservation-release list aligned | Ratified, owner, 2026-07-13 |
+| D-197 | Mirror and label sweep: the reopen/vector comments pair `(log-corrupt, storage-quarantine)`; the D-190 row's vector family corrected (family 7, not 13 — family 13 is storage) with the −P setup explicit (P enrolled or burned first, then candidate −P accepted under a named role and device); the remaining "pending" phrasings tied to named outcomes; row amendments ×8 | Ratified, owner, 2026-07-13 |
+| D-198 | Sources stay live for nonterminal transfers: cryptographic erasure of an item sourcing ANY nonterminal transfer journal DEFERS — the erase-queue entry is manifest-ineligible until every referencing journal is terminal (the queue already drains across rotations, §5.4); retrieval exclusion stays IMMEDIATE (only destruction of an already-released item waits for its copy; the owner's liveness remedy = kill the release, the journal closes, the deferral lifts); source equality is therefore ALWAYS checkable — the ImportCommitted marker, its exclusion, tombstone-order survival (D-191), and erasure-wins (D-178) are WITHDRAWN wholesale (the marker's crash contract promised bytes no durable object held — the opening of a prepared-import WAL, exactly the new-mechanism family the artifact-transition rule bars; the deferral deletes the problem: with the source live there is no window to order); residual: a C3′-ADOPTED erase manifest erases regardless (D-112 — the owner's ceremony) — every non-effect-final attempt of that source resolves `source-erased` at the adoption, the outcome's sole remaining reachability | Ratified, owner, 2026-07-13 |
+| D-199 | Unresolved references pend: a cited certificate or grant not yet held is `ref-unresolved` — indefinitely if need be; a portable absence proof is D0-B's (D-194 withdrawn: the dense-prefix nonexistence proof read an upper bound the envelope never signs — the tenant header carries `capability_epoch`, a LOWER bound; `ctrl_frontier` is admin-arm diagnostic and `issued_admin_epoch` audit-only — so same-epoch later issuance made delivery orders reach different permanent states); the never-issued basis-free cause entries removed with it; the C1→I→C2 / C1→C2→I convergence vector replaces the dense-prefix pair | Ratified, owner, 2026-07-13 |
+| D-200 | The terminal prose sweep (the artifact-transition cut): `XferReopen.basis` retyped `opfactref` (v0.5.18 retyped the Abort only — a statement-kind terminal basis parsed while the vector demanded parse failure); both prose terminal constructors carry `incarnation`; the Appendix cause-absence list unified with the one table (static classes included; never-issued dropped per D-199); the stale ItemCommit erasure-boundary comment replaced by the D-198 deferral; Txn-internal journal order frozen as `(frame ordinal, record index)` — sequential validation, all-or-nothing commit; the §10.5 `ref-unresolved` row gains the revocation-completion and unheld-reference contexts; the incomplete-compound vector pinned to (`ref-unresolved`, pending-dependency); wrong-incarnation vectors paired (`log-corrupt`, storage-quarantine); §4.2 names the completing carrier for pending revocations; the D-182 family label corrected (7, not 13) and D-159's refs-cover-wraps framing marked historical; "claimants that can NEVER win" softened to basis-standing wording — **from this cut forward, behavioral findings enter only with a failing executable trace against the companion corpus; prose-first rounds end here** | Ratified, owner, 2026-07-13 |
+| D-201 | The bare-writer actor class (the audit's D2, ruled): a bare non-human unattested writer has NO §11.4 class and counts toward NO status rule — alternative (c) of the surfaced alternatives; its judgments are recordable where authoring verbs admit them and inert in the §11.2 fold, and status influence requires attestation (the session path). Pinned by `status-bare-daemon-retract-inert` / `status-bare-daemon-supersede-inert`; the withdrawn scaffold mapping to `session` had granted status-counting authority B.2 reserves for attested sessions | Ratified, owner, 2026-07-14 |
+| D-202 | The late-receipt lifecycle (the audit's D5, ruled): `lease-stale` fires on a held QUALIFIED receipt outside every valid lease window and is STICKY — terminal where issued (alternative (ii)); convergence rides the writer's re-proposed operation (the quarantine-reproposal disposition read literally), the original operation's verdict is knowingly evidence-order-relative across replicas, and held timely evidence beats held late evidence at first evaluation (the `lease-stale-quarantines` / `lease-late-then-timely-receipt-admits` endpoint pair); re-evaluation-on-arrival and timeboxed pendency are rejected — the carrier sentence is narrowed to shared evidence-arrival structure by D-204 (the unqualified cross-structure promise was refuted by the Gate-A criterion-12 review's executable trace) | Ratified, owner, 2026-07-14 |
+| D-203 | The Gate-A ratification batch: cut-branch control operations classify `(cutoff, quarantine-reproposal)` (the D-140 recover-boundary reading — audit D3); a durable RewrapDone omitting an expected survivor and the D-89 N+1-Fence serialization violation classify `(log-corrupt, storage-quarantine)` (D7); `c.drill`'s recovery arm cites the CURRENT repoch (D8); the companion's fresh fold of the union commits to no arrival order (D10); the shared `op` domain tag across signature message and operation identity is recorded as accepted — disjoint shapes, no failing trace (D12); App C #2 offline-expiry confirmation stays a recorded open by owner choice (D11); the §4.7 fork-discovery statement wire gap is SHELVED for v1 — no new wire mechanism, held stmt-kind reopen invalidations stay honestly unverifiable; the P1 v1 profile is ratified as drafted (five implement-before-Gate-A mechanisms, the rest fail-closed with named outcomes); the coverage scope line: cheap single-op §10.4 negatives close before Gate A, and the big ceremony sagas (f7 ratify/checkpoint arcs, f9 issuer feeds, f10 generation machine, f11 transfer composites) defer to Gate B as recorded decisions, never drift; the Chromium and per-OS portable-storage execution lanes are funded per the plan | Ratified, owner, 2026-07-14 |
+| D-204 | D-202's convergence carrier narrowed to shared evidence-arrival structure: the re-proposed operation carries convergence only among replicas holding the same qualified-evidence class (timely vs late) at the original operation's first evaluation — late-first replicas issue sticky `lease-stale` and admit the re-proposal at the freed coordinate; timely-first replicas admit the original at evaluation, and the arriving re-proposal contests an OCCUPIED coordinate: D-130 fork evidence — BOTH variants, the admitted original included, freeze (`fork`, `freeze-writer`), reconcilable only by a committed boundary selection. The cross-structure verdict divergence is a stated owner-visible residual of alternative (ii) (v0.5.20's unqualified carrier sentence promised a cross-structure convergence no same-coordinate retry can honor — the Gate-A criterion-12 review's executable trace); harness enforcement: an evidence-lifecycle vector's listed deliveries MUST share the declared evidence-arrival structure, and the structure pair is vector-pinned (`lease-lifecycle-sticky-reproposal` late-first / `lease-lifecycle-timely-first-forks` timely-first, with the cross-world relationship pinned from one byte source by the reducer's `d202_two_worlds_derive_ruled_states` test) | Ratified, owner, 2026-07-16 |
+| D-205 | The self-evidence exception to same-coordinate fork registration (completing D-204): an arriving byte-variant whose OWN held evidence already classifies it `(lease-stale, quarantine-reproposal)` (T5/D-202) takes that sticky terminal classification and registers NO fork evidence — D-112's no-precedence-for-failed-operations posture extended to fork registration: a condemned original never freezes the writer's re-proposed convergence carrier, so D-204's late-first class converges on EVERY relative delivery order of original and re-proposal (the ff23f1cd review's F1 trace: re-proposal-first previously froze both variants inside the narrowed class); an arriving variant holding no qualified evidence, or timely evidence, remains D-130 fork evidence — the timely-first both-freeze world is unchanged. §13.1 gains the evidence-lifecycle exception to the universal-convergence sentence, and companion amendment #7 makes the declared class machine-readable (`evidence_class`, required on evidence-lifecycle vectors); the regression order rides the late-first vector's third listed delivery | Ratified under the owner's delegated adjudication of the ff23f1cd review round (the 2026-07-16 authority-to-decide grant, recorded in the program ledger; wording surfaced to the owner for veto), 2026-07-16 |
+| D-206 | **Gate-A closure rule (supersedes criterion-12 "finds nothing").** Gate A closes when a fresh independent review — conducted at a single pinned commit by a reviewer with no prior authorship in this program — re-executes the full battery and reports **zero blockers**, where a blocker is exactly: **(a) executable** — any suite or lane red at the pinned head (core, reducer, strict gate, storage, browser, including the discrimination and negative controls), or a demonstrated divergence between normative text (spec + companion) and committed artifact behavior that changes any admitted, pended, rejected, frozen, or derived outcome; **(b) normative** — a contradiction within or between the spec and companion under which two conforming implementations would disagree on the outcome of a covered behavior. All other findings — editorial drift, stale comments or counts, documentation mismatches, coverage-annotation gaps, style — are **residuals**: the reviewer files them with severity labels, the program records them in the residuals ledger (`residuals.md`) and repairs them in ordinary follow-up commits; residuals do not reopen Gate A, do not reset the review, and do not require a further fresh review. A zero-blocker review is a **PASS report**; the §16 stamp remains an owner act (D-151's reservation unchanged). If a review reports blockers, the repair requires **one scoped re-review only** — the repair diff plus a battery re-run at the new pin — never a full-program re-review. This rule does not modify Gate B, the P1 write bar, or any tenant-level requirement | Ratified, owner, 2026-07-16 |
+
+Open, tracked: `d0a-vector-cases.v1.json` (the D-91 companion —
+the first corpus artifact; D-91 stays **artifact-pending** until it
+exists and every fixture validates against it); umbrella RFC App C
+#2 offline confirmation fixture result (recorded
+here when run, family 14); drill cadence (product policy).
+
+---
+
+## 16. Gate checklists
+
+**Gate A** — all true: this document is self-contained (no normative
+reference to archived drafts); every signed/hashed/wrapped/stored
+object has closed schema, key encoding, cap, canonical order,
+unknown-field rule; every operation has typed authority, lane,
+transition, charge, replay rule, disposition; root custody meets
+D-38/D-46 (abstract contract here; envelope bytes at Gate B);
+receipts/leases are signed, issuer-qualified (device **or** service),
+device-self-excluding, lease-window-bound; the B.2/B.3 literal policy
+bytes reproduce their pinned hashes; solo/hosted/multi bootability vectors pass without
+ceiling crossings; generation/renewal/enrollment/epoch churn cannot
+reset budgets or cutoffs; frontier retirement canonical; crash/erase
+vectors fail closed per §6.2/§5.5; Memory admission/status/
+classification/evidence/audit/erase/transfer deterministic from
+portable bytes + `as_of_ms`; §15 complete with correct identifiers;
+the `d0a-vector-cases.v1.json` companion exists, predates every
+fixture, and every vector validates against container and companion
+(D-91); all §13 families green on their named surfaces; **closure
+per D-206 (§15)**: a fresh independent review at a single pinned
+commit, by a reviewer with no prior authorship, re-executes the full
+battery and reports zero blockers — the rule superseding this
+clause's earlier "finds only editorial drift" phrasing (any behavior
+invented in fixtures still folds back into this document first —
+the companion included).
+
+*Status: **Gate A — PASS, STAMPED by the owner 2026-07-16**, on the
+D-206 zero-blocker closure review at pin `44b56f96`
+(`reviews/2026-07-16-gate-a-44b56f96-closure-review.md`): the full
+battery re-executed by a no-prior-authorship reviewer in an isolated
+checkout — core 141/141, reducer 37/37, strict gate 170/170,
+storage 19/19 with the counter-equality and failpoint controls,
+browser 56/56, every discrimination and negative control red exactly
+where required — zero blockers, eight residuals (`residuals.md`,
+none gate-reopening; R6/R7 — this section's own stale status reason
+and pre-D-206 closure phrasing — are discharged by this stamp). The
+D-151 status line this stamp replaces read "pending — currently
+false"; its predicate is now satisfied and the claim is made.*
+
+**Gate B** — production custody adapters (Windows ACLs, keyctl
+persistence, Keychain/DPAPI, IndexedDB reality); ciphertext-only
+stores under the full crash/corruption matrix on macOS/Linux/Windows +
+named browsers; strict parser fuzzed under E8; erase end-to-end;
+production reducer/IAM/receipt/projection/migration integration;
+runtime-boundary tests (no plane key or plaintext in
+`intendant-runtime`); storage/keystore failure injection. **Gate B is
+necessary, not sufficient**: durable P1 writes additionally require
+the umbrella's P0.5 checkpoint replacement and tombed-Memory cutover.
+
+---
+
+## Appendix A — CDDL (normative, closed)
+
+```cddl
+; ---- primitives ----
+bytes16 = bstr .size 16    bytes32 = bstr .size 32
+ulid = bytes16             ms = uint
+hlc = [ms, uint]
+sigalg = "ed25519" / "p256"
+class = "public" / "internal" / "private" / "sensitive"
+kind = "observation" / "decision" / "episode" / "procedure" / "preference"
+devclass = "hosted-browser" / "owner-browser" / "native-app" / "daemon"
+         / "mobile-attested" / "mobile" / "other"
+spaceclass = "workflow" / "personal" / "project" / "audit"
+verb = "search" / "read" / "evidence.read" / "propose" / "assert"
+     / "judge.safe" / "judge.full" / "pin.safe" / "pin.full"
+     / "erase.request" / "raise" / "declassify" / "export" / "import"
+     / "curate.instruction" / "audit.write" / "admin"
+
+; ---- A.1 genesis / cert / grant / proof (§4.1–4.4) ----
+genesis = { v: 1, suite: "suite-v1", root_sig_alg: sigalg,
+  root_sig_pk: bstr, recovery_commitment: bytes32,
+  governance: { v: 1, kind: "single-owner" },
+  provenance: "trusted" / "hosted", created_ms: ms }
+cert = { v: 1, plane_id: bytes32, device_id: bytes16,
+  sig_alg: sigalg, sig_pk: bstr, kem_alg: "hpke-p256-v1", kem_pk: bstr,
+  class: devclass, evidence_hash: bytes32, ? evidence_media_type: text,
+  issued_admin_epoch: uint, ? expiry_deadline_ms: ms,
+  revocation_id: bytes16, ? renews: bytes32 }
+  ; renews = H_cert(predecessor certificate bytes) (D-85)
+grant = { v: 1, plane_id: bytes32, grant_id: bytes16,
+  subject_device: bytes16, ? lineage: bytes16,
+  tenants: [+ ("memory" / "agenda")], zone: ulid / "*",
+  spaces: [+ ulid] / "*", ops: [+ verb], ? kinds: [+ kind],
+  class_ceiling: class, ? can_declassify: bool, ? can_raise: bool,
+  ? raise_quota: uint, ? flows: [+ flow],
+  ? budget: { max_ops: uint, max_bytes: uint },
+  online_lease: bool, ? max_age_ms: ms,
+  issued_admin_epoch: uint, capability_epoch: uint,
+  ? expiry_deadline_ms: ms }
+  ; lineage REQUIRED when ops ∩ op-authoring verbs ≠ ∅ (D-60; the
+  ;   generation window lives on the lineage, §9.3); budget REQUIRED
+  ;   in deadline_fallback="budgets" zones; a v1 grant carrying
+  ;   "admin" rejects at issuance (D-61);
+  ; zone = "*" (with capability_epoch = 0) legal only when
+  ;   ops ⊆ {search, read, evidence.read};
+  ; kinds absent = all kinds otherwise authorized; present = exactly these;
+  ; raise_quota required iff can_raise; max_age_ms required iff online_lease
+flow = { from_zone: ulid, ? from_space: ulid, to: endpoint,
+  ? kinds: [+ kind], class_ceiling: class, expiry_deadline_ms: ms }
+endpoint = { plane_id: bytes32, zone_id: ulid, space_id: ulid }
+           ; plane destinations are complete (D-65)
+         / { egress: { kind: "model-provider" / "embedding" / "reflection",
+                       provider_id: text, profile_hash: bytes32 } }
+authproof = { arm: "dev", cert: bytes32, cap: bytes32 }
+            ; cert = H_cert(certificate bytes);
+            ;   cap = H_grant(grant bytes) (D-77)
+          / { arm: "genesis", genesis: bytes32 }
+            ; genesis = H_genesis(descriptor bytes) (D-85)
+          / { arm: "admin", epoch: uint, ctrl_frontier: bytes32 }
+          / { arm: "recovery", repoch: uint, recovery_pk: bstr .size 32 }
+
+; ---- A.2 envelope / frontier / receipts (§4.5–4.7) ----
+header = { v: 1, tenant: "memory" / "agenda" / "ctrl",
+  plane_id: bytes32, zone_id: ulid, space_id: ulid,
+  authored_kek_epoch: uint, capability_epoch: uint,
+  signer_alg: sigalg, signer_key_id: bytes32,
+  writer: { lineage: bytes16, gen: uint },
+  actor: { kind: "human" / "daemon" / "browser" / "agent-session"
+                / "peer" / "service", id: text, ? attested_by: bytes32 },
+  authorization_proof: authproof, request_id: bytes16,
+  writer_sequence: uint, previous_writer_hash: bytes32,
+  causal_references: [* bytes32], created_hlc: hlc,
+  operation_type: text, operation_version: uint, body_hash: bytes32 }
+signedop = { header: header, signature: bstr, body: opbody }
+opbody = mclaim / mjudge / mpin / munpin / merasereq / mexportrel
+       / mimport / maudit / wgen / ctrlbody
+  ; dispatched by (tenant, operation_type, operation_version) —
+  ; the registry row's shape is the ONLY admissible body
+frontier = { v: 1, zone_id: ulid, heads: [* head] }
+                             ; zone-scoped (D-62); sort key (lineage, gen)
+checkpointobj = { zone_id: ulid,   ; NO v — the envelope's
+                                     ;   operation_version versions
+                                     ;   the body (E6, D-88)
+  prev_checkpoint: bytes32 / "genesis",
+                                     ; op hash of the zone's previous
+                                     ;   c.checkpoint ("genesis" first)
+  covers: [* head],                  ; set (E7), key (lineage, gen);
+                                     ;   <= 256 — a PAGE: the accepted
+                                     ;   heads this checkpoint asserts
+                                     ;   (a full 4096-head Frontier
+                                     ;   cannot fit E8 row 1); the
+                                     ;   zone's effective coverage =
+                                     ;   the latest entry per
+                                     ;   (lineage, generation) —
+                                     ;   omission is never removal
+                                     ;   (D-111/D-118)
+  fences: [* fencecoord],            ; set (E7), key lineage; <= 256;
+                                     ;   each >= EVERY covers entry
+                                     ;   for that lineage, all
+                                     ;   generations (D-118) — the
+                                     ;   coordinate PENDING
+                                     ;   operations compare against
+                                     ;   (accepted heads alone can
+                                     ;   never cover a pending op)
+  retired: [* head],                 ; set (E7), key (lineage, gen);
+                                     ;   <= 256; retirements THIS
+                                     ;   checkpoint causes: each live
+                                     ;   in THIS operation's pre-state
+                                     ;   + eligible (D-76/D-96) — the
+                                     ;   fold removes exactly these,
+                                     ;   never bare coverage;
+                                     ;   immediate w.gen/cutoff
+                                     ;   retirements are never
+                                     ;   re-listed
+  proof_positions: [* { issuer: issuerid, through: uint,
+                        head_hash: bytes32 }] }
+                                     ; set (E7), keyed by issuer;
+                                     ;   currently qualified issuers
+                                     ;   only; <= 64; head_hash =
+                                     ;   stmt_id of statement #through
+                                     ;   (all-zero at 0 — D-87)
+fencecoord = { lineage: bytes16, gen: uint, seq: uint }
+head = { lineage: bytes16, gen: uint, seq: uint, op: bytes32 }
+issuerid = { src: "device", cert: bytes32 }
+         / { src: "service", key_id: bytes32 }
+signedreceipt = { stmt: receiptstmt, sig: bstr }
+receiptstmt = storagercpt / acceptrcpt / replicaack / ckptwitness
+storagercpt = { v: 1, kind: "storage", issuer: issuerid,
+  plane_id: bytes32, zone_id: ulid, subject: bytes32,
+  size: uint, seen_ms: ms, issuer_seq: uint,
+  prev_stmt: bytes32 }   ; D-87: stmt_id of the scope's previous
+                         ;   statement; all-zero at seq 1
+acceptrcpt = { v: 1, kind: "accept", issuer: issuerid,
+  plane_id: bytes32, zone_id: ulid, subject: bytes32,
+  seen_ms: ms, issuer_seq: uint, prev_stmt: bytes32 }
+replicaack = { v: 1, kind: "replica", issuer: issuerid,
+  plane_id: bytes32, zone_id: ulid, frontier_hash: bytes32,
+  seen_ms: ms, issuer_seq: uint, prev_stmt: bytes32 }
+ckptwitness = { v: 1, kind: "witness", issuer: issuerid,
+  plane_id: bytes32, zone_id: ulid,
+  checkpoint: bytes32,   ; the c.checkpoint op hash (D-80)
+  seen_ms: ms, issuer_seq: uint, prev_stmt: bytes32 }
+signedlease = { stmt: leasestmt, sig: bstr }
+leasestmt = { v: 1, issuer: issuerid, plane_id: bytes32,
+  zone_id: ulid, grant_id: bytes16, lineage: bytes16,
+  issued_ms: ms, expires_ms: ms,
+  ctrl_frontier: bytes32,   ; diagnostic (S4.7)
+  issuer_seq: uint, prev_stmt: bytes32 }
+
+; ---- A.3 control bodies (§7.1; tenant "ctrl") ----
+ctrlbody = cgenesis / cenroll / crevokedev / crevokezones / cwrapadd
+         / czonecreate / cspacecreate / cspacepolicy / cspaceretire
+         / czonepolicy / cservicekey / cgrant / crevokegrant
+         / cepochbump / clineagereauth / ckekrotate / ccutoff
+         / cabandon / ccheckpoint / cadminsucc / crecovsucc / cdrill
+cservicekey = { service: "connect", alg: sigalg, pk: bstr,
+  ? receipt_cutoffs: [+ { key_id: bytes32, through: uint,
+                          head_hash: bytes32 }] }
+  ; head_hash = stmt_id of statement #through (all-zero at 0 — D-87)
+  ; append-only registry, keyed by key_id = H_key({alg, pk}) (D-70);
+  ;   byte-identical re-install idempotent; qualification rides the
+  ;   zone policy's connect_service_key leaf at the epoch anchor;
+  ;   receipt_cutoffs: set (E7) keyed by key_id — target ANY
+  ;   installed key; cover receipts and leases (D-58/D-70)
+kekwrap = { v: 1, plane_id: bytes32, zone_id: ulid, epoch: uint,
+  recipient_device: bytes16, recipient_kem_key: bytes32,
+  kem: "hpke-p256-v1", enc: bstr .size 65, ct: bstr .size 48 }
+  ; GLOBAL key equality (D-116/D-125): in EVERY wrap-bearing
+  ;   operation (genesis, zone-create, rotation, enroll, renewal,
+  ;   wrap-add), recipient_kem_key MUST equal the recipient device's
+  ;   EFFECTIVE (unsuperseded) certificate's KEM key at this
+  ;   operation's control position — a superseded predecessor stays
+  ;   enrolled as validation history but stops qualifying the moment
+  ;   its renewal is accepted (v0.5.8's "an enrolled certificate"
+  ;   let a later wrap supersede a renewed-key wrap back to the old
+  ;   key after Kold destruction); sole exception: the certificate
+  ;   enrolled by the SAME operation (cgenesis/cenroll/cenrollrenew);
+  ;   no future-key staging anywhere
+lineagedef = { lineage: bytes16, device_id: bytes16, max_generations: uint }
+spacedef = { space_id: ulid, zone_id: ulid, name_hash: bytes32,
+  space_class: spaceclass, class_minimum: class, status_policy: polref }
+zonepolicy = { v: 1, zone_id: ulid, strictness: "strict" / "lenient",
+  deadline_fallback: "fail-closed" / "budgets",
+  require_cert_deadlines: bool, ? grant_epoch_slack: uint,
+  ? time_witnesses: [+ bytes16 / "connect"],   ; set (E7), <= 64 (D-96);
+                                               ;   stable device_ids
+  ? connect_service_key: bytes32 }
+  ; strictness (D-78): "strict" = epoch-advancing ops MUST carry
+  ;   closure cutoffs covering every live lineage; "lenient" =
+  ;   closure optional (lenient_epochs is removed — its fold-current
+  ;   comparison was order-divergent);
+  ; grant_epoch_slack (D-78): bounds op.capability_epoch −
+  ;   grant.capability_epoch (signed-vs-signed); absent = unbounded;
+  ; Connect qualifies iff "connect" in time_witnesses (one predicate);
+  ; connect_service_key REQUIRED iff so — it names an installed
+  ;   c.service_key descriptor by key_id (D-70);
+  ; deadline_fallback "fail-closed" REQUIRES require_cert_deadlines
+  ;   = true (cross-field, D-76)
+cgenesis = { descriptor: genesis, cert: cert, lineage: lineagedef,
+  zone: { zone_id: ulid, initial_epoch: 1,
+          wraps: [+ kekwrap] },   ; wraps set (E7)
+  home_space: spacedef,     ; exactly one; personal / private / workflow-v1
+  audit_space: spacedef,    ; exactly one; audit / private / owner-v1
+  zone_policy: zonepolicy,  ; the B.1 template instantiated
+  grant: grant,             ; finite budget REQUIRED (budgets posture)
+  audit_grant: grant }      ; ops = ["audit.write"], audit space
+cenroll = cenrollnew / cenrollrenew         ; discriminated by
+                                            ;   cert.renews (D-89)
+cenrollnew = { cert: cert,                  ; cert.renews ABSENT
+  grants: [* grant],                        ; set (E7)
+  lineage: lineagedef,
+  wraps: [* kekwrap] }                      ; set (E7)
+cenrollrenew = { cert: cert,                ; cert.renews REQUIRED
+  feed_closure: { key_id: bytes32, through: uint,
+                  head_hash: bytes32 },
+      ; REQUIRED (D-111): closes the PREDECESSOR signing key's
+      ;   receipt/lease feed (supersede purpose, immutable) —
+      ;   key_id = the old signing key; through/head_hash per D-87;
+      ;   delayed old-key statements <= through chain-verify against
+      ;   it, post-renewal mints die on it
+  history_cutoffs: [* frontierclose],
+      ; set (E7), <= 64; MAY be empty when required coverage is
+      ;   empty (D-97); heads = [] = the zero-history closure
+      ;   (D-143); zones beyond 64
+      ;   are covered by the zone's UNCONSUMED staged closes
+      ;   (ccutoff.closes, D-136/D-153 — one-shot; ratify state and
+      ;   prior consumers' entries never count);
+      ;   selector = the predecessor certificate (D-143);
+      ;   validation requires the UNION to cover the AUTHORSHIP
+      ;   domain (D-141): every zone named by the device's active
+      ;   op-authoring grants at this position (finite by D-32),
+      ;   INDEPENDENT of KEM membership — exclusion never orphans
+      ;   authored history (v0.5.10 keyed this to current
+      ;   membership; D-89)
+  ? wraps: [* kekwrap] }
+      ; REQUIRED iff the renewed cert rotates its KEM key: **one wrap
+      ;   per zone of the device's CURRENT-MEMBERSHIP SET (§4.3,
+      ;   D-125/D-133 — never grant-only zones, never zones a later
+      ;   epoch excluded: renewal mints no new access and never
+      ;   undoes an exclusion), at
+      ;   that zone's LATEST accepted epoch**
+      ;   (D-104 — v0.5.5's every-accepted-epoch rule was
+      ;   unsatisfiable: accepted epochs never leave control history;
+      ;   older epochs' KEKs are destroyed after completion — nothing
+      ;   exists to wrap; a queued rotation's staging re-targets the
+      ;   renewed key via its own c.wrap_adds); each
+      ;   recipient_kem_key == H_key({renewed cert kem_alg, kem_pk})
+      ;   (equality, D-97), superseding the predecessor's
+      ;   (zone, epoch, device) wrap; ABSENT when the KEM key is
+      ;   unchanged (old wraps stand) — D-89. Custody note (D-109/D-116 —
+      ;   the active-only condition went true too early: a Knew wrap
+      ;   on the ACTIVE epoch permitted Kold deletion while a queued
+      ;   intermediate epoch still had only old-key wraps, stranding
+      ;   it at activation — void): the device retains the
+      ;   predecessor KEM secret until every locally unretired epoch
+      ;   AT WHICH IT ACTUALLY HOLDS an old-KEM effective wrap gains
+      ;   a wrap targeting the device's CURRENT effective KEM key —
+      ;   any DESCENDANT of the old key, transitive across
+      ;   overlapping K0->K1->K2 renewals (a K2 wrap satisfies K0's
+      ;   obligation, D-141) — or retires locally (absence of a wrap
+      ;   at an epoch never obliges one — an excluded device's Kold
+      ;   drains as its old-wrap epochs retire, D-133; queued epochs
+      ;   it holds wraps at ARE included; coverage via
+      ;   post-acceptance c.wrap_adds; custody is LOCAL state —
+      ;   admission never reads it, D-125);
+      ;   grants and lineage NEVER appear (D-84)
+crevokedev = { mode: "exclude" / "compromise",
+  revocation_id: bytes16,
+                ; grant revocation is DERIVED (D-85): every active
+                ;   grant whose subject_device bears this
+                ;   revocation_id — no enumeration
+  cutoffs: [* frontierclose],  ; set; one per zone of the target's
+                               ;   AUTHORSHIP domain (D-159 — active
+                               ;   op-authoring grant zones, D-32:
+                               ;   grant-only / later-excluded zones
+                               ;   included); MAY be
+                               ;   empty (D-165: a zero-authorship
+                               ;   device is legally revocable);
+                               ;   ONE completion law (D-186/D-195):
+                               ;   linkage valid AND authorship
+                               ;   cutoffs total AND the
+                               ;   decryptable-wrap domain EMPTY —
+                               ;   v0.5.17's comment here still
+                               ;   said authorship-AND-wrap
+                               ;   coverage beside the new law
+  ? receipt_cutoffs: [+ { key_id: bytes32, through: uint,
+                          head_hash: bytes32 }],
+                                 ; set; REQUIRED iff mode = "compromise";
+                                 ;   head_hash = stmt_id of statement
+                                 ;   #through (all-zero at 0 — D-87);
+                                 ;   covers leases too
+  rotation_refs: [* bytes32] }   ; set; separately committed
+                                 ; c.kek_rotate op hashes (<= 64, E8);
+                                 ; TYPED LINKAGE, never coverage
+                                 ;   proof (D-180): completion is
+                                 ;   STATE-DERIVED — the target's
+                                 ;   DECRYPTABLE-WRAP domain (D-173:
+                                 ;   >= 1 accepted epoch holding an
+                                 ;   effective target wrap not yet
+                                 ;   excluded by a later accepted
+                                 ;   rotation) is EMPTY at the
+                                 ;   completing op's position;
+                                 ;   accepted exclusions shrink the
+                                 ;   domain themselves — references
+                                 ;   never discharge coverage, so a
+                                 ;   COVERAGE continuation cannot
+                                 ;   exist (crevokezones refs =
+                                 ;   additional linkage only,
+                                 ;   D-195); each reference
+                                 ;   MUST be a valid post-last-wrap
+                                 ;   exclusion of the target and
+                                 ;   carries the D-71 freeze
+                                 ;   linkage — MANDATORY on hosted
+                                 ;   planes (S7.5); an unheld
+                                 ;   reference = ref-unresolved, a
+                                 ;   held-invalid one =
+                                 ;   body-invariant (D-195)
+crevokezones = { revocation_id: bytes16,
+  ? rotation_refs: [+ bytes32],  ; set (E7) — additional TYPED
+                                 ;   LINKAGE only (D-186: references
+                                 ;   never discharge coverage;
+                                 ;   completion is state-derived)
+  ? cutoffs: [+ frontierclose] } ; set (E7); at least one field
+                                 ;   present — continuation for the
+                                 ;   same revocation's AUTHORSHIP
+                                 ;   coverage (D-71/D-186)
+cwrapadd = { zone_id: ulid, epoch: uint, wrap: kekwrap }
+  ; epoch: any accepted epoch — a control-log fact (D-97); wraps for
+  ;   locally retired epochs are inert (their KEK is destroyed);
+  ;   same-(zone, epoch, device) wrap supersedes the prior (D-89);
+  ;   equality (D-106): wrap.zone_id == zone_id, wrap.epoch == epoch,
+  ;   wrap.plane_id == the plane (outer/inner never diverge);
+  ;   key equality per the GLOBAL kekwrap rule (D-109/D-116/D-125 —
+  ;   the effective unsuperseded certificate); a wrap
+  ;   creating a 257th recipient of any (zone, accepted
+  ;   epoch) rejects (D-110/D-125)
+czonecreate = { zone_id: ulid, initial_epoch: 1,
+  wraps: [+ kekwrap],                        ; set (E7)
+  zone_policy: zonepolicy }
+cspacecreate = spacedef
+cspacepolicy = { space_id: ulid, ? space_class: spaceclass,
+  ? class_minimum: class, ? status_policy: polref }
+cspaceretire = { space_id: ulid, ? closes: [* frontierclose] }
+  ; retirement = an epoch event (S9.4) with MANDATORY frontier
+  ;   coverage of every live lineage (D-151) regardless of
+  ;   strictness
+  ;   (inline closes UNION staged ccutoff.closes, materialized with
+  ;   selector = epochs below the retirement — D-132/D-138/D-143);
+  ;   writes signed at or beyond the retirement epoch reject
+  ;   scope-space; old-epoch backdating dies on the frontier
+czonepolicy = { policy: zonepolicy, ? cutoffs: [* frontierclose] }
+  ; closure frontiers (D-78/D-143): set (E7), key
+  ;   (zone_id, lineage), <= 64;
+  ;   REQUIRED covering every live lineage (D-151) when the policy
+  ;   in force at acceptance is "strict"
+cgrant = { grant: grant }
+crevokegrant = { grant_id: bytes16, ? cutoff: frontierclose }
+  ; cutoff REQUIRED when the grant is op-authoring (D-78/D-143):
+  ;   the revoked grant's operations at or below the carried heads
+  ;   stand, beyond them — or in uncarried generations — quarantine
+  ;   ("cutoff"); selector = the revoked grant; no
+  ;   fold-current status read; read-only grants are edge-checked
+  ;   live and need none
+cepochbump = { zone_id: ulid, new_epoch: uint,
+  ? cutoffs: [* frontierclose] } ; closure frontiers — same rule
+                                 ;   (D-78/D-143)
+clineagereauth = { lineage: bytes16, max_generations: uint,
+  requester: { device_cert: bytes32, ctrl_frontier: bytes32, sig: bstr } }
+  ; sig = Sign(device_sk, msg("reauth", { plane_id, lineage,
+  ;   max_generations, request_id, ctrl_frontier, lineage_version,
+  ;   repoch })) — single-use (request_id consumed, D-59) and fresh
+  ;   (D-82/D-87: lineage_version = accepted reauth count, 0 at
+  ;   creation, monotone; repoch defeats C3′ resurrection); every
+  ;   input carried or control-derivable (D-100 — gens_total
+  ;   removed); the attestation is durable one-shot assent (D-100)
+ckekrotate = { zone_id: ulid, new_epoch: uint,
+  wraps: [+ kekwrap],                        ; set (E7)
+  erase_manifest: [* erasemref] }            ; set (E7), sorted by
+                                             ;   item_addr
+erasemref = { item_addr: bytes32, erase_op: bytes32,
+  target_op: bytes32 }
+  ; D-66: erase_op = an accepted m.erase_request; target_op MUST be a
+  ;   member of that request's targets; logical key = item_addr (E7);
+  ;   duplicates across rotations = idempotent skip
+frontierclose = { zone_id: ulid, lineage: bytes16,
+  heads: [* head] }
+  ; the AUTHORITY-CLOSURE shape of the immutable purposes —
+  ;   supersede / revoke / close / recover (D-143, replacing the
+  ;   scalar zonecutoff: one lex coordinate could neither bound
+  ;   several live generation chains nor end future
+  ;   generation-opening; ratify rides its own per-generation
+  ;   ratifycutoff; abandon rides cabandon.seals);
+  ; keyed (zone_id, lineage) (E7); heads: set keyed by gen (at most
+  ;   one per generation, Frontier-consistent), <= 65 (E8/D-152 —
+  ;   64 open gaps plus the live tip); TOTAL-OVERRIDE semantics for the
+  ;   ENDED AUTHORITY (the D-135 pattern): a carried generation
+  ;   admits at or below its head, an uncarried or later-opened
+  ;   generation admits nothing; heads = [] ends everything (the
+  ;   scalar "none" sentinel is retired with the shape);
+  ; the SELECTOR derives from the carrying operation (D-143, never
+  ;   carried): close -> capability epochs below the consuming
+  ;   advance; supersede -> the predecessor certificate; revoke ->
+  ;   the revoked grant / certs bearing the revocation_id;
+  ;   recover -> global; non-matching operations are untouched;
+  ; global validity (D-77): every head belongs to its named
+  ;   (zone_id, lineage);
+  ; composition is scoped by BOUNDARY PURPOSE (D-93/D-102): these
+  ;   purposes are immutable and never composed — a generic cutoff
+  ;   cannot amend them;
+  ; an unheld referenced Head = ref-unresolved (pending-dependency,
+  ;   D-102); differing bytes at a coordinate = fork evidence
+  ;   resolved by boundary SELECTION (D-130): the first committed
+  ;   selector in control order wins, the losing variant's suffix
+  ;   quarantines; body-invariant only against a PRIOR committed
+  ;   selection (v0.5.9's reject-on-mismatch was arrival-relative);
+  ;   a PENDING selector RESERVES the full (zone, lineage)
+  ;   scope — later boundaries naming ANY coordinate of that
+  ;   lineage pend behind, released on resolution,
+  ;   reject-permanent, or C3' removal (D-137/D-145/D-154 — the
+  ;   last_known dependency cone crosses generations);
+  ; differing entries for one key inside one operation are
+  ;   non-canonical (E7)
+ratifycutoff = { zone_id: ulid, lineage: bytes16, gen: uint,
+  accepted_through: head }
+  ; the per-generation RATIFY shape (D-114/D-120); logical key
+  ;   (zone_id, lineage, gen) (E7); equality: accepted_through.gen
+  ;   == gen and the Head belongs to its named (zone_id, lineage);
+  ;   the "none" arm is REMOVED (D-136): requester form requires
+  ;   EQUALITY with the carried head (D-129), and requesterless
+  ;   "none" became a pure no-op once coverage moved to scalar
+  ;   close state — zero-history retirement rides the TOTAL
+  ;   snapshot override (D-135) or seal/close authority; entries
+  ;   fold per D-135 (first = Bounded, later = max), clamped by
+  ;   the generation's immutable_cap (D-121/D-122)
+ccutoff = { cutoffs: [* ratifycutoff],
+  ? closes: [* frontierclose],
+  ? requester: { device_cert: bytes32, ctrl_frontier: bytes32,
+                 live_heads: [* zoneheads], sig: bstr } }
+zoneheads = { zone_id: ulid, heads: [* head] }
+  ; heads: set (E7), key gen — Frontier-consistent (at most one
+  ;   live head per generation; D-113), <= 65 (E8/D-152)
+  ; live_heads: set (E7) keyed by zone_id, one entry per named zone —
+  ;   the requester lineage's FULL live-head set there (plural under
+  ;   unknown gaps; empty = none); CARRIED so the signed message is
+  ;   reconstructable from the body alone (D-95 — v0.5.4 signed
+  ;   state it did not carry, and control-first delivery misread as
+  ;   sig-invalid)
+  ; cutoffs: set (E7), key (zone_id, lineage, gen), <= 64 — one
+  ;   operation retires several unknown-gap heads as several
+  ;   per-generation entries (D-80/D-120); MAY be empty iff the
+  ;   requester is present (pure snapshot retirement — the total
+  ;   override, D-135) or closes is non-empty (a pure staging
+  ;   operation — D-136); no entries, no closes, no requester =
+  ;   body-invariant;
+  ; closes: set (E7), key (zone_id, lineage), <= 64 — staged
+  ;   frontier closures (D-136/D-143/D-153): INERT until consumed;
+  ;   the zone's NEXT consuming advance/renewal/retirement consumes
+  ;   all its APPLICABLE unconsumed stages (D-176 — those within
+  ;   the consumer's own coverage domain) and materializes each with
+  ;   the consumer's selector — one-shot, a consumed stage never
+  ;   counts again (every later advance needs fresh coverage at
+  ;   current heads); consumption is APPLICABLE-scoped (D-176): a
+  ;   consumer takes only stages whose (zone, lineage) lie in ITS
+  ;   coverage domain (advance/retirement = the zone's live
+  ;   lineages; renewal = its predecessor's authorship domain —
+  ;   never another lineage's stage); a stage EXISTS at its
+  ;   carrier's ACCEPTANCE
+  ;   only — a pending carrier registers nothing and every
+  ;   REQUIRED-COVERAGE consumer (strict advance / ANY retirement /
+  ;   RENEWAL, D-176)
+  ;   pends behind an applicable held-but-pending carrier
+  ;   (ref-unresolved) — lenient advances never pend; a
+  ;   late-accepted carrier re-folds the bounded consumer suffix;
+  ;   a dead-lineage stage is consumed VACUOUSLY by the
+  ;   authority-ending frontier ITSELF at its acceptance
+  ;   (D-160/D-168/D-176/D-196 — revoke-then-regrant cannot
+  ;   resurrect it); the staging lane
+  ;   for wide-zone epoch advances and space-retirement coverage;
+  ;   requesterless/trusted only (closes alongside a requester, or
+  ;   under the hosted ceiling, = body-invariant);
+  ; requester.live_heads MUST be non-empty when the requester is
+  ;   present (>= 1 zoneheads entry — a requester naming no zone
+  ;   asserts no boundary, D-151; heads = [] INSIDE an entry stays
+  ;   the valid total-none snapshot);
+  ; requester REQUIRED on hosted planes (D-54); when present — on
+  ;   ANY plane — every entry names the requester's own lineage
+  ;   (D-120: the signature binds one scalar lineage_version; a
+  ;   trusted multi-lineage ceremony goes requesterless — no
+  ;   snapshot boundary, no composition check, equation-only
+  ;   validation); device_cert
+  ;   resolves to a certificate whose device_id owns that lineage;
+  ;   sig verifies under that certificate's key and
+  ;   = Sign(device_sk, msg("cutoffreq", { plane_id, cutoffs,
+  ;   live_heads, request_id, ctrl_frontier, lineage_version,
+  ;   repoch })) — single-use (D-59), fresh (D-82/D-87:
+  ;   lineage_version + repoch equality; gens_total removed, D-100);
+  ;   live_heads is CARRIED (reconstruction invariant, D-100) and
+  ;   SNAPSHOT-WINS (D-108): the carried set IS the boundary —
+  ;   uncarried successors retire deterministically at this op's
+  ;   fold position (no fold-relative equality check); each cutoffs
+  ;   entry names a generation present in the carried set for its
+  ;   zone, accepted_through EQUAL to that carried head
+  ;   (body-invariant otherwise, "none" included — D-114/D-129);
+  ;   each carried head belongs to (zone_id, the requester's
+  ;   lineage) — validation equality (D-130 pin); an unheld
+  ;   carried head pends (ref-unresolved, D-102), never sig-invalid
+cabandon = { zone_id: ulid, lineage: bytes16,
+  seals: [+ { gen: uint, at: head / "none" }],   ; non-empty (D-114)
+  ? requester: { device_cert: bytes32, ctrl_frontier: bytes32,
+                 sig: bstr } }
+  ; boundary purpose ABANDON (D-101/D-107): per-generation immutable
+  ;   seals (set (E7), keyed by gen, <= 64); at = "none" voids the
+  ;   generation; equality: at.gen == gen, at.lineage == lineage,
+  ;   and at resolves in the body's outer zone_id — the named Head
+  ;   belongs to (zone_id, lineage) (D-130 pin);
+  ;   unnamed generations untouched; later ratify never exceeds a
+  ;   seal; receipt-independent (outside the revisit paths);
+  ; requester REQUIRED on hosted planes (own lineage only — D-107):
+  ;   sig = Sign(device_sk, msg("abandonreq", { plane_id, zone_id,
+  ;   lineage, seals, request_id, ctrl_frontier, lineage_version,
+  ;   repoch })) — single-use (D-59), fresh (D-82/D-87)
+ccheckpoint = checkpointobj
+  ; the body IS the object (D-80): the operation hash is the
+  ;   checkpoint identity, the control log its carriage — no hash
+  ;   indirection (H_ckpt and the `ckpt` tag are removed)
+cadminsucc = { new_admin: { alg: sigalg, pk: bstr }, epoch: uint }
+crecovsucc = { base: { seq: uint, op: bytes32 }, epoch: uint,
+  repoch: uint, new_admin: { alg: sigalg, pk: bstr },
+  new_recovery_commitment: bytes32,
+  tenant_cutoffs: [* frontierclose],
+      ; set (E7), <= 256 (E8) — explicit recover boundaries
+      ;   (frontier shape, global selector, immutable — naming
+      ;   PRESERVED history at or below the carried heads, D-143);
+      ;   the complement domain is (zone, lineage) PAIRS whose
+      ;   lineage was enrolled at or before base (D-151/D-167 — a
+      ;   later-enrolled lineage folds normally; v0.5.13's mirror
+      ;   omitted the exception and quarantined post-recovery
+      ;   enrollments the main rule admits): a
+      ;   pair with an entry follows it; a pair without one
+      ;   folds the implicit revivable "none" override — every
+      ;   generation's admit_bound overrides to Bounded("none") at
+      ;   the recovery's fold position (portable: no tenant-side
+      ;   base coordinate exists — D-132/D-138; revivable by
+      ;   post-recovery ratify growth; entries are refinements, no
+      ;   continuation op needed)
+  ? adopted_renewals: [* { device_id: bytes16,
+                           renewal_op: bytes32 }],
+      ; set (E7), keyed (device_id, renewal_op), <= 64 (E8) —
+      ;   the D-112 adoption pattern for CERTIFICATE RENEWALS —
+      ;   KEM-rotating and signing-only alike (D-150/D-172): a
+      ;   recovery whose base precedes an accepted
+      ;   cenrollrenew either adopts it — the renewed certificate
+      ;   and its replacement wraps survive as validation material
+      ;   and storage state (the device's recipient identity), and
+      ;   its keys join the TYPED freshness history (D-158/D-164:
+      ;   signing
+      ;   key burned globally; the TERMINAL adopted KEM key bound
+      ;   to the adopted device — same-device recovery
+      ;   re-enrollment with it legal, any other device rejects;
+      ;   INTERMEDIATE adopted keys are rotated-away and burned) —
+      ;   or
+      ;   leaves it cut: a device that already destroyed its
+      ;   predecessor KEM secret under an unadopted renewal is
+      ;   storage-orphaned (v0.5.11's re-fold silently made the
+      ;   destroyed key effective again); per-device entries form a
+      ;   contiguous chain INCLUDING signing-only intermediate
+      ;   renewals — the bounded list carries ALL chain renewals,
+      ;   one rule one cap (D-158/D-164/D-172 — dependency closure;
+      ;   chains deeper than 64 orphan the excess, the D-117
+      ;   pattern — stated residual); a key appearing BOTH in
+      ;   retired_keys and as a terminal adopted key =
+      ;   body-invariant on the recovery (self-contradictory owner
+      ;   intent, D-172);
+      ;   wrong-device /
+      ;   non-renewal / not-strictly-AFTER-base (D-164 — v0.5.13's
+      ;   "not-before-base" negative was inverted and rejected the
+      ;   valid adoptions) / noncontiguous =
+      ;   body-invariant, unheld renewal_op = ref-unresolved
+      ;   (resolves before precedence, D-105/D-158)
+  ? retired_keys: [* bytes32],
+      ; set (E7), <= 256 (E8) — key_ids the owner commits as
+      ;   RETIRED from cut branches (D-150): joins the portable
+      ;   signing/KEM freshness domain; membership compares
+      ;   key_id = H_key({alg, pk}) — never raw key bytes (D-159) —
+      ;   and matching is CANDIDATE-SIDE across the closed v1 role
+      ;   tags (D-182: a candidate point is checked under BOTH
+      ;   p256 and hpke-p256-v1 — these hashes cannot be inverted
+      ;   to derive mat_id, so the candidate enumerates);
+      ;   an uncarried, unadopted cut-branch key
+      ;   is re-usable — a stated, vectored residual
+  adopted_rotations: [* { zone_id: ulid, rotation_op: bytes32,
+    fence_frontier: bytes32, control_frontier: bytes32,
+    recipients_hash: bytes32 }] }
+  ; set (E7), keyed by (zone_id, rotation_op) (D-104/D-112),
+  ;   <= 64 TOTAL (E8, D-117): each
+  ;   entry adopts one rotation's COMPLETE Fence-frame identity
+  ;   (fence_frontier + control_frontier + recipients_hash, §5.5);
+  ;   a zone's adopted rotations MUST form a contiguous chain from
+  ;   the cut branch (body-invariant) — predecessor-active replicas
+  ;   validate their own commitment against their own entry
+  ;   (v0.5.6's one-highest-entry left them unvalidatable). A
+  ;   replica whose activation matches its entry continues; a
+  ;   mismatched or unadopted activation is `storage-orphaned`
+  ;   (→ storage-quarantine) — a fork holding more activated
+  ;   rotations than one operation can adopt orphans the excess
+  ;   (deep-fork orphaning: a stated, vectored residual — rotations
+  ;   are rare owner ceremonies, D-117); an unheld rotation_op is
+  ;   `ref-unresolved` (D-105: no precedence effect while pending);
+  ;   accepted-but-unFenced cut rotations are never adopted — they
+  ;   are cut and re-issued on the surviving branch (nothing
+  ;   activated, D-117).
+  ;   Dependency closure (D-112/D-117): certificates/descriptors the
+  ;   adopted commitments reference survive as VALIDATION MATERIAL
+  ;   (never authority); the EFFECTIVE (superseding) wrap-add map
+  ;   through each adopted control_frontier survives as STORAGE
+  ;   STATE (the wraps that make adopted ciphertext readable — never
+  ;   as revived control authority); adopted rotations' erase
+  ;   manifests stand (erasure wins). The owner chooses, explicitly,
+  ;   per rotation
+cdrill = { nonce: bytes16 }
+
+; ---- A.4 item / storage (§5–6) ----
+ctrlopframe = { op: bstr }        ; 0x01 (control log only): exact
+                                  ;   SignedOperation triple bytes
+itemrewrapframe = { wrap: itemwrap }                        ; 0x12
+fenceframe = { kek_epoch: uint, rotation_op: bytes32,
+  fence_frontier: bytes32, control_frontier: bytes32,
+  recipients_hash: bytes32 }      ; 0x13 (D-77/D-97)
+recipientset = { v: 1,
+  pairs: [* { device: bytes16, kem_key: bytes32 }] }
+  ; v REQUIRED (D-110 — a direct H_recips preimage is a top-level
+  ;   hashed object under E6, not an operation body); set (E7),
+  ;   keyed by device, <= 256 — ENFORCED at admission
+  ;   (D-110/D-125): ANY wrap-bearing operation creating a zone's
+  ;   257th holder at any ACCEPTED epoch rejects (control-derived —
+  ;   local Fence progress never read), so every possible Fence's
+  ;   commitment is constructible;
+  ; recipients_hash = H_recips(canonical recipientset) — the closed
+  ;   intended recipient set; control_frontier = the OP HASH of the
+  ;   latest accepted control operation at the Fence (its identity,
+  ;   D-106) — wrap-adds accepted at or before it are IN the intent
+receiptframe = { body: signedreceipt / signedlease }        ; 0x16
+itemcore = { v: 1, aead: "a256gcm", nonce: bstr .size 12, ct: bstr }
+itemwrap = { v: 1, item_addr: bytes32, key_wrap_epoch: uint,
+  wrapped_dek: bstr .size 48 }   ; AES-256-GCM(32-byte DEK): ct || tag
+tombstone = { v: 1, item_addr: bytes32, erase_op: bytes32,
+  target_op: bytes32, retired_epoch: uint }
+itemcommit = { core: itemcore, wrap: itemwrap, lineage: bytes16,
+  gen: uint, seq: uint }
+rewrapdone = { kek_epoch: uint, rotation_op: bytes32, count: uint,
+  fence_frontier: bytes32,   ; zone Frontier hash at Fence (D-67)
+  control_frontier: bytes32, recipients_hash: bytes32,
+                             ; equal to the Fence's fields (D-97)
+  survivors: bytes32 }
+  ; survivors = H_survivors(canonical survivorset) (D-77);
+  ;   count == |survivorset.pairs| (D-92)
+survivorset = { v: 1, pairs: [* survivorpair] }
+                             ; set (E7), keyed by item_addr
+survivorpair = { item_addr: bytes32, wrap_hash: bytes32 }
+outboxmark = { through: { lineage: bytes16, gen: uint, seq: uint } }
+txnrec = itemcommit / pendingxfer / xferdone / xferabort
+       / xferreopen
+  ; the ImportCommitted marker (v0.5.18) is WITHDRAWN (D-198 —
+  ;   sources stay live for nonterminal transfers, so no
+  ;   marker-vs-tombstone order is needed and the marker's crash
+  ;   contract, which no durable object could honor, dies with it)
+txn = { records: [+ txnrec] }         ; <= 16 (E8)
+pendingxfer = { export_id: bytes16, release_op: bytes32,
+  dest_zone: ulid,
+  content_digest: bytes32, record_count: uint }
+                             ; release_op = the journal identity
+                             ;   (D-119/D-123); export_id =
+                             ;   correlation only
+xferdone = { export_id: bytes16, release_op: bytes32,
+  incarnation: uint,         ; D-192: self-describing interval
+  completed: [* bytes32] }   ; set (E7): the imported source_ops ==
+                             ;   the bundle's exact record set (D-65)
+factref = { kind: "op", ref: bytes32 }
+        / { kind: "stmt", ref: bytes32 }
+  ; the tagged fact reference (D-179): an operation hash or an
+  ;   issuer-statement stmt_id — INVALIDATIONS cite either domain;
+  ;   terminal BASES are op-kind only (opfactref, D-185/D-193)
+opfactref = { kind: "op", ref: bytes32 }
+xferabort = { export_id: bytes16, release_op: bytes32,
+  reason: "source-erased" / "reject-permanent"
+        / "release-rejected",
+  incarnation: uint,
+  missing: [+ { rec: bytes32, ? basis: opfactref }] }
+                             ; set (E7) keyed by rec, NON-EMPTY
+                             ;   (D-98 — an empty residue is
+                             ;   XferDone): source_ops never
+                             ;   imported; terminal (D-65).
+                             ;   "release-rejected" = the journal
+                             ;   cleanup abort (outside the finality
+                             ;   gate, D-126); the other two are
+                             ;   true terminals gated at the
+                             ;   release's effect-final coordinate;
+                             ;   incarnation (D-192) = the frame-
+                             ;   order interval index — a mismatch
+                             ;   = log-corrupt;
+                             ;   per-record basis (D-140/D-148/
+                             ;   D-157/D-179/D-193) = ONE
+                             ;   writer-chosen
+                             ;   sufficient branch-relative fact,
+                             ;   as an opfactref (op-kind ONLY —
+                             ;   stmt refs serve invalidation) —
+                             ;   the journal is replicated log
+                             ;   bytes, so the recorded cause IS
+                             ;   canonical and verification is
+                             ;   fact-held, never order-dependent
+                             ;   (v0.5.15's minimal-hash-at-`at`
+                             ;   could not order tenant facts or
+                             ;   issuer statements against a
+                             ;   control coordinate — withdrawn
+                             ;   with the `at` field, D-179;
+                             ;   import-collision left the cause
+                             ;   vocabulary — unreachable as a
+                             ;   terminal, D-177);
+                             ;   the vocabulary = D-149's
+                             ;   branch-relative class exactly
+                             ;   (absent = intrinsic bytes / static
+                             ;   scope-flow-class mismatches /
+                             ;   source-erased — the ONE table,
+                             ;   D-193/D-200; basis presence IS
+                             ;   the discriminator); MONOTONE
+                             ;   invalidation (D-179): the journal
+                             ;   reopens when the RECORDED cause
+                             ;   dissolves, displaces, or
+                             ;   retro-quarantines — even if
+                             ;   another sufficient fact holds;
+                             ;   re-derivation re-terminals the
+                             ;   next interval with the survivor
+xferreopen = { export_id: bytes16, release_op: bytes32,
+  incarnation: uint,
+  basis: opfactref, invalidation: factref }
+  ; basis = opfactref (D-193/D-200 — v0.5.18 retyped the Abort's
+  ;   basis and left the Reopen's on the broad union: a
+  ;   statement-kind terminal basis parsed while the vector said
+  ;   it must fail); invalidation keeps the full union
+                             ; D-140/D-148/D-157/D-163: appended
+                             ;   when ANY recorded basis
+                             ;   invalidates — basis = the
+                             ;   invalidated recorded cause
+                             ;   (a tagged factref, D-179),
+                             ;   invalidation =
+                             ;   the factref of the fact that
+                             ;   killed it (verifiable-when-held:
+                             ;   an unheld citation PENDS the
+                             ;   reopen — feed order never divides
+                             ;   replicas; an uncited or
+                             ;   unverifiable citation =
+                             ;   log-corrupt, D-163);
+                             ;   incarnation = the terminal
+                             ;   interval it closes (0-based);
+                             ;   legal ONLY after that interval's
+                             ;   cause invalidated; wrong/duplicate
+                             ;   incarnation, a second terminal in
+                             ;   one interval, or reopening a Done
+                             ;   = log-corrupt (storage-quarantine —
+                             ;   D-189/D-197); the
+                             ;   journal reopens and recovery
+                             ;   re-derives PER RECORD (no implicit
+                             ;   abandonment); terminal effect key
+                             ;   = ("terminal", release_op,
+                             ;   incarnation); XferDone never
+                             ;   reopens (escaped-effect residual)
+kekdestroyed = { epoch: uint }   ; the destroyed (retiring) epoch
+                                 ;   = new_epoch − 1 (D-92)
+
+; ---- A.5 memory bodies (§11; operation_version 1) ----
+bundlerec = { v: 1, op: bytes32, kind: kind, statement: text,
+  class_floor: class }       ; deterministic redaction (§11.8);
+                             ;   class_floor = the source's effective
+                             ;   classification at the release stamp
+bundleleaf = { v: 1, export_id: bytes16, rec_index: uint,
+  rec: bundlerec }
+  ; the NAMED leaf preimage (D-162 — v0.5.13's inline object fixed
+  ;   no canonical bytes: no version, no map-vs-bstr statement);
+  ;   leaf = H_brec(canonical bundleleaf); rec embedded as a map;
+  ;   rec_index = the record's 0-based rank in the release's
+  ;   signed, sorted sources (D-156)
+bundle = { v: 1, export_id: bytes16, recs: [+ bundlerec] }
+  ; NO release_op inside the digest preimage (D-127 — a
+  ;   bundle-carried release_op was a hash fixed point; the signed
+  ;   release travels ALONGSIDE the bundle, and release_op =
+  ;   H_op(release triple) is DERIVED by every post-signing
+  ;   consumer);
+  ; recs: set (E7), keyed by op — EXACTLY the release's sources;
+  ;   bundles are re-derived, never persisted or framed (D-75)
+polref = { id: text, version: uint, hash: bytes32 }
+evref = { ns: "plane", op: bytes32, zone: ulid, ? plane_id: bytes32,
+          ? span: text, class_floor: class }
+      / { ns: "external", scheme: "session-log" / "url" / "file",
+          locator_hash: bytes32, digest: bytes32, class_floor: class }
+mclaim = { kind: kind, statement: text, sensitivity: class,
+  ? observed_at_ms: ms, ? valid_from_ms: ms, ? valid_until_ms: ms,
+  ? expires_at_ms: ms,
+  provenance: { ? session: text, ? project: text, ? model: text,
+    evidence: [* evref] },
+                ; NO import arm (D-151, adopting the peer's M1):
+                ;   v1 imports ride m.import.claim EXCLUSIVELY, so
+                ;   the optional arm described no valid mclaim body
+                ;   — deleted structurally (import provenance
+                ;   exists only in mimport's dedicated shape)
+  ? supersedes: [* bytes32],   ; advisory lineage links (§11.2)
+  ? labels: [* text] }
+mjudge = { verdict: "accept" / "dispute" / "retract" / "retire",
+           target: bytes32, policy: polref, ? reason: text,
+           ? evidence: [* evref] }
+       / { verdict: "supersede", target: bytes32, replacement: bytes32,
+           policy: polref, ? reason: text }
+       / { verdict: "raise_class" / "declassify", target: bytes32,
+           new_class: class, policy: polref, ? reason: text }
+mpin = { target: bytes32, destination: { space: ulid, role: text },
+  ? expiry_ms: ms, ? token_budget: uint, ? provenance_floor: class,
+  accepted_under: { judgment: bytes32, policy: polref } }
+munpin = { target_pin: bytes32 }
+merasereq = { targets: [+ bytes32] }   ; set (E7): claim op hashes
+                                       ;   (D-66)
+mexportrel = { export_id: bytes16,
+  sources: [+ bytes32],     ; set (E7), keyed by op; claims only
+  content_digest: bytes32,  ; the bundle MERKLE ROOT (S11.8,
+                            ;   D-147) — per-record inclusion
+                            ;   proofs ride mimport (never a charge
+                            ;   input — D-98 removed the
+                            ;   self-attested bundle_size)
+  to: endpoint, class_floor: class,
+  data_frontier: bytes32, control_frontier: bytes32, as_of_ms: ms,
+                            ; the complete classification eval point
+  expiry_deadline_ms: ms }
+mimport = { source_op: bytes32,   ; the released bundlerec this binds to
+  class_floor: class,               ; the immutable lower bound
+  kind: kind, statement: text,
+  sensitivity: class,               ; == class_floor (equality, D-134)
+  rec_index: uint,                  ; == the record's 0-based RANK
+                                    ;   in the release's signed,
+                                    ;   sorted sources (D-156 — the
+                                    ;   verifier computes it from
+                                    ;   source_op)
+  proof: [* bytes32],               ; Merkle siblings, <= 7 (E8) —
+                                    ;   the self-describing leaf
+                                    ;   H_brec(bundleleaf — App
+                                    ;   A.5, D-162) folded up
+                                    ;   proof (bottom-up, exact
+                                    ;   consumption) reaches
+                                    ;   release.content_digest,
+                                    ;   else body-invariant
+                                    ;   (D-147/D-156/D-162:
+                                    ;   per-record admission —
+                                    ;   binds the layout; the ONLY
+                                    ;   validator = the FULL S11.8
+                                    ;   rule — leaf+path PLUS
+                                    ;   source equality, ALWAYS
+                                    ;   checkable: sources stay
+                                    ;   live for nonterminal
+                                    ;   transfers (D-198); the
+                                    ;   proof alone never admits)
+  provenance: {
+    import: { from_plane: bytes32, export_id: bytes16,
+              release_op: bytes32,
+              digest: bytes32 } } } ; the SINGLE authority source — no
+                                    ; duplicated top-level copies
+  ; a DEDICATED narrow shape (D-142): the prohibited fields —
+  ;   temporal, session/project/model, labels, evidence — are
+  ;   STRUCTURALLY absent (v0.5.10 reused the broad mclaim-like
+  ;   shape whose closed schema REQUIRED evidence while the D-134
+  ;   prose required its absence — no valid body existed); annotate
+  ;   post-import via ordinary judgments;
+  ; statement/kind/class_floor MUST equal the bound bundlerec (S11.8);
+  ; release_op = a signed MIRROR of the derived value (D-127/D-142);
+  ;   equalities: from_plane == release.header.plane_id, digest ==
+  ;   release.body.content_digest (S11.8 mirror matrix);
+  ; replay keys on (provenance.import.from_plane, release_op,
+  ;   source_op) — D-123; export_id = correlation only; ownership
+  ;   is DERIVED (D-155): total claimant order (grant control
+  ;   position, gen, seq); frozen at effect finality or under a
+  ;   matching authority-ending frontier — AND only with no held
+  ;   order-earlier claimant still capable of winning (pending OR
+  ;   revivably quarantined — D-161/D-169); unfreezes if the
+  ;   basis dissolves; the order-loser is DISPLACED
+  ;   (quarantine-reproposal, arrival-invariant — D-161); only a
+  ;   claim against a frozen owner = import-collision — a fold
+  ;   outcome, never a terminal cause (D-177)
+auditprin = { shape: 1, device: bytes16 }
+          / { shape: 2, device: bytes16, session: text }
+          / { shape: 3, token_hash: bytes32 }
+          / { shape: 4, kind: "peer", peer: text,
+              ? token_hash: bytes32 }
+          / { shape: 4, kind: "session", session: text,
+              token_hash: bytes32 }   ; mediated split (D-74/D-83)
+maudit = { principal: auditprin, read_id: bytes16,
+  chunk: { index: uint, count: uint },
+  scope: { zone: ulid, spaces: [+ ulid] },
+                             ; spaces: set (E7), <= 64;
+                             ;   one read = one zone (D-83)
+  result_ids: [* bytes32],   ; set (E7): op hashes (D-74)
+  at_ms: ms }                ; diagnostic local time (D-64)
+wgen = { last_known: { gen: uint, seq: uint, op: bytes32 } / "unknown" }
+
+; ---- A.6 policy object (§11.3) ----
+verdictname = "accept" / "dispute" / "retract" / "retire"
+            / "supersede" / "raise_class" / "declassify"
+policy = { v: 1, policy_id: text, version: uint,
+  rules: [+ rule] }               ; set (E7): sorted, duplicate-free
+rule = { verdict: verdictname, kinds: [+ kind] / "*",
+         space_classes: [+ spaceclass] / "*",
+         actor_classes: [+ ("owner" / "safe-human" / "session"
+                           / "external" / "peer" / "service")],
+         relation: "self" / "author" / "any" }
+  ; relation REQUIRED (D-51, principal-level — §11.2): "self" = same
+  ;   authoring principal P = (writer.lineage, actor.kind, actor.id);
+  ;   "author" = P equality, or same lineage + direct-human evidence;
+  ;   "any" = no relational constraint
+```
+
+## Appendix B — pinned constants
+
+**B.1 Genesis ZonePolicy template** (parameterized — `zone_id` varies
+per plane, so there is no single global hash; the template's fixed
+fields are pinned by family 7 over instantiated bytes):
+`{ v: 1, zone_id: <genesis zone>, strictness: "strict",
+deadline_fallback: "budgets",
+require_cert_deadlines: false }` (no `time_witnesses` — a solo plane
+has none; Connect time arrives only via explicit policy) — the
+solo posture (D-28). The recommended multi-device policy (installed
+only by explicit `c.zone_policy` after a second device enrolls):
+`deadline_fallback: "fail-closed", require_cert_deadlines: true,
+time_witnesses = the enrolled stable device_ids`.
+
+**B.2 `workflow-v1`** — the literal canonical object (rules in
+canonical set order; array members canonically sorted). Deterministic
+CBOR encoding: 1133 bytes;
+
+```
+H_policy(workflow-v1) =
+  219b9baced57e8fdc06f56119e25dd02403cc4076cec04448e4957d0fa91dd1c
+```
+
+(computed from these exact bytes by the reference encoder; vector
+family 11 re-derives it — a mismatch fails the corpus, never the
+protocol):
+
+```
+{ v: 1, policy_id: "workflow-v1", version: 1, rules: [
+  { verdict: accept, kinds: "*", space_classes: "*",
+    actor_classes: [owner], relation: any }
+  { verdict: retire, kinds: "*", space_classes: "*",
+    actor_classes: [owner], relation: any }
+  { verdict: dispute, kinds: "*", space_classes: "*",
+    actor_classes: [owner, safe-human], relation: any }
+  { verdict: retract, kinds: "*", space_classes: "*",
+    actor_classes: [owner], relation: any }
+  { verdict: retract, kinds: "*", space_classes: "*",
+    actor_classes: [peer, session, external, safe-human], relation: author }
+  { verdict: supersede, kinds: "*", space_classes: "*",
+    actor_classes: [owner], relation: any }
+  { verdict: supersede, kinds: "*", space_classes: [workflow],
+    actor_classes: [session], relation: author }
+  { verdict: declassify, kinds: "*", space_classes: "*",
+    actor_classes: [owner], relation: any }
+  { verdict: raise_class, kinds: "*", space_classes: "*",
+    actor_classes: [owner, session, safe-human], relation: any }
+  { verdict: accept, kinds: [episode, observation], space_classes: [personal, workflow],
+    actor_classes: [safe-human], relation: any }
+  { verdict: accept, kinds: [episode, observation], space_classes: [workflow],
+    actor_classes: [session], relation: self }
+  { verdict: retire, kinds: [episode, observation], space_classes: [personal, workflow],
+    actor_classes: [safe-human], relation: any }
+] }
+```
+
+**B.3 `owner-v1`** — every verdict, all kinds, all space classes,
+owner only, relation any. Canonical encoding: 571 bytes;
+
+```
+H_policy(owner-v1) =
+  d7d5559a6c3462426cb63eed84b05c569f2571da0cc6b5009edc79910f1e4486
+```
+
+```
+{ v: 1, policy_id: "owner-v1", version: 1, rules: [
+  { verdict: accept, kinds: "*", space_classes: "*",
+    actor_classes: [owner], relation: any }
+  { verdict: retire, kinds: "*", space_classes: "*",
+    actor_classes: [owner], relation: any }
+  { verdict: dispute, kinds: "*", space_classes: "*",
+    actor_classes: [owner], relation: any }
+  { verdict: retract, kinds: "*", space_classes: "*",
+    actor_classes: [owner], relation: any }
+  { verdict: supersede, kinds: "*", space_classes: "*",
+    actor_classes: [owner], relation: any }
+  { verdict: declassify, kinds: "*", space_classes: "*",
+    actor_classes: [owner], relation: any }
+  { verdict: raise_class, kinds: "*", space_classes: "*",
+    actor_classes: [owner], relation: any }
+] }
+```

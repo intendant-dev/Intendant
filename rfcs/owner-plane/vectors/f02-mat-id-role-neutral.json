@@ -1,0 +1,17 @@
+{
+  "case_kind": "key-id-derive",
+  "expected": {
+    "bytes": "c2fac6b6f02425284cf3a93a0e5786a2c8286830ec605f91d381221fc377d756"
+  },
+  "family": 2,
+  "inputs": {
+    "kind": "mat_id",
+    "pk": "043ad3861a95621392516bb593ef05583ed2e5866f5cb6260a3017237fd89b90afd0961c7e37075a6791a39c61f56295b02b6d26567b615e60aa41ee1c8e83388d"
+  },
+  "name": "mat-id-role-neutral",
+  "source": "2.2",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}
